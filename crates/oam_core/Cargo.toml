@@ -1,0 +1,9 @@
+[package]
+name = "oam_core"
+description = "Event loop, op system, Promise<->Future bridge. M1 workstream; placeholder at M0."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oam_diagnostics = { workspace = true }

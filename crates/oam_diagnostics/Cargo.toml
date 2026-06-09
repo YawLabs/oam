@@ -1,0 +1,10 @@
+[package]
+name = "oam_diagnostics"
+description = "ODIF (oam Diagnostic Interchange Format): the one envelope for every diagnostic oam emits. JSON is the source of truth; pretty-printers are renderers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "oam_cli"
+description = "The oam binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "oam"
+path = "src/main.rs"
+
+[dependencies]
+oam_engine = { workspace = true }
+oam_diagnostics = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

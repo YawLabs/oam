@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tier-1: every PR is gated on all six. Windows is not an afterthought.
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Smoke (oam run)
+        shell: bash
+        run: |
+          echo "console.log('ci smoke', 6 * 7)" > /tmp/smoke.js
+          out=$(./target/debug/oam run /tmp/smoke.js)
+          [ "$out" = "ci smoke 42" ] || { echo "unexpected: $out"; exit 1; }
+
+  unsafe-audit:
+    name: unsafe budget (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count unsafe blocks per crate
+        shell: bash
+        run: |
+          # Advisory for now; becomes a ratchet gate with the SAFETY-comment
+          # checker (AI-POLICY.md gate 5). oam_engine is the quarantined FFI
+          # boundary and is reported separately.
+          for crate in crates/*/; do
+            n=$(grep -rn 'unsafe' "$crate/src" --include='*.rs' | wc -l || true)
+            echo "$crate: $n unsafe mentions"
+          done

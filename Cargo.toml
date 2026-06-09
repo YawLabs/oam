@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oam_engine",
+    "crates/oam_core",
+    "crates/oam_diagnostics",
+    "crates/oam_cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Jeff <jeff@rad.fyi>"]
+
+[workspace.dependencies]
+# Engine: rusty_v8 — semver-stable V8 bindings, prebuilt static libs
+# (incl. aarch64-pc-windows-msvc, verified present in v150.0.0 assets).
+v8 = "150"
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+oam_engine = { path = "crates/oam_engine" }
+oam_core = { path = "crates/oam_core" }
+oam_diagnostics = { path = "crates/oam_diagnostics" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Fast iterative builds; release perf work (PGO/BOLT) comes with oam-bench.
+[profile.dev.package."*"]
+opt-level = 1
