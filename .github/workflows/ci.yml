@@ -17,9 +17,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Tier-1: every PR is gated on all six. Windows is not an afterthought.
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: macos-latest
@@ -28,6 +25,42 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Build
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Smoke (oam run)
+        shell: bash
+        run: |
+          echo "console.log('ci smoke', 6 * 7)" > smoke.js
+          out=$(./target/debug/oam run smoke.js)
+          [ "$out" = "ci smoke 42" ] || { echo "unexpected: $out"; exit 1; }
+
+  # ARM hosted runners (windows-11-arm, ubuntu-24.04-arm) are available on
+  # PUBLIC repos only; on a private repo the labels are invalid and the whole
+  # workflow startup_failures. Gated on visibility so both legs activate
+  # automatically when the repo goes public. Until then the win-arm64 leg is
+  # covered daily by local dev (the primary dev machine is windows-arm64).
+  test-arm:
+    if: ${{ !github.event.repository.private }}
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
@@ -47,8 +80,8 @@ jobs:
       - name: Smoke (oam run)
         shell: bash
         run: |
-          echo "console.log('ci smoke', 6 * 7)" > /tmp/smoke.js
-          out=$(./target/debug/oam run /tmp/smoke.js)
+          echo "console.log('ci smoke', 6 * 7)" > smoke.js
+          out=$(./target/debug/oam run smoke.js)
           [ "$out" = "ci smoke 42" ] || { echo "unexpected: $out"; exit 1; }
 
   unsafe-audit:
