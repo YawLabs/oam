@@ -1,5 +1,12 @@
 name: CI
 
+# NOTE: the YawLabs org Actions policy is "selected" (GitHub-owned + verified
+# + an explicit pattern allowlist). This workflow deliberately uses ONLY
+# GitHub-owned actions (checkout, cache) — third-party actions like
+# dtolnay/rust-toolchain or Swatinem/rust-cache fail the whole workflow at
+# startup unless added to the org allowlist. rustup ships on all hosted
+# runners and reads rust-toolchain.toml, so we don't need them.
+
 on:
   push:
     branches: [main]
@@ -27,10 +34,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@v4
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ matrix.target }}-cargo-
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -47,10 +60,9 @@ jobs:
           [ "$out" = "ci smoke 42" ] || { echo "unexpected: $out"; exit 1; }
 
   # ARM hosted runners (windows-11-arm, ubuntu-24.04-arm) are available on
-  # PUBLIC repos only; on a private repo the labels are invalid and the whole
-  # workflow startup_failures. Gated on visibility so both legs activate
-  # automatically when the repo goes public. Until then the win-arm64 leg is
-  # covered daily by local dev (the primary dev machine is windows-arm64).
+  # PUBLIC repos only. Gated on visibility so both legs activate automatically
+  # when the repo goes public. Until then the win-arm64 leg is covered daily
+  # by local dev (the primary dev machine is windows-arm64).
   test-arm:
     if: ${{ !github.event.repository.private }}
     name: ${{ matrix.target }}
@@ -65,10 +77,16 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@v4
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ matrix.target }}-cargo-
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
