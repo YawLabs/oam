@@ -16,6 +16,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::Once;
 
+mod cjs;
 mod modules;
 mod ops;
 mod timers;
@@ -64,6 +65,7 @@ impl JsRuntime {
             install_console(scope, context);
             timers::install(scope, context);
             ops::install(scope, context);
+            cjs::install(scope, context);
             global
         };
         Self { isolate, context }

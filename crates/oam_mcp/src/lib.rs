@@ -322,7 +322,7 @@ fn explain_code(code: &str) -> String {
         ),
         (
             "OAM-MOD0005",
-            "The package resolved to a CommonJS entry, which oam cannot execute yet — CJS interop is the next M2 slice. Dual-published packages' ESM builds (exports.import) work today.",
+            "Retired (no longer emitted): CommonJS entries execute through CJS interop since M2. If an old toolchain surfaced this code, upgrade oam and re-run.",
         ),
         (
             "OAM-MOD0006",
@@ -334,7 +334,7 @@ fn explain_code(code: &str) -> String {
         ),
         (
             "OAM-MOD0003",
-            "This module type (.cjs/.cts/.json or unknown extension) is not executable yet. CommonJS interop and JSON modules land in M2.",
+            "This module type is not executable: .cts (write ESM TypeScript instead), .json via import (import-attributes land in M2), or an unknown extension. Plain .cjs runs via CJS interop.",
         ),
         (
             "OAM-MOD0004",

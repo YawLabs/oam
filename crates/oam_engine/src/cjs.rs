@@ -1,0 +1,396 @@
+//! CommonJS interop: the bridge that makes the installed npm ecosystem run.
+//!
+//! Execution model: CJS modules are compiled with V8's CompileFunction
+//! (real line numbers, no textual wrapper) against the Node parameter list
+//! plus `global` — (exports, require, module, __filename, __dirname,
+//! global) — and executed EAGERLY: `require()` is synchronous by
+//! definition, and when the ESM graph loader hits a CJS file it executes
+//! it at load time, then reflects the ACTUAL runtime keys of
+//! `module.exports` as named exports through a generated ESM facade. ES2022
+//! arbitrary module-namespace names (`export { v as "any-string" }`) make
+//! the facade fully general — no cjs-module-lexer heuristics, no missed
+//! named exports.
+//!
+//! Documented divergences from Node:
+//! - `import` of a CJS module executes it during graph LOAD, not at
+//!   evaluation order position. Observable only via side-effect ordering
+//!   between sibling imports; require-time semantics inside the CJS world
+//!   are unchanged.
+//! - `__esModule` is honored (Bun-compatible): a transpiled-ESM CJS module
+//!   with `exports.__esModule = true` gets `exports.default` as its ESM
+//!   default import instead of the exports object. This is what the
+//!   TypeScript/Babel ecosystem expects; Node's lexer only special-cases a
+//!   subset.
+//!
+//! Cycle semantics are Node's: the module object is cached BEFORE its body
+//! runs, so a cycle sees partial exports. A module whose body throws is
+//! evicted from the cache (Node retries on the next require).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::modules::module_key;
+
+#[derive(Default)]
+pub(crate) struct CjsCache {
+    /// module-key -> the CJS `module` object ({exports, filename, id,
+    /// loaded}). The exports property is re-read on every hit so
+    /// `module.exports =` reassignment and mid-cycle partials both behave.
+    modules: HashMap<PathBuf, v8::Global<v8::Object>>,
+}
+
+/// Add the internal facade hook to the existing `__oam` object (created by
+/// ops::install — call order in JsRuntime::new matters).
+pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
+    let global = context.global(scope);
+    let internal_key = v8::String::new(scope, "__oam").unwrap();
+    let internal = global
+        .get(scope, internal_key.into())
+        .expect("__oam installed by ops::install");
+    let internal = v8::Local::<v8::Object>::try_from(internal).expect("__oam is an object");
+    let key = v8::String::new(scope, "requireCjs").unwrap();
+    let func = v8::Function::new(scope, op_require_cjs).unwrap();
+    internal.set(scope, key.into(), func.into());
+}
+
+fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let message = v8::String::new(scope, message)
+        .unwrap_or_else(|| v8::String::new(scope, "oam: error message too long").unwrap());
+    let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+/// `__oam.requireCjs(path)`: pure cache lookup used by generated ESM
+/// facades. The module was executed during graph load; a miss here is an
+/// internal invariant violation, not a user error.
+fn op_require_cjs(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = args.get(0).to_string(scope) else {
+        throw_error(scope, "oam internal: requireCjs needs a path");
+        return;
+    };
+    let key = PathBuf::from(path.to_rust_string_lossy(scope));
+    let cached = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.modules.get(&key).cloned());
+    match cached {
+        Some(module) => {
+            let module = v8::Local::new(scope, &module);
+            if let Some(exports) = module_exports(scope, module) {
+                rv.set(exports);
+            }
+        }
+        None => throw_error(
+            scope,
+            &format!(
+                "oam internal: CJS module not preloaded for facade: {}",
+                key.display()
+            ),
+        ),
+    }
+}
+
+fn module_exports<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    module: v8::Local<v8::Object>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, "exports")?;
+    module.get(scope, key.into())
+}
+
+/// The `require` implementation. Each CJS module gets its own Function
+/// instance whose `data` is the requiring file's path (zero-capture
+/// callbacks: per-module state must travel through V8, not Rust closures).
+fn require_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(specifier) = args.get(0).to_string(scope) else {
+        let message = v8::String::new(scope, "require expects a specifier string").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let specifier = specifier.to_rust_string_lossy(scope);
+    let referrer = PathBuf::from(
+        args.data()
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default(),
+    );
+
+    let path = match oam_loader::resolve_require(&specifier, &referrer) {
+        Ok(path) => path,
+        Err(failure) => {
+            // Node throws MODULE_NOT_FOUND (a runtime Error, not ODIF) —
+            // the diagnostic message carries the precise reason.
+            throw_error(scope, &failure.message);
+            return;
+        }
+    };
+    let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+    if !is_json && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Esm {
+        throw_error(
+            scope,
+            &format!(
+                "require() of ES module {} from {} is not supported yet — import it instead \
+                 (ERR_REQUIRE_ESM; synchronous require(esm) is on the M2 roadmap)",
+                path.display(),
+                referrer.display()
+            ),
+        );
+        return;
+    }
+    if let Some(exports) = load_cjs(scope, &path) {
+        rv.set(exports);
+    }
+}
+
+/// Load (or return cached) the CJS module at `path` and return its
+/// `module.exports`. `None` means a JS exception is pending — callers in
+/// callback position just return; the graph loader converts it via its
+/// TryCatch. Re-entrant: module bodies call require, which lands back here
+/// on the same stack.
+pub(crate) fn load_cjs<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    path: &Path,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = match module_key(path) {
+        Ok(key) => key,
+        Err(e) => {
+            throw_error(scope, &format!("bad module path {}: {e}", path.display()));
+            return None;
+        }
+    };
+    let file = key.to_string_lossy().into_owned();
+
+    let cached = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.modules.get(&key).cloned());
+    if let Some(module) = cached {
+        let module = v8::Local::new(scope, &module);
+        return module_exports(scope, module);
+    }
+
+    // .cts would execute as raw TypeScript here — gate it with a clear
+    // pointer until a TS-to-CJS transform exists (if ever; .ts is ESM).
+    if key.extension().and_then(|e| e.to_str()) == Some("cts") {
+        throw_error(
+            scope,
+            &format!(
+                "{file}: TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts)"
+            ),
+        );
+        return None;
+    }
+
+    let source = match std::fs::read_to_string(&key) {
+        Ok(source) => source,
+        Err(e) => {
+            throw_error(scope, &format!("cannot read {file}: {e}"));
+            return None;
+        }
+    };
+
+    // The module object, cached BEFORE execution so cycles see partials.
+    let module = v8::Object::new(scope);
+    let filename_v8 = v8::String::new(scope, &file)?;
+    for prop in ["filename", "id"] {
+        let prop_key = v8::String::new(scope, prop)?;
+        module.set(scope, prop_key.into(), filename_v8.into());
+    }
+    let loaded_key = v8::String::new(scope, "loaded")?;
+    let false_v8 = v8::Boolean::new(scope, false);
+    module.set(scope, loaded_key.into(), false_v8.into());
+
+    if key.extension().and_then(|e| e.to_str()) == Some("json") {
+        let text = v8::String::new(scope, &source)?;
+        let parsed = v8::json::parse(scope, text)?; // None: SyntaxError pending
+        let exports_key = v8::String::new(scope, "exports")?;
+        module.set(scope, exports_key.into(), parsed);
+        let global = v8::Global::new(scope, module);
+        scope
+            .get_slot_mut::<CjsCache>()
+            .expect("cjs cache installed")
+            .modules
+            .insert(key, global);
+        return Some(parsed);
+    }
+
+    let exports = v8::Object::new(scope);
+    let exports_key = v8::String::new(scope, "exports")?;
+    module.set(scope, exports_key.into(), exports.into());
+    {
+        let global = v8::Global::new(scope, module);
+        scope
+            .get_slot_mut::<CjsCache>()
+            .expect("cjs cache installed")
+            .modules
+            .insert(key.clone(), global);
+    }
+
+    // Shebang: byte-for-byte replacement keeps every offset intact.
+    let source = if let Some(rest) = source.strip_prefix("#!") {
+        format!("//{rest}")
+    } else {
+        source
+    };
+
+    let source_v8 = match v8::String::new(scope, &source) {
+        Some(source_v8) => source_v8,
+        None => {
+            evict(scope, &key);
+            throw_error(scope, &format!("{file}: source too long for V8 string"));
+            return None;
+        }
+    };
+    let name: v8::Local<v8::Value> = filename_v8.into();
+    let origin = v8::ScriptOrigin::new(
+        scope, name, 0, 0, false, 0, None, false, false, /* is_module */ false, None,
+    );
+    let mut compiler_source = v8::script_compiler::Source::new(source_v8, Some(&origin));
+    let params: Vec<v8::Local<v8::String>> = [
+        "exports",
+        "require",
+        "module",
+        "__filename",
+        "__dirname",
+        "global",
+    ]
+    .iter()
+    .map(|p| v8::String::new(scope, p).unwrap())
+    .collect();
+    let Some(wrapper) = v8::script_compiler::compile_function(
+        scope,
+        &mut compiler_source,
+        &params,
+        &[],
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
+        // Syntax error is pending; a broken module must not stay cached.
+        evict(scope, &key);
+        return None;
+    };
+
+    let require = v8::Function::builder(require_callback)
+        .data(filename_v8.into())
+        .build(scope)?;
+    let dirname = key
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dirname_v8 = v8::String::new(scope, &dirname)?;
+    let context = scope.get_current_context();
+    let global_obj = context.global(scope);
+
+    let recv: v8::Local<v8::Value> = exports.into();
+    let call_args: [v8::Local<v8::Value>; 6] = [
+        exports.into(),
+        require.into(),
+        module.into(),
+        filename_v8.into(),
+        dirname_v8.into(),
+        global_obj.into(),
+    ];
+    if wrapper.call(scope, recv, &call_args).is_none() {
+        // The body threw: exception stays pending, cache entry goes (Node
+        // re-executes on the next require).
+        evict(scope, &key);
+        return None;
+    }
+
+    let loaded_key = v8::String::new(scope, "loaded")?;
+    let true_v8 = v8::Boolean::new(scope, true);
+    module.set(scope, loaded_key.into(), true_v8.into());
+
+    // Re-read: `module.exports = ...` reassignment is the common idiom.
+    module_exports(scope, module)
+}
+
+fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
+    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.modules.remove(key);
+    }
+}
+
+/// Generate the ESM facade for an already-executed CJS module. Named
+/// exports are the exports object's own enumerable string keys — exact,
+/// because the module already ran. `default` follows __esModule (see
+/// module docs).
+pub(crate) fn facade_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    key: &Path,
+    exports: v8::Local<v8::Value>,
+) -> String {
+    let path_literal = serde_json::to_string(&key.to_string_lossy()).expect("path serializes");
+    let mut out = format!(
+        "const m = __oam.requireCjs({path_literal});\n\
+         export default (m !== null && (typeof m === \"object\" || typeof m === \"function\") \
+         && m.__esModule) ? m[\"default\"] : m;\n"
+    );
+
+    let Ok(exports_obj) = v8::Local::<v8::Object>::try_from(exports) else {
+        return out; // primitive module.exports: default-only facade
+    };
+    let names = exports_obj.get_own_property_names(
+        scope,
+        v8::GetPropertyNamesArgsBuilder::new()
+            .mode(v8::KeyCollectionMode::OwnOnly)
+            .property_filter(v8::PropertyFilter::ONLY_ENUMERABLE | v8::PropertyFilter::SKIP_SYMBOLS)
+            .key_conversion(v8::KeyConversionMode::ConvertToString)
+            .build(),
+    );
+    let Some(names) = names else { return out };
+
+    for i in 0..names.length() {
+        let Some(name) = names.get_index(scope, i) else {
+            continue;
+        };
+        let Some(name) = name.to_string(scope) else {
+            continue;
+        };
+        let name = name.to_rust_string_lossy(scope);
+        if name == "default" || name == "__esModule" {
+            continue;
+        }
+        let literal = serde_json::to_string(&name).expect("key serializes");
+        // ES2022 arbitrary module namespace names: any key string is a
+        // legal export name when spelled as a string literal.
+        out.push_str(&format!(
+            "const $cjs{i} = m[{literal}]; export {{ $cjs{i} as {literal} }};\n"
+        ));
+    }
+    out
+}
+
+/// Run a CJS entry file as the program: execute it, then pump the event
+/// loop (timers/ops keep the process alive, Node semantics) and fail on
+/// unhandled rejections, exactly like the ESM path.
+impl crate::JsRuntime {
+    pub fn execute_cjs(&mut self, entry: &Path) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
+        self.reset_run_slots()?;
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+
+        if load_cjs(tc, entry).is_none() {
+            return Err(vec![crate::modules::catch_to_diagnostic(
+                tc,
+                &entry.to_string_lossy(),
+            )]);
+        }
+        tc.perform_microtask_checkpoint();
+        if let Some(failure) = crate::modules::drain_uncaught(tc) {
+            return Err(failure);
+        }
+        crate::modules::pump_event_loop(tc, None)?;
+        match crate::modules::unhandled_rejection_failures(tc) {
+            Some(failures) => Err(failures),
+            None => Ok(()),
+        }
+    }
+}

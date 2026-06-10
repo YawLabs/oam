@@ -10,6 +10,10 @@ v8 = { workspace = true }
 anyhow = { workspace = true }
 oam_diagnostics = { workspace = true }
 oam_core = { workspace = true }
+# CJS interop: require() resolution + module-kind classification (v8-free).
+oam_loader = { workspace = true }
+# Facade generation JSON-escapes paths/export names.
+serde_json = { workspace = true }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

@@ -307,8 +307,9 @@ impl oam_engine::ModuleHost for CliHost {
         }
 
         // Anything we'd silently mis-execute gets a clear diagnostic instead:
-        // .cjs/.cts would run as ESM and die on a bare 'require is not
-        // defined'; .json would parse as JS and die on 'Unexpected token'.
+        // .json would parse as JS and die on 'Unexpected token'. CJS files
+        // never reach this host — the engine routes them through interop
+        // before load — so a .cjs/.cts here is an engine routing bug.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
             "js" | "mjs" | "ts" | "mts" => {}
@@ -318,7 +319,7 @@ impl oam_engine::ModuleHost for CliHost {
                     Severity::Error,
                     Origin::Resolve,
                     format!(
-                        "CommonJS modules (.cjs/.cts) land with npm/CJS interop (M2): {}",
+                        "internal: CommonJS file reached the ESM loader (oam bug — please report): {}",
                         path.display()
                     ),
                 )]);
@@ -366,6 +367,24 @@ impl oam_engine::ModuleHost for CliHost {
 }
 
 fn run_file(file: &Path) -> Result<(), Vec<Diagnostic>> {
+    if file.extension().and_then(|e| e.to_str()) == Some("cts") {
+        return Err(vec![Diagnostic::new(
+            "OAM-MOD0003",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts): {}",
+                file.display()
+            ),
+        )]);
+    }
     let mut rt = oam_engine::JsRuntime::new();
+    // Entry routing follows module kind: .cjs (or "type": "commonjs"
+    // project .js) runs as a CJS program through interop; everything else
+    // is the ESM graph. See oam_loader::module_kind for the typeless
+    // default divergence.
+    if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
+        return rt.execute_cjs(file);
+    }
     rt.execute_module(file, &CliHost)
 }

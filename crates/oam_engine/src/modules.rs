@@ -84,7 +84,7 @@ pub(crate) unsafe extern "C" fn message_listener(
 
 /// Take any uncaught-exception reports and convert them to a failing
 /// diagnostic set. Called after every microtask drain in the event loop.
-fn drain_uncaught(
+pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
     let reports: Vec<String> = tc
@@ -124,7 +124,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
-fn module_key(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn module_key(path: &Path) -> std::io::Result<PathBuf> {
     Ok(normalize_lexically(&std::path::absolute(path)?))
 }
 
@@ -138,6 +138,25 @@ fn rt_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
 }
 
 impl JsRuntime {
+    /// Reset all per-run isolate slots. Shared by the ESM and CJS entry
+    /// paths.
+    pub(crate) fn reset_run_slots(&mut self) -> Result<(), Vec<Diagnostic>> {
+        self.isolate.set_slot(ModuleMap::default());
+        self.isolate.set_slot(RejectionLedger::default());
+        self.isolate.set_slot(UncaughtLedger::default());
+        self.isolate.set_slot(crate::timers::TimerQueue::default());
+        self.isolate.set_slot(crate::cjs::CjsCache::default());
+        // Fresh CoreRuntime per run: dropping the old one cancels any ops a
+        // previous execute_module left in flight; PendingOps resolvers from
+        // that run die with it.
+        self.isolate.set_slot(
+            oam_core::CoreRuntime::new()
+                .map_err(|e| rt_diag("OAM-RT0002", format!("io runtime failed to start: {e}")))?,
+        );
+        self.isolate.set_slot(crate::ops::PendingOps::default());
+        Ok(())
+    }
+
     /// Load, instantiate, and evaluate the ES module graph rooted at `entry`.
     pub fn execute_module(
         &mut self,
@@ -150,18 +169,7 @@ impl JsRuntime {
                 format!("bad entry path {}: {e}", entry.display()),
             )
         })?;
-        self.isolate.set_slot(ModuleMap::default());
-        self.isolate.set_slot(RejectionLedger::default());
-        self.isolate.set_slot(UncaughtLedger::default());
-        self.isolate.set_slot(crate::timers::TimerQueue::default());
-        // Fresh CoreRuntime per run: dropping the old one cancels any ops a
-        // previous execute_module left in flight; PendingOps resolvers from
-        // that run die with it.
-        self.isolate.set_slot(
-            oam_core::CoreRuntime::new()
-                .map_err(|e| rt_diag("OAM-RT0002", format!("io runtime failed to start: {e}")))?,
-        );
-        self.isolate.set_slot(crate::ops::PendingOps::default());
+        self.reset_run_slots()?;
 
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
@@ -188,114 +196,13 @@ impl JsRuntime {
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
 
-        // M1 blocking event loop. Each turn services at most ONE due timer
-        // (so a clear issued by one callback cancels same-instant siblings)
-        // AND THEN one ready op completion — never timer-only: a
-        // continuously-due interval must not starve IO settlement (review
-        // blocker; Node's phase model services poll after timers no matter
-        // how busy timers are). Microtask drain after each, so dependent
-        // code runs at the earliest correct moment. When idle, block on the
-        // op channel with the next timer deadline as timeout (one blocking
-        // point, no busy-wait). Exit when nothing remains; process stays
-        // alive for pending timers/ops after the entry module fulfills —
-        // Node semantics. Entry rejection breaks early.
-        loop {
-            if promise.state() == v8::PromiseState::Rejected {
-                break;
-            }
-            let mut progressed = false;
-
-            let now = std::time::Instant::now();
-            let due = tc
-                .get_slot_mut::<crate::timers::TimerQueue>()
-                .and_then(|queue| queue.pop_due(now));
-            if let Some((callback, extra)) = due {
-                let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
-                let callback = v8::Local::new(tc, &callback);
-                let args: Vec<v8::Local<v8::Value>> =
-                    extra.iter().map(|g| v8::Local::new(tc, g)).collect();
-                if callback.call(tc, recv, &args).is_none() {
-                    return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
-                }
-                tc.perform_microtask_checkpoint();
-                if let Some(failure) = drain_uncaught(tc) {
-                    return Err(failure);
-                }
-                progressed = true;
-            }
-
-            if let Some(completion) = tc
-                .get_slot_mut::<oam_core::CoreRuntime>()
-                .and_then(|core| core.try_recv())
-            {
-                crate::ops::settle_completion(tc, completion);
-                tc.perform_microtask_checkpoint();
-                if let Some(failure) = drain_uncaught(tc) {
-                    return Err(failure);
-                }
-                progressed = true;
-            }
-            if progressed {
-                continue;
-            }
-
-            let next_deadline = tc
-                .get_slot_mut::<crate::timers::TimerQueue>()
-                .and_then(|queue| queue.next_deadline());
-            let has_inflight = tc
-                .get_slot::<oam_core::CoreRuntime>()
-                .is_some_and(|core| core.has_inflight());
-            match (next_deadline, has_inflight) {
-                (None, false) => break,
-                (deadline, true) => {
-                    let completion = tc
-                        .get_slot_mut::<oam_core::CoreRuntime>()
-                        .and_then(|core| core.recv_deadline(deadline));
-                    if let Some(completion) = completion {
-                        crate::ops::settle_completion(tc, completion);
-                        tc.perform_microtask_checkpoint();
-                        if let Some(failure) = drain_uncaught(tc) {
-                            return Err(failure);
-                        }
-                    }
-                }
-                (Some(deadline), false) => {
-                    let now = std::time::Instant::now();
-                    if deadline > now {
-                        std::thread::sleep(deadline - now);
-                    }
-                }
-            }
-        }
+        pump_event_loop(tc, Some(promise))?;
 
         match promise.state() {
-            v8::PromiseState::Fulfilled => {
-                let unhandled: Vec<String> = tc
-                    .get_slot_mut::<RejectionLedger>()
-                    .map(|ledger| {
-                        ledger
-                            .unhandled
-                            .drain(..)
-                            .map(|(_, message)| message)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if unhandled.is_empty() {
-                    Ok(())
-                } else {
-                    Err(unhandled
-                        .into_iter()
-                        .map(|message| {
-                            Diagnostic::new(
-                                "OAM-RT0004",
-                                Severity::Error,
-                                Origin::Runtime,
-                                format!("unhandled promise rejection: {message}"),
-                            )
-                        })
-                        .collect())
-                }
-            }
+            v8::PromiseState::Fulfilled => match unhandled_rejection_failures(tc) {
+                Some(failures) => Err(failures),
+                None => Ok(()),
+            },
             v8::PromiseState::Rejected => {
                 let exception = promise.result(tc);
                 let text = exception
@@ -315,15 +222,136 @@ impl JsRuntime {
     }
 }
 
+/// The blocking event loop, shared by ESM and CJS entry paths. Each turn
+/// services at most ONE due timer (so a clear issued by one callback
+/// cancels same-instant siblings) AND THEN one ready op completion — never
+/// timer-only: a continuously-due interval must not starve IO settlement
+/// (review blocker; Node's phase model services poll after timers no
+/// matter how busy timers are). Microtask drain after each, so dependent
+/// code runs at the earliest correct moment. When idle, block on the op
+/// channel with the next timer deadline as timeout (one blocking point, no
+/// busy-wait). Exit when nothing remains; the process stays alive for
+/// pending timers/ops after the entry settles — Node semantics. A rejected
+/// entry promise breaks early (the caller reports it).
+pub(crate) fn pump_event_loop(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    entry_promise: Option<v8::Local<'_, v8::Promise>>,
+) -> Result<(), Vec<Diagnostic>> {
+    loop {
+        if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
+            break;
+        }
+        let mut progressed = false;
+
+        let now = std::time::Instant::now();
+        let due = tc
+            .get_slot_mut::<crate::timers::TimerQueue>()
+            .and_then(|queue| queue.pop_due(now));
+        if let Some((callback, extra)) = due {
+            let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+            let callback = v8::Local::new(tc, &callback);
+            let args: Vec<v8::Local<v8::Value>> =
+                extra.iter().map(|g| v8::Local::new(tc, g)).collect();
+            if callback.call(tc, recv, &args).is_none() {
+                return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
+            }
+            tc.perform_microtask_checkpoint();
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            progressed = true;
+        }
+
+        if let Some(completion) = tc
+            .get_slot_mut::<oam_core::CoreRuntime>()
+            .and_then(|core| core.try_recv())
+        {
+            crate::ops::settle_completion(tc, completion);
+            tc.perform_microtask_checkpoint();
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            progressed = true;
+        }
+        if progressed {
+            continue;
+        }
+
+        let next_deadline = tc
+            .get_slot_mut::<crate::timers::TimerQueue>()
+            .and_then(|queue| queue.next_deadline());
+        let has_inflight = tc
+            .get_slot::<oam_core::CoreRuntime>()
+            .is_some_and(|core| core.has_inflight());
+        match (next_deadline, has_inflight) {
+            (None, false) => break,
+            (deadline, true) => {
+                let completion = tc
+                    .get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.recv_deadline(deadline));
+                if let Some(completion) = completion {
+                    crate::ops::settle_completion(tc, completion);
+                    tc.perform_microtask_checkpoint();
+                    if let Some(failure) = drain_uncaught(tc) {
+                        return Err(failure);
+                    }
+                }
+            }
+            (Some(deadline), false) => {
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drain the RejectionLedger into OAM-RT0004 failures (None = clean run).
+pub(crate) fn unhandled_rejection_failures(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<Vec<Diagnostic>> {
+    let unhandled: Vec<String> = tc
+        .get_slot_mut::<RejectionLedger>()
+        .map(|ledger| {
+            ledger
+                .unhandled
+                .drain(..)
+                .map(|(_, message)| message)
+                .collect()
+        })
+        .unwrap_or_default();
+    if unhandled.is_empty() {
+        return None;
+    }
+    Some(
+        unhandled
+            .into_iter()
+            .map(|message| {
+                Diagnostic::new(
+                    "OAM-RT0004",
+                    Severity::Error,
+                    Origin::Runtime,
+                    format!("unhandled promise rejection: {message}"),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Compile the module graph into the isolate's ModuleMap. Explicit worklist —
 /// recursion would overflow the stack on deep (generated-code) import chains.
+/// Discovery is breadth-first in import-declaration order (FIFO): CJS
+/// modules execute eagerly at load, so discovery order is their observable
+/// side-effect order — declaration order is what Node-shaped code expects.
 fn load_module_graph(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     host: &dyn ModuleHost,
     entry: PathBuf,
 ) -> Result<(), Vec<Diagnostic>> {
-    let mut work = vec![entry];
-    while let Some(path) = work.pop() {
+    let mut work = std::collections::VecDeque::from([entry]);
+    while let Some(path) = work.pop_front() {
         if tc
             .get_slot::<ModuleMap>()
             .expect("module map installed")
@@ -333,7 +361,22 @@ fn load_module_graph(
             continue;
         }
 
-        let code = host.load(&path)?;
+        // CJS files take the interop path: execute eagerly through the
+        // require machinery, then compile a generated ESM facade (real
+        // runtime export names) as the module at this path. JSON files
+        // ride the same branch when they arrive via npm resolution.
+        let code = if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
+            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
+                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+            };
+            tc.perform_microtask_checkpoint();
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            crate::cjs::facade_source(tc, &path, exports)
+        } else {
+            host.load(&path)?
+        };
         let file = path.to_string_lossy().into_owned();
 
         let source_str = v8::String::new(tc, &code).ok_or_else(|| {
@@ -384,7 +427,7 @@ fn load_module_graph(
                 .expect("module map installed")
                 .edges
                 .insert((path.clone(), specifier), resolved.clone());
-            work.push(resolved);
+            work.push_back(resolved);
         }
     }
     Ok(())
@@ -484,7 +527,7 @@ pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseReje
     }
 }
 
-fn catch_to_diagnostic(
+pub(crate) fn catch_to_diagnostic(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     name: &str,
 ) -> Diagnostic {

@@ -22,6 +22,7 @@ use oxc_allocator::Allocator;
 
 mod npm;
 mod tsconfig;
+pub use npm::{ModuleKind, module_kind, resolve_require};
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -152,14 +153,16 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
                 }
             }
         }
-        return npm::resolve_bare(specifier, referrer).map_err(|mut failure| {
-            if consulted_paths && failure.code == "OAM-MOD0002" {
+        return npm::resolve_bare(specifier, referrer, npm::ResolveMode::Import).map_err(
+            |mut failure| {
+                if consulted_paths && failure.code == "OAM-MOD0002" {
+                    failure
+                        .message
+                        .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
+                }
                 failure
-                    .message
-                    .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
-            }
-            failure
-        });
+            },
+        );
     }
 
     let raw = if is_relative {

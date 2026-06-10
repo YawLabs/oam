@@ -8,22 +8,56 @@
 //! ["node", "import", "default"], arrays as fallback chains, null as an
 //! explicit block) and otherwise the legacy main/index rules.
 //!
-//! Documented divergence: for legacy entry resolution we honor the
-//! bundler-standard "module" field before "main" — Node ignores it, but it
-//! is the difference between running a large class of dual-published ESM
-//! packages today versus gating them on CJS interop. Revisit when CJS
-//! interop lands.
+//! Documented divergence: for legacy IMPORT entry resolution we honor the
+//! bundler-standard "module" field before "main" — Node ignores it, but a
+//! large class of dual-published packages gets the better (ESM) build that
+//! way. `require()` resolution uses "main" only, exactly like Node: CJS
+//! callers expect the CJS build.
 //!
-//! Execution gates (precise diagnostics, never silent): resolved CJS
-//! entries -> OAM-MOD0005 (interop is the next slice); node builtins
+//! Execution gates (precise diagnostics, never silent): node builtins
 //! (prefixed or bare) -> OAM-MOD0006 (compat wave 1); exports-blocked
 //! subpaths -> OAM-MOD0007 (Node's ERR_PACKAGE_PATH_NOT_EXPORTED).
+//! Resolved CJS files are no longer gated (OAM-MOD0005 retired) — the
+//! engine routes them through CJS interop.
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-const CONDITIONS: [&str; 3] = ["node", "import", "default"];
+/// How a resolution request reached us. Import = ESM `import` statements;
+/// Require = `require()` calls inside CJS modules. They differ in exports
+/// conditions, legacy entry fields, and extension probing — parameterized
+/// here so the walk and the exports algorithm stay single-sourced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveMode {
+    Import,
+    Require,
+}
+
+impl ResolveMode {
+    fn conditions(self) -> &'static [&'static str] {
+        match self {
+            ResolveMode::Import => &["node", "import", "default"],
+            ResolveMode::Require => &["node", "require", "default"],
+        }
+    }
+
+    /// Legacy entry fields, in precedence order (see module docs for the
+    /// "module"-field divergence on the import side).
+    fn entry_fields(self) -> &'static [&'static str] {
+        match self {
+            ResolveMode::Import => &["module", "main"],
+            ResolveMode::Require => &["main"],
+        }
+    }
+
+    fn probe(self, raw: &Path) -> Option<PathBuf> {
+        match self {
+            ResolveMode::Import => probe_legacy(raw),
+            ResolveMode::Require => probe_require(raw),
+        }
+    }
+}
 
 /// Node builtin module names (bare or node:-prefixed) as of Node 26.
 const NODE_BUILTINS: [&str; 41] = [
@@ -81,7 +115,11 @@ pub(crate) fn is_node_builtin(specifier: &str) -> bool {
 }
 
 /// Resolve a bare specifier from `referrer` against node_modules.
-pub(crate) fn resolve_bare(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+pub(crate) fn resolve_bare(
+    specifier: &str,
+    referrer: &Path,
+    mode: ResolveMode,
+) -> Result<PathBuf, Diagnostic> {
     if specifier.starts_with("node:") || is_node_builtin(specifier) {
         return Err(diag(
             "OAM-MOD0006",
@@ -103,7 +141,7 @@ pub(crate) fn resolve_bare(specifier: &str, referrer: &Path) -> Result<PathBuf, 
         if package_dir.is_dir() {
             // Node stops at the first matching package directory: failures
             // inside it are real errors, not reasons to keep walking.
-            return resolve_in_package(&package_dir, &package, &subpath, specifier);
+            return resolve_in_package(&package_dir, &package, &subpath, specifier, mode);
         }
         searched += 1;
         dir = current.parent().map(Path::to_path_buf);
@@ -117,6 +155,40 @@ pub(crate) fn resolve_bare(specifier: &str, referrer: &Path) -> Result<PathBuf, 
             referrer.display()
         ),
     ))
+}
+
+/// Resolve a `require()` specifier from the CJS module at `referrer`.
+/// Covers the whole require surface: relative/absolute paths with Node's
+/// CJS probing (exact, .js, .json, directory main/index), and bare
+/// specifiers via the node_modules walk under require conditions. The
+/// engine converts the Diagnostic's message into the thrown JS Error.
+pub fn resolve_require(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+    if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
+        let base = referrer.parent().unwrap_or_else(|| Path::new("."));
+        let raw = base.join(specifier);
+        return probe_require(&raw).ok_or_else(|| {
+            diag(
+                "OAM-MOD0001",
+                format!(
+                    "Cannot find module '{specifier}' required from {}",
+                    referrer.display()
+                ),
+            )
+        });
+    }
+    if Path::new(specifier).is_absolute() {
+        let raw = PathBuf::from(specifier);
+        return probe_require(&raw).ok_or_else(|| {
+            diag(
+                "OAM-MOD0001",
+                format!(
+                    "Cannot find module '{specifier}' required from {}",
+                    referrer.display()
+                ),
+            )
+        });
+    }
+    resolve_bare(specifier, referrer, ResolveMode::Require)
 }
 
 /// "pkg" / "pkg/sub" / "@scope/pkg" / "@scope/pkg/sub" -> (name, "." or "./sub")
@@ -149,6 +221,7 @@ fn resolve_in_package(
     package: &str,
     subpath: &str,
     specifier: &str,
+    mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
     let manifest_path = package_dir.join("package.json");
     let manifest: Value = std::fs::read_to_string(&manifest_path)
@@ -157,19 +230,22 @@ fn resolve_in_package(
         .unwrap_or(Value::Null);
 
     let resolved = if let Some(exports) = manifest.get("exports") {
-        let target = exports_resolve(exports, subpath).map_err(|reason| match reason {
-            ExportsError::NotExported => diag(
-                "OAM-MOD0007",
-                format!(
-                    "subpath '{subpath}' is not exported by {package} \
+        let target =
+            exports_resolve(exports, subpath, mode.conditions()).map_err(
+                |reason| match reason {
+                    ExportsError::NotExported => diag(
+                        "OAM-MOD0007",
+                        format!(
+                            "subpath '{subpath}' is not exported by {package} \
                      (its exports map does not allow it)"
-                ),
-            ),
-            ExportsError::InvalidTarget(target) => diag(
-                "OAM-MOD0002",
-                format!("package {package} has an invalid exports target '{target}'"),
-            ),
-        })?;
+                        ),
+                    ),
+                    ExportsError::InvalidTarget(target) => diag(
+                        "OAM-MOD0002",
+                        format!("package {package} has an invalid exports target '{target}'"),
+                    ),
+                },
+            )?;
         let path = package_dir.join(target.trim_start_matches("./"));
         if !path.is_file() {
             return Err(diag(
@@ -184,20 +260,21 @@ fn resolve_in_package(
     } else if subpath != "." {
         // No exports map: subpaths hit the filesystem with legacy probing.
         let raw = package_dir.join(subpath.trim_start_matches("./"));
-        probe_legacy(&raw).ok_or_else(|| {
+        mode.probe(&raw).ok_or_else(|| {
             diag(
                 "OAM-MOD0002",
                 format!("cannot resolve '{specifier}': no file at {}", raw.display()),
             )
         })?
     } else {
-        // Legacy entry: module (bundler-standard, see module docs) > main > index.js.
-        let entry = ["module", "main"]
+        // Legacy entry (per mode — see module docs) falling back to index.js.
+        let entry = mode
+            .entry_fields()
             .iter()
             .find_map(|field| manifest.get(*field).and_then(Value::as_str))
             .unwrap_or("index.js");
         let raw = package_dir.join(entry);
-        probe_legacy(&raw).ok_or_else(|| {
+        mode.probe(&raw).ok_or_else(|| {
             diag(
                 "OAM-MOD0002",
                 format!(
@@ -207,22 +284,10 @@ fn resolve_in_package(
             )
         })?
     };
-
-    // Execution gate: ESM only until CJS interop lands.
-    if is_cjs(&resolved, package_dir, &manifest) {
-        return Err(diag(
-            "OAM-MOD0005",
-            format!(
-                "package {package} resolved to a CommonJS entry ({}); CJS interop is the next \
-                 M2 slice — ESM builds of dual-published packages work today",
-                resolved.display()
-            ),
-        ));
-    }
     Ok(resolved)
 }
 
-/// Legacy probing: exact, +.js, /index.js.
+/// Legacy probing (import side): exact, +.js, /index.js.
 fn probe_legacy(raw: &Path) -> Option<PathBuf> {
     if raw.is_file() {
         return Some(raw.to_path_buf());
@@ -235,38 +300,120 @@ fn probe_legacy(raw: &Path) -> Option<PathBuf> {
     index.is_file().then_some(index)
 }
 
-/// .mjs is ESM, .cjs is CJS, .js asks the nearest package.json "type"
-/// between the file and the package root (nested package.json files
-/// override, per Node).
-fn is_cjs(file: &Path, package_dir: &Path, root_manifest: &Value) -> bool {
-    match file.extension().and_then(|e| e.to_str()) {
-        Some("mjs") => return false,
-        Some("cjs") => return true,
+/// Node's CJS LOAD_AS_FILE + LOAD_AS_DIRECTORY: exact, +.js, +.json, then
+/// directory (package.json "main" probed as a file/index, index.js,
+/// index.json). `.node` addons are N-API territory (later milestone).
+fn probe_require(raw: &Path) -> Option<PathBuf> {
+    fn as_file(raw: &Path) -> Option<PathBuf> {
+        if raw.is_file() {
+            return Some(raw.to_path_buf());
+        }
+        for ext in ["js", "json"] {
+            let candidate = PathBuf::from(format!("{}.{ext}", raw.display()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+    fn as_index(dir: &Path) -> Option<PathBuf> {
+        for index in ["index.js", "index.json"] {
+            let candidate = dir.join(index);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    if let Some(found) = as_file(raw) {
+        return Some(found);
+    }
+    if raw.is_dir() {
+        let main = std::fs::read_to_string(raw.join("package.json"))
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
+            })
+            .and_then(|manifest| {
+                manifest
+                    .get("main")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if let Some(main) = main {
+            let target = raw.join(main);
+            if let Some(found) = as_file(&target).or_else(|| as_index(&target)) {
+                return Some(found);
+            }
+        }
+        return as_index(raw);
+    }
+    None
+}
+
+/// Is the file at `path` an ES module or CommonJS?
+///
+/// Extensions are authoritative: .mjs/.mts/.ts/.tsx are ESM, .cjs/.cts are
+/// CJS (TypeScript is always ESM in oam unless explicitly .cts). For
+/// .js/.jsx the nearest package.json "type" decides, walking up and
+/// stopping at a node_modules boundary, per Node.
+///
+/// Documented divergence on the MISSING-"type" default: inside
+/// node_modules it is CJS (Node-exact — typeless packages ship CJS), but
+/// for project files it is ESM. `npm init -y` writes no "type" field, and
+/// punishing modern project code with require semantics for that is the
+/// wrong default in 2026. Write .cjs (or "type": "commonjs") to opt
+/// project files into CJS.
+pub fn module_kind(path: &Path) -> ModuleKind {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mjs" | "mts" | "ts" | "tsx") => return ModuleKind::Esm,
+        Some("cjs" | "cts") => return ModuleKind::Cjs,
         _ => {}
     }
-    let mut dir = file.parent();
+    let in_node_modules = path.components().any(|c| c.as_os_str() == "node_modules");
+    let untyped_default = if in_node_modules {
+        ModuleKind::Cjs
+    } else {
+        ModuleKind::Esm
+    };
+
+    let mut dir = path.parent();
     while let Some(current) = dir {
         let manifest_path = current.join("package.json");
         if manifest_path.is_file() {
-            let manifest: Option<Value> = std::fs::read_to_string(&manifest_path)
+            let declared = std::fs::read_to_string(&manifest_path)
                 .ok()
-                .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok());
-            if let Some(manifest) = manifest
-                && let Some(kind) = manifest.get("type").and_then(Value::as_str)
-            {
-                return kind != "module";
-            }
-            // package.json without "type": CJS default — unless this is the
-            // root manifest we already inspected (fall through consistent).
-            return root_manifest.get("type").and_then(Value::as_str) != Some("module")
-                || current != package_dir;
+                .and_then(|text| {
+                    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
+                })
+                .and_then(|manifest| {
+                    manifest
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            return match declared.as_deref() {
+                Some("module") => ModuleKind::Esm,
+                Some(_) => ModuleKind::Cjs,
+                None => untyped_default,
+            };
         }
-        if current == package_dir {
+        if current
+            .file_name()
+            .is_some_and(|name| name == "node_modules")
+        {
             break;
         }
         dir = current.parent();
     }
-    root_manifest.get("type").and_then(Value::as_str) != Some("module")
+    untyped_default
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleKind {
+    Esm,
+    Cjs,
 }
 
 enum ExportsError {
@@ -277,7 +424,11 @@ enum ExportsError {
 /// PACKAGE_EXPORTS_RESOLVE, the subset that matters: exact subpaths,
 /// single-* wildcards (longest-prefix wins), condition objects in
 /// declaration order, arrays as fallbacks, null blocks.
-fn exports_resolve(exports: &Value, subpath: &str) -> Result<String, ExportsError> {
+fn exports_resolve(
+    exports: &Value,
+    subpath: &str,
+    conditions: &[&str],
+) -> Result<String, ExportsError> {
     // Sugar: a top-level string/array/conditions-object is the "." entry.
     let as_map = match exports {
         Value::Object(map) if map.keys().any(|k| k.starts_with('.')) => Some(map),
@@ -285,13 +436,13 @@ fn exports_resolve(exports: &Value, subpath: &str) -> Result<String, ExportsErro
     };
     let Some(map) = as_map else {
         if subpath == "." {
-            return resolve_target(exports, "");
+            return resolve_target(exports, "", conditions);
         }
         return Err(ExportsError::NotExported);
     };
 
     if let Some(value) = map.get(subpath) {
-        return resolve_target(value, "");
+        return resolve_target(value, "", conditions);
     }
 
     // Wildcards: one '*' per key; the longest static prefix wins.
@@ -310,12 +461,16 @@ fn exports_resolve(exports: &Value, subpath: &str) -> Result<String, ExportsErro
         }
     }
     match best {
-        Some((_, value, matched)) => resolve_target(value, &matched),
+        Some((_, value, matched)) => resolve_target(value, &matched, conditions),
         None => Err(ExportsError::NotExported),
     }
 }
 
-fn resolve_target(target: &Value, matched: &str) -> Result<String, ExportsError> {
+fn resolve_target(
+    target: &Value,
+    matched: &str,
+    conditions: &[&str],
+) -> Result<String, ExportsError> {
     match target {
         Value::String(s) => {
             let substituted = s.replace('*', matched);
@@ -325,17 +480,17 @@ fn resolve_target(target: &Value, matched: &str) -> Result<String, ExportsError>
                 Err(ExportsError::InvalidTarget(substituted))
             }
         }
-        Value::Object(conditions) => {
-            for (condition, value) in conditions {
-                if condition == "default" || CONDITIONS.contains(&condition.as_str()) {
-                    return resolve_target(value, matched);
+        Value::Object(branches) => {
+            for (condition, value) in branches {
+                if condition == "default" || conditions.contains(&condition.as_str()) {
+                    return resolve_target(value, matched, conditions);
                 }
             }
             Err(ExportsError::NotExported)
         }
         Value::Array(options) => {
             for option in options {
-                if let Ok(resolved) = resolve_target(option, matched) {
+                if let Ok(resolved) = resolve_target(option, matched, conditions) {
                     return Ok(resolved);
                 }
             }
@@ -380,16 +535,27 @@ mod tests {
         assert!(!is_node_builtin("lodash"));
     }
 
+    const IMPORT: &[&str] = &["node", "import", "default"];
+    const REQUIRE: &[&str] = &["node", "require", "default"];
+
     #[test]
     fn exports_sugar_and_conditions() {
         let exports = json!({ "import": "./esm.js", "require": "./cjs.cjs" });
-        assert_eq!(exports_resolve(&exports, ".").ok().unwrap(), "./esm.js");
+        assert_eq!(
+            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
+            "./esm.js"
+        );
+        // The same map under require conditions picks the CJS build.
+        assert_eq!(
+            exports_resolve(&exports, ".", REQUIRE).ok().unwrap(),
+            "./cjs.cjs"
+        );
         let string_sugar = json!("./main.js");
         assert_eq!(
-            exports_resolve(&string_sugar, ".").ok().unwrap(),
+            exports_resolve(&string_sugar, ".", IMPORT).ok().unwrap(),
             "./main.js"
         );
-        assert!(exports_resolve(&string_sugar, "./sub").is_err());
+        assert!(exports_resolve(&string_sugar, "./sub", IMPORT).is_err());
     }
 
     #[test]
@@ -401,26 +567,33 @@ mod tests {
             "./features/deep/*": "./src/deep/*.js",
             "./blocked": null,
         });
-        assert_eq!(exports_resolve(&exports, ".").ok().unwrap(), "./index.js");
         assert_eq!(
-            exports_resolve(&exports, "./extra").ok().unwrap(),
+            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
+            "./index.js"
+        );
+        assert_eq!(
+            exports_resolve(&exports, "./extra", IMPORT).ok().unwrap(),
             "./lib/extra.js"
         );
         assert_eq!(
-            exports_resolve(&exports, "./features/x").ok().unwrap(),
+            exports_resolve(&exports, "./features/x", IMPORT)
+                .ok()
+                .unwrap(),
             "./src/features/x.js"
         );
         // Longest static prefix wins.
         assert_eq!(
-            exports_resolve(&exports, "./features/deep/y").ok().unwrap(),
+            exports_resolve(&exports, "./features/deep/y", IMPORT)
+                .ok()
+                .unwrap(),
             "./src/deep/y.js"
         );
         assert!(matches!(
-            exports_resolve(&exports, "./blocked"),
+            exports_resolve(&exports, "./blocked", IMPORT),
             Err(ExportsError::NotExported)
         ));
         assert!(matches!(
-            exports_resolve(&exports, "./secret"),
+            exports_resolve(&exports, "./secret", IMPORT),
             Err(ExportsError::NotExported)
         ));
     }
@@ -429,13 +602,22 @@ mod tests {
     fn exports_arrays_fall_back_and_bad_targets_error() {
         let exports = json!({ ".": [{ "browser": "./b.js" }, "./fallback.js"] });
         assert_eq!(
-            exports_resolve(&exports, ".").ok().unwrap(),
+            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
             "./fallback.js"
         );
         let escape = json!({ ".": "../escape.js" });
         assert!(matches!(
-            exports_resolve(&escape, "."),
+            exports_resolve(&escape, ".", IMPORT),
             Err(ExportsError::InvalidTarget(_))
         ));
+    }
+
+    #[test]
+    fn module_kind_extensions_are_authoritative() {
+        assert_eq!(module_kind(Path::new("x.ts")), ModuleKind::Esm);
+        assert_eq!(module_kind(Path::new("x.mts")), ModuleKind::Esm);
+        assert_eq!(module_kind(Path::new("x.mjs")), ModuleKind::Esm);
+        assert_eq!(module_kind(Path::new("x.cjs")), ModuleKind::Cjs);
+        assert_eq!(module_kind(Path::new("x.cts")), ModuleKind::Cjs);
     }
 }

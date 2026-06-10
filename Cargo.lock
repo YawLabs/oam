@@ -1132,6 +1132,8 @@ dependencies = [
  "anyhow",
  "oam_core",
  "oam_diagnostics",
+ "oam_loader",
+ "serde_json",
  "v8",
 ]
 

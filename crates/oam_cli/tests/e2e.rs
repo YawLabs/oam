@@ -294,19 +294,338 @@ fn npm_resolution_runs_esm_packages() {
 }
 
 #[test]
-fn npm_cjs_entry_is_gated_with_mod0005() {
+fn npm_cjs_only_package_runs_via_interop() {
+    // MOD0005 (the CJS execution gate) is retired: this exact import shape
+    // was the gated case before interop landed.
     let proj = write_npm_fixtures();
-    std::fs::write(proj.join("cjs_main.ts"), "import 'cjs-only';").unwrap();
+    std::fs::write(
+        proj.join("cjs_main.ts"),
+        "import pkg from 'cjs-only';\nconsole.log('interop', pkg.nope);",
+    )
+    .unwrap();
     let out = oam(&[
         "run",
         proj.join("cjs_main.ts").to_str().unwrap(),
-        "--json",
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "interop true");
+}
+
+/// A second hand-written node_modules tree for the CJS interop matrix:
+/// require chains, JSON requires, exports-dot style, the cache, cycles,
+/// callable defaults, __esModule unwrapping, arbitrary export names, and
+/// the require-condition side of a dual package.
+fn write_cjs_fixtures() -> PathBuf {
+    write_temp(
+        "cjsproj/node_modules/classic/package.json",
+        "{\"name\": \"classic\", \"main\": \"lib/index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/classic/lib/index.js",
+        "const { helper } = require('./helper');\n\
+         const meta = require('../package.json');\n\
+         const dep = require('depcjs');\n\
+         exports.kind = 'classic';\n\
+         exports.helped = helper();\n\
+         exports.depName = dep.name;\n\
+         exports.metaName = meta.name;\n\
+         module.exports.dotAndModule = 'aliased';\n\
+         exports.hasDirname = typeof __dirname === 'string' && __dirname.length > 0;\n\
+         exports.hasGlobal = global === globalThis;\n",
+    );
+    write_temp(
+        "cjsproj/node_modules/classic/lib/helper.js",
+        "exports.helper = function () { return 'helped'; };",
+    );
+    write_temp(
+        "cjsproj/node_modules/depcjs/package.json",
+        "{\"name\": \"depcjs\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/depcjs/index.js",
+        "module.exports = { name: 'depcjs' };",
+    );
+    write_temp(
+        "cjsproj/node_modules/counter/package.json",
+        "{\"name\": \"counter\", \"main\": \"counter.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/counter/counter.js",
+        "let n = 0;\nmodule.exports = { bump: () => ++n };",
+    );
+    write_temp(
+        "cjsproj/node_modules/counter/a.js",
+        "exports.a = require('./counter').bump();",
+    );
+    write_temp(
+        "cjsproj/node_modules/counter/b.js",
+        "exports.b = require('./counter').bump();",
+    );
+    write_temp(
+        "cjsproj/node_modules/cycle/package.json",
+        "{\"name\": \"cycle\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/cycle/index.js",
+        "exports.started = true;\n\
+         const peer = require('./peer');\n\
+         exports.peerSawPartial = peer.sawPartial;\n\
+         exports.done = true;",
+    );
+    write_temp(
+        "cjsproj/node_modules/cycle/peer.js",
+        "const root = require('./index');\n\
+         exports.sawPartial = root.started === true && root.done === undefined;",
+    );
+    write_temp(
+        "cjsproj/node_modules/fnpkg/package.json",
+        "{\"name\": \"fnpkg\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/fnpkg/index.js",
+        "module.exports = function shout(s) { return s.toUpperCase(); };\n\
+         module.exports.flavor = 'fn';",
+    );
+    write_temp(
+        "cjsproj/node_modules/transpiled/package.json",
+        "{\"name\": \"transpiled\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/transpiled/index.js",
+        "Object.defineProperty(exports, '__esModule', { value: true });\n\
+         exports.default = function () { return 'unwrapped-default'; };\n\
+         exports.named = 'named-val';",
+    );
+    write_temp(
+        "cjsproj/node_modules/weird/package.json",
+        "{\"name\": \"weird\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/weird/index.js",
+        "module.exports = { 'weird-key': 'dash', 'class': 'reserved' };",
+    );
+    write_temp(
+        "cjsproj/node_modules/dualpkg/package.json",
+        "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
+    );
+    write_temp(
+        "cjsproj/node_modules/dualpkg/esm.mjs",
+        "export const flavor = 'esm';",
+    );
+    write_temp(
+        "cjsproj/node_modules/dualpkg/cjs.cjs",
+        "module.exports = { flavor: 'cjs' };",
+    );
+    write_temp(
+        "cjsproj/node_modules/wantsdual/package.json",
+        "{\"name\": \"wantsdual\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/wantsdual/index.js",
+        "exports.dualFlavor = require('dualpkg').flavor;",
+    );
+    write_temp(
+        "cjsproj/node_modules/boom/package.json",
+        "{\"name\": \"boom\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "cjsproj/node_modules/boom/index.js",
+        "throw new Error('cjs-init-boom');",
+    );
+    write_temp("cjsproj/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+#[test]
+fn cjs_interop_runs_require_chains_json_and_aliasing() {
+    let proj = write_cjs_fixtures();
+    std::fs::write(
+        proj.join("classic_main.ts"),
+        "import pkg, { kind, helped, depName, metaName, dotAndModule, hasDirname, hasGlobal } from 'classic';\n\
+         console.log(kind, helped, depName, metaName, dotAndModule, hasDirname, hasGlobal, pkg.kind);",
+    )
+    .unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("classic_main.ts").to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "classic helped depcjs classic aliased true true classic"
+    );
+}
+
+#[test]
+fn cjs_require_cache_is_a_singleton_and_cycles_see_partials() {
+    let proj = write_cjs_fixtures();
+    std::fs::write(
+        proj.join("cache_main.ts"),
+        "import { a } from 'counter/a';\nimport { b } from 'counter/b';\nimport { peerSawPartial, done } from 'cycle';\nconsole.log(a, b, peerSawPartial, done);",
+    )
+    .unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("cache_main.ts").to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // a=1, b=2 proves one shared module instance; the cycle peer observed
+    // partial exports (started set, done not yet) exactly like Node.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1 2 true true");
+}
+
+#[test]
+fn cjs_callable_default_esmodule_unwrap_and_arbitrary_names() {
+    let proj = write_cjs_fixtures();
+    // .mjs entry: arbitrary module-namespace import names are parsed by V8
+    // directly, keeping this independent of the TS transpile path.
+    std::fs::write(
+        proj.join("default_main.mjs"),
+        "import shout, { flavor } from 'fnpkg';\n\
+         import t, { named } from 'transpiled';\n\
+         import { 'weird-key' as wk, 'class' as cls } from 'weird';\n\
+         console.log(shout('hi'), flavor, t(), named, wk, cls);",
+    )
+    .unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("default_main.mjs").to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "HI fn unwrapped-default named-val dash reserved"
+    );
+}
+
+#[test]
+fn cjs_requiring_a_dual_package_gets_the_require_condition() {
+    let proj = write_cjs_fixtures();
+    std::fs::write(
+        proj.join("dual_main.ts"),
+        "import { flavor } from 'dualpkg';\nimport { dualFlavor } from 'wantsdual';\nconsole.log(flavor, dualFlavor);",
+    )
+    .unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("dual_main.ts").to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The ESM import sees the import condition; the CJS require sees the
+    // require condition — both flavors of the same package in one graph.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "esm cjs");
+}
+
+#[test]
+fn cjs_entry_program_runs_with_event_loop_and_relative_cjs_imports() {
+    let proj = write_cjs_fixtures();
+    std::fs::write(
+        proj.join("helper.cjs"),
+        "exports.helper = () => 'works';\nexports.util = 'relative-cjs';",
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("prog.cjs"),
+        "const { helper } = require('./helper.cjs');\n\
+         console.log('entry-cjs', helper(), typeof __filename === 'string');\n\
+         setTimeout(() => console.log('timer-in-cjs'), 10);",
+    )
+    .unwrap();
+    let out = oam(&["run", proj.join("prog.cjs").to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("entry-cjs works true"), "stdout: {stdout}");
+    // The timer fired: the event loop pumps for CJS entries too.
+    assert!(stdout.contains("timer-in-cjs"), "stdout: {stdout}");
+
+    // And ESM importing a relative .cjs file bridges the same way.
+    std::fs::write(
+        proj.join("rel_main.ts"),
+        "import h from './helper.cjs';\nconsole.log(h.util);",
+    )
+    .unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("rel_main.ts").to_str().unwrap(),
+        "--no-check",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "relative-cjs");
+}
+
+#[test]
+fn cjs_failure_modes_surface_clearly() {
+    let proj = write_cjs_fixtures();
+
+    // A CJS module whose body throws fails the run with the real error.
+    std::fs::write(proj.join("boom_main.ts"), "import 'boom';").unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("boom_main.ts").to_str().unwrap(),
         "--no-check",
     ]);
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-MOD0005"), "stderr: {stderr}");
-    assert!(stderr.contains("CommonJS"), "stderr: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cjs-init-boom"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // require() of a missing module is Node's wording.
+    std::fs::write(proj.join("missing.cjs"), "require('./does-not-exist');").unwrap();
+    let out = oam(&["run", proj.join("missing.cjs").to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Cannot find module"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // require() of an ES module points at import (ERR_REQUIRE_ESM).
+    std::fs::write(proj.join("esm_target.mjs"), "export const x = 1;").unwrap();
+    std::fs::write(proj.join("reqesm.cjs"), "require('./esm_target.mjs');").unwrap();
+    let out = oam(&["run", proj.join("reqesm.cjs").to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ERR_REQUIRE_ESM"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -482,13 +801,14 @@ fn json_import_is_a_clear_diagnostic() {
 }
 
 #[test]
-fn cjs_is_a_clear_diagnostic() {
-    let file = write_temp("legacy.cjs", "module.exports = { a: 1 };");
-    let out = oam(&["run", file.to_str().unwrap(), "--json"]);
+fn cts_is_a_clear_diagnostic() {
+    // .cjs runs via interop since M2; .cts (TypeScript-CJS) stays gated.
+    let file = write_temp("legacy.cts", "export const a: number = 1;");
+    let out = oam(&["run", file.to_str().unwrap(), "--json", "--no-check"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
-    assert!(stderr.contains("CommonJS"), "stderr: {stderr}");
+    assert!(stderr.contains("ESM TypeScript"), "stderr: {stderr}");
 }
 
 #[test]
