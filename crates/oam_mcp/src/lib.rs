@@ -318,7 +318,19 @@ fn explain_code(code: &str) -> String {
         ),
         (
             "OAM-MOD0002",
-            "Bare specifiers (npm packages) and node: builtins are not resolvable yet — npm resolution lands in M2. Use a relative path for local code.",
+            "A package could not be found in any node_modules directory above the importing file (or its resolution pointed at a missing file). Is it installed? oam resolves against existing npm/pnpm installs until the oam installer lands (M3).",
+        ),
+        (
+            "OAM-MOD0005",
+            "The package resolved to a CommonJS entry, which oam cannot execute yet — CJS interop is the next M2 slice. Dual-published packages' ESM builds (exports.import) work today.",
+        ),
+        (
+            "OAM-MOD0006",
+            "Node builtin modules (fs, path, node:*) are not available yet; the node: compat layer lands with M2 wave 1.",
+        ),
+        (
+            "OAM-MOD0007",
+            "The package's exports map does not export this subpath (Node's ERR_PACKAGE_PATH_NOT_EXPORTED). Check the package's documented entry points.",
         ),
         (
             "OAM-MOD0003",
@@ -428,7 +440,7 @@ mod tests {
 
     #[test]
     fn explain_knows_odif_codes_and_ts_passthrough() {
-        assert!(explain_code("OAM-MOD0002").contains("npm resolution"));
+        assert!(explain_code("OAM-MOD0002").contains("node_modules"));
         assert!(explain_code("OAM-TS2322").contains("TS2322"));
         assert!(explain_code("OAM-NOPE").contains("unknown code"));
     }

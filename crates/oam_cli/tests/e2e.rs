@@ -201,12 +201,155 @@ fn missing_import_is_odif_mod0001() {
 }
 
 #[test]
-fn bare_specifier_is_odif_mod0002_until_m2() {
-    let main = write_temp("bare_main.ts", "import 'lodash';");
+fn missing_package_is_odif_mod0002() {
+    let main = write_temp("bare_main.ts", "import 'definitely-not-installed';");
     let out = oam(&["run", main.to_str().unwrap(), "--json"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("OAM-MOD0002"), "stderr: {stderr}");
+    assert!(stderr.contains("is it installed"), "stderr: {stderr}");
+}
+
+/// One hand-written node_modules tree covering the resolution matrix.
+fn write_npm_fixtures() -> PathBuf {
+    write_temp(
+        "npmproj/node_modules/greeter/package.json",
+        "{\"name\": \"greeter\", \"type\": \"module\", \"exports\": {\".\": {\"import\": \"./dist/index.js\"}, \"./extra\": \"./dist/extra.js\", \"./features/*\": \"./dist/features/*.js\"}}",
+    );
+    write_temp(
+        "npmproj/node_modules/greeter/dist/index.js",
+        "import { scoped } from '@scope/pkg';\nexport function greet() { return 'greeter+' + scoped(); }",
+    );
+    write_temp(
+        "npmproj/node_modules/greeter/dist/extra.js",
+        "export const extra = 'extra';",
+    );
+    write_temp(
+        "npmproj/node_modules/greeter/dist/features/fast.js",
+        "export const feature = 'fast';",
+    );
+    write_temp(
+        "npmproj/node_modules/@scope/pkg/package.json",
+        "{\"name\": \"@scope/pkg\", \"type\": \"module\", \"exports\": \"./main.js\"}",
+    );
+    write_temp(
+        "npmproj/node_modules/@scope/pkg/main.js",
+        "export function scoped() { return 'scoped'; }",
+    );
+    write_temp(
+        "npmproj/node_modules/dualpkg/package.json",
+        "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
+    );
+    write_temp(
+        "npmproj/node_modules/dualpkg/esm.mjs",
+        "export const flavor = 'esm';",
+    );
+    write_temp(
+        "npmproj/node_modules/dualpkg/cjs.cjs",
+        "module.exports = { flavor: 'cjs' };",
+    );
+    write_temp(
+        "npmproj/node_modules/legacy-esm/package.json",
+        "{\"name\": \"legacy-esm\", \"type\": \"module\", \"main\": \"lib/entry.js\"}",
+    );
+    write_temp(
+        "npmproj/node_modules/legacy-esm/lib/entry.js",
+        "export const legacy = 'legacy';",
+    );
+    write_temp(
+        "npmproj/node_modules/cjs-only/package.json",
+        "{\"name\": \"cjs-only\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "npmproj/node_modules/cjs-only/index.js",
+        "module.exports = { nope: true };",
+    );
+    write_temp("npmproj/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+#[test]
+fn npm_resolution_runs_esm_packages() {
+    let proj = write_npm_fixtures();
+    // Exercises: exports conditions, string sugar, scoped packages,
+    // package-to-package imports, subpath exports, wildcards, dual-package
+    // import-condition pick, and the bundler-standard module/main legacy path.
+    std::fs::write(
+        proj.join("main.ts"),
+        "import { greet } from 'greeter';\nimport { extra } from 'greeter/extra';\nimport { feature } from 'greeter/features/fast';\nimport { flavor } from 'dualpkg';\nimport { legacy } from 'legacy-esm';\nconsole.log(greet(), extra, feature, flavor, legacy);",
+    )
+    .unwrap();
+    let out = oam(&["run", proj.join("main.ts").to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "greeter+scoped extra fast esm legacy"
+    );
+}
+
+#[test]
+fn npm_cjs_entry_is_gated_with_mod0005() {
+    let proj = write_npm_fixtures();
+    std::fs::write(proj.join("cjs_main.ts"), "import 'cjs-only';").unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("cjs_main.ts").to_str().unwrap(),
+        "--json",
+        "--no-check",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-MOD0005"), "stderr: {stderr}");
+    assert!(stderr.contains("CommonJS"), "stderr: {stderr}");
+}
+
+#[test]
+fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
+    let proj = write_npm_fixtures();
+    std::fs::write(proj.join("blocked_main.ts"), "import 'greeter/secret';").unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("blocked_main.ts").to_str().unwrap(),
+        "--json",
+        "--no-check",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0007"),
+        "blocked subpath"
+    );
+
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:fs';").unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("builtin_main.ts").to_str().unwrap(),
+        "--json",
+        "--no-check",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0006"),
+        "node: builtin gate"
+    );
+
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'path';").unwrap();
+    let out = oam(&[
+        "run",
+        proj.join("bare_builtin.ts").to_str().unwrap(),
+        "--json",
+        "--no-check",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0006"),
+        "bare builtin gate"
+    );
 }
 
 #[test]
@@ -835,7 +978,7 @@ fn tsconfig_paths_resolve_in_run_and_check_agrees() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("OAM-MOD0002"), "stderr: {stderr}");
     assert!(
-        stderr.contains("no tsconfig paths pattern"),
+        stderr.contains("tsconfig paths were consulted"),
         "stderr: {stderr}"
     );
 }

@@ -10,11 +10,17 @@
 //! interop, tsconfig paths, .tsx (needs the module loader for the JSX
 //! automatic runtime), content-addressed transform caches.
 
+// Diagnostic-as-error is ~200 bytes on cold resolution/parse failure paths;
+// boxing would tax every caller's API for nothing. Crate-wide stance,
+// shared with oam_ts.
+#![allow(clippy::result_large_err)]
+
 use std::path::{Path, PathBuf};
 
 use oam_diagnostics::{Diagnostic, Origin, Position, Severity, Span};
 use oxc_allocator::Allocator;
 
+mod npm;
 mod tsconfig;
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
@@ -116,10 +122,6 @@ fn to_odif(
 /// probing (.ts, .mts, .js, .mjs) and directory index (index.ts, index.js).
 /// Bare and node: specifiers are a clear diagnostic until npm resolution
 /// lands (M2).
-// result_large_err: Diagnostic is ~200 bytes of Strings/Vecs; this is the
-// cold error path of resolution, and boxing would push the cost onto every
-// caller's API instead. Deliberate.
-#[allow(clippy::result_large_err)]
 pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
     // Shapes that are invalid as ESM specifiers everywhere — npm resolution
     // will never fix these, so they get their own diagnostic, not MOD0002.
@@ -138,9 +140,9 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
     let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
     let is_root_relative = specifier.starts_with('/');
     if !is_relative && !is_root_relative && !Path::new(specifier).is_absolute() {
-        // Bare specifier: tsconfig paths get first crack (plan §2.6 —
-        // the resolver honors tsconfig exactly as tsgo does, so run and
-        // check never disagree). npm resolution lands in M2.
+        // Bare specifier: tsconfig paths get first crack (plan §2.6 — the
+        // resolver honors tsconfig exactly as tsgo does), then the Node ESM
+        // node_modules walk.
         let mut consulted_paths = false;
         if let Some(config) = tsconfig::load_for(referrer) {
             consulted_paths = true;
@@ -150,20 +152,14 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
                 }
             }
         }
-        return Err(Diagnostic::new(
-            "OAM-MOD0002",
-            Severity::Error,
-            Origin::Resolve,
-            format!(
-                "cannot resolve '{specifier}' from {}: {}bare and node: specifiers land with npm resolution (M2)",
-                referrer.display(),
-                if consulted_paths {
-                    "no tsconfig paths pattern produced an existing file; "
-                } else {
-                    ""
-                }
-            ),
-        ));
+        return npm::resolve_bare(specifier, referrer).map_err(|mut failure| {
+            if consulted_paths && failure.code == "OAM-MOD0002" {
+                failure
+                    .message
+                    .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
+            }
+            failure
+        });
     }
 
     let raw = if is_relative {
