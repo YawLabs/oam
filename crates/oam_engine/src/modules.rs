@@ -96,6 +96,7 @@ impl JsRuntime {
         })?;
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
+        self.isolate.set_slot(crate::timers::TimerQueue::default());
 
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
@@ -118,6 +119,48 @@ impl JsRuntime {
 
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
+
+        // M1 blocking event loop: one due timer per iteration (so a clear
+        // issued by one callback cancels same-instant siblings), microtask
+        // drain after each, sleep until the next deadline when idle, exit
+        // when no timers remain. The process stays alive for pending timers
+        // even after the entry module fulfills — Node semantics.
+        loop {
+            if promise.state() == v8::PromiseState::Rejected {
+                break;
+            }
+            let now = std::time::Instant::now();
+            let due = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.pop_due(now));
+            match due {
+                Some((callback, extra)) => {
+                    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+                    let callback = v8::Local::new(tc, &callback);
+                    let args: Vec<v8::Local<v8::Value>> =
+                        extra.iter().map(|g| v8::Local::new(tc, g)).collect();
+                    if callback.call(tc, recv, &args).is_none() {
+                        return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
+                    }
+                    tc.perform_microtask_checkpoint();
+                }
+                None => {
+                    let next = tc
+                        .get_slot_mut::<crate::timers::TimerQueue>()
+                        .and_then(|queue| queue.next_deadline());
+                    match next {
+                        Some(deadline) => {
+                            let now = std::time::Instant::now();
+                            if deadline > now {
+                                std::thread::sleep(deadline - now);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
         match promise.state() {
             v8::PromiseState::Fulfilled => {
                 let unhandled: Vec<String> = tc
@@ -159,7 +202,7 @@ impl JsRuntime {
             }
             v8::PromiseState::Pending => Err(rt_diag(
                 "OAM-RT0003",
-                "top-level await did not settle: pending timers/IO require the event loop (M1, oam_core)",
+                "top-level await never settled: no pending timers remain (deadlocked await)",
             )),
         }
     }

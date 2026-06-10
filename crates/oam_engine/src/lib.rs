@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use std::sync::Once;
 
 mod modules;
+mod timers;
 pub use modules::ModuleHost;
 
 static V8_INIT: Once = Once::new();
@@ -41,12 +42,14 @@ impl JsRuntime {
         init_platform();
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
+        isolate.set_slot(timers::TimerQueue::default());
         let context = {
             v8::scope!(let scope, &mut isolate);
             let context = v8::Context::new(scope, v8::ContextOptions::default());
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
             install_console(scope, context);
+            timers::install(scope, context);
             global
         };
         Self { isolate, context }

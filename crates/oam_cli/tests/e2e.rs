@@ -284,6 +284,123 @@ fn dot_and_backslash_specifiers_are_invalid_not_bare() {
 }
 
 #[test]
+fn timers_fire_in_deadline_order() {
+    let main = write_temp(
+        "timer_order.ts",
+        "setTimeout(() => console.log('late'), 30);\nsetTimeout(() => console.log('early'), 0);\nconsole.log('sync');",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "sync\nearly\nlate"
+    );
+}
+
+#[test]
+fn clear_timeout_cancels() {
+    let main = write_temp(
+        "timer_clear.ts",
+        "const id = setTimeout(() => console.log('never'), 10);\nclearTimeout(id);\nsetTimeout(() => console.log('done'), 20);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+}
+
+#[test]
+fn interval_repeats_until_cleared() {
+    let main = write_temp(
+        "timer_interval.ts",
+        "let n: number = 0;\nconst id = setInterval(() => {\n  n++;\n  console.log('tick', n);\n  if (n === 3) { clearInterval(id); console.log('done'); }\n}, 5);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "tick 1\ntick 2\ntick 3\ndone"
+    );
+}
+
+#[test]
+fn top_level_await_on_timer_settles() {
+    // Before the event loop this was OAM-RT0003; now it must just work.
+    let main = write_temp(
+        "tla_timer.ts",
+        "const v: string = await new Promise<string>(r => setTimeout(() => r('woke'), 15));\nconsole.log(v);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "woke");
+}
+
+#[test]
+fn deadlocked_top_level_await_is_rt0003() {
+    let main = write_temp("tla_stuck.ts", "await new Promise(() => {});");
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-RT0003"),
+        "expected deadlock diagnostic"
+    );
+}
+
+#[test]
+fn exception_in_timer_callback_fails_run() {
+    let main = write_temp(
+        "timer_throw.ts",
+        "setTimeout(() => { throw new Error('timer kaboom'); }, 0);",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-RT0001"), "stderr: {stderr}");
+    assert!(stderr.contains("timer kaboom"), "stderr: {stderr}");
+}
+
+#[test]
+fn queue_microtask_runs_before_timers() {
+    let main = write_temp(
+        "micro_order.ts",
+        "setTimeout(() => console.log('macro'), 0);\nqueueMicrotask(() => console.log('micro'));",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "micro\nmacro");
+}
+
+#[test]
+fn set_timeout_passes_extra_args() {
+    let main = write_temp(
+        "timer_args.ts",
+        "setTimeout((a: string, b: string) => console.log(a + b), 0, 'oa', 'm');",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "oam");
+}
+
+#[test]
 fn dotted_basename_resolves_appended_extension() {
     write_temp("my.module.ts", "export const m: string = 'dotted';");
     let main = write_temp(
