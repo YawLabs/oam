@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use oam_diagnostics::{Diagnostic, Origin, Position, Severity, Span};
 use oxc_allocator::Allocator;
+
+mod tsconfig;
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -136,13 +138,30 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
     let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
     let is_root_relative = specifier.starts_with('/');
     if !is_relative && !is_root_relative && !Path::new(specifier).is_absolute() {
+        // Bare specifier: tsconfig paths get first crack (plan §2.6 —
+        // the resolver honors tsconfig exactly as tsgo does, so run and
+        // check never disagree). npm resolution lands in M2.
+        let mut consulted_paths = false;
+        if let Some(config) = tsconfig::load_for(referrer) {
+            consulted_paths = true;
+            for raw in tsconfig::match_specifier(&config, specifier) {
+                if let (Some(found), _) = probe_candidates(&raw) {
+                    return Ok(found);
+                }
+            }
+        }
         return Err(Diagnostic::new(
             "OAM-MOD0002",
             Severity::Error,
             Origin::Resolve,
             format!(
-                "cannot resolve '{specifier}' from {}: bare and node: specifiers land with npm resolution (M2)",
-                referrer.display()
+                "cannot resolve '{specifier}' from {}: {}bare and node: specifiers land with npm resolution (M2)",
+                referrer.display(),
+                if consulted_paths {
+                    "no tsconfig paths pattern produced an existing file; "
+                } else {
+                    ""
+                }
             ),
         ));
     }
@@ -168,10 +187,31 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         PathBuf::from(specifier)
     };
 
-    // Candidate order: exact, TS-source fallback for JS extensions, then
-    // APPENDED extensions + directory index. Appending (not with_extension)
-    // keeps dotted basenames intact: './my.module' probes 'my.module.ts',
-    // never clobbers the '.module' segment.
+    let (found, candidates) = probe_candidates(&raw);
+    found.ok_or_else(|| {
+        Diagnostic::new(
+            "OAM-MOD0001",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "cannot resolve '{specifier}' from {} (tried {})",
+                referrer.display(),
+                candidates
+                    .iter()
+                    .map(|c| c.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })
+}
+
+/// Probe a raw path for the actual module file. Candidate order: exact,
+/// TS-source fallback for JS extensions, then APPENDED extensions +
+/// directory index. Appending (not with_extension) keeps dotted basenames
+/// intact: './my.module' probes 'my.module.ts', never clobbers the
+/// '.module' segment. Returns (found-absolute, every candidate tried).
+fn probe_candidates(raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     fn append_ext(p: &Path, ext: &str) -> PathBuf {
         let mut s = p.as_os_str().to_os_string();
         s.push(".");
@@ -179,7 +219,7 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         PathBuf::from(s)
     }
 
-    let mut candidates: Vec<PathBuf> = vec![raw.clone()];
+    let mut candidates: Vec<PathBuf> = vec![raw.to_path_buf()];
     match raw.extension().and_then(|e| e.to_str()) {
         Some("js") => candidates.push(raw.with_extension("ts")),
         Some("mjs") => candidates.push(raw.with_extension("mts")),
@@ -189,7 +229,7 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
             // No extension, or a dotted basename ('./my.module'): probe by
             // appending, then directory index.
             for ext in ["ts", "mts", "js", "mjs"] {
-                candidates.push(append_ext(&raw, ext));
+                candidates.push(append_ext(raw, ext));
             }
             for index in ["index.ts", "index.js"] {
                 candidates.push(raw.join(index));
@@ -197,26 +237,11 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         }
     }
 
-    candidates
+    let found = candidates
         .iter()
         .find(|c| c.is_file())
-        .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()))
-        .ok_or_else(|| {
-            Diagnostic::new(
-                "OAM-MOD0001",
-                Severity::Error,
-                Origin::Resolve,
-                format!(
-                    "cannot resolve '{specifier}' from {} (tried {})",
-                    referrer.display(),
-                    candidates
-                        .iter()
-                        .map(|c| c.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-        })
+        .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()));
+    (found, candidates)
 }
 
 /// Byte offset -> 1-based line/col. Columns are counted in CHARACTERS (what

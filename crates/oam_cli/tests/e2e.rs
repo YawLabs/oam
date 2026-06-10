@@ -1,4 +1,4 @@
-﻿//! End-to-end tests against the real `oam` binary.
+//! End-to-end tests against the real `oam` binary.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -789,6 +789,55 @@ fn run_clean_typescript_adds_no_noise() {
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
     assert_eq!(stderr.trim(), "", "clean runs stay quiet: {stderr}");
+}
+
+#[test]
+fn tsconfig_paths_resolve_in_run_and_check_agrees() {
+    // JSONC on purpose: real tsconfigs carry comments + trailing commas.
+    write_temp(
+        "pathsproj/tsconfig.json",
+        "{\n  // alias the lib (substitutions must be relative without baseUrl — TS5090)\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"noEmit\": true,\n    \"paths\": {\n      \"@lib/*\": [\"./src/lib/*\"],\n    },\n  },\n}",
+    );
+    write_temp(
+        "pathsproj/src/lib/util.ts",
+        "export function greet(): string { return 'via paths'; }",
+    );
+    let main = write_temp(
+        "pathsproj/main.ts",
+        "import { greet } from '@lib/util';\nconsole.log(greet());",
+    );
+
+    // run: the loader honors the alias.
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "via paths");
+
+    // check: tsgo agrees the same project is clean (resolution parity).
+    let proj = main.parent().unwrap();
+    let check = oam(&["check", proj.to_str().unwrap(), "--no-daemon"]);
+    if tsgo_available(&check) {
+        assert!(
+            check.status.success(),
+            "tsgo must agree with the loader: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    // A bare specifier that no pattern maps stays a clear MOD0002 with the
+    // paths-consulted note.
+    let miss = write_temp("pathsproj/miss.ts", "import '@nope/never';");
+    let out = oam(&["run", miss.to_str().unwrap(), "--json", "--no-check"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-MOD0002"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no tsconfig paths pattern"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

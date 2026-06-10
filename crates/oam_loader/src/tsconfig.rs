@@ -1,0 +1,347 @@
+//! tsconfig discovery + the `paths` mapping subset the resolver honors.
+//!
+//! Contract (plan §2.6): the resolver consults tsconfig EXACTLY as tsgo
+//! does, so `oam run` and `oam check` never disagree about what an import
+//! means. v1 surface: compilerOptions.baseUrl + paths from the nearest
+//! tsconfig.json, with relative `extends` chains merged (child wins).
+//! Bare-package extends ("@tsconfig/node20") needs npm resolution and is
+//! skipped until M2. Matching follows TypeScript: exact keys beat
+//! patterns, one `*` per pattern, longest matched prefix wins,
+//! substitutions tried in order, all resolved against baseUrl (default:
+//! the tsconfig's directory, TS 5 behavior).
+//!
+//! tsconfig.json is JSONC: comments and trailing commas are stripped
+//! before serde sees it.
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+pub(crate) struct PathsConfig {
+    /// Directory substitutions resolve against (resolved baseUrl).
+    pub base_dir: PathBuf,
+    /// (pattern, substitutions) in declaration order.
+    pub patterns: Vec<(String, Vec<String>)>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawTsconfig {
+    #[serde(default)]
+    extends: Option<String>,
+    #[serde(default, rename = "compilerOptions")]
+    compiler_options: RawCompilerOptions,
+}
+
+#[derive(Deserialize, Default)]
+struct RawCompilerOptions {
+    #[serde(default, rename = "baseUrl")]
+    base_url: Option<String>,
+    #[serde(default)]
+    paths: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Walk up from `referrer` to the nearest tsconfig.json and load its
+/// effective baseUrl/paths. None = no tsconfig or no paths configured.
+pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
+    let mut dir = if referrer.is_dir() {
+        referrer.to_path_buf()
+    } else {
+        referrer.parent()?.to_path_buf()
+    };
+    loop {
+        let candidate = dir.join("tsconfig.json");
+        if candidate.is_file() {
+            return load_chain(&candidate, 0);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Load a tsconfig and merge its relative `extends` chain (child wins;
+/// paths/baseUrl resolve against the file that DECLARED them, per TS).
+fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
+    if depth > 8 {
+        return None; // extends cycle / absurd chain: give up quietly
+    }
+    let raw = std::fs::read_to_string(tsconfig).ok()?;
+    let parsed: RawTsconfig = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
+    let dir = tsconfig.parent()?.to_path_buf();
+
+    let own = parsed.compiler_options.paths.map(|paths| {
+        let base_dir = match &parsed.compiler_options.base_url {
+            Some(base) => dir.join(base),
+            None => dir.clone(),
+        };
+        let patterns = paths
+            .into_iter()
+            .map(|(key, value)| {
+                let subs = value
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (key, subs)
+            })
+            .collect();
+        PathsConfig { base_dir, patterns }
+    });
+    if let Some(config) = own {
+        return Some(config); // child paths replace parent paths entirely (TS semantics)
+    }
+
+    // No paths here: a relative extends may carry them.
+    let extends = parsed.extends?;
+    if !(extends.starts_with("./") || extends.starts_with("../")) {
+        return None; // bare-package extends: needs npm resolution (M2)
+    }
+    // TS resolves './tsconfig.base' by trying the exact path, then with
+    // '.json' APPENDED (never set_extension — dotted basenames are normal).
+    let mut parent = dir.join(&extends);
+    if !parent.is_file() {
+        let mut with_json = parent.into_os_string();
+        with_json.push(".json");
+        parent = PathBuf::from(with_json);
+    }
+    load_chain(&parent, depth + 1)
+}
+
+/// Candidate raw paths for a bare specifier, per TypeScript's precedence.
+/// Empty = no pattern matched.
+pub(crate) fn match_specifier(config: &PathsConfig, specifier: &str) -> Vec<PathBuf> {
+    // Exact key wins outright.
+    if let Some((_, subs)) = config
+        .patterns
+        .iter()
+        .find(|(key, _)| !key.contains('*') && key == specifier)
+    {
+        return subs.iter().map(|s| config.base_dir.join(s)).collect();
+    }
+
+    // Otherwise: single-* patterns, longest matched prefix wins.
+    let mut best: Option<(usize, &Vec<String>, &str)> = None;
+    for (key, subs) in &config.patterns {
+        let Some(star) = key.find('*') else { continue };
+        let (prefix, suffix) = (&key[..star], &key[star + 1..]);
+        if specifier.len() >= prefix.len() + suffix.len()
+            && specifier.starts_with(prefix)
+            && specifier.ends_with(suffix)
+        {
+            let matched = &specifier[prefix.len()..specifier.len() - suffix.len()];
+            if best.is_none_or(|(len, _, _)| prefix.len() > len) {
+                best = Some((prefix.len(), subs, matched));
+            }
+        }
+    }
+    let Some((_, subs, matched)) = best else {
+        return Vec::new();
+    };
+    subs.iter()
+        .map(|s| config.base_dir.join(s.replace('*', matched)))
+        .collect()
+}
+
+/// Strip JSONC down to JSON: // and /* */ comments become spaces (string
+/// contents untouched), then trailing commas before } or ] are dropped.
+pub(crate) fn strip_jsonc(input: &str) -> String {
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        InString { escaped: bool },
+        LineComment,
+        BlockComment { star: bool },
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut state = State::Normal;
+    for c in input.chars() {
+        match &mut state {
+            State::Normal => match c {
+                '"' => {
+                    state = State::InString { escaped: false };
+                    out.push(c);
+                }
+                '/' => {
+                    // Peek handled by a marker: emit nothing yet, decide on
+                    // the NEXT char. Simplify by encoding the pending slash.
+                    state = State::LineComment; // provisional; fixed below
+                    out.push('\u{0}'); // placeholder, replaced or kept as '/'
+                }
+                _ => out.push(c),
+            },
+            State::InString { escaped } => {
+                if *escaped {
+                    *escaped = false;
+                } else if c == '\\' {
+                    *escaped = true;
+                } else if c == '"' {
+                    state = State::Normal;
+                }
+                out.push(c);
+            }
+            State::LineComment => {
+                // Disambiguate the provisional slash: the placeholder is the
+                // last char of `out` exactly when we just saw the first '/'.
+                if out.ends_with('\u{0}') {
+                    out.pop();
+                    match c {
+                        '/' => { /* real line comment: emit nothing */ }
+                        '*' => {
+                            state = State::BlockComment { star: false };
+                        }
+                        _ => {
+                            // Lone slash (invalid JSON anyway): keep both.
+                            out.push('/');
+                            out.push(c);
+                            state = State::Normal;
+                        }
+                    }
+                } else if c == '\n' {
+                    out.push('\n');
+                    state = State::Normal;
+                }
+                // else: swallow comment chars
+            }
+            State::BlockComment { star } => {
+                if *star && c == '/' {
+                    out.push(' ');
+                    state = State::Normal;
+                } else {
+                    *star = c == '*';
+                }
+            }
+        }
+    }
+
+    // Second pass: drop trailing commas (string-aware).
+    let mut cleaned = String::with_capacity(out.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes: Vec<char> = out.chars().collect();
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_string {
+            cleaned.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                cleaned.push(c);
+            }
+            ',' => {
+                let next_meaningful = bytes[i + 1..].iter().find(|c| !c.is_whitespace());
+                if matches!(next_meaningful, Some('}') | Some(']')) {
+                    continue; // trailing comma: drop
+                }
+                cleaned.push(c);
+            }
+            _ => cleaned.push(c),
+        }
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_comments_and_trailing_commas() {
+        let jsonc = r#"{
+  // line comment
+  "a": "value // not a comment",
+  /* block
+     comment */
+  "b": [1, 2, 3,],
+  "c": "/* also not a comment */",
+}"#;
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(jsonc)).unwrap();
+        assert_eq!(parsed["a"], "value // not a comment");
+        assert_eq!(parsed["b"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["c"], "/* also not a comment */");
+    }
+
+    fn config(patterns: &[(&str, &[&str])]) -> PathsConfig {
+        PathsConfig {
+            base_dir: PathBuf::from("/proj"),
+            patterns: patterns
+                .iter()
+                .map(|(k, subs)| (k.to_string(), subs.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn exact_key_beats_patterns() {
+        let cfg = config(&[
+            ("@lib/*", &["src/lib/*"]),
+            ("@lib/special", &["src/special.ts"]),
+        ]);
+        let candidates = match_specifier(&cfg, "@lib/special");
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/proj").join("src/special.ts")]
+        );
+    }
+
+    #[test]
+    fn longest_prefix_wins_and_star_substitutes() {
+        let cfg = config(&[("@app/*", &["src/*"]), ("@app/deep/*", &["src/deep/*"])]);
+        let candidates = match_specifier(&cfg, "@app/deep/thing");
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/proj").join("src/deep/thing")]
+        );
+    }
+
+    #[test]
+    fn multiple_substitutions_stay_ordered() {
+        let cfg = config(&[("#u/*", &["a/*", "b/*"])]);
+        let candidates = match_specifier(&cfg, "#u/x");
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/proj").join("a/x"),
+                PathBuf::from("/proj").join("b/x")
+            ]
+        );
+    }
+
+    #[test]
+    fn no_match_is_empty() {
+        let cfg = config(&[("@lib/*", &["src/lib/*"])]);
+        assert!(match_specifier(&cfg, "lodash").is_empty());
+    }
+
+    #[test]
+    fn extends_chain_supplies_paths() {
+        let dir = std::env::temp_dir().join(format!("oam-tsc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.base.json"),
+            r#"{ "compilerOptions": { "paths": { "@x/*": ["lib/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "extends": "./tsconfig.base", "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let cfg = load_for(&dir.join("entry.ts")).expect("paths via extends");
+        // baseUrl defaults to the dir of the file DECLARING the paths.
+        assert_eq!(cfg.base_dir, dir);
+        assert_eq!(cfg.patterns.len(), 1);
+        assert!(!match_specifier(&cfg, "@x/util").is_empty());
+    }
+}
