@@ -2,13 +2,14 @@
 //!
 //! Contract (plan §2.6): the resolver consults tsconfig EXACTLY as tsgo
 //! does, so `oam run` and `oam check` never disagree about what an import
-//! means. v1 surface: compilerOptions.baseUrl + paths from the nearest
+//! means. v1 surface: compilerOptions.paths from the nearest
 //! tsconfig.json, with relative `extends` chains merged (child wins).
 //! Bare-package extends ("@tsconfig/node20") needs npm resolution and is
-//! skipped until M2. Matching follows TypeScript: exact keys beat
+//! skipped until M2. Matching follows TypeScript 7: exact keys beat
 //! patterns, one `*` per pattern, longest matched prefix wins,
-//! substitutions tried in order, all resolved against baseUrl (default:
-//! the tsconfig's directory, TS 5 behavior).
+//! substitutions tried in order, resolved against the DECLARING
+//! tsconfig's directory (TS 7 removed baseUrl entirely — TS5102 — and
+//! requires relative substitutions — TS5090; both probed against tsgo).
 //!
 //! tsconfig.json is JSONC: comments and trailing commas are stripped
 //! before serde sees it.
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(crate) struct PathsConfig {
-    /// Directory substitutions resolve against (resolved baseUrl).
+    /// The declaring tsconfig's directory; substitutions resolve here.
     pub base_dir: PathBuf,
     /// (pattern, substitutions) in declaration order.
     pub patterns: Vec<(String, Vec<String>)>,
@@ -34,14 +35,17 @@ struct RawTsconfig {
 
 #[derive(Deserialize, Default)]
 struct RawCompilerOptions {
-    #[serde(default, rename = "baseUrl")]
-    base_url: Option<String>,
+    // NOTE: no baseUrl. TypeScript 7 REMOVED the option (TS5102, verified
+    // against tsgo 7.0.0-dev) — paths always resolve against the declaring
+    // tsconfig's directory. A config that still sets baseUrl gets tsgo's
+    // own loud TS5102 through `oam check`; the loader must not quietly
+    // honor what the checker rejects.
     #[serde(default)]
     paths: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Walk up from `referrer` to the nearest tsconfig.json and load its
-/// effective baseUrl/paths. None = no tsconfig or no paths configured.
+/// effective paths. None = no tsconfig or no paths configured.
 pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
     let mut dir = if referrer.is_dir() {
         referrer.to_path_buf()
@@ -60,20 +64,20 @@ pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
 }
 
 /// Load a tsconfig and merge its relative `extends` chain (child wins;
-/// paths/baseUrl resolve against the file that DECLARED them, per TS).
+/// paths resolve against the file that DECLARED them, per TS 7).
 fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
     if depth > 8 {
         return None; // extends cycle / absurd chain: give up quietly
     }
     let raw = std::fs::read_to_string(tsconfig).ok()?;
-    let parsed: RawTsconfig = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
+    // Windows editors love BOMs; tsgo accepts them, so we must too — a
+    // BOM'd tsconfig silently disabling paths was a real parity bug.
+    let raw = raw.trim_start_matches('\u{feff}');
+    let parsed: RawTsconfig = serde_json::from_str(&strip_jsonc(raw)).ok()?;
     let dir = tsconfig.parent()?.to_path_buf();
 
     let own = parsed.compiler_options.paths.map(|paths| {
-        let base_dir = match &parsed.compiler_options.base_url {
-            Some(base) => dir.join(base),
-            None => dir.clone(),
-        };
+        let base_dir = dir.clone();
         let patterns = paths
             .into_iter()
             .map(|(key, value)| {
@@ -321,6 +325,22 @@ mod tests {
     fn no_match_is_empty() {
         let cfg = config(&[("@lib/*", &["src/lib/*"])]);
         assert!(match_specifier(&cfg, "lodash").is_empty());
+    }
+
+    #[test]
+    fn bom_prefixed_tsconfig_still_supplies_paths() {
+        // Windows editors write BOMs; tsgo accepts them. A BOM'd tsconfig
+        // silently disabling paths was a real probe-found parity bug.
+        let dir = std::env::temp_dir().join(format!("oam-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            "\u{feff}{ \"compilerOptions\": { \"paths\": { \"@b/*\": [\"./lib/*\"] } } }",
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        let cfg = load_for(&dir.join("entry.ts")).expect("BOM must not disable paths");
+        assert!(!match_specifier(&cfg, "@b/util").is_empty());
     }
 
     #[test]

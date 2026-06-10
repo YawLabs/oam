@@ -10,6 +10,21 @@
 //! node: shims land here).
 
 fn main() {
+    // V8 snapshots are architecture-specific, and this build script runs on
+    // the HOST: cross-compiling would silently embed a host-arch blob that
+    // crashes the target binary at first isolate creation. Fail loudly until
+    // target-arch snapshot generation is implemented (the `oam compile`
+    // cross-target workstream owns that).
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch != std::env::consts::ARCH {
+        panic!(
+            "oam cross-compilation is not supported yet: the startup snapshot \
+             must be generated on the target architecture (host: {}, target: {})",
+            std::env::consts::ARCH,
+            target_arch
+        );
+    }
+
     let bootstrap_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js");
     println!("cargo:rerun-if-changed={bootstrap_path}");
     let bootstrap = std::fs::read_to_string(bootstrap_path).expect("bootstrap.js readable");

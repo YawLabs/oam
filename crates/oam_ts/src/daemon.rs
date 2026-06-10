@@ -131,6 +131,18 @@ fn random_token() -> String {
 /// Cheap whole-project content fingerprint: (rel path, mtime, size) of every
 /// TS source + tsconfig, FNV-mixed. None = too big to fingerprint (then we
 /// simply never serve from cache — correctness first).
+///
+/// Staleness envelope (probed): a same-size rewrite within the mtime
+/// granularity window would produce the same fingerprint. Tier-1
+/// filesystems are ns-class (NTFS 100ns — probed unreproducible with
+/// back-to-back writes; ext4/APFS ns), so this only matters on FAT/exFAT
+/// (2s) or some network mounts. Revisit with content hashing if a real
+/// report ever lands.
+///
+/// Concurrent-spawn note (probed): racing `oam check` calls can spawn
+/// sibling daemons; the state file is last-writer-wins and orphans
+/// self-reap after one idle period having served at most their own
+/// spawner correctly. Benign by design — no wrong results possible.
 fn fingerprint(root: &Path) -> Option<u64> {
     const CAP: usize = 50_000;
     let mut entries: Vec<(String, u128, u64)> = Vec::new();
