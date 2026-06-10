@@ -59,3 +59,6 @@ sidecar, inspector) lands per the roadmap; crates are created when their workstr
 
 Domain: https://oam.sh (0am.sh is defensively registered and redirects here; the installer and
 update channel serve from oam.sh exclusively).
+
+Distribution: the oam.sh install script is canonical; the npm package is **@yawlabs/oam**
+(bare `oam` on npm belongs to an unrelated project). Private until the M1 wedge demo.
