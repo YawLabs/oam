@@ -222,6 +222,75 @@ impl JsRuntime {
     }
 }
 
+impl JsRuntime {
+    /// Run the tests a just-evaluated test file registered: call
+    /// `globalThis.__oamTestRun(filter)` (snapshot JS) and pump the event
+    /// loop until its promise settles. Returns the results object as a
+    /// JSON string. Reuses the run slots from the preceding
+    /// execute_module/execute_cjs call — do NOT reset them here, the test
+    /// file's module state must stay alive.
+    pub fn run_registered_tests(
+        &mut self,
+        filter: Option<&str>,
+    ) -> Result<String, Vec<Diagnostic>> {
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamTestRun")
+            .ok_or_else(|| rt_diag("OAM-RT0001", "test runner key allocation failed"))?;
+        let runner = global
+            .get(tc, key.into())
+            .ok_or_else(|| rt_diag("OAM-TEST0003", "__oamTestRun missing from snapshot"))?;
+        let runner = v8::Local::<v8::Function>::try_from(runner)
+            .map_err(|_| rt_diag("OAM-TEST0003", "__oamTestRun is not a function"))?;
+
+        let arg: v8::Local<v8::Value> = match filter {
+            Some(filter) => v8::String::new(tc, filter)
+                .ok_or_else(|| rt_diag("OAM-RT0001", "filter too long for V8 string"))?
+                .into(),
+            None => v8::undefined(tc).into(),
+        };
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let Some(result) = runner.call(tc, recv, &[arg]) else {
+            return Err(vec![catch_to_diagnostic(tc, "__oamTestRun")]);
+        };
+        tc.perform_microtask_checkpoint();
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+        let promise = v8::Local::<v8::Promise>::try_from(result)
+            .map_err(|_| rt_diag("OAM-TEST0003", "__oamTestRun did not return a promise"))?;
+
+        pump_event_loop(tc, Some(promise))?;
+
+        match promise.state() {
+            v8::PromiseState::Fulfilled => {
+                let value = promise.result(tc);
+                let json = v8::json::stringify(tc, value)
+                    .ok_or_else(|| rt_diag("OAM-TEST0003", "test results failed to serialize"))?;
+                Ok(json.to_rust_string_lossy(tc))
+            }
+            v8::PromiseState::Rejected => {
+                let exception = promise.result(tc);
+                let text = exception
+                    .to_string(tc)
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "unknown exception".to_string());
+                Err(rt_diag(
+                    "OAM-TEST0003",
+                    format!("test run crashed outside any test: {text}"),
+                ))
+            }
+            v8::PromiseState::Pending => Err(rt_diag(
+                "OAM-TEST0003",
+                "test run never settled: a test holds the loop open (deadlocked await?)",
+            )),
+        }
+    }
+}
+
 /// The blocking event loop, shared by ESM and CJS entry paths. Each turn
 /// services at most ONE due timer (so a clear issued by one callback
 /// cancels same-instant siblings) AND THEN one ready op completion — never
@@ -361,12 +430,19 @@ fn load_module_graph(
             continue;
         }
 
-        // node builtins: instantiate via the snapshot registry, compile a
-        // facade module under the virtual node:NAME path.
-        let builtin = path
-            .to_str()
-            .and_then(|s| s.strip_prefix("node:"))
-            .map(str::to_string);
+        // Virtual modules (node builtins + oam: runtime modules):
+        // instantiate via the snapshot registry, compile a facade module
+        // under the virtual path. Registry keys are stripped for node:
+        // ("fs") and full for oam: ("oam:test").
+        let builtin = path.to_str().and_then(|s| {
+            if let Some(stripped) = s.strip_prefix("node:") {
+                Some(stripped.to_string())
+            } else if s.starts_with("oam:") {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        });
         // CJS files take the interop path: execute eagerly through the
         // require machinery, then compile a generated ESM facade (real
         // runtime export names) as the module at this path. JSON files
@@ -430,7 +506,10 @@ fn load_module_graph(
             let resolved = host.resolve(&specifier, &path)?;
             // Virtual builtin paths must not go through filesystem
             // normalization (absolute() would anchor "node:fs" at cwd).
-            let resolved = if resolved.to_str().is_some_and(|s| s.starts_with("node:")) {
+            let resolved = if resolved
+                .to_str()
+                .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+            {
                 resolved
             } else {
                 module_key(&resolved).map_err(|e| {
@@ -577,7 +656,7 @@ pub(crate) unsafe extern "C" fn import_meta_callback(
     };
 
     let path_text = path.to_string_lossy().into_owned();
-    let is_builtin = path_text.starts_with("node:");
+    let is_builtin = path_text.starts_with("node:") || path_text.starts_with("oam:");
     let url = if is_builtin {
         path_text.clone()
     } else {

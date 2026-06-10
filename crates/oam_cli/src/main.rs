@@ -52,6 +52,16 @@ enum Command {
         #[arg(last = true)]
         script_args: Vec<String>,
     },
+    /// Run tests (*.test.* / *.spec.* / *_test.* files; import 'oam:test').
+    /// Each file runs in a fresh isolate. Type checking stays with `oam
+    /// check` — the runner never blocks on types.
+    Test {
+        /// Files or directories to search (default: current directory).
+        paths: Vec<PathBuf>,
+        /// Run only tests whose full name matches (regex, else substring).
+        #[arg(short = 't', long)]
+        test_name_pattern: Option<String>,
+    },
     /// Type-check a file or project with tsgo (TypeScript 7 native).
     Check {
         /// A .ts file or a directory; the nearest tsconfig.json upward wins.
@@ -97,6 +107,10 @@ fn main() -> ExitCode {
             no_check,
             script_args,
         } => run_command(file, *check, *no_check, cli.json, script_args),
+        Command::Test {
+            paths,
+            test_name_pattern,
+        } => test_command(paths, test_name_pattern.as_deref(), cli.json),
         Command::Check { path, no_daemon } => check_path(path, cli.json, *no_daemon),
         Command::Daemon { action } => match action {
             DaemonAction::Status { path } => {
@@ -274,6 +288,217 @@ fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+/// Is this file named like a test? (*.test.* / *.spec.* / *_test.*)
+fn is_test_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !matches!(ext, "ts" | "mts" | "js" | "mjs" | "cjs") {
+        return false;
+    }
+    let stem = &name[..name.len() - ext.len() - 1];
+    stem.ends_with(".test") || stem.ends_with(".spec") || stem.ends_with("_test")
+}
+
+/// Discover test files under `paths` (explicit files pass regardless of
+/// naming; directories recurse, skipping dependency/build trees).
+fn discover_test_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    const SKIP_DIRS: [&str; 6] = ["node_modules", ".git", "target", "dist", "coverage", ".oam"];
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if SKIP_DIRS.iter().any(|s| name == *s) || name.starts_with(".oam") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if is_test_file(&path) {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let roots: Vec<PathBuf> = if paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        paths.to_vec()
+    };
+    for root in roots {
+        if root.is_file() {
+            out.push(root);
+        } else {
+            walk(&root, &mut out);
+        }
+    }
+    out
+}
+
+/// `oam test`: every file in a FRESH isolate (registered state cannot leak
+/// across files), results rendered pretty or as ODIF JSONL from the same
+/// data. Exit 0 only when every discovered test passed.
+fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode {
+    let files = discover_test_files(paths);
+    if files.is_empty() {
+        eprintln!(
+            "oam test: no test files found (looked for *.test.* / *.spec.* / *_test.* with js/ts extensions)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let started = std::time::Instant::now();
+    let (mut pass, mut fail, mut skip, mut todo) = (0u64, 0u64, 0u64, 0u64);
+    let mut file_failures = 0u64;
+
+    for file in &files {
+        if !json {
+            eprintln!("{}", file.display());
+        }
+        let mut rt = oam_engine::JsRuntime::new();
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "oam".to_string());
+        let script = std::path::absolute(file)
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .into_owned();
+        rt.set_process_argv(vec![exe, script]);
+
+        let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
+            rt.execute_cjs(file)
+        } else {
+            rt.execute_module(file, &CliHost)
+        };
+        if let Err(diagnostics) = evaluated {
+            file_failures += 1;
+            for d in &diagnostics {
+                render(d, json);
+            }
+            continue;
+        }
+
+        let results = match rt.run_registered_tests(filter) {
+            Ok(json_text) => json_text,
+            Err(diagnostics) => {
+                file_failures += 1;
+                for d in &diagnostics {
+                    render(d, json);
+                }
+                continue;
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&results) {
+            Ok(value) => value,
+            Err(e) => {
+                file_failures += 1;
+                eprintln!("oam test: unreadable results from {}: {e}", file.display());
+                continue;
+            }
+        };
+
+        let tests = parsed["tests"].as_array().cloned().unwrap_or_default();
+        if tests.is_empty() && parsed["noTestModule"].as_bool() == Some(true) && !json {
+            eprintln!("  (no tests registered — does the file import 'oam:test'?)");
+        }
+        for t in &tests {
+            let name = t["name"].as_str().unwrap_or("(unnamed)");
+            let status = t["status"].as_str().unwrap_or("fail");
+            let duration = t["durationMs"].as_u64().unwrap_or(0);
+            match status {
+                "pass" => {
+                    pass += 1;
+                    if !json {
+                        eprintln!("  ok   {name} ({duration}ms)");
+                    }
+                }
+                "skip" => {
+                    skip += 1;
+                    if !json {
+                        eprintln!("  skip {name}");
+                    }
+                }
+                "todo" => {
+                    todo += 1;
+                    if !json {
+                        eprintln!("  todo {name}");
+                    }
+                }
+                _ => {
+                    fail += 1;
+                    let message = t["error"]["message"].as_str().unwrap_or("failed");
+                    if json {
+                        let d = Diagnostic::new(
+                            "OAM-TEST0001",
+                            Severity::Error,
+                            Origin::Test,
+                            format!("FAIL {name}: {message}"),
+                        )
+                        .with_span(oam_diagnostics::Span {
+                            file: file.to_string_lossy().into_owned(),
+                            start: oam_diagnostics::Position { line: 1, col: 1 },
+                            end: oam_diagnostics::Position { line: 1, col: 1 },
+                        });
+                        render(&d, true);
+                    } else {
+                        eprintln!("  FAIL {name} ({duration}ms)");
+                        eprintln!("       {message}");
+                        if let Some(stack) = t["error"]["stack"].as_str() {
+                            for line in stack.lines().take(4) {
+                                eprintln!("       {}", line.trim());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let elapsed = started.elapsed().as_millis();
+    let failed_total = fail + file_failures;
+    if json {
+        // Machine summary as an ODIF info/error diagnostic, same stream.
+        let d = Diagnostic::new(
+            "OAM-TEST0000",
+            if failed_total == 0 {
+                Severity::Info
+            } else {
+                Severity::Error
+            },
+            Origin::Test,
+            format!(
+                "{} file(s): {pass} passed, {fail} failed, {skip} skipped, {todo} todo, {file_failures} file error(s) in {elapsed}ms",
+                files.len()
+            ),
+        );
+        render(&d, true);
+    } else {
+        eprintln!();
+        eprintln!(
+            "{} file(s): {pass} passed, {fail} failed, {skip} skipped, {todo} todo{} ({elapsed}ms)",
+            files.len(),
+            if file_failures > 0 {
+                format!(", {file_failures} file error(s)")
+            } else {
+                String::new()
+            }
+        );
+    }
+    if failed_total == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

@@ -1273,6 +1273,197 @@ fn cjs_modules_can_require_builtins() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from-cjs true");
 }
 
+// ------------------------------------------------------------- oam test
+
+#[test]
+fn oam_test_runs_passing_and_failing_tests_with_exit_codes() {
+    write_temp(
+        "runner1/math.test.ts",
+        "import { test, expect, describe } from 'oam:test';\n\
+         describe('math', () => {\n\
+           test('adds', () => { expect(1 + 1).toBe(2); });\n\
+           test('deep equal', () => { expect({ a: [1, 2] }).toEqual({ a: [1, 2] }); });\n\
+           test('fails on purpose', () => { expect(2 + 2).toBe(5); });\n\
+           test.skip('skipped', () => { throw new Error('never runs'); });\n\
+           test.todo('later');\n\
+         });",
+    );
+    let dir = write_temp("runner1/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    assert!(!out.status.success(), "one failing test must fail the run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ok   math > adds"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FAIL math > fails on purpose"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("expect(4).toBe(5)"), "stderr: {stderr}");
+    assert!(stderr.contains("skip math > skipped"), "stderr: {stderr}");
+    assert!(stderr.contains("todo math > later"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("2 passed, 1 failed, 1 skipped, 1 todo"),
+        "stderr: {stderr}"
+    );
+
+    // All-green file exits 0.
+    write_temp(
+        "runner2/green.test.ts",
+        "import { test, expect } from 'oam:test';\n\
+         test('green', () => { expect('oam').toContain('oa'); });",
+    );
+    let dir = write_temp("runner2/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn oam_test_async_hooks_only_filter_and_json_mode() {
+    write_temp(
+        "runner3/flow.test.ts",
+        "import { test, expect, describe, beforeEach, afterEach } from 'oam:test';\n\
+         const order: string[] = [];\n\
+         describe('hooks', () => {\n\
+           beforeEach(() => order.push('before'));\n\
+           afterEach(() => order.push('after'));\n\
+           test('async settles', async () => {\n\
+             const v = await new Promise((r) => setTimeout(() => r('done'), 5));\n\
+             expect(v).toBe('done');\n\
+             expect(order).toContain('before');\n\
+           });\n\
+           test('await rejects', async () => {\n\
+             await expect(Promise.reject(new Error('nope'))).rejects.toThrow('nope');\n\
+             await expect(Promise.resolve(7)).resolves.toBe(7);\n\
+           });\n\
+         });",
+    );
+    let dir = write_temp("runner3/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // -t filter: only the matching test runs.
+    let out = oam(&["test", dir.to_str().unwrap(), "-t", "async settles"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success());
+    assert!(
+        stderr.contains("ok   hooks > async settles"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("await rejects"), "filtered out: {stderr}");
+
+    // --json: failures are ODIF; the summary is ODIF.
+    write_temp(
+        "runner4/red.test.ts",
+        "import { test, expect } from 'oam:test';\n\
+         test('red', () => { expect(1).toBe(2); });",
+    );
+    let dir = write_temp("runner4/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-TEST0001"), "stderr: {stderr}");
+    assert!(stderr.contains("\"odif\":\"1\""), "stderr: {stderr}");
+    assert!(stderr.contains("OAM-TEST0000"), "summary line: {stderr}");
+}
+
+#[test]
+fn oam_test_mocks_spies_and_fake_timers() {
+    write_temp(
+        "runner5/mocks.test.ts",
+        "import { test, expect, mock } from 'oam:test';\n\
+         test('mock.fn tracks calls and impls', () => {\n\
+           const f = mock.fn((x: number) => x * 2);\n\
+           f.mockReturnValueOnce(99);\n\
+           expect(f(1)).toBe(99);\n\
+           expect(f(3)).toBe(6);\n\
+           expect(f).toHaveBeenCalledTimes(2);\n\
+           expect(f).toHaveBeenCalledWith(3);\n\
+           expect(f).toHaveBeenLastCalledWith(3);\n\
+         });\n\
+         test('spyOn wraps and restores', () => {\n\
+           const target = { greet: (n: string) => 'hi ' + n };\n\
+           const spy = mock.spyOn(target, 'greet');\n\
+           expect(target.greet('oam')).toBe('hi oam');\n\
+           expect(spy).toHaveBeenCalledWith('oam');\n\
+           spy.mockRestore();\n\
+           expect((target.greet as any).mock).toBeUndefined();\n\
+         });\n\
+         test('fake timers tick deterministically', () => {\n\
+           mock.timers.enable({ now: 1000 });\n\
+           const fired: number[] = [];\n\
+           setTimeout(() => fired.push(Date.now()), 50);\n\
+           setInterval(() => fired.push(-Date.now()), 30);\n\
+           expect(fired).toHaveLength(0);\n\
+           mock.timers.tick(60);\n\
+           expect(fired).toEqual([-1030, 1050, -1060]);\n\
+           mock.timers.restore();\n\
+         });",
+    );
+    let dir = write_temp("runner5/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("3 passed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn oam_test_timeout_and_no_files_are_clear_failures() {
+    write_temp(
+        "runner6/slow.test.ts",
+        "import { test } from 'oam:test';\n\
+         test('hangs', async () => { await new Promise(() => {}); }, { timeout: 200 });",
+    );
+    let dir = write_temp("runner6/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("timed out after 200ms"), "stderr: {stderr}");
+
+    let empty = write_temp("runner7/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", empty.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no test files found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn import_cycles_follow_esm_tdz_semantics() {
     // cycle_a evaluates first (entry-last post-order), so its top level must

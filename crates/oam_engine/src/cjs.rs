@@ -148,10 +148,15 @@ fn require_callback(
             return;
         }
     };
-    // Builtins resolve to virtual node:NAME paths; the registry object is
-    // the require() result (same instance the ESM facade exposes).
-    if let Some(name) = path.to_str().and_then(|s| s.strip_prefix("node:")) {
-        let name = name.to_string();
+    // Virtual modules (node:NAME stripped, oam:NAME full) come from the
+    // snapshot registry; the registry object is the require() result —
+    // same instance the ESM facade exposes.
+    let registry_key = path.to_str().and_then(|s| {
+        s.strip_prefix("node:")
+            .map(str::to_string)
+            .or_else(|| s.starts_with("oam:").then(|| s.to_string()))
+    });
+    if let Some(name) = registry_key {
         if let Some(builtin) = get_builtin(scope, &name) {
             rv.set(builtin);
         }

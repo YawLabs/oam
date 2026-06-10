@@ -144,8 +144,12 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         // Builtins bypass tsconfig paths entirely: Node guarantees node:
         // (and bare builtin names) never hit userland resolution, and
         // require() in the same project would disagree otherwise — two
-        // identities for 'fs' in one run.
-        if specifier.starts_with("node:") || npm::is_node_builtin(specifier) {
+        // identities for 'fs' in one run. oam: runtime modules get the
+        // same guarantee.
+        if specifier.starts_with("node:")
+            || specifier.starts_with("oam:")
+            || npm::is_node_builtin(specifier)
+        {
             return npm::resolve_bare(specifier, referrer, npm::ResolveMode::Import);
         }
         // Bare specifier: tsconfig paths get first crack (plan §2.6 — the

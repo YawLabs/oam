@@ -343,6 +343,18 @@ fn explain_code(code: &str) -> String {
             "Invalid module specifier shape: '.', '..', or backslashes. Use './name' or '../name' with forward slashes.",
         ),
         (
+            "OAM-TEST0000",
+            "oam test machine summary (counts per run). severity=info means all green; severity=error means at least one failure.",
+        ),
+        (
+            "OAM-TEST0001",
+            "A test failed. The message carries 'FAIL <full test name>: <assertion message>'; the span points at the test file. Run `oam test -t '<name>'` to re-run just that test.",
+        ),
+        (
+            "OAM-TEST0003",
+            "The test run itself crashed outside any test (a beforeAll threw at module scope, the runner deadlocked, or results failed to serialize). Fix the file-level error before reading individual results.",
+        ),
+        (
             "OAM-RT0001",
             "Uncaught runtime exception. The message carries the JS error; the span (when present) points at the throw site.",
         ),
