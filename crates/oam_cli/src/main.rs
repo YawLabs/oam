@@ -36,6 +36,9 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Serve oam's introspection to coding agents over MCP (stdio transport).
+    /// Register with e.g.: claude mcp add oam -- oam mcp
+    Mcp,
 }
 
 fn main() -> ExitCode {
@@ -51,6 +54,13 @@ fn main() -> ExitCode {
             }
         },
         Command::Check { path } => check_path(path, cli.json),
+        Command::Mcp => match oam_mcp::serve_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("oam mcp: stdio transport failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

@@ -702,6 +702,67 @@ fn check_single_file_without_tsconfig() {
 }
 
 #[test]
+fn mcp_serves_the_agent_loop_over_stdio() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let broken = write_temp("mcp_broken.ts", "import './does_not_exist';");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam mcp spawns");
+
+    let requests = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "e2e"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "oam_run", "arguments": {"file": broken.to_str().unwrap()}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "oam_explain", "arguments": {"code": "OAM-MOD0001"}}}),
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for request in &requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+    }
+    drop(child.stdin.take()); // EOF ends the server loop cleanly.
+
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).expect("each response is JSON"))
+        .collect();
+    assert!(child.wait().unwrap().success(), "clean exit on stdin EOF");
+
+    // 4 requests with ids -> 4 responses, in order; the notification none.
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 4);
+
+    // The run tool reports the failure as structured ODIF, not prose.
+    let run_payload: serde_json::Value = serde_json::from_str(
+        responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .expect("oam_run payload is JSON");
+    assert_eq!(run_payload["exitCode"], 1);
+    assert_eq!(run_payload["diagnostics"][0]["code"], "OAM-MOD0001");
+    assert_eq!(run_payload["diagnostics"][0]["origin"], "resolve");
+
+    // And the agent can ask what the code means.
+    let explanation = responses[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(explanation.contains("candidate path"), "got: {explanation}");
+}
+
+#[test]
 fn dotted_basename_resolves_appended_extension() {
     write_temp("my.module.ts", "export const m: string = 'dotted';");
     let main = write_temp(
