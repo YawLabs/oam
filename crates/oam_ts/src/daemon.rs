@@ -327,8 +327,16 @@ pub fn stop(target: &Path) -> bool {
 /// exits — observed as a 30-minute test hang. Clearing the inherit flag on
 /// our own std handles before the spawn closes the leak; our own IO is
 /// unaffected (the flag only governs inheritance).
+///
+/// IMPORTANT: every INTERMEDIATE spawner needs this too — `oam mcp` piping
+/// `oam run` leaked ITS std handles (the agent's pipes) into the run child
+/// as non-stdio extras, which the daemon then inherited transitively. Any
+/// oam code spawning children with piped/null stdio should call this first
+/// (and must NOT rely on Stdio::inherit afterwards — inherit requires the
+/// handle to stay inheritable). The durable fix is an explicit
+/// PROC_THREAD_ATTRIBUTE_HANDLE_LIST; tracked for the perf/correctness pass.
 #[cfg(windows)]
-fn unshare_std_handles() {
+pub fn unshare_std_handles() {
     unsafe extern "system" {
         fn GetStdHandle(std_handle: u32) -> *mut core::ffi::c_void;
         fn SetHandleInformation(handle: *mut core::ffi::c_void, mask: u32, flags: u32) -> i32;
@@ -346,6 +354,11 @@ fn unshare_std_handles() {
         }
     }
 }
+
+/// Non-Windows: handle inheritance is governed by CLOEXEC, which Rust std
+/// sets on everything it creates; nothing to do.
+#[cfg(not(windows))]
+pub fn unshare_std_handles() {}
 
 fn spawn_daemon(tsconfig: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;

@@ -222,11 +222,17 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
     use std::time::{Duration, Instant};
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // Windows: clear inherit on OUR std handles (the agent's pipes) so they
+    // can't leak through the run child into its detached type-check daemon
+    // and hold the agent's pipe chain open (see oam_ts::daemon docs). stdin
+    // is explicitly null because inherit would no longer work after this.
+    oam_ts::daemon::unshare_std_handles();
     let mut child = std::process::Command::new(exe)
         .arg("run")
         .arg("--json")
         .arg("--")
         .arg(file)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

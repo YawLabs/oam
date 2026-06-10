@@ -1,0 +1,10 @@
+{
+  // The demo project uses paths aliases — oam's loader and tsgo agree.
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "paths": {
+      "@lib/*": ["./src/lib/*"],
+    },
+  },
+}
