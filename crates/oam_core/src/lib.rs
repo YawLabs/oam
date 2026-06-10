@@ -56,6 +56,11 @@ pub struct OpCompletion {
 /// await. Single-reader discipline is guaranteed by ReadableStream's lock.
 pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Response>>>;
 
+/// Open file handles for fs streams — same remove-await-reinsert
+/// discipline as BodyRegistry (node:stream's write queue serializes
+/// access per handle).
+pub type FileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::fs::File>>>;
+
 pub struct CoreRuntime {
     tokio: tokio::runtime::Runtime,
     /// Shared HTTP client (connection pool). Owned per CoreRuntime so pooled
@@ -66,6 +71,7 @@ pub struct CoreRuntime {
     next_id: OpId,
     inflight: usize,
     bodies: BodyRegistry,
+    files: FileRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -96,6 +102,7 @@ impl CoreRuntime {
             next_id: 1,
             inflight: 0,
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -111,9 +118,15 @@ impl CoreRuntime {
         self.bodies.clone()
     }
 
-    /// Allocator handle for new streaming bodies.
+    /// Allocator handle for new streaming bodies AND file handles (one id
+    /// space; the registries are separate).
     pub fn body_ids(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.next_body.clone()
+    }
+
+    /// Open-file registry for fs streams (Arc clone; dies with the run).
+    pub fn files(&self) -> FileRegistry {
+        self.files.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /
@@ -518,6 +531,89 @@ pub mod ops {
             "bodyHandle": handle,
         });
         OpOutcome::Json(payload.to_string())
+    }
+
+    /// Open a file for streaming. Mode: "r" read, "w" truncate-create,
+    /// "a" append-create. Resolves with Json {handle}.
+    pub async fn fs_open(
+        files: super::FileRegistry,
+        ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        path: String,
+        mode: String,
+    ) -> OpOutcome {
+        let mut options = tokio::fs::OpenOptions::new();
+        match mode.as_str() {
+            "r" => options.read(true),
+            "w" => options.write(true).create(true).truncate(true),
+            "a" => options.append(true).create(true),
+            other => {
+                return OpOutcome::Failed(format!("fs_open: unknown mode '{other}'"));
+            }
+        };
+        match options.open(&path).await {
+            Ok(file) => {
+                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                files
+                    .lock()
+                    .expect("file registry lock")
+                    .insert(handle, file);
+                OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
+            }
+            Err(e) => node_fail(e, "open", &path),
+        }
+    }
+
+    /// Read up to `len` bytes. Bytes = data, Done = EOF (handle stays open
+    /// until fs_close — the JS side closes explicitly).
+    pub async fn fs_read_chunk(files: super::FileRegistry, handle: u64, len: usize) -> OpOutcome {
+        use tokio::io::AsyncReadExt;
+        let file = files.lock().expect("file registry lock").remove(&handle);
+        let Some(mut file) = file else {
+            return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
+        };
+        let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
+        match file.read(&mut buf).await {
+            Ok(0) => {
+                files
+                    .lock()
+                    .expect("file registry lock")
+                    .insert(handle, file);
+                OpOutcome::Done
+            }
+            Ok(n) => {
+                files
+                    .lock()
+                    .expect("file registry lock")
+                    .insert(handle, file);
+                buf.truncate(n);
+                OpOutcome::Bytes(buf)
+            }
+            Err(e) => node_fail(e, "read", &handle.to_string()),
+        }
+    }
+
+    /// Append one chunk to an open handle (the node:stream write queue
+    /// serializes callers).
+    pub async fn fs_write_chunk(
+        files: super::FileRegistry,
+        handle: u64,
+        bytes: Vec<u8>,
+    ) -> OpOutcome {
+        use tokio::io::AsyncWriteExt;
+        let file = files.lock().expect("file registry lock").remove(&handle);
+        let Some(mut file) = file else {
+            return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
+        };
+        match file.write_all(&bytes).await {
+            Ok(()) => {
+                files
+                    .lock()
+                    .expect("file registry lock")
+                    .insert(handle, file);
+                OpOutcome::Done
+            }
+            Err(e) => node_fail(e, "write", &handle.to_string()),
+        }
     }
 
     /// Read one chunk from a streaming body. Bytes = a chunk, Done = EOF

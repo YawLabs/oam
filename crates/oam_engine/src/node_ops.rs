@@ -123,6 +123,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsUnlink", op_fs_unlink),
         ("fsAccess", op_fs_access),
         ("fsRealpath", op_fs_realpath),
+        // fs streams (createReadStream/createWriteStream)
+        ("fsOpen", op_fs_open),
+        ("fsReadChunk", op_fs_read_chunk),
+        ("fsWriteChunk", op_fs_write_chunk),
+        ("fsClose", op_fs_close),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -838,4 +843,81 @@ fn op_fs_realpath(
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_realpath(path));
+}
+
+// ---------------------------------------------------------- fs stream ops
+
+fn op_fs_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "fsOpen requires a path");
+        return;
+    };
+    let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let files = core.files();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_open(files, ids, path, mode),
+    );
+}
+
+fn op_fs_read_chunk(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let files = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .files();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_read_chunk(files, handle, len),
+    );
+}
+
+fn op_fs_write_chunk(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "fsWriteChunk requires data");
+        return;
+    };
+    let files = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .files();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_write_chunk(files, handle, bytes),
+    );
+}
+
+/// Synchronous: dropping the File closes it (flush happens in write ops).
+fn op_fs_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .files();
+    files.lock().expect("file registry lock").remove(&handle);
 }

@@ -24,7 +24,8 @@ v8 = "150"
 
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "fs"] }
+# io-util: AsyncReadExt/AsyncWriteExt for the streaming file ops.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util"] }
 # rustls-no-provider + explicit ring: reqwest's default rustls provider is
 # aws-lc-rs, whose C build (aws-lc-sys) fails under MSVC on ARM64. ring
 # compiles clean on every tier-1 target (same choice Deno ships).

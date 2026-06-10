@@ -328,7 +328,7 @@ fn explain_code(code: &str) -> String {
         ),
         (
             "OAM-MOD0006",
-            "This Node builtin is not implemented yet. Wave 1 ships assert, async_hooks (AsyncLocalStorage), buffer, events, fs, fs/promises, module, os, path, process, tty, and util; the rest (crypto, http, child_process, streams, ...) land with later compat waves.",
+            "This Node builtin is not implemented yet. Shipped: assert, async_hooks (AsyncLocalStorage), buffer, events, fs (+streams), fs/promises, module, os, path, process, stream (+promises/web/consumers), tty, util; the rest (crypto, http, child_process, ...) land with later compat waves.",
         ),
         (
             "OAM-MOD0007",

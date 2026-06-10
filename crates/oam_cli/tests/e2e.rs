@@ -1108,6 +1108,126 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
     );
 }
 
+// ------------------------------------------------------------ node:stream
+
+#[test]
+fn node_stream_readable_writable_and_pipe_backpressure() {
+    let stdout = run_ok(
+        "nstream_core.mjs",
+        "import { Readable, Writable } from 'node:stream';\n\
+         // Push-source Readable: data events + end.\n\
+         const r1 = new Readable({ read() {} });\n\
+         const got = [];\n\
+         r1.on('data', (c) => got.push(c.toString()));\n\
+         r1.on('end', () => console.log('events:', got.join('+')));\n\
+         r1.push('a'); r1.push('b'); r1.push(null);\n\
+         // Async iteration over a pull source.\n\
+         let n = 0;\n\
+         const r2 = new Readable({ objectMode: true, read() { n++; this.push(n > 3 ? null : n); } });\n\
+         const nums = [];\n\
+         for await (const v of r2) nums.push(v);\n\
+         console.log('iter:', nums.join(','));\n\
+         // pipe with backpressure: tiny HWM writable, slow consumer.\n\
+         const src = Readable.from(['x'.repeat(10), 'y'.repeat(10), 'z'.repeat(10)]);\n\
+         let written = '';\n\
+         let sawFalse = false;\n\
+         const dest = new Writable({\n\
+           objectMode: true,\n\
+           highWaterMark: 1,\n\
+           write(chunk, _e, cb) { written += chunk; setTimeout(cb, 5); },\n\
+         });\n\
+         const origWrite = dest.write.bind(dest);\n\
+         dest.write = (...a) => { const ok = origWrite(...a); if (!ok) sawFalse = true; return ok; };\n\
+         await new Promise((resolve) => { dest.on('finish', resolve); src.pipe(dest); });\n\
+         console.log('piped:', written.length, sawFalse);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "events: a+b");
+    assert_eq!(lines[1], "iter: 1,2,3");
+    // All 30 chars arrived AND backpressure was exercised.
+    assert_eq!(lines[2], "piped: 30 true");
+}
+
+#[test]
+fn node_stream_transform_pipeline_finished_and_web_interop() {
+    let stdout = run_ok(
+        "nstream_pipe.mjs",
+        "import { Readable, Writable, Transform, PassThrough } from 'node:stream';\n\
+         import { pipeline, finished } from 'node:stream/promises';\n\
+         const upper = new Transform({\n\
+           transform(chunk, _e, cb) { cb(null, chunk.toString().toUpperCase()); },\n\
+         });\n\
+         let out = '';\n\
+         const sink = new Writable({ write(c, _e, cb) { out += c; cb(); } });\n\
+         await pipeline(Readable.from(['ab', 'cd']), upper, new PassThrough(), sink);\n\
+         console.log(out);\n\
+         // pipeline propagates errors and destroys the chain.\n\
+         const boom = new Transform({ transform(_c, _e, cb) { cb(new Error('mid-fail')); } });\n\
+         let caught = '';\n\
+         try {\n\
+           await pipeline(Readable.from(['x']), boom, new Writable({ write(_c, _e, cb) { cb(); } }));\n\
+         } catch (e) { caught = e.message; }\n\
+         console.log(caught);\n\
+         // finished() resolves on writable completion.\n\
+         const w = new Writable({ write(_c, _e, cb) { cb(); } });\n\
+         const done = finished(w);\n\
+         w.end('last');\n\
+         await done;\n\
+         console.log('finished-ok');\n\
+         // Web interop round trip: node Readable -> web -> TextDecoderStream.\n\
+         const node = Readable.from([new Uint8Array([0x68, 0x69])]);\n\
+         const web = Readable.toWeb(node);\n\
+         let text = '';\n\
+         for await (const part of web.pipeThrough(new TextDecoderStream())) text += part;\n\
+         console.log('toWeb:', text);\n\
+         const back = Readable.fromWeb(ReadableStream.from(['w1', 'w2']), { objectMode: true });\n\
+         const items = [];\n\
+         for await (const v of back) items.push(v);\n\
+         console.log('fromWeb:', items.join(','));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "ABCD");
+    assert_eq!(lines[1], "mid-fail");
+    assert_eq!(lines[2], "finished-ok");
+    assert_eq!(lines[3], "toWeb: hi");
+    assert_eq!(lines[4], "fromWeb: w1,w2");
+}
+
+#[test]
+fn fs_streams_roundtrip_large_file_in_chunks() {
+    let stdout = run_ok(
+        "fsstream/main.mjs",
+        "import fs from 'node:fs';\n\
+         import path from 'node:path';\n\
+         import { pipeline } from 'node:stream/promises';\n\
+         const dir = import.meta.dirname;\n\
+         const src = path.join(dir, 'big.bin');\n\
+         const dst = path.join(dir, 'copy.bin');\n\
+         // ~300KB: forces multiple 64KB chunks through the read stream.\n\
+         const payload = Buffer.alloc(300 * 1024);\n\
+         for (let i = 0; i < payload.length; i++) payload[i] = i % 251;\n\
+         fs.writeFileSync(src, payload);\n\
+         let chunks = 0;\n\
+         const reader = fs.createReadStream(src);\n\
+         reader.on('data', () => chunks++);\n\
+         reader.pause();\n\
+         await pipeline(reader, fs.createWriteStream(dst));\n\
+         const copied = fs.readFileSync(dst);\n\
+         console.log(copied.length, copied.equals(payload), chunks > 1);\n\
+         // setEncoding on a text file.\n\
+         const tsrc = path.join(dir, 'lines.txt');\n\
+         fs.writeFileSync(tsrc, 'line1\\nline2\\nline3');\n\
+         let text = '';\n\
+         const tr = fs.createReadStream(tsrc, { encoding: 'utf8' });\n\
+         for await (const part of tr) text += part;\n\
+         console.log(text.split('\\n').length);\n\
+         fs.rmSync(src); fs.rmSync(dst); fs.rmSync(tsrc);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "307200 true true");
+    assert_eq!(lines[1], "3");
+}
+
 // ------------------------------------------------------------ web streams
 
 #[test]
