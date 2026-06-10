@@ -94,6 +94,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
+        // AsyncLocalStorage substrate: V8's continuation-preserved embedder
+        // data, propagated across promise continuations by V8 itself.
+        ("getContinuationData", op_get_continuation_data),
+        ("setContinuationData", op_set_continuation_data),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsWriteFileSync", op_fs_write_file_sync),
@@ -418,6 +422,26 @@ fn op_username(
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
     }
+}
+
+/// Read the current continuation frame (an immutable Map of
+/// AsyncLocalStorage -> store, or undefined). V8 snapshots this value into
+/// every promise reaction at creation and restores it when the reaction
+/// runs — which is exactly AsyncLocalStorage's await semantics, for free.
+fn op_get_continuation_data(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(scope.get_continuation_preserved_embedder_data());
+}
+
+fn op_set_continuation_data(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    scope.set_continuation_preserved_embedder_data(args.get(0));
 }
 
 fn op_make_require(

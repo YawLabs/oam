@@ -1094,6 +1094,145 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
     );
 }
 
+// ------------------------------------------------- AsyncLocalStorage (CPED)
+
+#[test]
+fn als_basic_nested_and_sibling_isolation() {
+    let stdout = run_ok(
+        "als_basic.mjs",
+        "import { AsyncLocalStorage } from 'node:async_hooks';\n\
+         const als = new AsyncLocalStorage();\n\
+         const other = new AsyncLocalStorage();\n\
+         console.log(als.getStore());\n\
+         als.run('outer', () => {\n\
+           console.log(als.getStore(), other.getStore());\n\
+           als.run('inner', () => console.log(als.getStore()));\n\
+           other.run('sibling', () => console.log(als.getStore(), other.getStore()));\n\
+           console.log(als.getStore());\n\
+         });\n\
+         console.log(als.getStore());",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "undefined");
+    assert_eq!(lines[1], "outer undefined");
+    assert_eq!(lines[2], "inner");
+    // A sibling storage layered on top must not disturb this one.
+    assert_eq!(lines[3], "outer sibling");
+    assert_eq!(lines[4], "outer");
+    assert_eq!(lines[5], "undefined");
+}
+
+#[test]
+fn als_survives_await_and_timers() {
+    // The CPED probe: context must survive (1) a plain microtask await,
+    // (2) a real async-op await (the oam sleep ride the op channel), and
+    // (3) a setTimeout macrotask hop. This empirically proves the V8 build
+    // propagates continuation-preserved embedder data.
+    let stdout = run_ok(
+        "als_await.mjs",
+        "import { AsyncLocalStorage } from 'node:async_hooks';\n\
+         const als = new AsyncLocalStorage();\n\
+         await als.run('ctx', async () => {\n\
+           await Promise.resolve();\n\
+           console.log('after-micro', als.getStore());\n\
+           await oam.sleep(5);\n\
+           console.log('after-op', als.getStore());\n\
+           await new Promise((resolve) => setTimeout(resolve, 5));\n\
+           console.log('after-timer', als.getStore());\n\
+           setTimeout(() => console.log('in-timer', als.getStore()), 5);\n\
+         });\n\
+         console.log('outside', als.getStore());",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "after-micro ctx");
+    assert_eq!(lines[1], "after-op ctx");
+    assert_eq!(lines[2], "after-timer ctx");
+    assert_eq!(lines[3], "outside undefined");
+    assert_eq!(lines[4], "in-timer ctx");
+}
+
+#[test]
+fn als_interleaved_concurrent_contexts_stay_isolated() {
+    // The classic correctness test: two async chains with different stores
+    // interleaving through timers — each must always see ITS OWN store.
+    let stdout = run_ok(
+        "als_interleave.mjs",
+        "import { AsyncLocalStorage } from 'node:async_hooks';\n\
+         const als = new AsyncLocalStorage();\n\
+         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\n\
+         const seen = [];\n\
+         async function task(name, delay) {\n\
+           await als.run(name, async () => {\n\
+             for (let i = 0; i < 3; i++) {\n\
+               await sleep(delay);\n\
+               seen.push(`${name}=${als.getStore()}`);\n\
+             }\n\
+           });\n\
+         }\n\
+         await Promise.all([task('A', 3), task('B', 5), task('C', 1)]);\n\
+         console.log(seen.every((s) => { const [want, got] = s.split('='); return want === got; }), seen.length);",
+    );
+    assert_eq!(stdout, "true 9");
+}
+
+#[test]
+fn als_enter_with_exit_snapshot_and_resource_bind() {
+    let stdout = run_ok(
+        "als_api.mjs",
+        "import { AsyncLocalStorage, AsyncResource } from 'node:async_hooks';\n\
+         const als = new AsyncLocalStorage();\n\
+         als.run('outer', () => {\n\
+           als.exit(() => console.log('exited', als.getStore()));\n\
+           console.log('back', als.getStore());\n\
+           const restore = AsyncLocalStorage.snapshot();\n\
+           als.run('other', () => {\n\
+             restore(() => console.log('snapshot-sees', als.getStore()));\n\
+           });\n\
+           const bound = AsyncResource.bind(() => als.getStore());\n\
+           als.run('rebound', () => console.log('bound-sees', bound()));\n\
+         });\n\
+         als.enterWith('entered');\n\
+         console.log('entered', als.getStore());\n\
+         als.disable();\n\
+         console.log('disabled', als.getStore());",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "exited undefined");
+    assert_eq!(lines[1], "back outer");
+    // snapshot() captured the 'outer' frame, not the 'other' one.
+    assert_eq!(lines[2], "snapshot-sees outer");
+    // AsyncResource.bind froze the 'outer' frame too.
+    assert_eq!(lines[3], "bound-sees outer");
+    assert_eq!(lines[4], "entered entered");
+    assert_eq!(lines[5], "disabled undefined");
+}
+
+#[test]
+fn als_works_from_require_and_nexttick() {
+    write_temp(
+        "alsreq/main.cjs",
+        "const { AsyncLocalStorage } = require('node:async_hooks');\n\
+         const als = new AsyncLocalStorage();\n\
+         als.run({ id: 42 }, () => {\n\
+           process.nextTick(() => console.log('tick', als.getStore().id));\n\
+           queueMicrotask(() => console.log('micro', als.getStore().id));\n\
+         });",
+    );
+    let main = write_temp("alsreq/.anchor", "")
+        .parent()
+        .unwrap()
+        .join("main.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("tick 42"), "stdout: {stdout}");
+    assert!(stdout.contains("micro 42"), "stdout: {stdout}");
+}
+
 #[test]
 fn dynamic_import_rejects_with_actionable_message() {
     let main = write_temp(

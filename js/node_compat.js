@@ -2242,6 +2242,7 @@
 
     const builtinModules = [
       "assert",
+      "async_hooks",
       "buffer",
       "events",
       "fs",
@@ -2272,6 +2273,145 @@
     };
   };
 
+  // ---------------------------------------------------------- async_hooks
+  // AsyncLocalStorage rides V8's continuation-preserved embedder data
+  // (Node 24's AsyncContextFrame model): the "frame" is an IMMUTABLE Map
+  // of storage-instance -> store living in the CPED slot. V8 snapshots the
+  // frame into every promise reaction at creation and restores it when the
+  // reaction runs, so `await` propagation costs nothing extra; timers and
+  // friends are bound to their scheduling frame by the wrappers installed
+  // in installRuntimeGlobals.
+  //
+  // Wave-1 divergences (documented): executionAsyncId/triggerAsyncId
+  // return 0 (no async-ids machinery); createHook is a warn-once no-op —
+  // the legacy diagnostics API is deprecated in Node and the packages that
+  // matter feature-detect AsyncLocalStorage first.
+  registry.factories.async_hooks = (natives) => {
+    const getFrame = () => natives.getContinuationData();
+    const setFrame = (frame) => natives.setContinuationData(frame);
+
+    class AsyncResource {
+      constructor(type, _options) {
+        this.type = String(type ?? "AsyncResource");
+        this._frame = getFrame();
+      }
+      runInAsyncScope(fn, thisArg, ...args) {
+        const prev = getFrame();
+        setFrame(this._frame);
+        try {
+          return fn.apply(thisArg, args);
+        } finally {
+          setFrame(prev);
+        }
+      }
+      bind(fn) {
+        const resource = this;
+        const bound = function (...args) {
+          return resource.runInAsyncScope(fn, this, ...args);
+        };
+        Object.defineProperty(bound, "name", { value: `bound ${fn.name || ""}`.trim() });
+        return bound;
+      }
+      static bind(fn, type, thisArg) {
+        const resource = new AsyncResource(type ?? "bound-anonymous-fn");
+        const bound = function (...args) {
+          return resource.runInAsyncScope(fn, thisArg ?? this, ...args);
+        };
+        Object.defineProperty(bound, "name", { value: `bound ${fn.name || ""}`.trim() });
+        return bound;
+      }
+      emitDestroy() {
+        return this;
+      }
+      asyncId() {
+        return 0;
+      }
+      triggerAsyncId() {
+        return 0;
+      }
+    }
+
+    class AsyncLocalStorage {
+      constructor() {
+        this._disabled = false;
+      }
+      static bind(fn) {
+        return AsyncResource.bind(fn);
+      }
+      static snapshot() {
+        return AsyncResource.bind((cb, ...args) => cb(...args), "AsyncLocalStorage.snapshot");
+      }
+      getStore() {
+        if (this._disabled) return undefined;
+        const frame = getFrame();
+        return frame instanceof Map ? frame.get(this) : undefined;
+      }
+      run(store, fn, ...args) {
+        this._disabled = false;
+        const prev = getFrame();
+        const next = new Map(prev instanceof Map ? prev : undefined);
+        next.set(this, store);
+        setFrame(next);
+        try {
+          return fn(...args);
+        } finally {
+          setFrame(prev);
+        }
+      }
+      exit(fn, ...args) {
+        const prev = getFrame();
+        if (!(prev instanceof Map) || !prev.has(this)) return fn(...args);
+        const next = new Map(prev);
+        next.delete(this);
+        setFrame(next);
+        try {
+          return fn(...args);
+        } finally {
+          setFrame(prev);
+        }
+      }
+      enterWith(store) {
+        this._disabled = false;
+        const prev = getFrame();
+        const next = new Map(prev instanceof Map ? prev : undefined);
+        next.set(this, store);
+        setFrame(next);
+      }
+      disable() {
+        this._disabled = true;
+      }
+    }
+
+    let warnedCreateHook = false;
+    function createHook(_callbacks) {
+      if (!warnedCreateHook) {
+        warnedCreateHook = true;
+        if (globalThis.console) {
+          globalThis.console.warn(
+            "(oam) async_hooks.createHook is a no-op: the legacy hooks API is " +
+              "deprecated in Node; use AsyncLocalStorage (fully supported)",
+          );
+        }
+      }
+      return {
+        enable() {
+          return this;
+        },
+        disable() {
+          return this;
+        },
+      };
+    }
+
+    return {
+      AsyncLocalStorage,
+      AsyncResource,
+      createHook,
+      executionAsyncId: () => 0,
+      triggerAsyncId: () => 0,
+      executionAsyncResource: () => ({}),
+    };
+  };
   // ------------------------------------------------------------------ tty
   registry.factories.tty = (natives) => ({
     isatty: (fd) => natives.isTTY(Number(fd)),
@@ -2313,6 +2453,37 @@
       now: () => natives.nowMs(),
       timeOrigin: Date.now() - natives.nowMs(),
     };
+
+    // AsyncLocalStorage across macrotasks: V8's CPED only travels with
+    // promise continuations, so timer-family callbacks are bound to the
+    // frame current at SCHEDULING time (Node semantics). Promise paths
+    // need no wrapper — V8 handles them.
+    {
+      const bindToCurrentFrame = (fn) => {
+        if (typeof fn !== "function") return fn;
+        const frame = natives.getContinuationData();
+        return function (...args) {
+          const prev = natives.getContinuationData();
+          natives.setContinuationData(frame);
+          try {
+            return fn.apply(this, args);
+          } finally {
+            natives.setContinuationData(prev);
+          }
+        };
+      };
+      // setImmediate delegates to globalThis.setTimeout at call time, so
+      // wrapping the timer pair covers it — no double-bind.
+      for (const name of ["setTimeout", "setInterval", "queueMicrotask"]) {
+        const native = globalThis[name];
+        if (typeof native !== "function") continue;
+        const wrapped = function (fn, ...rest) {
+          return native(bindToCurrentFrame(fn), ...rest);
+        };
+        Object.defineProperty(wrapped, "name", { value: name });
+        globalThis[name] = wrapped;
+      }
+    }
 
     const util = registry.get("util");
     const fmt = (args) =>
