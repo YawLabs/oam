@@ -19,6 +19,8 @@ pub enum Origin {
     Parse,
     /// OAM-TS*: type diagnostics from the tsgo sidecar (TS codes pass through).
     Typecheck,
+    /// OAM-MOD*: module resolution / loading.
+    Resolve,
     /// OAM-RT*: runtime exceptions, unhandled rejections.
     Runtime,
     /// OAM-TEST*: test runner results.

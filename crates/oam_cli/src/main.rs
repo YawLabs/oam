@@ -66,45 +66,49 @@ fn run(cli: &Cli) -> Result<(), Vec<Diagnostic>> {
     }
 }
 
-fn run_file(file: &Path) -> Result<(), Vec<Diagnostic>> {
-    let kind = oam_loader::classify(file);
-    if kind == SourceKind::Jsx {
-        return Err(vec![Diagnostic::new(
-            "OAM-PARSE0003",
-            Severity::Error,
-            Origin::Parse,
-            format!(
-                ".tsx/.jsx support lands with the module loader (JSX automatic runtime needs ESM): {}",
-                file.display()
-            ),
-        )]);
+/// The CLI's module host: filesystem loading + oxc transpilation, with the
+/// resolution rules from oam_loader. Everything `oam run` executes goes
+/// through this — entry file included — as an ES module (ESM-first per plan).
+struct CliHost;
+
+impl oam_engine::ModuleHost for CliHost {
+    fn resolve(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Vec<Diagnostic>> {
+        oam_loader::resolve_import(specifier, referrer).map_err(|d| vec![d])
     }
 
-    let source = std::fs::read_to_string(file).map_err(|e| {
-        vec![Diagnostic::new(
-            "OAM-RT0002",
-            Severity::Error,
-            Origin::Runtime,
-            format!("could not read {}: {e}", file.display()),
-        )]
-    })?;
-
-    let code = match kind {
-        SourceKind::TypeScript => {
-            oam_loader::transpile_typescript(file, &source).map_err(|e| e.diagnostics)?
+    fn load(&self, path: &Path) -> Result<String, Vec<Diagnostic>> {
+        let kind = oam_loader::classify(path);
+        if kind == SourceKind::Jsx {
+            return Err(vec![Diagnostic::new(
+                "OAM-PARSE0003",
+                Severity::Error,
+                Origin::Parse,
+                format!(
+                    ".tsx/.jsx support lands with the JSX automatic runtime (needs npm resolution, M2): {}",
+                    path.display()
+                ),
+            )]);
         }
-        _ => source,
-    };
 
-    let mut rt = oam_engine::JsRuntime::new();
-    rt.execute_script(&file.to_string_lossy(), &code)
-        .map_err(|e| {
+        let source = std::fs::read_to_string(path).map_err(|e| {
             vec![Diagnostic::new(
-                "OAM-RT0001",
+                "OAM-RT0002",
                 Severity::Error,
                 Origin::Runtime,
-                e.to_string(),
+                format!("could not read {}: {e}", path.display()),
             )]
         })?;
-    Ok(())
+
+        match kind {
+            SourceKind::TypeScript => {
+                oam_loader::transpile_typescript(path, &source).map_err(|e| e.diagnostics)
+            }
+            _ => Ok(source),
+        }
+    }
+}
+
+fn run_file(file: &Path) -> Result<(), Vec<Diagnostic>> {
+    let mut rt = oam_engine::JsRuntime::new();
+    rt.execute_module(file, &CliHost)
 }

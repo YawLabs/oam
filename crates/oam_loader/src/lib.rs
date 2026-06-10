@@ -10,7 +10,7 @@
 //! interop, tsconfig paths, .tsx (needs the module loader for the JSX
 //! automatic runtime), content-addressed transform caches.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oam_diagnostics::{Diagnostic, Origin, Position, Severity, Span};
 use oxc_allocator::Allocator;
@@ -104,6 +104,81 @@ fn to_odif(
             d
         })
         .collect()
+}
+
+/// Resolve an import specifier as written in the module at `referrer`.
+///
+/// M1 slice: relative + absolute paths only. Candidate order for './x':
+/// exact (if it has an extension), TS-source fallback for JS extensions
+/// ('./x.js' -> x.ts, the tsgo rewrite convention), then extensionless
+/// probing (.ts, .mts, .js, .mjs) and directory index (index.ts, index.js).
+/// Bare and node: specifiers are a clear diagnostic until npm resolution
+/// lands (M2).
+pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+    let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
+    if !is_relative && !Path::new(specifier).is_absolute() {
+        return Err(Diagnostic::new(
+            "OAM-MOD0002",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "cannot resolve '{specifier}' from {}: bare and node: specifiers land with npm resolution (M2)",
+                referrer.display()
+            ),
+        ));
+    }
+
+    let base = referrer.parent().unwrap_or_else(|| Path::new("."));
+    let raw = if is_relative {
+        base.join(specifier)
+    } else {
+        PathBuf::from(specifier)
+    };
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match raw.extension().and_then(|e| e.to_str()) {
+        Some(ext) => {
+            candidates.push(raw.clone());
+            let ts_swap = match ext {
+                "js" => Some("ts"),
+                "mjs" => Some("mts"),
+                "cjs" => Some("cts"),
+                _ => None,
+            };
+            if let Some(swap) = ts_swap {
+                candidates.push(raw.with_extension(swap));
+            }
+        }
+        None => {
+            for ext in ["ts", "mts", "js", "mjs"] {
+                candidates.push(raw.with_extension(ext));
+            }
+            for index in ["index.ts", "index.js"] {
+                candidates.push(raw.join(index));
+            }
+        }
+    }
+
+    candidates
+        .iter()
+        .find(|c| c.is_file())
+        .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()))
+        .ok_or_else(|| {
+            Diagnostic::new(
+                "OAM-MOD0001",
+                Severity::Error,
+                Origin::Resolve,
+                format!(
+                    "cannot resolve '{specifier}' from {} (tried {})",
+                    referrer.display(),
+                    candidates
+                        .iter()
+                        .map(|c| c.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        })
 }
 
 /// Byte offset -> 1-based line/col. Clamps past-the-end offsets.

@@ -16,6 +16,9 @@
 use anyhow::{Result, anyhow};
 use std::sync::Once;
 
+mod modules;
+pub use modules::ModuleHost;
+
 static V8_INIT: Once = Once::new();
 
 /// Initialize the V8 platform exactly once per process.
@@ -85,7 +88,7 @@ impl Default for JsRuntime {
     }
 }
 
-fn exception_to_error(
+pub(crate) fn exception_to_error(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     name: &str,
 ) -> anyhow::Error {
