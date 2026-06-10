@@ -1,4 +1,4 @@
-//! End-to-end tests against the real `oam` binary.
+﻿//! End-to-end tests against the real `oam` binary.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -219,7 +219,7 @@ fn top_level_await_settles_on_microtasks() {
 #[test]
 fn import_cycles_follow_esm_tdz_semantics() {
     // cycle_a evaluates first (entry-last post-order), so its top level must
-    // not touch cycle_b's bindings — but lazy access via a function is fine.
+    // not touch cycle_b's bindings â€” but lazy access via a function is fine.
     write_temp(
         "cycle_a.ts",
         "import { b } from './cycle_b';\nexport const a: string = 'a';\nexport function aSeesB(): string { return b; }",
@@ -696,7 +696,7 @@ fn uncaught_microtask_exception_fails_the_run() {
 fn check_missing_tsgo_is_ts0000_via_env() {
     let file = write_temp("env_check.ts", "export const n: number = 1;");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["check", file.to_str().unwrap(), "--json"])
+        .args(["check", file.to_str().unwrap(), "--json", "--no-daemon"])
         .env("OAM_TSGO", "/definitely/not/a/tsgo")
         .output()
         .unwrap();
@@ -704,6 +704,92 @@ fn check_missing_tsgo_is_ts0000_via_env() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000"),
         "missing tsgo must classify as OAM-TS0000"
+    );
+}
+
+#[test]
+fn check_daemon_lifecycle_and_cache() {
+    // Fully isolated daemon world: state files, build-info, and the daemon
+    // itself all live under this run's cache dir and are stopped at the end.
+    let cache = write_temp("daemon-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "daemonproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("daemonproj/ok.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let oam_d = |args: &[&str]| -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            // Regression guard: if daemon spawn/teardown ever breaks again,
+            // the daemon reaps itself in 45s instead of wedging the suite.
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .output()
+            .expect("oam runs")
+    };
+
+    let first = oam_d(&["check", proj.to_str().unwrap()]);
+    if !tsgo_available(&first) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let status = oam_d(&["daemon", "status", proj.to_str().unwrap()]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    assert_eq!(parsed["running"], true, "daemon should be up: {parsed}");
+    assert!(parsed["checks_served"].as_u64().unwrap() >= 1);
+
+    // Unchanged tree: second check must be served from the daemon cache.
+    let second = oam_d(&["check", proj.to_str().unwrap()]);
+    assert!(second.status.success());
+    let status = oam_d(&["daemon", "status", proj.to_str().unwrap()]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    assert!(
+        parsed["cache_hits"].as_u64().unwrap() >= 1,
+        "repeat check should cache-hit: {parsed}"
+    );
+
+    // Edited tree: diagnostics stay correct (a NEW error must surface).
+    write_temp("daemonproj/ok.ts", "export const n: number = 'broken';");
+    let third = oam_d(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(!third.status.success(), "edited project must fail check");
+    assert!(
+        String::from_utf8_lossy(&third.stderr).contains("OAM-TS2322"),
+        "stderr: {}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+
+    let stop = oam_d(&["daemon", "stop", proj.to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&stop.stdout).trim(),
+        "{\"stopped\":true}"
+    );
+    let status = oam_d(&["daemon", "status", proj.to_str().unwrap()]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    assert_eq!(parsed["running"], false);
+
+    // The incremental build-info landed under OUR cache, not the repo.
+    let buildinfo_dir = cache.join("ts-buildinfo");
+    assert!(
+        buildinfo_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
+        "tsbuildinfo expected under the oam cache"
     );
 }
 
@@ -747,7 +833,7 @@ fn check_reports_type_errors_as_odif() {
     .parent()
     .unwrap()
     .to_path_buf();
-    let out = oam(&["check", dir.to_str().unwrap(), "--json"]);
+    let out = oam(&["check", dir.to_str().unwrap(), "--json", "--no-daemon"]);
     if !tsgo_available(&out) {
         eprintln!("skipping: tsgo not installed");
         return;
@@ -778,7 +864,7 @@ fn check_clean_project_exits_zero() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let out = oam(&["check", dir.to_str().unwrap()]);
+    let out = oam(&["check", dir.to_str().unwrap(), "--no-daemon"]);
     if !tsgo_available(&out) {
         eprintln!("skipping: tsgo not installed");
         return;
@@ -800,7 +886,7 @@ fn check_single_file_without_tsconfig() {
         "lonely_check.ts",
         "const s: string = 42;\nexport default s;",
     );
-    let out = oam(&["check", file.to_str().unwrap(), "--json"]);
+    let out = oam(&["check", file.to_str().unwrap(), "--json", "--no-daemon"]);
     if !tsgo_available(&out) {
         eprintln!("skipping: tsgo not installed");
         return;

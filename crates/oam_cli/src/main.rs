@@ -35,10 +35,35 @@ enum Command {
         /// A .ts file or a directory; the nearest tsconfig.json upward wins.
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Skip the type-check daemon; run a one-shot check.
+        #[arg(long)]
+        no_daemon: bool,
+    },
+    /// Inspect or stop the per-project type-check daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
     },
     /// Serve oam's introspection to coding agents over MCP (stdio transport).
     /// Register with e.g.: claude mcp add oam -- oam mcp
     Mcp,
+    /// Internal: type-check daemon server process. Not for direct use.
+    #[command(name = "__oamd-ts", hide = true)]
+    DaemonServe { tsconfig: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Report whether the project's daemon is running (JSON).
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Stop the project's daemon.
+    Stop {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -53,7 +78,22 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Check { path } => check_path(path, cli.json),
+        Command::Check { path, no_daemon } => check_path(path, cli.json, *no_daemon),
+        Command::Daemon { action } => match action {
+            DaemonAction::Status { path } => {
+                let status = oam_ts::daemon::status(path);
+                println!(
+                    "{}",
+                    serde_json::to_string(&status).expect("status serializes")
+                );
+                ExitCode::SUCCESS
+            }
+            DaemonAction::Stop { path } => {
+                let stopped = oam_ts::daemon::stop(path);
+                println!("{{\"stopped\":{stopped}}}");
+                ExitCode::SUCCESS
+            }
+        },
         Command::Mcp => match oam_mcp::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -61,11 +101,28 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::DaemonServe { tsconfig } => match oam_ts::daemon::serve(tsconfig) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("oam type-check daemon failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
-fn check_path(path: &Path, json: bool) -> ExitCode {
-    match oam_ts::check(path) {
+fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
+    // Daemon first (instant repeat checks), one-shot on ANY daemon trouble:
+    // the daemon may never make `oam check` less reliable than no daemon.
+    let result = if no_daemon {
+        oam_ts::check(path)
+    } else {
+        match oam_ts::daemon::check_via_daemon(path) {
+            Ok(diagnostics) => Ok(diagnostics),
+            Err(_) => oam_ts::check(path),
+        }
+    };
+    match result {
         Err(failure) => {
             render(&failure, json);
             ExitCode::FAILURE

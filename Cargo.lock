@@ -1164,6 +1164,8 @@ name = "oam_ts"
 version = "0.0.1"
 dependencies = [
  "oam_diagnostics",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

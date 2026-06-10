@@ -16,6 +16,4 @@ oam_loader = { workspace = true }
 oam_ts = { workspace = true }
 oam_mcp = { workspace = true }
 clap = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
