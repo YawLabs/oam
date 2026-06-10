@@ -56,8 +56,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
 }
 
 /// Spawn `op` and return its promise via `rv`. The shared shape of every
-/// async binding.
-fn spawn_op(
+/// async binding (node_ops fs natives ride it too).
+pub(crate) fn spawn_op(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     op: impl Future<Output = OpOutcome> + Send + 'static,
@@ -183,10 +183,39 @@ pub(crate) fn settle_completion(
                 }
             }
         }
+        OpOutcome::Bytes(bytes) => {
+            let len = bytes.len();
+            let store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.into_boxed_slice())
+                .make_shared();
+            let buffer = v8::ArrayBuffer::with_backing_store(tc, &store);
+            match v8::Uint8Array::new(tc, buffer, 0, len) {
+                Some(array) => {
+                    resolver.resolve(tc, array.into());
+                }
+                None => {
+                    let message =
+                        v8::String::new(tc, "op produced an unviewable byte payload").unwrap();
+                    let exception = v8::Exception::error(tc, message);
+                    resolver.reject(tc, exception);
+                }
+            }
+        }
         OpOutcome::Failed(message) => {
             let message = v8::String::new(tc, &message)
                 .unwrap_or_else(|| v8::String::new(tc, "op failed").unwrap());
             let exception = v8::Exception::error(tc, message);
+            resolver.reject(tc, exception);
+        }
+        OpOutcome::NodeFailed { code, message } => {
+            let message = v8::String::new(tc, &message)
+                .unwrap_or_else(|| v8::String::new(tc, &code).unwrap());
+            let exception = v8::Exception::error(tc, message);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let key = v8::String::new(tc, "code").unwrap();
+                if let Some(value) = v8::String::new(tc, &code) {
+                    obj.set(tc, key.into(), value.into());
+                }
+            }
             resolver.reject(tc, exception);
         }
     }

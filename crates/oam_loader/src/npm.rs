@@ -14,11 +14,12 @@
 //! way. `require()` resolution uses "main" only, exactly like Node: CJS
 //! callers expect the CJS build.
 //!
-//! Execution gates (precise diagnostics, never silent): node builtins
-//! (prefixed or bare) -> OAM-MOD0006 (compat wave 1); exports-blocked
-//! subpaths -> OAM-MOD0007 (Node's ERR_PACKAGE_PATH_NOT_EXPORTED).
-//! Resolved CJS files are no longer gated (OAM-MOD0005 retired) — the
-//! engine routes them through CJS interop.
+//! Node builtins (prefixed or bare) resolve to virtual `node:NAME` paths
+//! when wave 1 ships them (SUPPORTED_BUILTINS); recognized-but-unshipped
+//! builtins gate on OAM-MOD0006. Exports-blocked subpaths ->
+//! OAM-MOD0007 (Node's ERR_PACKAGE_PATH_NOT_EXPORTED). Resolved CJS files
+//! are no longer gated (OAM-MOD0005 retired) — the engine routes them
+//! through CJS interop.
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use serde_json::Value;
@@ -104,6 +105,25 @@ const NODE_BUILTINS: [&str; 41] = [
     "zlib",
 ];
 
+/// node: compat wave 1 — builtins that resolve to virtual node:NAME paths
+/// the engine instantiates from the snapshot registry. Recognized names
+/// outside this list gate on OAM-MOD0006 with a precise pointer.
+const SUPPORTED_BUILTINS: [&str; 13] = [
+    "assert",
+    "buffer",
+    "events",
+    "fs",
+    "fs/promises",
+    "module",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "process",
+    "tty",
+    "util",
+];
+
 fn diag(code: &str, message: String) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Resolve, message)
 }
@@ -121,9 +141,25 @@ pub(crate) fn resolve_bare(
     mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
     if specifier.starts_with("node:") || is_node_builtin(specifier) {
+        let name = specifier.strip_prefix("node:").unwrap_or(specifier);
+        if SUPPORTED_BUILTINS.contains(&name) {
+            // Virtual path; the engine instantiates the builtin from the
+            // snapshot registry (never touches the filesystem).
+            return Ok(PathBuf::from(format!("node:{name}")));
+        }
+        if is_node_builtin(specifier) {
+            return Err(diag(
+                "OAM-MOD0006",
+                format!(
+                    "'{specifier}' is a Node builtin oam does not implement yet \
+                     (wave 1 ships: {}); the rest land with later compat waves",
+                    SUPPORTED_BUILTINS.join(", ")
+                ),
+            ));
+        }
         return Err(diag(
             "OAM-MOD0006",
-            format!("'{specifier}' is a Node builtin; the node: compat layer lands with M2 wave 1"),
+            format!("'{specifier}' is not a known node: builtin module"),
         ));
     }
 

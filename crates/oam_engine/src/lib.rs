@@ -18,6 +18,7 @@ use std::sync::Once;
 
 mod cjs;
 mod modules;
+mod node_ops;
 mod ops;
 mod timers;
 pub use modules::ModuleHost;
@@ -52,6 +53,7 @@ impl JsRuntime {
         let mut isolate = v8::Isolate::new(params);
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.add_message_listener(modules::message_listener);
+        isolate.set_host_initialize_import_meta_object_callback(modules::import_meta_callback);
         isolate.set_slot(timers::TimerQueue::default());
         isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
         isolate.set_slot(ops::PendingOps::default());
@@ -65,7 +67,12 @@ impl JsRuntime {
             install_console(scope, context);
             timers::install(scope, context);
             ops::install(scope, context);
+            node_ops::install(scope, context);
             cjs::install(scope, context);
+            // Runtime-data globals (process, performance) + the
+            // util.inspect-powered console, defined by node_compat.js in
+            // the snapshot and instantiated here against live natives.
+            install_runtime_globals(scope, context);
             global
         };
         Self { isolate, context }
@@ -120,8 +127,30 @@ pub(crate) fn exception_to_error(
     anyhow!("{name}:{line}: {text}")
 }
 
-/// M0 console: log/info/debug -> stdout, warn/error -> stderr.
-/// Replaced in M1 by the ODIF-aware console in snapshot JS.
+/// Call `__oamNode.installRuntimeGlobals()` (snapshot JS): installs
+/// process/performance and upgrades console to the util.inspect formatter.
+fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
+    let global = context.global(scope);
+    let registry_key = v8::String::new(scope, "__oamNode").unwrap();
+    let registry = global
+        .get(scope, registry_key.into())
+        .expect("__oamNode in snapshot");
+    let registry = v8::Local::<v8::Object>::try_from(registry).expect("__oamNode is an object");
+    let install_key = v8::String::new(scope, "installRuntimeGlobals").unwrap();
+    let install = registry
+        .get(scope, install_key.into())
+        .expect("installRuntimeGlobals defined");
+    let install =
+        v8::Local::<v8::Function>::try_from(install).expect("installRuntimeGlobals is a function");
+    let recv: v8::Local<v8::Value> = registry.into();
+    install
+        .call(scope, recv, &[])
+        .expect("runtime globals install cleanly");
+}
+
+/// M0 console: log/info/debug -> stdout, warn/error -> stderr. Replaced at
+/// JsRuntime::new time by node_compat's util.inspect console; kept as the
+/// fallback surface during snapshot bring-up.
 fn install_console(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
     let global = context.global(scope);
     let console = v8::Object::new(scope);

@@ -644,7 +644,9 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "blocked subpath"
     );
 
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:fs';").unwrap();
+    // Wave-1 builtins (fs, path, ...) now resolve; the MOD0006 gate covers
+    // the not-yet-shipped ones, prefixed or bare.
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:crypto';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -652,12 +654,17 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "--no-check",
     ]);
     assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0006"),
-        "node: builtin gate"
+        stderr.contains("OAM-MOD0006"),
+        "node: builtin gate: {stderr}"
+    );
+    assert!(
+        stderr.contains("wave 1 ships"),
+        "gate lists wave 1: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'path';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'http';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),
@@ -684,6 +691,243 @@ fn top_level_await_settles_on_microtasks() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "settled");
+}
+
+// ---------------------------------------------------- node: compat wave 1
+
+/// Run a script and return trimmed stdout, failing loudly on a bad exit.
+fn run_ok(name: &str, source: &str) -> String {
+    let main = write_temp(name, source);
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn node_builtins_resolve_from_all_specifier_forms() {
+    let stdout = run_ok(
+        "builtin_forms.ts",
+        "import path from 'node:path';\n\
+         import { join } from 'path';\n\
+         import fsp from 'fs/promises';\n\
+         import { posix } from 'node:path';\n\
+         console.log(\n\
+           typeof path.join === 'function' && join === path.join,\n\
+           typeof fsp.readFile === 'function',\n\
+           posix.join('a', 'b'),\n\
+         );",
+    );
+    assert_eq!(stdout, "true true a/b");
+}
+
+#[test]
+fn node_path_module_correctness() {
+    let stdout = run_ok(
+        "path_correct.ts",
+        "import { win32 as w, posix as p } from 'node:path';\n\
+         console.log(w.join('C:\\\\a', 'b', '..', 'c'));\n\
+         console.log(w.resolve('C:\\\\x', 'y\\\\z'));\n\
+         console.log(w.relative('C:\\\\a\\\\b', 'C:\\\\a\\\\d\\\\e'));\n\
+         console.log(w.basename('C:\\\\dir\\\\file.tar.gz'), w.extname('file.tar.gz'));\n\
+         console.log(w.dirname('C:\\\\dir\\\\sub\\\\file.ts'), w.isAbsolute('C:\\\\x'), w.isAbsolute('x\\\\y'));\n\
+         console.log(p.join('/a', 'b', '..', 'c'), p.normalize('/a//b/../c/'), p.relative('/a/b', '/a/c'));\n\
+         const parsed = p.parse('/home/user/file.txt');\n\
+         console.log(parsed.root, parsed.base, parsed.name, parsed.ext);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "C:\\a\\c");
+    assert_eq!(lines[1], "C:\\x\\y\\z");
+    assert_eq!(lines[2], "..\\d\\e");
+    assert_eq!(lines[3], "file.tar.gz .gz");
+    assert_eq!(lines[4], "C:\\dir\\sub true false");
+    assert_eq!(lines[5], "/a/c /a/c/ ../c");
+    assert_eq!(lines[6], "/ file.txt file .txt");
+}
+
+#[test]
+fn buffer_roundtrips_views_and_numerics() {
+    let stdout = run_ok(
+        "buffer_round.ts",
+        "import { Buffer } from 'node:buffer';\n\
+         const b = Buffer.from('hello oam', 'utf8');\n\
+         console.log(b.toString('hex'), b.toString('base64'));\n\
+         console.log(Buffer.from(b.toString('hex'), 'hex').toString(), Buffer.from(b.toString('base64'), 'base64').toString());\n\
+         const n = Buffer.alloc(8);\n\
+         n.writeUInt32BE(0xdeadbeef, 0); n.writeUInt32LE(0x01020304, 4);\n\
+         console.log(n.readUInt32BE(0).toString(16), n.readUInt32LE(4).toString(16));\n\
+         const view = b.slice(0, 5); view[0] = 72;\n\
+         console.log(b.toString('utf8', 0, 5), Buffer.isBuffer(view), view instanceof Uint8Array);\n\
+         console.log(Buffer.concat([Buffer.from('a'), Buffer.from('bc')]).toString(), Buffer.byteLength('héllo'), b.indexOf('oam'), b.includes('xyz'));\n\
+         console.log(globalThis.Buffer === Buffer, atob(btoa('wire')), JSON.stringify(Buffer.from([1,2]).toJSON()));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "68656c6c6f206f616d aGVsbG8gb2Ft");
+    assert_eq!(lines[1], "hello oam hello oam");
+    assert_eq!(lines[2], "deadbeef 1020304");
+    // Buffer#slice is a view: the write through it is visible in the parent.
+    assert_eq!(lines[3], "Hello true true");
+    assert_eq!(lines[4], "abc 6 6 false");
+    assert_eq!(lines[5], "true wire {\"type\":\"Buffer\",\"data\":[1,2]}");
+}
+
+#[test]
+fn event_emitter_semantics() {
+    let stdout = run_ok(
+        "events_sem.ts",
+        "import { EventEmitter, once } from 'node:events';\n\
+         const ee = new EventEmitter();\n\
+         const order: string[] = [];\n\
+         ee.on('x', () => order.push('on'));\n\
+         ee.prependListener('x', () => order.push('pre'));\n\
+         ee.once('x', () => order.push('once'));\n\
+         ee.emit('x'); ee.emit('x');\n\
+         console.log(order.join(','), ee.listenerCount('x'));\n\
+         let threw = false;\n\
+         try { ee.emit('error', new Error('unhandled-err')); } catch (e) { threw = (e as Error).message === 'unhandled-err'; }\n\
+         console.log(threw);\n\
+         setTimeout(() => ee.emit('ready', 41, 42), 5);\n\
+         const args = await once(ee, 'ready');\n\
+         console.log(args.join('+'));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "pre,on,once,pre,on 2");
+    assert_eq!(lines[1], "true");
+    assert_eq!(lines[2], "41+42");
+}
+
+#[test]
+fn fs_sync_and_promises_roundtrip_with_error_codes() {
+    let stdout = run_ok(
+        "fs_round.ts",
+        "import fs from 'node:fs';\n\
+         import { mkdir, writeFile, readFile, readdir, stat, rm } from 'node:fs/promises';\n\
+         import path from 'node:path';\n\
+         const dir = path.join(import.meta.dirname, 'fs-scratch');\n\
+         fs.mkdirSync(path.join(dir, 'deep'), { recursive: true });\n\
+         fs.writeFileSync(path.join(dir, 'a.txt'), 'sync-write');\n\
+         console.log(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), fs.existsSync(path.join(dir, 'a.txt')));\n\
+         const buf = fs.readFileSync(path.join(dir, 'a.txt'));\n\
+         console.log(Buffer.isBuffer(buf), buf.toString());\n\
+         console.log(fs.statSync(path.join(dir, 'a.txt')).isFile(), fs.statSync(dir).isDirectory());\n\
+         await writeFile(path.join(dir, 'b.txt'), 'async-write');\n\
+         console.log(await readFile(path.join(dir, 'b.txt'), 'utf8'), (await stat(path.join(dir, 'b.txt'))).isFile());\n\
+         console.log((await readdir(dir)).sort().join(','));\n\
+         let syncCode = ''; try { fs.readFileSync(path.join(dir, 'nope.txt')); } catch (e: any) { syncCode = e.code; }\n\
+         let asyncCode = ''; try { await readFile(path.join(dir, 'nope.txt')); } catch (e: any) { asyncCode = e.code; }\n\
+         console.log(syncCode, asyncCode);\n\
+         await rm(dir, { recursive: true });\n\
+         console.log(fs.existsSync(dir));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "sync-write true");
+    assert_eq!(lines[1], "true sync-write");
+    assert_eq!(lines[2], "true true");
+    assert_eq!(lines[3], "async-write true");
+    assert_eq!(lines[4], "a.txt,b.txt,deep");
+    assert_eq!(lines[5], "ENOENT ENOENT");
+    assert_eq!(lines[6], "false");
+}
+
+#[test]
+fn process_globals_and_scheduling() {
+    let stdout = run_ok(
+        "process_glob.ts",
+        "const order: string[] = [];\n\
+         process.nextTick(() => order.push('tick'));\n\
+         setImmediate(() => {\n\
+           order.push('immediate');\n\
+           console.log(order.join(','));\n\
+           console.log({ nested: { deep: [1, 2] } });\n\
+         });\n\
+         Promise.resolve().then(() => order.push('micro'));\n\
+         const t0 = performance.now();\n\
+         console.log(\n\
+           ['win32', 'darwin', 'linux'].includes(process.platform),\n\
+           typeof process.env === 'object' && typeof process.cwd() === 'string',\n\
+           process.versions.oam.length > 0,\n\
+           typeof process.pid === 'number',\n\
+           t0 >= 0 && performance.now() >= t0,\n\
+           typeof process.hrtime.bigint() === 'bigint',\n\
+         );",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true true true true true true");
+    assert_eq!(lines[1], "tick,micro,immediate");
+    // The upgraded console renders objects structurally, not as
+    // '[object Object]'.
+    assert_eq!(lines[2], "{ nested: { deep: [ 1, 2 ] } }");
+}
+
+#[test]
+fn util_and_assert_modules() {
+    let stdout = run_ok(
+        "util_assert.ts",
+        "import util from 'node:util';\n\
+         import assert from 'node:assert';\n\
+         console.log(util.format('%s=%d %j', 'n', 42, { a: 1 }));\n\
+         const sleepy = util.promisify((ms: number, cb: any) => setTimeout(() => cb(null, 'done-' + ms), ms));\n\
+         console.log(await sleepy(5));\n\
+         const circular: any = { name: 'c' }; circular.self = circular;\n\
+         console.log(util.inspect(circular).includes('[Circular'));\n\
+         assert.deepStrictEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] });\n\
+         assert.throws(() => { throw new TypeError('boom'); }, TypeError);\n\
+         let code = '';\n\
+         try { assert.deepStrictEqual([1], [2]); } catch (e: any) { code = e.code; }\n\
+         console.log(code, assert.strict.equal === assert.strictEqual);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "n=42 {\"a\":1}");
+    assert_eq!(lines[1], "done-5");
+    assert_eq!(lines[2], "true");
+    assert_eq!(lines[3], "ERR_ASSERTION true");
+}
+
+#[test]
+fn create_require_and_import_meta() {
+    write_temp(
+        "meta/cjs_dep.cjs",
+        "module.exports = { via: 'createRequire' };",
+    );
+    let stdout = run_ok(
+        "meta/meta_main.ts",
+        "import { createRequire } from 'node:module';\n\
+         console.log(import.meta.url.startsWith('file://'), typeof import.meta.filename === 'string', typeof import.meta.dirname === 'string');\n\
+         const require = createRequire(import.meta.url);\n\
+         console.log(require('./cjs_dep.cjs').via);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true true true");
+    assert_eq!(lines[1], "createRequire");
+}
+
+#[test]
+fn cjs_modules_can_require_builtins() {
+    write_temp(
+        "reqbuiltin/main.cjs",
+        "const path = require('path');\n\
+         const fs = require('node:fs');\n\
+         const os = require('os');\n\
+         const file = path.join(__dirname, 'cjs-fs.txt');\n\
+         fs.writeFileSync(file, 'from-cjs');\n\
+         console.log(fs.readFileSync(file, 'utf8'), typeof os.tmpdir() === 'string');\n\
+         fs.unlinkSync(file);",
+    );
+    let main = write_temp("reqbuiltin/.anchor", "")
+        .parent()
+        .unwrap()
+        .join("main.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from-cjs true");
 }
 
 #[test]

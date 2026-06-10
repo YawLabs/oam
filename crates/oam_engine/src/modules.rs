@@ -361,11 +361,22 @@ fn load_module_graph(
             continue;
         }
 
+        // node builtins: instantiate via the snapshot registry, compile a
+        // facade module under the virtual node:NAME path.
+        let builtin = path
+            .to_str()
+            .and_then(|s| s.strip_prefix("node:"))
+            .map(str::to_string);
         // CJS files take the interop path: execute eagerly through the
         // require machinery, then compile a generated ESM facade (real
         // runtime export names) as the module at this path. JSON files
         // ride the same branch when they arrive via npm resolution.
-        let code = if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
+        let code = if let Some(name) = builtin {
+            let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
+                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+            };
+            crate::cjs::builtin_facade_source(tc, &name, exports)
+        } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
             let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
@@ -417,12 +428,18 @@ fn load_module_graph(
                 .expect("module request entry is a ModuleRequest");
             let specifier = request.get_specifier().to_rust_string_lossy(tc);
             let resolved = host.resolve(&specifier, &path)?;
-            let resolved = module_key(&resolved).map_err(|e| {
-                rt_diag(
-                    "OAM-RT0002",
-                    format!("bad resolved path {}: {e}", resolved.display()),
-                )
-            })?;
+            // Virtual builtin paths must not go through filesystem
+            // normalization (absolute() would anchor "node:fs" at cwd).
+            let resolved = if resolved.to_str().is_some_and(|s| s.starts_with("node:")) {
+                resolved
+            } else {
+                module_key(&resolved).map_err(|e| {
+                    rt_diag(
+                        "OAM-RT0002",
+                        format!("bad resolved path {}: {e}", resolved.display()),
+                    )
+                })?
+            };
             tc.get_slot_mut::<ModuleMap>()
                 .expect("module map installed")
                 .edges
@@ -480,6 +497,83 @@ fn resolve_module_callback<'s>(
             scope.throw_exception(exception);
             None
         }
+    }
+}
+
+/// Windows-safe file:// URL with minimal percent-encoding (space, #, ?, %).
+fn path_to_file_url(path: &Path) -> String {
+    let slashed = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::from("file://");
+    if !slashed.starts_with('/') {
+        out.push('/');
+    }
+    for ch in slashed.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '%' => out.push_str("%25"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// import.meta initializer: url, filename, dirname (Node 20.11+ parity).
+/// Builtin facades get url = "node:<name>" with no filename/dirname; CJS
+/// facades get their real file path — createRequire(import.meta.url) works
+/// everywhere user code can spell it. Zero capture, raw C ABI.
+pub(crate) unsafe extern "C" fn import_meta_callback(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    // Module identity -> path, the same hash-then-compare dance as the
+    // resolve callback (identity hashes are not unique).
+    let candidates: Vec<(PathBuf, v8::Global<v8::Module>)> = {
+        let Some(map) = scope.get_slot::<ModuleMap>() else {
+            return;
+        };
+        let Some(paths) = map.paths_by_hash.get(&module.get_identity_hash()) else {
+            return;
+        };
+        paths
+            .iter()
+            .filter_map(|p| map.by_path.get(p).map(|g| (p.clone(), g.clone())))
+            .collect()
+    };
+    let Some(path) = candidates.into_iter().find_map(|(path, global)| {
+        let candidate = v8::Local::new(scope, &global);
+        (candidate == module).then_some(path)
+    }) else {
+        return;
+    };
+
+    let path_text = path.to_string_lossy().into_owned();
+    let is_builtin = path_text.starts_with("node:");
+    let url = if is_builtin {
+        path_text.clone()
+    } else {
+        path_to_file_url(&path)
+    };
+    let entries: Vec<(&str, String)> = if is_builtin {
+        vec![("url", url)]
+    } else {
+        let dirname = path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        vec![("url", url), ("filename", path_text), ("dirname", dirname)]
+    };
+    for (name, value) in entries {
+        let Some(key) = v8::String::new(scope, name) else {
+            continue;
+        };
+        let Some(value) = v8::String::new(scope, &value) else {
+            continue;
+        };
+        meta.create_data_property(scope, key.into(), value.into());
     }
 }
 

@@ -1,0 +1,2070 @@
+// oam node: compat wave 1 — the JS half of the builtin modules.
+//
+// Architecture: every builtin is a FACTORY registered on __oamNode and
+// instantiated lazily at first import/require, receiving the natives
+// object (globalThis.__oam.node, installed post-restore). Factories may
+// cross-reference each other via __oamNode.get(). Pure-JS pieces (Buffer,
+// TextEncoder/TextDecoder, atob/btoa, setImmediate) install as globals at
+// snapshot evaluation; runtime-data globals (process, performance, the
+// upgraded console) install post-restore via installRuntimeGlobals().
+//
+// SNAPSHOT CONSTRAINT (same as bootstrap.js): this file is evaluated at
+// BUILD time into the V8 startup snapshot, where no native bindings exist.
+// Anything from __oam must be looked up at CALL time, never captured at
+// eval time. Nothing at top level may touch __oam, console, or timers.
+//
+// Wave-1 documented divergences (all carry a clear error or doc note):
+// - process.env is a copy taken at first access of the process module;
+//   writes mutate the JS object only.
+// - process.exit() exits immediately (no 'exit' event flush), like Bun.
+// - process.nextTick is microtask-based: it interleaves with promise
+//   jobs instead of running strictly before them.
+// - fs streams (createReadStream/...) throw with a wave-2 pointer.
+// - TextDecoder supports utf-8 only (fatal + ignoreBOM honored).
+"use strict";
+(() => {
+  // ---------------------------------------------------------------- utf-8
+  class TextEncoder {
+    get encoding() {
+      return "utf-8";
+    }
+    encode(input = "") {
+      const str = String(input);
+      const out = new Uint8Array(str.length * 3);
+      let o = 0;
+      for (let i = 0; i < str.length; i++) {
+        let cp = str.codePointAt(i);
+        if (cp > 0xffff) i++;
+        // Lone surrogates encode as U+FFFD, per WHATWG.
+        if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+        if (cp < 0x80) {
+          out[o++] = cp;
+        } else if (cp < 0x800) {
+          out[o++] = 0xc0 | (cp >> 6);
+          out[o++] = 0x80 | (cp & 63);
+        } else if (cp < 0x10000) {
+          out[o++] = 0xe0 | (cp >> 12);
+          out[o++] = 0x80 | ((cp >> 6) & 63);
+          out[o++] = 0x80 | (cp & 63);
+        } else {
+          out[o++] = 0xf0 | (cp >> 18);
+          out[o++] = 0x80 | ((cp >> 12) & 63);
+          out[o++] = 0x80 | ((cp >> 6) & 63);
+          out[o++] = 0x80 | (cp & 63);
+        }
+      }
+      return out.slice(0, o);
+    }
+    encodeInto(source, destination) {
+      const bytes = this.encode(source);
+      const written = Math.min(bytes.length, destination.length);
+      destination.set(bytes.subarray(0, written));
+      // `read` is approximate when truncation splits a code point; exact
+      // accounting arrives with the native encoder.
+      let read = 0;
+      let count = 0;
+      const str = String(source);
+      while (read < str.length) {
+        const cp = str.codePointAt(read);
+        const size = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        if (count + size > written) break;
+        count += size;
+        read += cp > 0xffff ? 2 : 1;
+      }
+      return { read, written: count };
+    }
+  }
+
+  class TextDecoder {
+    constructor(label = "utf-8", options = {}) {
+      const canonical = String(label).toLowerCase();
+      if (canonical !== "utf-8" && canonical !== "utf8" && canonical !== "unicode-1-1-utf-8") {
+        throw new RangeError(
+          `TextDecoder: only utf-8 is supported in oam today (got '${label}')`,
+        );
+      }
+      this.encoding = "utf-8";
+      this.fatal = options.fatal === true;
+      this.ignoreBOM = options.ignoreBOM === true;
+    }
+    decode(input) {
+      if (input === undefined) return "";
+      let bytes;
+      if (input instanceof Uint8Array) bytes = input;
+      else if (ArrayBuffer.isView(input))
+        bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      else bytes = new Uint8Array(input);
+      let i = 0;
+      if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+        i = 3;
+      }
+      let out = "";
+      const fail = (at) => {
+        if (this.fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
+        out += "�";
+      };
+      while (i < bytes.length) {
+        const b = bytes[i];
+        if (b < 0x80) {
+          out += String.fromCharCode(b);
+          i++;
+        } else if (b >= 0xc2 && b <= 0xdf) {
+          if (i + 1 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80) {
+            out += String.fromCharCode(((b & 31) << 6) | (bytes[i + 1] & 63));
+            i += 2;
+          } else {
+            fail(i);
+            i++;
+          }
+        } else if (b >= 0xe0 && b <= 0xef) {
+          const b1 = bytes[i + 1];
+          const b2 = bytes[i + 2];
+          const lower = b === 0xe0 ? 0xa0 : 0x80;
+          const upper = b === 0xed ? 0x9f : 0xbf;
+          if (
+            i + 2 < bytes.length &&
+            b1 >= lower &&
+            b1 <= upper &&
+            (b2 & 0xc0) === 0x80
+          ) {
+            out += String.fromCharCode(((b & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63));
+            i += 3;
+          } else {
+            fail(i);
+            i++;
+          }
+        } else if (b >= 0xf0 && b <= 0xf4) {
+          const b1 = bytes[i + 1];
+          const b2 = bytes[i + 2];
+          const b3 = bytes[i + 3];
+          const lower = b === 0xf0 ? 0x90 : 0x80;
+          const upper = b === 0xf4 ? 0x8f : 0xbf;
+          if (
+            i + 3 < bytes.length &&
+            b1 >= lower &&
+            b1 <= upper &&
+            (b2 & 0xc0) === 0x80 &&
+            (b3 & 0xc0) === 0x80
+          ) {
+            const cp =
+              ((b & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+            out += String.fromCodePoint(cp);
+            i += 4;
+          } else {
+            fail(i);
+            i++;
+          }
+        } else {
+          fail(i);
+          i++;
+        }
+      }
+      return out;
+    }
+  }
+
+  globalThis.TextEncoder = TextEncoder;
+  globalThis.TextDecoder = TextDecoder;
+  const utf8Encoder = new TextEncoder();
+  const utf8Decoder = new TextDecoder();
+
+  // ---------------------------------------------------------------- Buffer
+  function normalizeEncoding(enc) {
+    const e = String(enc === undefined ? "utf8" : enc).toLowerCase();
+    switch (e) {
+      case "utf8":
+      case "utf-8":
+        return "utf8";
+      case "hex":
+        return "hex";
+      case "base64":
+        return "base64";
+      case "base64url":
+        return "base64url";
+      case "latin1":
+      case "binary":
+        return "latin1";
+      case "ascii":
+        return "ascii";
+      case "utf16le":
+      case "utf-16le":
+      case "ucs2":
+      case "ucs-2":
+        return "utf16le";
+      default:
+        return undefined;
+    }
+  }
+
+  function bytesFromString(str, enc) {
+    const encoding = normalizeEncoding(enc);
+    switch (encoding) {
+      case "utf8":
+        return utf8Encoder.encode(str);
+      case "hex": {
+        // Node is lenient: parse stops at the first invalid pair.
+        const len = str.length >>> 1;
+        const out = new Uint8Array(len);
+        let o = 0;
+        for (let i = 0; i + 1 < str.length; i += 2) {
+          const byte = parseInt(str.slice(i, i + 2), 16);
+          if (Number.isNaN(byte)) break;
+          out[o++] = byte;
+        }
+        return out.subarray(0, o);
+      }
+      case "base64":
+      case "base64url": {
+        try {
+          return Uint8Array.fromBase64(str, {
+            alphabet: encoding === "base64url" ? "base64url" : "base64",
+            lastChunkHandling: "loose",
+          });
+        } catch {
+          // Node tolerates junk; strip non-alphabet chars and retry.
+          const cleaned = str.replace(
+            encoding === "base64url" ? /[^A-Za-z0-9\-_]/g : /[^A-Za-z0-9+/=]/g,
+            "",
+          );
+          try {
+            return Uint8Array.fromBase64(cleaned, {
+              alphabet: encoding === "base64url" ? "base64url" : "base64",
+              lastChunkHandling: "loose",
+            });
+          } catch {
+            return new Uint8Array(0);
+          }
+        }
+      }
+      case "latin1": {
+        const out = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
+        return out;
+      }
+      case "ascii": {
+        const out = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0x7f;
+        return out;
+      }
+      case "utf16le": {
+        const out = new Uint8Array(str.length * 2);
+        for (let i = 0; i < str.length; i++) {
+          const c = str.charCodeAt(i);
+          out[i * 2] = c & 0xff;
+          out[i * 2 + 1] = c >> 8;
+        }
+        return out;
+      }
+      default:
+        throw new TypeError(`Unknown encoding: ${enc}`);
+    }
+  }
+
+  class Buffer extends Uint8Array {
+    static get [Symbol.species]() {
+      return Buffer;
+    }
+
+    static isBuffer(value) {
+      return value instanceof Buffer;
+    }
+
+    static isEncoding(enc) {
+      return normalizeEncoding(enc) !== undefined;
+    }
+
+    static alloc(size, fill, encoding) {
+      const buf = new Buffer(size);
+      if (fill !== undefined && fill !== 0) buf.fill(fill, 0, buf.length, encoding);
+      return buf;
+    }
+
+    static allocUnsafe(size) {
+      return new Buffer(size);
+    }
+
+    static allocUnsafeSlow(size) {
+      return new Buffer(size);
+    }
+
+    static from(value, encodingOrOffset, length) {
+      if (typeof value === "string") {
+        const bytes = bytesFromString(value, encodingOrOffset);
+        return new Buffer(bytes.buffer, bytes.byteOffset, bytes.length);
+      }
+      if (value instanceof ArrayBuffer || value instanceof SharedArrayBuffer) {
+        // Views the SAME memory, per Node.
+        return new Buffer(value, encodingOrOffset, length);
+      }
+      if (ArrayBuffer.isView(value)) {
+        // COPIES, per Node (from(typedArray) copies; from(arrayBuffer) views).
+        const src = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        const buf = new Buffer(src.length);
+        buf.set(src);
+        return buf;
+      }
+      if (Array.isArray(value) || typeof value?.length === "number") {
+        const buf = new Buffer(value.length >>> 0);
+        for (let i = 0; i < buf.length; i++) buf[i] = value[i] & 0xff;
+        return buf;
+      }
+      if (value && typeof value === "object" && value.type === "Buffer" && Array.isArray(value.data)) {
+        return Buffer.from(value.data);
+      }
+      throw new TypeError(
+        "Buffer.from: first argument must be a string, Buffer, ArrayBuffer, Array, or array-like",
+      );
+    }
+
+    static byteLength(value, encoding) {
+      if (typeof value !== "string") return value.byteLength ?? value.length;
+      switch (normalizeEncoding(encoding)) {
+        case "latin1":
+        case "ascii":
+          return value.length;
+        case "utf16le":
+          return value.length * 2;
+        case "hex":
+          return value.length >>> 1;
+        case "base64":
+        case "base64url": {
+          const trimmed = value.replace(/=+$/, "");
+          return Math.floor((trimmed.length * 3) / 4);
+        }
+        default:
+          return utf8Encoder.encode(value).length;
+      }
+    }
+
+    static concat(list, totalLength) {
+      let total = totalLength;
+      if (total === undefined) {
+        total = 0;
+        for (const item of list) total += item.length;
+      }
+      const out = new Buffer(total);
+      let offset = 0;
+      for (const item of list) {
+        if (offset >= total) break;
+        const chunk =
+          item instanceof Uint8Array
+            ? item.subarray(0, Math.min(item.length, total - offset))
+            : Buffer.from(item);
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return out;
+    }
+
+    static compare(a, b) {
+      return a.compare(b);
+    }
+
+    toString(encoding, start, end) {
+      const view = this.subarray(start ?? 0, end ?? this.length);
+      switch (normalizeEncoding(encoding)) {
+        case "hex":
+          return view.toHex();
+        case "base64":
+          return view.toBase64();
+        case "base64url":
+          return view.toBase64({ alphabet: "base64url", omitPadding: true });
+        case "latin1": {
+          let out = "";
+          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
+          return out;
+        }
+        case "ascii": {
+          let out = "";
+          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
+          return out;
+        }
+        case "utf16le": {
+          let out = "";
+          for (let i = 0; i + 1 < view.length; i += 2) {
+            out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+          }
+          return out;
+        }
+        case "utf8":
+          return utf8Decoder.decode(view);
+        default:
+          throw new TypeError(`Unknown encoding: ${encoding}`);
+      }
+    }
+
+    // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
+    slice(start, end) {
+      return this.subarray(start, end);
+    }
+
+    equals(other) {
+      if (this === other) return true;
+      if (this.length !== other.length) return false;
+      for (let i = 0; i < this.length; i++) {
+        if (this[i] !== other[i]) return false;
+      }
+      return true;
+    }
+
+    compare(target, targetStart = 0, targetEnd = target.length, sourceStart = 0, sourceEnd = this.length) {
+      const a = this.subarray(sourceStart, sourceEnd);
+      const b = target.subarray(targetStart, targetEnd);
+      const len = Math.min(a.length, b.length);
+      for (let i = 0; i < len; i++) {
+        if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+      }
+      return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+    }
+
+    copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
+      const chunk = this.subarray(sourceStart, Math.min(sourceEnd, this.length));
+      const writable = Math.min(chunk.length, target.length - targetStart);
+      target.set(chunk.subarray(0, writable), targetStart);
+      return writable;
+    }
+
+    write(string, offset, length, encoding) {
+      // write(str), write(str, enc), write(str, offset, enc),
+      // write(str, offset, length, enc)
+      if (typeof offset === "string") {
+        encoding = offset;
+        offset = 0;
+        length = undefined;
+      } else if (typeof length === "string") {
+        encoding = length;
+        length = undefined;
+      }
+      offset = offset ?? 0;
+      const bytes = bytesFromString(String(string), encoding);
+      const writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
+      this.set(bytes.subarray(0, writable), offset);
+      return writable;
+    }
+
+    fill(value, start = 0, end = this.length, encoding) {
+      if (typeof value === "number") {
+        Uint8Array.prototype.fill.call(this, value & 0xff, start, end);
+        return this;
+      }
+      const pattern =
+        typeof value === "string" ? bytesFromString(value, encoding) : Buffer.from(value);
+      if (pattern.length === 0) {
+        Uint8Array.prototype.fill.call(this, 0, start, end);
+        return this;
+      }
+      for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
+      return this;
+    }
+
+    indexOf(needle, byteOffset = 0, encoding) {
+      if (typeof byteOffset === "string") {
+        encoding = byteOffset;
+        byteOffset = 0;
+      }
+      if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
+      if (typeof needle === "number") {
+        return Uint8Array.prototype.indexOf.call(this, needle & 0xff, byteOffset);
+      }
+      const pattern =
+        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
+      if (pattern.length === 0) return byteOffset <= this.length ? byteOffset : this.length;
+      outer: for (let i = byteOffset; i + pattern.length <= this.length; i++) {
+        for (let j = 0; j < pattern.length; j++) {
+          if (this[i + j] !== pattern[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    }
+
+    lastIndexOf(needle, byteOffset, encoding) {
+      if (typeof byteOffset === "string") {
+        encoding = byteOffset;
+        byteOffset = undefined;
+      }
+      if (typeof needle === "number") {
+        return Uint8Array.prototype.lastIndexOf.call(
+          this,
+          needle & 0xff,
+          byteOffset ?? this.length - 1,
+        );
+      }
+      const pattern =
+        typeof needle === "string" ? bytesFromString(needle, encoding) : needle;
+      if (pattern.length === 0) return Math.min(byteOffset ?? this.length, this.length);
+      const last = Math.min(byteOffset ?? this.length - pattern.length, this.length - pattern.length);
+      outer: for (let i = last; i >= 0; i--) {
+        for (let j = 0; j < pattern.length; j++) {
+          if (this[i + j] !== pattern[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    }
+
+    includes(needle, byteOffset, encoding) {
+      return this.indexOf(needle, byteOffset, encoding) !== -1;
+    }
+
+    toJSON() {
+      return { type: "Buffer", data: Array.from(this) };
+    }
+
+    inspect() {
+      const head = Array.from(this.subarray(0, 50))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+      return `<Buffer ${head}${this.length > 50 ? " ... " + (this.length - 50) + " more bytes" : ""}>`;
+    }
+  }
+
+  // The numeric read/write family, generated over DataView.
+  {
+    const specs = [
+      ["UInt8", 1, "Uint8", false],
+      ["Int8", 1, "Int8", false],
+      ["UInt16", 2, "Uint16", true],
+      ["Int16", 2, "Int16", true],
+      ["UInt32", 4, "Uint32", true],
+      ["Int32", 4, "Int32", true],
+      ["Float", 4, "Float32", true],
+      ["Double", 8, "Float64", true],
+      ["BigUInt64", 8, "BigUint64", true],
+      ["BigInt64", 8, "BigInt64", true],
+    ];
+    const view = (buf) => new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    for (const [name, _size, dv, multi] of specs) {
+      if (multi) {
+        for (const [suffix, little] of [["LE", true], ["BE", false]]) {
+          Buffer.prototype[`read${name}${suffix}`] = function (offset = 0) {
+            return view(this)[`get${dv}`](offset, little);
+          };
+          Buffer.prototype[`write${name}${suffix}`] = function (value, offset = 0) {
+            view(this)[`set${dv}`](offset, value, little);
+            return offset + _size;
+          };
+        }
+      } else {
+        Buffer.prototype[`read${name}`] = function (offset = 0) {
+          return view(this)[`get${dv}`](offset);
+        };
+        Buffer.prototype[`write${name}`] = function (value, offset = 0) {
+          view(this)[`set${dv}`](offset, value);
+          return offset + _size;
+        };
+      }
+    }
+  }
+  Buffer.poolSize = 8192;
+
+  function btoa(input) {
+    const str = String(input);
+    const bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      if (c > 0xff) {
+        throw new (globalThis.DOMException ?? TypeError)(
+          "btoa: the string contains characters outside of the Latin1 range",
+        );
+      }
+      bytes[i] = c;
+    }
+    return bytes.toBase64();
+  }
+
+  function atob(input) {
+    let bytes;
+    try {
+      bytes = Uint8Array.fromBase64(String(input).replace(/\s/g, ""), {
+        lastChunkHandling: "loose",
+      });
+    } catch {
+      throw new (globalThis.DOMException ?? TypeError)(
+        "atob: the string to be decoded is not correctly encoded",
+      );
+    }
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+
+  globalThis.Buffer = Buffer;
+  globalThis.atob = atob;
+  globalThis.btoa = btoa;
+  globalThis.setImmediate = function setImmediate(fn, ...args) {
+    return globalThis.setTimeout(fn, 0, ...args);
+  };
+  globalThis.clearImmediate = function clearImmediate(id) {
+    return globalThis.clearTimeout(id);
+  };
+
+  // ------------------------------------------------------------- registry
+  const registry = {
+    factories: { __proto__: null },
+    cache: new Map(),
+    get(name) {
+      if (registry.cache.has(name)) return registry.cache.get(name);
+      const factory = registry.factories[name];
+      if (!factory) {
+        throw new Error(`oam internal: no builtin factory registered for '${name}'`);
+      }
+      const mod = factory(globalThis.__oam.node);
+      registry.cache.set(name, mod);
+      return mod;
+    },
+  };
+  Object.defineProperty(globalThis, "__oamNode", {
+    value: registry,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  // --------------------------------------------------------------- events
+  registry.factories.events = () => {
+    const kMax = Symbol("maxListeners");
+    const errorMonitor = Symbol("events.errorMonitor");
+
+    class EventEmitter {
+      constructor() {
+        this._events = { __proto__: null };
+        this._eventsCount = 0;
+      }
+      setMaxListeners(n) {
+        this[kMax] = n;
+        return this;
+      }
+      getMaxListeners() {
+        return this[kMax] ?? EventEmitter.defaultMaxListeners;
+      }
+      _add(type, listener, prepend, once) {
+        if (typeof listener !== "function") {
+          throw new TypeError(`The "listener" argument must be a function`);
+        }
+        let entry = listener;
+        if (once) {
+          const wrapper = (...args) => {
+            this.removeListener(type, wrapper);
+            listener.apply(this, args);
+          };
+          wrapper.listener = listener;
+          entry = wrapper;
+        }
+        if (this._events.newListener) {
+          this.emit("newListener", type, entry.listener ?? entry);
+        }
+        const existing = this._events[type];
+        if (existing === undefined) {
+          this._events[type] = entry;
+          this._eventsCount++;
+        } else if (typeof existing === "function") {
+          this._events[type] = prepend ? [entry, existing] : [existing, entry];
+        } else if (prepend) {
+          existing.unshift(entry);
+        } else {
+          existing.push(entry);
+        }
+        const count = this.listenerCount(type);
+        const max = this.getMaxListeners();
+        if (max > 0 && count > max && !this._events[type].warned) {
+          this._events[type].warned = true;
+          if (globalThis.console) {
+            globalThis.console.warn(
+              `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
+                `Use emitter.setMaxListeners() to increase limit`,
+            );
+          }
+        }
+        return this;
+      }
+      addListener(type, listener) {
+        return this._add(type, listener, false, false);
+      }
+      on(type, listener) {
+        return this._add(type, listener, false, false);
+      }
+      once(type, listener) {
+        return this._add(type, listener, false, true);
+      }
+      prependListener(type, listener) {
+        return this._add(type, listener, true, false);
+      }
+      prependOnceListener(type, listener) {
+        return this._add(type, listener, true, true);
+      }
+      removeListener(type, listener) {
+        const existing = this._events[type];
+        if (existing === undefined) return this;
+        if (existing === listener || existing.listener === listener) {
+          delete this._events[type];
+          this._eventsCount--;
+          if (this._events.removeListener) {
+            this.emit("removeListener", type, existing.listener ?? existing);
+          }
+          return this;
+        }
+        if (typeof existing !== "function") {
+          for (let i = existing.length - 1; i >= 0; i--) {
+            if (existing[i] === listener || existing[i].listener === listener) {
+              const removed = existing[i];
+              existing.splice(i, 1);
+              if (existing.length === 1) this._events[type] = existing[0];
+              else if (existing.length === 0) {
+                delete this._events[type];
+                this._eventsCount--;
+              }
+              if (this._events.removeListener) {
+                this.emit("removeListener", type, removed.listener ?? removed);
+              }
+              break;
+            }
+          }
+        }
+        return this;
+      }
+      off(type, listener) {
+        return this.removeListener(type, listener);
+      }
+      removeAllListeners(type) {
+        if (type === undefined) {
+          this._events = { __proto__: null };
+          this._eventsCount = 0;
+        } else if (this._events[type] !== undefined) {
+          delete this._events[type];
+          this._eventsCount--;
+        }
+        return this;
+      }
+      listeners(type) {
+        return this.rawListeners(type).map((l) => l.listener ?? l);
+      }
+      rawListeners(type) {
+        const existing = this._events[type];
+        if (existing === undefined) return [];
+        return typeof existing === "function" ? [existing] : existing.slice();
+      }
+      listenerCount(type) {
+        const existing = this._events[type];
+        if (existing === undefined) return 0;
+        return typeof existing === "function" ? 1 : existing.length;
+      }
+      eventNames() {
+        return Reflect.ownKeys(this._events);
+      }
+      emit(type, ...args) {
+        if (type === "error" && this._events[errorMonitor]) {
+          for (const l of this.rawListeners(errorMonitor)) l.apply(this, args);
+        }
+        const existing = this._events[type];
+        if (existing === undefined) {
+          if (type === "error") {
+            const err = args[0];
+            throw err instanceof Error
+              ? err
+              : new Error(`Unhandled error. (${String(err)})`);
+          }
+          return false;
+        }
+        const list = typeof existing === "function" ? [existing] : existing.slice();
+        for (const listener of list) listener.apply(this, args);
+        return true;
+      }
+    }
+    EventEmitter.defaultMaxListeners = 10;
+    EventEmitter.errorMonitor = errorMonitor;
+
+    function once(emitter, type) {
+      return new Promise((resolve, reject) => {
+        const onEvent = (...args) => {
+          emitter.removeListener("error", onError);
+          resolve(args);
+        };
+        const onError = (err) => {
+          emitter.removeListener(type, onEvent);
+          reject(err);
+        };
+        emitter.once(type, onEvent);
+        if (type !== "error") emitter.once("error", onError);
+      });
+    }
+
+    // require('events') === EventEmitter, with the named forms attached.
+    EventEmitter.EventEmitter = EventEmitter;
+    EventEmitter.once = once;
+    EventEmitter.listenerCount = (emitter, type) => emitter.listenerCount(type);
+    return EventEmitter;
+  };
+
+  // ----------------------------------------------------------------- path
+  function makePathModule(isWin, natives) {
+    const sep = isWin ? "\\" : "/";
+    const delimiter = isWin ? ";" : ":";
+    const isSep = isWin ? (c) => c === "/" || c === "\\" : (c) => c === "/";
+    const isDrive = (p, i = 0) =>
+      isWin && /[A-Za-z]/.test(p[i] ?? "") && p[i + 1] === ":";
+
+    function assertPath(p) {
+      if (typeof p !== "string") {
+        throw new TypeError(`Path must be a string. Received ${typeof p}`);
+      }
+    }
+
+    /// {root, rest}: root is "" (relative), "/" or "\", "C:\", "C:"
+    /// (drive-relative), or "\\host\share\".
+    function splitRoot(p) {
+      if (!isWin) {
+        return isSep(p[0]) ? { root: "/", rest: p.slice(1) } : { root: "", rest: p };
+      }
+      if (p.length >= 2 && isSep(p[0]) && isSep(p[1])) {
+        let i = 2;
+        while (i < p.length && !isSep(p[i])) i++;
+        if (i > 2 && i < p.length) {
+          let j = i + 1;
+          let k = j;
+          while (k < p.length && !isSep(p[k])) k++;
+          if (k > j) {
+            return {
+              root: "\\\\" + p.slice(2, i) + "\\" + p.slice(j, k) + "\\",
+              rest: k < p.length ? p.slice(k + 1) : "",
+            };
+          }
+        }
+        return { root: "\\", rest: p.slice(1) };
+      }
+      if (isDrive(p)) {
+        if (p.length > 2 && isSep(p[2])) {
+          return { root: p.slice(0, 2).toUpperCase() + "\\", rest: p.slice(3) };
+        }
+        return { root: p.slice(0, 2).toUpperCase(), rest: p.slice(2) };
+      }
+      if (isSep(p[0])) return { root: "\\", rest: p.slice(1) };
+      return { root: "", rest: p };
+    }
+
+    function normalizeParts(rest, allowAboveRoot) {
+      const out = [];
+      let part = "";
+      const flush = () => {
+        if (part === "" || part === ".") {
+          // skip
+        } else if (part === "..") {
+          if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
+          else if (allowAboveRoot) out.push("..");
+        } else {
+          out.push(part);
+        }
+        part = "";
+      };
+      for (let i = 0; i < rest.length; i++) {
+        if (isSep(rest[i])) flush();
+        else part += rest[i];
+      }
+      flush();
+      return out;
+    }
+
+    function normalize(p) {
+      assertPath(p);
+      if (p.length === 0) return ".";
+      const { root, rest } = splitRoot(p);
+      const parts = normalizeParts(rest, root === "");
+      let out = root + parts.join(sep);
+      if (out.length === 0) out = ".";
+      // Preserve a single trailing separator, per Node.
+      if (isSep(p[p.length - 1]) && !isSep(out[out.length - 1]) && out !== ".") {
+        out += sep;
+      }
+      return out;
+    }
+
+    function isAbsolute(p) {
+      assertPath(p);
+      if (!isWin) return isSep(p[0]);
+      if (isSep(p[0])) return true;
+      return isDrive(p) && isSep(p[2]);
+    }
+
+    function join(...args) {
+      if (args.length === 0) return ".";
+      let joined = "";
+      for (const arg of args) {
+        assertPath(arg);
+        if (arg.length > 0) joined += joined.length > 0 ? sep + arg : arg;
+      }
+      if (joined.length === 0) return ".";
+      return normalize(joined);
+    }
+
+    function resolve(...args) {
+      let resolvedTail = "";
+      let resolvedRoot = "";
+      for (let i = args.length - 1; i >= 0 && resolvedRoot === ""; i--) {
+        const p = args[i];
+        assertPath(p);
+        if (p.length === 0) continue;
+        const { root, rest } = splitRoot(p);
+        resolvedTail = rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
+        if (root !== "" && root !== resolvedRoot) {
+          if (isWin && root.length === 2 && !isSep(root[1] === ":" ? "x" : root[1])) {
+            // never taken; drive roots are length 3 (C:\) or 2 (C:)
+          }
+          resolvedRoot = root;
+        }
+      }
+      if (resolvedRoot === "" || (isWin && resolvedRoot.length === 2 && resolvedRoot[1] === ":")) {
+        // Relative (or drive-relative): anchor at cwd. Drive-relative paths
+        // resolve against cwd when it is on the same drive, else the drive
+        // root (wave-1 simplification of Node's per-drive cwd tracking).
+        const cwd = natives ? natives.cwd() : "/";
+        const cwdSplit = splitRoot(cwd);
+        if (resolvedRoot === "") {
+          resolvedTail =
+            cwdSplit.rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
+          resolvedRoot = cwdSplit.root;
+        } else if (
+          cwdSplit.root.slice(0, 2).toUpperCase() === resolvedRoot.toUpperCase()
+        ) {
+          resolvedTail =
+            cwdSplit.rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
+          resolvedRoot = cwdSplit.root;
+        } else {
+          resolvedRoot = resolvedRoot + "\\";
+        }
+      }
+      const parts = normalizeParts(resolvedTail, false);
+      const out = resolvedRoot + parts.join(sep);
+      return out.length > 0 ? out : ".";
+    }
+
+    function relative(from, to) {
+      assertPath(from);
+      assertPath(to);
+      const f = resolve(from);
+      const t = resolve(to);
+      const cmp = (s) => (isWin ? s.toLowerCase() : s);
+      if (cmp(f) === cmp(t)) return "";
+      const fSplit = splitRoot(f);
+      const tSplit = splitRoot(t);
+      if (cmp(fSplit.root) !== cmp(tSplit.root)) return t;
+      const fParts = fSplit.rest.length > 0 ? fSplit.rest.split(sep) : [];
+      const tParts = tSplit.rest.length > 0 ? tSplit.rest.split(sep) : [];
+      let common = 0;
+      while (
+        common < fParts.length &&
+        common < tParts.length &&
+        cmp(fParts[common]) === cmp(tParts[common])
+      ) {
+        common++;
+      }
+      const ups = fParts.length - common;
+      const segments = [];
+      for (let i = 0; i < ups; i++) segments.push("..");
+      segments.push(...tParts.slice(common));
+      return segments.join(sep);
+    }
+
+    function basename(p, suffix) {
+      assertPath(p);
+      const { rest } = splitRoot(p);
+      let end = rest.length;
+      while (end > 0 && isSep(rest[end - 1])) end--;
+      let start = end;
+      while (start > 0 && !isSep(rest[start - 1])) start--;
+      let base = rest.slice(start, end);
+      if (suffix !== undefined && base.endsWith(suffix) && base !== suffix) {
+        base = base.slice(0, base.length - suffix.length);
+      }
+      return base;
+    }
+
+    function extname(p) {
+      const base = basename(p);
+      const dot = base.lastIndexOf(".");
+      return dot <= 0 ? "" : base.slice(dot);
+    }
+
+    function dirname(p) {
+      assertPath(p);
+      const { root, rest } = splitRoot(p);
+      let end = rest.length;
+      while (end > 0 && isSep(rest[end - 1])) end--;
+      let cut = end;
+      while (cut > 0 && !isSep(rest[cut - 1])) cut--;
+      while (cut > 0 && isSep(rest[cut - 1])) cut--;
+      if (cut === 0) return root.length > 0 ? root : ".";
+      return root + rest.slice(0, cut);
+    }
+
+    function parse(p) {
+      assertPath(p);
+      const { root } = splitRoot(p);
+      const base = basename(p);
+      const ext = extname(p);
+      const dir = dirname(p);
+      return {
+        root,
+        dir: dir === "." && !p.startsWith(".") && root === "" && p.indexOf(sep) === -1 ? "" : dir,
+        base,
+        ext,
+        name: base.slice(0, base.length - ext.length),
+      };
+    }
+
+    function format(obj) {
+      const dir = obj.dir || obj.root || "";
+      const base = obj.base || (obj.name || "") + (obj.ext || "");
+      if (!dir) return base;
+      return dir === obj.root ? dir + base : dir + sep + base;
+    }
+
+    function toNamespacedPath(p) {
+      if (!isWin || typeof p !== "string" || p.length === 0) return p;
+      const resolved = resolve(p);
+      if (resolved.startsWith("\\\\")) {
+        if (resolved.startsWith("\\\\?\\")) return resolved;
+        return "\\\\?\\UNC\\" + resolved.slice(2);
+      }
+      if (isDrive(resolved) && resolved[2] === "\\") return "\\\\?\\" + resolved;
+      return p;
+    }
+
+    return {
+      sep,
+      delimiter,
+      normalize,
+      isAbsolute,
+      join,
+      resolve,
+      relative,
+      basename,
+      extname,
+      dirname,
+      parse,
+      format,
+      toNamespacedPath,
+    };
+  }
+
+  registry.factories.path = (natives) => {
+    const win32 = makePathModule(true, natives);
+    const posix = makePathModule(false, natives);
+    const mod = natives.platform === "win32" ? { ...win32 } : { ...posix };
+    win32.win32 = win32;
+    win32.posix = posix;
+    posix.win32 = win32;
+    posix.posix = posix;
+    mod.win32 = win32;
+    mod.posix = posix;
+    return mod;
+  };
+  registry.factories["path/posix"] = () => registry.get("path").posix;
+  registry.factories["path/win32"] = () => registry.get("path").win32;
+
+  // ------------------------------------------------------------------- os
+  registry.factories.os = (natives) => {
+    const isWin = natives.platform === "win32";
+    return {
+      EOL: isWin ? "\r\n" : "\n",
+      devNull: isWin ? "\\\\.\\nul" : "/dev/null",
+      platform: () => natives.platform,
+      arch: () => natives.arch,
+      type: () =>
+        natives.platform === "win32"
+          ? "Windows_NT"
+          : natives.platform === "darwin"
+            ? "Darwin"
+            : "Linux",
+      release: () => "",
+      version: () => "",
+      homedir: () => natives.homedir(),
+      tmpdir: () => natives.tmpdir(),
+      hostname: () => natives.hostname(),
+      endianness: () => "LE",
+      availableParallelism: () => natives.cpuCount,
+      cpus: () =>
+        Array.from({ length: natives.cpuCount }, () => ({
+          model: "unknown",
+          speed: 0,
+          times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
+        })),
+      // Wave-1 stubs (documented): real values need a sysinfo native.
+      totalmem: () => 0,
+      freemem: () => 0,
+      uptime: () => natives.uptimeMs() / 1000,
+      loadavg: () => [0, 0, 0],
+      networkInterfaces: () => ({}),
+      userInfo: () => ({
+        username: natives.username(),
+        homedir: natives.homedir(),
+        shell: null,
+        uid: -1,
+        gid: -1,
+      }),
+    };
+  };
+
+  // ----------------------------------------------------------------- util
+  registry.factories.util = (natives) => {
+    function inspect(value, options = {}) {
+      const depth = options.depth === undefined ? 2 : options.depth;
+      const seen = new Set();
+
+      function walk(v, level) {
+        if (v === null) return "null";
+        const t = typeof v;
+        if (t === "string") return level === 0 && options.bare ? v : `'${v}'`;
+        if (t === "number" || t === "boolean" || t === "undefined") return String(v);
+        if (t === "bigint") return `${v}n`;
+        if (t === "symbol") return v.toString();
+        if (t === "function") {
+          const name = v.name ? `: ${v.name}` : " (anonymous)";
+          const kind = String(v).startsWith("class") ? "class" : "Function";
+          return `[${kind}${name}]`;
+        }
+        if (v instanceof Date) {
+          return Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+        }
+        if (v instanceof RegExp) return v.toString();
+        if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
+        if (globalThis.Buffer && v instanceof globalThis.Buffer) return v.inspect();
+        if (seen.has(v)) return "[Circular *1]";
+        if (depth !== null && level > depth) {
+          return Array.isArray(v) ? "[Array]" : "[Object]";
+        }
+        seen.add(v);
+        try {
+          if (Array.isArray(v)) {
+            const max = 100;
+            const items = v.slice(0, max).map((item) => walk(item, level + 1));
+            if (v.length > max) items.push(`... ${v.length - max} more items`);
+            return `[ ${items.join(", ")} ]`;
+          }
+          if (v instanceof Map) {
+            const items = [];
+            for (const [k, val] of v) {
+              items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
+              if (items.length >= 100) break;
+            }
+            return `Map(${v.size}) { ${items.join(", ")} }`;
+          }
+          if (v instanceof Set) {
+            const items = [];
+            for (const val of v) {
+              items.push(walk(val, level + 1));
+              if (items.length >= 100) break;
+            }
+            return `Set(${v.size}) { ${items.join(", ")} }`;
+          }
+          if (ArrayBuffer.isView(v)) {
+            const name = v.constructor?.name ?? "TypedArray";
+            const items = Array.from(v.subarray ? v.subarray(0, 50) : []).join(", ");
+            return `${name}(${v.length ?? v.byteLength}) [ ${items} ]`;
+          }
+          const ctor = v.constructor?.name;
+          const prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
+          const keys = Reflect.ownKeys(v).filter(
+            (k) => Object.getOwnPropertyDescriptor(v, k)?.enumerable,
+          );
+          if (keys.length === 0) return `${prefix}{}`;
+          const items = keys.slice(0, 200).map((k) => {
+            const keyText =
+              typeof k === "symbol"
+                ? `[${k.toString()}]`
+                : /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)
+                  ? k
+                  : `'${k}'`;
+            const desc = Object.getOwnPropertyDescriptor(v, k);
+            const valText = desc.get
+              ? "[Getter]"
+              : walk(v[k], level + 1);
+            return `${keyText}: ${valText}`;
+          });
+          return `${prefix}{ ${items.join(", ")} }`;
+        } finally {
+          seen.delete(v);
+        }
+      }
+      return walk(value, 0);
+    }
+
+    function formatValue(v) {
+      return typeof v === "string" ? v : inspect(v);
+    }
+
+    function format(f, ...args) {
+      if (typeof f !== "string") {
+        return [f, ...args].map(formatValue).join(" ");
+      }
+      let i = 0;
+      let out = f.replace(/%[sdifjoO%]/g, (spec) => {
+        if (spec === "%%") return "%";
+        if (i >= args.length) return spec;
+        const arg = args[i++];
+        switch (spec) {
+          case "%s":
+            return typeof arg === "string" ? arg : inspect(arg, { bare: true });
+          case "%d":
+            return typeof arg === "bigint" ? `${arg}n` : String(Number(arg));
+          case "%i":
+            return String(parseInt(arg, 10));
+          case "%f":
+            return String(parseFloat(arg));
+          case "%j":
+            try {
+              return JSON.stringify(arg);
+            } catch {
+              return "[Circular]";
+            }
+          case "%o":
+          case "%O":
+            return inspect(arg);
+          default:
+            return spec;
+        }
+      });
+      for (; i < args.length; i++) out += " " + formatValue(args[i]);
+      return out;
+    }
+
+    const customPromisify = Symbol.for("nodejs.util.promisify.custom");
+    function promisify(original) {
+      if (typeof original !== "function") {
+        throw new TypeError('The "original" argument must be of type function');
+      }
+      if (original[customPromisify]) return original[customPromisify];
+      function promisified(...args) {
+        return new Promise((resolve, reject) => {
+          original.call(this, ...args, (err, value) => {
+            if (err) reject(err);
+            else resolve(value);
+          });
+        });
+      }
+      Object.defineProperty(promisified, "name", { value: original.name });
+      return promisified;
+    }
+    promisify.custom = customPromisify;
+
+    function callbackify(original) {
+      function callbackified(...args) {
+        const cb = args.pop();
+        original.apply(this, args).then(
+          (value) => queueMicrotask(() => cb(null, value)),
+          (reason) =>
+            queueMicrotask(() =>
+              cb(reason ?? new Error("Promise was rejected with falsy value")),
+            ),
+        );
+      }
+      Object.defineProperty(callbackified, "name", { value: original.name });
+      return callbackified;
+    }
+
+    function inherits(ctor, superCtor) {
+      Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
+      Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+    }
+
+    function deprecate(fn, msg) {
+      let warned = false;
+      function deprecated(...args) {
+        if (!warned) {
+          warned = true;
+          if (globalThis.console) globalThis.console.warn(`DeprecationWarning: ${msg}`);
+        }
+        return fn.apply(this, args);
+      }
+      return deprecated;
+    }
+
+    function debuglog(section) {
+      const enabled = () => {
+        const debug = globalThis.process?.env?.NODE_DEBUG ?? "";
+        return debug
+          .split(",")
+          .some((s) => s.trim().toLowerCase() === String(section).toLowerCase());
+      };
+      const logger = (...args) => {
+        if (enabled() && globalThis.console) {
+          globalThis.console.error(`${String(section).toUpperCase()}: ${format(...args)}`);
+        }
+      };
+      logger.enabled = enabled();
+      return logger;
+    }
+
+    function deepEqualImpl(a, b, strict, memo) {
+      const primitiveEqual = strict
+        ? (x, y) => Object.is(x, y) || (x === 0 && y === 0)
+        : // eslint-disable-next-line eqeqeq
+          (x, y) => x == y || (Number.isNaN(x) && Number.isNaN(y));
+      if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+        return primitiveEqual(a, b);
+      }
+      if (a === b) return true;
+      if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      if (a instanceof Date) return b instanceof Date && a.getTime() === b.getTime();
+      if (a instanceof RegExp) {
+        return b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+      }
+      if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+        if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
+        const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+        const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+        if (ua.length !== ub.length) return false;
+        for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+        return true;
+      }
+      memo = memo ?? new Map();
+      const prior = memo.get(a);
+      if (prior && prior.has(b)) return true;
+      if (prior) prior.add(b);
+      else memo.set(a, new Set([b]));
+
+      if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+          if (!deepEqualImpl(a[i], b[i], strict, memo)) return false;
+        }
+        return true;
+      }
+      if (a instanceof Map) {
+        if (!(b instanceof Map) || a.size !== b.size) return false;
+        for (const [k, v] of a) {
+          if (b.has(k)) {
+            if (!deepEqualImpl(v, b.get(k), strict, memo)) return false;
+          } else {
+            let found = false;
+            for (const [bk, bv] of b) {
+              if (deepEqualImpl(k, bk, strict, memo) && deepEqualImpl(v, bv, strict, memo)) {
+                found = true;
+                break;
+              }
+            }
+            if (!found) return false;
+          }
+        }
+        return true;
+      }
+      if (a instanceof Set) {
+        if (!(b instanceof Set) || a.size !== b.size) return false;
+        for (const v of a) {
+          if (b.has(v)) continue;
+          let found = false;
+          for (const bv of b) {
+            if (deepEqualImpl(v, bv, strict, memo)) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) return false;
+        }
+        return true;
+      }
+      if (a instanceof Error) {
+        if (!(b instanceof Error) || a.name !== b.name || a.message !== b.message) {
+          return false;
+        }
+      }
+      const aKeys = Object.keys(a);
+      const bKeys = Object.keys(b);
+      if (aKeys.length !== bKeys.length) return false;
+      for (const key of aKeys) {
+        if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+        if (!deepEqualImpl(a[key], b[key], strict, memo)) return false;
+      }
+      return true;
+    }
+
+    return {
+      format,
+      formatWithOptions: (_opts, ...args) => format(...args),
+      inspect,
+      promisify,
+      callbackify,
+      inherits,
+      deprecate,
+      debuglog,
+      debug: debuglog,
+      isArray: Array.isArray,
+      isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
+      _deepEqual: deepEqualImpl,
+      stripVTControlCharacters: (str) =>
+        // eslint-disable-next-line no-control-regex
+        String(str).replace(/\[[0-9;]*[A-Za-z]/g, ""),
+      TextEncoder: globalThis.TextEncoder,
+      TextDecoder: globalThis.TextDecoder,
+      types: {
+        isDate: (v) => v instanceof Date,
+        isRegExp: (v) => v instanceof RegExp,
+        isNativeError: (v) => v instanceof Error,
+        isPromise: (v) => v instanceof Promise,
+        isMap: (v) => v instanceof Map,
+        isSet: (v) => v instanceof Set,
+        isWeakMap: (v) => v instanceof WeakMap,
+        isWeakSet: (v) => v instanceof WeakSet,
+        isArrayBuffer: (v) => v instanceof ArrayBuffer,
+        isSharedArrayBuffer: (v) =>
+          typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer,
+        isAnyArrayBuffer: (v) =>
+          v instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer),
+        isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
+        isUint8Array: (v) => v instanceof Uint8Array,
+        isDataView: (v) => v instanceof DataView,
+        isAsyncFunction: (v) =>
+          typeof v === "function" && v.constructor?.name === "AsyncFunction",
+        isGeneratorFunction: (v) =>
+          typeof v === "function" && v.constructor?.name === "GeneratorFunction",
+        isProxy: () => false,
+        isBoxedPrimitive: (v) =>
+          v instanceof Number || v instanceof String || v instanceof Boolean,
+      },
+    };
+  };
+
+  // --------------------------------------------------------------- assert
+  registry.factories.assert = () => {
+    const util = registry.get("util");
+    const deepEqual = util._deepEqual;
+
+    class AssertionError extends Error {
+      constructor(options) {
+        super(
+          options.message ||
+            `${util.inspect(options.actual)} ${options.operator} ${util.inspect(options.expected)}`,
+        );
+        this.name = "AssertionError";
+        this.code = "ERR_ASSERTION";
+        this.actual = options.actual;
+        this.expected = options.expected;
+        this.operator = options.operator;
+        this.generatedMessage = !options.message;
+      }
+    }
+
+    function innerFail(actual, expected, message, operator) {
+      throw new AssertionError({
+        actual,
+        expected,
+        message: message instanceof Error ? undefined : message,
+        operator,
+      });
+    }
+
+    function ok(value, message) {
+      if (!value) {
+        if (message instanceof Error) throw message;
+        throw new AssertionError({
+          actual: value,
+          expected: true,
+          message:
+            message ?? "The expression evaluated to a falsy value",
+          operator: "==",
+        });
+      }
+    }
+
+    function checkExpected(err, expected) {
+      if (expected instanceof RegExp) {
+        return expected.test(err instanceof Error ? err.message : String(err));
+      }
+      if (typeof expected === "function") {
+        if (expected.prototype !== undefined && err instanceof expected) return true;
+        if (expected === Error || Object.getPrototypeOf(expected) === Error) {
+          return err instanceof expected;
+        }
+        return expected(err) === true;
+      }
+      if (expected && typeof expected === "object") {
+        for (const key of Object.keys(expected)) {
+          const want = expected[key];
+          const got = err?.[key];
+          if (want instanceof RegExp) {
+            if (!want.test(String(got))) return false;
+          } else if (!deepEqual(got, want, true)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return true;
+    }
+
+    function throws(fn, expected, message) {
+      if (typeof expected === "string") {
+        message = expected;
+        expected = undefined;
+      }
+      let threw = false;
+      let thrown;
+      try {
+        fn();
+      } catch (e) {
+        threw = true;
+        thrown = e;
+      }
+      if (!threw) {
+        throw new AssertionError({
+          actual: undefined,
+          expected,
+          message: message ?? "Missing expected exception",
+          operator: "throws",
+        });
+      }
+      if (expected !== undefined && !checkExpected(thrown, expected)) {
+        throw thrown instanceof AssertionError
+          ? thrown
+          : new AssertionError({
+              actual: thrown,
+              expected,
+              message: message ?? `The error does not match the expected pattern`,
+              operator: "throws",
+            });
+      }
+      return thrown;
+    }
+
+    async function rejects(fnOrPromise, expected, message) {
+      if (typeof expected === "string") {
+        message = expected;
+        expected = undefined;
+      }
+      let rejected = false;
+      let reason;
+      try {
+        await (typeof fnOrPromise === "function" ? fnOrPromise() : fnOrPromise);
+      } catch (e) {
+        rejected = true;
+        reason = e;
+      }
+      if (!rejected) {
+        throw new AssertionError({
+          actual: undefined,
+          expected,
+          message: message ?? "Missing expected rejection",
+          operator: "rejects",
+        });
+      }
+      if (expected !== undefined && !checkExpected(reason, expected)) {
+        throw new AssertionError({
+          actual: reason,
+          expected,
+          message: message ?? "The rejection reason does not match the expected pattern",
+          operator: "rejects",
+        });
+      }
+      return reason;
+    }
+
+    const assert = Object.assign(ok, {
+      AssertionError,
+      ok,
+      fail: (message) => {
+        if (message instanceof Error) throw message;
+        throw new AssertionError({ message: message ?? "Failed", operator: "fail" });
+      },
+      equal: (actual, expected, message) => {
+        // eslint-disable-next-line eqeqeq
+        if (!(actual == expected || (Number.isNaN(actual) && Number.isNaN(expected)))) {
+          innerFail(actual, expected, message, "==");
+        }
+      },
+      notEqual: (actual, expected, message) => {
+        // eslint-disable-next-line eqeqeq
+        if (actual == expected) innerFail(actual, expected, message, "!=");
+      },
+      strictEqual: (actual, expected, message) => {
+        if (!Object.is(actual, expected) && !(actual === 0 && expected === 0)) {
+          innerFail(actual, expected, message, "strictEqual");
+        }
+      },
+      notStrictEqual: (actual, expected, message) => {
+        if (Object.is(actual, expected) || (actual === 0 && expected === 0)) {
+          innerFail(actual, expected, message, "notStrictEqual");
+        }
+      },
+      deepEqual: (actual, expected, message) => {
+        if (!deepEqual(actual, expected, false)) {
+          innerFail(actual, expected, message, "deepEqual");
+        }
+      },
+      notDeepEqual: (actual, expected, message) => {
+        if (deepEqual(actual, expected, false)) {
+          innerFail(actual, expected, message, "notDeepEqual");
+        }
+      },
+      deepStrictEqual: (actual, expected, message) => {
+        if (!deepEqual(actual, expected, true)) {
+          innerFail(actual, expected, message, "deepStrictEqual");
+        }
+      },
+      notDeepStrictEqual: (actual, expected, message) => {
+        if (deepEqual(actual, expected, true)) {
+          innerFail(actual, expected, message, "notDeepStrictEqual");
+        }
+      },
+      throws,
+      doesNotThrow: (fn, message) => {
+        try {
+          fn();
+        } catch (e) {
+          throw new AssertionError({
+            actual: e,
+            expected: undefined,
+            message: message ?? `Got unwanted exception: ${e?.message ?? e}`,
+            operator: "doesNotThrow",
+          });
+        }
+      },
+      rejects,
+      doesNotReject: async (fnOrPromise, message) => {
+        try {
+          await (typeof fnOrPromise === "function" ? fnOrPromise() : fnOrPromise);
+        } catch (e) {
+          throw new AssertionError({
+            actual: e,
+            expected: undefined,
+            message: message ?? `Got unwanted rejection: ${e?.message ?? e}`,
+            operator: "doesNotReject",
+          });
+        }
+      },
+      match: (string, regexp, message) => {
+        if (!regexp.test(string)) {
+          innerFail(string, regexp, message ?? `The input did not match the regular expression`, "match");
+        }
+      },
+      doesNotMatch: (string, regexp, message) => {
+        if (regexp.test(string)) {
+          innerFail(string, regexp, message ?? `The input was expected to not match`, "doesNotMatch");
+        }
+      },
+    });
+    // assert.strict: equal family promoted to strict semantics.
+    assert.strict = Object.assign(
+      (value, message) => ok(value, message),
+      assert,
+      {
+        equal: assert.strictEqual,
+        notEqual: assert.notStrictEqual,
+        deepEqual: assert.deepStrictEqual,
+        notDeepEqual: assert.notDeepStrictEqual,
+      },
+    );
+    assert.strict.strict = assert.strict;
+    return assert;
+  };
+
+  // ------------------------------------------------------------------- fs
+  function wrapStat(raw) {
+    return {
+      ...raw,
+      isFile: () => raw.kind === "file",
+      isDirectory: () => raw.kind === "dir",
+      isSymbolicLink: () => raw.kind === "symlink",
+      isBlockDevice: () => false,
+      isCharacterDevice: () => false,
+      isFIFO: () => false,
+      isSocket: () => false,
+      mtime: new Date(raw.mtimeMs),
+      atime: new Date(raw.atimeMs),
+      ctime: new Date(raw.ctimeMs),
+      birthtime: new Date(raw.birthtimeMs),
+    };
+  }
+
+  function wrapDirents(parent, entries, withFileTypes) {
+    if (!withFileTypes) return entries.map((e) => e.name);
+    return entries.map((e) => ({
+      name: e.name,
+      parentPath: parent,
+      path: parent,
+      isFile: () => e.kind === "file",
+      isDirectory: () => e.kind === "dir",
+      isSymbolicLink: () => e.kind === "symlink",
+      isBlockDevice: () => false,
+      isCharacterDevice: () => false,
+      isFIFO: () => false,
+      isSocket: () => false,
+    }));
+  }
+
+  function readOptions(options) {
+    if (typeof options === "string") return { encoding: options };
+    return options ?? {};
+  }
+
+  function toBufferIfBinary(result, encoding) {
+    if (encoding) return result; // already a string from the native
+    const BufferCtor = globalThis.Buffer;
+    return new BufferCtor(result.buffer, result.byteOffset, result.byteLength);
+  }
+
+  function streamStub(name) {
+    return () => {
+      throw new Error(
+        `fs.${name} needs stream support, which lands with node: compat wave 2 — ` +
+          `use fs.promises.readFile/writeFile or the sync forms today`,
+      );
+    };
+  }
+
+  registry.factories["fs/promises"] = (natives) => {
+    const normEnc = (options) => {
+      const { encoding } = readOptions(options);
+      return encoding ? String(encoding) : null;
+    };
+    return {
+      readFile: async (path, options) => {
+        const encoding = normEnc(options);
+        const result = await natives.fsReadFile(String(path), encoding);
+        return toBufferIfBinary(result, encoding);
+      },
+      writeFile: (path, data, _options) => natives.fsWriteFile(String(path), data, false),
+      appendFile: (path, data, _options) => natives.fsWriteFile(String(path), data, true),
+      stat: async (path) => wrapStat(await natives.fsStat(String(path), false)),
+      lstat: async (path) => wrapStat(await natives.fsStat(String(path), true)),
+      readdir: async (path, options) => {
+        const { withFileTypes } = readOptions(options);
+        const entries = await natives.fsReaddir(String(path));
+        return wrapDirents(String(path), entries, withFileTypes === true);
+      },
+      mkdir: async (path, options) => {
+        await natives.fsMkdir(String(path), readOptions(options).recursive === true);
+      },
+      rm: async (path, options = {}) => {
+        await natives.fsRm(String(path), options.recursive === true, options.force === true);
+      },
+      rmdir: (path) => natives.fsRm(String(path), false, false),
+      unlink: (path) => natives.fsUnlink(String(path)),
+      rename: (from, to) => natives.fsRename(String(from), String(to)),
+      copyFile: (from, to) => natives.fsCopyFile(String(from), String(to)),
+      access: (path) => natives.fsAccess(String(path)),
+      realpath: (path) => natives.fsRealpath(String(path)),
+    };
+  };
+
+  registry.factories.fs = (natives) => {
+    const promises = registry.get("fs/promises");
+
+    // Callback forms delegate to the promise forms (Node-style (err, value)).
+    function callbackify1(promiseFn) {
+      return (...args) => {
+        const cb = args.pop();
+        if (typeof cb !== "function") {
+          throw new TypeError("Callback must be a function");
+        }
+        promiseFn(...args).then(
+          (value) => queueMicrotask(() => cb(null, value)),
+          (err) => queueMicrotask(() => cb(err)),
+        );
+      };
+    }
+
+    const fs = {
+      promises,
+      constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
+
+      readFileSync: (path, options) => {
+        const encoding = readOptions(options).encoding ?? null;
+        const result = natives.fsReadFileSync(String(path), encoding ? String(encoding) : null);
+        return toBufferIfBinary(result, encoding);
+      },
+      writeFileSync: (path, data, _options) => {
+        natives.fsWriteFileSync(String(path), data, false);
+      },
+      appendFileSync: (path, data, _options) => {
+        natives.fsWriteFileSync(String(path), data, true);
+      },
+      existsSync: (path) => natives.fsExistsSync(String(path)),
+      statSync: (path) => wrapStat(natives.fsStatSync(String(path), false)),
+      lstatSync: (path) => wrapStat(natives.fsStatSync(String(path), true)),
+      readdirSync: (path, options) => {
+        const { withFileTypes } = readOptions(options);
+        return wrapDirents(
+          String(path),
+          natives.fsReaddirSync(String(path)),
+          withFileTypes === true,
+        );
+      },
+      mkdirSync: (path, options) => {
+        natives.fsMkdirSync(String(path), readOptions(options).recursive === true);
+      },
+      rmSync: (path, options = {}) => {
+        natives.fsRmSync(String(path), options.recursive === true, options.force === true);
+      },
+      rmdirSync: (path) => natives.fsRmSync(String(path), false, false),
+      unlinkSync: (path) => natives.fsUnlinkSync(String(path)),
+      renameSync: (from, to) => natives.fsRenameSync(String(from), String(to)),
+      copyFileSync: (from, to) => natives.fsCopyFileSync(String(from), String(to)),
+      accessSync: (path) => natives.fsAccessSync(String(path)),
+      realpathSync: (path) => natives.fsRealpathSync(String(path)),
+
+      readFile: callbackify1(promises.readFile),
+      writeFile: callbackify1(promises.writeFile),
+      appendFile: callbackify1(promises.appendFile),
+      stat: callbackify1(promises.stat),
+      lstat: callbackify1(promises.lstat),
+      readdir: callbackify1(promises.readdir),
+      mkdir: callbackify1(promises.mkdir),
+      rm: callbackify1(promises.rm),
+      rmdir: callbackify1(promises.rmdir),
+      unlink: callbackify1(promises.unlink),
+      rename: callbackify1(promises.rename),
+      copyFile: callbackify1(promises.copyFile),
+      access: callbackify1(promises.access),
+      realpath: callbackify1(promises.realpath),
+      exists: (path, cb) => {
+        // Deprecated single-arg callback shape, still in the wild.
+        cb(natives.fsExistsSync(String(path)));
+      },
+
+      createReadStream: streamStub("createReadStream"),
+      createWriteStream: streamStub("createWriteStream"),
+      watch: streamStub("watch"),
+      watchFile: streamStub("watchFile"),
+    };
+    fs.realpathSync.native = fs.realpathSync;
+    return fs;
+  };
+
+  // -------------------------------------------------------------- process
+  registry.factories.process = (natives) => {
+    const EventEmitter = registry.get("events");
+    const process = new EventEmitter();
+
+    const env = natives.env();
+    const argv = natives.argv();
+    const stdoutIsTTY = natives.isTTY(1);
+    const stderrIsTTY = natives.isTTY(2);
+
+    Object.assign(process, {
+      env,
+      argv,
+      argv0: argv[0],
+      execPath: argv[0],
+      execArgv: [],
+      platform: natives.platform,
+      arch: natives.arch,
+      // Compat claim: packages feature-detect via process.version. oam
+      // tracks the Node LTS line its compat layer targets.
+      version: "v22.16.0",
+      versions: {
+        node: "22.16.0",
+        oam: natives.oamVersion,
+        v8: natives.v8Version,
+      },
+      pid: natives.pid,
+      ppid: 0,
+      title: "oam",
+      exitCode: undefined,
+      exit(code) {
+        natives.exit(code ?? process.exitCode ?? 0);
+      },
+      cwd: () => natives.cwd(),
+      chdir: (dir) => natives.chdir(String(dir)),
+      nextTick(fn, ...args) {
+        if (typeof fn !== "function") {
+          throw new TypeError('The "callback" argument must be of type function');
+        }
+        queueMicrotask(() => fn(...args));
+      },
+      hrtime: Object.assign(
+        (prev) => {
+          const ns = natives.hrtimeNanos();
+          const total = Number(ns);
+          let secs = Math.floor(total / 1e9);
+          let nanos = total % 1e9;
+          if (prev) {
+            secs -= prev[0];
+            nanos -= prev[1];
+            if (nanos < 0) {
+              secs -= 1;
+              nanos += 1e9;
+            }
+          }
+          return [secs, nanos];
+        },
+        { bigint: () => natives.hrtimeNanos() },
+      ),
+      uptime: () => natives.uptimeMs() / 1000,
+      memoryUsage: Object.assign(
+        () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
+        { rss: () => 0 },
+      ),
+      stdout: {
+        fd: 1,
+        isTTY: stdoutIsTTY,
+        write(chunk) {
+          natives.stdoutWrite(
+            typeof chunk === "string" ? chunk : globalThis.Buffer.from(chunk).toString("utf8"),
+          );
+          return true;
+        },
+        columns: stdoutIsTTY ? 80 : undefined,
+        hasColors: () => stdoutIsTTY,
+      },
+      stderr: {
+        fd: 2,
+        isTTY: stderrIsTTY,
+        write(chunk) {
+          natives.stderrWrite(
+            typeof chunk === "string" ? chunk : globalThis.Buffer.from(chunk).toString("utf8"),
+          );
+          return true;
+        },
+        columns: stderrIsTTY ? 80 : undefined,
+        hasColors: () => stderrIsTTY,
+      },
+      stdin: { fd: 0, isTTY: natives.isTTY(0) },
+      emitWarning(warning) {
+        if (globalThis.console) {
+          globalThis.console.warn(
+            warning instanceof Error ? `${warning.name}: ${warning.message}` : `Warning: ${warning}`,
+          );
+        }
+      },
+      umask: () => 0,
+      release: { name: "node" },
+      config: { variables: {} },
+      features: { inspector: false, ipv6: true, tls: true },
+      allowedNodeEnvironmentFlags: new Set(),
+      report: undefined,
+    });
+    return process;
+  };
+
+  // --------------------------------------------------------------- module
+  registry.factories.module = (natives) => {
+    function fileURLToPathLite(url) {
+      let p = String(url).slice("file://".length);
+      p = decodeURIComponent(p);
+      if (natives.platform === "win32") {
+        if (p.startsWith("/") && /^[A-Za-z]:/.test(p.slice(1))) p = p.slice(1);
+        p = p.replaceAll("/", "\\");
+      }
+      return p;
+    }
+
+    class Module {}
+
+    const builtinModules = [
+      "assert",
+      "buffer",
+      "events",
+      "fs",
+      "fs/promises",
+      "module",
+      "os",
+      "path",
+      "path/posix",
+      "path/win32",
+      "process",
+      "tty",
+      "util",
+    ];
+
+    return {
+      createRequire(filename) {
+        let base = String(filename);
+        if (base.startsWith("file://")) base = fileURLToPathLite(base);
+        return natives.makeRequire(base);
+      },
+      builtinModules,
+      isBuiltin: (name) => {
+        const bare = String(name).replace(/^node:/, "");
+        return builtinModules.includes(bare);
+      },
+      syncBuiltinESMExports: () => {},
+      Module,
+    };
+  };
+
+  // ------------------------------------------------------------------ tty
+  registry.factories.tty = (natives) => ({
+    isatty: (fd) => natives.isTTY(Number(fd)),
+    ReadStream: class ReadStream {},
+    WriteStream: class WriteStream {},
+  });
+
+  // --------------------------------------------------------------- buffer
+  registry.factories.buffer = () => ({
+    Buffer: globalThis.Buffer,
+    atob: globalThis.atob,
+    btoa: globalThis.btoa,
+    constants: { MAX_LENGTH: 4294967295, MAX_STRING_LENGTH: 536870888 },
+    kMaxLength: 4294967295,
+    isUtf8: (input) => {
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(input);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    isAscii: (input) => {
+      const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+      for (let i = 0; i < bytes.length; i++) if (bytes[i] > 0x7f) return false;
+      return true;
+    },
+  });
+
+  // ------------------------------------------------- runtime global setup
+  // Called from Rust after snapshot restore + native install. Installs the
+  // globals that need runtime data, and upgrades console with the
+  // util.inspect-powered formatter (the M0 native console stringified
+  // objects to '[object Object]').
+  registry.installRuntimeGlobals = function installRuntimeGlobals() {
+    const natives = globalThis.__oam.node;
+    globalThis.process = registry.get("process");
+    globalThis.performance = {
+      now: () => natives.nowMs(),
+      timeOrigin: Date.now() - natives.nowMs(),
+    };
+
+    const util = registry.get("util");
+    const fmt = (args) =>
+      args.length > 0 && typeof args[0] === "string"
+        ? util.format(...args)
+        : args.map((a) => (typeof a === "string" ? a : util.inspect(a))).join(" ");
+    const writeOut = (args) => natives.stdoutWrite(fmt(args) + "\n");
+    const writeErr = (args) => natives.stderrWrite(fmt(args) + "\n");
+
+    const timers = new Map();
+    const counters = new Map();
+    globalThis.console = {
+      log: (...args) => writeOut(args),
+      info: (...args) => writeOut(args),
+      debug: (...args) => writeOut(args),
+      warn: (...args) => writeErr(args),
+      error: (...args) => writeErr(args),
+      trace: (...args) => {
+        const stack = new Error().stack?.split("\n").slice(1).join("\n") ?? "";
+        writeErr([`Trace: ${fmt(args)}\n${stack}`]);
+      },
+      assert: (cond, ...args) => {
+        if (!cond) writeErr([`Assertion failed${args.length ? ": " + fmt(args) : ""}`]);
+      },
+      dir: (obj, options) => writeOut([util.inspect(obj, options ?? { depth: 2 })]),
+      table: (data) => writeOut([util.inspect(data)]),
+      time: (label = "default") => timers.set(label, natives.nowMs()),
+      timeEnd: (label = "default") => {
+        const start = timers.get(label);
+        timers.delete(label);
+        writeOut([`${label}: ${start === undefined ? "NaN" : (natives.nowMs() - start).toFixed(3)}ms`]);
+      },
+      count: (label = "default") => {
+        const next = (counters.get(label) ?? 0) + 1;
+        counters.set(label, next);
+        writeOut([`${label}: ${next}`]);
+      },
+      countReset: (label = "default") => counters.delete(label),
+      group: (...args) => {
+        if (args.length) writeOut(args);
+      },
+      groupEnd: () => {},
+    };
+  };
+})();

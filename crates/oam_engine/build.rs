@@ -25,9 +25,23 @@ fn main() {
         );
     }
 
-    let bootstrap_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js");
-    println!("cargo:rerun-if-changed={bootstrap_path}");
-    let bootstrap = std::fs::read_to_string(bootstrap_path).expect("bootstrap.js readable");
+    // Evaluated in order: web surface first, then the node: compat layer
+    // (node_compat.js installs Buffer/TextEncoder globals and the builtin
+    // factory registry — all pure JS, natives looked up at call time).
+    let js_files = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/node_compat.js"),
+    ];
+    let sources: Vec<(String, String)> = js_files
+        .iter()
+        .map(|path| {
+            println!("cargo:rerun-if-changed={path}");
+            (
+                path.to_string(),
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}")),
+            )
+        })
+        .collect();
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
@@ -39,9 +53,15 @@ fn main() {
         let context = v8::Context::new(scope, v8::ContextOptions::default());
         {
             let scope = &mut v8::ContextScope::new(scope, context);
-            let source = v8::String::new(scope, &bootstrap).expect("bootstrap fits");
-            let script = v8::Script::compile(scope, source, None).expect("bootstrap compiles");
-            script.run(scope).expect("bootstrap evaluates");
+            for (path, text) in &sources {
+                let source = v8::String::new(scope, text)
+                    .unwrap_or_else(|| panic!("{path}: too long for V8 string"));
+                let script = v8::Script::compile(scope, source, None)
+                    .unwrap_or_else(|| panic!("{path}: does not compile"));
+                script
+                    .run(scope)
+                    .unwrap_or_else(|| panic!("{path}: failed to evaluate"));
+            }
         }
         scope.set_default_context(context);
     }

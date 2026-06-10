@@ -30,7 +30,17 @@ pub enum OpOutcome {
     /// structured-payload path until a zero-copy transfer lands with the
     /// op-macro work.
     Json(String),
+    /// Raw bytes; the engine surfaces a Uint8Array over a fresh backing
+    /// store (JS wraps it in Buffer where node: semantics apply).
+    Bytes(Vec<u8>),
     Failed(String),
+    /// A failure carrying a Node errno code (ENOENT, EACCES, ...). The
+    /// engine rejects with an Error whose `.code` property is set —
+    /// ecosystem code branches on err.code constantly (graceful-fs et al).
+    NodeFailed {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -135,6 +145,62 @@ impl CoreRuntime {
     }
 }
 
+/// Map an I/O error to the Node errno code ecosystem code branches on.
+/// Shared by the async fs ops below and oam_engine's sync fs natives.
+pub fn node_error_code(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::NotFound => "ENOENT",
+        ErrorKind::PermissionDenied => "EACCES",
+        ErrorKind::AlreadyExists => "EEXIST",
+        ErrorKind::DirectoryNotEmpty => "ENOTEMPTY",
+        ErrorKind::NotADirectory => "ENOTDIR",
+        ErrorKind::IsADirectory => "EISDIR",
+        ErrorKind::InvalidInput => "EINVAL",
+        ErrorKind::TimedOut => "ETIMEDOUT",
+        ErrorKind::Interrupted => "EINTR",
+        ErrorKind::Unsupported => "ENOSYS",
+        ErrorKind::BrokenPipe => "EPIPE",
+        ErrorKind::WouldBlock => "EAGAIN",
+        _ => "EIO",
+    }
+}
+
+/// Node-style error message: "ENOENT: no such file or directory, open 'p'".
+pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io::Error) -> String {
+    let reason = match code {
+        "ENOENT" => "no such file or directory".to_string(),
+        "EACCES" => "permission denied".to_string(),
+        "EEXIST" => "file already exists".to_string(),
+        "ENOTEMPTY" => "directory not empty".to_string(),
+        "ENOTDIR" => "not a directory".to_string(),
+        "EISDIR" => "illegal operation on a directory".to_string(),
+        _ => error.to_string(),
+    };
+    format!("{code}: {reason}, {syscall} '{path}'")
+}
+
+/// rm with Node semantics: file or directory, optional recursion.
+pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        if recursive {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_dir(path)
+        }
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// std::fs::canonicalize returns \\?\-prefixed paths on Windows, which leak
+/// into user-visible strings and break naive comparisons — strip the prefix.
+pub fn strip_unc_prefix(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
 /// Built-in op implementations. Plain futures; the engine decides how their
 /// outcomes surface in JS.
 pub mod ops {
@@ -144,6 +210,179 @@ pub mod ops {
     pub async fn sleep(ms: u64) -> OpOutcome {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         OpOutcome::Done
+    }
+
+    fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
+        let code = super::node_error_code(&error);
+        OpOutcome::NodeFailed {
+            code: code.to_string(),
+            message: super::node_error_message(code, syscall, path, &error),
+        }
+    }
+
+    /// stat/lstat payload, shared with the sync native in oam_engine for a
+    /// single wire shape ({kind, size, mtimeMs, ...}).
+    pub fn stat_to_json(meta: &std::fs::Metadata) -> String {
+        fn ms(time: std::io::Result<std::time::SystemTime>) -> f64 {
+            time.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0)
+        }
+        let kind = if meta.is_symlink() {
+            "symlink"
+        } else if meta.is_dir() {
+            "dir"
+        } else {
+            "file"
+        };
+        serde_json::json!({
+            "kind": kind,
+            "size": meta.len(),
+            "mtimeMs": ms(meta.modified()),
+            "atimeMs": ms(meta.accessed()),
+            "ctimeMs": ms(meta.modified()),
+            "birthtimeMs": ms(meta.created()),
+            "mode": 0,
+        })
+        .to_string()
+    }
+
+    pub fn readdir_to_json(path: &str) -> std::io::Result<String> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = match entry.file_type() {
+                Ok(t) if t.is_symlink() => "symlink",
+                Ok(t) if t.is_dir() => "dir",
+                _ => "file",
+            };
+            entries.push(serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "kind": kind,
+            }));
+        }
+        Ok(serde_json::Value::Array(entries).to_string())
+    }
+
+    pub async fn fs_read_file(path: String, encoding: Option<String>) -> OpOutcome {
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => match encoding.as_deref() {
+                None => OpOutcome::Bytes(bytes),
+                Some(_) => OpOutcome::Text(String::from_utf8_lossy(&bytes).into_owned()),
+            },
+            Err(e) => node_fail(e, "open", &path),
+        }
+    }
+
+    pub async fn fs_write_file(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+        let result = if append {
+            tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(&data))
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        } else {
+            tokio::fs::write(&path, data).await
+        };
+        match result {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "open", &path),
+        }
+    }
+
+    pub async fn fs_stat(path: String, lstat: bool) -> OpOutcome {
+        let meta = if lstat {
+            tokio::fs::symlink_metadata(&path).await
+        } else {
+            tokio::fs::metadata(&path).await
+        };
+        match meta {
+            Ok(meta) => OpOutcome::Json(stat_to_json(&meta)),
+            Err(e) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
+        }
+    }
+
+    pub async fn fs_readdir(path: String) -> OpOutcome {
+        match tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || readdir_to_json(&path)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        {
+            Ok(json) => OpOutcome::Json(json),
+            Err(e) => node_fail(e, "scandir", &path),
+        }
+    }
+
+    pub async fn fs_mkdir(path: String, recursive: bool) -> OpOutcome {
+        let result = if recursive {
+            tokio::fs::create_dir_all(&path).await
+        } else {
+            tokio::fs::create_dir(&path).await
+        };
+        match result {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "mkdir", &path),
+        }
+    }
+
+    pub async fn fs_rm(path: String, recursive: bool, force: bool) -> OpOutcome {
+        let result = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || super::remove_path(&path, recursive)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        match result {
+            Ok(()) => OpOutcome::Done,
+            Err(e) if force && e.kind() == std::io::ErrorKind::NotFound => OpOutcome::Done,
+            Err(e) => node_fail(e, "rm", &path),
+        }
+    }
+
+    pub async fn fs_unlink(path: String) -> OpOutcome {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "unlink", &path),
+        }
+    }
+
+    pub async fn fs_rename(from: String, to: String) -> OpOutcome {
+        match tokio::fs::rename(&from, &to).await {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "rename", &from),
+        }
+    }
+
+    pub async fn fs_copy_file(from: String, to: String) -> OpOutcome {
+        match tokio::fs::copy(&from, &to).await {
+            Ok(_) => OpOutcome::Done,
+            Err(e) => node_fail(e, "copyfile", &from),
+        }
+    }
+
+    pub async fn fs_access(path: String) -> OpOutcome {
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => OpOutcome::Done,
+            Err(e) => node_fail(e, "access", &path),
+        }
+    }
+
+    pub async fn fs_realpath(path: String) -> OpOutcome {
+        match tokio::fs::canonicalize(&path).await {
+            Ok(real) => OpOutcome::Text(super::strip_unc_prefix(&real)),
+            Err(e) => node_fail(e, "realpath", &path),
+        }
     }
 
     pub async fn read_text_file(path: String) -> OpOutcome {

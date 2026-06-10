@@ -132,6 +132,15 @@ fn require_callback(
             return;
         }
     };
+    // Builtins resolve to virtual node:NAME paths; the registry object is
+    // the require() result (same instance the ESM facade exposes).
+    if let Some(name) = path.to_str().and_then(|s| s.strip_prefix("node:")) {
+        let name = name.to_string();
+        if let Some(builtin) = get_builtin(scope, &name) {
+            rv.set(builtin);
+        }
+        return;
+    }
     let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
     if !is_json && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Esm {
         throw_error(
@@ -277,9 +286,7 @@ pub(crate) fn load_cjs<'s>(
         return None;
     };
 
-    let require = v8::Function::builder(require_callback)
-        .data(filename_v8.into())
-        .build(scope)?;
+    let require = make_require(scope, &file)?;
     let dirname = key
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -318,6 +325,43 @@ fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
     }
 }
 
+/// Build a `require` function bound to `filename` (each CJS module gets
+/// one; node:module's createRequire hands them to ESM callers too).
+pub(crate) fn make_require<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    filename: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let data = v8::String::new(scope, filename)?;
+    v8::Function::builder(require_callback)
+        .data(data.into())
+        .build(scope)
+}
+
+/// Instantiate (or fetch cached) the node builtin `name` via the snapshot
+/// registry. None means a JS exception is pending.
+pub(crate) fn get_builtin<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let registry_key = v8::String::new(scope, "__oamNode")?;
+    let registry = global.get(scope, registry_key.into())?;
+    let Ok(registry) = v8::Local::<v8::Object>::try_from(registry) else {
+        throw_error(scope, "oam internal: __oamNode registry missing");
+        return None;
+    };
+    let get_key = v8::String::new(scope, "get")?;
+    let get = registry.get(scope, get_key.into())?;
+    let Ok(get) = v8::Local::<v8::Function>::try_from(get) else {
+        throw_error(scope, "oam internal: __oamNode.get missing");
+        return None;
+    };
+    let name_v8 = v8::String::new(scope, name)?;
+    let recv: v8::Local<v8::Value> = registry.into();
+    get.call(scope, recv, &[name_v8.into()])
+}
+
 /// Generate the ESM facade for an already-executed CJS module. Named
 /// exports are the exports object's own enumerable string keys — exact,
 /// because the module already ran. `default` follows __esModule (see
@@ -328,12 +372,33 @@ pub(crate) fn facade_source(
     exports: v8::Local<v8::Value>,
 ) -> String {
     let path_literal = serde_json::to_string(&key.to_string_lossy()).expect("path serializes");
-    let mut out = format!(
+    let prelude = format!(
         "const m = __oam.requireCjs({path_literal});\n\
          export default (m !== null && (typeof m === \"object\" || typeof m === \"function\") \
          && m.__esModule) ? m[\"default\"] : m;\n"
     );
+    facade_with_prelude(scope, prelude, exports)
+}
 
+/// Generate the ESM facade for a node builtin. Default is the module
+/// object itself (Node parity: `import fs from 'node:fs'` is the
+/// namespace), named exports are its runtime keys.
+pub(crate) fn builtin_facade_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    name: &str,
+    exports: v8::Local<v8::Value>,
+) -> String {
+    let name_literal = serde_json::to_string(name).expect("name serializes");
+    let prelude = format!("const m = __oamNode.get({name_literal});\nexport default m;\n");
+    facade_with_prelude(scope, prelude, exports)
+}
+
+fn facade_with_prelude(
+    scope: &mut v8::PinScope<'_, '_>,
+    prelude: String,
+    exports: v8::Local<v8::Value>,
+) -> String {
+    let mut out = prelude;
     let Ok(exports_obj) = v8::Local::<v8::Object>::try_from(exports) else {
         return out; // primitive module.exports: default-only facade
     };
