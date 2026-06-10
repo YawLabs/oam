@@ -7,9 +7,11 @@
 // Wire contract with crates/oam_core ops::fetch:
 //   request:  JSON string {url, method, headers: [[k,v]], body}
 //   response: {status, statusText, url, headers: [[k,v]], body}
+// SNAPSHOT CONSTRAINT: this file is evaluated at BUILD time into the V8
+// startup snapshot, where no native bindings exist. Anything from __oam
+// must be looked up at CALL time, never captured at eval time.
 "use strict";
 (() => {
-  const core = globalThis.__oam;
 
   function makeHeaders(pairs) {
     const map = new Map();
@@ -80,7 +82,7 @@
     };
     let raw;
     try {
-      raw = await core.fetch(JSON.stringify(request));
+      raw = await globalThis.__oam.fetch(JSON.stringify(request));
     } catch (e) {
       // WHATWG: fetch() rejects with a TypeError on network failure.
       throw new TypeError(e && e.message ? e.message : String(e));

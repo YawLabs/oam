@@ -10,3 +10,7 @@ v8 = { workspace = true }
 anyhow = { workspace = true }
 oam_diagnostics = { workspace = true }
 oam_core = { workspace = true }
+
+[build-dependencies]
+# Snapshot generation evaluates js/bootstrap.js at build time (build.rs).
+v8 = { workspace = true }

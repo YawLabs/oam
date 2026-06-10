@@ -23,6 +23,12 @@ pub use modules::ModuleHost;
 
 static V8_INIT: Once = Once::new();
 
+/// Build-time startup snapshot: js/bootstrap.js pre-parsed, pre-evaluated,
+/// compiled code retained. Every Context::new materializes a fresh context
+/// from this template; natives are installed after restore (the blob holds
+/// pure JS only — see build.rs).
+static OAM_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oam_snapshot.bin"));
+
 /// Initialize the V8 platform exactly once per process.
 pub fn init_platform() {
     V8_INIT.call_once(|| {
@@ -41,7 +47,8 @@ pub struct JsRuntime {
 impl JsRuntime {
     pub fn new() -> Self {
         init_platform();
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        let params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
+        let mut isolate = v8::Isolate::new(params);
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.add_message_listener(modules::message_listener);
         isolate.set_slot(timers::TimerQueue::default());
@@ -49,13 +56,14 @@ impl JsRuntime {
         isolate.set_slot(ops::PendingOps::default());
         let context = {
             v8::scope!(let scope, &mut isolate);
+            // Deserializes the snapshot's default context: bootstrap.js is
+            // already evaluated in here — no JS parsing at startup.
             let context = v8::Context::new(scope, v8::ContextOptions::default());
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
             install_console(scope, context);
             timers::install(scope, context);
             ops::install(scope, context);
-            run_bootstrap(scope);
             global
         };
         Self { isolate, context }
@@ -108,20 +116,6 @@ pub(crate) fn exception_to_error(
     let text = message.get(tc).to_rust_string_lossy(tc);
     let line = message.get_line_number(tc).unwrap_or(0);
     anyhow!("{name}:{line}: {text}")
-}
-
-/// Evaluate js/bootstrap.js — the JS half of the runtime surface (fetch et
-/// al. over the __oam op table). Compiled into the startup snapshot once
-/// that pipeline lands; a failure here is an oam build defect, never user
-/// error, so it panics loudly.
-fn run_bootstrap(scope: &mut v8::PinScope<'_, '_>) {
-    const BOOTSTRAP: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../js/bootstrap.js"
-    ));
-    let source = v8::String::new(scope, BOOTSTRAP).expect("bootstrap source fits");
-    let script = v8::Script::compile(scope, source, None).expect("bootstrap compiles");
-    script.run(scope).expect("bootstrap runs");
 }
 
 /// M0 console: log/info/debug -> stdout, warn/error -> stderr.
@@ -219,5 +213,21 @@ mod tests {
         let mut rt = JsRuntime::new();
         rt.execute_script("log.js", "console.log('hello from oam')")
             .unwrap();
+    }
+
+    #[test]
+    fn bootstrap_comes_from_the_snapshot() {
+        // fetch is defined by bootstrap.js, which is only ever evaluated at
+        // BUILD time into the snapshot — its presence proves the context
+        // deserialized from the blob.
+        let mut rt = JsRuntime::new();
+        let result = rt.execute_script("snap.js", "typeof fetch").unwrap();
+        assert_eq!(result, "function");
+        // And a second runtime restores independently.
+        let mut rt2 = JsRuntime::new();
+        assert_eq!(
+            rt2.execute_script("snap2.js", "typeof fetch").unwrap(),
+            "function"
+        );
     }
 }
