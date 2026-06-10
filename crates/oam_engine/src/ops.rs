@@ -48,9 +48,21 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let fetch_key = v8::String::new(scope, "fetch").unwrap();
-    let fetch_fn = v8::Function::new(scope, op_fetch).unwrap();
-    internal.set(scope, fetch_key.into(), fetch_fn.into());
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 3] = [
+        ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
+        (
+            "fetchBodyRead",
+            v8::Function::new(scope, op_fetch_body_read).unwrap(),
+        ),
+        (
+            "fetchBodyCancel",
+            v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
+        ),
+    ];
+    for (name, function) in internal_bindings {
+        let key = v8::String::new(scope, name).unwrap();
+        internal.set(scope, key.into(), function.into());
+    }
     let internal_key = v8::String::new(scope, "__oam").unwrap();
     global.set(scope, internal_key.into(), internal.into());
 }
@@ -133,11 +145,49 @@ fn op_fetch(
             return;
         }
     };
-    let client = scope
+    let core = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed");
+    let client = core.http_client();
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fetch(client, request, bodies, ids),
+    );
+}
+
+fn op_fetch_body_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let bodies = scope
         .get_slot::<CoreRuntime>()
         .expect("core runtime installed")
-        .http_client();
-    spawn_op(scope, &mut rv, oam_core::ops::fetch(client, request));
+        .bodies();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fetch_body_read(bodies, handle),
+    );
+}
+
+/// Synchronous: drop the stored response (connection closes). Safe to call
+/// on an already-drained handle.
+fn op_fetch_body_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let bodies = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .bodies();
+    bodies.lock().expect("body registry lock").remove(&handle);
 }
 
 /// Settle one completed op against its parked resolver. Runs on the isolate

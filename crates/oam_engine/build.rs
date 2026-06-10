@@ -33,6 +33,8 @@ fn main() {
     let js_files = [
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/node_compat.js"),
+        // streams.js: TextDecoderStream needs node_compat's TextDecoder.
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/streams.js"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/test_runner.js"),
     ];
     let sources: Vec<(String, String)> = js_files

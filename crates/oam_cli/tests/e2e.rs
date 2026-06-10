@@ -80,6 +80,20 @@ fn spawn_echo_server() -> std::net::SocketAddr {
                     );
                     return;
                 }
+                if path == "/stream" {
+                    // SSE-style: headers immediately, then chunks flushed
+                    // with real gaps — proves incremental delivery.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                    for token in ["data: tok1\n\n", "data: tok2\n\n", "data: [DONE]\n\n"] {
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        let _ = stream.write_all(token.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    return;
+                }
                 let x_probe = head
                     .lines()
                     .filter_map(|l| l.split_once(':'))
@@ -1092,6 +1106,122 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "BROWSER-SHIM function function"
     );
+}
+
+// ------------------------------------------------------------ web streams
+
+#[test]
+fn readable_stream_core_and_text_pipeline() {
+    let stdout = run_ok(
+        "streams_core.mjs",
+        "// Custom pull source + async iteration.\n\
+         let n = 0;\n\
+         const rs = new ReadableStream({\n\
+           pull(c) { n++; if (n > 3) c.close(); else c.enqueue(n); },\n\
+         });\n\
+         const got = [];\n\
+         for await (const v of rs) got.push(v);\n\
+         console.log(got.join(','));\n\
+         // from() + TransformStream doubling.\n\
+         const doubled = ReadableStream.from([1, 2, 3]).pipeThrough(\n\
+           new TransformStream({ transform: (v, c) => c.enqueue(v * 2) }),\n\
+         );\n\
+         const out = [];\n\
+         for await (const v of doubled) out.push(v);\n\
+         console.log(out.join(','));\n\
+         // WritableStream collects, serialized.\n\
+         const sink = [];\n\
+         const ws = new WritableStream({ write(chunk) { sink.push(chunk); } });\n\
+         const w = ws.getWriter();\n\
+         await w.write('a'); await w.write('b'); await w.close();\n\
+         console.log(sink.join(''));\n\
+         // TextDecoderStream reassembles a split multi-byte char.\n\
+         const euro = ReadableStream.from([\n\
+           new Uint8Array([0x61, 0xE2]),\n\
+           new Uint8Array([0x82, 0xAC, 0x62]),\n\
+         ]).pipeThrough(new TextDecoderStream());\n\
+         let text = '';\n\
+         for await (const part of euro) text += part;\n\
+         console.log(text === 'a\\u20ACb', text.length);\n\
+         // tee: both branches see everything.\n\
+         const [t1, t2] = ReadableStream.from(['x', 'y']).tee();\n\
+         const c1 = []; const c2 = [];\n\
+         for await (const v of t1) c1.push(v);\n\
+         for await (const v of t2) c2.push(v);\n\
+         console.log(c1.join(''), c2.join(''));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "1,2,3");
+    assert_eq!(lines[1], "2,4,6");
+    assert_eq!(lines[2], "ab");
+    assert_eq!(lines[3], "true 3");
+    assert_eq!(lines[4], "xy xy");
+}
+
+#[test]
+fn fetch_body_streams_incrementally() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "stream_fetch.mjs",
+        &format!(
+            "const res = await fetch('http://{addr}/stream');\n\
+             console.log(res.status, res.headers.get('content-type'));\n\
+             const events = [];\n\
+             let chunkCount = 0;\n\
+             const decoder = new TextDecoderStream();\n\
+             for await (const part of res.body.pipeThrough(decoder)) {{\n\
+               chunkCount++;\n\
+               for (const line of part.split('\\n')) {{\n\
+                 if (line.startsWith('data: ')) events.push(line.slice(6));\n\
+               }}\n\
+             }}\n\
+             // >1 chunk proves INCREMENTAL delivery (the server sleeps\n\
+             // between flushes); exact count is transport-dependent.\n\
+             console.log(chunkCount > 1, events.join('|'));"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "200 text/event-stream");
+    assert_eq!(lines[1], "true tok1|tok2|[DONE]");
+}
+
+#[test]
+fn fetch_text_json_still_work_and_cancel_does_not_hang() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "stream_drain.mjs",
+        &format!(
+            "const res = await fetch('http://{addr}/hello', {{ method: 'POST', body: 'ping' }});\n\
+             const data = await res.json();\n\
+             console.log(data.method, data.echo, res.bodyUsed);\n\
+             let doubled = '';\n\
+             try {{ await res.text(); }} catch (e) {{ doubled = e.constructor.name; }}\n\
+             console.log(doubled);\n\
+             // Early-exit from iteration cancels the body; the run must\n\
+             // exit promptly instead of waiting out the server's stream.\n\
+             const slow = await fetch('http://{addr}/stream');\n\
+             for await (const _chunk of slow.body) break;\n\
+             console.log('cancelled-clean');"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "POST ping true");
+    assert_eq!(lines[1], "TypeError");
+    assert_eq!(lines[2], "cancelled-clean");
 }
 
 // ------------------------------------------------- AsyncLocalStorage (CPED)

@@ -10,6 +10,7 @@
 //! Roadmap: the #[op] macro, the io_uring/IOCP completion IoDriver, and
 //! per-workload tokio tuning land here as the op surface grows.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -49,6 +50,12 @@ pub struct OpCompletion {
     pub outcome: OpOutcome,
 }
 
+/// Live streaming response bodies, keyed by handle. A std (not tokio)
+/// Mutex on purpose: readers REMOVE the response under a short lock, await
+/// the chunk with no lock held, then reinsert — no guard ever crosses an
+/// await. Single-reader discipline is guaranteed by ReadableStream's lock.
+pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Response>>>;
+
 pub struct CoreRuntime {
     tokio: tokio::runtime::Runtime,
     /// Shared HTTP client (connection pool). Owned per CoreRuntime so pooled
@@ -58,6 +65,8 @@ pub struct CoreRuntime {
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
     inflight: usize,
+    bodies: BodyRegistry,
+    next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CoreRuntime {
@@ -86,12 +95,25 @@ impl CoreRuntime {
             rx,
             next_id: 1,
             inflight: 0,
+            bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
 
     /// Cheap Arc clone for ops that need the pooled HTTP client.
     pub fn http_client(&self) -> reqwest::Client {
         self.http.clone()
+    }
+
+    /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,
+    /// so per-run resets drop any unread bodies.
+    pub fn bodies(&self) -> BodyRegistry {
+        self.bodies.clone()
+    }
+
+    /// Allocator handle for new streaming bodies.
+    pub fn body_ids(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.next_body.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /
@@ -434,10 +456,16 @@ pub mod ops {
         pub body: Option<String>,
     }
 
-    /// Buffered fetch (M1 subset: full-body, UTF-8-lossy text; streaming
-    /// bodies arrive with ReadableStream). Returns Json with
-    /// {status, statusText, url, headers: [[k,v]], body}.
-    pub async fn fetch(client: reqwest::Client, req: FetchRequest) -> OpOutcome {
+    /// Streaming fetch: resolves at HEADERS time with the response shape
+    /// plus a body handle. The body streams through fetch_body_read one
+    /// chunk per op — `for await (const chunk of response.body)` sees
+    /// tokens as the server flushes them (the SSE/AI-client path).
+    pub async fn fetch(
+        client: reqwest::Client,
+        req: FetchRequest,
+        bodies: super::BodyRegistry,
+        ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> OpOutcome {
         let method = req.method.as_deref().unwrap_or("GET");
         let method = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
@@ -476,20 +504,41 @@ pub mod ops {
                 )
             })
             .collect();
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => return OpOutcome::Failed(format!("fetch: body read failed: {e}")),
-        };
-        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bodies
+            .lock()
+            .expect("body registry lock")
+            .insert(handle, response);
         let payload = serde_json::json!({
             "status": status,
             "statusText": status_text,
             "url": url,
             "redirected": redirected,
             "headers": headers,
-            "body": body,
+            "bodyHandle": handle,
         });
         OpOutcome::Json(payload.to_string())
+    }
+
+    /// Read one chunk from a streaming body. Bytes = a chunk, Done = EOF
+    /// (handle dropped). Remove-await-reinsert keeps the lock short; the
+    /// JS ReadableStream lock guarantees a single reader per handle.
+    pub async fn fetch_body_read(bodies: super::BodyRegistry, handle: u64) -> OpOutcome {
+        let response = bodies.lock().expect("body registry lock").remove(&handle);
+        let Some(mut response) = response else {
+            return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
+        };
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                bodies
+                    .lock()
+                    .expect("body registry lock")
+                    .insert(handle, response);
+                OpOutcome::Bytes(bytes.to_vec())
+            }
+            Ok(None) => OpOutcome::Done,
+            Err(e) => OpOutcome::Failed(format!("fetch: body read failed: {e}")),
+        }
     }
 }
 

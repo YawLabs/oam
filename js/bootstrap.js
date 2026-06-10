@@ -33,12 +33,46 @@
   }
 
   function makeResponse(raw) {
+    const handle = raw.bodyHandle;
     let consumed = false;
-    function takeBody() {
+    let bodyStream = null;
+
+    // The body is a real ReadableStream over the wire handle: each pull is
+    // one op, so chunks surface as the server flushes them (SSE / token
+    // streaming). Lazy: responses whose body is never touched never spawn
+    // a read op; the handle dies with the run's CoreRuntime.
+    function ensureBody() {
+      bodyStream ??= new ReadableStream({
+        async pull(controller) {
+          const chunk = await globalThis.__oam.fetchBodyRead(handle);
+          if (chunk === undefined) controller.close();
+          else controller.enqueue(chunk);
+        },
+        cancel() {
+          globalThis.__oam.fetchBodyCancel(handle);
+        },
+      });
+      return bodyStream;
+    }
+
+    async function drainBytes() {
       if (consumed) throw new TypeError("Body already consumed");
       consumed = true;
-      return raw.body;
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of ensureBody()) {
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return out;
     }
+
     return {
       status: raw.status,
       statusText: raw.statusText,
@@ -46,11 +80,16 @@
       url: raw.url,
       redirected: raw.redirected === true,
       headers: makeHeaders(raw.headers),
-      get bodyUsed() {
-        return consumed;
+      get body() {
+        return ensureBody();
       },
-      text: async () => takeBody(),
-      json: async () => JSON.parse(takeBody()),
+      get bodyUsed() {
+        return consumed || (bodyStream !== null && bodyStream.locked);
+      },
+      arrayBuffer: async () => (await drainBytes()).buffer,
+      bytes: () => drainBytes(),
+      text: async () => new TextDecoder().decode(await drainBytes()),
+      json: async () => JSON.parse(new TextDecoder().decode(await drainBytes())),
     };
   }
 
