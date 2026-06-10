@@ -5,6 +5,7 @@ members = [
     "crates/oam_core",
     "crates/oam_diagnostics",
     "crates/oam_loader",
+    "crates/oam_ts",
     "crates/oam_cli",
     "xtask",
 ]
@@ -47,6 +48,7 @@ oam_engine = { path = "crates/oam_engine" }
 oam_core = { path = "crates/oam_core" }
 oam_diagnostics = { path = "crates/oam_diagnostics" }
 oam_loader = { path = "crates/oam_loader" }
+oam_ts = { path = "crates/oam_ts" }
 
 [profile.release]
 lto = "thin"

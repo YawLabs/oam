@@ -1,0 +1,9 @@
+[package]
+name = "oam_ts"
+description = "TypeScript checking via the tsgo (TypeScript 7 native) sidecar: discovery, invocation, tsc-output -> ODIF."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oam_diagnostics = { workspace = true }

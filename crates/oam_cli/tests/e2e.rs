@@ -614,6 +614,93 @@ fn fetch_body_cannot_be_consumed_twice() {
     );
 }
 
+/// tsgo is an external toolchain piece; when it's absent the runtime emits
+/// the stable OAM-TS0000 code and these tests skip rather than flake.
+fn tsgo_available(out: &Output) -> bool {
+    !String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000")
+}
+
+#[test]
+fn check_reports_type_errors_as_odif() {
+    write_temp(
+        "checkproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let dir = write_temp(
+        "checkproj/bad.ts",
+        "const n: number = 'oops';\nexport default n;",
+    )
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", dir.to_str().unwrap(), "--json"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let first = stderr.lines().next().unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(first).expect("ODIF JSONL");
+    assert_eq!(parsed["code"], "OAM-TS2322");
+    assert_eq!(parsed["origin"], "typecheck");
+    assert_eq!(parsed["severity"], "error");
+    assert!(
+        parsed["spans"][0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("bad.ts")
+    );
+    assert_eq!(parsed["spans"][0]["start"]["line"], 1);
+}
+
+#[test]
+fn check_clean_project_exits_zero() {
+    write_temp(
+        "cleanproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let dir = write_temp("cleanproj/good.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["check", dir.to_str().unwrap()]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("clean"),
+        "human summary expected"
+    );
+}
+
+#[test]
+fn check_single_file_without_tsconfig() {
+    let file = write_temp(
+        "lonely_check.ts",
+        "const s: string = 42;\nexport default s;",
+    );
+    let out = oam(&["check", file.to_str().unwrap(), "--json"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    // NOTE: nearest-tsconfig walk-up can find unrelated configs above the
+    // temp dir in exotic setups; the diagnostic still lands either way.
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-TS2322"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn dotted_basename_resolves_appended_extension() {
     write_temp("my.module.ts", "export const m: string = 'dotted';");

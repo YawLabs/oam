@@ -30,17 +30,60 @@ struct Cli {
 enum Command {
     /// Run a JavaScript or TypeScript file.
     Run { file: PathBuf },
+    /// Type-check a file or project with tsgo (TypeScript 7 native).
+    Check {
+        /// A .ts file or a directory; the nearest tsconfig.json upward wins.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(diagnostics) => {
-            for d in &diagnostics {
-                render(d, cli.json);
+    match &cli.command {
+        Command::Run { file } => match run_file(file) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(diagnostics) => {
+                for d in &diagnostics {
+                    render(d, cli.json);
+                }
+                ExitCode::FAILURE
             }
+        },
+        Command::Check { path } => check_path(path, cli.json),
+    }
+}
+
+fn check_path(path: &Path, json: bool) -> ExitCode {
+    match oam_ts::check(path) {
+        Err(failure) => {
+            render(&failure, json);
             ExitCode::FAILURE
+        }
+        Ok(diagnostics) => {
+            for d in &diagnostics {
+                render(d, json);
+            }
+            let errors = diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .count();
+            if !json {
+                // Human summary only; --json stays pure JSONL.
+                if errors == 0 {
+                    eprintln!(
+                        "oam check: clean ({} non-error diagnostic(s))",
+                        diagnostics.len()
+                    );
+                } else {
+                    eprintln!("oam check: {errors} error(s)");
+                }
+            }
+            if errors == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -57,12 +100,6 @@ fn render(d: &Diagnostic, json: bool) {
             .map(|s| format!(" ({}:{}:{})", s.file, s.start.line, s.start.col))
             .unwrap_or_default();
         eprintln!("error[{}]: {}{}", d.code, d.message, loc);
-    }
-}
-
-fn run(cli: &Cli) -> Result<(), Vec<Diagnostic>> {
-    match &cli.command {
-        Command::Run { file } => run_file(file),
     }
 }
 

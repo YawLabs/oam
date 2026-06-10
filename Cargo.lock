@@ -1100,6 +1100,7 @@ dependencies = [
  "oam_diagnostics",
  "oam_engine",
  "oam_loader",
+ "oam_ts",
  "serde_json",
 ]
 
@@ -1146,6 +1147,13 @@ dependencies = [
  "oxc_span",
  "oxc_transformer",
  "thiserror",
+]
+
+[[package]]
+name = "oam_ts"
+version = "0.0.1"
+dependencies = [
+ "oam_diagnostics",
 ]
 
 [[package]]
