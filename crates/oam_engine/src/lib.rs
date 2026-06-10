@@ -43,6 +43,7 @@ impl JsRuntime {
         init_platform();
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
+        isolate.add_message_listener(modules::message_listener);
         isolate.set_slot(timers::TimerQueue::default());
         isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
         isolate.set_slot(ops::PendingOps::default());

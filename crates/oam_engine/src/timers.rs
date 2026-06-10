@@ -141,7 +141,9 @@ fn schedule_from_args(
         return;
     };
     let ms = args.get(1).number_value(scope).unwrap_or(0.0);
-    let ms = if ms.is_finite() && ms > 0.0 { ms } else { 0.0 };
+    // Node parity: delays clamp to a 1ms minimum. Also kills the 0ms-interval
+    // busy-spin (review finding: continuously-due timers starved op completions).
+    let ms = if ms.is_finite() && ms > 1.0 { ms } else { 1.0 };
     let delay = Duration::from_millis(ms as u64);
 
     let callback = v8::Global::new(scope, callback);

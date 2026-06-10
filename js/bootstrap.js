@@ -42,6 +42,7 @@
       statusText: raw.statusText,
       ok: raw.status >= 200 && raw.status <= 299,
       url: raw.url,
+      redirected: raw.redirected === true,
       headers: makeHeaders(raw.headers),
       get bodyUsed() {
         return consumed;
@@ -51,21 +52,39 @@
     };
   }
 
+  // Lone surrogates would survive JSON.stringify (escaped) but be rejected
+  // by the Rust-side wire parser with a misleading "malformed request";
+  // sanitize up front so bad strings degrade to U+FFFD like the web does.
+  function wellFormed(value) {
+    return String(value).toWellFormed();
+  }
+
   globalThis.fetch = async function fetch(input, init) {
     init = init || {};
     let headers = [];
     if (init.headers) {
-      headers = Array.isArray(init.headers)
-        ? init.headers.map(([k, v]) => [String(k), String(v)])
-        : Object.entries(init.headers).map(([k, v]) => [String(k), String(v)]);
+      // Branch on iterability, not Array-ness: a Map (valid HeadersInit)
+      // is not an Array, and Object.entries(map) is [] — auth headers were
+      // silently dropped.
+      const h = init.headers;
+      headers =
+        typeof h !== "string" && typeof h[Symbol.iterator] === "function"
+          ? [...h].map(([k, v]) => [wellFormed(k), wellFormed(v)])
+          : Object.entries(h).map(([k, v]) => [wellFormed(k), wellFormed(v)]);
     }
     const request = {
-      url: String(input),
+      url: wellFormed(input),
       method: init.method ? String(init.method).toUpperCase() : "GET",
       headers,
-      body: init.body == null ? null : String(init.body),
+      body: init.body == null ? null : wellFormed(init.body),
     };
-    const raw = await core.fetch(JSON.stringify(request));
+    let raw;
+    try {
+      raw = await core.fetch(JSON.stringify(request));
+    } catch (e) {
+      // WHATWG: fetch() rejects with a TypeError on network failure.
+      throw new TypeError(e && e.message ? e.message : String(e));
+    }
     return makeResponse(raw);
   };
 })();

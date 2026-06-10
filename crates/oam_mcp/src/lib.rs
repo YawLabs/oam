@@ -19,21 +19,29 @@ use std::path::PathBuf;
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Serve MCP over stdio until stdin closes. Responses are written as one
-/// JSON line each; notifications produce no response.
+/// JSON line each; notifications produce no response. Lines are read as
+/// bytes and lossy-decoded: one non-UTF-8 line from a buggy client gets the
+/// graceful -32700, not server death (BufRead::lines would Err and exit).
 pub fn serve_stdio() -> std::io::Result<()> {
     let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if stdin.read_until(b'\n', &mut buf)? == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(&line) {
+        if let Some(response) = handle_line(line) {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
         }
     }
-    Ok(())
 }
 
 /// One message in, at most one response out (None for notifications).
@@ -118,11 +126,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "oam_run",
-            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data.",
+            "description": "Run a JavaScript/TypeScript file with the oam runtime. Returns exit code, stdout, and ODIF diagnostics (parse/resolve/runtime errors) as structured data. Kills the script and reports timedOut=true if it exceeds the time budget (long-lived servers/intervals will always hit it).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "file": { "type": "string", "description": "Path to the .js/.mjs/.ts/.mts entry file." }
+                    "file": { "type": "string", "description": "Path to the .js/.mjs/.ts/.mts entry file." },
+                    "timeoutMs": { "type": "number", "description": "Time budget in milliseconds (default 30000, max 600000)." }
                 },
                 "required": ["file"]
             }
@@ -170,37 +179,26 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
                 .get("file")
                 .and_then(Value::as_str)
                 .ok_or("oam_run requires 'file'")?;
-            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-            // Subprocess isolation: a crashing or hanging-then-killed script
-            // never takes the MCP server down with it.
-            let output = std::process::Command::new(exe)
-                .arg("run")
-                .arg(file)
-                .arg("--json")
-                .output()
-                .map_err(|e| format!("spawn oam run: {e}"))?;
-            let diagnostics: Vec<Value> = String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect();
-            let payload = json!({
-                "exitCode": output.status.code(),
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "diagnostics": diagnostics,
-            });
-            Ok(tool_text(&payload.to_string(), false))
+            let timeout_ms = arguments
+                .get("timeoutMs")
+                .and_then(Value::as_f64)
+                .unwrap_or(30_000.0)
+                .clamp(100.0, 600_000.0) as u64;
+            run_subprocess(file, timeout_ms)
         }
         "oam_project_info" => {
             let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
             let tsconfig = oam_ts::find_tsconfig(&cwd);
-            let tsgo_available = oam_ts::check(&cwd.join("__oam_probe_nonexistent__.ts"))
-                .err()
-                .is_none_or(|d| d.code != "OAM-TS0000");
+            // available() is a --version probe (milliseconds); the old
+            // check()-on-a-fake-file probe could run a FULL project
+            // typecheck, and misreported missing tsgo as available.
+            let tsgo_version = oam_ts::available().ok();
             let payload = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "cwd": cwd.to_string_lossy(),
                 "tsconfig": tsconfig.map(|p| p.to_string_lossy().into_owned()),
-                "tsgoAvailable": tsgo_available,
+                "tsgoAvailable": tsgo_version.is_some(),
+                "tsgoVersion": tsgo_version,
             });
             Ok(tool_text(&payload.to_string(), false))
         }
@@ -213,6 +211,77 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Run `oam run <file> --json` with a kill-on-deadline budget. The `--`
+/// terminator keeps '-'-prefixed file strings out of clap's flag parsing
+/// (file '--help' used to return a success-shaped payload). Pipes are
+/// drained on threads so a chatty child can't deadlock the wait loop.
+fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut child = std::process::Command::new(exe)
+        .arg("run")
+        .arg("--json")
+        .arg("--")
+        .arg(file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn oam run: {e}"))?;
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("wait: {e}"))? {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(15)),
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    let mut diagnostics: Vec<Value> = Vec::new();
+    let mut stderr_raw: Vec<&str> = Vec::new();
+    for line in stderr.lines() {
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => diagnostics.push(v),
+            // Non-ODIF stderr (e.g. a panic) must not vanish: agents need
+            // SOMETHING to explain a non-zero exit with zero diagnostics.
+            Err(_) if !line.trim().is_empty() => stderr_raw.push(line),
+            Err(_) => {}
+        }
+    }
+    let payload = json!({
+        "exitCode": status.and_then(|s| s.code()),
+        "timedOut": timed_out,
+        "timeoutMs": timeout_ms,
+        "stdout": stdout,
+        "diagnostics": diagnostics,
+        "stderrRaw": stderr_raw,
+    });
+    Ok(tool_text(&payload.to_string(), timed_out))
 }
 
 fn tool_text(text: &str, is_error: bool) -> Value {

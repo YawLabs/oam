@@ -35,9 +35,14 @@ fn missing_tsgo(detail: &str) -> Diagnostic {
     )
 }
 
-/// Locate tsgo: OAM_TSGO env var, then PATH (via the npm .cmd shim on
-/// Windows, where CreateProcess only resolves .exe).
-fn tsgo_command() -> Result<Command, Diagnostic> {
+/// tsgo program candidates, in resolution order. OAM_TSGO wins outright.
+/// On Windows the npm shim is tsgo.cmd — spawned DIRECTLY (not via cmd /C):
+/// Rust >=1.77 spawns .cmd with batch-aware quoting (errors on
+/// unrepresentable args instead of silently misquoting — cmd /C expanded
+/// %VAR% inside quoted paths, review finding) and yields a real NotFound
+/// io::Error when the shim is absent (cmd /C always spawned, turning
+/// missing-tsgo into a 9009 misclassified as OAM-TS0004, review finding).
+fn tsgo_candidates() -> Result<Vec<PathBuf>, Diagnostic> {
     if let Ok(explicit) = std::env::var("OAM_TSGO") {
         let path = PathBuf::from(&explicit);
         if !path.is_file() {
@@ -45,19 +50,58 @@ fn tsgo_command() -> Result<Command, Diagnostic> {
                 "OAM_TSGO points to {explicit}, which does not exist"
             )));
         }
-        return Ok(Command::new(path));
+        return Ok(vec![path]);
     }
-    #[cfg(windows)]
-    {
-        // npm installs a tsgo.cmd shim; route through cmd /C to resolve it.
-        let mut command = Command::new("cmd");
-        command.arg("/C").arg("tsgo");
-        Ok(command)
+    if cfg!(windows) {
+        Ok(vec![PathBuf::from("tsgo.cmd"), PathBuf::from("tsgo.exe")])
+    } else {
+        Ok(vec![PathBuf::from("tsgo")])
     }
-    #[cfg(not(windows))]
-    {
-        Ok(Command::new("tsgo"))
+}
+
+/// Run tsgo with `args` from `base`. Tries each candidate; a NotFound spawn
+/// moves to the next, any other failure surfaces. All-NotFound = OAM-TS0000.
+fn run_tsgo(args: &[&std::ffi::OsStr], base: &Path) -> Result<std::process::Output, Diagnostic> {
+    let mut last_error: Option<std::io::Error> = None;
+    for candidate in tsgo_candidates()? {
+        match Command::new(&candidate)
+            .args(args)
+            .current_dir(base)
+            .output()
+        {
+            Ok(output) => return Ok(output),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(e);
+            }
+            Err(e) => {
+                return Err(Diagnostic::new(
+                    "OAM-TS0002",
+                    Severity::Error,
+                    Origin::Typecheck,
+                    format!("could not invoke {}: {e}", candidate.display()),
+                ));
+            }
+        }
     }
+    Err(missing_tsgo(&last_error.map_or_else(
+        || "not on PATH".to_string(),
+        |e| e.to_string(),
+    )))
+}
+
+/// Is tsgo runnable? Returns its version string. Milliseconds — safe to call
+/// from availability probes (a full check() on a project is NOT).
+pub fn available() -> Result<String, Diagnostic> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        Diagnostic::new(
+            "OAM-TS0002",
+            Severity::Error,
+            Origin::Typecheck,
+            format!("cwd: {e}"),
+        )
+    })?;
+    let output = run_tsgo(&["--version".as_ref()], &cwd)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Walk up from `start` looking for tsconfig.json.
@@ -91,23 +135,24 @@ pub fn check(target: &Path) -> Result<Vec<Diagnostic>, Diagnostic> {
     })?;
 
     let tsconfig = find_tsconfig(&target);
-    let (mut command, base) = match (&tsconfig, target.is_file()) {
+    let common: [&std::ffi::OsStr; 3] =
+        ["--pretty".as_ref(), "false".as_ref(), "--noEmit".as_ref()];
+    let (args, base): (Vec<&std::ffi::OsStr>, PathBuf) = match (&tsconfig, target.is_file()) {
         (Some(tsconfig), _) => {
             let base = tsconfig
                 .parent()
                 .expect("tsconfig has a parent")
                 .to_path_buf();
-            let mut command = tsgo_command()?;
-            command.arg("--pretty").arg("false").arg("--noEmit");
-            command.arg("-p").arg(tsconfig);
-            (command, base)
+            let mut args = common.to_vec();
+            args.push("-p".as_ref());
+            args.push(tsconfig.as_os_str());
+            (args, base)
         }
         (None, true) => {
             let base = target.parent().expect("file has a parent").to_path_buf();
-            let mut command = tsgo_command()?;
-            command.arg("--pretty").arg("false").arg("--noEmit");
-            command.arg(&target);
-            (command, base)
+            let mut args = common.to_vec();
+            args.push(target.as_os_str());
+            (args, base)
         }
         (None, false) => {
             return Err(Diagnostic::new(
@@ -124,10 +169,7 @@ pub fn check(target: &Path) -> Result<Vec<Diagnostic>, Diagnostic> {
 
     // Run from `base` so the CWD-relative paths in tsgo's output join back
     // to absolute ODIF spans unambiguously.
-    let output = command
-        .current_dir(&base)
-        .output()
-        .map_err(|e| missing_tsgo(&e.to_string()))?;
+    let output = run_tsgo(&args, &base)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

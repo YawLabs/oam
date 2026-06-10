@@ -198,6 +198,11 @@ pub mod ops {
             .unwrap_or_default()
             .to_string();
         let url = response.url().to_string();
+        // Compare PARSED urls: string comparison false-positives on
+        // normalization (trailing slash, default port, percent-casing).
+        let redirected = reqwest::Url::parse(&req.url)
+            .map(|original| *response.url() != original)
+            .unwrap_or(false);
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
@@ -217,6 +222,7 @@ pub mod ops {
             "status": status,
             "statusText": status_text,
             "url": url,
+            "redirected": redirected,
             "headers": headers,
             "body": body,
         });

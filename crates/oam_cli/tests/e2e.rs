@@ -66,10 +66,22 @@ fn spawn_echo_server() -> std::net::SocketAddr {
                         Ok(n) => body.extend_from_slice(&chunk[..n]),
                     }
                 }
+                if path == "/redirect" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nlocation: /hello\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
+                    return;
+                }
+                let x_probe = head
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-probe"))
+                    .map(|(_, v)| v.trim().to_string());
                 let payload = serde_json::json!({
                     "method": method,
                     "path": path,
                     "echo": String::from_utf8_lossy(&body),
+                    "xProbe": x_probe,
                 })
                 .to_string();
                 let response = format!(
@@ -578,11 +590,12 @@ fn fetch_posts_body_and_headers() {
 }
 
 #[test]
-fn fetch_network_error_rejects_catchably() {
+fn fetch_network_error_rejects_with_typeerror() {
     // Port 1 on loopback: reliably refused, no external network involved.
+    // WHATWG requires fetch to reject with a TypeError specifically.
     let main = write_temp(
         "fetch_refused.ts",
-        "try {\n  await fetch('http://127.0.0.1:1/');\n} catch (e) {\n  console.log('caught:', (e as Error).message.includes('fetch failed'));\n}",
+        "try {\n  await fetch('http://127.0.0.1:1/');\n} catch (e) {\n  console.log('caught:', e instanceof TypeError && (e as Error).message.includes('fetch failed'));\n}",
     );
     let out = oam(&["run", main.to_str().unwrap()]);
     assert!(
@@ -591,6 +604,107 @@ fn fetch_network_error_rejects_catchably() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "caught: true");
+}
+
+#[test]
+fn fetch_map_headers_are_sent() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "fetch_map_headers.ts",
+        &format!(
+            "const res = await fetch('http://{addr}/h', {{ headers: new Map([['x-probe', 'mapval']]) }});\nconst data = await res.json();\nconsole.log(data.xProbe);"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mapval");
+}
+
+#[test]
+fn fetch_reports_redirected() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "fetch_redirect.ts",
+        &format!(
+            "const res = await fetch('http://{addr}/redirect');\nconsole.log(res.redirected, res.status, res.url.endsWith('/hello'));\nconst direct = await fetch('http://{addr}/hello');\nconsole.log(direct.redirected);"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true 200 true\nfalse"
+    );
+}
+
+#[test]
+fn busy_interval_does_not_starve_ops() {
+    // Review blocker regression: a continuously-due interval must not stop
+    // op completions from settling. The n-guard turns a regression into a
+    // fast failure instead of a hung test.
+    let main = write_temp(
+        "starve.ts",
+        "let n = 0;\nlet done = false;\nconst id = setInterval(() => {\n  n++;\n  if (done) { clearInterval(id); console.log('settled-with-interval', n > 0); }\n  else if (n > 100000) { clearInterval(id); console.log('starved'); }\n}, 0);\noam.sleep(15).then(() => { done = true; });",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("settled-with-interval true"),
+        "got: {stdout}"
+    );
+    assert!(!stdout.contains("starved"), "op completion starved");
+}
+
+#[test]
+fn uncaught_microtask_exception_fails_the_run() {
+    // Review major regression: this used to print to STDOUT via V8's
+    // default handler and exit 0.
+    let main = write_temp(
+        "micro_throw.ts",
+        "queueMicrotask(() => { throw new Error('vanished-from-microtask'); });",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success(), "must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-RT0001"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("vanished-from-microtask"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("in microtask"), "stderr: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "no unstructured dump on stdout"
+    );
+}
+
+#[test]
+fn check_missing_tsgo_is_ts0000_via_env() {
+    let file = write_temp("env_check.ts", "export const n: number = 1;");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["check", file.to_str().unwrap(), "--json"])
+        .env("OAM_TSGO", "/definitely/not/a/tsgo")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000"),
+        "missing tsgo must classify as OAM-TS0000"
+    );
 }
 
 #[test]
@@ -760,6 +874,89 @@ fn mcp_serves_the_agent_loop_over_stdio() {
         .as_str()
         .unwrap();
     assert!(explanation.contains("candidate path"), "got: {explanation}");
+}
+
+#[test]
+fn mcp_run_kills_hung_scripts_at_deadline() {
+    use std::io::{BufRead, BufReader, Write};
+
+    // Legitimate Node keep-alive semantics: this script never exits.
+    let hang = write_temp("mcp_hang.ts", "setInterval(() => {}, 1000);");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam mcp spawns");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "oam_run", "arguments": {"file": hang.to_str().unwrap(), "timeoutMs": 1500}}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let started = std::time::Instant::now();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "deadline must fire, not hang"
+    );
+
+    let payload: serde_json::Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["timedOut"], true);
+    assert_eq!(responses[0]["result"]["isError"], true);
+}
+
+#[test]
+fn mcp_run_treats_dash_prefixed_file_as_path() {
+    use std::io::{BufRead, BufReader, Write};
+
+    // Pre-fix, file '--help' hit clap's flag parsing and returned a
+    // success-shaped payload with clap's help text.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam mcp spawns");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "oam_run", "arguments": {"file": "--help"}}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    assert!(child.wait().unwrap().success());
+
+    let payload: serde_json::Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["exitCode"], 1, "'--help' must be treated as a path");
+    assert!(
+        !payload["diagnostics"].as_array().unwrap().is_empty(),
+        "a diagnostic must explain the failure: {payload}"
+    );
 }
 
 #[test]

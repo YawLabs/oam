@@ -53,6 +53,62 @@ pub(crate) struct RejectionLedger {
     unhandled: Vec<(v8::Global<v8::Promise>, String)>,
 }
 
+/// Uncaught exceptions V8 reports outside any TryCatch — microtask callbacks
+/// are the reachable case: perform_microtask_checkpoint SWALLOWS their
+/// exceptions (documented), and without a message listener V8 just printed
+/// them to stdout while we exited 0 (review finding). The listener records
+/// them here; the event loop fails the run after each drain, like Node's
+/// uncaughtException.
+#[derive(Default)]
+pub(crate) struct UncaughtLedger {
+    reports: Vec<String>,
+}
+
+/// V8 message listener. Zero capture, raw C ABI.
+pub(crate) unsafe extern "C" fn message_listener(
+    message: v8::Local<v8::Message>,
+    _exception: v8::Local<v8::Value>,
+) {
+    v8::callback_scope!(unsafe scope, message);
+    let text = message.get(scope).to_rust_string_lossy(scope);
+    let line = message.get_line_number(scope).unwrap_or(0);
+    let file = message
+        .get_script_resource_name(scope)
+        .and_then(|name| name.to_string(scope))
+        .map(|name| name.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
+        ledger.reports.push(format!("{file}:{line}: {text}"));
+    }
+}
+
+/// Take any uncaught-exception reports and convert them to a failing
+/// diagnostic set. Called after every microtask drain in the event loop.
+fn drain_uncaught(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<Vec<Diagnostic>> {
+    let reports: Vec<String> = tc
+        .get_slot_mut::<UncaughtLedger>()
+        .map(|ledger| ledger.reports.drain(..).collect())
+        .unwrap_or_default();
+    if reports.is_empty() {
+        return None;
+    }
+    Some(
+        reports
+            .into_iter()
+            .map(|report| {
+                Diagnostic::new(
+                    "OAM-RT0001",
+                    Severity::Error,
+                    Origin::Runtime,
+                    format!("Uncaught (in microtask) {report}"),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// Lexically collapse '.' and '..'. Input should already be absolute.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -96,6 +152,7 @@ impl JsRuntime {
         })?;
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
+        self.isolate.set_slot(UncaughtLedger::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
         // Fresh CoreRuntime per run: dropping the old one cancels any ops a
         // previous execute_module left in flight; PendingOps resolvers from
@@ -124,22 +181,30 @@ impl JsRuntime {
             return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
         };
         tc.perform_microtask_checkpoint();
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
 
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
 
-        // M1 blocking event loop. Each turn: fire one due timer (so a clear
-        // issued by one callback cancels same-instant siblings), else settle
-        // one ready op completion — microtask drain after either, so
-        // dependent code runs at the earliest correct moment. When idle,
-        // block on the op channel with the next timer deadline as timeout
-        // (one blocking point, no busy-wait). Exit when nothing remains;
-        // process stays alive for pending timers/ops after the entry module
-        // fulfills — Node semantics. Entry rejection breaks early.
+        // M1 blocking event loop. Each turn services at most ONE due timer
+        // (so a clear issued by one callback cancels same-instant siblings)
+        // AND THEN one ready op completion — never timer-only: a
+        // continuously-due interval must not starve IO settlement (review
+        // blocker; Node's phase model services poll after timers no matter
+        // how busy timers are). Microtask drain after each, so dependent
+        // code runs at the earliest correct moment. When idle, block on the
+        // op channel with the next timer deadline as timeout (one blocking
+        // point, no busy-wait). Exit when nothing remains; process stays
+        // alive for pending timers/ops after the entry module fulfills —
+        // Node semantics. Entry rejection breaks early.
         loop {
             if promise.state() == v8::PromiseState::Rejected {
                 break;
             }
+            let mut progressed = false;
+
             let now = std::time::Instant::now();
             let due = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
@@ -153,7 +218,10 @@ impl JsRuntime {
                     return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
                 }
                 tc.perform_microtask_checkpoint();
-                continue;
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+                progressed = true;
             }
 
             if let Some(completion) = tc
@@ -162,6 +230,12 @@ impl JsRuntime {
             {
                 crate::ops::settle_completion(tc, completion);
                 tc.perform_microtask_checkpoint();
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+                progressed = true;
+            }
+            if progressed {
                 continue;
             }
 
@@ -180,6 +254,9 @@ impl JsRuntime {
                     if let Some(completion) = completion {
                         crate::ops::settle_completion(tc, completion);
                         tc.perform_microtask_checkpoint();
+                        if let Some(failure) = drain_uncaught(tc) {
+                            return Err(failure);
+                        }
                     }
                 }
                 (Some(deadline), false) => {
