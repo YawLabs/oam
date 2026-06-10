@@ -44,6 +44,15 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
 
     let oam_key = v8::String::new(scope, "oam").unwrap();
     global.set(scope, oam_key.into(), oam.into());
+
+    // __oam: the internal op table consumed by js/bootstrap.js. Not public
+    // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
+    let internal = v8::Object::new(scope);
+    let fetch_key = v8::String::new(scope, "fetch").unwrap();
+    let fetch_fn = v8::Function::new(scope, op_fetch).unwrap();
+    internal.set(scope, fetch_key.into(), fetch_fn.into());
+    let internal_key = v8::String::new(scope, "__oam").unwrap();
+    global.set(scope, internal_key.into(), internal.into());
 }
 
 /// Spawn `op` and return its promise via `rv`. The shared shape of every
@@ -103,6 +112,34 @@ fn op_read_text_file(
     spawn_op(scope, &mut rv, oam_core::ops::read_text_file(path));
 }
 
+fn op_fetch(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(wire) = args.get(0).to_string(scope) else {
+        let message = v8::String::new(scope, "fetch op requires a request payload").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let wire = wire.to_rust_string_lossy(scope);
+    let request = match oam_core::ops::parse_fetch_request(&wire) {
+        Ok(request) => request,
+        Err(message) => {
+            let message = v8::String::new(scope, &message).unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        }
+    };
+    let client = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .http_client();
+    spawn_op(scope, &mut rv, oam_core::ops::fetch(client, request));
+}
+
 /// Settle one completed op against its parked resolver. Runs on the isolate
 /// thread inside the event loop's TryCatch.
 pub(crate) fn settle_completion(
@@ -132,6 +169,20 @@ pub(crate) fn settle_completion(
                 resolver.reject(tc, exception);
             }
         },
+        OpOutcome::Json(json) => {
+            let parsed = v8::String::new(tc, &json).and_then(|s| v8::json::parse(tc, s));
+            match parsed {
+                Some(value) => {
+                    resolver.resolve(tc, value);
+                }
+                None => {
+                    let message =
+                        v8::String::new(tc, "op produced an unparseable payload").unwrap();
+                    let exception = v8::Exception::error(tc, message);
+                    resolver.reject(tc, exception);
+                }
+            }
+        }
         OpOutcome::Failed(message) => {
             let message = v8::String::new(tc, &message)
                 .unwrap_or_else(|| v8::String::new(tc, "op failed").unwrap());

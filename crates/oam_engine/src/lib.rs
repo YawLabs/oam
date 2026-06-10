@@ -54,6 +54,7 @@ impl JsRuntime {
             install_console(scope, context);
             timers::install(scope, context);
             ops::install(scope, context);
+            run_bootstrap(scope);
             global
         };
         Self { isolate, context }
@@ -106,6 +107,20 @@ pub(crate) fn exception_to_error(
     let text = message.get(tc).to_rust_string_lossy(tc);
     let line = message.get_line_number(tc).unwrap_or(0);
     anyhow!("{name}:{line}: {text}")
+}
+
+/// Evaluate js/bootstrap.js — the JS half of the runtime surface (fetch et
+/// al. over the __oam op table). Compiled into the startup snapshot once
+/// that pipeline lands; a failure here is an oam build defect, never user
+/// error, so it panics loudly.
+fn run_bootstrap(scope: &mut v8::PinScope<'_, '_>) {
+    const BOOTSTRAP: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../js/bootstrap.js"
+    ));
+    let source = v8::String::new(scope, BOOTSTRAP).expect("bootstrap source fits");
+    let script = v8::Script::compile(scope, source, None).expect("bootstrap compiles");
+    script.run(scope).expect("bootstrap runs");
 }
 
 /// M0 console: log/info/debug -> stdout, warn/error -> stderr.

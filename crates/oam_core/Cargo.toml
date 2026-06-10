@@ -8,3 +8,7 @@ license.workspace = true
 [dependencies]
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

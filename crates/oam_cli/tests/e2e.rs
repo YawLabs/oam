@@ -28,6 +28,62 @@ fn oam(args: &[&str]) -> Output {
         .expect("oam binary runs")
 }
 
+/// Minimal local HTTP/1.1 echo server so fetch tests never touch the
+/// network (CI determinism). Echoes {method, path, echo: body} as JSON.
+fn spawn_echo_server() -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // Read until end of headers.
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let content_length: usize = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = buf[head_end..].to_vec();
+                while body.len() < content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let payload = serde_json::json!({
+                    "method": method,
+                    "path": path,
+                    "echo": String::from_utf8_lossy(&body),
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-oam-test: yes\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    addr
+}
+
 #[test]
 fn runs_javascript() {
     let file = write_temp("hello.js", "console.log('hello', 6 * 7);");
@@ -480,6 +536,82 @@ fn pending_op_keeps_process_alive() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "kept alive");
+}
+
+#[test]
+fn fetch_gets_json_with_headers() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "fetch_get.ts",
+        &format!(
+            "const res = await fetch('http://{addr}/hello');\nconsole.log(res.ok, res.status, res.headers.get('x-oam-test'));\nconst data = await res.json();\nconsole.log(data.method, data.path);"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true 200 yes\nGET /hello"
+    );
+}
+
+#[test]
+fn fetch_posts_body_and_headers() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "fetch_post.ts",
+        &format!(
+            "const res = await fetch('http://{addr}/submit', {{ method: 'post', headers: {{ 'content-type': 'text/plain' }}, body: 'ping' }});\nconst data = await res.json();\nconsole.log(data.method, data.echo);"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "POST ping");
+}
+
+#[test]
+fn fetch_network_error_rejects_catchably() {
+    // Port 1 on loopback: reliably refused, no external network involved.
+    let main = write_temp(
+        "fetch_refused.ts",
+        "try {\n  await fetch('http://127.0.0.1:1/');\n} catch (e) {\n  console.log('caught:', (e as Error).message.includes('fetch failed'));\n}",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "caught: true");
+}
+
+#[test]
+fn fetch_body_cannot_be_consumed_twice() {
+    let addr = spawn_echo_server();
+    let main = write_temp(
+        "fetch_double.ts",
+        &format!(
+            "const res = await fetch('http://{addr}/');\nawait res.text();\ntry {{\n  await res.json();\n}} catch (e) {{\n  console.log('double:', (e as Error).message);\n}}\nconsole.log('used:', res.bodyUsed);"
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "double: Body already consumed\nused: true"
+    );
 }
 
 #[test]

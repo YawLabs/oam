@@ -19,12 +19,17 @@ pub use oam_diagnostics as diagnostics;
 pub type OpId = u64;
 
 /// What an async op produced. v8-free by design; the engine maps these to
-/// promise resolutions (Done -> undefined, Text -> string, Failed -> reject
-/// with Error(message)).
+/// promise resolutions (Done -> undefined, Text -> string, Json -> the
+/// parsed value via V8's own JSON parser, Failed -> reject with
+/// Error(message)).
 #[derive(Debug)]
 pub enum OpOutcome {
     Done,
     Text(String),
+    /// A JSON document; the engine parses it on the isolate thread. The
+    /// structured-payload path until a zero-copy transfer lands with the
+    /// op-macro work.
+    Json(String),
     Failed(String),
 }
 
@@ -36,6 +41,9 @@ pub struct OpCompletion {
 
 pub struct CoreRuntime {
     tokio: tokio::runtime::Runtime,
+    /// Shared HTTP client (connection pool). Owned per CoreRuntime so pooled
+    /// connections never outlive the tokio runtime they were spawned on.
+    http: reqwest::Client,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -43,20 +51,37 @@ pub struct CoreRuntime {
 }
 
 impl CoreRuntime {
-    pub fn new() -> std::io::Result<Self> {
+    pub fn new() -> Result<Self, String> {
+        // Process-wide TLS provider: ring (see workspace Cargo.toml for why
+        // not aws-lc-rs). Err means a provider is already installed: fine.
+        static TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
+        TLS_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("oam-io")
             .enable_all()
-            .build()?;
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
         let (tx, rx) = mpsc::channel();
         Ok(Self {
             tokio,
+            http,
             tx,
             rx,
             next_id: 1,
             inflight: 0,
         })
+    }
+
+    /// Cheap Arc clone for ops that need the pooled HTTP client.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /
@@ -126,6 +151,76 @@ pub mod ops {
             Ok(text) => OpOutcome::Text(text),
             Err(e) => OpOutcome::Failed(format!("could not read {path}: {e}")),
         }
+    }
+
+    /// Parse the wire JSON from the JS `fetch` wrapper. Kept here so the
+    /// engine never needs a serde dependency.
+    pub fn parse_fetch_request(json: &str) -> Result<FetchRequest, String> {
+        serde_json::from_str(json).map_err(|e| format!("fetch: malformed request: {e}"))
+    }
+
+    /// The wire shape `fetch` sends down from JS (serialized JSON).
+    #[derive(serde::Deserialize)]
+    pub struct FetchRequest {
+        pub url: String,
+        #[serde(default)]
+        pub method: Option<String>,
+        #[serde(default)]
+        pub headers: Vec<(String, String)>,
+        #[serde(default)]
+        pub body: Option<String>,
+    }
+
+    /// Buffered fetch (M1 subset: full-body, UTF-8-lossy text; streaming
+    /// bodies arrive with ReadableStream). Returns Json with
+    /// {status, statusText, url, headers: [[k,v]], body}.
+    pub async fn fetch(client: reqwest::Client, req: FetchRequest) -> OpOutcome {
+        let method = req.method.as_deref().unwrap_or("GET");
+        let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => return OpOutcome::Failed(format!("fetch: invalid method '{method}'")),
+        };
+        let mut builder = client.request(method, &req.url);
+        for (name, value) in &req.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = req.body {
+            builder = builder.body(body);
+        }
+        let response = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => return OpOutcome::Failed(format!("fetch failed: {e}")),
+        };
+        let status = response.status().as_u16();
+        let status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or_default()
+            .to_string();
+        let url = response.url().to_string();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => return OpOutcome::Failed(format!("fetch: body read failed: {e}")),
+        };
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let payload = serde_json::json!({
+            "status": status,
+            "statusText": status_text,
+            "url": url,
+            "headers": headers,
+            "body": body,
+        });
+        OpOutcome::Json(payload.to_string())
     }
 }
 
