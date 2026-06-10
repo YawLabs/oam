@@ -167,21 +167,6 @@ fn arg_string(
         .map(|s| s.to_rust_string_lossy(scope))
 }
 
-/// String argument that may be null/undefined (e.g. an optional encoding).
-fn arg_opt_string(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-    index: i32,
-) -> Option<String> {
-    let value = args.get(index);
-    if value.is_null_or_undefined() {
-        return None;
-    }
-    value
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
-}
-
 /// Bytes from a write payload: ArrayBufferView copies, anything else goes
 /// through ToString as UTF-8 (Node coerces the same way for strings).
 fn arg_bytes(
@@ -249,17 +234,20 @@ fn op_argv(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "oam".to_string());
-    let mut argv: Vec<String> = vec![exe];
-    // Skip the binary name and the `run` subcommand; keep file + rest so
-    // argv[1] is the script, like Node.
-    let mut rest = std::env::args().skip(1).peekable();
-    if rest.peek().map(String::as_str) == Some("run") {
-        rest.next();
-    }
-    argv.extend(rest.filter(|a| !a.starts_with("--")));
+    // The embedder declares argv explicitly (JsRuntime::set_process_argv) —
+    // re-deriving it from env::args() leaked oam's own flag VALUES into
+    // script args and displaced argv[1]. No slot = embedded context: just
+    // [exe], like a Node REPL.
+    let argv: Vec<String> = scope
+        .get_slot::<crate::ProcessArgv>()
+        .map(|slot| slot.0.clone())
+        .unwrap_or_else(|| {
+            vec![
+                std::env::current_exe()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "oam".to_string()),
+            ]
+        });
     let elements: Vec<v8::Local<v8::Value>> = argv
         .iter()
         .filter_map(|a| v8::String::new(scope, a).map(Into::into))
@@ -310,11 +298,13 @@ fn op_stdout_write(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if let Some(text) = arg_string(scope, &args, 0) {
+    // arg_bytes: views pass through VERBATIM (binary pipes stay binary),
+    // strings encode as UTF-8.
+    if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        let _ = lock.write_all(text.as_bytes());
+        let _ = lock.write_all(&bytes);
         let _ = lock.flush();
     }
 }
@@ -324,11 +314,11 @@ fn op_stderr_write(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if let Some(text) = arg_string(scope, &args, 0) {
+    if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        let _ = lock.write_all(text.as_bytes());
+        let _ = lock.write_all(&bytes);
         let _ = lock.flush();
     }
 }
@@ -455,21 +445,14 @@ fn op_fs_read_file_sync(
         throw_type_error(scope, "readFileSync requires a path");
         return;
     };
-    let encoding = arg_opt_string(scope, &args, 1);
+    // Always raw bytes: encodings decode JS-side via Buffer#toString, so
+    // 'base64'/'hex'/'latin1' behave instead of utf8-lossy garbage.
     match std::fs::read(&path) {
-        Ok(bytes) => match encoding {
-            Some(_) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if let Some(value) = v8::String::new(scope, &text) {
-                    rv.set(value.into());
-                }
+        Ok(bytes) => {
+            if let Some(value) = bytes_to_uint8array(scope, bytes) {
+                rv.set(value);
             }
-            None => {
-                if let Some(value) = bytes_to_uint8array(scope, bytes) {
-                    rv.set(value);
-                }
-            }
-        },
+        }
         Err(e) => throw_node_error(scope, "open", &path, &e),
     }
 }
@@ -640,8 +623,27 @@ fn op_fs_access_sync(
         throw_type_error(scope, "accessSync requires a path");
         return;
     };
-    if let Err(e) = std::fs::metadata(&path) {
-        throw_node_error(scope, "access", &path, &e);
+    let mode = args.get(1).int32_value(scope).unwrap_or(0);
+    match oam_core::check_access(&path, mode) {
+        Ok(()) => {}
+        Err((code, message)) => {
+            // EPERM/EACCES with the path attached, same shape as
+            // throw_node_error but with the access-specific code.
+            let message_v8 = v8::String::new(scope, &message)
+                .unwrap_or_else(|| v8::String::new(scope, &code).unwrap());
+            let exception = v8::Exception::error(scope, message_v8);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let props: [(&str, &str); 3] =
+                    [("code", &code), ("syscall", "access"), ("path", &path)];
+                for (name, value) in props {
+                    let key = v8::String::new(scope, name).unwrap();
+                    if let Some(value) = v8::String::new(scope, value) {
+                        obj.set(scope, key.into(), value.into());
+                    }
+                }
+            }
+            scope.throw_exception(exception);
+        }
     }
 }
 
@@ -676,8 +678,8 @@ fn op_fs_read_file(
         throw_type_error(scope, "readFile requires a path");
         return;
     };
-    let encoding = arg_opt_string(scope, &args, 1);
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_read_file(path, encoding));
+    // Always raw bytes; encodings decode JS-side (see the sync twin).
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_read_file(path));
 }
 
 fn op_fs_write_file(
@@ -798,7 +800,8 @@ fn op_fs_access(
         throw_type_error(scope, "access requires a path");
         return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_access(path));
+    let mode = args.get(1).int32_value(scope).unwrap_or(0);
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_access(path, mode));
 }
 
 fn op_fs_realpath(

@@ -227,10 +227,12 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
     // and hold the agent's pipe chain open (see oam_ts::daemon docs). stdin
     // is explicitly null because inherit would no longer work after this.
     oam_ts::daemon::unshare_std_handles();
+    // Absolutize so a dash-prefixed filename ('--help') can never read as a
+    // flag — `--` is taken by script-args forwarding since the argv work.
+    let file = std::path::absolute(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
     let mut child = std::process::Command::new(exe)
         .arg("run")
         .arg("--json")
-        .arg("--")
         .arg(file)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

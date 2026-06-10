@@ -86,16 +86,59 @@
       this.encoding = "utf-8";
       this.fatal = options.fatal === true;
       this.ignoreBOM = options.ignoreBOM === true;
+      this._pending = null; // carry-over bytes between stream:true chunks
+      this._atStart = true; // BOM stripping applies to the stream head only
     }
-    decode(input) {
-      if (input === undefined) return "";
+    decode(input, options) {
+      const stream = options != null && options.stream === true;
       let bytes;
-      if (input instanceof Uint8Array) bytes = input;
+      if (input === undefined) bytes = new Uint8Array(0);
+      else if (input instanceof Uint8Array) bytes = input;
       else if (ArrayBuffer.isView(input))
         bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
       else bytes = new Uint8Array(input);
+
+      if (this._pending !== null && this._pending.length > 0) {
+        const joined = new Uint8Array(this._pending.length + bytes.length);
+        joined.set(this._pending);
+        joined.set(bytes, this._pending.length);
+        bytes = joined;
+      }
+      this._pending = null;
+
+      if (stream) {
+        // Hold back a trailing INCOMPLETE multi-byte sequence for the next
+        // chunk (the standard SSE/streaming decode pattern). Complete or
+        // invalid trailers decode now.
+        let hold = bytes.length;
+        let back = bytes.length - 1;
+        let cont = 0;
+        while (back >= 0 && cont < 3 && (bytes[back] & 0xc0) === 0x80) {
+          back--;
+          cont++;
+        }
+        if (back >= 0) {
+          const lead = bytes[back];
+          const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+          if (lead >= 0xc0 && cont + 1 < need) hold = back;
+        }
+        if (hold < bytes.length) {
+          this._pending = bytes.slice(hold); // copy: caller may reuse input
+          bytes = bytes.subarray(0, hold);
+        }
+      }
+
       let i = 0;
-      if (!this.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      const atStart = this._atStart;
+      this._atStart = !stream; // a final (non-stream) decode resets the stream
+      if (
+        atStart &&
+        !this.ignoreBOM &&
+        bytes.length >= 3 &&
+        bytes[0] === 0xef &&
+        bytes[1] === 0xbb &&
+        bytes[2] === 0xbf
+      ) {
         i = 3;
       }
       let out = "";
@@ -166,7 +209,9 @@
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
   const utf8Encoder = new TextEncoder();
-  const utf8Decoder = new TextDecoder();
+  // Buffer#toString never strips a BOM (Node parity) — only the WHATWG
+  // TextDecoder default does.
+  const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
   // ---------------------------------------------------------------- Buffer
   function normalizeEncoding(enc) {
@@ -196,6 +241,44 @@
     }
   }
 
+  const B64_LOOKUP = (() => {
+    const table = new Int8Array(256).fill(-1);
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (let i = 0; i < alphabet.length; i++) table[alphabet.charCodeAt(i)] = i;
+    table[0x2b] = 62; // '+'
+    table[0x2f] = 63; // '/'
+    table[0x2d] = 62; // '-'  (base64url)
+    table[0x5f] = 63; // '_'  (base64url)
+    return table;
+  })();
+
+  function decodeBase64Lenient(str) {
+    const out = new Uint8Array(((str.length * 3) >> 2) + 3);
+    let o = 0;
+    let acc = 0;
+    let bits = 0;
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      if (c === 0x3d) break; // '=' ends the data
+      if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) continue; // whitespace
+      const v = c < 256 ? B64_LOOKUP[c] : -1;
+      if (v === -1) break; // junk terminates, per Node
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[o++] = (acc >> bits) & 0xff;
+      }
+    }
+    return out.subarray(0, o);
+  }
+
+  function makeNodeError(code, message) {
+    const err = new Error(message);
+    err.code = code;
+    return err;
+  }
+
   function bytesFromString(str, enc) {
     const encoding = normalizeEncoding(enc);
     switch (encoding) {
@@ -214,28 +297,13 @@
         return out.subarray(0, o);
       }
       case "base64":
-      case "base64url": {
-        try {
-          return Uint8Array.fromBase64(str, {
-            alphabet: encoding === "base64url" ? "base64url" : "base64",
-            lastChunkHandling: "loose",
-          });
-        } catch {
-          // Node tolerates junk; strip non-alphabet chars and retry.
-          const cleaned = str.replace(
-            encoding === "base64url" ? /[^A-Za-z0-9\-_]/g : /[^A-Za-z0-9+/=]/g,
-            "",
-          );
-          try {
-            return Uint8Array.fromBase64(cleaned, {
-              alphabet: encoding === "base64url" ? "base64url" : "base64",
-              lastChunkHandling: "loose",
-            });
-          } catch {
-            return new Uint8Array(0);
-          }
-        }
-      }
+      case "base64url":
+        // Node's lenient decoder for BOTH labels: either alphabet accepted
+        // ('-'/'_' alongside '+'/'/'), whitespace skipped, '=' or junk
+        // terminates, trailing partial groups decode greedily. JWT-era code
+        // decodes base64url payloads via 'base64' constantly — the strict
+        // Uint8Array.fromBase64 path returned EMPTY for those.
+        return decodeBase64Lenient(str);
       case "latin1": {
         const out = new Uint8Array(str.length);
         for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
@@ -437,12 +505,40 @@
       }
       offset = offset ?? 0;
       const bytes = bytesFromString(String(string), encoding);
-      const writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
+      let writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
+      // Node never writes partial characters: back off to a character
+      // boundary when the encoded string does not fit.
+      if (writable < bytes.length) {
+        const norm = normalizeEncoding(encoding);
+        if (norm === "utf8" || norm === undefined) {
+          while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
+        } else if (norm === "utf16le") {
+          writable &= ~1;
+        }
+      }
       this.set(bytes.subarray(0, writable), offset);
       return writable;
     }
 
     fill(value, start = 0, end = this.length, encoding) {
+      // Node signature: fill(value[, offset[, end]][, encoding]) — a
+      // trailing string in the offset or end position is the encoding.
+      if (typeof start === "string") {
+        encoding = start;
+        start = 0;
+        end = this.length;
+      } else if (typeof end === "string") {
+        encoding = end;
+        end = this.length;
+      }
+      if (start < 0 || end > this.length || start > end) {
+        throw Object.assign(
+          new RangeError(
+            `The value of "offset" is out of range. It must be >= 0 and <= ${this.length}. Received ${start < 0 ? start : end}`,
+          ),
+          { code: "ERR_OUT_OF_RANGE" },
+        );
+      }
       if (typeof value === "number") {
         Uint8Array.prototype.fill.call(this, value & 0xff, start, end);
         return this;
@@ -553,6 +649,96 @@
           view(this)[`set${dv}`](offset, value);
           return offset + _size;
         };
+      }
+    }
+  }
+  // Variable-byteLength integer family (24/40/48-bit wire formats).
+  {
+    function checkVarLen(byteLength) {
+      if (!(byteLength >= 1 && byteLength <= 6)) {
+        throw Object.assign(
+          new RangeError(
+            `The value of "byteLength" is out of range. It must be >= 1 and <= 6. Received ${byteLength}`,
+          ),
+          { code: "ERR_OUT_OF_RANGE" },
+        );
+      }
+    }
+    Buffer.prototype.readUIntLE = function (offset = 0, byteLength) {
+      checkVarLen(byteLength);
+      let value = 0;
+      for (let i = byteLength - 1; i >= 0; i--) value = value * 256 + this[offset + i];
+      return value;
+    };
+    Buffer.prototype.readUIntBE = function (offset = 0, byteLength) {
+      checkVarLen(byteLength);
+      let value = 0;
+      for (let i = 0; i < byteLength; i++) value = value * 256 + this[offset + i];
+      return value;
+    };
+    Buffer.prototype.readIntLE = function (offset = 0, byteLength) {
+      const unsigned = this.readUIntLE(offset, byteLength);
+      const limit = 2 ** (byteLength * 8 - 1);
+      return unsigned >= limit ? unsigned - limit * 2 : unsigned;
+    };
+    Buffer.prototype.readIntBE = function (offset = 0, byteLength) {
+      const unsigned = this.readUIntBE(offset, byteLength);
+      const limit = 2 ** (byteLength * 8 - 1);
+      return unsigned >= limit ? unsigned - limit * 2 : unsigned;
+    };
+    Buffer.prototype.writeUIntLE = function (value, offset = 0, byteLength) {
+      checkVarLen(byteLength);
+      let v = value;
+      for (let i = 0; i < byteLength; i++) {
+        this[offset + i] = v % 256;
+        v = Math.floor(v / 256);
+      }
+      return offset + byteLength;
+    };
+    Buffer.prototype.writeUIntBE = function (value, offset = 0, byteLength) {
+      checkVarLen(byteLength);
+      let v = value;
+      for (let i = byteLength - 1; i >= 0; i--) {
+        this[offset + i] = v % 256;
+        v = Math.floor(v / 256);
+      }
+      return offset + byteLength;
+    };
+    Buffer.prototype.writeIntLE = function (value, offset = 0, byteLength) {
+      const limit = 2 ** (byteLength * 8);
+      return this.writeUIntLE(value < 0 ? value + limit : value, offset, byteLength);
+    };
+    Buffer.prototype.writeIntBE = function (value, offset = 0, byteLength) {
+      const limit = 2 ** (byteLength * 8);
+      return this.writeUIntBE(value < 0 ? value + limit : value, offset, byteLength);
+    };
+
+    function swapper(width) {
+      return function () {
+        if (this.length % width !== 0) {
+          throw Object.assign(
+            new RangeError(`Buffer size must be a multiple of ${width * 8}-bits`),
+            { code: "ERR_INVALID_BUFFER_SIZE" },
+          );
+        }
+        for (let i = 0; i < this.length; i += width) {
+          for (let j = 0; j < width / 2; j++) {
+            const tmp = this[i + j];
+            this[i + j] = this[i + width - 1 - j];
+            this[i + width - 1 - j] = tmp;
+          }
+        }
+        return this;
+      };
+    }
+    Buffer.prototype.swap16 = swapper(2);
+    Buffer.prototype.swap32 = swapper(4);
+    Buffer.prototype.swap64 = swapper(8);
+
+    // Node >= 14.9 lowercase aliases: readUint8, writeBigUint64LE, ...
+    for (const name of Object.getOwnPropertyNames(Buffer.prototype)) {
+      if (name.includes("UInt")) {
+        Buffer.prototype[name.replace("UInt", "Uint")] = Buffer.prototype[name];
       }
     }
   }
@@ -833,14 +1019,21 @@
         return { root: "\\", rest: p.slice(1) };
       }
       if (isDrive(p)) {
+        // Drive letter case is preserved (Node parity); comparisons that
+        // need case-insensitivity fold at the comparison site.
         if (p.length > 2 && isSep(p[2])) {
-          return { root: p.slice(0, 2).toUpperCase() + "\\", rest: p.slice(3) };
+          return { root: p.slice(0, 2) + "\\", rest: p.slice(3) };
         }
-        return { root: p.slice(0, 2).toUpperCase(), rest: p.slice(2) };
+        return { root: p.slice(0, 2), rest: p.slice(2) };
       }
       if (isSep(p[0])) return { root: "\\", rest: p.slice(1) };
       return { root: "", rest: p };
     }
+
+    /// Is this root drive-relative ('C:' with no separator)? Such paths are
+    /// NOT absolute: '..' segments survive normalization, and resolve()
+    /// keeps scanning for an absolute anchor.
+    const isDriveRelativeRoot = (root) => isWin && root.length === 2 && root[1] === ":";
 
     function normalizeParts(rest, allowAboveRoot) {
       const out = [];
@@ -868,7 +1061,9 @@
       assertPath(p);
       if (p.length === 0) return ".";
       const { root, rest } = splitRoot(p);
-      const parts = normalizeParts(rest, root === "");
+      // '..' survives when there is no ABSOLUTE anchor — that includes
+      // drive-relative roots ('C:..' stays 'C:..', per Node).
+      const parts = normalizeParts(rest, root === "" || isDriveRelativeRoot(root));
       let out = root + parts.join(sep);
       if (out.length === 0) out = ".";
       // Preserve a single trailing separator, per Node.
@@ -888,52 +1083,96 @@
     function join(...args) {
       if (args.length === 0) return ".";
       let joined = "";
+      let firstPart = "";
       for (const arg of args) {
         assertPath(arg);
-        if (arg.length > 0) joined += joined.length > 0 ? sep + arg : arg;
+        if (arg.length > 0) {
+          if (joined.length === 0) firstPart = arg;
+          joined += joined.length > 0 ? sep + arg : arg;
+        }
       }
       if (joined.length === 0) return ".";
+      if (isWin) {
+        // Node's UNC guard: joining must never FABRICATE a network path.
+        // join('\\\\', 'host') would otherwise normalize as UNC root
+        // '\\\\host'. Only a first argument that itself spells >= 2 leading
+        // separators (with a server name following) keeps UNC intent.
+        let needsReplace = true;
+        let slashCount = 0;
+        if (isSep(firstPart[0])) {
+          slashCount++;
+          if (firstPart.length > 1 && isSep(firstPart[1])) {
+            slashCount++;
+            if (firstPart.length > 2) {
+              if (isSep(firstPart[2])) slashCount++;
+              else needsReplace = false; // genuine '\\\\host...' UNC intent
+            }
+          }
+        }
+        if (needsReplace) {
+          while (slashCount < joined.length && isSep(joined[slashCount])) slashCount++;
+          if (slashCount >= 2) joined = sep + joined.slice(slashCount);
+        }
+      }
       return normalize(joined);
     }
 
     function resolve(...args) {
-      let resolvedTail = "";
-      let resolvedRoot = "";
-      for (let i = args.length - 1; i >= 0 && resolvedRoot === ""; i--) {
+      // Node's win32 algorithm: scan right-to-left tracking DEVICE and
+      // ABSOLUTENESS separately. An arg on a different device than the one
+      // already chosen is skipped; scanning continues until both a device
+      // and an absolute anchor are found (so resolve('C:\\\\base','C:file')
+      // is 'C:\\\\base\\\\file', and resolve('C:\\\\a','\\\\b') is 'C:\\\\b').
+      let device = "";
+      let tail = "";
+      let absolute = false;
+      for (let i = args.length - 1; i >= 0 && !(device !== "" && absolute); i--) {
         const p = args[i];
         assertPath(p);
         if (p.length === 0) continue;
         const { root, rest } = splitRoot(p);
-        resolvedTail = rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
-        if (root !== "" && root !== resolvedRoot) {
-          if (isWin && root.length === 2 && !isSep(root[1] === ":" ? "x" : root[1])) {
-            // never taken; drive roots are length 3 (C:\) or 2 (C:)
-          }
-          resolvedRoot = root;
+        const argDevice = isWin
+          ? isDriveRelativeRoot(root)
+            ? root
+            : root.length >= 3 && root[1] === ":"
+              ? root.slice(0, 2)
+              : root.startsWith("\\\\")
+                ? root
+                : ""
+          : root;
+        const argAbsolute = root !== "" && !isDriveRelativeRoot(root);
+        if (
+          device !== "" &&
+          argDevice !== "" &&
+          argDevice.toUpperCase() !== device.toUpperCase()
+        ) {
+          continue; // different drive: irrelevant to this resolution
+        }
+        if (device === "" && argDevice !== "") device = argDevice;
+        if (!absolute) {
+          tail = rest + (tail.length > 0 ? sep + tail : "");
+          absolute = argAbsolute;
         }
       }
-      if (resolvedRoot === "" || (isWin && resolvedRoot.length === 2 && resolvedRoot[1] === ":")) {
-        // Relative (or drive-relative): anchor at cwd. Drive-relative paths
-        // resolve against cwd when it is on the same drive, else the drive
-        // root (wave-1 simplification of Node's per-drive cwd tracking).
+      if (!absolute || (isWin && device === "")) {
+        // cwd fills whatever is missing: the tail anchor (when nothing was
+        // absolute; same-device cwd anchors fully, foreign-device cwd
+        // anchors at the device root — wave-1 simplification of Node's
+        // per-drive cwd tracking) and/or the device (when an absolute
+        // driveless '\\x' path needs qualification).
         const cwd = natives ? natives.cwd() : "/";
         const cwdSplit = splitRoot(cwd);
-        if (resolvedRoot === "") {
-          resolvedTail =
-            cwdSplit.rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
-          resolvedRoot = cwdSplit.root;
-        } else if (
-          cwdSplit.root.slice(0, 2).toUpperCase() === resolvedRoot.toUpperCase()
-        ) {
-          resolvedTail =
-            cwdSplit.rest + (resolvedTail.length > 0 ? sep + resolvedTail : "");
-          resolvedRoot = cwdSplit.root;
-        } else {
-          resolvedRoot = resolvedRoot + "\\";
+        const cwdDevice =
+          isWin && cwdSplit.root.length >= 2 ? cwdSplit.root.slice(0, 2) : cwdSplit.root;
+        if (!absolute && (device === "" || cwdDevice.toUpperCase() === device.toUpperCase())) {
+          tail = cwdSplit.rest + (tail.length > 0 ? sep + tail : "");
         }
+        if (device === "") device = isWin ? cwdDevice : "";
+        absolute = true;
       }
-      const parts = normalizeParts(resolvedTail, false);
-      const out = resolvedRoot + parts.join(sep);
+      const root = isWin ? (device.startsWith("\\\\") ? device : device + "\\") : "/";
+      const parts = normalizeParts(tail, false);
+      const out = root + parts.join(sep);
       return out.length > 0 ? out : ".";
     }
 
@@ -1205,10 +1444,13 @@
           case "%s":
             return typeof arg === "string" ? arg : inspect(arg, { bare: true });
           case "%d":
+            if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
             return typeof arg === "bigint" ? `${arg}n` : String(Number(arg));
           case "%i":
-            return String(parseInt(arg, 10));
+            if (typeof arg === "symbol") return "NaN";
+            return typeof arg === "bigint" ? `${arg}n` : String(parseInt(arg, 10));
           case "%f":
+            if (typeof arg === "symbol") return "NaN";
             return String(parseFloat(arg));
           case "%j":
             try {
@@ -1295,8 +1537,10 @@
     }
 
     function deepEqualImpl(a, b, strict, memo) {
+      // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
+      // equal -0 — exactly Node's deepStrictEqual primitive rule.
       const primitiveEqual = strict
-        ? (x, y) => Object.is(x, y) || (x === 0 && y === 0)
+        ? Object.is
         : // eslint-disable-next-line eqeqeq
           (x, y) => x == y || (Number.isNaN(x) && Number.isNaN(y));
       if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
@@ -1576,12 +1820,12 @@
         if (actual == expected) innerFail(actual, expected, message, "!=");
       },
       strictEqual: (actual, expected, message) => {
-        if (!Object.is(actual, expected) && !(actual === 0 && expected === 0)) {
+        if (!Object.is(actual, expected)) {
           innerFail(actual, expected, message, "strictEqual");
         }
       },
       notStrictEqual: (actual, expected, message) => {
-        if (Object.is(actual, expected) || (actual === 0 && expected === 0)) {
+        if (Object.is(actual, expected)) {
           innerFail(actual, expected, message, "notStrictEqual");
         }
       },
@@ -1696,10 +1940,22 @@
     return options ?? {};
   }
 
-  function toBufferIfBinary(result, encoding) {
-    if (encoding) return result; // already a string from the native
+  /// Natives always hand back raw bytes; encodings decode HERE via
+  /// Buffer#toString so 'base64'/'hex'/'latin1'/... all behave (the
+  /// Rust-side decode was utf8-only and silently wrong for the rest).
+  function decodeRead(bytes, encoding) {
     const BufferCtor = globalThis.Buffer;
-    return new BufferCtor(result.buffer, result.byteOffset, result.byteLength);
+    const buf = new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return encoding ? buf.toString(encoding) : buf;
+  }
+
+  /// Encode a write payload: strings honor the encoding option (Node
+  /// decodes 'base64'/'hex'/... before writing); views pass through.
+  function encodeWrite(data, options) {
+    if (typeof data === "string") {
+      return globalThis.Buffer.from(data, readOptions(options).encoding ?? "utf8");
+    }
+    return data;
   }
 
   function streamStub(name) {
@@ -1712,18 +1968,16 @@
   }
 
   registry.factories["fs/promises"] = (natives) => {
-    const normEnc = (options) => {
-      const { encoding } = readOptions(options);
-      return encoding ? String(encoding) : null;
-    };
+    const isWin = natives.platform === "win32";
     return {
       readFile: async (path, options) => {
-        const encoding = normEnc(options);
-        const result = await natives.fsReadFile(String(path), encoding);
-        return toBufferIfBinary(result, encoding);
+        const bytes = await natives.fsReadFile(String(path));
+        return decodeRead(bytes, readOptions(options).encoding ?? null);
       },
-      writeFile: (path, data, _options) => natives.fsWriteFile(String(path), data, false),
-      appendFile: (path, data, _options) => natives.fsWriteFile(String(path), data, true),
+      writeFile: (path, data, options) =>
+        natives.fsWriteFile(String(path), encodeWrite(data, options), false),
+      appendFile: (path, data, options) =>
+        natives.fsWriteFile(String(path), encodeWrite(data, options), true),
       stat: async (path) => wrapStat(await natives.fsStat(String(path), false)),
       lstat: async (path) => wrapStat(await natives.fsStat(String(path), true)),
       readdir: async (path, options) => {
@@ -1737,11 +1991,22 @@
       rm: async (path, options = {}) => {
         await natives.fsRm(String(path), options.recursive === true, options.force === true);
       },
-      rmdir: (path) => natives.fsRm(String(path), false, false),
+      rmdir: async (path) => {
+        // Node never deletes a FILE through rmdir (code-probing callers
+        // depend on the throw); kind-check first.
+        const raw = await natives.fsStat(String(path), true);
+        if (raw.kind !== "dir") {
+          throw makeNodeError(
+            isWin ? "ENOENT" : "ENOTDIR",
+            `${isWin ? "ENOENT" : "ENOTDIR"}: not a directory, rmdir '${path}'`,
+          );
+        }
+        await natives.fsRm(String(path), false, false);
+      },
       unlink: (path) => natives.fsUnlink(String(path)),
       rename: (from, to) => natives.fsRename(String(from), String(to)),
       copyFile: (from, to) => natives.fsCopyFile(String(from), String(to)),
-      access: (path) => natives.fsAccess(String(path)),
+      access: (path, mode) => natives.fsAccess(String(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(String(path)),
     };
   };
@@ -1768,15 +2033,14 @@
       constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
 
       readFileSync: (path, options) => {
-        const encoding = readOptions(options).encoding ?? null;
-        const result = natives.fsReadFileSync(String(path), encoding ? String(encoding) : null);
-        return toBufferIfBinary(result, encoding);
+        const bytes = natives.fsReadFileSync(String(path));
+        return decodeRead(bytes, readOptions(options).encoding ?? null);
       },
-      writeFileSync: (path, data, _options) => {
-        natives.fsWriteFileSync(String(path), data, false);
+      writeFileSync: (path, data, options) => {
+        natives.fsWriteFileSync(String(path), encodeWrite(data, options), false);
       },
-      appendFileSync: (path, data, _options) => {
-        natives.fsWriteFileSync(String(path), data, true);
+      appendFileSync: (path, data, options) => {
+        natives.fsWriteFileSync(String(path), encodeWrite(data, options), true);
       },
       existsSync: (path) => natives.fsExistsSync(String(path)),
       statSync: (path) => wrapStat(natives.fsStatSync(String(path), false)),
@@ -1795,11 +2059,21 @@
       rmSync: (path, options = {}) => {
         natives.fsRmSync(String(path), options.recursive === true, options.force === true);
       },
-      rmdirSync: (path) => natives.fsRmSync(String(path), false, false),
+      rmdirSync: (path) => {
+        const raw = natives.fsStatSync(String(path), true);
+        if (raw.kind !== "dir") {
+          const isWin = natives.platform === "win32";
+          throw makeNodeError(
+            isWin ? "ENOENT" : "ENOTDIR",
+            `${isWin ? "ENOENT" : "ENOTDIR"}: not a directory, rmdir '${path}'`,
+          );
+        }
+        natives.fsRmSync(String(path), false, false);
+      },
       unlinkSync: (path) => natives.fsUnlinkSync(String(path)),
       renameSync: (from, to) => natives.fsRenameSync(String(from), String(to)),
       copyFileSync: (from, to) => natives.fsCopyFileSync(String(from), String(to)),
-      accessSync: (path) => natives.fsAccessSync(String(path)),
+      accessSync: (path, mode) => natives.fsAccessSync(String(path), mode ?? 0),
       realpathSync: (path) => natives.fsRealpathSync(String(path)),
 
       readFile: callbackify1(promises.readFile),
@@ -1836,15 +2110,32 @@
     const process = new EventEmitter();
 
     const env = natives.env();
-    const argv = natives.argv();
     const stdoutIsTTY = natives.isTTY(1);
     const stderrIsTTY = natives.isTTY(2);
 
+    // argv is LAZY: the embedder declares it (entry path + script args)
+    // after this module instantiates, so the first script-time access must
+    // read the native, not a construction-time copy.
+    let argvCache = null;
+    const argv = () => (argvCache ??= natives.argv());
+    Object.defineProperty(process, "argv", {
+      get: () => argv(),
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(process, "argv0", {
+      get: () => argv()[0],
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(process, "execPath", {
+      get: () => argv()[0],
+      enumerable: true,
+      configurable: true,
+    });
+
     Object.assign(process, {
       env,
-      argv,
-      argv0: argv[0],
-      execPath: argv[0],
       execArgv: [],
       platform: natives.platform,
       arch: natives.arch,
@@ -1894,13 +2185,14 @@
         () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
         { rss: () => 0 },
       ),
+      // Binary chunks (Buffers/views) pass through to the native as RAW
+      // bytes — a UTF-8 round-trip corrupts piped binary output (images,
+      // gzip). Strings encode as UTF-8 on the Rust side.
       stdout: {
         fd: 1,
         isTTY: stdoutIsTTY,
         write(chunk) {
-          natives.stdoutWrite(
-            typeof chunk === "string" ? chunk : globalThis.Buffer.from(chunk).toString("utf8"),
-          );
+          natives.stdoutWrite(chunk);
           return true;
         },
         columns: stdoutIsTTY ? 80 : undefined,
@@ -1910,9 +2202,7 @@
         fd: 2,
         isTTY: stderrIsTTY,
         write(chunk) {
-          natives.stderrWrite(
-            typeof chunk === "string" ? chunk : globalThis.Buffer.from(chunk).toString("utf8"),
-          );
+          natives.stderrWrite(chunk);
           return true;
         },
         columns: stderrIsTTY ? 80 : undefined,

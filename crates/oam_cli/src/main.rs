@@ -48,6 +48,9 @@ enum Command {
         /// Alias for --check=off.
         #[arg(long)]
         no_check: bool,
+        /// Arguments passed to the script (process.argv) after `--`.
+        #[arg(last = true)]
+        script_args: Vec<String>,
     },
     /// Type-check a file or project with tsgo (TypeScript 7 native).
     Check {
@@ -92,7 +95,8 @@ fn main() -> ExitCode {
             file,
             check,
             no_check,
-        } => run_command(file, *check, *no_check, cli.json),
+            script_args,
+        } => run_command(file, *check, *no_check, cli.json, script_args),
         Command::Check { path, no_daemon } => check_path(path, cli.json, *no_daemon),
         Command::Daemon { action } => match action {
             DaemonAction::Status { path } => {
@@ -146,7 +150,13 @@ fn error_count(diagnostics: &[Diagnostic]) -> usize {
 
 /// `oam run` with the typed loop: strip-and-run starts immediately; the
 /// checker runs concurrently (warn), gates (block), or stays off.
-fn run_command(file: &Path, check: CheckMode, no_check: bool, json: bool) -> ExitCode {
+fn run_command(
+    file: &Path,
+    check: CheckMode,
+    no_check: bool,
+    json: bool,
+    script_args: &[String],
+) -> ExitCode {
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
     // their normal paths untouched.
@@ -186,8 +196,8 @@ fn run_command(file: &Path, check: CheckMode, no_check: bool, json: bool) -> Exi
         rx
     });
 
-    let exit = match run_file(file) {
-        Ok(()) => ExitCode::SUCCESS,
+    let exit = match run_file(file, script_args) {
+        Ok(code) => ExitCode::from(code),
         Err(diagnostics) => {
             for d in &diagnostics {
                 render(d, json);
@@ -366,7 +376,9 @@ impl oam_engine::ModuleHost for CliHost {
     }
 }
 
-fn run_file(file: &Path) -> Result<(), Vec<Diagnostic>> {
+/// Run the entry; Ok carries the process exit code (0, or a natural-exit
+/// process.exitCode the script declared — Node honors it, so does oam).
+fn run_file(file: &Path, script_args: &[String]) -> Result<u8, Vec<Diagnostic>> {
     if file.extension().and_then(|e| e.to_str()) == Some("cts") {
         return Err(vec![Diagnostic::new(
             "OAM-MOD0003",
@@ -379,12 +391,27 @@ fn run_file(file: &Path) -> Result<(), Vec<Diagnostic>> {
         )]);
     }
     let mut rt = oam_engine::JsRuntime::new();
+    // process.argv: [exe, absolute script path, ...script args] — Node's
+    // shape. Script args arrive after `--` (cargo-run convention).
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "oam".to_string());
+    let script = std::path::absolute(file)
+        .unwrap_or_else(|_| file.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut argv = vec![exe, script];
+    argv.extend(script_args.iter().cloned());
+    rt.set_process_argv(argv);
+
     // Entry routing follows module kind: .cjs (or "type": "commonjs"
     // project .js) runs as a CJS program through interop; everything else
     // is the ESM graph. See oam_loader::module_kind for the typeless
     // default divergence.
-    if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
-        return rt.execute_cjs(file);
-    }
-    rt.execute_module(file, &CliHost)
+    let result = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
+        rt.execute_cjs(file)
+    } else {
+        rt.execute_module(file, &CliHost)
+    };
+    result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
 }

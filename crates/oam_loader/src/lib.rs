@@ -141,6 +141,13 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
     let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
     let is_root_relative = specifier.starts_with('/');
     if !is_relative && !is_root_relative && !Path::new(specifier).is_absolute() {
+        // Builtins bypass tsconfig paths entirely: Node guarantees node:
+        // (and bare builtin names) never hit userland resolution, and
+        // require() in the same project would disagree otherwise — two
+        // identities for 'fs' in one run.
+        if specifier.starts_with("node:") || npm::is_node_builtin(specifier) {
+            return npm::resolve_bare(specifier, referrer, npm::ResolveMode::Import);
+        }
         // Bare specifier: tsconfig paths get first crack (plan §2.6 — the
         // resolver honors tsconfig exactly as tsgo does), then the Node ESM
         // node_modules walk.

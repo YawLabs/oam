@@ -500,6 +500,32 @@ fn resolve_module_callback<'s>(
     }
 }
 
+/// Dynamic import() host callback — wave-1 interim: reject with a clear,
+/// actionable message instead of V8's bare "Error: Not supported". Full
+/// support (on-demand graph load through the ModuleMap) is roadmapped with
+/// the M2 module work.
+pub(crate) fn dynamic_import_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    _resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    let spec = specifier.to_rust_string_lossy(scope);
+    let message = v8::String::new(
+        scope,
+        &format!(
+            "oam: dynamic import('{spec}') is not supported yet (lands later in M2) — \
+             use a static import, or require() inside CommonJS"
+        ),
+    )?;
+    let exception = v8::Exception::error(scope, message);
+    resolver.reject(scope, exception);
+    Some(promise)
+}
+
 /// Windows-safe file:// URL with minimal percent-encoding (space, #, ?, %).
 fn path_to_file_url(path: &Path) -> String {
     let slashed = path.to_string_lossy().replace('\\', "/");

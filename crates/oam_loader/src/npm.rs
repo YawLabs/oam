@@ -124,14 +124,34 @@ const SUPPORTED_BUILTINS: [&str; 13] = [
     "util",
 ];
 
+/// Subpath builtins Node recognizes by EXACT name. Anything else with a
+/// slash ('process/browser', 'fs/foo', 'buffer/') is NOT a builtin — it
+/// falls through to node_modules resolution like Node does (the userland
+/// 'process' package ships process/browser, and packages require it).
+const SUBPATH_BUILTINS: [&str; 12] = [
+    "assert/strict",
+    "dns/promises",
+    "fs/promises",
+    "inspector/promises",
+    "path/posix",
+    "path/win32",
+    "readline/promises",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "timers/promises",
+    "util/types",
+];
+
 fn diag(code: &str, message: String) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Resolve, message)
 }
 
+/// Exact-name builtin check (Node semantics): 'fs' and 'fs/promises' are
+/// builtins; 'fs/foo' and 'process/browser' are NOT.
 pub(crate) fn is_node_builtin(specifier: &str) -> bool {
     let name = specifier.strip_prefix("node:").unwrap_or(specifier);
-    let name = name.split('/').next().unwrap_or(name);
-    NODE_BUILTINS.contains(&name)
+    NODE_BUILTINS.contains(&name) || SUBPATH_BUILTINS.contains(&name)
 }
 
 /// Resolve a bare specifier from `referrer` against node_modules.
@@ -157,6 +177,8 @@ pub(crate) fn resolve_bare(
                 ),
             ));
         }
+        // node:-prefixed but not a recognized builtin name — Node's
+        // ERR_UNKNOWN_BUILTIN_MODULE, never a node_modules walk.
         return Err(diag(
             "OAM-MOD0006",
             format!("'{specifier}' is not a known node: builtin module"),
@@ -569,6 +591,12 @@ mod tests {
         assert!(is_node_builtin("node:fs"));
         assert!(is_node_builtin("fs/promises"));
         assert!(!is_node_builtin("lodash"));
+        // Exact-name semantics: builtin-prefixed subpaths are NOT builtins;
+        // they resolve through node_modules (the userland 'process' package
+        // ships process/browser).
+        assert!(!is_node_builtin("process/browser"));
+        assert!(!is_node_builtin("fs/foo"));
+        assert!(!is_node_builtin("buffer/"));
     }
 
     const IMPORT: &[&str] = &["node", "import", "default"];

@@ -180,6 +180,28 @@ pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io
     format!("{code}: {reason}, {syscall} '{path}'")
 }
 
+/// fs.access semantics: existence always; W_OK (mode & 2) additionally
+/// requires the file not be read-only — Node throws EPERM on Windows for
+/// W_OK against a read-only file, and programs gate writes on exactly this
+/// call. X_OK is approximated as existence (wave 1). Err is (code, message).
+pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String)> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        let code = node_error_code(&e);
+        (
+            code.to_string(),
+            node_error_message(code, "access", path, &e),
+        )
+    })?;
+    if mode & 2 != 0 && meta.permissions().readonly() {
+        let code = if cfg!(windows) { "EPERM" } else { "EACCES" };
+        return Err((
+            code.to_string(),
+            format!("{code}: operation not permitted, access '{path}'"),
+        ));
+    }
+    Ok(())
+}
+
 /// rm with Node semantics: file or directory, optional recursion.
 pub fn remove_path(path: &str, recursive: bool) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
@@ -265,12 +287,12 @@ pub mod ops {
         Ok(serde_json::Value::Array(entries).to_string())
     }
 
-    pub async fn fs_read_file(path: String, encoding: Option<String>) -> OpOutcome {
+    pub async fn fs_read_file(path: String) -> OpOutcome {
+        // Always raw bytes: encodings decode JS-side via Buffer#toString
+        // (a Rust-side utf8-lossy decode was silently wrong for base64/
+        // hex/latin1 requests).
         match tokio::fs::read(&path).await {
-            Ok(bytes) => match encoding.as_deref() {
-                None => OpOutcome::Bytes(bytes),
-                Some(_) => OpOutcome::Text(String::from_utf8_lossy(&bytes).into_owned()),
-            },
+            Ok(bytes) => OpOutcome::Bytes(bytes),
             Err(e) => node_fail(e, "open", &path),
         }
     }
@@ -371,11 +393,13 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_access(path: String) -> OpOutcome {
-        match tokio::fs::metadata(&path).await {
-            Ok(_) => OpOutcome::Done,
-            Err(e) => node_fail(e, "access", &path),
-        }
+    pub async fn fs_access(path: String, mode: i32) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
+            Ok(()) => OpOutcome::Done,
+            Err((code, message)) => OpOutcome::NodeFailed { code, message },
+        })
+        .await;
+        result.unwrap_or_else(|e| OpOutcome::Failed(format!("access: {e}")))
     }
 
     pub async fn fs_realpath(path: String) -> OpOutcome {

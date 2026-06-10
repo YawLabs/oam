@@ -906,6 +906,210 @@ fn create_require_and_import_meta() {
 }
 
 #[test]
+fn buffer_base64_is_node_lenient_and_bom_is_preserved() {
+    let stdout = run_ok(
+        "b64_lenient.ts",
+        "// RFC 7515 HS256 example signature: base64url chars via 'base64'.\n\
+         const sig = Buffer.from('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk', 'base64');\n\
+         console.log(sig.length);\n\
+         console.log(Buffer.from('QUJDREVGR-k', 'base64').toString('hex'));\n\
+         console.log(Buffer.from('abcde', 'base64').toString('hex'));\n\
+         // Buffer#toString never strips a BOM (Node parity).\n\
+         console.log(Buffer.from([0xEF, 0xBB, 0xBF, 0x61]).toString().length);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "32");
+    assert_eq!(lines[1], "41424344454647e9");
+    assert_eq!(lines[2], "69b71d");
+    assert_eq!(lines[3], "2");
+}
+
+#[test]
+fn buffer_write_boundaries_fill_juggling_and_var_numerics() {
+    let stdout = run_ok(
+        "buf_fixes.mjs",
+        "const b = Buffer.alloc(3);\n\
+         console.log(b.write('ab\\u20AC'), b.toString('hex'));\n\
+         console.log(Buffer.alloc(5).fill('ab', 'utf16le').toString('hex'));\n\
+         const v = Buffer.alloc(6);\n\
+         v.writeUIntBE(0xdeadbeefca, 0, 5);\n\
+         console.log(v.readUIntBE(0, 5).toString(16), typeof v.writeUint8);\n\
+         console.log(Buffer.from([1, 2, 3, 4]).swap16().toString('hex'));\n\
+         const dec = new TextDecoder();\n\
+         const partA = dec.decode(new Uint8Array([0xE2]), { stream: true });\n\
+         const partB = dec.decode(new Uint8Array([0x82, 0xAC]));\n\
+         console.log(JSON.stringify(partA), partB === '\\u20AC');",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    // write backs off the torn euro sign: 2 bytes, third stays zero.
+    assert_eq!(lines[0], "2 616200");
+    // fill('ab','utf16le') fills the pattern, not silence.
+    assert_eq!(lines[1], "6100620061");
+    assert_eq!(lines[2], "deadbeefca function");
+    assert_eq!(lines[3], "02010403");
+    // Streaming decode buffers the split euro sign.
+    assert_eq!(lines[4], "\"\" true");
+}
+
+#[test]
+fn path_win32_drive_case_resolve_and_assert_zero_signs() {
+    let stdout = run_ok(
+        "path_assert_fixes.ts",
+        "import { win32 as w } from 'node:path';\n\
+         import assert from 'node:assert';\n\
+         import util from 'node:util';\n\
+         console.log(w.normalize('c:\\\\foo'), w.normalize('C:..'));\n\
+         console.log(w.resolve('C:\\\\base', 'C:file'), w.resolve('C:\\\\a', '\\\\b'));\n\
+         console.log(w.join('\\\\', 'host', 'share'));\n\
+         assert.notStrictEqual(0, -0); // Node: +0 and -0 are NOT strictly equal\n\
+         let threw = false;\n\
+         try { assert.strictEqual(0, -0); } catch { threw = true; }\n\
+         console.log(threw);\n\
+         console.log(util.format('%d', Symbol('x')));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "c:\\foo C:..");
+    assert_eq!(lines[1], "C:\\base\\file C:\\b");
+    assert_eq!(lines[2], "\\host\\share");
+    assert_eq!(lines[3], "true");
+    assert_eq!(lines[4], "NaN");
+}
+
+#[test]
+fn fs_encodings_rmdir_guard_and_natural_exit_code() {
+    let stdout = run_ok(
+        "fs_fixes/main.ts",
+        "import fs from 'node:fs';\n\
+         import path from 'node:path';\n\
+         const dir = import.meta.dirname;\n\
+         const p = path.join(dir, 'enc.bin');\n\
+         fs.writeFileSync(p, 'aGk=', { encoding: 'base64' });\n\
+         console.log(fs.readFileSync(p, 'utf8'), fs.readFileSync(p, 'base64'), fs.readFileSync(p, 'hex'));\n\
+         let rmdirCode = '';\n\
+         try { fs.rmdirSync(p); } catch (e: any) { rmdirCode = e.code; }\n\
+         console.log(rmdirCode, fs.existsSync(p));\n\
+         fs.unlinkSync(p);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    // base64-encoded write decoded to 'hi'; reads honor each encoding.
+    assert_eq!(lines[0], "hi aGk= 6869");
+    // rmdir on a FILE throws (ENOENT on Windows) and deletes nothing.
+    assert_eq!(lines[1], "ENOENT true");
+
+    // Natural-exit honors process.exitCode (Node parity; CI depends on it).
+    let main = write_temp("exitcode.mjs", "process.exitCode = 7;");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "process.exitCode at natural exit"
+    );
+}
+
+#[test]
+fn process_argv_shape_and_require_error_codes() {
+    // argv: [exe, absolute script, ...args after --], no oam flags leaking.
+    let main = write_temp(
+        "argvshape.mjs",
+        "const a = process.argv;\n\
+         console.log(a.length, a[1].includes('argvshape.mjs'), a.slice(2).join(','));",
+    );
+    let out = oam(&[
+        "run",
+        main.to_str().unwrap(),
+        "--no-check",
+        "--",
+        "x",
+        "--flag",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "4 true x,--flag"
+    );
+
+    // require() failures carry Node's .code.
+    let main = write_temp(
+        "reqcodes.cjs",
+        "let mnf = ''; try { require('./missing-thing'); } catch (e) { mnf = e.code; }\n\
+         console.log(mnf);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "MODULE_NOT_FOUND"
+    );
+}
+
+#[test]
+fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
+    // A real node_modules package named like a builtin: non-builtin
+    // subpaths must resolve through it (Node loads process/browser).
+    write_temp(
+        "shadow/node_modules/process/package.json",
+        "{\"name\": \"process\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "shadow/node_modules/process/index.js",
+        "module.exports = 'PKG-MAIN';",
+    );
+    write_temp(
+        "shadow/node_modules/process/browser.js",
+        "module.exports = 'BROWSER-SHIM';",
+    );
+    write_temp(
+        "shadow/tsconfig.json",
+        "{\"compilerOptions\": {\"paths\": {\"fs\": [\"./fake-fs.ts\"], \"node:fs\": [\"./fake-fs.ts\"]}}}",
+    );
+    write_temp("shadow/fake-fs.ts", "export default 'FAKE-FS';");
+    let proj = write_temp("shadow/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    std::fs::write(
+        proj.join("main.ts"),
+        "import shim from 'process/browser.js';\n\
+         import fs from 'node:fs';\n\
+         import bare from 'fs';\n\
+         console.log(shim, typeof fs.readFileSync, typeof bare.readFileSync);",
+    )
+    .unwrap();
+    let out = oam(&["run", proj.join("main.ts").to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The shim resolves from node_modules; both builtin forms bypass the
+    // tsconfig paths trap and return the REAL fs.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "BROWSER-SHIM function function"
+    );
+}
+
+#[test]
+fn dynamic_import_rejects_with_actionable_message() {
+    let main = write_temp(
+        "dyn.mjs",
+        "try { await import('./whatever.mjs'); } catch (e) { console.log(e.message.includes('dynamic import'), e.message.includes('static import')); }",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true true");
+}
+
+#[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(
         "reqbuiltin/main.cjs",

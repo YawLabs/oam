@@ -46,6 +46,10 @@ pub struct JsRuntime {
     context: v8::Global<v8::Context>,
 }
 
+/// process.argv as declared by the embedder ([exe, script, ...script-args]).
+/// Lives in an isolate slot because the reading native is zero-capture.
+pub(crate) struct ProcessArgv(pub Vec<String>);
+
 impl JsRuntime {
     pub fn new() -> Self {
         init_platform();
@@ -54,6 +58,7 @@ impl JsRuntime {
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.add_message_listener(modules::message_listener);
         isolate.set_host_initialize_import_meta_object_callback(modules::import_meta_callback);
+        isolate.set_host_import_module_dynamically_callback(modules::dynamic_import_callback);
         isolate.set_slot(timers::TimerQueue::default());
         isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
         isolate.set_slot(ops::PendingOps::default());
@@ -76,6 +81,29 @@ impl JsRuntime {
             global
         };
         Self { isolate, context }
+    }
+
+    /// Declare process.argv ([exe, script, ...script-args]) for this run.
+    /// Call before executing the entry — process.argv reads it lazily.
+    pub fn set_process_argv(&mut self, argv: Vec<String>) {
+        self.isolate.set_slot(ProcessArgv(argv));
+    }
+
+    /// Read `process.exitCode` after a completed run — Node honors it at
+    /// natural exit, and CI consuming exit codes depends on that.
+    pub fn process_exit_code(&mut self) -> Option<i32> {
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        let context = scope.get_current_context();
+        let global = context.global(scope);
+        let process_key = v8::String::new(scope, "process")?;
+        let process = global.get(scope, process_key.into())?;
+        let process = v8::Local::<v8::Object>::try_from(process).ok()?;
+        let key = v8::String::new(scope, "exitCode")?;
+        let value = process.get(scope, key.into())?;
+        if value.is_null_or_undefined() {
+            return None;
+        }
+        value.int32_value(scope)
     }
 
     /// Compile and run `source` as a classic script. Returns the stringified

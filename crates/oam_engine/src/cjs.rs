@@ -60,6 +60,21 @@ fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     scope.throw_exception(exception);
 }
 
+/// Throw an Error carrying Node's `.code` — the ecosystem branches on
+/// MODULE_NOT_FOUND / ERR_REQUIRE_ESM, not on message text.
+fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let message =
+        v8::String::new(scope, message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let key = v8::String::new(scope, "code").unwrap();
+        if let Some(value) = v8::String::new(scope, code) {
+            obj.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
 /// `__oam.requireCjs(path)`: pure cache lookup used by generated ESM
 /// facades. The module was executed during graph load; a miss here is an
 /// internal invariant violation, not a user error.
@@ -126,9 +141,10 @@ fn require_callback(
     let path = match oam_loader::resolve_require(&specifier, &referrer) {
         Ok(path) => path,
         Err(failure) => {
-            // Node throws MODULE_NOT_FOUND (a runtime Error, not ODIF) —
-            // the diagnostic message carries the precise reason.
-            throw_error(scope, &failure.message);
+            // Node's MODULE_NOT_FOUND (a runtime Error, not ODIF) — the
+            // diagnostic message carries the precise reason, the code
+            // carries what optional-dependency try/catch blocks test.
+            throw_error_with_code(scope, "MODULE_NOT_FOUND", &failure.message);
             return;
         }
     };
@@ -143,11 +159,12 @@ fn require_callback(
     }
     let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
     if !is_json && oam_loader::module_kind(&path) == oam_loader::ModuleKind::Esm {
-        throw_error(
+        throw_error_with_code(
             scope,
+            "ERR_REQUIRE_ESM",
             &format!(
-                "require() of ES module {} from {} is not supported yet — import it instead \
-                 (ERR_REQUIRE_ESM; synchronous require(esm) is on the M2 roadmap)",
+                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported yet — \
+                 import it instead (synchronous require(esm) is on the M2 roadmap)",
                 path.display(),
                 referrer.display()
             ),
