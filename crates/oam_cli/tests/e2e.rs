@@ -4,9 +4,19 @@ use std::path::PathBuf;
 use std::process::Output;
 
 fn write_temp(name: &str, content: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oam-e2e-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    use std::sync::OnceLock;
+    // PID alone can be recycled across runs and leave stale files behind;
+    // a startup-time nanos component makes the dir unique per suite run.
+    static RUN_DIR: OnceLock<PathBuf> = OnceLock::new();
+    let dir = RUN_DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("oam-e2e-{}-{nanos}", std::process::id()))
+    });
     let path = dir.join(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
     path
 }
@@ -180,4 +190,111 @@ fn jsx_is_a_clear_diagnostic_not_a_crash() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("OAM-PARSE0003"), "stderr: {stderr}");
+}
+
+#[test]
+fn parent_dir_specifiers_dedup_to_one_module_instance() {
+    // The same module reached as './b1_x' and '../b1_x' (through a subdir)
+    // must instantiate once: side effect printed exactly once.
+    write_temp(
+        "b1_x.ts",
+        "console.log('x-effect');\nexport const x: number = 1;",
+    );
+    write_temp(
+        "b1_sub/y.ts",
+        "import { x } from '../b1_x';\nexport const y: number = x + 1;",
+    );
+    let main = write_temp(
+        "b1_main.ts",
+        "import { x } from './b1_x';\nimport { y } from './b1_sub/y';\nconsole.log(x, y);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "x-effect\n1 2");
+    assert_eq!(stdout.matches("x-effect").count(), 1, "module ran twice");
+}
+
+#[test]
+fn unhandled_rejection_fails_like_node() {
+    let main = write_temp(
+        "reject_main.ts",
+        "Promise.reject(new Error('lost rejection'));\nconsole.log('body done');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(
+        !out.status.success(),
+        "a detached rejection must not exit 0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-RT0004"), "stderr: {stderr}");
+    assert!(stderr.contains("lost rejection"), "stderr: {stderr}");
+}
+
+#[test]
+fn late_handled_rejection_is_not_reported() {
+    // queueMicrotask lands with the ECMA-429 surface; plain Promise scheduling
+    // exercises the same late-handler path.
+    let main = write_temp(
+        "handled_main.ts",
+        "const p = Promise.reject(new Error('caught later'));\nPromise.resolve().then(() => { p.catch(() => console.log('handled')); });",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn json_import_is_a_clear_diagnostic() {
+    write_temp("data.json", "{\"a\": 1}");
+    let main = write_temp("json_main.ts", "import './data.json';");
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
+    assert!(stderr.contains("import-attributes"), "stderr: {stderr}");
+}
+
+#[test]
+fn cjs_is_a_clear_diagnostic() {
+    let file = write_temp("legacy.cjs", "module.exports = { a: 1 };");
+    let out = oam(&["run", file.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
+    assert!(stderr.contains("CommonJS"), "stderr: {stderr}");
+}
+
+#[test]
+fn dot_and_backslash_specifiers_are_invalid_not_bare() {
+    let main = write_temp("dot_main.ts", "import '.';");
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-MOD0004"),
+        "'.' should be invalid-specifier, not bare"
+    );
+}
+
+#[test]
+fn dotted_basename_resolves_appended_extension() {
+    write_temp("my.module.ts", "export const m: string = 'dotted';");
+    let main = write_temp(
+        "dotted_main.ts",
+        "import { m } from './my.module';\nconsole.log(m);",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "dotted");
 }

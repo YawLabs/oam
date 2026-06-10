@@ -90,6 +90,47 @@ impl oam_engine::ModuleHost for CliHost {
             )]);
         }
 
+        // Anything we'd silently mis-execute gets a clear diagnostic instead:
+        // .cjs/.cts would run as ESM and die on a bare 'require is not
+        // defined'; .json would parse as JS and die on 'Unexpected token'.
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext {
+            "js" | "mjs" | "ts" | "mts" => {}
+            "cjs" | "cts" => {
+                return Err(vec![Diagnostic::new(
+                    "OAM-MOD0003",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!(
+                        "CommonJS modules (.cjs/.cts) land with npm/CJS interop (M2): {}",
+                        path.display()
+                    ),
+                )]);
+            }
+            "json" => {
+                return Err(vec![Diagnostic::new(
+                    "OAM-MOD0003",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!(
+                        "JSON modules land with import-attributes support (M2): {}",
+                        path.display()
+                    ),
+                )]);
+            }
+            other => {
+                return Err(vec![Diagnostic::new(
+                    "OAM-MOD0003",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!(
+                        "unsupported module type '.{other}' (expected .js/.mjs/.ts/.mts): {}",
+                        path.display()
+                    ),
+                )]);
+            }
+        }
+
         let source = std::fs::read_to_string(path).map_err(|e| {
             vec![Diagnostic::new(
                 "OAM-RT0002",

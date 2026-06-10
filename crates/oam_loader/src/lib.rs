@@ -114,9 +114,28 @@ fn to_odif(
 /// probing (.ts, .mts, .js, .mjs) and directory index (index.ts, index.js).
 /// Bare and node: specifiers are a clear diagnostic until npm resolution
 /// lands (M2).
+// result_large_err: Diagnostic is ~200 bytes of Strings/Vecs; this is the
+// cold error path of resolution, and boxing would push the cost onto every
+// caller's API instead. Deliberate.
+#[allow(clippy::result_large_err)]
 pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+    // Shapes that are invalid as ESM specifiers everywhere — npm resolution
+    // will never fix these, so they get their own diagnostic, not MOD0002.
+    if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\') {
+        return Err(Diagnostic::new(
+            "OAM-MOD0004",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "invalid module specifier '{specifier}' in {}: use './name' / '../name' with forward slashes",
+                referrer.display()
+            ),
+        ));
+    }
+
     let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
-    if !is_relative && !Path::new(specifier).is_absolute() {
+    let is_root_relative = specifier.starts_with('/');
+    if !is_relative && !is_root_relative && !Path::new(specifier).is_absolute() {
         return Err(Diagnostic::new(
             "OAM-MOD0002",
             Severity::Error,
@@ -128,30 +147,49 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         ));
     }
 
-    let base = referrer.parent().unwrap_or_else(|| Path::new("."));
     let raw = if is_relative {
+        let base = referrer.parent().unwrap_or_else(|| Path::new("."));
         base.join(specifier)
+    } else if is_root_relative && !Path::new(specifier).is_absolute() {
+        // Windows: '/x' is drive-relative — anchor it at the referrer's root
+        // so behavior matches POSIX ('/' = filesystem root of the referrer).
+        let mut root: PathBuf = referrer
+            .components()
+            .take_while(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+            .collect();
+        root.push(specifier.trim_start_matches('/'));
+        root
     } else {
         PathBuf::from(specifier)
     };
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Candidate order: exact, TS-source fallback for JS extensions, then
+    // APPENDED extensions + directory index. Appending (not with_extension)
+    // keeps dotted basenames intact: './my.module' probes 'my.module.ts',
+    // never clobbers the '.module' segment.
+    fn append_ext(p: &Path, ext: &str) -> PathBuf {
+        let mut s = p.as_os_str().to_os_string();
+        s.push(".");
+        s.push(ext);
+        PathBuf::from(s)
+    }
+
+    let mut candidates: Vec<PathBuf> = vec![raw.clone()];
     match raw.extension().and_then(|e| e.to_str()) {
-        Some(ext) => {
-            candidates.push(raw.clone());
-            let ts_swap = match ext {
-                "js" => Some("ts"),
-                "mjs" => Some("mts"),
-                "cjs" => Some("cts"),
-                _ => None,
-            };
-            if let Some(swap) = ts_swap {
-                candidates.push(raw.with_extension(swap));
-            }
-        }
-        None => {
+        Some("js") => candidates.push(raw.with_extension("ts")),
+        Some("mjs") => candidates.push(raw.with_extension("mts")),
+        Some("cjs") => candidates.push(raw.with_extension("cts")),
+        Some("ts") | Some("mts") | Some("cts") | Some("tsx") | Some("jsx") | Some("json") => {}
+        _ => {
+            // No extension, or a dotted basename ('./my.module'): probe by
+            // appending, then directory index.
             for ext in ["ts", "mts", "js", "mjs"] {
-                candidates.push(raw.with_extension(ext));
+                candidates.push(append_ext(&raw, ext));
             }
             for index in ["index.ts", "index.js"] {
                 candidates.push(raw.join(index));
@@ -181,12 +219,18 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
         })
 }
 
-/// Byte offset -> 1-based line/col. Clamps past-the-end offsets.
+/// Byte offset -> 1-based line/col. Columns are counted in CHARACTERS (what
+/// editors and LSP consumers of ODIF expect), not bytes; offsets are clamped
+/// to the nearest char boundary so a mid-codepoint label can never panic.
 fn offset_to_position(source: &str, offset: usize) -> Position {
-    let offset = offset.min(source.len());
+    let mut offset = offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
     let before = &source[..offset];
     let line = before.bytes().filter(|&b| b == b'\n').count() as u32 + 1;
-    let col = (offset - before.rfind('\n').map_or(0, |i| i + 1)) as u32 + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let col = source[line_start..offset].chars().count() as u32 + 1;
     Position { line, col }
 }
 

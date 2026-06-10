@@ -40,6 +40,7 @@ impl JsRuntime {
     pub fn new() -> Self {
         init_platform();
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        isolate.set_promise_reject_callback(modules::promise_reject_callback);
         let context = {
             v8::scope!(let scope, &mut isolate);
             let context = v8::Context::new(scope, v8::ContextOptions::default());
