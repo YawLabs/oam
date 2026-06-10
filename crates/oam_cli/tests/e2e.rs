@@ -401,6 +401,88 @@ fn set_timeout_passes_extra_args() {
 }
 
 #[test]
+fn oam_sleep_settles_through_tokio() {
+    let main = write_temp("op_sleep.ts", "await oam.sleep(20);\nconsole.log('slept');");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "slept");
+}
+
+#[test]
+fn oam_read_text_file_roundtrips() {
+    let data = write_temp("op_data.txt", "hello from disk");
+    let main = write_temp(
+        "op_read.ts",
+        &format!(
+            "const text: string = await oam.readTextFile({:?});\nconsole.log(text);",
+            data.to_str().unwrap()
+        ),
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "hello from disk"
+    );
+}
+
+#[test]
+fn oam_read_text_file_rejects_catchably() {
+    let main = write_temp(
+        "op_read_missing.ts",
+        "try {\n  await oam.readTextFile('/definitely/not/here.txt');\n} catch (e) {\n  console.log('caught:', (e as Error).message.includes('could not read'));\n}",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "caught: true");
+}
+
+#[test]
+fn timers_and_ops_interleave() {
+    // A 0ms timer must fire while a longer op is in flight.
+    let main = write_temp(
+        "op_interleave.ts",
+        "setTimeout(() => console.log('timer'), 0);\nawait oam.sleep(40);\nconsole.log('slept');",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "timer\nslept");
+}
+
+#[test]
+fn pending_op_keeps_process_alive() {
+    // No await: the entry fulfills immediately, but the op must still
+    // complete before exit (Node keep-alive semantics).
+    let main = write_temp(
+        "op_keepalive.ts",
+        "oam.sleep(20).then(() => console.log('kept alive'));",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "kept alive");
+}
+
+#[test]
 fn dotted_basename_resolves_appended_extension() {
     write_temp("my.module.ts", "export const m: string = 'dotted';");
     let main = write_temp(

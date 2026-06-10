@@ -97,6 +97,14 @@ impl JsRuntime {
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
+        // Fresh CoreRuntime per run: dropping the old one cancels any ops a
+        // previous execute_module left in flight; PendingOps resolvers from
+        // that run die with it.
+        self.isolate.set_slot(
+            oam_core::CoreRuntime::new()
+                .map_err(|e| rt_diag("OAM-RT0002", format!("io runtime failed to start: {e}")))?,
+        );
+        self.isolate.set_slot(crate::ops::PendingOps::default());
 
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
@@ -120,11 +128,14 @@ impl JsRuntime {
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
 
-        // M1 blocking event loop: one due timer per iteration (so a clear
-        // issued by one callback cancels same-instant siblings), microtask
-        // drain after each, sleep until the next deadline when idle, exit
-        // when no timers remain. The process stays alive for pending timers
-        // even after the entry module fulfills — Node semantics.
+        // M1 blocking event loop. Each turn: fire one due timer (so a clear
+        // issued by one callback cancels same-instant siblings), else settle
+        // one ready op completion — microtask drain after either, so
+        // dependent code runs at the earliest correct moment. When idle,
+        // block on the op channel with the next timer deadline as timeout
+        // (one blocking point, no busy-wait). Exit when nothing remains;
+        // process stays alive for pending timers/ops after the entry module
+        // fulfills — Node semantics. Entry rejection breaks early.
         loop {
             if promise.state() == v8::PromiseState::Rejected {
                 break;
@@ -133,29 +144,48 @@ impl JsRuntime {
             let due = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
                 .and_then(|queue| queue.pop_due(now));
-            match due {
-                Some((callback, extra)) => {
-                    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
-                    let callback = v8::Local::new(tc, &callback);
-                    let args: Vec<v8::Local<v8::Value>> =
-                        extra.iter().map(|g| v8::Local::new(tc, g)).collect();
-                    if callback.call(tc, recv, &args).is_none() {
-                        return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
-                    }
-                    tc.perform_microtask_checkpoint();
+            if let Some((callback, extra)) = due {
+                let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+                let callback = v8::Local::new(tc, &callback);
+                let args: Vec<v8::Local<v8::Value>> =
+                    extra.iter().map(|g| v8::Local::new(tc, g)).collect();
+                if callback.call(tc, recv, &args).is_none() {
+                    return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
                 }
-                None => {
-                    let next = tc
-                        .get_slot_mut::<crate::timers::TimerQueue>()
-                        .and_then(|queue| queue.next_deadline());
-                    match next {
-                        Some(deadline) => {
-                            let now = std::time::Instant::now();
-                            if deadline > now {
-                                std::thread::sleep(deadline - now);
-                            }
-                        }
-                        None => break,
+                tc.perform_microtask_checkpoint();
+                continue;
+            }
+
+            if let Some(completion) = tc
+                .get_slot_mut::<oam_core::CoreRuntime>()
+                .and_then(|core| core.try_recv())
+            {
+                crate::ops::settle_completion(tc, completion);
+                tc.perform_microtask_checkpoint();
+                continue;
+            }
+
+            let next_deadline = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.next_deadline());
+            let has_inflight = tc
+                .get_slot::<oam_core::CoreRuntime>()
+                .is_some_and(|core| core.has_inflight());
+            match (next_deadline, has_inflight) {
+                (None, false) => break,
+                (deadline, true) => {
+                    let completion = tc
+                        .get_slot_mut::<oam_core::CoreRuntime>()
+                        .and_then(|core| core.recv_deadline(deadline));
+                    if let Some(completion) = completion {
+                        crate::ops::settle_completion(tc, completion);
+                        tc.perform_microtask_checkpoint();
+                    }
+                }
+                (Some(deadline), false) => {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
                     }
                 }
             }

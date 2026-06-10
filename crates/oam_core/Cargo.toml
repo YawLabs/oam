@@ -1,9 +1,10 @@
 [package]
 name = "oam_core"
-description = "Event loop, op system, Promise<->Future bridge. M1 workstream; placeholder at M0."
+description = "Engine-agnostic async substrate: tokio runtime, op-completion channel, built-in op futures. v8-free by design."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 oam_diagnostics = { workspace = true }
+tokio = { workspace = true }

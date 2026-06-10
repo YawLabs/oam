@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use std::sync::Once;
 
 mod modules;
+mod ops;
 mod timers;
 pub use modules::ModuleHost;
 
@@ -43,6 +44,8 @@ impl JsRuntime {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default());
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.set_slot(timers::TimerQueue::default());
+        isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
+        isolate.set_slot(ops::PendingOps::default());
         let context = {
             v8::scope!(let scope, &mut isolate);
             let context = v8::Context::new(scope, v8::ContextOptions::default());
@@ -50,6 +53,7 @@ impl JsRuntime {
             let scope = &mut v8::ContextScope::new(scope, context);
             install_console(scope, context);
             timers::install(scope, context);
+            ops::install(scope, context);
             global
         };
         Self { isolate, context }
