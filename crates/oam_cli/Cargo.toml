@@ -12,5 +12,8 @@ path = "src/main.rs"
 [dependencies]
 oam_engine = { workspace = true }
 oam_diagnostics = { workspace = true }
-anyhow = { workspace = true }
+oam_loader = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "oam_loader"
+description = "Module pipeline: TS strip/transform (oxc), and later the ESM graph, npm resolution, CJS interop, caches."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oam_diagnostics = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+oxc_semantic = { workspace = true }
+oxc_transformer = { workspace = true }
+oxc_codegen = { workspace = true }
+oxc_diagnostics = { workspace = true }
+thiserror = { workspace = true }
