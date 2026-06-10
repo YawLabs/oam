@@ -20,11 +20,18 @@ oam is a JavaScript/TypeScript runtime built in Rust on V8, designed around thre
 
 ## Status
 
-Pre-alpha (M0). The engine boundary runs JavaScript end-to-end; everything else is roadmap.
+Pre-alpha, M2 in flight. M1 (the typed-loop wedge) is complete; M2 has landed npm resolution
+against existing node_modules, CommonJS interop, node: compat wave 1 (fs, path, process,
+Buffer, events, util, assert, os, tty, module, async_hooks — AsyncLocalStorage rides V8's
+continuation-preserved embedder data), JSON modules with import attributes, and `oam test`
+(fresh isolate per file, mocking + fake timers day one). Real packages run unmodified today:
+zod, lodash, ms, chalk, debug, semver, @opentelemetry/context-async-hooks.
 See [ROADMAP.md](ROADMAP.md).
 
 ```
-oam run hello.js
+oam run hello.ts        # strip + execute instantly, types stream concurrently
+oam test                # *.test.ts in fresh isolates, ODIF output for agents
+oam check               # tsgo type-check with a warm daemon
 ```
 
 ## Building

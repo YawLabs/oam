@@ -560,12 +560,15 @@ impl oam_engine::ModuleHost for CliHost {
                 )]);
             }
             "json" => {
+                // Unreachable for imports (the engine routes .json through
+                // the JSON-module branch before host.load); only a .json
+                // ENTRY file lands here, which is not a program.
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
                     Severity::Error,
                     Origin::Resolve,
                     format!(
-                        "JSON modules land with import-attributes support (M2): {}",
+                        "a .json file is not a program — import it from a script instead: {}",
                         path.display()
                     ),
                 )]);
@@ -604,16 +607,30 @@ impl oam_engine::ModuleHost for CliHost {
 /// Run the entry; Ok carries the process exit code (0, or a natural-exit
 /// process.exitCode the script declared — Node honors it, so does oam).
 fn run_file(file: &Path, script_args: &[String]) -> Result<u8, Vec<Diagnostic>> {
-    if file.extension().and_then(|e| e.to_str()) == Some("cts") {
-        return Err(vec![Diagnostic::new(
-            "OAM-MOD0003",
-            Severity::Error,
-            Origin::Resolve,
-            format!(
-                "TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts): {}",
-                file.display()
-            ),
-        )]);
+    match file.extension().and_then(|e| e.to_str()) {
+        Some("cts") => {
+            return Err(vec![Diagnostic::new(
+                "OAM-MOD0003",
+                Severity::Error,
+                Origin::Resolve,
+                format!(
+                    "TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts): {}",
+                    file.display()
+                ),
+            )]);
+        }
+        Some("json") => {
+            return Err(vec![Diagnostic::new(
+                "OAM-MOD0003",
+                Severity::Error,
+                Origin::Resolve,
+                format!(
+                    "a .json file is not a program — import it from a script instead: {}",
+                    file.display()
+                ),
+            )]);
+        }
+        _ => {}
     }
     let mut rt = oam_engine::JsRuntime::new();
     // process.argv: [exe, absolute script path, ...script args] — Node's

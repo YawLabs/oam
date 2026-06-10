@@ -1568,14 +1568,77 @@ fn late_handled_rejection_is_not_reported() {
 }
 
 #[test]
-fn json_import_is_a_clear_diagnostic() {
-    write_temp("data.json", "{\"a\": 1}");
-    let main = write_temp("json_main.ts", "import './data.json';");
-    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+fn json_modules_import_with_and_without_attributes() {
+    write_temp(
+        "jsonmod/config.json",
+        "{\"name\": \"oam\", \"port\": 8080, \"tags\": [\"fast\", \"typed\"]}",
+    );
+    let stdout = run_ok(
+        "jsonmod/main.ts",
+        "import config from './config.json';\n\
+         import attributed from './config.json' with { type: 'json' };\n\
+         import { name, port } from './config.json';\n\
+         console.log(config.name, config.tags.length, attributed.port, name, port);",
+    );
+    assert_eq!(stdout, "oam 2 8080 oam 8080");
+}
+
+#[test]
+fn json_modules_from_packages_bom_and_failure_modes() {
+    // Package-shipped JSON (the import side of require('../package.json')).
+    write_temp(
+        "jsonpkg/node_modules/withdata/package.json",
+        "{\"name\": \"withdata\", \"type\": \"module\", \"main\": \"index.js\"}",
+    );
+    write_temp(
+        "jsonpkg/node_modules/withdata/data/values.json",
+        "{\"answer\": 42}",
+    );
+    write_temp(
+        "jsonpkg/node_modules/withdata/index.js",
+        "import values from './data/values.json';\nexport const answer = values.answer;",
+    );
+    // BOM'd JSON parses (Node strips it; PowerShell writes them).
+    write_temp("jsonpkg/bom.json", "\u{feff}{\"bom\": true}");
+    let stdout = run_ok(
+        "jsonpkg/main.ts",
+        "import { answer } from 'withdata';\n\
+         import bom from './bom.json';\n\
+         console.log(answer, bom.bom);",
+    );
+    assert_eq!(stdout, "42 true");
+
+    // Malformed JSON fails the load with the file named.
+    write_temp("jsonbad/broken.json", "{\"oops\": ");
+    let main = write_temp("jsonbad/main.ts", "import './broken.json';");
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("broken.json"), "stderr: {stderr}");
+
+    // An unsupported attribute type is a clear diagnostic, not a crash.
+    write_temp("jsonbad/style.css", "body {}");
+    let main = write_temp(
+        "jsonbad/css_main.ts",
+        "import './style.css' with { type: 'css' };",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json", "--no-check"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
-    assert!(stderr.contains("import-attributes"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("only supported import-attribute type"),
+        "stderr: {stderr}"
+    );
+
+    // A .json ENTRY is not a program.
+    let entry = write_temp("jsonbad/alone.json", "{}");
+    let out = oam(&["run", entry.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a program"),
+        "json entry gate"
+    );
 }
 
 #[test]

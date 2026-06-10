@@ -239,7 +239,10 @@ pub(crate) fn load_cjs<'s>(
     module.set(scope, loaded_key.into(), false_v8.into());
 
     if key.extension().and_then(|e| e.to_str()) == Some("json") {
-        let text = v8::String::new(scope, &source)?;
+        // BOM strip, like Node's JSON loader — PowerShell's Set-Content
+        // writes BOMs and JSON.parse rejects them.
+        let source = source.trim_start_matches('\u{feff}');
+        let text = v8::String::new(scope, source)?;
         let parsed = v8::json::parse(scope, text)?; // None: SyntaxError pending
         let exports_key = v8::String::new(scope, "exports")?;
         module.set(scope, exports_key.into(), parsed);

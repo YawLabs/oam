@@ -447,11 +447,22 @@ fn load_module_graph(
         // require machinery, then compile a generated ESM facade (real
         // runtime export names) as the module at this path. JSON files
         // ride the same branch when they arrive via npm resolution.
+        let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
         let code = if let Some(name) = builtin {
             let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
             crate::cjs::builtin_facade_source(tc, &name, exports)
+        } else if is_json {
+            // JSON modules: parsed once through the CJS json loader (same
+            // cache require() uses), exposed via the facade — default is
+            // the parsed value; top-level keys are ALSO named exports, a
+            // documented superset of Node's default-only shape (TS's
+            // resolveJsonModule idiom expects the named form).
+            let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
+                return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
+            };
+            crate::cjs::facade_source(tc, &path, exports)
         } else if oam_loader::module_kind(&path) == oam_loader::ModuleKind::Cjs {
             let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
@@ -503,7 +514,56 @@ fn load_module_graph(
             let request = v8::Local::<v8::ModuleRequest>::try_from(request)
                 .expect("module request entry is a ModuleRequest");
             let specifier = request.get_specifier().to_rust_string_lossy(tc);
+
+            // Import attributes: [key, value, source_offset] triples. The
+            // only supported attribute is type, and the only supported
+            // type is json. Spec-required behavior is to IGNORE unknown
+            // keys; an unsupported type VALUE is an error.
+            let attributes = request.get_import_attributes();
+            let mut typed_json = false;
+            let mut index = 0;
+            while index + 1 < attributes.length() {
+                let key = attributes
+                    .get(tc, index)
+                    .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                    .and_then(|v| v.to_string(tc))
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_default();
+                let value = attributes
+                    .get(tc, index + 1)
+                    .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+                    .and_then(|v| v.to_string(tc))
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_default();
+                if key == "type" {
+                    if value == "json" {
+                        typed_json = true;
+                    } else {
+                        return Err(rt_diag(
+                            "OAM-MOD0003",
+                            format!(
+                                "{}: import of '{specifier}' declares type \"{value}\" — \
+                                 the only supported import-attribute type is \"json\"",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                index += 3;
+            }
+
             let resolved = host.resolve(&specifier, &path)?;
+            if typed_json && resolved.extension().and_then(|e| e.to_str()) != Some("json") {
+                return Err(rt_diag(
+                    "OAM-MOD0003",
+                    format!(
+                        "{}: '{specifier}' is imported with type \"json\" but resolves to {} \
+                         (only .json files load as JSON modules today)",
+                        path.display(),
+                        resolved.display()
+                    ),
+                ));
+            }
             // Virtual builtin paths must not go through filesystem
             // normalization (absolute() would anchor "node:fs" at cwd).
             let resolved = if resolved
