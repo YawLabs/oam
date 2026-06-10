@@ -26,10 +26,29 @@ struct Cli {
     json: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CheckMode {
+    /// Check concurrently with execution; report, never block (default).
+    Warn,
+    /// Check BEFORE execution; type errors prevent the run (CI gate).
+    Block,
+    /// No type checking.
+    Off,
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Run a JavaScript or TypeScript file.
-    Run { file: PathBuf },
+    /// Run a JavaScript or TypeScript file (TypeScript is type-checked
+    /// concurrently by default — execution never waits for the checker).
+    Run {
+        file: PathBuf,
+        /// Type-check policy for TypeScript entries.
+        #[arg(long, value_enum, default_value = "warn")]
+        check: CheckMode,
+        /// Alias for --check=off.
+        #[arg(long)]
+        no_check: bool,
+    },
     /// Type-check a file or project with tsgo (TypeScript 7 native).
     Check {
         /// A .ts file or a directory; the nearest tsconfig.json upward wins.
@@ -69,15 +88,11 @@ enum DaemonAction {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Run { file } => match run_file(file) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(diagnostics) => {
-                for d in &diagnostics {
-                    render(d, cli.json);
-                }
-                ExitCode::FAILURE
-            }
-        },
+        Command::Run {
+            file,
+            check,
+            no_check,
+        } => run_command(file, *check, *no_check, cli.json),
         Command::Check { path, no_daemon } => check_path(path, cli.json, *no_daemon),
         Command::Daemon { action } => match action {
             DaemonAction::Status { path } => {
@@ -111,16 +126,113 @@ fn main() -> ExitCode {
     }
 }
 
+/// Daemon first (instant repeat checks), one-shot on ANY daemon trouble:
+/// the daemon may never make checking less reliable than no daemon.
+// result_large_err: cold path, deliberate — same stance as oam_loader/oam_ts.
+#[allow(clippy::result_large_err)]
+fn run_check(path: &Path) -> Result<Vec<Diagnostic>, Diagnostic> {
+    match oam_ts::daemon::check_via_daemon(path) {
+        Ok(diagnostics) => Ok(diagnostics),
+        Err(_) => oam_ts::check(path),
+    }
+}
+
+fn error_count(diagnostics: &[Diagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count()
+}
+
+/// `oam run` with the typed loop: strip-and-run starts immediately; the
+/// checker runs concurrently (warn), gates (block), or stays off.
+fn run_command(file: &Path, check: CheckMode, no_check: bool, json: bool) -> ExitCode {
+    let mode = if no_check { CheckMode::Off } else { check };
+    // Only TypeScript entries are checkable; .js and .tsx flow through
+    // their normal paths untouched.
+    let checkable = oam_loader::classify(file) == SourceKind::TypeScript;
+
+    if mode == CheckMode::Block && checkable {
+        match run_check(file) {
+            Err(failure) => {
+                render(&failure, json);
+                return ExitCode::FAILURE;
+            }
+            Ok(diagnostics) => {
+                let errors = error_count(&diagnostics);
+                for d in &diagnostics {
+                    render(d, json);
+                }
+                if errors > 0 {
+                    if !json {
+                        eprintln!(
+                            "oam run: {errors} type error(s) — not executing (--check=block)"
+                        );
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+
+    // Warn mode: the check races execution on a thread; we collect it after
+    // the program finishes. Execution NEVER waits for the checker to start.
+    let pending = (mode == CheckMode::Warn && checkable).then(|| {
+        let path = file.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_check(&path));
+        });
+        rx
+    });
+
+    let exit = match run_file(file) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(diagnostics) => {
+            for d in &diagnostics {
+                render(d, json);
+            }
+            ExitCode::FAILURE
+        }
+    };
+
+    if let Some(rx) = pending {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(diagnostics)) => {
+                let errors = error_count(&diagnostics);
+                for d in &diagnostics {
+                    render(d, json);
+                }
+                if errors > 0 && !json {
+                    eprintln!(
+                        "oam run: {errors} type error(s) (execution was not blocked; use --check=block to gate)"
+                    );
+                }
+            }
+            Ok(Err(failure)) => {
+                // Checker unavailable (e.g. no tsgo): report once, quietly,
+                // human-mode only — never fail a successful run over it.
+                if !json {
+                    eprintln!("oam run: type check skipped: {}", failure.message);
+                }
+            }
+            Err(_) => {
+                if !json {
+                    eprintln!(
+                        "oam run: type check still running (daemon warming); results are instant on the next run"
+                    );
+                }
+            }
+        }
+    }
+    exit
+}
+
 fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
-    // Daemon first (instant repeat checks), one-shot on ANY daemon trouble:
-    // the daemon may never make `oam check` less reliable than no daemon.
     let result = if no_daemon {
         oam_ts::check(path)
     } else {
-        match oam_ts::daemon::check_via_daemon(path) {
-            Ok(diagnostics) => Ok(diagnostics),
-            Err(_) => oam_ts::check(path),
-        }
+        run_check(path)
     };
     match result {
         Err(failure) => {

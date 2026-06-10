@@ -22,8 +22,16 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
 }
 
 fn oam(args: &[&str]) -> Output {
+    // Isolated cache world: any daemon/build-info these invocations create
+    // lives under the run dir and self-reaps quickly.
+    let cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
     std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(args)
+        .env("OAM_CACHE_DIR", cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
         .output()
         .expect("oam binary runs")
 }
@@ -705,6 +713,82 @@ fn check_missing_tsgo_is_ts0000_via_env() {
         String::from_utf8_lossy(&out.stderr).contains("OAM-TS0000"),
         "missing tsgo must classify as OAM-TS0000"
     );
+}
+
+#[test]
+fn run_warn_reports_type_errors_without_blocking() {
+    // The wedge: the program EXECUTES (types stripped) while the checker
+    // reports the type error afterward — Bun shows nothing, Node can't run
+    // checks at all.
+    // Type-broken but runtime-fine: strips to a plain string assignment.
+    let main = write_temp(
+        "typed_loop.ts",
+        "const n: number = 'oops';\nconsole.log('ran anyway');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("OAM-TS0000") {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(out.status.success(), "warn mode must not change exit code");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran anyway");
+    assert!(
+        stderr.contains("\"origin\":\"typecheck\""),
+        "typecheck ODIF expected in the stream: {stderr}"
+    );
+    assert!(stderr.contains("OAM-TS2322"), "stderr: {stderr}");
+}
+
+#[test]
+fn run_check_block_gates_execution() {
+    let main = write_temp(
+        "typed_gate.ts",
+        "const n: number = 'oops';\nconsole.log('must not run');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--check", "block", "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("OAM-TS0000") {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(!out.status.success(), "block mode must gate on type errors");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "program must not execute"
+    );
+    assert!(stderr.contains("OAM-TS2322"), "stderr: {stderr}");
+}
+
+#[test]
+fn run_no_check_stays_silent() {
+    let main = write_temp(
+        "typed_off.ts",
+        "const n: number = 'oops';\nconsole.log('ran');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "",
+        "no checker output in off mode"
+    );
+}
+
+#[test]
+fn run_clean_typescript_adds_no_noise() {
+    let main = write_temp("typed_clean.ts", "const n: number = 42;\nconsole.log(n);");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("OAM-TS0000") || stderr.contains("type check skipped") {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
+    assert_eq!(stderr.trim(), "", "clean runs stay quiet: {stderr}");
 }
 
 #[test]
