@@ -3848,12 +3848,25 @@
         return this._material.length;
       }
       export() {
-        return new BufferCtor(this._material.buffer, this._material.byteOffset, this._material.length);
+        // Fresh Buffer (not a view): mutating the export must not corrupt
+        // the stored key material.
+        return BufferCtor.from(
+          this._material.buffer.slice(
+            this._material.byteOffset,
+            this._material.byteOffset + this._material.length,
+          ),
+        );
       }
     }
 
     function createSecretKey(key, encoding) {
-      return new KeyObject("secret", toBytes(key, encoding));
+      // COPY the material (Node parity): toBytes aliases an existing
+      // Uint8Array, so without the copy a later caller zeroing the source
+      // buffer (standard key-hygiene) would silently corrupt the key.
+      // NOTE: Buffer#slice is a VIEW here (Node semantics) — use a real
+      // Uint8Array copy.
+      const material = toBytes(key, encoding);
+      return new KeyObject("secret", new Uint8Array(material));
     }
 
     function asymmetricUnsupported() {
@@ -4190,12 +4203,27 @@
   // ------------------------------------------------- node:timers/promises
   registry.factories["timers/promises"] = () => {
     function promisedTimeout(delay, value, options = {}) {
+      const signal = options.signal;
+      // Already-aborted: reject immediately, never schedule (Node).
+      if (signal?.aborted) {
+        return Promise.reject(
+          signal.reason ??
+            new globalThis.DOMException("The operation was aborted", "AbortError"),
+        );
+      }
       return new Promise((resolve, reject) => {
         const id = globalThis.setTimeout(() => resolve(value), delay ?? 1);
-        options.signal?.addEventListener?.("abort", () => {
-          globalThis.clearTimeout(id);
-          reject(options.signal.reason ?? new Error("The operation was aborted"));
-        });
+        signal?.addEventListener?.(
+          "abort",
+          () => {
+            globalThis.clearTimeout(id);
+            reject(
+              signal.reason ??
+                new globalThis.DOMException("The operation was aborted", "AbortError"),
+            );
+          },
+          { once: true },
+        );
       });
     }
     function promisedImmediate(value) {
@@ -4285,6 +4313,7 @@
         this._headers = new Map();
         this._streamId = null;
         this._ended = false;
+        this._chain = Promise.resolve(); // serializes streaming writes
         this.statusCode = 200;
         this.statusMessage = "";
         this.headersSent = false;
@@ -4332,7 +4361,17 @@
       _toBytes(chunk, encoding) {
         if (chunk === null || chunk === undefined) return new Uint8Array(0);
         if (typeof chunk === "string") return globalThis.Buffer.from(chunk, encoding ?? "utf8");
-        return chunk;
+        if (chunk instanceof Uint8Array) return chunk;
+        if (ArrayBuffer.isView(chunk)) {
+          return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        }
+        // Node throws ERR_INVALID_ARG_TYPE rather than shipping garbage.
+        throw Object.assign(
+          new TypeError(
+            `The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received ${typeof chunk}`,
+          ),
+          { code: "ERR_INVALID_ARG_TYPE" },
+        );
       }
       write(chunk, encoding, cb) {
         if (typeof encoding === "function") {
@@ -4340,6 +4379,7 @@
           encoding = undefined;
         }
         if (this._ended) return false;
+        const bytes = this._toBytes(chunk, encoding);
         if (this._streamId === null) {
           this.headersSent = true;
           this._streamId = natives.httpRespondStream(
@@ -4348,10 +4388,15 @@
             this._headerPairsJson(),
           );
         }
-        natives.httpBodyPush(this._streamId, this._toBytes(chunk, encoding)).then(
+        // SERIALIZE: each push chains on the previous one. Independent
+        // unawaited ops raced (chunks reordered, dropped, and end() pulled
+        // the stream out from under in-flight writes), corrupting every
+        // multi-chunk response. The chain guarantees byte order.
+        const streamId = this._streamId;
+        this._chain = this._chain.then(() => natives.httpBodyPush(streamId, bytes)).then(
           () => cb?.(),
           (err) => {
-            this.emit("error", err);
+            if (this.listenerCount("error") > 0) this.emit("error", err);
             cb?.(err);
           },
         );
@@ -4366,9 +4411,9 @@
           encoding = undefined;
         }
         if (this._ended) return this;
-        this._ended = true;
         if (this._streamId === null) {
           // Single-shot: full body, hyper sets content-length.
+          this._ended = true;
           this.headersSent = true;
           natives.httpRespond(
             this._requestId,
@@ -4381,16 +4426,16 @@
             cb?.();
           });
         } else {
-          const finish = () => {
-            natives.httpBodyEnd(this._streamId);
+          // A trailing chunk joins the same serialized chain; the stream
+          // closes only AFTER every queued push has flushed, in order.
+          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+          this._ended = true;
+          const streamId = this._streamId;
+          this._chain = this._chain.then(() => {
+            natives.httpBodyEnd(streamId);
             this.emit("finish");
             cb?.();
-          };
-          if (chunk !== undefined && chunk !== null) {
-            natives.httpBodyPush(this._streamId, this._toBytes(chunk, encoding)).then(finish, finish);
-          } else {
-            finish();
-          }
+          });
         }
         return this;
       }

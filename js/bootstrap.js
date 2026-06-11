@@ -13,6 +13,133 @@
 "use strict";
 (() => {
 
+  // Minimal DOMException (AbortError/TimeoutError carriers) — defined
+  // first so the abort primitives below can throw it.
+  if (typeof globalThis.DOMException !== "function") {
+    class DOMException extends Error {
+      constructor(message = "", name = "Error") {
+        super(message);
+        this.name = name;
+      }
+    }
+    globalThis.DOMException = DOMException;
+  }
+
+  // ----------------------------------------------- Event / EventTarget
+  // The DOM event primitives AbortController is built on. Minimal but
+  // spec-shaped: once listeners, stopImmediatePropagation, dispatchEvent
+  // returning !defaultPrevented.
+  class Event {
+    constructor(type, init = {}) {
+      this.type = String(type);
+      this.bubbles = init.bubbles === true;
+      this.cancelable = init.cancelable === true;
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this._stopImmediate = false;
+      this.timeStamp = 0;
+    }
+    preventDefault() {
+      if (this.cancelable) this.defaultPrevented = true;
+    }
+    stopPropagation() {}
+    stopImmediatePropagation() {
+      this._stopImmediate = true;
+    }
+  }
+  globalThis.Event = Event;
+
+  class EventTarget {
+    constructor() {
+      this._listeners = new Map(); // type -> [{ fn, once }]
+    }
+    addEventListener(type, listener, options) {
+      if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
+      const once = options === true ? false : options?.once === true;
+      const list = this._listeners.get(type) ?? [];
+      if (!list.some((e) => e.fn === listener)) {
+        list.push({ fn: listener, once });
+        this._listeners.set(type, list);
+      }
+    }
+    removeEventListener(type, listener) {
+      const list = this._listeners.get(type);
+      if (list) this._listeners.set(type, list.filter((e) => e.fn !== listener));
+    }
+    dispatchEvent(event) {
+      event.target = this;
+      event.currentTarget = this;
+      const list = (this._listeners.get(event.type) ?? []).slice();
+      for (const entry of list) {
+        if (entry.once) this.removeEventListener(event.type, entry.fn);
+        const handler = typeof entry.fn === "function" ? entry.fn : entry.fn.handleEvent;
+        handler.call(this, event);
+        if (event._stopImmediate) break;
+      }
+      return !event.defaultPrevented;
+    }
+  }
+  globalThis.EventTarget = EventTarget;
+
+  // ------------------------------------------- AbortController / Signal
+  class AbortSignal extends EventTarget {
+    constructor() {
+      super();
+      this.aborted = false;
+      this.reason = undefined;
+      this.onabort = null;
+    }
+    static abort(reason) {
+      const signal = new AbortSignal();
+      signal.aborted = true;
+      signal.reason =
+        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      return signal;
+    }
+    static timeout(ms) {
+      const signal = new AbortSignal();
+      globalThis.setTimeout(() => {
+        signal._fire(new globalThis.DOMException("The operation timed out", "TimeoutError"));
+      }, ms);
+      return signal;
+    }
+    static any(signals) {
+      const result = new AbortSignal();
+      for (const signal of signals) {
+        if (signal.aborted) {
+          result._fire(signal.reason);
+          return result;
+        }
+        signal.addEventListener("abort", () => result._fire(signal.reason), { once: true });
+      }
+      return result;
+    }
+    throwIfAborted() {
+      if (this.aborted) throw this.reason;
+    }
+    _fire(reason) {
+      if (this.aborted) return;
+      this.aborted = true;
+      this.reason =
+        reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      const event = new Event("abort");
+      if (typeof this.onabort === "function") this.onabort.call(this, event);
+      this.dispatchEvent(event);
+    }
+  }
+  globalThis.AbortSignal = AbortSignal;
+
+  class AbortController {
+    constructor() {
+      this.signal = new AbortSignal();
+    }
+    abort(reason) {
+      this.signal._fire(reason);
+    }
+  }
+  globalThis.AbortController = AbortController;
+
   // Headers (Fetch-standard subset): case-insensitive, repeated values
   // combine per the comma rule, iterable. Shared by fetch responses,
   // server requests, and the Response constructor.
@@ -176,6 +303,11 @@
 
   globalThis.fetch = async function fetch(input, init) {
     init = init || {};
+    const signal = init.signal;
+    // Already-aborted: reject before touching the network (spec).
+    if (signal?.aborted) {
+      throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    }
     let headers = [];
     if (init.headers) {
       // Branch on iterability, not Array-ness: a Map (valid HeadersInit)
@@ -193,14 +325,31 @@
       headers,
       body: init.body == null ? null : wellFormed(init.body),
     };
-    let raw;
-    try {
-      raw = await globalThis.__oam.fetch(JSON.stringify(request));
-    } catch (e) {
-      // WHATWG: fetch() rejects with a TypeError on network failure.
-      throw new TypeError(e && e.message ? e.message : String(e));
-    }
-    return makeResponse(raw);
+    const op = globalThis.__oam
+      .fetch(JSON.stringify(request))
+      .then(makeResponse, (e) => {
+        // WHATWG: fetch() rejects with a TypeError on network failure.
+        throw new TypeError(e && e.message ? e.message : String(e));
+      });
+    if (!signal) return op;
+    // Race the abort. Wave-1 divergence (documented): the underlying op
+    // is not cancelled at the socket — the abort rejects the fetch
+    // PROMISE promptly (the observable contract), the response is
+    // discarded; full socket-level cancellation lands with the op-handle
+    // rework.
+    return Promise.race([
+      op,
+      new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () =>
+            reject(
+              signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError"),
+            ),
+          { once: true },
+        );
+      }),
+    ]);
   };
 
   // ---------------------------------------------------------- oam.serve

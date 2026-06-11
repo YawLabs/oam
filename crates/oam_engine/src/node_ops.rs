@@ -1381,5 +1381,11 @@ fn op_fs_close(
         .get_slot::<oam_core::CoreRuntime>()
         .expect("core runtime installed")
         .files();
-    files.lock().expect("file registry lock").remove(&handle);
+    let mut guard = files.lock().expect("file registry lock");
+    // If the File is in flight (removed by a chunk op for its IO await),
+    // it is absent here — record the close so the op's reinsert drops it
+    // instead of resurrecting a leaked fd (destroy()-during-read race).
+    if guard.files.remove(&handle).is_none() {
+        guard.closed.insert(handle);
+    }
 }

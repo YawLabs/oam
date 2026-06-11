@@ -54,7 +54,20 @@ impl TimerQueue {
     }
 
     fn cancel(&mut self, id: u32) {
-        self.active.remove(&id);
+        if self.active.remove(&id).is_none() {
+            return;
+        }
+        // The heap entry stays until its deadline reaches the front, so a
+        // cancelled far-future timer (the ubiquitous set-then-clear-on-
+        // success pattern) would sit in the heap for the whole timeout
+        // window — unbounded growth on a long-running server. When dead
+        // entries dominate, rebuild the heap from the live set. Amortized
+        // O(1): the rebuild cost is paid against the dead entries removed.
+        let live = self.active.len();
+        if self.heap.len() > 64 && self.heap.len() > live * 2 {
+            self.heap
+                .retain(|Reverse((_, _, id))| self.active.contains_key(id));
+        }
     }
 
     /// Next deadline among live timers, lazily discarding cancelled entries.

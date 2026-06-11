@@ -1,5 +1,5 @@
 {
-  "commit": "4b92197",
+  "commit": "34c038c",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -74,13 +74,13 @@
     "surface": {
       "globals": {
         "detail": {
-          "AbortController": false,
-          "AbortSignal": false,
+          "AbortController": true,
+          "AbortSignal": true,
           "Blob": false,
           "BroadcastChannel": false,
           "Buffer": true,
-          "Event": false,
-          "EventTarget": false,
+          "Event": true,
+          "EventTarget": true,
           "FormData": false,
           "Headers": true,
           "ReadableStream": true,
@@ -107,7 +107,7 @@
           "setTimeout": true,
           "structuredClone": false
         },
-        "have": 22,
+        "have": 26,
         "total": 32
       },
       "modules": {

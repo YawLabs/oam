@@ -1330,6 +1330,85 @@ fn oam_serve_streams_sse_incrementally() {
 }
 
 #[test]
+fn http_streaming_writes_stay_ordered_and_bodies_dont_leak() {
+    // Regression for the M2 safety fleet: 50 synchronous res.write() calls
+    // must arrive in order and intact (was a spawn-order race that
+    // reordered/dropped chunks), and a route that never reads the request
+    // body must not retain it (the RAII drop guard frees it).
+    let stdout = run_ok(
+        "http_safety.mjs",
+        "import http from 'node:http';\n\
+         const server = http.createServer((req, res) => {\n\
+           if (req.url === '/stream') {\n\
+             res.writeHead(200);\n\
+             for (let i = 0; i < 50; i++) res.write(`[${i}]`);\n\
+             res.end();\n\
+             return;\n\
+           }\n\
+           res.end('ok'); // never reads the body\n\
+         });\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const body = await (await fetch(`${base}/stream`)).text();\n\
+         const expected = Array.from({ length: 50 }, (_, i) => `[${i}]`).join('');\n\
+         console.log(body === expected, body.length);\n\
+         // Several unread-body POSTs — exercised the leak path, must all 200.\n\
+         let ok = 0;\n\
+         for (let i = 0; i < 10; i++) {\n\
+           const r = await fetch(`${base}/ping`, { method: 'POST', body: 'x'.repeat(4096) });\n\
+           if (r.status === 200) ok++;\n\
+         }\n\
+         console.log(ok);\n\
+         // res.write of a non-string/Buffer throws (no silent corruption).\n\
+         let threwCode = '';\n\
+         const probe = http.createServer((req, res) => {\n\
+           try { res.write({ bad: 1 }); res.end(); } catch (e) { threwCode = e.code; res.end('caught'); }\n\
+         });\n\
+         await new Promise((r) => probe.listen(0, r));\n\
+         await (await fetch(`http://127.0.0.1:${probe.address().port}/`)).text();\n\
+         console.log(threwCode);\n\
+         server.close();\n\
+         probe.close();",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true 190");
+    assert_eq!(lines[1], "10");
+    assert_eq!(lines[2], "ERR_INVALID_ARG_TYPE");
+}
+
+#[test]
+fn abort_controller_and_signal_work() {
+    let stdout = run_ok(
+        "abort.mjs",
+        "import { setTimeout as wait } from 'node:timers/promises';\n\
+         console.log(typeof AbortController, typeof AbortSignal, typeof EventTarget, typeof Event);\n\
+         const ac = new AbortController();\n\
+         let fired = '';\n\
+         ac.signal.addEventListener('abort', () => { fired = ac.signal.reason.name; });\n\
+         ac.abort();\n\
+         console.log(ac.signal.aborted, fired);\n\
+         // fetch with an already-aborted signal rejects AbortError.\n\
+         let name = '';\n\
+         try { await fetch('http://127.0.0.1:1/x', { signal: AbortSignal.abort() }); } catch (e) { name = e.name; }\n\
+         console.log(name);\n\
+         // timers/promises honors an already-aborted signal immediately.\n\
+         let timed = '';\n\
+         try { await wait(1000, null, { signal: AbortSignal.abort() }); } catch (e) { timed = e.name; }\n\
+         console.log(timed);\n\
+         // AbortSignal.timeout fires.\n\
+         const sig = AbortSignal.timeout(10);\n\
+         await new Promise((r) => setTimeout(r, 30));\n\
+         console.log(sig.aborted, sig.reason.name);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "function function function function");
+    assert_eq!(lines[1], "true AbortError");
+    assert_eq!(lines[2], "AbortError");
+    assert_eq!(lines[3], "AbortError");
+    assert_eq!(lines[4], "true TimeoutError");
+}
+
+#[test]
 fn node_http_create_server_express_style() {
     let stdout = run_ok(
         "node_http.mjs",

@@ -246,6 +246,32 @@ pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super
     )
 }
 
+/// RAII cleanup tied to the REQUEST lifetime, not the body read. When
+/// handle_request returns — handler responded, client disconnected (future
+/// cancelled at any await), or queue-send failed — both the buffered body
+/// and the pending responder are removed. Without this, a handler that
+/// never reads the body (a GET route, a 401, a webhook branching on
+/// headers) leaked the body forever: a remote, attacker-controlled DoS.
+struct RequestGuard {
+    state: Arc<HttpState>,
+    id: u64,
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.state
+            .bodies
+            .lock()
+            .expect("http bodies lock")
+            .remove(&self.id);
+        self.state
+            .pending
+            .lock()
+            .expect("http pending lock")
+            .remove(&self.id);
+    }
+}
+
 async fn handle_request(
     state: Arc<HttpState>,
     queue: mpsc::Sender<IncomingRequest>,
@@ -295,6 +321,12 @@ async fn handle_request(
         .lock()
         .expect("http bodies lock")
         .insert(id, collected.to_vec());
+    // From here on, every exit cleans up — including a cancelled future
+    // if the client disconnects while the handler runs.
+    let _guard = RequestGuard {
+        state: state.clone(),
+        id,
+    };
 
     let sent = queue
         .send(IncomingRequest {
@@ -306,8 +338,6 @@ async fn handle_request(
         })
         .await;
     if sent.is_err() {
-        state.pending.lock().expect("http pending lock").remove(&id);
-        state.bodies.lock().expect("http bodies lock").remove(&id);
         return Ok(hyper::Response::builder()
             .status(503)
             .body(http_body_util::Full::new(Bytes::from_static(b"server is closing")).boxed())

@@ -60,8 +60,17 @@ pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Re
 
 /// Open file handles for fs streams — same remove-await-reinsert
 /// discipline as BodyRegistry (node:stream's write queue serializes
-/// access per handle).
-pub type FileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::fs::File>>>;
+/// access per handle). The `closed` set is the generation guard: a chunk
+/// op removes the File, awaits IO unlocked, then reinserts — but if
+/// fsClose landed during that await (stream.destroy() racing an in-flight
+/// read), the reinsert would resurrect a leaked fd. closed tracks ids
+/// retired mid-flight so the reinsert drops the File instead.
+#[derive(Default)]
+pub struct FileState {
+    pub files: HashMap<u64, tokio::fs::File>,
+    pub closed: std::collections::HashSet<u64>,
+}
+pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 
 pub struct CoreRuntime {
     /// Option so Drop can take it for shutdown_background (see below).
@@ -106,7 +115,7 @@ impl CoreRuntime {
             next_id: 1,
             inflight: 0,
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
@@ -692,6 +701,7 @@ pub mod ops {
                 files
                     .lock()
                     .expect("file registry lock")
+                    .files
                     .insert(handle, file);
                 OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
             }
@@ -699,28 +709,40 @@ pub mod ops {
         }
     }
 
+    /// Reinsert a File ONLY if it was not closed mid-flight. Returns
+    /// whether it was kept (false = the handle was retired by fsClose
+    /// during the IO await, so the File is dropped here, closing the fd).
+    fn reinsert_file(files: &super::FileRegistry, handle: u64, file: tokio::fs::File) -> bool {
+        let mut guard = files.lock().expect("file registry lock");
+        if guard.closed.remove(&handle) {
+            drop(file); // closed during the await: do not resurrect
+            false
+        } else {
+            guard.files.insert(handle, file);
+            true
+        }
+    }
+
     /// Read up to `len` bytes. Bytes = data, Done = EOF (handle stays open
     /// until fs_close — the JS side closes explicitly).
     pub async fn fs_read_chunk(files: super::FileRegistry, handle: u64, len: usize) -> OpOutcome {
         use tokio::io::AsyncReadExt;
-        let file = files.lock().expect("file registry lock").remove(&handle);
+        let file = files
+            .lock()
+            .expect("file registry lock")
+            .files
+            .remove(&handle);
         let Some(mut file) = file else {
             return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
         };
         let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
         match file.read(&mut buf).await {
             Ok(0) => {
-                files
-                    .lock()
-                    .expect("file registry lock")
-                    .insert(handle, file);
+                reinsert_file(&files, handle, file);
                 OpOutcome::Done
             }
             Ok(n) => {
-                files
-                    .lock()
-                    .expect("file registry lock")
-                    .insert(handle, file);
+                reinsert_file(&files, handle, file);
                 buf.truncate(n);
                 OpOutcome::Bytes(buf)
             }
@@ -736,16 +758,17 @@ pub mod ops {
         bytes: Vec<u8>,
     ) -> OpOutcome {
         use tokio::io::AsyncWriteExt;
-        let file = files.lock().expect("file registry lock").remove(&handle);
+        let file = files
+            .lock()
+            .expect("file registry lock")
+            .files
+            .remove(&handle);
         let Some(mut file) = file else {
             return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
         };
         match file.write_all(&bytes).await {
             Ok(()) => {
-                files
-                    .lock()
-                    .expect("file registry lock")
-                    .insert(handle, file);
+                reinsert_file(&files, handle, file);
                 OpOutcome::Done
             }
             Err(e) => node_fail(e, "write", &handle.to_string()),
