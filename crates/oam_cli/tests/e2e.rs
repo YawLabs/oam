@@ -659,8 +659,13 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     );
 
     // Shipped builtins resolve; the MOD0006 gate covers the rest,
-    // prefixed or bare.
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:zlib';").unwrap();
+    // prefixed or bare. (worker_threads is the long-horizon example —
+    // earlier picks kept SHIPPING and flipping this test.)
+    std::fs::write(
+        proj.join("builtin_main.ts"),
+        "import 'node:worker_threads';",
+    )
+    .unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -1106,6 +1111,39 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "BROWSER-SHIM function function"
     );
+}
+
+// ------------------------------------------- zlib / querystring / timers/promises
+
+#[test]
+fn small_builtins_wave_smoke() {
+    let stdout = run_ok(
+        "small_wave.mjs",
+        "import zlib from 'node:zlib';\n\
+         import qs from 'node:querystring';\n\
+         import { setTimeout as wait, scheduler } from 'node:timers/promises';\n\
+         import { Console } from 'node:console';\n\
+         import { Writable } from 'node:stream';\n\
+         const data = Buffer.from('payload-'.repeat(10));\n\
+         console.log(zlib.gunzipSync(zlib.gzipSync(data)).equals(data), zlib.unzipSync(zlib.deflateSync(data)).equals(data));\n\
+         // A gzip blob produced by real Node decompresses here (interop).\n\
+         const nodeVector = 'H4sIAAAAAAAACstPzFVIzs9Lyy/KTcxLTlUoSKzMyU9MsVJITEo2NDKmPwkATCxew5EAAAA=';\n\
+         console.log(zlib.gunzipSync(Buffer.from(nodeVector, 'base64')).toString().startsWith('oam conformance payload'));\n\
+         console.log(qs.stringify({ a: 'x y', b: ['1', '2'] }), qs.parse('a=x+y&flag').a, JSON.stringify(qs.parse('a=1&flag').flag));\n\
+         console.log(await wait(2, 'waited'));\n\
+         await scheduler.yield();\n\
+         let captured = '';\n\
+         const sink = new Writable({ write(c, _e, cb) { captured += c; cb(); } });\n\
+         new Console(sink).log('sunk %d', 9);\n\
+         await wait(1);\n\
+         console.log(JSON.stringify(captured));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true true");
+    assert_eq!(lines[1], "true");
+    assert_eq!(lines[2], "a=x%20y&b=1&b=2 x y \"\"");
+    assert_eq!(lines[3], "waited");
+    assert_eq!(lines[4], "\"sunk 9\\n\"");
 }
 
 // ------------------------------------------------------------- node:crypto

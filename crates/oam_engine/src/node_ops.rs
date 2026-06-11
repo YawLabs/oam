@@ -135,6 +135,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadChunk", op_fs_read_chunk),
         ("fsWriteChunk", op_fs_write_chunk),
         ("fsClose", op_fs_close),
+        // node:zlib
+        ("zlibSync", op_zlib_sync),
+        ("zlibAsync", op_zlib_async),
         // node:crypto (crypto_ops.rs)
         ("cryptoHashCreate", op_crypto_hash_create),
         ("cryptoHmacCreate", op_crypto_hmac_create),
@@ -442,6 +445,71 @@ fn op_username(
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
     }
+}
+
+/// zlibSync(bytes, format, level, compress) — synchronous transform on the
+/// isolate thread (the *Sync API contract). "unzip" auto-detects on decode.
+fn op_zlib_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(bytes) = arg_bytes(scope, &args, 0) else {
+        throw_type_error(scope, "zlib requires data");
+        return;
+    };
+    let format = arg_string(scope, &args, 1).unwrap_or_default();
+    let level = args.get(2).int32_value(scope).unwrap_or(-1);
+    let compress = args.get(3).is_true();
+    let result = if !compress && format == "unzip" {
+        oam_core::zlib::unzip(&bytes)
+    } else {
+        match oam_core::zlib::Format::parse(&format) {
+            Some(parsed) => {
+                if compress {
+                    oam_core::zlib::compress(&bytes, parsed, level)
+                } else {
+                    oam_core::zlib::decompress(&bytes, parsed)
+                }
+            }
+            None => {
+                throw_type_error(scope, &format!("unknown zlib format '{format}'"));
+                return;
+            }
+        }
+    };
+    match result {
+        Ok(out) => {
+            if let Some(value) = bytes_to_uint8array(scope, out) {
+                rv.set(value);
+            }
+        }
+        Err(e) => {
+            let message = v8::String::new(scope, &format!("zlib: {e}")).unwrap();
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+    }
+}
+
+/// zlibAsync(bytes, format, level, compress) -> Promise<Uint8Array>.
+fn op_zlib_async(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(bytes) = arg_bytes(scope, &args, 0) else {
+        throw_type_error(scope, "zlib requires data");
+        return;
+    };
+    let format = arg_string(scope, &args, 1).unwrap_or_default();
+    let level = args.get(2).int32_value(scope).unwrap_or(-1);
+    let compress = args.get(3).is_true();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_transform(bytes, format, level, compress),
+    );
 }
 
 /// Serialize every WHATWG component of a parsed URL in one bundle — the

@@ -43,6 +43,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"
 getrandom = "0.3"
+# node:zlib: gzip/deflate via the same backend everything else in the
+# Rust ecosystem uses (already in-tree transitively through oxc).
+flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —

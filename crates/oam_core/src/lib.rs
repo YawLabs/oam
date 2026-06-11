@@ -258,6 +258,83 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
+/// node:zlib backend (flate2). Sync fns serve the *Sync natives directly;
+/// the async ops below wrap them in spawn_blocking — compression is CPU
+/// work and must not sit on the isolate thread for the callback forms.
+pub mod zlib {
+    use flate2::Compression;
+    use std::io::{Read, Write};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Format {
+        Gzip,
+        Deflate,
+        DeflateRaw,
+    }
+
+    impl Format {
+        pub fn parse(name: &str) -> Option<Self> {
+            Some(match name {
+                "gzip" => Format::Gzip,
+                "deflate" => Format::Deflate,
+                "deflateRaw" => Format::DeflateRaw,
+                _ => return None,
+            })
+        }
+    }
+
+    pub fn compress(bytes: &[u8], format: Format, level: i32) -> std::io::Result<Vec<u8>> {
+        // Node levels: -1 default, 0..=9. flate2 default is 6, same as zlib.
+        let level = if (0..=9).contains(&level) {
+            Compression::new(level as u32)
+        } else {
+            Compression::default()
+        };
+        match format {
+            Format::Gzip => {
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
+                encoder.write_all(bytes)?;
+                encoder.finish()
+            }
+            Format::Deflate => {
+                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
+                encoder.write_all(bytes)?;
+                encoder.finish()
+            }
+            Format::DeflateRaw => {
+                let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
+                encoder.write_all(bytes)?;
+                encoder.finish()
+            }
+        }
+    }
+
+    pub fn decompress(bytes: &[u8], format: Format) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        match format {
+            Format::Gzip => {
+                flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+            }
+            Format::Deflate => {
+                flate2::read::ZlibDecoder::new(bytes).read_to_end(&mut out)?;
+            }
+            Format::DeflateRaw => {
+                flate2::read::DeflateDecoder::new(bytes).read_to_end(&mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Node's unzip*: auto-detect gzip (1f 8b magic) vs zlib-wrapped.
+    pub fn unzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            decompress(bytes, Format::Gzip)
+        } else {
+            decompress(bytes, Format::Deflate)
+        }
+    }
+}
+
 /// Built-in op implementations. Plain futures; the engine decides how their
 /// outcomes surface in JS.
 pub mod ops {
@@ -531,6 +608,39 @@ pub mod ops {
             "bodyHandle": handle,
         });
         OpOutcome::Json(payload.to_string())
+    }
+
+    /// Async zlib: CPU-bound, so spawn_blocking off the op channel
+    /// (Node's threadpool model). compress=true encodes, false decodes;
+    /// format "unzip" auto-detects on the decode side.
+    pub async fn zlib_transform(
+        bytes: Vec<u8>,
+        format: String,
+        level: i32,
+        compress: bool,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            if !compress && format == "unzip" {
+                return super::zlib::unzip(&bytes);
+            }
+            let Some(parsed) = super::zlib::Format::parse(&format) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown zlib format '{format}'"),
+                ));
+            };
+            if compress {
+                super::zlib::compress(&bytes, parsed, level)
+            } else {
+                super::zlib::decompress(&bytes, parsed)
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(out)) => OpOutcome::Bytes(out),
+            Ok(Err(e)) => OpOutcome::Failed(format!("zlib: {e}")),
+            Err(e) => OpOutcome::Failed(format!("zlib task: {e}")),
+        }
     }
 
     /// Open a file for streaming. Mode: "r" read, "w" truncate-create,

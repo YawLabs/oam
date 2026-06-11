@@ -1189,6 +1189,7 @@ dependencies = [
 name = "oam_core"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "oam_diagnostics",
  "reqwest",
  "rustls",

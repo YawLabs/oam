@@ -2318,6 +2318,7 @@
       "assert",
       "async_hooks",
       "buffer",
+      "console",
       "crypto",
       "events",
       "fs",
@@ -2328,14 +2329,17 @@
       "path/posix",
       "path/win32",
       "process",
+      "querystring",
       "stream",
       "stream/consumers",
       "stream/promises",
       "stream/web",
       "string_decoder",
+      "timers/promises",
       "tty",
       "url",
       "util",
+      "zlib",
     ];
 
     return {
@@ -3981,6 +3985,239 @@
       subtle,
       getRandomValues,
     };
+  };
+
+  // ------------------------------------------------------------ node:zlib
+  // gzip/deflate/deflateRaw + unzip auto-detect. Sync forms run on the
+  // isolate thread (the API contract); callback forms ride the async op
+  // (CPU work on the blocking pool, Node's threadpool model). create*
+  // Transform classes BUFFER input and emit on flush — wave-1 divergence,
+  // documented: true incremental compression streams land later. brotli*
+  // is gated with a pointer.
+  registry.factories.zlib = (natives) => {
+    const BufferCtor = globalThis.Buffer;
+    const toBytes = (data) =>
+      typeof data === "string"
+        ? BufferCtor.from(data, "utf8")
+        : data instanceof Uint8Array
+          ? data
+          : ArrayBuffer.isView(data)
+            ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+            : new Uint8Array(data);
+    const asBuffer = (bytes) => new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.length);
+    const levelOf = (options) => options?.level ?? -1;
+
+    const sync = (format, compress) => (data, options) =>
+      asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress));
+    const callbackForm = (format, compress) => (data, options, callback) => {
+      if (typeof options === "function") {
+        callback = options;
+        options = undefined;
+      }
+      natives.zlibAsync(toBytes(data), format, levelOf(options), compress).then(
+        (bytes) => callback(null, asBuffer(bytes)),
+        (err) => callback(err),
+      );
+    };
+
+    function transformClass(format, compress) {
+      const { Transform } = registry.get("stream");
+      return class extends Transform {
+        constructor(options) {
+          super({});
+          this._zlibChunks = [];
+          this._zlibLevel = levelOf(options);
+        }
+        _transform(chunk, _encoding, cb) {
+          this._zlibChunks.push(toBytes(chunk));
+          cb();
+        }
+        _flush(cb) {
+          const total = this._zlibChunks.reduce((n, c) => n + c.length, 0);
+          const joined = new Uint8Array(total);
+          let offset = 0;
+          for (const c of this._zlibChunks) {
+            joined.set(c, offset);
+            offset += c.length;
+          }
+          natives.zlibAsync(joined, format, this._zlibLevel, compress).then(
+            (bytes) => cb(null, asBuffer(bytes)),
+            (err) => cb(err),
+          );
+        }
+      };
+    }
+
+    const brotliGate = () => {
+      throw new Error("brotli lands with a later zlib wave — gzip/deflate work today");
+    };
+
+    return {
+      gzipSync: sync("gzip", true),
+      gunzipSync: sync("gzip", false),
+      deflateSync: sync("deflate", true),
+      inflateSync: sync("deflate", false),
+      deflateRawSync: sync("deflateRaw", true),
+      inflateRawSync: sync("deflateRaw", false),
+      unzipSync: sync("unzip", false),
+      gzip: callbackForm("gzip", true),
+      gunzip: callbackForm("gzip", false),
+      deflate: callbackForm("deflate", true),
+      inflate: callbackForm("deflate", false),
+      deflateRaw: callbackForm("deflateRaw", true),
+      inflateRaw: callbackForm("deflateRaw", false),
+      unzip: callbackForm("unzip", false),
+      createGzip: (o) => new (transformClass("gzip", true))(o),
+      createGunzip: (o) => new (transformClass("gzip", false))(o),
+      createDeflate: (o) => new (transformClass("deflate", true))(o),
+      createInflate: (o) => new (transformClass("deflate", false))(o),
+      createDeflateRaw: (o) => new (transformClass("deflateRaw", true))(o),
+      createInflateRaw: (o) => new (transformClass("deflateRaw", false))(o),
+      createUnzip: (o) => new (transformClass("unzip", false))(o),
+      brotliCompressSync: brotliGate,
+      brotliDecompressSync: brotliGate,
+      brotliCompress: brotliGate,
+      brotliDecompress: brotliGate,
+      constants: {
+        Z_NO_COMPRESSION: 0,
+        Z_BEST_SPEED: 1,
+        Z_BEST_COMPRESSION: 9,
+        Z_DEFAULT_COMPRESSION: -1,
+        Z_OK: 0,
+        Z_STREAM_END: 1,
+        Z_DATA_ERROR: -3,
+      },
+    };
+  };
+
+  // ----------------------------------------------------- node:querystring
+  // Legacy querystring: escape ~= encodeURIComponent (space -> %20),
+  // parse decodes '+' as space, repeated keys become arrays, custom
+  // separators supported — all node-probed semantics.
+  registry.factories.querystring = () => {
+    const unescape = (text) => {
+      try {
+        return decodeURIComponent(text);
+      } catch {
+        // Malformed sequences decode per-piece, bad pieces stay literal.
+        return text.replace(/%[0-9A-Fa-f]{2}/g, (m) => {
+          try {
+            return decodeURIComponent(m);
+          } catch {
+            return m;
+          }
+        });
+      }
+    };
+    const escape = (text) => encodeURIComponent(String(text));
+
+    function parse(input, sep = "&", eq = "=", options = {}) {
+      const out = Object.create(null);
+      if (typeof input !== "string" || input.length === 0) return out;
+      const maxKeys = options.maxKeys ?? 1000;
+      const pieces = input.split(sep);
+      const limit = maxKeys > 0 ? Math.min(pieces.length, maxKeys) : pieces.length;
+      for (let i = 0; i < limit; i++) {
+        const piece = pieces[i];
+        if (piece.length === 0) continue;
+        const idx = piece.indexOf(eq);
+        const rawKey = idx === -1 ? piece : piece.slice(0, idx);
+        const rawValue = idx === -1 ? "" : piece.slice(idx + eq.length);
+        const key = unescape(rawKey.replaceAll("+", " "));
+        const value = unescape(rawValue.replaceAll("+", " "));
+        if (key in out) {
+          if (Array.isArray(out[key])) out[key].push(value);
+          else out[key] = [out[key], value];
+        } else {
+          out[key] = value;
+        }
+      }
+      return out;
+    }
+
+    function stringify(obj, sep = "&", eq = "=", _options = {}) {
+      if (obj === null || typeof obj !== "object") return "";
+      const parts = [];
+      for (const key of Object.keys(obj)) {
+        const escapedKey = escape(key);
+        const value = obj[key];
+        if (Array.isArray(value)) {
+          for (const item of value) parts.push(`${escapedKey}${eq}${escape(stringifyPrimitive(item))}`);
+        } else {
+          parts.push(`${escapedKey}${eq}${escape(stringifyPrimitive(value))}`);
+        }
+      }
+      return parts.join(sep);
+    }
+
+    function stringifyPrimitive(value) {
+      if (typeof value === "string") return value;
+      if (typeof value === "number" && Number.isFinite(value)) return String(value);
+      if (typeof value === "boolean") return String(value);
+      if (typeof value === "bigint") return String(value);
+      return "";
+    }
+
+    return { parse, stringify, escape, unescape, decode: parse, encode: stringify };
+  };
+
+  // ------------------------------------------------- node:timers/promises
+  registry.factories["timers/promises"] = () => {
+    function promisedTimeout(delay, value, options = {}) {
+      return new Promise((resolve, reject) => {
+        const id = globalThis.setTimeout(() => resolve(value), delay ?? 1);
+        options.signal?.addEventListener?.("abort", () => {
+          globalThis.clearTimeout(id);
+          reject(options.signal.reason ?? new Error("The operation was aborted"));
+        });
+      });
+    }
+    function promisedImmediate(value) {
+      return new Promise((resolve) => globalThis.setTimeout(() => resolve(value), 0));
+    }
+    async function* intervalIterator(delay, value) {
+      for (;;) {
+        await promisedTimeout(delay, undefined);
+        yield value;
+      }
+    }
+    return {
+      setTimeout: promisedTimeout,
+      setImmediate: promisedImmediate,
+      setInterval: intervalIterator,
+      scheduler: {
+        wait: (delay) => promisedTimeout(delay, undefined),
+        yield: () => promisedImmediate(undefined),
+      },
+    };
+  };
+
+  // ----------------------------------------------------------- node:console
+  // require('console') is the global console plus a Console class bound to
+  // caller-provided writables.
+  registry.factories.console = () => {
+    const util = registry.get("util");
+    class Console {
+      constructor(stdout, stderr) {
+        const options = stdout && stdout.write ? { stdout, stderr } : (stdout ?? {});
+        this._out = options.stdout;
+        this._err = options.stderr ?? options.stdout;
+        if (!this._out || typeof this._out.write !== "function") {
+          throw new TypeError("Console expects a writable stream instance");
+        }
+        const writeTo = (stream) => (...args) => {
+          stream.write(`${util.format(...args)}\n`);
+        };
+        this.log = writeTo(this._out);
+        this.info = this.log;
+        this.debug = this.log;
+        this.warn = writeTo(this._err);
+        this.error = this.warn;
+      }
+    }
+    const mod = Object.create(globalThis.console);
+    mod.Console = Console;
+    return mod;
   };
 
   // ------------------------------------------------------------------ tty

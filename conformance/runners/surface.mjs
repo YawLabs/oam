@@ -12,8 +12,8 @@ const MODULES = [
   "fs/promises", "http", "http2", "https", "inspector", "module", "net",
   "os", "path", "perf_hooks", "process", "punycode", "querystring",
   "readline", "repl", "stream", "stream/promises", "stream/web",
-  "stream/consumers", "string_decoder", "timers", "tls", "trace_events",
-  "tty", "url", "util", "v8", "vm", "worker_threads", "zlib",
+  "stream/consumers", "string_decoder", "timers", "timers/promises", "tls",
+  "trace_events", "tty", "url", "util", "v8", "vm", "worker_threads", "zlib",
 ];
 
 const GLOBALS = [

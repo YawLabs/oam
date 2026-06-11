@@ -1,5 +1,5 @@
 {
-  "commit": "3036fbe",
+  "commit": "959495b",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -54,10 +54,22 @@
         {
           "case": "12-node-url.mjs",
           "status": "pass"
+        },
+        {
+          "case": "13-zlib.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "14-querystring.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "15-timers-promises-console.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 12,
-      "total": 12
+      "pass": 15,
+      "total": 15
     },
     "surface": {
       "globals": {
@@ -105,7 +117,7 @@
           "buffer": true,
           "child_process": false,
           "cluster": false,
-          "console": false,
+          "console": true,
           "crypto": true,
           "dgram": false,
           "diagnostics_channel": false,
@@ -125,7 +137,7 @@
           "perf_hooks": false,
           "process": true,
           "punycode": false,
-          "querystring": false,
+          "querystring": true,
           "readline": false,
           "repl": false,
           "stream": true,
@@ -134,6 +146,7 @@
           "stream/web": true,
           "string_decoder": true,
           "timers": false,
+          "timers/promises": true,
           "tls": false,
           "trace_events": false,
           "tty": true,
@@ -142,10 +155,10 @@
           "v8": false,
           "vm": false,
           "worker_threads": false,
-          "zlib": false
+          "zlib": true
         },
-        "have": 19,
-        "total": 43
+        "have": 23,
+        "total": 44
       }
     },
     "wptUrl": {

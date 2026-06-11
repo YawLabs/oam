@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "oam_core"
 description = "Engine-agnostic async substrate: tokio runtime, op-completion channel, built-in op futures. v8-free by design."
 version.workspace = true
@@ -12,3 +12,5 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# node:zlib compression backend.
+flate2 = { workspace = true }
