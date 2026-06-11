@@ -1113,6 +1113,77 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
     );
 }
 
+// -------------------------------------------------------------------- REPL
+
+#[test]
+fn repl_evaluates_typed_lines_with_live_event_loop() {
+    use std::io::Write;
+    let cache = write_temp("replcache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .env("OAM_CACHE_DIR", cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("repl spawns");
+    let script = "1+2\n\
+                  const x: number = 40\n\
+                  x + 2\n\
+                  await Promise.resolve(7)\n\
+                  _\n\
+                  function outer() {\n\
+                  return 'multi'\n\
+                  }\n\
+                  outer()\n\
+                  setTimeout(() => console.log('background fired'), 40)\n\
+                  await new Promise<string>((r) => setTimeout(() => r('timer-live'), 80))\n\
+                  nope.boom\n\
+                  .exit\n";
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("repl exits");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let cleaned: Vec<String> = stdout
+        .lines()
+        .skip(1) // banner
+        .map(|l| {
+            // Prompts accumulate before a result line: "> ... ... value".
+            l.trim_start_matches("> ")
+                .trim_start_matches("... ")
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        cleaned,
+        vec![
+            "3",
+            "undefined", // typed declaration
+            "42",
+            "7",         // top-level await
+            "7",         // _ holds the last value
+            "undefined", // multi-line function declaration
+            "'multi'",
+            "1",                // timer id
+            "background fired", // fired while AWAITING the next line — live loop
+            "'timer-live'",
+        ],
+        "stdout was: {stdout}"
+    );
+    // The bad line errored on stderr without killing the session.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nope is not defined"), "stderr: {stderr}");
+}
+
 // ------------------------------------------------------------- N-API alpha
 
 #[test]

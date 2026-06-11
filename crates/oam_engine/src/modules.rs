@@ -225,6 +225,173 @@ impl JsRuntime {
 }
 
 impl JsRuntime {
+    /// Service the event loop for at most `budget` (REPL idle ticks):
+    /// run any due timers and ready op completions, then wait out the
+    /// remaining budget on the op channel. Errors are returned, not fatal.
+    pub fn tick(&mut self, budget: std::time::Duration) -> Result<(), Vec<Diagnostic>> {
+        let deadline = std::time::Instant::now() + budget;
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        v8::tc_scope!(let tc, scope);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let mut progressed = false;
+            let due = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.pop_due(now));
+            if let Some((callback, extra)) = due {
+                let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+                let callback = v8::Local::new(tc, &callback);
+                let args: Vec<v8::Local<v8::Value>> =
+                    extra.iter().map(|g| v8::Local::new(tc, g)).collect();
+                if callback.call(tc, recv, &args).is_none() {
+                    return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
+                }
+                tc.perform_microtask_checkpoint();
+                progressed = true;
+            }
+            if let Some(completion) = tc
+                .get_slot_mut::<oam_core::CoreRuntime>()
+                .and_then(|core| core.try_recv())
+            {
+                crate::ops::settle_completion(tc, completion);
+                tc.perform_microtask_checkpoint();
+                progressed = true;
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            if progressed {
+                continue;
+            }
+            // Idle: block on the op channel for the remaining budget (or
+            // the next timer, whichever is sooner).
+            let next_timer = tc
+                .get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.next_deadline());
+            let wait_until = match next_timer {
+                Some(timer) if timer < deadline => timer,
+                _ => deadline,
+            };
+            let completion = tc
+                .get_slot_mut::<oam_core::CoreRuntime>()
+                .and_then(|core| core.recv_deadline(Some(wait_until)));
+            if let Some(completion) = completion {
+                crate::ops::settle_completion(tc, completion);
+                tc.perform_microtask_checkpoint();
+            } else if next_timer.is_none_or(|t| t >= deadline) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One REPL evaluation: TypeScript-stripped, await-aware, result
+    /// rendered via util.inspect, `_` bound to the last value. Err is the
+    /// pretty error text.
+    pub fn repl_eval(&mut self, source: &str) -> Result<String, String> {
+        let has_await = source.contains("await");
+        let prepared = if has_await {
+            // Top-level await: evaluate as an async IIFE and pump until
+            // settled. Expression form first (trailing semicolons from the
+            // TS strip would break it); statement fallback below.
+            let expression = source.trim_end().trim_end_matches(';');
+            format!("(async () => ({expression}\n))()")
+        } else {
+            source.to_string()
+        };
+
+        let run = |runtime: &mut JsRuntime, text: &str| -> Result<String, (bool, String)> {
+            v8::scope_with_context!(let scope, &mut runtime.isolate, &runtime.context);
+            v8::tc_scope!(let tc, scope);
+            let Some(code) = v8::String::new(tc, text) else {
+                return Err((false, "input too long".to_string()));
+            };
+            let name: v8::Local<v8::Value> = v8::String::new(tc, "repl").unwrap().into();
+            let origin =
+                v8::ScriptOrigin::new(tc, name, 0, 0, false, 0, None, false, false, false, None);
+            let Some(script) = v8::Script::compile(tc, code, Some(&origin)) else {
+                let message = tc
+                    .message()
+                    .map(|m| m.get(tc).to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "syntax error".to_string());
+                return Err((true, message));
+            };
+            let Some(mut value) = script.run(tc) else {
+                let message = tc
+                    .message()
+                    .map(|m| m.get(tc).to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "uncaught exception".to_string());
+                return Err((false, format!("Uncaught {message}")));
+            };
+            tc.perform_microtask_checkpoint();
+
+            // Settle a returned promise (the await wrapper, or any
+            // promise the user typed) by pumping the loop.
+            if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
+                if pump_event_loop(tc, Some(promise)).is_err() {
+                    return Err((false, "event loop error while awaiting".to_string()));
+                }
+                match promise.state() {
+                    v8::PromiseState::Fulfilled => value = promise.result(tc),
+                    v8::PromiseState::Rejected => {
+                        let text = promise
+                            .result(tc)
+                            .to_string(tc)
+                            .map(|s| s.to_rust_string_lossy(tc))
+                            .unwrap_or_default();
+                        return Err((false, format!("Uncaught (in promise) {text}")));
+                    }
+                    v8::PromiseState::Pending => {
+                        return Err((false, "promise never settled (deadlock)".to_string()));
+                    }
+                }
+            }
+
+            // Bind `_` and render via util.inspect (the snapshot console's
+            // formatter), falling back to ToString.
+            let context = tc.get_current_context();
+            let global = context.global(tc);
+            let underscore = v8::String::new(tc, "_").unwrap();
+            global.set(tc, underscore.into(), value);
+
+            let inspected = (|| {
+                let registry_key = v8::String::new(tc, "__oamNode")?;
+                let registry = global.get(tc, registry_key.into())?;
+                let registry = v8::Local::<v8::Object>::try_from(registry).ok()?;
+                let get_key = v8::String::new(tc, "get")?;
+                let get =
+                    v8::Local::<v8::Function>::try_from(registry.get(tc, get_key.into())?).ok()?;
+                let util_name = v8::String::new(tc, "util")?;
+                let util = get.call(tc, registry.into(), &[util_name.into()])?;
+                let util = v8::Local::<v8::Object>::try_from(util).ok()?;
+                let inspect_key = v8::String::new(tc, "inspect")?;
+                let inspect =
+                    v8::Local::<v8::Function>::try_from(util.get(tc, inspect_key.into())?).ok()?;
+                let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+                let rendered = inspect.call(tc, recv, &[value])?;
+                rendered.to_string(tc).map(|s| s.to_rust_string_lossy(tc))
+            })();
+            Ok(inspected.unwrap_or_else(|| {
+                value
+                    .to_string(tc)
+                    .map(|s| s.to_rust_string_lossy(tc))
+                    .unwrap_or_default()
+            }))
+        };
+
+        match run(self, &prepared) {
+            Ok(text) => Ok(text),
+            Err((syntax, _message)) if has_await && syntax => {
+                // Statement-shaped await input: re-wrap as a block.
+                let block = format!("(async () => {{ {source}\n }})()");
+                run(self, &block).map_err(|(_, m)| m)
+            }
+            Err((_, message)) => Err(message),
+        }
+    }
+
     /// Run the tests a just-evaluated test file registered: call
     /// `globalThis.__oamTestRun(filter)` (snapshot JS) and pump the event
     /// loop until its promise settles. Returns the results object as a

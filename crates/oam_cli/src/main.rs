@@ -19,8 +19,9 @@ use std::process::ExitCode;
     about = "oam — the reliable TypeScript runtime for the AI era"
 )]
 struct Cli {
+    /// No subcommand drops into the typed REPL.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
     /// Emit machine-readable ODIF JSONL on stderr instead of pretty errors.
     #[arg(long, global = true)]
     json: bool,
@@ -62,6 +63,8 @@ enum Command {
         #[arg(short = 't', long)]
         test_name_pattern: Option<String>,
     },
+    /// Interactive typed REPL (also the default with no subcommand).
+    Repl,
     /// Type-check a file or project with tsgo (TypeScript 7 native).
     Check {
         /// A .ts file or a directory; the nearest tsconfig.json upward wins.
@@ -100,7 +103,11 @@ enum DaemonAction {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match &cli.command {
+    let Some(command) = &cli.command else {
+        return repl_command();
+    };
+    match command {
+        Command::Repl => repl_command(),
         Command::Run {
             file,
             check,
@@ -289,6 +296,131 @@ fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
             }
         }
     }
+}
+
+/// Brace/paren/bracket balance ignoring string/template contents — the
+/// REPL's multi-line continuation heuristic.
+fn input_balanced(source: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in source.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth <= 0 && quote.is_none()
+}
+
+/// The typed REPL: every line runs through the oxc TypeScript strip, so
+/// annotations just work. A reader thread feeds lines over a channel
+/// while the main thread ticks the event loop between inputs — timers
+/// and async ops stay LIVE at the prompt.
+fn repl_command() -> ExitCode {
+    use std::io::{BufRead, Write};
+
+    println!(
+        "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut rt = oam_engine::JsRuntime::new();
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "oam".to_string());
+    rt.set_process_argv(vec![exe]);
+
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(Some(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(None); // EOF
+    });
+
+    let prompt = |continuation: bool| {
+        print!("{}", if continuation { "... " } else { "> " });
+        let _ = std::io::stdout().flush();
+    };
+
+    let mut buffer = String::new();
+    prompt(false);
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(None) => break,
+            Ok(Some(line)) => {
+                if buffer.is_empty() {
+                    let trimmed = line.trim();
+                    match trimmed {
+                        ".exit" => break,
+                        ".help" => {
+                            println!(
+                                ".exit  quit | .help  this | `_` holds the last value | top-level await works"
+                            );
+                            prompt(false);
+                            continue;
+                        }
+                        "" => {
+                            prompt(false);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                buffer.push_str(&line);
+                buffer.push('\n');
+                if !input_balanced(&buffer) {
+                    prompt(true);
+                    continue;
+                }
+                let source = std::mem::take(&mut buffer);
+                // Typed input: strip annotations first; oxc handles plain
+                // JS identically, and its parse errors are the user's.
+                let prepared = match oam_loader::transpile_typescript(Path::new("repl.ts"), &source)
+                {
+                    Ok(stripped) => stripped,
+                    Err(e) => {
+                        for d in &e.diagnostics {
+                            eprintln!("{}", d.message);
+                        }
+                        prompt(false);
+                        continue;
+                    }
+                };
+                match rt.repl_eval(&prepared) {
+                    Ok(rendered) => println!("{rendered}"),
+                    Err(message) => eprintln!("{message}"),
+                }
+                prompt(false);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Idle: keep timers/ops alive at the prompt.
+                let _ = rt.tick(std::time::Duration::from_millis(25));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Is this file named like a test? (*.test.* / *.spec.* / *_test.*)
