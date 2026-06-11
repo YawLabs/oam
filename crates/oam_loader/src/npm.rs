@@ -108,7 +108,7 @@ const NODE_BUILTINS: [&str; 41] = [
 /// node: compat wave 1 — builtins that resolve to virtual node:NAME paths
 /// the engine instantiates from the snapshot registry. Recognized names
 /// outside this list gate on OAM-MOD0006 with a precise pointer.
-const SUPPORTED_BUILTINS: [&str; 19] = [
+const SUPPORTED_BUILTINS: [&str; 20] = [
     "assert",
     "async_hooks",
     "buffer",
@@ -127,6 +127,7 @@ const SUPPORTED_BUILTINS: [&str; 19] = [
     "stream/web",
     "string_decoder",
     "tty",
+    "url",
     "util",
 ];
 

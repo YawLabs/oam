@@ -1108,6 +1108,169 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
     );
 }
 
+// -------------------------------------------------------------------- URL
+
+#[test]
+fn url_parses_resolves_and_mutates() {
+    let stdout = run_ok(
+        "url_core.mjs",
+        "const u = new URL('https://user:pw@example.com:8443/a/b?x=1&y=2#frag');\n\
+         console.log(u.protocol, u.username, u.password, u.host, u.hostname, u.port);\n\
+         console.log(u.pathname, u.search, u.hash, u.origin);\n\
+         // Relative resolution against a base.\n\
+         console.log(new URL('../up?q', 'https://example.com/a/b/c').href);\n\
+         console.log(new URL('//other.com/x', 'https://example.com/a').href);\n\
+         // Mutation: setters re-serialize; bad setters keep old (spec).\n\
+         u.hash = 'new'; u.port = ''; u.pathname = '/z z';\n\
+         console.log(u.href);\n\
+         u.protocol = '!!invalid!!';\n\
+         console.log(u.protocol);\n\
+         // IDNA: non-ASCII hosts punycode.\n\
+         console.log(new URL('http://b\\u00FCcher.de/p').hostname);\n\
+         // canParse + invalid throws TypeError.\n\
+         console.log(URL.canParse('not a url'), URL.canParse('https://ok.dev'));\n\
+         let threw = '';\n\
+         try { new URL('::nope::'); } catch (e) { threw = e.constructor.name; }\n\
+         console.log(threw);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "https: user pw example.com:8443 example.com 8443");
+    assert_eq!(lines[1], "/a/b ?x=1&y=2 #frag https://example.com:8443");
+    assert_eq!(lines[2], "https://example.com/a/up?q");
+    assert_eq!(lines[3], "https://other.com/x");
+    assert_eq!(lines[4], "https://user:pw@example.com/z%20z?x=1&y=2#new");
+    assert_eq!(lines[5], "https:");
+    assert_eq!(lines[6], "xn--bcher-kva.de");
+    assert_eq!(lines[7], "false true");
+    assert_eq!(lines[8], "TypeError");
+}
+
+#[test]
+fn url_search_params_full_surface() {
+    let stdout = run_ok(
+        "usp.mjs",
+        "const p = new URLSearchParams('a=1&b=two+words&a=3&empty=&plain');\n\
+         console.log(p.get('a'), p.getAll('a').join(','), p.get('b'), p.get('empty'), p.get('plain'), p.size);\n\
+         p.append('c', 'x y'); p.set('a', 'only'); p.delete('plain');\n\
+         console.log(p.toString());\n\
+         p.sort();\n\
+         console.log([...p.keys()].join(','));\n\
+         // Unicode round trip through the form codec.\n\
+         const u = new URLSearchParams();\n\
+         u.set('q', 'caf\\u00E9 \\u20AC');\n\
+         console.log(u.toString(), new URLSearchParams(u.toString()).get('q'));\n\
+         // Linked to a URL: mutations flow both ways.\n\
+         const url = new URL('https://x.dev/p?one=1');\n\
+         url.searchParams.set('two', '2');\n\
+         console.log(url.href);\n\
+         url.search = '?fresh=yes';\n\
+         console.log(url.searchParams.get('fresh'), url.searchParams.get('one'));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    // A bare key ('plain', no '=') has value '' per WHATWG, not null —
+    // two empty fields print as adjacent spaces (node-verified).
+    assert_eq!(lines[0], "1 1,3 two words   5");
+    assert_eq!(lines[1], "a=only&b=two+words&empty=&c=x+y");
+    assert_eq!(lines[2], "a,b,c,empty");
+    assert_eq!(lines[3], "q=caf%C3%A9+%E2%82%AC caf\u{e9} \u{20ac}");
+    assert_eq!(lines[4], "https://x.dev/p?one=1&two=2");
+    assert_eq!(lines[5], "yes null");
+}
+
+#[test]
+fn url_parity_fleet_regressions() {
+    // Every case here is a confirmed divergence from the adversarial
+    // oam-vs-node parity fleet, now pinned to node's behavior.
+    let stdout = run_ok(
+        "url_parity.mjs",
+        "import { fileURLToPath, pathToFileURL, urlToHttpOptions } from 'node:url';\n\
+         import path from 'node:path';\n\
+         // BLOCKER: astral chars through string init.\n\
+         const sp = new URLSearchParams('e=\\u{1F984}');\n\
+         console.log(sp.toString(), sp.get('e') === '\\u{1F984}');\n\
+         // Live (not snapshot) iteration: delete-during-iterate skips.\n\
+         const live = new URLSearchParams('a=1&b=2&c=3&d=4');\n\
+         for (const [k] of live) live.delete(k);\n\
+         console.log(live.toString(), live.size);\n\
+         // search edge: empty-present query reads '' but href keeps '?'.\n\
+         const q = new URL('https://x.example/p?');\n\
+         console.log(JSON.stringify(q.search), q.href);\n\
+         const q2 = new URL('https://x.example/p?a=1');\n\
+         q2.search = '?';\n\
+         console.log(q2.href);\n\
+         // Port setter: WHATWG leading-digit parse.\n\
+         const pu = new URL('http://example.com:81/');\n\
+         pu.port = '8080 ';\n\
+         console.log(pu.href);\n\
+         // hostname setter no-ops whole on ':'.\n\
+         const hu = new URL('http://a.com:7/');\n\
+         hu.hostname = 'b.com:99';\n\
+         console.log(hu.href);\n\
+         // pathname setter no-ops on opaque paths.\n\
+         const du = new URL('data:text/plain,abc');\n\
+         du.pathname = 'xyz';\n\
+         console.log(du.href);\n\
+         // Encoded separators must throw, not smuggle.\n\
+         let smuggle = '';\n\
+         try { fileURLToPath('file:///C:/foo%2Fbar'); } catch (e) { smuggle = e.code; }\n\
+         let driveless = '';\n\
+         try { fileURLToPath('file:///foo/bar'); } catch (e) { driveless = e.code; }\n\
+         console.log(smuggle, driveless);\n\
+         // Relative pathToFileURL resolves against cwd; device paths clean.\n\
+         const rel = pathToFileURL('foo/bar.txt').href;\n\
+         console.log(rel === pathToFileURL(path.resolve('foo/bar.txt')).href, rel.includes('/C:/') || rel.includes(':/'));\n\
+         console.log(pathToFileURL('\\\\\\\\?\\\\C:\\\\foo').href);\n\
+         // urlToHttpOptions: node shape.\n\
+         const o = urlToHttpOptions(new URL('http://us%65r:p%40ss@[::1]:8080/x/y?q=1#h'));\n\
+         console.log(o.hostname, typeof o.port, o.port, o.auth, o.pathname);\n\
+         const o2 = urlToHttpOptions(new URL('https://example.com/'));\n\
+         console.log('port' in o2, 'auth' in o2);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "e=%F0%9F%A6%84 true");
+    assert_eq!(lines[1], "b=2&d=4 2");
+    assert_eq!(lines[2], "\"\" https://x.example/p?");
+    assert_eq!(lines[3], "https://x.example/p?");
+    assert_eq!(lines[4], "http://example.com:8080/");
+    assert_eq!(lines[5], "http://a.com:7/");
+    assert_eq!(lines[6], "data:text/plain,abc");
+    assert_eq!(
+        lines[7],
+        "ERR_INVALID_FILE_URL_PATH ERR_INVALID_FILE_URL_PATH"
+    );
+    assert_eq!(lines[8], "true true");
+    assert_eq!(lines[9], "file:///C:/foo");
+    assert_eq!(lines[10], "::1 number 8080 user:p@ss /x/y");
+    assert_eq!(lines[11], "false false");
+}
+
+#[test]
+fn node_url_file_conversions_round_trip() {
+    let stdout = run_ok(
+        "nodeurl.mjs",
+        "import { fileURLToPath, pathToFileURL } from 'node:url';\n\
+         // import.meta round trip: url -> path === import.meta.filename.\n\
+         console.log(fileURLToPath(import.meta.url) === import.meta.filename);\n\
+         // Windows drive + spaces.\n\
+         console.log(fileURLToPath('file:///C:/dir%20name/file.txt'));\n\
+         console.log(pathToFileURL('C:\\\\dir name\\\\file.txt').href);\n\
+         // UNC both directions.\n\
+         console.log(fileURLToPath('file://server/share/x.txt'));\n\
+         console.log(pathToFileURL('\\\\\\\\server\\\\share\\\\y.txt').href);\n\
+         // Non-file scheme throws with the Node code.\n\
+         let code = '';\n\
+         try { fileURLToPath('https://x.dev/a'); } catch (e) { code = e.code; }\n\
+         console.log(code);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "true");
+    assert_eq!(lines[1], "C:\\dir name\\file.txt");
+    assert_eq!(lines[2], "file:///C:/dir%20name/file.txt");
+    assert_eq!(lines[3], "\\\\server\\share\\x.txt");
+    assert_eq!(lines[4], "file://server/share/y.txt");
+    assert_eq!(lines[5], "ERR_INVALID_URL_SCHEME");
+}
+
 // ------------------------------------------------------------ node:stream
 
 #[test]

@@ -71,6 +71,14 @@ fix opportunistically or when a real package trips one.
   without a doc note; os.uptime() is process uptime, not system uptime.
 - module.createRequire mishandles UNC file:// URLs (file://server/share).
 
+## URL (from the url-parity fleet; everything else it found was fixed)
+
+- protocol setter cannot transition INTO 'file:' (rust-url's set_scheme
+  excludes file from its special-scheme transitions; http->file no-ops
+  where Node rewrites). Upstream limitation; revisit on url-crate bump.
+- pathToFileURL keeps '+' literal in hrefs (round-trips fine; href
+  string equality with Node differs on '+'-bearing names).
+
 ## CLI
 
 - Script flags arrive via `oam run file.ts -- --flag` (cargo convention);

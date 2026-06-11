@@ -94,6 +94,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
+        // WHATWG URL (servo url crate): parse + component mutation.
+        ("urlParse", op_url_parse),
+        ("urlUpdate", op_url_update),
         // AsyncLocalStorage substrate: V8's continuation-preserved embedder
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
@@ -427,6 +430,223 @@ fn op_username(
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
     }
+}
+
+/// Serialize every WHATWG component of a parsed URL in one bundle — the
+/// JS class stores these and re-requests on mutation.
+fn url_components(parsed: &url::Url) -> serde_json::Value {
+    serde_json::json!({
+        "href": parsed.as_str(),
+        "protocol": format!("{}:", parsed.scheme()),
+        "username": parsed.username(),
+        "password": parsed.password().unwrap_or(""),
+        "hostname": parsed.host_str().unwrap_or(""),
+        "port": parsed.port().map(|p| p.to_string()).unwrap_or_default(),
+        "host": match (parsed.host_str(), parsed.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            _ => String::new(),
+        },
+        "pathname": parsed.path(),
+        // Spec: the search GETTER is "" for both null and empty query
+        // (href keeps a bare '?' for the empty-present case).
+        "search": parsed.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
+        "hash": parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+        "origin": parsed.origin().ascii_serialization(),
+    })
+}
+
+/// urlParse(input, base?) -> components, or throws TypeError("Invalid URL").
+fn op_url_parse(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(input) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "Invalid URL");
+        return;
+    };
+    let base = args.get(1);
+    let parsed = if base.is_null_or_undefined() {
+        url::Url::parse(&input)
+    } else {
+        let Some(base) = base.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) else {
+            throw_type_error(scope, "Invalid base URL");
+            return;
+        };
+        match url::Url::parse(&base) {
+            Ok(base) => base.join(&input),
+            Err(_) => {
+                throw_type_error(scope, &format!("Invalid base URL: {base}"));
+                return;
+            }
+        }
+    };
+    match parsed {
+        Ok(parsed) => return_json(scope, &mut rv, &url_components(&parsed).to_string()),
+        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    }
+}
+
+/// urlUpdate(href, part, value) -> components after applying a WHATWG
+/// setter. Setter FAILURES are silent keep-old per spec (returns the
+/// unchanged components).
+fn op_url_update(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let (Some(href), Some(part), Some(value)) = (
+        arg_string(scope, &args, 0),
+        arg_string(scope, &args, 1),
+        arg_string(scope, &args, 2),
+    ) else {
+        throw_type_error(scope, "urlUpdate requires href, part, value");
+        return;
+    };
+    let Ok(mut parsed) = url::Url::parse(&href) else {
+        throw_type_error(scope, &format!("Invalid URL: {href}"));
+        return;
+    };
+    match part.as_str() {
+        "protocol" => {
+            let _ = parsed.set_scheme(value.trim_end_matches(':'));
+        }
+        "username" => {
+            let _ = parsed.set_username(&value);
+        }
+        "password" => {
+            let _ = parsed.set_password(if value.is_empty() { None } else { Some(&value) });
+        }
+        "host" => {
+            // WHATWG host-state (setter form): strip tab/CR/LF, split
+            // host from port respecting IPv6 brackets, port = leading
+            // digits (trailing garbage ignored), file: forbids ':' and
+            // maps localhost to the empty host.
+            let cleaned: String = value
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect();
+            if parsed.scheme() == "file" {
+                if !cleaned.contains(':') {
+                    if cleaned.eq_ignore_ascii_case("localhost") {
+                        let _ = parsed.set_host(None);
+                    } else {
+                        let _ = parsed.set_host(Some(&cleaned));
+                    }
+                }
+            } else if let Some((host, port_digits)) = split_host_port(&cleaned)
+                && !host.is_empty()
+                && parsed.set_host(Some(host)).is_ok()
+                && let Some(digits) = port_digits
+                && !digits.is_empty()
+                && let Ok(port) = digits.parse::<u32>()
+                && port <= 65535
+            {
+                apply_port(&mut parsed, port as u16);
+            }
+        }
+        "hostname" => {
+            // The hostname setter FAILS WHOLE on ':' outside brackets.
+            let cleaned: String = value
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect();
+            if cleaned.starts_with('[') || !cleaned.contains(':') {
+                if parsed.scheme() == "file" && cleaned.eq_ignore_ascii_case("localhost") {
+                    let _ = parsed.set_host(None);
+                } else {
+                    let _ = parsed.set_host(Some(&cleaned));
+                }
+            }
+        }
+        "port" => {
+            if value.is_empty() {
+                let _ = parsed.set_port(None);
+            } else {
+                // WHATWG: parse LEADING digits, ignore the rest; out of
+                // range or no digits = keep old.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty()
+                    && let Ok(port) = digits.parse::<u32>()
+                    && port <= 65535
+                {
+                    apply_port(&mut parsed, port as u16);
+                }
+            }
+        }
+        "pathname" => {
+            // Opaque-path URLs (data:, mailto:, ...) ignore the pathname
+            // setter entirely, per spec.
+            if !parsed.cannot_be_a_base() {
+                parsed.set_path(&value);
+            }
+        }
+        "search" => {
+            // Strip exactly ONE leading '?'. An empty VALUE clears the
+            // query; a bare '?' keeps an empty-present query (href ends
+            // with '?', getter reads "").
+            if value.is_empty() {
+                parsed.set_query(None);
+            } else {
+                let trimmed = value.strip_prefix('?').unwrap_or(&value);
+                parsed.set_query(Some(trimmed));
+            }
+        }
+        "hash" => {
+            let trimmed = value.strip_prefix('#').unwrap_or(&value);
+            parsed.set_fragment(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            });
+        }
+        other => {
+            throw_type_error(scope, &format!("urlUpdate: unknown part '{other}'"));
+            return;
+        }
+    }
+    return_json(scope, &mut rv, &url_components(&parsed).to_string());
+}
+
+/// Split a host-setter value into (host, port-digits), respecting IPv6
+/// brackets. None = unparseable shape (setter no-ops). The port side is
+/// the LEADING digits after ':' (WHATWG port-state with state override).
+fn split_host_port(value: &str) -> Option<(&str, Option<String>)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &value[..close + 2];
+        let after = &value[close + 2..];
+        if after.is_empty() {
+            return Some((host, None));
+        }
+        let digits = after.strip_prefix(':')?;
+        let digits: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return Some((host, Some(digits)));
+    }
+    match value.split_once(':') {
+        None => Some((value, None)),
+        Some((host, rest)) => {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            Some((host, Some(digits)))
+        }
+    }
+}
+
+/// Set a port with default-port elision (http/ws 80, https/wss 443,
+/// ftp 21 serialize portless, per spec).
+fn apply_port(parsed: &mut url::Url, port: u16) {
+    let default = match parsed.scheme() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        "ftp" => Some(21),
+        _ => None,
+    };
+    let _ = parsed.set_port(if default == Some(port) {
+        None
+    } else {
+        Some(port)
+    });
 }
 
 /// Read the current continuation frame (an immutable Map of

@@ -2309,16 +2309,6 @@
 
   // --------------------------------------------------------------- module
   registry.factories.module = (natives) => {
-    function fileURLToPathLite(url) {
-      let p = String(url).slice("file://".length);
-      p = decodeURIComponent(p);
-      if (natives.platform === "win32") {
-        if (p.startsWith("/") && /^[A-Za-z]:/.test(p.slice(1))) p = p.slice(1);
-        p = p.replaceAll("/", "\\");
-      }
-      return p;
-    }
-
     class Module {}
 
     const builtinModules = [
@@ -2340,13 +2330,16 @@
       "stream/web",
       "string_decoder",
       "tty",
+      "url",
       "util",
     ];
 
     return {
       createRequire(filename) {
         let base = String(filename);
-        if (base.startsWith("file://")) base = fileURLToPathLite(base);
+        if (base.startsWith("file://")) {
+          base = registry.get("url").fileURLToPath(base);
+        }
         return natives.makeRequire(base);
       },
       builtinModules,
@@ -3384,6 +3377,404 @@
       }
     }
     return { StringDecoder };
+  };
+
+  // ------------------------------------------------- URL / URLSearchParams
+  // WHATWG URL: parsing and component mutation happen in Rust (servo's
+  // url crate — the reference implementation, IDNA included); these
+  // classes are thin component holders. Setter failures keep the old
+  // value silently, per spec.
+  {
+    const FORM_SAFE = /[A-Za-z0-9*\-._]/;
+
+    function formEncode(text) {
+      const bytes = new TextEncoder().encode(String(text));
+      let out = "";
+      for (const byte of bytes) {
+        const ch = String.fromCharCode(byte);
+        if (ch === " ") out += "+";
+        else if (FORM_SAFE.test(ch)) out += ch;
+        else out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+      }
+      return out;
+    }
+
+    function formDecode(text) {
+      const src = String(text).replaceAll("+", " ");
+      const bytes = [];
+      // Literal chars are buffered into RUNS before UTF-8 encoding —
+      // encoding per code UNIT tears astral pairs (emoji) into U+FFFD.
+      let literal = "";
+      const flush = () => {
+        if (literal.length > 0) {
+          for (const b of new TextEncoder().encode(literal)) bytes.push(b);
+          literal = "";
+        }
+      };
+      for (let i = 0; i < src.length; i++) {
+        if (src[i] === "%" && /^[0-9A-Fa-f]{2}$/.test(src.slice(i + 1, i + 3))) {
+          flush();
+          bytes.push(parseInt(src.slice(i + 1, i + 3), 16));
+          i += 2;
+        } else {
+          literal += src[i];
+        }
+      }
+      flush();
+      return new TextDecoder().decode(new Uint8Array(bytes));
+    }
+
+    /// USVString conversion at the API boundary (WebIDL): lone surrogates
+    /// become U+FFFD on entry, so get/has agree with toString.
+    const usv = (value) => String(value).toWellFormed();
+
+    function requireArgs(count, got, method, name) {
+      if (got < count) {
+        throw new TypeError(`URLSearchParams.${method}: the "${name}" argument must be specified`);
+      }
+    }
+
+    class URLSearchParams {
+      constructor(init) {
+        // The list is mutated IN PLACE everywhere: iteration is LIVE and
+        // index-based (spec) — snapshot iteration diverges on the classic
+        // mutate-while-iterating shapes.
+        this._list = []; // [name, value] pairs, order-preserving
+        this._url = null; // back-reference set by URL
+        if (init === undefined || init === null) {
+          // empty
+        } else if (typeof init === "string") {
+          this._parse(init);
+        } else if (typeof init[Symbol.iterator] === "function") {
+          for (const pair of init) {
+            const entry = Array.from(pair);
+            if (entry.length !== 2) {
+              throw new TypeError("URLSearchParams: each init pair must have 2 items");
+            }
+            this._list.push([usv(entry[0]), usv(entry[1])]);
+          }
+        } else if (typeof init === "object") {
+          for (const key of Object.keys(init)) {
+            this._list.push([usv(key), usv(init[key])]);
+          }
+        }
+      }
+      _parse(text) {
+        this._list.length = 0;
+        const raw = String(text).replace(/^\?/, "");
+        if (raw.length === 0) return;
+        for (const piece of raw.split("&")) {
+          if (piece.length === 0) continue;
+          const eq = piece.indexOf("=");
+          if (eq === -1) this._list.push([formDecode(piece), ""]);
+          else this._list.push([formDecode(piece.slice(0, eq)), formDecode(piece.slice(eq + 1))]);
+        }
+      }
+      _sync() {
+        if (this._url) this._url._setSearchFromParams(this.toString());
+      }
+      get size() {
+        return this._list.length;
+      }
+      append(name, value) {
+        requireArgs(2, arguments.length, "append", "value");
+        this._list.push([usv(name), usv(value)]);
+        this._sync();
+      }
+      delete(name, value) {
+        requireArgs(1, arguments.length, "delete", "name");
+        const n = usv(name);
+        const matchValue = arguments.length >= 2 ? usv(value) : null;
+        for (let i = this._list.length - 1; i >= 0; i--) {
+          if (this._list[i][0] === n && (matchValue === null || this._list[i][1] === matchValue)) {
+            this._list.splice(i, 1);
+          }
+        }
+        this._sync();
+      }
+      get(name) {
+        requireArgs(1, arguments.length, "get", "name");
+        const n = usv(name);
+        for (const [k, v] of this._list) if (k === n) return v;
+        return null;
+      }
+      getAll(name) {
+        requireArgs(1, arguments.length, "getAll", "name");
+        const n = usv(name);
+        return this._list.filter(([k]) => k === n).map(([, v]) => v);
+      }
+      has(name, value) {
+        requireArgs(1, arguments.length, "has", "name");
+        const n = usv(name);
+        const matchValue = arguments.length >= 2 ? usv(value) : null;
+        return this._list.some(
+          ([k, v]) => k === n && (matchValue === null || v === matchValue),
+        );
+      }
+      set(name, value) {
+        requireArgs(2, arguments.length, "set", "value");
+        const n = usv(name);
+        const v = usv(value);
+        let found = false;
+        for (let i = 0; i < this._list.length; i++) {
+          if (this._list[i][0] === n) {
+            if (found) {
+              this._list.splice(i, 1);
+              i--;
+            } else {
+              this._list[i][1] = v;
+              found = true;
+            }
+          }
+        }
+        if (!found) this._list.push([n, v]);
+        this._sync();
+      }
+      sort() {
+        // In-place stable sort by name only (Array#sort is spec-stable).
+        this._list.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+        this._sync();
+      }
+      forEach(fn) {
+        const thisArg = arguments[1]; // optional thisArg must not count in .length
+        for (let i = 0; i < this._list.length; i++) {
+          fn.call(thisArg, this._list[i][1], this._list[i][0], this);
+        }
+      }
+      *entries() {
+        for (let i = 0; i < this._list.length; i++) {
+          yield [this._list[i][0], this._list[i][1]];
+        }
+      }
+      *keys() {
+        for (let i = 0; i < this._list.length; i++) yield this._list[i][0];
+      }
+      *values() {
+        for (let i = 0; i < this._list.length; i++) yield this._list[i][1];
+      }
+      toString() {
+        return this._list.map(([k, v]) => `${formEncode(k)}=${formEncode(v)}`).join("&");
+      }
+    }
+    // WebIDL identity: usp[Symbol.iterator] IS usp.entries.
+    URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
+
+    class URL {
+      constructor(input, base) {
+        this._c = globalThis.__oam.node.urlParse(String(input), base ?? undefined);
+        this._params = null;
+      }
+      static canParse(input, base) {
+        try {
+          new URL(input, base);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      static parse(input, base) {
+        try {
+          return new URL(input, base);
+        } catch {
+          return null;
+        }
+      }
+      _update(part, value) {
+        this._c = globalThis.__oam.node.urlUpdate(this._c.href, part, String(value));
+        if (this._params && (part === "search" || part === "href")) {
+          this._params._parse(this._c.search);
+        }
+      }
+      _setSearchFromParams(serialized) {
+        // Called by the linked URLSearchParams; must not re-parse params.
+        this._c = globalThis.__oam.node.urlUpdate(this._c.href, "search", serialized);
+      }
+      get href() {
+        return this._c.href;
+      }
+      set href(value) {
+        this._c = globalThis.__oam.node.urlParse(String(value));
+        if (this._params) this._params._parse(this._c.search);
+      }
+      get origin() {
+        return this._c.origin;
+      }
+      get protocol() {
+        return this._c.protocol;
+      }
+      set protocol(v) {
+        this._update("protocol", v);
+      }
+      get username() {
+        return this._c.username;
+      }
+      set username(v) {
+        this._update("username", v);
+      }
+      get password() {
+        return this._c.password;
+      }
+      set password(v) {
+        this._update("password", v);
+      }
+      get host() {
+        return this._c.host;
+      }
+      set host(v) {
+        this._update("host", v);
+      }
+      get hostname() {
+        return this._c.hostname;
+      }
+      set hostname(v) {
+        this._update("hostname", v);
+      }
+      get port() {
+        return this._c.port;
+      }
+      set port(v) {
+        this._update("port", v);
+      }
+      get pathname() {
+        return this._c.pathname;
+      }
+      set pathname(v) {
+        this._update("pathname", v);
+      }
+      get search() {
+        return this._c.search;
+      }
+      set search(v) {
+        this._update("search", v);
+      }
+      get hash() {
+        return this._c.hash;
+      }
+      set hash(v) {
+        this._update("hash", v);
+      }
+      get searchParams() {
+        if (this._params === null) {
+          this._params = new URLSearchParams(this._c.search);
+          this._params._url = this;
+        }
+        return this._params;
+      }
+      toString() {
+        return this._c.href;
+      }
+      toJSON() {
+        return this._c.href;
+      }
+    }
+
+    globalThis.URL = URL;
+    globalThis.URLSearchParams = URLSearchParams;
+  }
+
+  // ------------------------------------------------------------- node:url
+  registry.factories.url = (natives) => {
+    const isWin = natives.platform === "win32";
+
+    function fileURLToPath(input) {
+      const url = typeof input === "string" ? new globalThis.URL(input) : input;
+      if (url.protocol !== "file:") {
+        throw makeNodeError(
+          "ERR_INVALID_URL_SCHEME",
+          "The URL must be of scheme file",
+        );
+      }
+      // Encoded separators would let a URL smuggle path segments past
+      // consumers — Node throws, so do we.
+      if (/%2f|%5c/i.test(url.pathname)) {
+        throw makeNodeError(
+          "ERR_INVALID_FILE_URL_PATH",
+          "File URL path must not include encoded \\ or / characters",
+        );
+      }
+      let pathname = decodeURIComponent(url.pathname);
+      if (isWin) {
+        pathname = pathname.replaceAll("/", "\\");
+        if (url.hostname) {
+          // file://server/share -> \\server\share
+          return `\\\\${url.hostname}${pathname}`;
+        }
+        if (!/^\\[A-Za-z]:/.test(pathname)) {
+          // A drive-less path would silently resolve against the cwd's
+          // drive — fail loud like Node.
+          throw makeNodeError(
+            "ERR_INVALID_FILE_URL_PATH",
+            "File URL path must be absolute",
+          );
+        }
+        return pathname.slice(1); // strip the slash before the drive letter
+      }
+      return pathname;
+    }
+
+    function pathToFileURL(path) {
+      const pathModule = registry.get("path");
+      let p = String(path);
+      if (isWin) {
+        // \\?\ device paths: resolve the prefix away (Node parity);
+        // \\?\UNC\server\share is the long form of \\server\share.
+        if (p.startsWith("\\\\?\\UNC\\")) p = "\\\\" + p.slice(8);
+        else if (p.startsWith("\\\\?\\")) p = p.slice(4);
+      }
+      const trailingSep = /[\\/]$/.test(p) && p.length > 1;
+      p = pathModule.resolve(p); // relative paths anchor at cwd (Node parity)
+      p = p.replaceAll("\\", "/");
+      if (trailingSep && !p.endsWith("/")) p += "/";
+      // Percent-encode the URL-special characters paths may carry ('%'
+      // FIRST — later substitutions insert literal % sequences).
+      const encoded = p
+        .replaceAll("%", "%25")
+        .replaceAll("#", "%23")
+        .replaceAll("?", "%3F")
+        .replaceAll(" ", "%20")
+        .replaceAll("~", "%7E")
+        .replaceAll("^", "%5E");
+      if (isWin && encoded.startsWith("//")) {
+        // UNC: \\server\share -> file://server/share
+        return new globalThis.URL("file:" + encoded);
+      }
+      return new globalThis.URL("file://" + (encoded.startsWith("/") ? "" : "/") + encoded);
+    }
+
+    function urlToHttpOptions(url) {
+      const options = {
+        protocol: url.protocol,
+        hostname: url.hostname.startsWith("[")
+          ? url.hostname.slice(1, -1) // IPv6: net/dns want it bracket-free
+          : url.hostname,
+        hash: url.hash,
+        search: url.search,
+        pathname: url.pathname,
+        path: `${url.pathname}${url.search}`,
+        href: url.href,
+      };
+      if (url.port !== "") options.port = Number(url.port);
+      if (url.username || url.password) {
+        options.auth = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+      }
+      return options;
+    }
+
+    return {
+      URL: globalThis.URL,
+      URLSearchParams: globalThis.URLSearchParams,
+      fileURLToPath,
+      pathToFileURL,
+      urlToHttpOptions,
+      format: (url) => String(url),
+      domainToASCII: (domain) => {
+        try {
+          return new globalThis.URL(`http://${domain}`).hostname;
+        } catch {
+          return "";
+        }
+      },
+    };
   };
 
   // ------------------------------------------------------------------ tty
