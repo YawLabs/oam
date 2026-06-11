@@ -47,27 +47,28 @@ struct ModuleMap {
 /// Unhandled promise rejections, tracked via V8's reject callback so a
 /// detached `Promise.reject(...)` cannot exit 0 in silence (Node parity:
 /// ERR_UNHANDLED_REJECTION). Lives in an isolate slot for the same
-/// zero-capture reason as ModuleMap.
+/// zero-capture reason as ModuleMap. Carries the rejection VALUE (not just
+/// text) so a process 'unhandledRejection' listener gets the real reason.
 #[derive(Default)]
 pub(crate) struct RejectionLedger {
-    unhandled: Vec<(v8::Global<v8::Promise>, String)>,
+    unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>, String)>,
 }
 
 /// Uncaught exceptions V8 reports outside any TryCatch — microtask callbacks
 /// are the reachable case: perform_microtask_checkpoint SWALLOWS their
 /// exceptions (documented), and without a message listener V8 just printed
 /// them to stdout while we exited 0 (review finding). The listener records
-/// them here; the event loop fails the run after each drain, like Node's
-/// uncaughtException.
+/// the VALUE here so a process 'uncaughtException' listener gets the real
+/// Error; without a listener the event loop fails the run, like Node.
 #[derive(Default)]
 pub(crate) struct UncaughtLedger {
-    reports: Vec<String>,
+    entries: Vec<(v8::Global<v8::Value>, String)>,
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
 pub(crate) unsafe extern "C" fn message_listener(
     message: v8::Local<v8::Message>,
-    _exception: v8::Local<v8::Value>,
+    exception: v8::Local<v8::Value>,
 ) {
     v8::callback_scope!(unsafe scope, message);
     let text = message.get(scope).to_rust_string_lossy(scope);
@@ -77,36 +78,152 @@ pub(crate) unsafe extern "C" fn message_listener(
         .and_then(|name| name.to_string(scope))
         .map(|name| name.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "<unknown>".to_string());
+    let value = v8::Global::new(scope, exception);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
-        ledger.reports.push(format!("{file}:{line}: {text}"));
+        ledger
+            .entries
+            .push((value, format!("{file}:{line}: {text}")));
     }
 }
 
-/// Take any uncaught-exception reports and convert them to a failing
-/// diagnostic set. Called after every microtask drain in the event loop.
+/// Deliver `event` to a `process` EventEmitter listener if one exists.
+/// Returns true iff a listener ran without throwing (Node: a present
+/// uncaughtException/unhandledRejection listener suppresses the default
+/// fatal exit). A throwing handler is treated as not-handled (fatal),
+/// with its own exception cleared so the original stands.
+fn emit_process_event(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    event: &str,
+    args: &[v8::Local<v8::Value>],
+) -> bool {
+    let lookup = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let process_key = v8::String::new(tc, "process")?;
+        let process = global.get(tc, process_key.into())?;
+        let process = v8::Local::<v8::Object>::try_from(process).ok()?;
+        let emit_key = v8::String::new(tc, "emit")?;
+        let emit = v8::Local::<v8::Function>::try_from(process.get(tc, emit_key.into())?).ok()?;
+        Some((process, emit))
+    })();
+    let Some((process, emit)) = lookup else {
+        return false;
+    };
+    let Some(event_str) = v8::String::new(tc, event) else {
+        return false;
+    };
+    let mut call_args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args.len() + 1);
+    call_args.push(event_str.into());
+    call_args.extend_from_slice(args);
+    let recv: v8::Local<v8::Value> = process.into();
+    match emit.call(tc, recv, &call_args) {
+        // EventEmitter.emit returns true iff there were listeners.
+        Some(result) => result.is_true(),
+        None => {
+            tc.reset(); // handler threw: clear it, the original stays fatal
+            false
+        }
+    }
+}
+
+/// True iff `process` has at least one listener for `event` — checked
+/// BEFORE draining the rejection ledger so a no-listener rejection stays
+/// in the ledger and is fatal at end-of-run.
+fn process_has_listener(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    event: &str,
+) -> bool {
+    (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let process_key = v8::String::new(tc, "process")?;
+        let process =
+            v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
+        let count_key = v8::String::new(tc, "listenerCount")?;
+        let count_fn =
+            v8::Local::<v8::Function>::try_from(process.get(tc, count_key.into())?).ok()?;
+        let event_str = v8::String::new(tc, event)?;
+        let recv: v8::Local<v8::Value> = process.into();
+        let result = count_fn.call(tc, recv, &[event_str.into()])?;
+        Some(result.integer_value(tc).unwrap_or(0) > 0)
+    })()
+    .unwrap_or(false)
+}
+
+/// Fire 'unhandledRejection' for ledger entries that HAVE a listener,
+/// promptly (Node fires after the microtask checkpoint, not at end-of-run).
+/// No-listener rejections are left in the ledger for the fatal end check.
+/// Called after each microtask checkpoint in the event loop.
+pub(crate) fn flush_handled_rejections(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) {
+    if !process_has_listener(tc, "unhandledRejection") {
+        return;
+    }
+    let drained: Vec<v8::Global<v8::Value>> = tc
+        .get_slot_mut::<RejectionLedger>()
+        .map(|ledger| ledger.unhandled.drain(..).map(|(_, r, _)| r).collect())
+        .unwrap_or_default();
+    for reason in drained {
+        let local = v8::Local::new(tc, &reason);
+        emit_process_event(tc, "unhandledRejection", &[local]);
+    }
+}
+
+/// A callback threw directly (timer/op settle). Offer it to a process
+/// 'uncaughtException' listener; None = handled (continue), Some = fatal.
+pub(crate) fn handle_uncaught_throw(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    context: &str,
+) -> Option<Vec<Diagnostic>> {
+    // The scope has a PENDING exception — V8 won't run JS in that state, so
+    // capture the value + message, RESET, then try the listener.
+    let Some(exception) = tc.exception() else {
+        return Some(vec![catch_to_diagnostic(tc, context)]);
+    };
+    let value = v8::Global::new(tc, exception);
+    let message = crate::exception_to_error(tc, context).to_string();
+    tc.reset();
+
+    let local = v8::Local::new(tc, &value);
+    if emit_process_event(tc, "uncaughtException", &[local]) {
+        return None;
+    }
+    Some(vec![Diagnostic::new(
+        "OAM-RT0001",
+        Severity::Error,
+        Origin::Runtime,
+        message,
+    )])
+}
+
+/// Take any uncaught-exception reports (from the message listener, i.e.
+/// exceptions swallowed by the microtask checkpoint) and either deliver
+/// them to an 'uncaughtException' listener or fail the run.
 pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
-    let reports: Vec<String> = tc
+    let captured: Vec<(v8::Global<v8::Value>, String)> = tc
         .get_slot_mut::<UncaughtLedger>()
-        .map(|ledger| ledger.reports.drain(..).collect())
+        .map(|ledger| ledger.entries.drain(..).collect())
         .unwrap_or_default();
-    if reports.is_empty() {
+    if captured.is_empty() {
         return None;
     }
-    Some(
-        reports
-            .into_iter()
-            .map(|report| {
-                Diagnostic::new(
-                    "OAM-RT0001",
-                    Severity::Error,
-                    Origin::Runtime,
-                    format!("Uncaught (in microtask) {report}"),
-                )
-            })
-            .collect(),
-    )
+    let mut fatal = Vec::new();
+    for (value, text) in captured {
+        let local = v8::Local::new(tc, &value);
+        if emit_process_event(tc, "uncaughtException", &[local]) {
+            continue; // a listener handled it
+        }
+        fatal.push(Diagnostic::new(
+            "OAM-RT0001",
+            Severity::Error,
+            Origin::Runtime,
+            format!("Uncaught (in microtask) {text}"),
+        ));
+    }
+    if fatal.is_empty() { None } else { Some(fatal) }
 }
 
 /// Lexically collapse '.' and '..'. Input should already be absolute.
@@ -247,7 +364,11 @@ impl JsRuntime {
                 let args: Vec<v8::Local<v8::Value>> =
                     extra.iter().map(|g| v8::Local::new(tc, g)).collect();
                 if callback.call(tc, recv, &args).is_none() {
-                    return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
+                    // A timer body threw directly — the canonical async
+                    // throw. Offer it to uncaughtException before dying.
+                    if let Some(failure) = handle_uncaught_throw(tc, "timer callback") {
+                        return Err(failure);
+                    }
                 }
                 tc.perform_microtask_checkpoint();
                 progressed = true;
@@ -479,6 +600,10 @@ pub(crate) fn pump_event_loop(
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
             break;
         }
+        // Fire 'unhandledRejection' for any rejection a listener can catch,
+        // promptly (Node fires after the prior turn's microtasks settled,
+        // not at end-of-run). No-listener rejections stay fatal.
+        flush_handled_rejections(tc);
         let mut progressed = false;
 
         let now = std::time::Instant::now();
@@ -490,8 +615,10 @@ pub(crate) fn pump_event_loop(
             let callback = v8::Local::new(tc, &callback);
             let args: Vec<v8::Local<v8::Value>> =
                 extra.iter().map(|g| v8::Local::new(tc, g)).collect();
-            if callback.call(tc, recv, &args).is_none() {
-                return Err(vec![catch_to_diagnostic(tc, "timer callback")]);
+            if callback.call(tc, recv, &args).is_none()
+                && let Some(failure) = handle_uncaught_throw(tc, "timer callback")
+            {
+                return Err(failure);
             }
             tc.perform_microtask_checkpoint();
             if let Some(failure) = drain_uncaught(tc) {
@@ -550,32 +677,36 @@ pub(crate) fn pump_event_loop(
 pub(crate) fn unhandled_rejection_failures(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
-    let unhandled: Vec<String> = tc
+    let unhandled: Vec<(v8::Global<v8::Value>, String)> = tc
         .get_slot_mut::<RejectionLedger>()
         .map(|ledger| {
             ledger
                 .unhandled
                 .drain(..)
-                .map(|(_, message)| message)
+                .map(|(_, reason, message)| (reason, message))
                 .collect()
         })
         .unwrap_or_default();
     if unhandled.is_empty() {
         return None;
     }
-    Some(
-        unhandled
-            .into_iter()
-            .map(|message| {
-                Diagnostic::new(
-                    "OAM-RT0004",
-                    Severity::Error,
-                    Origin::Runtime,
-                    format!("unhandled promise rejection: {message}"),
-                )
-            })
-            .collect(),
-    )
+    let mut fatal = Vec::new();
+    for (reason, message) in unhandled {
+        // Node: process.emit('unhandledRejection', reason, promise). We
+        // pass the reason (the promise arg is a wave-1 gap; few handlers
+        // use it). A present listener suppresses the fatal exit.
+        let local = v8::Local::new(tc, &reason);
+        if emit_process_event(tc, "unhandledRejection", &[local]) {
+            continue;
+        }
+        fatal.push(Diagnostic::new(
+            "OAM-RT0004",
+            Severity::Error,
+            Origin::Runtime,
+            format!("unhandled promise rejection: {message}"),
+        ));
+    }
+    if fatal.is_empty() { None } else { Some(fatal) }
 }
 
 /// Compile the module graph into the isolate's ModuleMap. Explicit worklist —
@@ -918,14 +1049,17 @@ pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseReje
     let promise = message.get_promise();
     match message.get_event() {
         v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
-            let text = message
+            let reason = message
                 .get_value()
-                .and_then(|v| v.to_string(scope))
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            let text = reason
+                .to_string(scope)
                 .map(|s| s.to_rust_string_lossy(scope))
                 .unwrap_or_else(|| "unknown value".to_string());
+            let reason_global = v8::Global::new(scope, reason);
             let global = v8::Global::new(scope, promise);
             if let Some(ledger) = scope.get_slot_mut::<RejectionLedger>() {
-                ledger.unhandled.push((global, text));
+                ledger.unhandled.push((global, reason_global, text));
             }
         }
         v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
@@ -937,7 +1071,7 @@ pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseReje
                         .unhandled
                         .iter()
                         .enumerate()
-                        .map(|(i, (g, _))| (i, g.clone()))
+                        .map(|(i, (g, _, _))| (i, g.clone()))
                         .collect()
                 })
                 .unwrap_or_default();

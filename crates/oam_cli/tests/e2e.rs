@@ -1377,6 +1377,55 @@ fn http_streaming_writes_stay_ordered_and_bodies_dont_leak() {
 }
 
 #[test]
+fn process_error_events_catch_and_survive() {
+    // A handler makes an async throw / rejection non-fatal (the resilience
+    // boundary every long-running server installs); without one, both stay
+    // fatal — verified separately below.
+    let stdout = run_ok(
+        "proc_err.mjs",
+        "const caught = [];\n\
+         process.on('uncaughtException', (e) => caught.push('uncaught:' + e.message));\n\
+         process.on('unhandledRejection', (reason) => caught.push('rejection:' + reason.message));\n\
+         setTimeout(() => { throw new Error('timer-boom'); }, 10);\n\
+         Promise.reject(new Error('promise-boom'));\n\
+         setTimeout(() => {\n\
+           console.log(JSON.stringify(caught.sort()));\n\
+           console.log('survived');\n\
+         }, 40);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "[\"rejection:promise-boom\",\"uncaught:timer-boom\"]"
+    );
+    assert_eq!(lines[1], "survived");
+
+    // No listener -> async throw is still fatal (exit 1, OAM-RT0001).
+    let main = write_temp(
+        "proc_fatal.mjs",
+        "setTimeout(() => { throw new Error('still-fatal'); }, 5);",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-RT0001"),
+        "no-listener throw stays fatal"
+    );
+
+    // No listener -> unhandled rejection still fatal (OAM-RT0004).
+    let main = write_temp(
+        "proc_rejfatal.mjs",
+        "Promise.reject(new Error('rej-fatal'));",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("OAM-RT0004"),
+        "no-listener rejection stays fatal"
+    );
+}
+
+#[test]
 fn abort_controller_and_signal_work() {
     let stdout = run_ok(
         "abort.mjs",
