@@ -479,8 +479,25 @@ fn facade_with_prelude(
 impl crate::JsRuntime {
     pub fn execute_cjs(&mut self, entry: &Path) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
         self.reset_run_slots()?;
+
+        // --inspect-brk on a CJS entry: cloned out before the &mut isolate
+        // borrow. (The ESM path lives in execute_module.)
+        let wait = self
+            .inspector
+            .as_ref()
+            .filter(|state| state.break_on_start())
+            .map(|state| state.shared());
+
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
+
+        // load_cjs runs the entry body directly (no separate graph/evaluate),
+        // so attach and arm break-on-start right before it: the pause lands on
+        // the entry's first statement.
+        if let Some(shared) = &wait {
+            shared.wait_for_attach();
+            shared.arm_break();
+        }
 
         if load_cjs(tc, entry).is_none() {
             return Err(vec![crate::modules::catch_to_diagnostic(

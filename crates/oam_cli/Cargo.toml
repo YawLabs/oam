@@ -17,3 +17,10 @@ oam_ts = { workspace = true }
 oam_mcp = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Inspector e2e: a CDP-over-WebSocket client that attaches to the spawned
+# `oam run --inspect-brk` process and drives the pause/resume handshake.
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+futures-util = { workspace = true }

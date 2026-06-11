@@ -19,3 +19,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+sha1 = { workspace = true }

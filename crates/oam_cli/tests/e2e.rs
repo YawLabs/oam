@@ -3469,3 +3469,114 @@ fn dotted_basename_resolves_appended_extension() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "dotted");
 }
+
+/// End-to-end V8 Inspector: spawn `oam run --inspect-brk`, attach a real
+/// CDP-over-WebSocket client, drive the enable/run handshake, ride the
+/// break-on-start and `debugger;` pauses by resuming each, and confirm the
+/// program runs to completion. Exercises the whole transport + pause-loop
+/// reentrancy end to end.
+#[tokio::test]
+async fn inspector_attaches_pauses_on_debugger_and_resumes() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Grab a free port, then release it so the child can bind it.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let file = write_temp(
+        "inspector/brk.mjs",
+        "console.log('before'); debugger; console.log('after');",
+    );
+    let cache = write_temp("oam-cache-insp/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args([
+            "run",
+            &format!("--inspect-brk=127.0.0.1:{port}"),
+            file.to_str().unwrap(),
+        ])
+        .env("OAM_CACHE_DIR", cache)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oam binary spawns");
+
+    // The whole drive is time-boxed so a regression can never hang CI.
+    let drive = tokio::time::timeout(Duration::from_secs(25), async {
+        // The path is ignored by the server (it routes on the Upgrade
+        // header, not the URL), so a fixed path is fine.
+        let url = format!("ws://127.0.0.1:{port}/oam");
+        let mut ws = None;
+        for _ in 0..50 {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((stream, _)) => {
+                    ws = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut ws = ws.expect("inspector accepts a WebSocket connection");
+
+        // Standard DevTools attach handshake. runIfWaitingForDebugger
+        // releases --inspect-brk's wait and arms the break-on-start.
+        for msg in [
+            r#"{"id":1,"method":"Runtime.enable"}"#,
+            r#"{"id":2,"method":"Debugger.enable"}"#,
+            r#"{"id":3,"method":"Runtime.runIfWaitingForDebugger"}"#,
+        ] {
+            ws.send(Message::Text(msg.to_string())).await.unwrap();
+        }
+
+        let mut paused = 0;
+        let mut resume_id = 100;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("\"Debugger.paused\"") {
+                        paused += 1;
+                        resume_id += 1;
+                        let resume = format!("{{\"id\":{resume_id},\"method\":\"Debugger.resume\"}}");
+                        ws.send(Message::Text(resume)).await.unwrap();
+                    }
+                }
+                // Program finished -> runtime dropped -> socket closed.
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) | Err(_) => break,
+            }
+        }
+        paused
+    });
+
+    let paused = drive.await.expect("inspector drive did not time out");
+
+    let output = child.wait_with_output().expect("child exits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        paused >= 1,
+        "expected at least one Debugger.paused; stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "program should run to completion after resume; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("before") && stdout.contains("after"),
+        "program output incomplete: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("Debugger listening on ws://"),
+        "missing listening banner: {stderr}"
+    );
+}

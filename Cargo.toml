@@ -54,6 +54,11 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# V8 Inspector (CDP) transport: WebSocket framing for the debugger socket.
+# default-features=false drops the TLS backends — the inspector is
+# plaintext localhost only.
+tokio-tungstenite = { version = "0.24", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # N-API: dlopen for .node addons (and the test addon's host-symbol lookup).
 libloading = "0.8"
 clap = { version = "4", features = ["derive"] }

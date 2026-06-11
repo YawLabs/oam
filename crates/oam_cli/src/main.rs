@@ -49,6 +49,14 @@ enum Command {
         /// Alias for --check=off.
         #[arg(long)]
         no_check: bool,
+        /// Attach the V8 Inspector (Chrome DevTools Protocol). Optional
+        /// value is `[host:]port` (default 127.0.0.1:9229).
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        inspect: Option<String>,
+        /// Like --inspect, but wait for a debugger to attach and break on the
+        /// first line. Optional value is `[host:]port`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        inspect_brk: Option<String>,
         /// Arguments passed to the script (process.argv) after `--`.
         #[arg(last = true)]
         script_args: Vec<String>,
@@ -112,8 +120,19 @@ fn main() -> ExitCode {
             file,
             check,
             no_check,
+            inspect,
+            inspect_brk,
             script_args,
-        } => run_command(file, *check, *no_check, cli.json, script_args),
+        } => {
+            let inspect = match resolve_inspect(inspect.as_deref(), inspect_brk.as_deref()) {
+                Ok(value) => value,
+                Err(message) => {
+                    eprintln!("oam run: {message}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            run_command(file, *check, *no_check, cli.json, script_args, inspect)
+        }
         Command::Test {
             paths,
             test_name_pattern,
@@ -171,12 +190,36 @@ fn error_count(diagnostics: &[Diagnostic]) -> usize {
 
 /// `oam run` with the typed loop: strip-and-run starts immediately; the
 /// checker runs concurrently (warn), gates (block), or stays off.
+/// Resolve the `--inspect` / `--inspect-brk` flags into an optional
+/// (address, break-on-start) pair. `--inspect-brk` wins if both are given.
+/// The value is `PORT` or `HOST:PORT`; a bare port binds 127.0.0.1.
+fn resolve_inspect(
+    inspect: Option<&str>,
+    inspect_brk: Option<&str>,
+) -> Result<Option<(std::net::SocketAddr, bool)>, String> {
+    let (value, brk) = match (inspect_brk, inspect) {
+        (Some(v), _) => (v, true),
+        (None, Some(v)) => (v, false),
+        (None, None) => return Ok(None),
+    };
+    let with_host = if value.contains(':') {
+        value.to_string()
+    } else {
+        format!("127.0.0.1:{value}")
+    };
+    let addr = with_host
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| format!("invalid --inspect address '{value}' (expected [host:]port)"))?;
+    Ok(Some((addr, brk)))
+}
+
 fn run_command(
     file: &Path,
     check: CheckMode,
     no_check: bool,
     json: bool,
     script_args: &[String],
+    inspect: Option<(std::net::SocketAddr, bool)>,
 ) -> ExitCode {
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
@@ -217,7 +260,7 @@ fn run_command(
         rx
     });
 
-    let exit = match run_file(file, script_args) {
+    let exit = match run_file(file, script_args, inspect) {
         Ok(code) => ExitCode::from(code),
         Err(diagnostics) => {
             for d in &diagnostics {
@@ -738,7 +781,11 @@ impl oam_engine::ModuleHost for CliHost {
 
 /// Run the entry; Ok carries the process exit code (0, or a natural-exit
 /// process.exitCode the script declared — Node honors it, so does oam).
-fn run_file(file: &Path, script_args: &[String]) -> Result<u8, Vec<Diagnostic>> {
+fn run_file(
+    file: &Path,
+    script_args: &[String],
+    inspect: Option<(std::net::SocketAddr, bool)>,
+) -> Result<u8, Vec<Diagnostic>> {
     match file.extension().and_then(|e| e.to_str()) {
         Some("cts") => {
             return Err(vec![Diagnostic::new(
@@ -777,6 +824,25 @@ fn run_file(file: &Path, script_args: &[String]) -> Result<u8, Vec<Diagnostic>> 
     let mut argv = vec![exe, script];
     argv.extend(script_args.iter().cloned());
     rt.set_process_argv(argv);
+
+    if let Some((addr, brk)) = inspect {
+        match rt.attach_inspector(addr, brk) {
+            Ok(url) => {
+                // Node prints these two lines to stderr; tooling scrapes the
+                // first for the WebSocket URL.
+                eprintln!("Debugger listening on {url}");
+                eprintln!("For help, see: https://oam.sh/docs/inspector");
+            }
+            Err(e) => {
+                return Err(vec![Diagnostic::new(
+                    "OAM-RT0004",
+                    Severity::Error,
+                    Origin::Runtime,
+                    format!("could not start inspector on {addr}: {e}"),
+                )]);
+            }
+        }
+    }
 
     // Entry routing follows module kind: .cjs (or "type": "commonjs"
     // project .js) runs as a CJS program through interop; everything else

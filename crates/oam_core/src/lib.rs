@@ -18,6 +18,7 @@ use std::time::Instant;
 pub use oam_diagnostics as diagnostics;
 
 pub mod http_server;
+pub mod inspector;
 
 pub type OpId = u64;
 

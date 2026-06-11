@@ -18,6 +18,7 @@ use std::sync::Once;
 
 mod cjs;
 mod crypto_ops;
+mod inspector;
 mod modules;
 pub mod napi;
 mod node_ops;
@@ -44,6 +45,10 @@ pub fn init_platform() {
 
 /// A single JavaScript execution environment: one isolate, one context.
 pub struct JsRuntime {
+    /// Optional V8 Inspector (CDP debugger). Declared FIRST so it drops
+    /// before `isolate` — its V8Inspector/session Drop call back into V8 and
+    /// need a live isolate.
+    inspector: Option<inspector::InspectorState>,
     isolate: v8::OwnedIsolate,
     context: v8::Global<v8::Context>,
 }
@@ -83,7 +88,30 @@ impl JsRuntime {
             install_runtime_globals(scope, context);
             global
         };
-        Self { isolate, context }
+        Self {
+            inspector: None,
+            isolate,
+            context,
+        }
+    }
+
+    /// Attach the V8 Inspector (Chrome DevTools Protocol) on `addr`. Returns
+    /// the `ws://` URL a debugger connects to. With `break_on_start`
+    /// (`--inspect-brk`), the next run waits for a debugger to attach and
+    /// breaks on the first statement. Call once, before executing the entry.
+    pub fn attach_inspector(
+        &mut self,
+        addr: std::net::SocketAddr,
+        break_on_start: bool,
+    ) -> Result<String> {
+        let (state, ws_url) =
+            inspector::attach(&mut self.isolate, &self.context, addr, break_on_start)?;
+        // The slot lets pump_event_loop reach the transport without the
+        // runtime; the field keeps the V8 inspector alive for the run.
+        self.isolate
+            .set_slot(inspector::InspectorSlot(state.shared()));
+        self.inspector = Some(state);
+        Ok(ws_url)
     }
 
     /// Declare process.argv ([exe, script, ...script-args]) for this run.
@@ -143,6 +171,20 @@ impl JsRuntime {
 impl Default for JsRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for JsRuntime {
+    fn drop(&mut self) {
+        // Tear the V8 inspector down explicitly, with the isolate entered and
+        // the context unregistered, while the isolate is still alive. Field
+        // drop order alone is not enough: the session/inspector C++
+        // destructors require the isolate to be current.
+        if let Some(inspector) = self.inspector.take() {
+            v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+            let context = scope.get_current_context();
+            inspector.teardown(context);
+        }
     }
 }
 

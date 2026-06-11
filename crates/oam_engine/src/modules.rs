@@ -290,8 +290,23 @@ impl JsRuntime {
         })?;
         self.reset_run_slots()?;
 
+        // --inspect-brk: cloned out so it owns its ref independently of the
+        // upcoming &mut self.isolate borrow.
+        let wait = self
+            .inspector
+            .as_ref()
+            .filter(|state| state.break_on_start())
+            .map(|state| state.shared());
+
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
+
+        // Block until the debugger attaches, BEFORE any code runs, so the
+        // client can set breakpoints (including in dependencies, whose bodies
+        // run eagerly during graph load below).
+        if let Some(shared) = &wait {
+            shared.wait_for_attach();
+        }
 
         load_module_graph(tc, host, entry.clone())?;
 
@@ -303,6 +318,12 @@ impl JsRuntime {
 
         if module.instantiate_module(tc, resolve_module_callback) != Some(true) {
             return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
+        }
+        // Arm break-on-start only NOW — graph load just ran any CJS
+        // dependency bodies; arming earlier would land the pause inside
+        // node_modules instead of the entry's first line.
+        if let Some(shared) = &wait {
+            shared.arm_break();
         }
         let Some(value) = module.evaluate(tc) else {
             return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
@@ -604,6 +625,17 @@ pub(crate) fn pump_event_loop(
         // promptly (Node fires after the prior turn's microtasks settled,
         // not at end-of-run). No-listener rejections stay fatal.
         flush_handled_rejections(tc);
+
+        // Dispatch any debugger commands that arrived since the last turn.
+        // Clone the Rc out first so the isolate slot borrow is released
+        // before dispatch reenters V8 (it can run JS / pause).
+        let inspector = tc
+            .get_slot::<crate::inspector::InspectorSlot>()
+            .map(|slot| slot.0.clone());
+        if let Some(shared) = inspector {
+            shared.poll();
+        }
+
         let mut progressed = false;
 
         let now = std::time::Instant::now();
