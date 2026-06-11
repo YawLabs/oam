@@ -98,33 +98,38 @@ fail at load with a missing-symbol error naming the gap):
 - napi_open/close_handle_scope are not yet real (values live in the
   caller's scope)
 
-## HTTP server (from the M2 safety fleet — design-shaped, deferred)
+## HTTP server (from the M2 safety fleet)
 
 The fleet's blockers and the cheap leaks are FIXED (body/pending drop
 guard, serialized streaming writes, AbortController, timer-heap sweep, fs
-destroy race, key copy). These need design decisions and are deferred:
+destroy race, key copy). The three design-shaped items are now also FIXED
+(see below); the remaining gap is streaming *request* bodies, deferred.
 
-- **No global request-body memory budget / connection cap.** The 100MiB
-  cap is per-request; N concurrent uploads buffer N*up-to-100MiB. Needs a
-  configurable aggregate budget + a connection semaphore + (eventually)
-  streaming request bodies so large uploads don't buffer at all. Until
-  then, oam.serve behind a reverse proxy with body limits is the
-  recommended deployment. (http_server.rs:21, :222)
-- **Streaming-response pump wedges on mid-stream client disconnect.** When
-  a client drops an SSE/streaming connection, hyper doesn't promptly drop
-  the ChannelBody, so httpBodyPush's bounded(16) send blocks forever and
-  the JS pump parks — one leaked pump per disconnected streaming client.
-  Needs abort propagation from the connection task to the stream (an
-  AbortSignal wired through respond_stream, or a hyper on-close hook).
-  (http_server.rs:367-383, :232-235)
-- **server.close() hard-resets in-flight requests** instead of draining
-  them (Node lets in-flight complete). Needs a graceful-shutdown path that
-  stops accepting but lets live connections finish. (http_server.rs:229-235)
-- **process.on('uncaughtException' / 'unhandledRejection') never fire.**
-  process is an EventEmitter so the handlers attach, but the Rust ledger
-  treats uncaught throws/rejections as fatal and never emits the events.
-  Needs a bridge from drain_uncaught/unhandled_rejection_failures
-  (modules.rs) into a process-object emit before failing the run.
+- ~~**No global request-body memory budget / connection cap.**~~ FIXED:
+  a 512MiB aggregate retained-body budget (`GLOBAL_BODY_BUDGET`, an
+  `AtomicUsize` reserved at collect-time, refunded on `RequestGuard` drop)
+  layered over the 100MiB per-request cap, plus a 256-slot connection
+  semaphore (`MAX_CONNECTIONS`) on the accept loop. Over-budget uploads
+  get 503 (413 only on the per-request cap); excess connections are
+  dropped. Remaining gap: request bodies still buffer fully — streaming
+  request bodies (so a large upload never buffers at all) is the deferred
+  follow-up. Until then a reverse proxy with body limits remains the
+  belt-and-suspenders deployment. (http_server.rs)
+- ~~**Streaming-response pump wedges on mid-stream client disconnect.**~~
+  FIXED: `http_body_push` now wraps the `ChannelBody` send in a 60s
+  `STREAM_PUSH_TIMEOUT`. A client that stops reading no longer parks the
+  JS pump forever — the send either lands, errors (client gone -> Failed
+  "client disconnected"), or times out (Failed "stream stalled: client is
+  not reading") and ends the stream. (http_server.rs)
+- ~~**server.close() hard-resets in-flight requests.**~~ FIXED: the conn
+  task now drives hyper's `graceful_shutdown` on the close signal
+  (`disable_keep_alive`, then let the live request finish) instead of
+  dropping the connection. Byte-identical to Node's drain-then-close on
+  an in-flight slow response. (http_server.rs)
+- ~~process.on('uncaughtException' / 'unhandledRejection') never fire.~~
+  FIXED (commit 25229e4): a present listener now suppresses the fatal
+  exit and receives the real Error; no-listener stays fatal. Remaining
+  gap: unhandledRejection passes only the reason, not the promise arg.
 
 ## CLI
 

@@ -8,17 +8,39 @@
 //! event loop alive while listening, exactly Node's semantics. Responses
 //! come back either as one full buffer or as a CHANNEL BODY the JS side
 //! pushes chunks into (the SSE/token-streaming path).
+//!
+//! Hardening (after the M2 safety fleet): a per-server CONNECTION CAP
+//! refuses floods, a global RETAINED-BODY BUDGET bounds buffered upload
+//! memory, the streaming push has a STALL TIMEOUT so a half-open client
+//! can't wedge the pump, and close() does a GRACEFUL shutdown (in-flight
+//! requests finish, keep-alive is disabled) instead of resetting live
+//! connections.
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Frame;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
-/// 100 MiB request-body cap (wave-1 buffered bodies).
+/// Per-request body cap (wave-1 buffered bodies).
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+/// Aggregate cap on RETAINED request-body bytes across all in-flight
+/// requests of the run — bounds the body-buffer memory a flood of uploads
+/// can pin. (Per-request transient during collection is bounded by the
+/// connection cap; truly bounding it needs streaming request bodies, the
+/// next wave.)
+const GLOBAL_BODY_BUDGET: usize = 512 * 1024 * 1024;
+/// Concurrent-connection cap per server. New connections past this are
+/// dropped (refused), not queued — a flood can't spawn unbounded tasks or
+/// buffer unbounded bodies.
+const MAX_CONNECTIONS: usize = 256;
+/// A single streaming-response chunk that cannot be delivered within this
+/// window means the consumer is gone or wedged (a half-open socket the OS
+/// hasn't reset yet): end the stream so the JS pump never parks forever.
+const STREAM_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct IncomingRequest {
     pub id: u64,
@@ -61,6 +83,9 @@ pub struct HttpState {
     bodies: Mutex<HashMap<u64, Vec<u8>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
     streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    /// Retained request-body bytes across all in-flight requests; reserved
+    /// when a body is buffered, refunded when the request finishes.
+    body_bytes: AtomicUsize,
 }
 
 impl HttpState {
@@ -210,34 +235,57 @@ pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super
     );
 
     let accept_state = state.clone();
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, _peer)) = accepted else { continue };
+                    // Connection cap: refuse (drop) past the ceiling rather
+                    // than queue — a flood can't spawn unbounded tasks or
+                    // buffer unbounded bodies. The permit lives in the conn
+                    // task and frees when the connection ends.
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // released when the task ends
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
                             handle_request(conn_state.clone(), conn_queue.clone(), req)
                         });
                         let conn = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service);
-                        // close() aborts idle keep-alive connections too —
-                        // otherwise their queue_tx clones keep the accept
-                        // channel open for the client pool's idle timeout.
-                        tokio::select! {
-                            _ = conn => {}
-                            _ = conn_shutdown.changed() => {}
+                        // GRACEFUL shutdown on close(): disable keep-alive and
+                        // let the IN-FLIGHT request finish (Node's
+                        // server.close() semantics), instead of resetting it.
+                        // An idle keep-alive connection just closes — so the
+                        // queue_tx clone still drops promptly and the accept
+                        // op isn't pinned.
+                        let mut conn = std::pin::pin!(conn);
+                        let mut shutting_down = false;
+                        loop {
+                            tokio::select! {
+                                result = conn.as_mut() => {
+                                    let _ = result;
+                                    break;
+                                }
+                                _ = conn_shutdown.changed(), if !shutting_down => {
+                                    shutting_down = true;
+                                    conn.as_mut().graceful_shutdown();
+                                }
+                            }
                         }
                     });
                 }
             }
         }
-        // Last queue_tx drops with the loop + aborted connections: the
+        // Last queue_tx drops with the loop + finished connections: the
         // pending accept op resolves Done and the JS loop exits.
     });
 
@@ -255,6 +303,9 @@ pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super
 struct RequestGuard {
     state: Arc<HttpState>,
     id: u64,
+    /// Body bytes this request reserved against the global budget; refunded
+    /// on drop along with the map cleanup.
+    reserved: usize,
 }
 
 impl Drop for RequestGuard {
@@ -269,7 +320,19 @@ impl Drop for RequestGuard {
             .lock()
             .expect("http pending lock")
             .remove(&self.id);
+        if self.reserved > 0 {
+            self.state
+                .body_bytes
+                .fetch_sub(self.reserved, Ordering::AcqRel);
+        }
     }
+}
+
+fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
+    hyper::Response::builder()
+        .status(status)
+        .body(http_body_util::Full::new(Bytes::from_static(text)).boxed())
+        .expect("static status body builds")
 }
 
 async fn handle_request(
@@ -278,21 +341,26 @@ async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<BoxedBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
-    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY)
-        .collect()
-        .await
-    {
+    // Read at most the smaller of the per-request cap and the budget still
+    // available — a near-full budget shrinks the cap so one request can't
+    // exhaust it.
+    let already = state.body_bytes.load(Ordering::Acquire);
+    let limit = MAX_REQUEST_BODY.min(GLOBAL_BODY_BUDGET.saturating_sub(already));
+    let budget_constrained = limit < MAX_REQUEST_BODY;
+    let collected = match http_body_util::Limited::new(body, limit).collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return Ok(hyper::Response::builder()
-                .status(413)
-                .body(
-                    http_body_util::Full::new(Bytes::from_static(b"request body too large"))
-                        .boxed(),
-                )
-                .expect("static 413 builds"));
-        }
+        // Budget-constrained over-limit is "busy" (503); a true oversized
+        // body under a full budget is "too large" (413).
+        Err(_) if budget_constrained => return Ok(status_body(503, b"server is busy")),
+        Err(_) => return Ok(status_body(413, b"request body too large")),
     };
+    // Reserve the retained bytes; refund (RequestGuard) on completion.
+    let body_len = collected.len();
+    let prev = state.body_bytes.fetch_add(body_len, Ordering::AcqRel);
+    if prev + body_len > GLOBAL_BODY_BUDGET {
+        state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
+        return Ok(status_body(503, b"server is busy"));
+    }
     let id = state.next_id();
     let headers: Vec<(String, String)> = parts
         .headers
@@ -322,10 +390,12 @@ async fn handle_request(
         .expect("http bodies lock")
         .insert(id, collected.to_vec());
     // From here on, every exit cleans up — including a cancelled future
-    // if the client disconnects while the handler runs.
+    // if the client disconnects while the handler runs — and refunds the
+    // reserved body bytes.
     let _guard = RequestGuard {
         state: state.clone(),
         id,
+        reserved: body_len,
     };
 
     let sent = queue
@@ -393,7 +463,11 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
     }
 }
 
-/// Backpressured chunk push for streaming responses.
+/// Backpressured chunk push for streaming responses. A bounded timeout is
+/// the half-open backstop: when a client stops reading (or vanishes
+/// without a reset the OS has noticed yet), hyper stops draining the body,
+/// the channel fills, and `send` would park forever — wedging the JS pump.
+/// The timeout ends the stream so the pump always makes progress.
 pub async fn http_body_push(
     state: Arc<HttpState>,
     stream_id: u64,
@@ -402,12 +476,18 @@ pub async fn http_body_push(
     let Some(sender) = state.stream_sender(stream_id) else {
         return super::OpOutcome::Failed(format!("http stream {stream_id} is gone"));
     };
-    match sender.send(bytes).await {
-        Ok(()) => super::OpOutcome::Done,
-        Err(_) => {
-            // Client disconnected: surface as failure so JS can stop.
+    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(bytes)).await {
+        Ok(Ok(())) => super::OpOutcome::Done,
+        Ok(Err(_)) => {
+            // Receiver dropped (hyper ended the response / connection gone).
             state.end_stream(stream_id);
             super::OpOutcome::Failed("client disconnected".to_string())
+        }
+        Err(_elapsed) => {
+            // Stalled: consumer not reading. Drop the stream; the lingering
+            // socket is reaped by the OS / graceful close.
+            state.end_stream(stream_id);
+            super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
     }
 }

@@ -1330,6 +1330,49 @@ fn oam_serve_streams_sse_incrementally() {
 }
 
 #[test]
+fn http_close_is_graceful_and_body_budget_rejects_floods() {
+    let stdout = run_ok(
+        "http_harden.mjs",
+        "import http from 'node:http';\n\
+         // Graceful close: a request in flight when close() fires still\n\
+         // completes (Node semantics), not connection-reset.\n\
+         const server = http.createServer((req, res) => {\n\
+           if (req.url === '/slow') { setTimeout(() => res.end('slow-done'), 200); return; }\n\
+           res.end('ok'); // never reads the body\n\
+         });\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const inflight = fetch(`${base}/slow`).then((r) => r.text());\n\
+         await new Promise((r) => setTimeout(r, 60));\n\
+         server.close();\n\
+         let drained = '';\n\
+         try { drained = await inflight; } catch (e) { drained = 'FAILED:' + e.constructor.name; }\n\
+         console.log(drained);\n\
+         // Body budget: a flood of large unread uploads must reject some\n\
+         // (503) rather than retain unbounded memory.\n\
+         const server2 = http.createServer((req, res) => res.end('ok'));\n\
+         await new Promise((r) => server2.listen(0, r));\n\
+         const base2 = `http://127.0.0.1:${server2.address().port}`;\n\
+         const big = 'x'.repeat(8 * 1024 * 1024);\n\
+         let ok = 0, busy = 0, shed = 0;\n\
+         await Promise.all(Array.from({ length: 120 }, () =>\n\
+           fetch(`${base2}/up`, { method: 'POST', body: big })\n\
+             .then((r) => { if (r.status === 200) ok++; else if (r.status === 503) busy++; else shed++; })\n\
+             // An over-budget reject can reset the client's in-flight\n\
+             // upload — that is load-shedding, counted as such.\n\
+             .catch(() => shed++),\n\
+         ));\n\
+         // Served what fits, rejected the excess, every request accounted,\n\
+         // process survived (no OOM).\n\
+         console.log(ok > 0, busy + shed > 0, ok + busy + shed === 120);\n\
+         server2.close();",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "slow-done");
+    assert_eq!(lines[1], "true true true");
+}
+
+#[test]
 fn http_streaming_writes_stay_ordered_and_bodies_dont_leak() {
     // Regression for the M2 safety fleet: 50 synchronous res.write() calls
     // must arrive in order and intact (was a spawn-order race that
