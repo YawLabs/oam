@@ -138,6 +138,15 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:zlib
         ("zlibSync", op_zlib_sync),
         ("zlibAsync", op_zlib_async),
+        // HTTP server
+        ("httpServe", op_http_serve),
+        ("httpAccept", op_http_accept),
+        ("httpRequestBody", op_http_request_body),
+        ("httpRespond", op_http_respond),
+        ("httpRespondStream", op_http_respond_stream),
+        ("httpBodyPush", op_http_body_push),
+        ("httpBodyEnd", op_http_body_end),
+        ("httpClose", op_http_close),
         // node:crypto (crypto_ops.rs)
         ("cryptoHashCreate", op_crypto_hash_create),
         ("cryptoHmacCreate", op_crypto_hmac_create),
@@ -445,6 +454,129 @@ fn op_username(
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
     }
+}
+
+// ------------------------------------------------------------ http server
+
+fn http_state(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> std::sync::Arc<oam_core::http_server::HttpState> {
+    scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .http()
+}
+
+/// Headers travel as a JSON [[name, value], ...] string both directions.
+fn parse_headers_json(json: &str) -> Vec<(String, String)> {
+    serde_json::from_str::<Vec<(String, String)>>(json).unwrap_or_default()
+}
+
+fn op_http_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let state = http_state(scope);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_serve(state, host, port),
+    );
+}
+
+fn op_http_accept(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let state = http_state(scope);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_accept(state, server_id),
+    );
+}
+
+fn op_http_request_body(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let bytes = http_state(scope).take_request_body(id).unwrap_or_default();
+    if let Some(value) = bytes_to_uint8array(scope, bytes) {
+        rv.set(value);
+    }
+}
+
+fn op_http_respond(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
+    let headers = arg_string(scope, &args, 2)
+        .map(|j| parse_headers_json(&j))
+        .unwrap_or_default();
+    let body = arg_bytes(scope, &args, 3).unwrap_or_default();
+    rv.set_bool(http_state(scope).respond_full(id, status, headers, body));
+}
+
+fn op_http_respond_stream(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
+    let headers = arg_string(scope, &args, 2)
+        .map(|j| parse_headers_json(&j))
+        .unwrap_or_default();
+    match http_state(scope).respond_stream(id, status, headers) {
+        Some(stream_id) => rv.set_double(stream_id as f64),
+        None => throw_type_error(scope, "request already responded or connection gone"),
+    }
+}
+
+fn op_http_body_push(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "httpBodyPush requires data");
+        return;
+    };
+    let state = http_state(scope);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_body_push(state, stream_id, bytes),
+    );
+}
+
+fn op_http_body_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    http_state(scope).end_stream(stream_id);
+}
+
+fn op_http_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    http_state(scope).close_server(server_id);
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

@@ -1,5 +1,5 @@
 {
-  "commit": "959495b",
+  "commit": "4b92197",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -82,10 +82,10 @@
           "Event": false,
           "EventTarget": false,
           "FormData": false,
-          "Headers": false,
+          "Headers": true,
           "ReadableStream": true,
           "Request": false,
-          "Response": false,
+          "Response": true,
           "TextDecoder": true,
           "TextDecoderStream": true,
           "TextEncoder": true,
@@ -107,7 +107,7 @@
           "setTimeout": true,
           "structuredClone": false
         },
-        "have": 20,
+        "have": 22,
         "total": 32
       },
       "modules": {
@@ -126,12 +126,12 @@
           "events": true,
           "fs": true,
           "fs/promises": true,
-          "http": false,
+          "http": true,
           "http2": false,
           "https": false,
           "inspector": false,
           "module": true,
-          "net": false,
+          "net": true,
           "os": true,
           "path": true,
           "perf_hooks": false,
@@ -157,7 +157,7 @@
           "worker_threads": false,
           "zlib": true
         },
-        "have": 23,
+        "have": 25,
         "total": 44
       }
     },

@@ -1,0 +1,383 @@
+//! Inbound HTTP/1.1 server on hyper (already in-tree via reqwest).
+//!
+//! Flow: `http_serve` binds a tokio listener and spawns an accept loop;
+//! each hyper request collects its body (wave-1: BUFFERED, capped — most
+//! API payloads are small; streaming request bodies land later), parks a
+//! oneshot responder, and pushes metadata onto the server's queue. JS
+//! long-polls `http_accept` — the pending accept op is what keeps the
+//! event loop alive while listening, exactly Node's semantics. Responses
+//! come back either as one full buffer or as a CHANNEL BODY the JS side
+//! pushes chunks into (the SSE/token-streaming path).
+
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::Frame;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
+
+/// 100 MiB request-body cap (wave-1 buffered bodies).
+const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+
+pub struct IncomingRequest {
+    pub id: u64,
+    pub method: String,
+    /// Path + query, as received.
+    pub uri: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+pub enum ResponseBody {
+    Full(Vec<u8>),
+    Stream(mpsc::Receiver<Vec<u8>>),
+}
+
+pub struct ResponseSpec {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: ResponseBody,
+}
+
+struct ServerEntry {
+    /// Taken out for the duration of each accept await (remove-await-
+    /// reinsert; the JS accept loop is the single consumer).
+    queue: Option<mpsc::Receiver<IncomingRequest>>,
+    /// watch (not oneshot): every CONNECTION task selects on it too.
+    /// Keep-alive sockets (a client pool can idle one for 90s) would
+    /// otherwise hold queue_tx clones long after close, leaving the
+    /// pending accept op pinning the event loop open.
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+#[derive(Default)]
+pub struct HttpState {
+    next: AtomicU64,
+    servers: Mutex<HashMap<u64, ServerEntry>>,
+    /// request id -> the hyper-side responder waiting for JS.
+    pending: Mutex<HashMap<u64, oneshot::Sender<ResponseSpec>>>,
+    /// request id -> buffered request body (fetched once by JS).
+    bodies: Mutex<HashMap<u64, Vec<u8>>>,
+    /// response-stream id -> chunk sender (JS pushes, hyper drains).
+    streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+}
+
+impl HttpState {
+    fn next_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Sync (isolate-thread) helpers consumed by the engine natives.
+    pub fn take_request_body(&self, id: u64) -> Option<Vec<u8>> {
+        self.bodies.lock().expect("http bodies lock").remove(&id)
+    }
+
+    pub fn respond_full(
+        &self,
+        id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> bool {
+        let Some(responder) = self.pending.lock().expect("http pending lock").remove(&id) else {
+            return false;
+        };
+        responder
+            .send(ResponseSpec {
+                status,
+                headers,
+                body: ResponseBody::Full(body),
+            })
+            .is_ok()
+    }
+
+    /// Start a streaming response; returns the stream handle JS pushes to.
+    pub fn respond_stream(
+        &self,
+        id: u64,
+        status: u16,
+        headers: Vec<(String, String)>,
+    ) -> Option<u64> {
+        let responder = self
+            .pending
+            .lock()
+            .expect("http pending lock")
+            .remove(&id)?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let stream_id = self.next_id();
+        self.streams
+            .lock()
+            .expect("http streams lock")
+            .insert(stream_id, tx);
+        let ok = responder
+            .send(ResponseSpec {
+                status,
+                headers,
+                body: ResponseBody::Stream(rx),
+            })
+            .is_ok();
+        if ok { Some(stream_id) } else { None }
+    }
+
+    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.streams
+            .lock()
+            .expect("http streams lock")
+            .get(&stream_id)
+            .cloned()
+    }
+
+    /// Dropping the sender ends the hyper body (clean EOF / final chunk).
+    pub fn end_stream(&self, stream_id: u64) {
+        self.streams
+            .lock()
+            .expect("http streams lock")
+            .remove(&stream_id);
+    }
+
+    pub fn close_server(&self, server_id: u64) {
+        if let Some(mut entry) = self
+            .servers
+            .lock()
+            .expect("http servers lock")
+            .remove(&server_id)
+            && let Some(shutdown) = entry.shutdown.take()
+        {
+            let _ = shutdown.send(true);
+        }
+    }
+}
+
+/// hyper Body over the JS-pushed chunk channel.
+struct ChannelBody {
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(chunk)) => {
+                std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
+    let mut builder = hyper::Response::builder().status(spec.status);
+    for (name, value) in &spec.headers {
+        builder = builder.header(name, value);
+    }
+    let body: BoxedBody = match spec.body {
+        ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
+        ResponseBody::Stream(rx) => ChannelBody { rx }.boxed(),
+    };
+    builder.body(body).unwrap_or_else(|_| {
+        hyper::Response::builder()
+            .status(500)
+            .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
+            .expect("static 500 builds")
+    })
+}
+
+/// Bind + spawn the accept loop. Resolves Json {serverId, port}.
+pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super::OpOutcome {
+    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    };
+    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    state.servers.lock().expect("http servers lock").insert(
+        server_id,
+        ServerEntry {
+            queue: Some(queue_rx),
+            shutdown: Some(shutdown_tx),
+        },
+    );
+
+    let accept_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _peer)) = accepted else { continue };
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let mut conn_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let service = hyper::service::service_fn(move |req| {
+                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                        });
+                        let conn = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service);
+                        // close() aborts idle keep-alive connections too —
+                        // otherwise their queue_tx clones keep the accept
+                        // channel open for the client pool's idle timeout.
+                        tokio::select! {
+                            _ = conn => {}
+                            _ = conn_shutdown.changed() => {}
+                        }
+                    });
+                }
+            }
+        }
+        // Last queue_tx drops with the loop + aborted connections: the
+        // pending accept op resolves Done and the JS loop exits.
+    });
+
+    super::OpOutcome::Json(
+        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+    )
+}
+
+async fn handle_request(
+    state: Arc<HttpState>,
+    queue: mpsc::Sender<IncomingRequest>,
+    req: hyper::Request<hyper::body::Incoming>,
+) -> Result<hyper::Response<BoxedBody>, std::convert::Infallible> {
+    let (parts, body) = req.into_parts();
+    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(hyper::Response::builder()
+                .status(413)
+                .body(
+                    http_body_util::Full::new(Bytes::from_static(b"request body too large"))
+                        .boxed(),
+                )
+                .expect("static 413 builds"));
+        }
+    };
+    let id = state.next_id();
+    let headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let uri = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+
+    let (tx, rx) = oneshot::channel::<ResponseSpec>();
+    state
+        .pending
+        .lock()
+        .expect("http pending lock")
+        .insert(id, tx);
+    state
+        .bodies
+        .lock()
+        .expect("http bodies lock")
+        .insert(id, collected.to_vec());
+
+    let sent = queue
+        .send(IncomingRequest {
+            id,
+            method: parts.method.as_str().to_string(),
+            uri,
+            headers,
+            body: Vec::new(), // delivered via take_request_body
+        })
+        .await;
+    if sent.is_err() {
+        state.pending.lock().expect("http pending lock").remove(&id);
+        state.bodies.lock().expect("http bodies lock").remove(&id);
+        return Ok(hyper::Response::builder()
+            .status(503)
+            .body(http_body_util::Full::new(Bytes::from_static(b"server is closing")).boxed())
+            .expect("static 503 builds"));
+    }
+
+    match rx.await {
+        Ok(spec) => Ok(spec_to_response(spec)),
+        Err(_) => Ok(hyper::Response::builder()
+            .status(500)
+            .body(
+                http_body_util::Full::new(Bytes::from_static(b"handler dropped the request"))
+                    .boxed(),
+            )
+            .expect("static 500 builds")),
+    }
+}
+
+/// Long-poll the next request. Json metadata, or Done when the server
+/// closed (queue drained + senders dropped).
+pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutcome {
+    let queue = state
+        .servers
+        .lock()
+        .expect("http servers lock")
+        .get_mut(&server_id)
+        .and_then(|entry| entry.queue.take());
+    let Some(mut queue) = queue else {
+        return super::OpOutcome::Failed(format!(
+            "http server {server_id} is gone or accept is already pending"
+        ));
+    };
+    let next = queue.recv().await;
+    if let Some(entry) = state
+        .servers
+        .lock()
+        .expect("http servers lock")
+        .get_mut(&server_id)
+    {
+        entry.queue = Some(queue);
+    }
+    match next {
+        Some(request) => super::OpOutcome::Json(
+            serde_json::json!({
+                "requestId": request.id,
+                "method": request.method,
+                "uri": request.uri,
+                "headers": request.headers,
+            })
+            .to_string(),
+        ),
+        None => super::OpOutcome::Done,
+    }
+}
+
+/// Backpressured chunk push for streaming responses.
+pub async fn http_body_push(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    bytes: Vec<u8>,
+) -> super::OpOutcome {
+    let Some(sender) = state.stream_sender(stream_id) else {
+        return super::OpOutcome::Failed(format!("http stream {stream_id} is gone"));
+    };
+    match sender.send(bytes).await {
+        Ok(()) => super::OpOutcome::Done,
+        Err(_) => {
+            // Client disconnected: surface as failure so JS can stop.
+            state.end_stream(stream_id);
+            super::OpOutcome::Failed("client disconnected".to_string())
+        }
+    }
+}

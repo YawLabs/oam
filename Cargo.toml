@@ -25,7 +25,8 @@ v8 = "150"
 anyhow = "1"
 thiserror = "2"
 # io-util: AsyncReadExt/AsyncWriteExt for the streaming file ops.
-tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util"] }
+# net/sync/macros: the HTTP server (TcpListener, channels, select!).
+tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util", "net", "sync", "macros"] }
 # rustls-no-provider + explicit ring: reqwest's default rustls provider is
 # aws-lc-rs, whose C build (aws-lc-sys) fails under MSVC on ARM64. ring
 # compiles clean on every tier-1 target (same choice Deno ships).
@@ -46,6 +47,12 @@ getrandom = "0.3"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"
+# HTTP server: hyper + adapters (already in-tree transitively through
+# reqwest — declaring them adds no new compilation units).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —

@@ -13,23 +13,97 @@
 "use strict";
 (() => {
 
-  function makeHeaders(pairs) {
-    const map = new Map();
-    for (const [name, value] of pairs) {
-      const key = String(name).toLowerCase();
-      // Repeated headers combine per the spec's comma rule.
-      map.set(key, map.has(key) ? map.get(key) + ", " + String(value) : String(value));
+  // Headers (Fetch-standard subset): case-insensitive, repeated values
+  // combine per the comma rule, iterable. Shared by fetch responses,
+  // server requests, and the Response constructor.
+  class Headers {
+    constructor(init) {
+      this._map = new Map();
+      if (init === undefined || init === null) return;
+      if (init instanceof Headers) {
+        for (const [k, v] of init) this._map.set(k, v);
+      } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
+        for (const pair of init) this.append(pair[0], pair[1]);
+      } else {
+        for (const key of Object.keys(init)) this.append(key, init[key]);
+      }
     }
-    return {
-      get: (name) => {
-        const value = map.get(String(name).toLowerCase());
-        return value === undefined ? null : value;
-      },
-      has: (name) => map.has(String(name).toLowerCase()),
-      forEach: (fn) => {
-        for (const [key, value] of map) fn(value, key);
-      },
-    };
+    append(name, value) {
+      const key = String(name).toLowerCase();
+      const text = String(value);
+      this._map.set(key, this._map.has(key) ? `${this._map.get(key)}, ${text}` : text);
+    }
+    set(name, value) {
+      this._map.set(String(name).toLowerCase(), String(value));
+    }
+    get(name) {
+      const value = this._map.get(String(name).toLowerCase());
+      return value === undefined ? null : value;
+    }
+    has(name) {
+      return this._map.has(String(name).toLowerCase());
+    }
+    delete(name) {
+      this._map.delete(String(name).toLowerCase());
+    }
+    forEach(fn, thisArg) {
+      for (const [key, value] of this._map) fn.call(thisArg, value, key, this);
+    }
+    *entries() {
+      yield* this._map.entries();
+    }
+    *keys() {
+      yield* this._map.keys();
+    }
+    *values() {
+      yield* this._map.values();
+    }
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+  }
+  globalThis.Headers = Headers;
+
+  // Response constructor (the SERVING side; fetch's inbound responses come
+  // from makeResponse below). Body: string | bytes | ReadableStream | null.
+  class Response {
+    constructor(body, init = {}) {
+      this.status = init.status ?? 200;
+      this.statusText = init.statusText ?? "";
+      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+      this._body = body ?? null;
+      this.ok = this.status >= 200 && this.status <= 299;
+    }
+    static json(data, init = {}) {
+      const response = new Response(JSON.stringify(data), init);
+      if (!response.headers.has("content-type")) {
+        response.headers.set("content-type", "application/json");
+      }
+      return response;
+    }
+    get body() {
+      return this._body;
+    }
+    async text() {
+      if (typeof this._body === "string") return this._body;
+      if (this._body === null) return "";
+      if (this._body instanceof Uint8Array) return new TextDecoder().decode(this._body);
+      let out = "";
+      for await (const chunk of this._body) {
+        out += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+      }
+      return out;
+    }
+    async json() {
+      return JSON.parse(await this.text());
+    }
+  }
+  globalThis.Response = Response;
+
+  function makeHeaders(pairs) {
+    const headers = new Headers();
+    for (const [name, value] of pairs) headers.append(name, value);
+    return headers;
   }
 
   function makeResponse(raw) {
@@ -128,4 +202,111 @@
     }
     return makeResponse(raw);
   };
+
+  // ---------------------------------------------------------- oam.serve
+  // The web-standard server: oam.serve({ port, hostname, fetch(request) })
+  // -> Promise<{ port, hostname, close() }>. The handler returns a
+  // Response; a ReadableStream body streams to the client chunk-by-chunk
+  // (the SSE/token path). Requests are dispatched CONCURRENTLY — the
+  // accept loop never awaits a handler.
+  function makeServerRequest(meta, host) {
+    let bodyBytes = null;
+    let consumed = false;
+    const takeBody = () => {
+      if (consumed) throw new TypeError("Body already consumed");
+      consumed = true;
+      bodyBytes ??= globalThis.__oam.node.httpRequestBody(meta.requestId);
+      return bodyBytes;
+    };
+    return {
+      method: meta.method,
+      url: `http://${host}${meta.uri}`,
+      headers: new Headers(meta.headers),
+      get bodyUsed() {
+        return consumed;
+      },
+      arrayBuffer: async () => takeBody().buffer,
+      bytes: async () => takeBody(),
+      text: async () => new TextDecoder().decode(takeBody()),
+      json: async () => JSON.parse(new TextDecoder().decode(takeBody())),
+    };
+  }
+
+  async function respondWith(requestId, response) {
+    const node = globalThis.__oam.node;
+    const status = response?.status ?? 200;
+    const headerPairs = [];
+    if (response?.headers) {
+      response.headers.forEach((value, key) => headerPairs.push([key, value]));
+    }
+    const headersJson = JSON.stringify(headerPairs);
+    const body = response?.body ?? response?._body ?? null;
+    if (body !== null && typeof body === "object" && typeof body.getReader === "function") {
+      // Streaming response: chunks flush as the handler produces them.
+      const streamId = node.httpRespondStream(requestId, status, headersJson);
+      const reader = body.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const bytes =
+            typeof value === "string" ? new TextEncoder().encode(value) : value;
+          await node.httpBodyPush(streamId, bytes);
+        }
+      } catch {
+        // Client gone or source errored: stop pushing.
+      } finally {
+        node.httpBodyEnd(streamId);
+      }
+      return;
+    }
+    const bytes =
+      body === null
+        ? new Uint8Array(0)
+        : typeof body === "string"
+          ? new TextEncoder().encode(body)
+          : body;
+    node.httpRespond(requestId, status, headersJson, bytes);
+  }
+
+  async function serve(options) {
+    const handler = typeof options === "function" ? options : options.fetch;
+    if (typeof handler !== "function") {
+      throw new TypeError("oam.serve requires a fetch(request) handler");
+    }
+    const hostname = options.hostname ?? "127.0.0.1";
+    const node = globalThis.__oam.node;
+    const bound = await node.httpServe(hostname, options.port ?? 0);
+    const host = `${hostname}:${bound.port}`;
+
+    const handleOne = async (meta) => {
+      let response;
+      try {
+        response = await handler(makeServerRequest(meta, host));
+      } catch (e) {
+        const message = e && e.message ? e.message : String(e);
+        response = new Response(`oam: handler error: ${message}`, { status: 500 });
+      }
+      await respondWith(meta.requestId, response);
+    };
+
+    (async () => {
+      for (;;) {
+        const meta = await node.httpAccept(bound.serverId);
+        if (meta === undefined) break; // server closed
+        void handleOne(meta);
+      }
+    })();
+
+    return {
+      port: bound.port,
+      hostname,
+      close() {
+        node.httpClose(bound.serverId);
+      },
+    };
+  }
+  // Attached to the oam namespace post-restore (ops.rs installs `oam`
+  // before this runs at runtime? No — snapshot time. Lazy attach instead).
+  globalThis.__oamServe = serve;
 })();

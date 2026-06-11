@@ -683,7 +683,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "gate lists wave 1: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'http';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'cluster';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),
@@ -1111,6 +1111,136 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "BROWSER-SHIM function function"
     );
+}
+
+// ------------------------------------------------------------- http server
+
+#[test]
+fn oam_serve_handles_get_post_and_errors() {
+    let stdout = run_ok(
+        "serve_basic.mjs",
+        "const server = await oam.serve({\n\
+           async fetch(req) {\n\
+             const url = new URL(req.url);\n\
+             if (url.pathname === '/hello') {\n\
+               return new Response('hi from oam', { headers: { 'x-served-by': 'oam' } });\n\
+             }\n\
+             if (url.pathname === '/echo') {\n\
+               const body = await req.json();\n\
+               return Response.json({ method: req.method, got: body, q: url.searchParams.get('q') });\n\
+             }\n\
+             if (url.pathname === '/boom') throw new Error('handler exploded');\n\
+             return new Response('nope', { status: 404 });\n\
+           },\n\
+         });\n\
+         const base = `http://127.0.0.1:${server.port}`;\n\
+         const hello = await fetch(`${base}/hello`);\n\
+         console.log(hello.status, hello.headers.get('x-served-by'), await hello.text());\n\
+         const echo = await fetch(`${base}/echo?q=7`, { method: 'POST', body: JSON.stringify({ n: 42 }) });\n\
+         const data = await echo.json();\n\
+         console.log(echo.headers.get('content-type'), data.method, data.got.n, data.q);\n\
+         const missing = await fetch(`${base}/nope`);\n\
+         console.log(missing.status);\n\
+         const boom = await fetch(`${base}/boom`);\n\
+         console.log(boom.status, (await boom.text()).includes('handler exploded'));\n\
+         // Concurrency: two in flight at once.\n\
+         const [a, b] = await Promise.all([fetch(`${base}/hello`), fetch(`${base}/hello`)]);\n\
+         console.log(a.status, b.status);\n\
+         server.close();\n\
+         console.log('closed');",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "200 oam hi from oam");
+    assert_eq!(lines[1], "application/json POST 42 7");
+    assert_eq!(lines[2], "404");
+    assert_eq!(lines[3], "500 true");
+    assert_eq!(lines[4], "200 200");
+    assert_eq!(lines[5], "closed");
+}
+
+#[test]
+fn oam_serve_streams_sse_incrementally() {
+    let stdout = run_ok(
+        "serve_sse.mjs",
+        "const server = await oam.serve({\n\
+           fetch() {\n\
+             const stream = new ReadableStream({\n\
+               async start(controller) {\n\
+                 for (const tok of ['alpha', 'beta', 'gamma']) {\n\
+                   controller.enqueue(`data: ${tok}\\n\\n`);\n\
+                   await new Promise((r) => setTimeout(r, 30));\n\
+                 }\n\
+                 controller.close();\n\
+               },\n\
+             });\n\
+             return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });\n\
+           },\n\
+         });\n\
+         const res = await fetch(`http://127.0.0.1:${server.port}/sse`);\n\
+         let chunkCount = 0;\n\
+         const events = [];\n\
+         for await (const part of res.body.pipeThrough(new TextDecoderStream())) {\n\
+           chunkCount++;\n\
+           for (const line of part.split('\\n')) {\n\
+             if (line.startsWith('data: ')) events.push(line.slice(6));\n\
+           }\n\
+         }\n\
+         // >1 chunk proves the server FLUSHED per-token (no buffering).\n\
+         console.log(chunkCount > 1, events.join('|'));\n\
+         server.close();",
+    );
+    assert_eq!(stdout, "true alpha|beta|gamma");
+}
+
+#[test]
+fn node_http_create_server_express_style() {
+    let stdout = run_ok(
+        "node_http.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const server = http.createServer((req, res) => {\n\
+           if (req.url === '/info') {\n\
+             res.writeHead(200, { 'content-type': 'text/plain', 'x-powered-by': 'oam' });\n\
+             res.end(`${req.method} ${req.url} ${req.headers['x-probe']}`);\n\
+             return;\n\
+           }\n\
+           if (req.url === '/body') {\n\
+             const chunks = [];\n\
+             req.on('data', (c) => chunks.push(c));\n\
+             req.on('end', () => {\n\
+               res.statusCode = 201;\n\
+               res.setHeader('content-type', 'application/json');\n\
+               res.end(JSON.stringify({ size: Buffer.concat(chunks).length }));\n\
+             });\n\
+             return;\n\
+           }\n\
+           if (req.url === '/chunked') {\n\
+             res.writeHead(200, { 'content-type': 'text/plain' });\n\
+             res.write('part1|');\n\
+             setTimeout(() => { res.write('part2|'); res.end('done'); }, 20);\n\
+             return;\n\
+           }\n\
+           res.writeHead(404);\n\
+           res.end();\n\
+         });\n\
+         await new Promise((resolve) => server.listen(0, resolve));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const info = await fetch(`${base}/info`, { headers: { 'x-probe': 'p1' } });\n\
+         console.log(info.status, info.headers.get('x-powered-by'), await info.text());\n\
+         const body = await fetch(`${base}/body`, { method: 'POST', body: 'x'.repeat(100) });\n\
+         console.log(body.status, (await body.json()).size);\n\
+         const chunked = await fetch(`${base}/chunked`);\n\
+         console.log(await chunked.text());\n\
+         console.log(net.isIP('10.0.0.1'), net.isIP('::1'), net.isIP('nope'), net.isIPv4('256.1.1.1'));\n\
+         server.close();\n\
+         console.log(http.STATUS_CODES[404]);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "200 oam GET /info p1");
+    assert_eq!(lines[1], "201 100");
+    assert_eq!(lines[2], "part1|part2|done");
+    assert_eq!(lines[3], "4 6 0 false");
+    assert_eq!(lines[4], "Not Found");
 }
 
 // ------------------------------------------- zlib / querystring / timers/promises

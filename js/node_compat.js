@@ -1,4 +1,4 @@
-// oam node: compat wave 1 — the JS half of the builtin modules.
+﻿// oam node: compat wave 1 â€” the JS half of the builtin modules.
 //
 // Architecture: every builtin is a FACTORY registered on __oamNode and
 // instantiated lazily at first import/require, receiving the natives
@@ -144,7 +144,7 @@
       let out = "";
       const fail = (at) => {
         if (this.fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
-        out += "�";
+        out += "ï¿½";
       };
       while (i < bytes.length) {
         const b = bytes[i];
@@ -209,7 +209,7 @@
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
   const utf8Encoder = new TextEncoder();
-  // Buffer#toString never strips a BOM (Node parity) — only the WHATWG
+  // Buffer#toString never strips a BOM (Node parity) â€” only the WHATWG
   // TextDecoder default does.
   const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
@@ -301,7 +301,7 @@
         // Node's lenient decoder for BOTH labels: either alphabet accepted
         // ('-'/'_' alongside '+'/'/'), whitespace skipped, '=' or junk
         // terminates, trailing partial groups decode greedily. JWT-era code
-        // decodes base64url payloads via 'base64' constantly — the strict
+        // decodes base64url payloads via 'base64' constantly â€” the strict
         // Uint8Array.fromBase64 path returned EMPTY for those.
         return decodeBase64Lenient(str);
       case "latin1": {
@@ -521,7 +521,7 @@
     }
 
     fill(value, start = 0, end = this.length, encoding) {
-      // Node signature: fill(value[, offset[, end]][, encoding]) — a
+      // Node signature: fill(value[, offset[, end]][, encoding]) â€” a
       // trailing string in the offset or end position is the encoding.
       if (typeof start === "string") {
         encoding = start;
@@ -742,6 +742,16 @@
       }
     }
   }
+  // Node's Buffer statics are ENUMERABLE (assigned, not class-static) —
+  // safer-buffer/safe-buffer clone them with for..in, and class statics
+  // (non-enumerable) would clone to an empty shell (iconv-lite found it).
+  for (const name of Object.getOwnPropertyNames(Buffer)) {
+    if (name === "prototype" || name === "name" || name === "length") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Buffer, name);
+    if (descriptor && descriptor.configurable && !descriptor.enumerable) {
+      Object.defineProperty(Buffer, name, { ...descriptor, enumerable: true });
+    }
+  }
   Buffer.poolSize = 8192;
 
   function btoa(input) {
@@ -812,6 +822,17 @@
     const kMax = Symbol("maxListeners");
     const errorMonitor = Symbol("events.errorMonitor");
 
+    // Lazy state init (Node parity): express-style code mixes
+    // EventEmitter.prototype onto plain functions WITHOUT running the
+    // constructor, so every method must tolerate a missing _events.
+    function eventsOf(self) {
+      if (self._events === undefined) {
+        self._events = { __proto__: null };
+        self._eventsCount = 0;
+      }
+      return self._events;
+    }
+
     class EventEmitter {
       constructor() {
         this._events = { __proto__: null };
@@ -825,6 +846,7 @@
         return this[kMax] ?? EventEmitter.defaultMaxListeners;
       }
       _add(type, listener, prepend, once) {
+        eventsOf(this);
         if (typeof listener !== "function") {
           throw new TypeError(`The "listener" argument must be a function`);
         }
@@ -880,7 +902,7 @@
         return this._add(type, listener, true, true);
       }
       removeListener(type, listener) {
-        const existing = this._events[type];
+        const existing = eventsOf(this)[type];
         if (existing === undefined) return this;
         if (existing === listener || existing.listener === listener) {
           delete this._events[type];
@@ -913,6 +935,7 @@
         return this.removeListener(type, listener);
       }
       removeAllListeners(type) {
+        eventsOf(this);
         if (type === undefined) {
           this._events = { __proto__: null };
           this._eventsCount = 0;
@@ -926,23 +949,24 @@
         return this.rawListeners(type).map((l) => l.listener ?? l);
       }
       rawListeners(type) {
-        const existing = this._events[type];
+        const existing = eventsOf(this)[type];
         if (existing === undefined) return [];
         return typeof existing === "function" ? [existing] : existing.slice();
       }
       listenerCount(type) {
-        const existing = this._events[type];
+        const existing = eventsOf(this)[type];
         if (existing === undefined) return 0;
         return typeof existing === "function" ? 1 : existing.length;
       }
       eventNames() {
-        return Reflect.ownKeys(this._events);
+        return Reflect.ownKeys(eventsOf(this));
       }
       emit(type, ...args) {
-        if (type === "error" && this._events[errorMonitor]) {
+        const events = eventsOf(this);
+        if (type === "error" && events[errorMonitor]) {
           for (const l of this.rawListeners(errorMonitor)) l.apply(this, args);
         }
-        const existing = this._events[type];
+        const existing = events[type];
         if (existing === undefined) {
           if (type === "error") {
             const err = args[0];
@@ -1061,7 +1085,7 @@
       assertPath(p);
       if (p.length === 0) return ".";
       const { root, rest } = splitRoot(p);
-      // '..' survives when there is no ABSOLUTE anchor — that includes
+      // '..' survives when there is no ABSOLUTE anchor â€” that includes
       // drive-relative roots ('C:..' stays 'C:..', per Node).
       const parts = normalizeParts(rest, root === "" || isDriveRelativeRoot(root));
       let out = root + parts.join(sep);
@@ -1157,7 +1181,7 @@
       if (!absolute || (isWin && device === "")) {
         // cwd fills whatever is missing: the tail anchor (when nothing was
         // absolute; same-device cwd anchors fully, foreign-device cwd
-        // anchors at the device root — wave-1 simplification of Node's
+        // anchors at the device root â€” wave-1 simplification of Node's
         // per-drive cwd tracking) and/or the device (when an absolute
         // driveless '\\x' path needs qualification).
         const cwd = natives ? natives.cwd() : "/";
@@ -1541,7 +1565,7 @@
 
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
-      // equal -0 — exactly Node's deepStrictEqual primitive rule.
+      // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
       const primitiveEqual = strict
         ? Object.is
         : // eslint-disable-next-line eqeqeq
@@ -1964,7 +1988,7 @@
   function streamStub(name) {
     return () => {
       throw new Error(
-        `fs.${name} is not implemented yet — fs.watch lands with a later compat wave`,
+        `fs.${name} is not implemented yet â€” fs.watch lands with a later compat wave`,
       );
     };
   }
@@ -2270,7 +2294,7 @@
         { rss: () => 0 },
       ),
       // Binary chunks (Buffers/views) pass through to the native as RAW
-      // bytes — a UTF-8 round-trip corrupts piped binary output (images,
+      // bytes â€” a UTF-8 round-trip corrupts piped binary output (images,
       // gzip). Strings encode as UTF-8 on the Rust side.
       stdout: {
         fd: 1,
@@ -2323,7 +2347,9 @@
       "events",
       "fs",
       "fs/promises",
+      "http",
       "module",
+      "net",
       "os",
       "path",
       "path/posix",
@@ -2370,7 +2396,7 @@
   // in installRuntimeGlobals.
   //
   // Wave-1 divergences (documented): executionAsyncId/triggerAsyncId
-  // return 0 (no async-ids machinery); createHook is a warn-once no-op —
+  // return 0 (no async-ids machinery); createHook is a warn-once no-op â€”
   // the legacy diagnostics API is deprecated in Node and the packages that
   // matter feature-detect AsyncLocalStorage first.
   registry.factories.async_hooks = (natives) => {
@@ -2507,7 +2533,7 @@
   // forms), async iteration, and web-stream interop (from/toWeb).
   //
   // Documented divergences: setEncoding decodes per-chunk (a multi-byte
-  // character split EXACTLY across chunks can mojibake — use
+  // character split EXACTLY across chunks can mojibake â€” use
   // TextDecoderStream for byte-exact decoding); no _writev/cork batching
   // (cork/uncork are accepted no-ops); 'readable'-event pull scheduling is
   // simplified (emitted on every push).
@@ -2758,7 +2784,7 @@
         src.on("end", state.onend);
         dest.emit("pipe", src);
         // pipe() flows the source even if it was explicitly paused (Node
-        // semantics) — backpressure re-pauses as needed.
+        // semantics) â€” backpressure re-pauses as needed.
         src.resume();
         return dest;
       }
@@ -3292,7 +3318,7 @@
     }
 
     // require('stream') IS the legacy Stream class in Node (an
-    // EventEmitter subclass with .prototype) — packages do
+    // EventEmitter subclass with .prototype) â€” packages do
     // util.inherits(X, require('stream')) (jws/jsonwebtoken among them),
     // so the module export must be the CLASS, with everything else
     // attached as properties.
@@ -3394,7 +3420,7 @@
 
   // ------------------------------------------------- URL / URLSearchParams
   // WHATWG URL: parsing and component mutation happen in Rust (servo's
-  // url crate — the reference implementation, IDNA included); these
+  // url crate â€” the reference implementation, IDNA included); these
   // classes are thin component holders. Setter failures keep the old
   // value silently, per spec.
   {
@@ -3415,7 +3441,7 @@
     function formDecode(text) {
       const src = String(text).replaceAll("+", " ");
       const bytes = [];
-      // Literal chars are buffered into RUNS before UTF-8 encoding —
+      // Literal chars are buffered into RUNS before UTF-8 encoding â€”
       // encoding per code UNIT tears astral pairs (emoji) into U+FFFD.
       let literal = "";
       const flush = () => {
@@ -3450,7 +3476,7 @@
     class URLSearchParams {
       constructor(init) {
         // The list is mutated IN PLACE everywhere: iteration is LIVE and
-        // index-based (spec) — snapshot iteration diverges on the classic
+        // index-based (spec) â€” snapshot iteration diverges on the classic
         // mutate-while-iterating shapes.
         this._list = []; // [name, value] pairs, order-preserving
         this._url = null; // back-reference set by URL
@@ -3698,7 +3724,7 @@
         );
       }
       // Encoded separators would let a URL smuggle path segments past
-      // consumers — Node throws, so do we.
+      // consumers â€” Node throws, so do we.
       if (/%2f|%5c/i.test(url.pathname)) {
         throw makeNodeError(
           "ERR_INVALID_FILE_URL_PATH",
@@ -3714,7 +3740,7 @@
         }
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
-          // drive — fail loud like Node.
+          // drive â€” fail loud like Node.
           throw makeNodeError(
             "ERR_INVALID_FILE_URL_PATH",
             "File URL path must be absolute",
@@ -3739,7 +3765,7 @@
       p = p.replaceAll("\\", "/");
       if (trailingSep && !p.endsWith("/")) p += "/";
       // Percent-encode the URL-special characters paths may carry ('%'
-      // FIRST — later substitutions insert literal % sequences).
+      // FIRST â€” later substitutions insert literal % sequences).
       const encoded = p
         .replaceAll("%", "%25")
         .replaceAll("#", "%23")
@@ -3812,7 +3838,7 @@
     // Secret-key KeyObject subset: jsonwebtoken-class packages route every
     // key through instanceof KeyObject / createSecretKey, with
     // createPrivateKey/createPublicKey probed in try/catch for asymmetric
-    // detection — those throw until the asymmetric wave lands.
+    // detection â€” those throw until the asymmetric wave lands.
     class KeyObject {
       constructor(type, material) {
         this.type = type;
@@ -3833,7 +3859,7 @@
     function asymmetricUnsupported() {
       throw makeNodeError(
         "ERR_CRYPTO_UNSUPPORTED_OPERATION",
-        "asymmetric keys (RSA/EC) land with a later crypto wave — HS* (HMAC) algorithms work today",
+        "asymmetric keys (RSA/EC) land with a later crypto wave â€” HS* (HMAC) algorithms work today",
       );
     }
 
@@ -3916,7 +3942,7 @@
         throw new RangeError("randomInt: max must be greater than min (safe integers)");
       }
       const range = max - min;
-      // Rejection sampling over 48 bits — uniform, like Node.
+      // Rejection sampling over 48 bits â€” uniform, like Node.
       let value;
       do {
         const bytes = natives.cryptoRandomFill(6);
@@ -3991,7 +4017,7 @@
   // gzip/deflate/deflateRaw + unzip auto-detect. Sync forms run on the
   // isolate thread (the API contract); callback forms ride the async op
   // (CPU work on the blocking pool, Node's threadpool model). create*
-  // Transform classes BUFFER input and emit on flush — wave-1 divergence,
+  // Transform classes BUFFER input and emit on flush â€” wave-1 divergence,
   // documented: true incremental compression streams land later. brotli*
   // is gated with a pointer.
   registry.factories.zlib = (natives) => {
@@ -4049,7 +4075,7 @@
     }
 
     const brotliGate = () => {
-      throw new Error("brotli lands with a later zlib wave — gzip/deflate work today");
+      throw new Error("brotli lands with a later zlib wave â€” gzip/deflate work today");
     };
 
     return {
@@ -4093,7 +4119,7 @@
   // ----------------------------------------------------- node:querystring
   // Legacy querystring: escape ~= encodeURIComponent (space -> %20),
   // parse decodes '+' as space, repeated keys become arrays, custom
-  // separators supported — all node-probed semantics.
+  // separators supported â€” all node-probed semantics.
   registry.factories.querystring = () => {
     const unescape = (text) => {
       try {
@@ -4220,6 +4246,299 @@
     return mod;
   };
 
+  // ------------------------------------------------------------ node:http
+  // Server side over the same natives oam.serve uses. createServer's
+  // ServerResponse streams: the first write() opens a chunked response,
+  // so res.write per SSE event flushes immediately. The http CLIENT
+  // (http.request/get) is gated â€” use fetch (documented).
+  registry.factories.http = (natives) => {
+    const EventEmitter = registry.get("events");
+    const { Readable } = registry.get("stream");
+
+    class IncomingMessage extends Readable {
+      constructor(meta) {
+        super({});
+        this.method = meta.method;
+        this.url = meta.uri;
+        this.httpVersion = "1.1";
+        this.headers = {};
+        this.rawHeaders = [];
+        for (const [name, value] of meta.headers) {
+          const key = name.toLowerCase();
+          this.headers[key] = key in this.headers ? `${this.headers[key]}, ${value}` : value;
+          this.rawHeaders.push(name, value);
+        }
+        this.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+        const body = natives.httpRequestBody(meta.requestId);
+        if (body.length > 0) {
+          this.push(new globalThis.Buffer(body.buffer, body.byteOffset, body.length));
+        }
+        this.push(null);
+      }
+      _read() {}
+    }
+
+    class ServerResponse extends EventEmitter {
+      constructor(requestId) {
+        super();
+        this._requestId = requestId;
+        this._headers = new Map();
+        this._streamId = null;
+        this._ended = false;
+        this.statusCode = 200;
+        this.statusMessage = "";
+        this.headersSent = false;
+      }
+      setHeader(name, value) {
+        this._headers.set(String(name).toLowerCase(), value);
+        return this;
+      }
+      getHeader(name) {
+        return this._headers.get(String(name).toLowerCase());
+      }
+      getHeaderNames() {
+        return [...this._headers.keys()];
+      }
+      removeHeader(name) {
+        this._headers.delete(String(name).toLowerCase());
+      }
+      hasHeader(name) {
+        return this._headers.has(String(name).toLowerCase());
+      }
+      writeHead(status, message, headers) {
+        if (typeof message === "object" && message !== null) {
+          headers = message;
+          message = undefined;
+        }
+        this.statusCode = status;
+        if (message) this.statusMessage = message;
+        if (headers) {
+          if (Array.isArray(headers)) {
+            for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
+          } else {
+            for (const key of Object.keys(headers)) this.setHeader(key, headers[key]);
+          }
+        }
+        return this;
+      }
+      _headerPairsJson() {
+        const pairs = [];
+        for (const [key, value] of this._headers) {
+          if (Array.isArray(value)) for (const item of value) pairs.push([key, String(item)]);
+          else pairs.push([key, String(value)]);
+        }
+        return JSON.stringify(pairs);
+      }
+      _toBytes(chunk, encoding) {
+        if (chunk === null || chunk === undefined) return new Uint8Array(0);
+        if (typeof chunk === "string") return globalThis.Buffer.from(chunk, encoding ?? "utf8");
+        return chunk;
+      }
+      write(chunk, encoding, cb) {
+        if (typeof encoding === "function") {
+          cb = encoding;
+          encoding = undefined;
+        }
+        if (this._ended) return false;
+        if (this._streamId === null) {
+          this.headersSent = true;
+          this._streamId = natives.httpRespondStream(
+            this._requestId,
+            this.statusCode,
+            this._headerPairsJson(),
+          );
+        }
+        natives.httpBodyPush(this._streamId, this._toBytes(chunk, encoding)).then(
+          () => cb?.(),
+          (err) => {
+            this.emit("error", err);
+            cb?.(err);
+          },
+        );
+        return true;
+      }
+      end(chunk, encoding, cb) {
+        if (typeof chunk === "function") {
+          cb = chunk;
+          chunk = undefined;
+        } else if (typeof encoding === "function") {
+          cb = encoding;
+          encoding = undefined;
+        }
+        if (this._ended) return this;
+        this._ended = true;
+        if (this._streamId === null) {
+          // Single-shot: full body, hyper sets content-length.
+          this.headersSent = true;
+          natives.httpRespond(
+            this._requestId,
+            this.statusCode,
+            this._headerPairsJson(),
+            this._toBytes(chunk, encoding),
+          );
+          queueMicrotask(() => {
+            this.emit("finish");
+            cb?.();
+          });
+        } else {
+          const finish = () => {
+            natives.httpBodyEnd(this._streamId);
+            this.emit("finish");
+            cb?.();
+          };
+          if (chunk !== undefined && chunk !== null) {
+            natives.httpBodyPush(this._streamId, this._toBytes(chunk, encoding)).then(finish, finish);
+          } else {
+            finish();
+          }
+        }
+        return this;
+      }
+      flushHeaders() {
+        if (this._streamId === null && !this._ended) this.write(new Uint8Array(0));
+      }
+    }
+
+    class Server extends EventEmitter {
+      constructor(handler) {
+        super();
+        if (handler) this.on("request", handler);
+        this._serverId = null;
+        this._port = null;
+        this._host = null;
+        this.listening = false;
+      }
+      listen(port, host, callback) {
+        if (typeof port === "object" && port !== null) {
+          // listen({ port, host }, cb)
+          callback = host;
+          host = port.host;
+          port = port.port;
+        }
+        if (typeof host === "function") {
+          callback = host;
+          host = undefined;
+        }
+        if (typeof callback === "function") this.once("listening", callback);
+        const hostname = host ?? "127.0.0.1";
+        natives.httpServe(hostname, port ?? 0).then(
+          (bound) => {
+            this._serverId = bound.serverId;
+            this._port = bound.port;
+            this._host = hostname;
+            this.listening = true;
+            this.emit("listening");
+            (async () => {
+              for (;;) {
+                const meta = await natives.httpAccept(bound.serverId);
+                if (meta === undefined) break;
+                const req = new IncomingMessage(meta);
+                const res = new ServerResponse(meta.requestId);
+                this.emit("request", req, res);
+              }
+              this.emit("close");
+            })();
+          },
+          (err) => this.emit("error", err),
+        );
+        return this;
+      }
+      address() {
+        return this.listening
+          ? { port: this._port, address: this._host, family: "IPv4" }
+          : null;
+      }
+      close(callback) {
+        if (this._serverId !== null) {
+          natives.httpClose(this._serverId);
+          this.listening = false;
+        }
+        if (callback) this.once("close", callback);
+        return this;
+      }
+    }
+
+    const clientGate = () => {
+      throw new Error(
+        "http.request/http.get land with a later wave â€” use fetch() (streaming supported)",
+      );
+    };
+
+    return {
+      createServer: (options, handler) =>
+        new Server(typeof options === "function" ? options : handler),
+      Server,
+      IncomingMessage,
+      ServerResponse,
+      request: clientGate,
+      get: clientGate,
+      METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+      STATUS_CODES: {
+        200: "OK",
+        201: "Created",
+        204: "No Content",
+        301: "Moved Permanently",
+        302: "Found",
+        304: "Not Modified",
+        400: "Bad Request",
+        401: "Unauthorized",
+        403: "Forbidden",
+        404: "Not Found",
+        413: "Payload Too Large",
+        500: "Internal Server Error",
+        503: "Service Unavailable",
+      },
+    };
+  };
+
+  // ------------------------------------------------------------- node:net
+  // Wave-1 subset: the address-classification helpers framework stacks
+  // require at load (proxy-addr -> express). Sockets land with a later
+  // wave; everything socket-shaped throws with a pointer.
+  registry.factories.net = () => {
+    const V4_SEGMENT = /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
+    function isIPv4(input) {
+      const parts = String(input).split(".");
+      return parts.length === 4 && parts.every((p) => V4_SEGMENT.test(p));
+    }
+    function isIPv6(input) {
+      const text = String(input);
+      if (text.length === 0 || text.includes(" ")) return false;
+      const sections = text.split("::");
+      if (sections.length > 2) return false;
+      const check = (part) =>
+        part === "" ||
+        part
+          .split(":")
+          .every(
+            (group, i, arr) =>
+              /^[0-9A-Fa-f]{1,4}$/.test(group) ||
+              (i === arr.length - 1 && isIPv4(group)),
+          );
+      if (sections.length === 2) return check(sections[0]) && check(sections[1]);
+      const groups = text.split(":");
+      const hasV4Tail = isIPv4(groups[groups.length - 1]);
+      const expected = hasV4Tail ? 7 : 8;
+      return groups.length === expected && check(text);
+    }
+    const socketGate = () => {
+      throw new Error("net sockets land with a later wave â€” wave 1 ships isIP/isIPv4/isIPv6");
+    };
+    return {
+      isIPv4,
+      isIPv6,
+      isIP: (input) => (isIPv4(input) ? 4 : isIPv6(input) ? 6 : 0),
+      createConnection: socketGate,
+      connect: socketGate,
+      createServer: socketGate,
+      Socket: class Socket {
+        constructor() {
+          socketGate();
+        }
+      },
+    };
+  };
+
   // ------------------------------------------------------------------ tty
   registry.factories.tty = (natives) => ({
     isatty: (fd) => natives.isTTY(Number(fd)),
@@ -4262,11 +4581,16 @@
       timeOrigin: Date.now() - natives.nowMs(),
     };
     globalThis.crypto = registry.get("crypto").webcrypto;
+    // oam.serve: defined in bootstrap (snapshot), attached here because
+    // the `oam` namespace object is a post-restore native install.
+    if (globalThis.oam && globalThis.__oamServe) {
+      globalThis.oam.serve = globalThis.__oamServe;
+    }
 
     // AsyncLocalStorage across macrotasks: V8's CPED only travels with
     // promise continuations, so timer-family callbacks are bound to the
     // frame current at SCHEDULING time (Node semantics). Promise paths
-    // need no wrapper — V8 handles them.
+    // need no wrapper â€” V8 handles them.
     {
       const bindToCurrentFrame = (fn) => {
         if (typeof fn !== "function") return fn;
@@ -4282,7 +4606,7 @@
         };
       };
       // setImmediate delegates to globalThis.setTimeout at call time, so
-      // wrapping the timer pair covers it — no double-bind.
+      // wrapping the timer pair covers it â€” no double-bind.
       for (const name of ["setTimeout", "setInterval", "queueMicrotask"]) {
         const native = globalThis[name];
         if (typeof native !== "function") continue;

@@ -14,3 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # node:zlib compression backend.
 flate2 = { workspace = true }
+# HTTP server (hyper rides in-tree via reqwest).
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }

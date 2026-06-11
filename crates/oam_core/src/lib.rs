@@ -17,6 +17,8 @@ use std::time::Instant;
 
 pub use oam_diagnostics as diagnostics;
 
+pub mod http_server;
+
 pub type OpId = u64;
 
 /// What an async op produced. v8-free by design; the engine maps these to
@@ -62,7 +64,8 @@ pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Re
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, tokio::fs::File>>>;
 
 pub struct CoreRuntime {
-    tokio: tokio::runtime::Runtime,
+    /// Option so Drop can take it for shutdown_background (see below).
+    tokio: Option<tokio::runtime::Runtime>,
     /// Shared HTTP client (connection pool). Owned per CoreRuntime so pooled
     /// connections never outlive the tokio runtime they were spawned on.
     http: reqwest::Client,
@@ -72,6 +75,7 @@ pub struct CoreRuntime {
     inflight: usize,
     bodies: BodyRegistry,
     files: FileRegistry,
+    http_state: std::sync::Arc<http_server::HttpState>,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -95,7 +99,7 @@ impl CoreRuntime {
             .map_err(|e| format!("http client: {e}"))?;
         let (tx, rx) = mpsc::channel();
         Ok(Self {
-            tokio,
+            tokio: Some(tokio),
             http,
             tx,
             rx,
@@ -103,6 +107,7 @@ impl CoreRuntime {
             inflight: 0,
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http_state: std::sync::Arc::new(http_server::HttpState::default()),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -129,6 +134,11 @@ impl CoreRuntime {
         self.files.clone()
     }
 
+    /// HTTP server state (Arc clone; servers die with the run).
+    pub fn http(&self) -> std::sync::Arc<http_server::HttpState> {
+        self.http_state.clone()
+    }
+
     /// Spawn an async op; its completion will surface via try_recv /
     /// recv_deadline tagged with the returned id.
     pub fn spawn_op<F>(&mut self, op: F) -> OpId
@@ -139,11 +149,14 @@ impl CoreRuntime {
         self.next_id += 1;
         self.inflight += 1;
         let tx = self.tx.clone();
-        self.tokio.spawn(async move {
-            let outcome = op.await;
-            // Receiver dropped means the runtime is shutting down: fine.
-            let _ = tx.send(OpCompletion { id, outcome });
-        });
+        self.tokio
+            .as_ref()
+            .expect("runtime alive")
+            .spawn(async move {
+                let outcome = op.await;
+                // Receiver dropped means the runtime is shutting down: fine.
+                let _ = tx.send(OpCompletion { id, outcome });
+            });
         id
     }
 
@@ -177,6 +190,19 @@ impl CoreRuntime {
             self.inflight -= 1;
         }
         completion
+    }
+}
+
+impl Drop for CoreRuntime {
+    fn drop(&mut self) {
+        // The run is over: nothing on the IO runtime may block process
+        // exit. A plain Runtime::drop WAITS — an idle keep-alive
+        // connection (reqwest pool, 90s idle timeout; a hyper server
+        // conn) turned exit into a 90-second hang. shutdown_background
+        // drops everything without waiting.
+        if let Some(runtime) = self.tokio.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
