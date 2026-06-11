@@ -19,6 +19,7 @@ use std::sync::Once;
 mod cjs;
 mod crypto_ops;
 mod modules;
+pub mod napi;
 mod node_ops;
 mod ops;
 mod timers;

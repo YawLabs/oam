@@ -1113,6 +1113,72 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
     );
 }
 
+// ------------------------------------------------------------- N-API alpha
+
+#[test]
+fn napi_addon_loads_and_calls_native_functions() {
+    // The workspace builds the test addon cdylib alongside everything
+    // else; rename it to .node like an npm-shipped prebuilt.
+    let artifact = if cfg!(windows) {
+        "oam_napi_test_addon.dll"
+    } else if cfg!(target_os = "macos") {
+        "liboam_napi_test_addon.dylib"
+    } else {
+        "liboam_napi_test_addon.so"
+    };
+    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(artifact);
+    if !built.is_file() {
+        panic!(
+            "test addon not built at {} — `cargo build -p oam_napi_test_addon` first",
+            built.display()
+        );
+    }
+    let addon = write_temp("napi/native.node", "placeholder");
+    std::fs::copy(&built, &addon).expect("copy addon into place");
+
+    write_temp(
+        "napi/main.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.add(40, 2), native.answer);\n\
+         console.log(native.greet('oam'));\n\
+         console.log(native.concat(['a', 'b', 'c']));\n\
+         // Same instance through the cache.\n\
+         console.log(require('./native.node') === native);\n\
+         // Native throw surfaces as a real JS TypeError with the code.\n\
+         try {\n\
+           native.boom();\n\
+         } catch (e) {\n\
+           console.log(e.constructor.name, e.code, e.message);\n\
+         }\n\
+         // Bad args path.\n\
+         try {\n\
+           native.add('x');\n\
+         } catch (e) {\n\
+           console.log(e.code);\n\
+         }",
+    );
+    let main = write_temp("napi/.anchor", "")
+        .parent()
+        .unwrap()
+        .join("main.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "42 42");
+    assert_eq!(lines[1], "hello from native, oam");
+    assert_eq!(lines[2], "a+b+c");
+    assert_eq!(lines[3], "true");
+    assert_eq!(lines[4], "TypeError ERR_NATIVE_BOOM native says no");
+    assert_eq!(lines[5], "ERR_NATIVE_ARGS");
+}
+
 // ------------------------------------------------------------- http server
 
 #[test]

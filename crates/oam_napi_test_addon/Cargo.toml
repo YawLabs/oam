@@ -1,0 +1,13 @@
+[package]
+name = "oam_napi_test_addon"
+description = "Test fixture: a real compiled N-API addon (.node) used by the e2e suite to prove the ABI path."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libloading = { workspace = true }

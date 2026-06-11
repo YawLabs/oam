@@ -207,6 +207,21 @@ pub(crate) fn load_cjs<'s>(
         return module_exports(scope, module);
     }
 
+    // N-API addons: dlopen + register, cached like any CJS module.
+    if key.extension().and_then(|e| e.to_str()) == Some("node") {
+        let exports_value = crate::napi::load_addon(scope, &key)?;
+        let module = v8::Object::new(scope);
+        let exports_key = v8::String::new(scope, "exports")?;
+        module.set(scope, exports_key.into(), exports_value);
+        let global = v8::Global::new(scope, module);
+        scope
+            .get_slot_mut::<CjsCache>()
+            .expect("cjs cache installed")
+            .modules
+            .insert(key, global);
+        return Some(exports_value);
+    }
+
     // .cts would execute as raw TypeScript here — gate it with a clear
     // pointer until a TS-to-CJS transform exists (if ever; .ts is ESM).
     if key.extension().and_then(|e| e.to_str()) == Some("cts") {

@@ -8,6 +8,7 @@ members = [
     "crates/oam_ts",
     "crates/oam_mcp",
     "crates/oam_cli",
+    "crates/oam_napi_test_addon",
     "xtask",
 ]
 
@@ -53,6 +54,8 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# N-API: dlopen for .node addons (and the test addon's host-symbol lookup).
+libloading = "0.8"
 clap = { version = "4", features = ["derive"] }
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —

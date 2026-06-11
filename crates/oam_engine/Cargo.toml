@@ -22,6 +22,8 @@ sha2 = { workspace = true }
 md-5 = { workspace = true }
 hmac = { workspace = true }
 getrandom = { workspace = true }
+# N-API addon loading.
+libloading = { workspace = true }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

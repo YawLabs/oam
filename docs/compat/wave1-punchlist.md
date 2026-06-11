@@ -83,6 +83,21 @@ fix opportunistically or when a real package trips one.
 - pathToFileURL keeps '+' literal in hrefs (round-trips fine; href
   string equality with Node differs on '+'-bearing names).
 
+## N-API (alpha boundaries)
+
+The alpha ships the value/property/function/error core (~39 symbols) —
+enough for procedural addons. Not yet implemented (addons needing these
+fail at load with a missing-symbol error naming the gap):
+
+- napi_wrap / napi_define_class / instance data (the class machinery
+  better-sqlite3-style addons need)
+- napi_create_reference / deleted-value lifetimes
+- napi_create_async_work / threadsafe functions (libuv-shaped)
+- buffers/arraybuffers/typedarrays across the boundary
+- bigint, dates, external values
+- napi_open/close_handle_scope are not yet real (values live in the
+  caller's scope)
+
 ## CLI
 
 - Script flags arrive via `oam run file.ts -- --flag` (cargo convention);

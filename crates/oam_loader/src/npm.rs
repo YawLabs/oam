@@ -392,7 +392,8 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
         if raw.is_file() {
             return Some(raw.to_path_buf());
         }
-        for ext in ["js", "json"] {
+        // Node's LOAD_AS_FILE order: .js, .json, .node.
+        for ext in ["js", "json", "node"] {
             let candidate = PathBuf::from(format!("{}.{ext}", raw.display()));
             if candidate.is_file() {
                 return Some(candidate);
@@ -452,7 +453,8 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
 pub fn module_kind(path: &Path) -> ModuleKind {
     match path.extension().and_then(|e| e.to_str()) {
         Some("mjs" | "mts" | "ts" | "tsx") => return ModuleKind::Esm,
-        Some("cjs" | "cts") => return ModuleKind::Cjs,
+        // .node addons ride the CJS/require machinery, per Node.
+        Some("cjs" | "cts" | "node") => return ModuleKind::Cjs,
         _ => {}
     }
     let in_node_modules = path.components().any(|c| c.as_os_str() == "node_modules");
