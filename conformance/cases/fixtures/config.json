@@ -1,0 +1,6 @@
+{
+  "name": "oam-conformance",
+  "port": 8080,
+  "tags": ["fast", "typed", "reliable"],
+  "nested": { "deep": [1, 2, 3] }
+}

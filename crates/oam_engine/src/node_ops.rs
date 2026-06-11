@@ -468,6 +468,27 @@ fn url_components(parsed: &url::Url) -> serde_json::Value {
     })
 }
 
+/// Parse with a PANIC boundary: rust-url carries debug assertions that
+/// hostile inputs (the WPT corpus reaches them) can trip; a library panic
+/// must surface as a JS TypeError, never unwind into V8's callback frames
+/// (that aborts the process). Err is the user-facing message.
+fn parse_components(input: &str, base: Option<&str>) -> Result<String, String> {
+    std::panic::catch_unwind(|| {
+        let parsed = match base {
+            None => url::Url::parse(input),
+            Some(base) => match url::Url::parse(base) {
+                Ok(base) => base.join(input),
+                Err(_) => return Err(format!("Invalid base URL: {base}")),
+            },
+        };
+        match parsed {
+            Ok(parsed) => Ok(url_components(&parsed).to_string()),
+            Err(_) => Err(format!("Invalid URL: {input}")),
+        }
+    })
+    .unwrap_or_else(|_| Err(format!("Invalid URL: {input}")))
+}
+
 /// urlParse(input, base?) -> components, or throws TypeError("Invalid URL").
 fn op_url_parse(
     scope: &mut v8::PinScope<'_, '_>,
@@ -479,24 +500,20 @@ fn op_url_parse(
         return;
     };
     let base = args.get(1);
-    let parsed = if base.is_null_or_undefined() {
-        url::Url::parse(&input)
+    let base = if base.is_null_or_undefined() {
+        None
     } else {
-        let Some(base) = base.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) else {
-            throw_type_error(scope, "Invalid base URL");
-            return;
-        };
-        match url::Url::parse(&base) {
-            Ok(base) => base.join(&input),
-            Err(_) => {
-                throw_type_error(scope, &format!("Invalid base URL: {base}"));
+        match base.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) {
+            Some(base) => Some(base),
+            None => {
+                throw_type_error(scope, "Invalid base URL");
                 return;
             }
         }
     };
-    match parsed {
-        Ok(parsed) => return_json(scope, &mut rv, &url_components(&parsed).to_string()),
-        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    match parse_components(&input, base.as_deref()) {
+        Ok(json) => return_json(scope, &mut rv, &json),
+        Err(message) => throw_type_error(scope, &message),
     }
 }
 
@@ -516,19 +533,33 @@ fn op_url_update(
         throw_type_error(scope, "urlUpdate requires href, part, value");
         return;
     };
-    let Ok(mut parsed) = url::Url::parse(&href) else {
-        throw_type_error(scope, &format!("Invalid URL: {href}"));
-        return;
+    // Same panic boundary as parse_components: rust-url setter internals
+    // carry debug assertions hostile values can trip; spec setter
+    // semantics on failure are keep-old, so a panic returns the original.
+    let updated = std::panic::catch_unwind(|| update_components(&href, &part, &value))
+        .unwrap_or_else(|_| update_components(&href, "__noop", ""));
+    match updated {
+        Ok(json) => return_json(scope, &mut rv, &json),
+        Err(message) => throw_type_error(scope, &message),
+    }
+}
+
+/// Apply one WHATWG setter to `href`, returning the resulting component
+/// bundle. "__noop" re-serializes unchanged (the panic-recovery path).
+fn update_components(href: &str, part: &str, value: &str) -> Result<String, String> {
+    let Ok(mut parsed) = url::Url::parse(href) else {
+        return Err(format!("Invalid URL: {href}"));
     };
-    match part.as_str() {
+    match part {
+        "__noop" => {}
         "protocol" => {
             let _ = parsed.set_scheme(value.trim_end_matches(':'));
         }
         "username" => {
-            let _ = parsed.set_username(&value);
+            let _ = parsed.set_username(value);
         }
         "password" => {
-            let _ = parsed.set_password(if value.is_empty() { None } else { Some(&value) });
+            let _ = parsed.set_password(if value.is_empty() { None } else { Some(value) });
         }
         "host" => {
             // WHATWG host-state (setter form): strip tab/CR/LF, split
@@ -591,7 +622,7 @@ fn op_url_update(
             // Opaque-path URLs (data:, mailto:, ...) ignore the pathname
             // setter entirely, per spec.
             if !parsed.cannot_be_a_base() {
-                parsed.set_path(&value);
+                parsed.set_path(value);
             }
         }
         "search" => {
@@ -601,12 +632,12 @@ fn op_url_update(
             if value.is_empty() {
                 parsed.set_query(None);
             } else {
-                let trimmed = value.strip_prefix('?').unwrap_or(&value);
+                let trimmed = value.strip_prefix('?').unwrap_or(value);
                 parsed.set_query(Some(trimmed));
             }
         }
         "hash" => {
-            let trimmed = value.strip_prefix('#').unwrap_or(&value);
+            let trimmed = value.strip_prefix('#').unwrap_or(value);
             parsed.set_fragment(if trimmed.is_empty() {
                 None
             } else {
@@ -614,11 +645,10 @@ fn op_url_update(
             });
         }
         other => {
-            throw_type_error(scope, &format!("urlUpdate: unknown part '{other}'"));
-            return;
+            return Err(format!("urlUpdate: unknown part '{other}'"));
         }
     }
-    return_json(scope, &mut rv, &url_components(&parsed).to_string());
+    Ok(url_components(&parsed).to_string())
 }
 
 /// Split a host-setter value into (host, port-digits), respecting IPv6

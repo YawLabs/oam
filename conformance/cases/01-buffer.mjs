@@ -1,0 +1,22 @@
+// Buffer: encodings, lenient base64, numerics, write boundaries, BOM.
+const b = Buffer.from("hello oam", "utf8");
+console.log(b.toString("hex"), b.toString("base64"), b.toString("base64url"));
+console.log(Buffer.from(b.toString("hex"), "hex").toString());
+console.log(Buffer.from("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "base64").length);
+console.log(Buffer.from("QUJDREVGR-k", "base64").toString("hex"));
+console.log(Buffer.from("abcde", "base64").toString("hex"));
+console.log(Buffer.from([0xef, 0xbb, 0xbf, 0x61]).toString().length);
+const n = Buffer.alloc(8);
+n.writeUInt32BE(0xdeadbeef, 0);
+n.writeUIntLE(0x010203040506 / 256, 2, 5);
+console.log(n.toString("hex"), n.readUInt32BE(0).toString(16));
+const w = Buffer.alloc(3);
+console.log(w.write("ab€"), w.toString("hex"));
+console.log(Buffer.alloc(5).fill("ab", "utf16le").toString("hex"));
+console.log(Buffer.from([1, 2, 3, 4]).swap16().toString("hex"));
+console.log(Buffer.from("café", "latin1").toString("latin1"));
+console.log(Buffer.byteLength("héllo"), Buffer.from("ab", "utf16le").length);
+console.log(Buffer.concat([Buffer.from("a"), Buffer.from("bc")]).toString());
+console.log(b.subarray(0, 5).toString(), b.indexOf("oam"), b.includes("xyz"));
+console.log(JSON.stringify(Buffer.from([1, 2]).toJSON()));
+console.log(atob(btoa("wire")), btoa("hi"));

@@ -66,6 +66,10 @@ fix opportunistically or when a real package trips one.
 - Unhandled-rejection policy diverges from Node: late-attached handlers
   un-flag (Node warns immediately at the macrotask boundary), detection
   happens only at end of run.
+- process.nextTick relative ordering vs already-queued microtasks differs
+  (oam's nextTick IS a microtask; Node drains the nextTick queue at its
+  own checkpoints — observable in ESM top-level where the module job
+  itself is a microtask). Both-before-timers holds in both runtimes.
 - stat results hardcode mode: 0 and alias ctimeMs to mtimeMs.
 - os.release()/os.version() return '' and cpus() reports model 'unknown'
   without a doc note; os.uptime() is process uptime, not system uptime.

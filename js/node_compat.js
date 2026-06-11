@@ -1435,6 +1435,9 @@
       if (typeof f !== "string") {
         return [f, ...args].map(formatValue).join(" ");
       }
+      // Node fast-path: a lone format string with NO substitution args is
+      // returned verbatim ('%%' stays '%%').
+      if (args.length === 0) return f;
       let i = 0;
       let out = f.replace(/%[sdifjoO%]/g, (spec) => {
         if (spec === "%%") return "%";

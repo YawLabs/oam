@@ -1,0 +1,366 @@
+{
+  "commit": "3036fbe",
+  "host": "windows-aarch64",
+  "nodeVersion": "v22.22.2",
+  "oamVersion": "oam 0.0.1",
+  "schema": "oam-conformance/1",
+  "suites": {
+    "nodeDifferential": {
+      "cases": [
+        {
+          "case": "01-buffer.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "02-path.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "03-url.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "04-events.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "05-node-streams.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "06-web-streams.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "07-crypto.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "08-string-decoder-util-assert.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "09-fs-sync.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "10-timers-als-process.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "11-json-modules.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "12-node-url.mjs",
+          "status": "pass"
+        }
+      ],
+      "pass": 12,
+      "total": 12
+    },
+    "surface": {
+      "globals": {
+        "detail": {
+          "AbortController": false,
+          "AbortSignal": false,
+          "Blob": false,
+          "BroadcastChannel": false,
+          "Buffer": true,
+          "Event": false,
+          "EventTarget": false,
+          "FormData": false,
+          "Headers": false,
+          "ReadableStream": true,
+          "Request": false,
+          "Response": false,
+          "TextDecoder": true,
+          "TextDecoderStream": true,
+          "TextEncoder": true,
+          "TextEncoderStream": true,
+          "TransformStream": true,
+          "URL": true,
+          "URLSearchParams": true,
+          "WebSocket": false,
+          "WritableStream": true,
+          "atob": true,
+          "btoa": true,
+          "crypto": true,
+          "fetch": true,
+          "performance": true,
+          "process": true,
+          "queueMicrotask": true,
+          "setImmediate": true,
+          "setInterval": true,
+          "setTimeout": true,
+          "structuredClone": false
+        },
+        "have": 20,
+        "total": 32
+      },
+      "modules": {
+        "detail": {
+          "assert": true,
+          "async_hooks": true,
+          "buffer": true,
+          "child_process": false,
+          "cluster": false,
+          "console": false,
+          "crypto": true,
+          "dgram": false,
+          "diagnostics_channel": false,
+          "dns": false,
+          "domain": false,
+          "events": true,
+          "fs": true,
+          "fs/promises": true,
+          "http": false,
+          "http2": false,
+          "https": false,
+          "inspector": false,
+          "module": true,
+          "net": false,
+          "os": true,
+          "path": true,
+          "perf_hooks": false,
+          "process": true,
+          "punycode": false,
+          "querystring": false,
+          "readline": false,
+          "repl": false,
+          "stream": true,
+          "stream/consumers": true,
+          "stream/promises": true,
+          "stream/web": true,
+          "string_decoder": true,
+          "timers": false,
+          "tls": false,
+          "trace_events": false,
+          "tty": true,
+          "url": true,
+          "util": true,
+          "v8": false,
+          "vm": false,
+          "worker_threads": false,
+          "zlib": false
+        },
+        "have": 19,
+        "total": 43
+      }
+    },
+    "wptUrl": {
+      "constructor": {
+        "pass": 820,
+        "total": 888
+      },
+      "failureCount": 125,
+      "failureSample": [
+        {
+          "base": "http://example.org/foo/bar",
+          "expected": "",
+          "field": "hash",
+          "got": "#",
+          "input": ":#",
+          "suite": "constructor"
+        },
+        {
+          "base": "http://example.org/foo/bar",
+          "expected": "",
+          "field": "hash",
+          "got": "#",
+          "input": "#",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:///w:/m",
+          "field": "href",
+          "got": "file:///w|/m",
+          "input": "file:///w|/m",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "",
+          "field": "hash",
+          "got": "#",
+          "input": "http://www.google.com/foo?bar=baz#",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "non-special:opaque %20?hi",
+          "field": "href",
+          "got": "non-special:opaque  ?hi",
+          "input": "non-special:opaque  ?hi",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "non-special:opaque %20#hi",
+          "field": "href",
+          "got": "non-special:opaque  #hi",
+          "input": "non-special:opaque  #hi",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "non-special:opaque  %20#hi",
+          "field": "href",
+          "got": "non-special:opaque   #hi",
+          "input": "non-special:opaque \t\t  \t#hi",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "non-special:opaque  %20#hi",
+          "field": "href",
+          "got": "non-special:opaque   #hi",
+          "input": "non-special:opaque \t\t  #hi",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "non-special:opaque  %20#hi",
+          "field": "href",
+          "got": "non-special:opaque   #hi",
+          "input": "non-special:opaque\t\t  \r #hi",
+          "suite": "constructor"
+        },
+        {
+          "base": "test:test",
+          "expected": "",
+          "field": "hash",
+          "got": "#",
+          "input": "#",
+          "suite": "constructor"
+        },
+        {
+          "base": "test:test?test",
+          "expected": "",
+          "field": "hash",
+          "got": "#",
+          "input": "#",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://h/C:/a/b",
+          "expected": "file://h/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "/",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////",
+          "field": "href",
+          "got": "file:///",
+          "input": "file:\\\\//",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////",
+          "field": "href",
+          "got": "file:///",
+          "input": "file:\\\\\\\\",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////?fox",
+          "field": "href",
+          "got": "file:///?fox",
+          "input": "file:\\\\\\\\?fox",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////#guppy",
+          "field": "href",
+          "got": "file:///#guppy",
+          "input": "file:\\\\\\\\#guppy",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file://spider///",
+          "field": "href",
+          "got": "file://spider/",
+          "input": "file://spider///",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////",
+          "field": "href",
+          "got": "file:///",
+          "input": "file:\\\\localhost//",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file:////localhost//cat",
+          "field": "href",
+          "got": "file:///localhost//cat",
+          "input": "file://\\/localhost//cat",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file://///",
+          "field": "href",
+          "got": "file:///",
+          "input": "file://localhost//a//../..//",
+          "suite": "constructor"
+        },
+        {
+          "base": "file:///elephant",
+          "expected": "file://///mouse",
+          "field": "href",
+          "got": "file:///mouse",
+          "input": "/////mouse",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://lion/",
+          "expected": "file:////pig",
+          "field": "href",
+          "got": "file:///pig",
+          "input": "\\/localhost//pig",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://lion/",
+          "expected": "file:////pig",
+          "field": "href",
+          "got": "file:///pig",
+          "input": "//localhost//pig",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://lion/",
+          "expected": "file://lion//localhost//pig",
+          "field": "href",
+          "got": "file://lion/localhost//pig",
+          "input": "/..//localhost//pig",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:",
+          "field": "href",
+          "got": "file:///C:",
+          "input": "C|",
+          "suite": "constructor"
+        }
+      ],
+      "setters": {
+        "pass": 221,
+        "total": 278
+      },
+      "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
+    }
+  }
+}
