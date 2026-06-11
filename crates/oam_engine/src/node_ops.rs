@@ -7,6 +7,10 @@
 //! failures throw/reject Errors carrying Node's `.code` (ENOENT, ...) —
 //! the ecosystem branches on codes, not messages.
 
+use crate::crypto_ops::{
+    op_crypto_hash_copy, op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update,
+    op_crypto_hmac_create, op_crypto_random_fill, op_crypto_timing_safe_equal,
+};
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -131,6 +135,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadChunk", op_fs_read_chunk),
         ("fsWriteChunk", op_fs_write_chunk),
         ("fsClose", op_fs_close),
+        // node:crypto (crypto_ops.rs)
+        ("cryptoHashCreate", op_crypto_hash_create),
+        ("cryptoHmacCreate", op_crypto_hmac_create),
+        ("cryptoHashUpdate", op_crypto_hash_update),
+        ("cryptoHashDigest", op_crypto_hash_digest),
+        ("cryptoHashCopy", op_crypto_hash_copy),
+        ("cryptoRandomFill", op_crypto_random_fill),
+        ("cryptoTimingSafeEqual", op_crypto_timing_safe_equal),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -139,7 +151,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
 
 // ----------------------------------------------------------------- helpers
 
-fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     let message = v8::String::new(scope, message).unwrap();
     let exception = v8::Exception::type_error(scope, message);
     scope.throw_exception(exception);
@@ -169,7 +181,7 @@ fn throw_node_error(
     scope.throw_exception(exception);
 }
 
-fn arg_string(
+pub(crate) fn arg_string(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
@@ -181,7 +193,7 @@ fn arg_string(
 
 /// Bytes from a write payload: ArrayBufferView copies, anything else goes
 /// through ToString as UTF-8 (Node coerces the same way for strings).
-fn arg_bytes(
+pub(crate) fn arg_bytes(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
@@ -197,7 +209,7 @@ fn arg_bytes(
     Some(text.into_bytes())
 }
 
-fn bytes_to_uint8array<'s>(
+pub(crate) fn bytes_to_uint8array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: Vec<u8>,
 ) -> Option<v8::Local<'s, v8::Value>> {

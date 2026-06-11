@@ -36,6 +36,13 @@ serde_json = "1"
 # WHATWG URL parsing (servo's reference implementation, incl. IDNA) — the
 # same engine Deno ships. The JS URL class is a thin wrapper over it.
 url = "2"
+# node:crypto wave 1: RustCrypto streaming digests + HMAC (pure Rust,
+# builds on every tier-1 target) and OS randomness.
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+getrandom = "0.3"
 clap = { version = "4", features = ["derive"] }
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —

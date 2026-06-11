@@ -2315,6 +2315,7 @@
       "assert",
       "async_hooks",
       "buffer",
+      "crypto",
       "events",
       "fs",
       "fs/promises",
@@ -3283,13 +3284,19 @@
       return last;
     }
 
-    const stream = {
+    // require('stream') IS the legacy Stream class in Node (an
+    // EventEmitter subclass with .prototype) — packages do
+    // util.inherits(X, require('stream')) (jws/jsonwebtoken among them),
+    // so the module export must be the CLASS, with everything else
+    // attached as properties.
+    class Stream extends EventEmitter {}
+    Object.assign(Stream, {
+      Stream,
       Readable,
       Writable,
       Duplex,
       Transform,
       PassThrough,
-      Stream: Readable, // legacy alias shape
       pipeline,
       finished,
       promises: {
@@ -3304,9 +3311,8 @@
       },
       isErrored: (s) => Boolean(s._rState?.errored),
       isReadable: (s) => Boolean(s._rState && !s._rState.destroyed && !s._rState.endEmitted),
-    };
-    // require('stream') is callable-ish legacy: keep the object shape only.
-    return stream;
+    });
+    return Stream;
   };
   registry.factories["stream/promises"] = () => registry.get("stream").promises;
   registry.factories["stream/web"] = () => ({
@@ -3777,6 +3783,203 @@
     };
   };
 
+  // ---------------------------------------------------------- node:crypto
+  // Wave-1 surface: streaming hashes + HMAC (md5/sha1/sha224-512, the
+  // workhorses of etags, cache keys, and HS256 JWTs), OS randomness, and
+  // the WebCrypto subset (subtle.digest, getRandomValues, randomUUID).
+  // Asymmetric keys / sign-verify / ciphers land with a later wave.
+  registry.factories.crypto = (natives) => {
+    const BufferCtor = globalThis.Buffer;
+
+    const toBytes = (data, encoding) => {
+      if (typeof data === "string") return BufferCtor.from(data, encoding ?? "utf8");
+      if (data instanceof KeyObject) return data._material;
+      if (data instanceof Uint8Array) return data;
+      if (ArrayBuffer.isView(data)) {
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      }
+      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      throw new TypeError("crypto: data must be a string, Buffer, TypedArray, or ArrayBuffer");
+    };
+
+    // Secret-key KeyObject subset: jsonwebtoken-class packages route every
+    // key through instanceof KeyObject / createSecretKey, with
+    // createPrivateKey/createPublicKey probed in try/catch for asymmetric
+    // detection — those throw until the asymmetric wave lands.
+    class KeyObject {
+      constructor(type, material) {
+        this.type = type;
+        this._material = material;
+      }
+      get symmetricKeySize() {
+        return this._material.length;
+      }
+      export() {
+        return new BufferCtor(this._material.buffer, this._material.byteOffset, this._material.length);
+      }
+    }
+
+    function createSecretKey(key, encoding) {
+      return new KeyObject("secret", toBytes(key, encoding));
+    }
+
+    function asymmetricUnsupported() {
+      throw makeNodeError(
+        "ERR_CRYPTO_UNSUPPORTED_OPERATION",
+        "asymmetric keys (RSA/EC) land with a later crypto wave — HS* (HMAC) algorithms work today",
+      );
+    }
+
+    const asBuffer = (bytes) =>
+      new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.length);
+
+    class Hash {
+      constructor(id) {
+        this._id = id;
+      }
+      update(data, inputEncoding) {
+        natives.cryptoHashUpdate(this._id, toBytes(data, inputEncoding));
+        return this;
+      }
+      digest(encoding) {
+        const bytes = asBuffer(natives.cryptoHashDigest(this._id));
+        return encoding ? bytes.toString(encoding) : bytes;
+      }
+      copy() {
+        return new Hash(natives.cryptoHashCopy(this._id));
+      }
+    }
+
+    class Hmac extends Hash {
+      copy() {
+        throw new Error("Hmac.copy is not supported (Node parity)");
+      }
+    }
+
+    function createHash(algorithm) {
+      return new Hash(natives.cryptoHashCreate(String(algorithm)));
+    }
+
+    function createHmac(algorithm, key) {
+      return new Hmac(natives.cryptoHmacCreate(String(algorithm), toBytes(key)));
+    }
+
+    function randomBytes(size, callback) {
+      // Chunked: the native caps one call at 64KiB.
+      const out = BufferCtor.alloc(size);
+      let offset = 0;
+      while (offset < size) {
+        const chunk = natives.cryptoRandomFill(Math.min(65536, size - offset));
+        out.set(chunk, offset);
+        offset += chunk.length;
+      }
+      if (typeof callback === "function") {
+        queueMicrotask(() => callback(null, out));
+        return undefined;
+      }
+      return out;
+    }
+
+    function randomFillSync(buffer, offset = 0, size) {
+      const view =
+        buffer instanceof Uint8Array
+          ? buffer
+          : new Uint8Array(buffer.buffer ?? buffer, buffer.byteOffset ?? 0, buffer.byteLength);
+      const count = size ?? view.length - offset;
+      const bytes = randomBytes(count);
+      view.set(bytes, offset);
+      return buffer;
+    }
+
+    function randomUUID() {
+      const bytes = natives.cryptoRandomFill(16);
+      bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+      bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+      const hex = asBuffer(bytes).toString("hex");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+
+    function randomInt(min, max, callback) {
+      if (max === undefined || typeof max === "function") {
+        callback = max;
+        max = min;
+        min = 0;
+      }
+      if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || max <= min) {
+        throw new RangeError("randomInt: max must be greater than min (safe integers)");
+      }
+      const range = max - min;
+      // Rejection sampling over 48 bits — uniform, like Node.
+      let value;
+      do {
+        const bytes = natives.cryptoRandomFill(6);
+        value = 0;
+        for (const b of bytes) value = value * 256 + b;
+      } while (value >= Math.floor(2 ** 48 / range) * range);
+      const result = min + (value % range);
+      if (typeof callback === "function") {
+        queueMicrotask(() => callback(null, result));
+        return undefined;
+      }
+      return result;
+    }
+
+    function timingSafeEqual(a, b) {
+      return natives.cryptoTimingSafeEqual(toBytes(a), toBytes(b));
+    }
+
+    const subtle = {
+      async digest(algorithm, data) {
+        const name = typeof algorithm === "string" ? algorithm : algorithm?.name;
+        const id = natives.cryptoHashCreate(String(name));
+        natives.cryptoHashUpdate(id, toBytes(data));
+        const bytes = natives.cryptoHashDigest(id);
+        // WebCrypto returns a fresh ArrayBuffer.
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
+      },
+    };
+
+    function getRandomValues(typedArray) {
+      if (
+        !ArrayBuffer.isView(typedArray) ||
+        typedArray instanceof Float32Array ||
+        typedArray instanceof Float64Array ||
+        typedArray instanceof DataView
+      ) {
+        throw new TypeError("getRandomValues: argument must be an integer TypedArray");
+      }
+      if (typedArray.byteLength > 65536) {
+        throw Object.assign(
+          new Error("getRandomValues: requested too many random bytes (max 65536)"),
+          { name: "QuotaExceededError" },
+        );
+      }
+      const bytes = natives.cryptoRandomFill(typedArray.byteLength);
+      new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(bytes);
+      return typedArray;
+    }
+
+    const webcrypto = { subtle, getRandomValues, randomUUID };
+
+    return {
+      createHash,
+      createHmac,
+      randomBytes,
+      randomFillSync,
+      randomUUID,
+      randomInt,
+      timingSafeEqual,
+      getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
+      KeyObject,
+      createSecretKey,
+      createPrivateKey: asymmetricUnsupported,
+      createPublicKey: asymmetricUnsupported,
+      webcrypto,
+      subtle,
+      getRandomValues,
+    };
+  };
+
   // ------------------------------------------------------------------ tty
   registry.factories.tty = (natives) => ({
     isatty: (fd) => natives.isTTY(Number(fd)),
@@ -3818,6 +4021,7 @@
       now: () => natives.nowMs(),
       timeOrigin: Date.now() - natives.nowMs(),
     };
+    globalThis.crypto = registry.get("crypto").webcrypto;
 
     // AsyncLocalStorage across macrotasks: V8's CPED only travels with
     // promise continuations, so timer-family callbacks are bound to the

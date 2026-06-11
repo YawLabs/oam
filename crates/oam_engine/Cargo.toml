@@ -16,6 +16,12 @@ oam_loader = { workspace = true }
 serde_json = { workspace = true }
 # WHATWG URL parse/mutate natives for the JS URL class.
 url = { workspace = true }
+# node:crypto natives: streaming digests, HMAC, OS randomness.
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+hmac = { workspace = true }
+getrandom = { workspace = true }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

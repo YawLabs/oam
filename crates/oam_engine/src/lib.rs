@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use std::sync::Once;
 
 mod cjs;
+mod crypto_ops;
 mod modules;
 mod node_ops;
 mod ops;
@@ -62,6 +63,7 @@ impl JsRuntime {
         isolate.set_slot(timers::TimerQueue::default());
         isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
         isolate.set_slot(ops::PendingOps::default());
+        isolate.set_slot(crypto_ops::CryptoState::default());
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's default context: bootstrap.js is

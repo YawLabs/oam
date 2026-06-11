@@ -658,9 +658,9 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "blocked subpath"
     );
 
-    // Wave-1 builtins (fs, path, ...) now resolve; the MOD0006 gate covers
-    // the not-yet-shipped ones, prefixed or bare.
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:crypto';").unwrap();
+    // Shipped builtins resolve; the MOD0006 gate covers the rest,
+    // prefixed or bare.
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:zlib';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
@@ -1106,6 +1106,89 @@ fn builtin_named_packages_and_tsconfig_never_shadow_builtins() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "BROWSER-SHIM function function"
     );
+}
+
+// ------------------------------------------------------------- node:crypto
+
+#[test]
+fn crypto_hashes_match_published_vectors() {
+    let stdout = run_ok(
+        "crypto_vectors.mjs",
+        "import { createHash, createHmac, getHashes } from 'node:crypto';\n\
+         // FIPS-180 / RFC 1321 'abc' vectors.\n\
+         console.log(createHash('sha256').update('abc').digest('hex'));\n\
+         console.log(createHash('sha1').update('abc').digest('hex'));\n\
+         console.log(createHash('md5').update('abc').digest('hex'));\n\
+         console.log(createHash('sha512').update('abc').digest('hex').slice(0, 32));\n\
+         // Streaming: chunked updates equal one-shot; copy() forks state.\n\
+         const chunked = createHash('sha256').update('a').update('b');\n\
+         const forked = chunked.copy();\n\
+         console.log(chunked.update('c').digest('hex') === createHash('sha256').update('abc').digest('hex'));\n\
+         console.log(forked.update('X').digest('hex') === createHash('sha256').update('abX').digest('hex'));\n\
+         // Encodings: base64 digest, Buffer input, SHA-256 alias.\n\
+         console.log(createHash('sha256').update(Buffer.from('abc')).digest('base64'));\n\
+         console.log(createHash('SHA-256').update('abc').digest('hex') === createHash('sha256').update('abc').digest('hex'));\n\
+         // Classic quick-brown-fox HMAC-SHA256 vector (key 'key').\n\
+         console.log(createHmac('sha256', 'key').update('The quick brown fox jumps over the lazy dog').digest('hex'));\n\
+         console.log(getHashes().includes('sha256'));\n\
+         // Unknown algorithm fails loud.\n\
+         let bad = false;\n\
+         try { createHash('sha3-512'); } catch { bad = true; }\n\
+         console.log(bad);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(lines[1], "a9993e364706816aba3e25717850c26c9cd0d89d");
+    assert_eq!(lines[2], "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(lines[3], "ddaf35a193617abacc417349ae204131");
+    assert_eq!(lines[4], "true");
+    assert_eq!(lines[5], "true");
+    assert_eq!(lines[6], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+    assert_eq!(lines[7], "true");
+    assert_eq!(
+        lines[8],
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+    assert_eq!(lines[9], "true");
+    assert_eq!(lines[10], "true");
+}
+
+#[test]
+fn crypto_randomness_and_webcrypto() {
+    let stdout = run_ok(
+        "crypto_random.mjs",
+        "import crypto, { randomBytes, randomUUID, randomInt, timingSafeEqual } from 'node:crypto';\n\
+         const a = randomBytes(32);\n\
+         const b = randomBytes(32);\n\
+         console.log(a.length, Buffer.isBuffer(a), a.equals(b));\n\
+         const uuid = randomUUID();\n\
+         console.log(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid));\n\
+         const ints = Array.from({ length: 200 }, () => randomInt(3, 6));\n\
+         console.log(ints.every((n) => n >= 3 && n < 6), new Set(ints).size > 1);\n\
+         console.log(timingSafeEqual(Buffer.from('same'), Buffer.from('same')), timingSafeEqual(Buffer.from('same'), Buffer.from('diff')));\n\
+         let lenErr = false;\n\
+         try { timingSafeEqual(Buffer.from('a'), Buffer.from('ab')); } catch { lenErr = true; }\n\
+         console.log(lenErr);\n\
+         // The crypto GLOBAL (WebCrypto shape).\n\
+         const view = new Uint32Array(4);\n\
+         const same = globalThis.crypto.getRandomValues(view);\n\
+         console.log(same === view, view.some((v) => v !== 0));\n\
+         const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc'));\n\
+         console.log(digest instanceof ArrayBuffer, Buffer.from(digest).toString('hex').slice(0, 16));\n\
+         console.log(crypto.webcrypto.subtle === crypto.subtle, typeof globalThis.crypto.randomUUID());",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "32 true false");
+    assert_eq!(lines[1], "true");
+    assert_eq!(lines[2], "true true");
+    assert_eq!(lines[3], "true false");
+    assert_eq!(lines[4], "true");
+    assert_eq!(lines[5], "true true");
+    assert_eq!(lines[6], "true ba7816bf8f01cfea");
+    assert_eq!(lines[7], "true string");
 }
 
 // -------------------------------------------------------------------- URL

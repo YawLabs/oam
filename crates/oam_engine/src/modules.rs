@@ -146,6 +146,8 @@ impl JsRuntime {
         self.isolate.set_slot(UncaughtLedger::default());
         self.isolate.set_slot(crate::timers::TimerQueue::default());
         self.isolate.set_slot(crate::cjs::CjsCache::default());
+        self.isolate
+            .set_slot(crate::crypto_ops::CryptoState::default());
         // Fresh CoreRuntime per run: dropping the old one cancels any ops a
         // previous execute_module left in flight; PendingOps resolvers from
         // that run die with it.
