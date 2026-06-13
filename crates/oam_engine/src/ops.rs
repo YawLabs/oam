@@ -121,6 +121,25 @@ fn op_read_text_file(
         return;
     };
     let path = path.to_rust_string_lossy(scope);
+    // Permission gate: read access for this path.
+    if let Err(msg) = scope
+        .get_slot::<crate::permissions::Permissions>()
+        .cloned()
+        .unwrap_or_default()
+        .check_read(&path)
+    {
+        let msg_v8 = v8::String::new(scope, &msg)
+            .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
+        let exception = v8::Exception::error(scope, msg_v8);
+        if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+            let key = v8::String::new(scope, "code").unwrap();
+            if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
+                obj.set(scope, key.into(), code.into());
+            }
+        }
+        scope.throw_exception(exception);
+        return;
+    }
     spawn_op(scope, &mut rv, oam_core::ops::read_text_file(path));
 }
 
@@ -145,6 +164,31 @@ fn op_fetch(
             return;
         }
     };
+    // Net permission gate: check the hostname extracted from the URL.
+    {
+        let host = url::Url::parse(&request.url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        if let Err(msg) = scope
+            .get_slot::<crate::permissions::Permissions>()
+            .cloned()
+            .unwrap_or_default()
+            .check_net(&host)
+        {
+            let msg_v8 = v8::String::new(scope, &msg)
+                .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
+            let exception = v8::Exception::error(scope, msg_v8);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let key = v8::String::new(scope, "code").unwrap();
+                if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
+                    obj.set(scope, key.into(), code.into());
+                }
+            }
+            scope.throw_exception(exception);
+            return;
+        }
+    }
     let core = scope
         .get_slot::<CoreRuntime>()
         .expect("core runtime installed");

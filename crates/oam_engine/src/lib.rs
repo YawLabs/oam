@@ -23,8 +23,10 @@ mod modules;
 pub mod napi;
 mod node_ops;
 mod ops;
+pub mod permissions;
 mod timers;
 pub use modules::ModuleHost;
+pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 
 static V8_INIT: Once = Once::new();
 
@@ -59,6 +61,12 @@ pub(crate) struct ProcessArgv(pub Vec<String>);
 
 impl JsRuntime {
     pub fn new() -> Self {
+        Self::new_with_permissions(None)
+    }
+
+    /// Create a new runtime with the given permission restrictions.
+    /// `None` -> all permissions granted (same as `new()`).
+    pub fn new_with_permissions(opts: Option<permissions::PermissionsOptions>) -> Self {
         init_platform();
         let params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
         let mut isolate = v8::Isolate::new(params);
@@ -71,6 +79,9 @@ impl JsRuntime {
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
         isolate.set_slot(napi::AddonRegistry::new());
+        // Permissions slot: all-granted by default so existing code needs
+        // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
+        isolate.set_slot(permissions::Permissions::from_opts(opts));
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's default context: bootstrap.js is
@@ -406,6 +417,280 @@ mod tests {
             drops, ITERATIONS,
             "expected {ITERATIONS} NapiEnv drops (one per runtime), got {drops}; \
              the AddonRegistry fix is not working correctly"
+        );
+    }
+
+    // ---------------------------------------- permission gate integration tests
+
+    /// Helper: build a temp file path that does not exist (for "denied" tests
+    /// we never need to read it; for "allowed" tests we create it first).
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("oam-perm-test-{name}"))
+    }
+
+    /// Returns the JSON-escaped form of `path` (forward slashes on all
+    /// platforms).
+    fn js_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    // ---- read denied
+    //
+    // Use __oam.node.fsReadFileSync directly (the internal op) rather than
+    // going through require('fs'), which needs a module system.
+
+    #[test]
+    fn permission_read_denied_throws_err_permission_denied() {
+        let opts = permissions::PermissionsOptions {
+            read: permissions::BoolOrList::Bool(false),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        // fsReadFileSync is the raw op; call it directly to avoid require().
+        let err = rt
+            .execute_script(
+                "perm_read_deny.js",
+                r#"
+                try {
+                    __oam.node.fsReadFileSync('/tmp/any-file');
+                    'no-throw'
+                } catch (e) {
+                    e.code
+                }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+    }
+
+    // ---- read allowed for whitelisted prefix
+
+    #[test]
+    fn permission_read_allowed_for_permitted_path() {
+        let path = temp_path("read-allow.txt");
+        std::fs::write(&path, b"hello").expect("write temp file");
+        let js = js_path(&path);
+        // Only the temp dir is whitelisted.
+        let tmp = std::env::temp_dir();
+        let tmp_str = tmp.to_string_lossy().replace('\\', "/");
+        let opts = permissions::PermissionsOptions {
+            read: permissions::BoolOrList::List(vec![tmp_str]),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        let result = rt
+            .execute_script(
+                "perm_read_allow.js",
+                &format!(
+                    r#"
+                    try {{
+                        __oam.node.fsReadFileSync('{js}');
+                        'ok'
+                    }} catch (e) {{
+                        'err:' + e.code
+                    }}
+                    "#
+                ),
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, "ok", "got: {result}");
+    }
+
+    // ---- write denied
+
+    #[test]
+    fn permission_write_denied_throws_err_permission_denied() {
+        let opts = permissions::PermissionsOptions {
+            write: permissions::BoolOrList::Bool(false),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        let err = rt
+            .execute_script(
+                "perm_write_deny.js",
+                r#"
+                try {
+                    __oam.node.fsWriteFileSync('/tmp/oam-perm-write-deny.txt', 'x');
+                    'no-throw'
+                } catch (e) {
+                    e.code
+                }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+    }
+
+    // ---- write allowed
+
+    #[test]
+    fn permission_write_allowed_for_permitted_path() {
+        let path = temp_path("write-allow.txt");
+        let _ = std::fs::remove_file(&path);
+        let js = js_path(&path);
+        let tmp = std::env::temp_dir();
+        let tmp_str = tmp.to_string_lossy().replace('\\', "/");
+        let opts = permissions::PermissionsOptions {
+            write: permissions::BoolOrList::List(vec![tmp_str]),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        let result = rt
+            .execute_script(
+                "perm_write_allow.js",
+                &format!(
+                    r#"
+                    try {{
+                        __oam.node.fsWriteFileSync('{js}', 'oam-perm-test');
+                        'ok'
+                    }} catch (e) {{
+                        'err:' + e.code
+                    }}
+                    "#
+                ),
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result, "ok", "got: {result}");
+    }
+
+    // ---- net denied (fetch -- synchronous gate in the __oam.fetch op)
+    //
+    // The fetch() global is a thin wrapper over __oam.fetch; the permission
+    // check inside op_fetch throws synchronously before any promise is
+    // created. That uncaught exception surfaces in execute_script as
+    // execute_script returning Err, OR as the exception value in a try/catch.
+
+    #[test]
+    fn permission_net_denied_fetch_throws_err_permission_denied() {
+        let opts = permissions::PermissionsOptions {
+            net: permissions::BoolOrList::Bool(false),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        // Call __oam.fetch directly with a minimal JSON payload so we bypass
+        // any JS-level try/catch wrapping in the fetch() global wrapper.
+        let err = rt
+            .execute_script(
+                "perm_net_deny.js",
+                r#"
+                try {
+                    __oam.fetch(JSON.stringify({url: 'http://example.com/'}));
+                    'no-throw'
+                } catch (e) {
+                    e.code
+                }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+    }
+
+    // ---- net allowed
+
+    #[test]
+    fn permission_net_allowed_for_listed_host_does_not_throw() {
+        let opts = permissions::PermissionsOptions {
+            net: permissions::BoolOrList::List(vec!["example.com".to_string()]),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        // The op IS spawned (it returns a pending promise); the permission gate
+        // passes, so no exception is thrown synchronously.  We do NOT await
+        // (no real HTTP connection in unit tests); just verify no throw.
+        let result = rt
+            .execute_script(
+                "perm_net_allow.js",
+                r#"
+                try {
+                    const p = __oam.fetch(JSON.stringify({url: 'http://example.com/'}));
+                    typeof p        // "object" (Promise)
+                } catch (e) {
+                    'err:' + e.code
+                }
+                "#,
+            )
+            .unwrap();
+        // Drop inflight ops: the future spawned in the test will be cancelled
+        // when the runtime drops (shutdown_background).
+        assert_eq!(result, "object", "got: {result}");
+    }
+
+    // ---- permissions query via oam:permissions JS module
+
+    #[test]
+    fn oam_permissions_module_query_returns_correct_state() {
+        use crate::modules::ModuleHost;
+        use oam_diagnostics::{Diagnostic, Origin, Severity};
+
+        struct InlineHost {
+            source: String,
+        }
+        impl ModuleHost for InlineHost {
+            fn resolve(
+                &self,
+                specifier: &str,
+                _referrer: &std::path::Path,
+            ) -> Result<std::path::PathBuf, Vec<Diagnostic>> {
+                if specifier == "oam:permissions" {
+                    return Ok(std::path::PathBuf::from("oam:permissions"));
+                }
+                Err(vec![Diagnostic::new(
+                    "OAM-MOD0001",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!("cannot resolve {specifier}"),
+                )])
+            }
+            fn load(&self, path: &std::path::Path) -> Result<String, Vec<Diagnostic>> {
+                // execute_module normalizes the entry to an absolute path via
+                // module_key(); match by file name only so tests don't need to
+                // supply an absolute path as the entry.
+                if path.file_name().and_then(|n| n.to_str()) == Some("perm_query_test.mjs") {
+                    return Ok(self.source.clone());
+                }
+                Err(vec![Diagnostic::new(
+                    "OAM-RT0002",
+                    Severity::Error,
+                    Origin::Runtime,
+                    format!("cannot load {}", path.display()),
+                )])
+            }
+        }
+
+        let opts = permissions::PermissionsOptions {
+            read: permissions::BoolOrList::Bool(false),
+            net: permissions::BoolOrList::Bool(false),
+            write: permissions::BoolOrList::Bool(true),
+            ..Default::default()
+        };
+        let mut rt = JsRuntime::new_with_permissions(Some(opts));
+
+        let source = r#"
+            import { permissions } from 'oam:permissions';
+            const readStatus  = await permissions.query({ name: 'read' });
+            const writeStatus = await permissions.query({ name: 'write' });
+            const netStatus   = await permissions.query({ name: 'net' });
+            if (readStatus.state  !== 'denied')  throw new Error('read should be denied: '  + readStatus.state);
+            if (writeStatus.state !== 'granted') throw new Error('write should be granted: ' + writeStatus.state);
+            if (netStatus.state   !== 'denied')  throw new Error('net should be denied: '   + netStatus.state);
+            globalThis.__perm_ok = true;
+        "#
+        .to_string();
+
+        let host = InlineHost { source };
+        let entry = std::path::Path::new("perm_query_test.mjs");
+        rt.execute_module(entry, &host)
+            .expect("permissions query module runs without error");
+
+        // Verify the module ran to completion.
+        let ok = rt
+            .execute_script("check.js", "globalThis.__perm_ok")
+            .unwrap();
+        assert_eq!(
+            ok, "true",
+            "permissions query module did not complete: {ok}"
         );
     }
 }
