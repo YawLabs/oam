@@ -59,10 +59,10 @@ pub struct OpCompletion {
 /// await. Single-reader discipline is guaranteed by ReadableStream's lock.
 pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Response>>>;
 
-/// Open file handles for fs streams — same remove-await-reinsert
+/// Open file handles for fs streams -- same remove-await-reinsert
 /// discipline as BodyRegistry (node:stream's write queue serializes
 /// access per handle). The `closed` set is the generation guard: a chunk
-/// op removes the File, awaits IO unlocked, then reinserts — but if
+/// op removes the File, awaits IO unlocked, then reinserts -- but if
 /// fsClose landed during that await (stream.destroy() racing an in-flight
 /// read), the reinsert would resurrect a leaked fd. closed tracks ids
 /// retired mid-flight so the reinsert drops the File instead.
@@ -72,6 +72,16 @@ pub struct FileState {
     pub closed: std::collections::HashSet<u64>,
 }
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
+
+/// Incremental zlib stream state. Each entry is a thread-safe encoder or
+/// decoder that can accept chunks one at a time. The JS Transform wires
+/// _transform to zlibStreamWrite and _flush to zlibStreamFlush.
+pub enum ZlibStream {
+    Compress(zlib::StreamCompressor),
+    Decompress(zlib::StreamDecompressor),
+}
+
+pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
 
 pub struct CoreRuntime {
     /// Option so Drop can take it for shutdown_background (see below).
@@ -85,6 +95,7 @@ pub struct CoreRuntime {
     inflight: usize,
     bodies: BodyRegistry,
     files: FileRegistry,
+    zlib_streams: ZlibRegistry,
     http_state: std::sync::Arc<http_server::HttpState>,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -117,6 +128,7 @@ impl CoreRuntime {
             inflight: 0,
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
+            zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
@@ -142,6 +154,11 @@ impl CoreRuntime {
     /// Open-file registry for fs streams (Arc clone; dies with the run).
     pub fn files(&self) -> FileRegistry {
         self.files.clone()
+    }
+
+    /// Incremental zlib stream registry (Arc clone; dies with the run).
+    pub fn zlib_streams(&self) -> ZlibRegistry {
+        self.zlib_streams.clone()
     }
 
     /// HTTP server state (Arc clone; servers die with the run).
@@ -295,8 +312,14 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 }
 
 /// node:zlib backend (flate2). Sync fns serve the *Sync natives directly;
-/// the async ops below wrap them in spawn_blocking — compression is CPU
+/// the async ops below wrap them in spawn_blocking -- compression is CPU
 /// work and must not sit on the isolate thread for the callback forms.
+///
+/// Incremental streaming (StreamCompressor / StreamDecompressor) is the
+/// backing state for the JS Transform classes introduced in the
+/// feature/zlib-streaming wave. Each JS Transform stream creates one
+/// handle in the ZlibRegistry; _transform feeds chunks via zlibStreamWrite
+/// and _flush finalizes via zlibStreamFlush.
 pub mod zlib {
     use flate2::Compression;
     use std::io::{Read, Write};
@@ -369,6 +392,176 @@ pub mod zlib {
             decompress(bytes, Format::Deflate)
         }
     }
+
+    // ----------------------------------------------------------------
+    // Incremental streaming types
+    //
+    // The flate2 write-based encoders/decoders are stateful: we feed them
+    // bytes and they emit compressed bytes immediately (up to their internal
+    // buffer size) without needing the full input. We wrap them in a Vec<u8>
+    // backing store and expose write + flush-to-collected.
+    //
+    // Send requirement: all flate2 encoder/decoder types are Send, and our
+    // wrappers hold no thread-local state, so these are safe to move across
+    // thread boundaries (the registry lives on the main thread; write ops
+    // hop to spawn_blocking).
+    // ----------------------------------------------------------------
+
+    /// Wraps any of the three flate2 write-encoders behind a uniform
+    /// interface. Created via `StreamCompressor::new`; consumes chunks via
+    /// `write_chunk`; finalizes via `finish` (emits the trailing CRC /
+    /// checksum bytes the format requires).
+    pub struct StreamCompressor {
+        inner: CompressorInner,
+    }
+
+    enum CompressorInner {
+        Gzip(flate2::write::GzEncoder<Vec<u8>>),
+        Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
+        DeflateRaw(flate2::write::DeflateEncoder<Vec<u8>>),
+    }
+
+    impl StreamCompressor {
+        pub fn new(format: Format, level: i32) -> Self {
+            let level = if (0..=9).contains(&level) {
+                Compression::new(level as u32)
+            } else {
+                Compression::default()
+            };
+            let inner = match format {
+                Format::Gzip => CompressorInner::Gzip(
+                    flate2::write::GzEncoder::new(Vec::new(), level),
+                ),
+                Format::Deflate => CompressorInner::Deflate(
+                    flate2::write::ZlibEncoder::new(Vec::new(), level),
+                ),
+                Format::DeflateRaw => CompressorInner::DeflateRaw(
+                    flate2::write::DeflateEncoder::new(Vec::new(), level),
+                ),
+            };
+            Self { inner }
+        }
+
+        /// Feed a chunk. Returns whatever bytes the encoder produced
+        /// immediately (may be empty -- the encoder buffers internally
+        /// until it has a full deflate block ready).
+        pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+            match &mut self.inner {
+                CompressorInner::Gzip(enc) => {
+                    enc.write_all(chunk)?;
+                    Ok(std::mem::take(enc.get_mut()))
+                }
+                CompressorInner::Deflate(enc) => {
+                    enc.write_all(chunk)?;
+                    Ok(std::mem::take(enc.get_mut()))
+                }
+                CompressorInner::DeflateRaw(enc) => {
+                    enc.write_all(chunk)?;
+                    Ok(std::mem::take(enc.get_mut()))
+                }
+            }
+        }
+
+        /// Flush and finalize. Consumes self; returns the tail bytes
+        /// (including the gzip/zlib trailer). After this the stream handle
+        /// is dropped -- close is implicit.
+        pub fn finish(self) -> std::io::Result<Vec<u8>> {
+            match self.inner {
+                CompressorInner::Gzip(enc) => enc.finish(),
+                CompressorInner::Deflate(enc) => enc.finish(),
+                CompressorInner::DeflateRaw(enc) => enc.finish(),
+            }
+        }
+    }
+
+    // Manual Send -- CompressorInner holds encoder types that are all Send.
+    unsafe impl Send for StreamCompressor {}
+
+    /// Wraps the three flate2 read-decoders behind a uniform interface.
+    ///
+    /// Design note: flate2's read-based decoders require a complete compressed
+    /// stream. For the streaming Transform contract (_transform feeds chunks,
+    /// _flush finalizes), we accumulate all compressed input during write_chunk
+    /// and decompress everything in finish. This means write_chunk returns empty
+    /// and finish returns all decompressed bytes -- the JS side pushes them in
+    /// _flush. The compress side (StreamCompressor) is the side that emits
+    /// incremental output during _transform; the decompress side trades that
+    /// for simplicity and full flate2 compatibility.
+    ///
+    /// A future wave can switch to flate2::Decompress (the low-level API) for
+    /// truly streaming decompression, but for node:zlib's Transform semantics
+    /// (pipe a complete compressed stream through, get decompressed output)
+    /// this approach is correct.
+    pub struct StreamDecompressor {
+        inner: DecompressorInner,
+        // All compressed input accumulated across write_chunk calls.
+        input: Vec<u8>,
+    }
+
+    enum DecompressorInner {
+        Gzip,
+        Deflate,
+        DeflateRaw,
+        Unzip, // auto-detect: resolved on first non-empty chunk
+    }
+
+    impl StreamDecompressor {
+        pub fn new_gzip() -> Self {
+            Self { inner: DecompressorInner::Gzip, input: Vec::new() }
+        }
+        pub fn new_deflate() -> Self {
+            Self { inner: DecompressorInner::Deflate, input: Vec::new() }
+        }
+        pub fn new_deflate_raw() -> Self {
+            Self { inner: DecompressorInner::DeflateRaw, input: Vec::new() }
+        }
+        pub fn new_unzip() -> Self {
+            Self { inner: DecompressorInner::Unzip, input: Vec::new() }
+        }
+
+        /// Accumulate a chunk of compressed data. Returns empty -- the full
+        /// decompressed output is not available until the complete compressed
+        /// stream is received (see finish).
+        pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+            self.input.extend_from_slice(chunk);
+            Ok(Vec::new())
+        }
+
+        /// Decompress the entire accumulated input and return all decompressed
+        /// bytes. After this call the stream handle should be dropped.
+        pub fn finish(&mut self) -> std::io::Result<Vec<u8>> {
+            if self.input.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Resolve auto-detect from the first two magic bytes.
+            if matches!(self.inner, DecompressorInner::Unzip) {
+                if self.input.starts_with(&[0x1f, 0x8b]) {
+                    self.inner = DecompressorInner::Gzip;
+                } else {
+                    self.inner = DecompressorInner::Deflate;
+                }
+            }
+            let mut out = Vec::new();
+            match &self.inner {
+                DecompressorInner::Gzip => {
+                    flate2::read::GzDecoder::new(self.input.as_slice())
+                        .read_to_end(&mut out)?;
+                }
+                DecompressorInner::Deflate => {
+                    flate2::read::ZlibDecoder::new(self.input.as_slice())
+                        .read_to_end(&mut out)?;
+                }
+                DecompressorInner::DeflateRaw => {
+                    flate2::read::DeflateDecoder::new(self.input.as_slice())
+                        .read_to_end(&mut out)?;
+                }
+                DecompressorInner::Unzip => unreachable!("resolved above"),
+            }
+            Ok(out)
+        }
+    }
+
+    unsafe impl Send for StreamDecompressor {}
 }
 
 /// Built-in op implementations. Plain futures; the engine decides how their
@@ -645,6 +838,118 @@ pub mod ops {
             "bodyHandle": handle,
         });
         OpOutcome::Json(payload.to_string())
+    }
+
+    /// zlibStreamCreate: allocate an incremental compressor or decompressor.
+    /// Returns Json {handle} on success. compress=true for encoding,
+    /// false for decoding. format must be "gzip", "deflate", "deflateRaw",
+    /// or "unzip" (decompress only).
+    pub async fn zlib_stream_create(
+        streams: super::ZlibRegistry,
+        ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        format: String,
+        level: i32,
+        compress: bool,
+    ) -> OpOutcome {
+        // Stream allocation is cheap: do it inline (no IO).
+        let stream = if compress {
+            let Some(fmt) = super::zlib::Format::parse(&format) else {
+                return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'"));
+            };
+            super::ZlibStream::Compress(super::zlib::StreamCompressor::new(fmt, level))
+        } else {
+            let dec = match format.as_str() {
+                "gzip" => super::zlib::StreamDecompressor::new_gzip(),
+                "deflate" => super::zlib::StreamDecompressor::new_deflate(),
+                "deflateRaw" => super::zlib::StreamDecompressor::new_deflate_raw(),
+                "unzip" => super::zlib::StreamDecompressor::new_unzip(),
+                _ => {
+                    return OpOutcome::Failed(format!(
+                        "zlib stream: unknown format '{format}'"
+                    ))
+                }
+            };
+            super::ZlibStream::Decompress(dec)
+        };
+        let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        streams
+            .lock()
+            .expect("zlib stream registry lock")
+            .insert(handle, stream);
+        OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
+    }
+
+    /// zlibStreamWrite: feed one chunk into an incremental stream.
+    /// Resolves with the bytes produced immediately (may be empty for
+    /// compressors that buffer internally). Runs on spawn_blocking --
+    /// the CPU work is non-trivial for large chunks.
+    pub async fn zlib_stream_write(
+        streams: super::ZlibRegistry,
+        handle: u64,
+        chunk: Vec<u8>,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut guard = streams.lock().expect("zlib stream registry lock");
+            let Some(stream) = guard.get_mut(&handle) else {
+                return Err(format!("zlib stream: handle {handle} not found"));
+            };
+            match stream {
+                super::ZlibStream::Compress(enc) => {
+                    enc.write_chunk(&chunk).map_err(|e| format!("zlib stream write: {e}"))
+                }
+                super::ZlibStream::Decompress(dec) => {
+                    dec.write_chunk(&chunk).map_err(|e| format!("zlib stream write: {e}"))
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
+            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Err(e) => OpOutcome::Failed(format!("zlib stream write task: {e}")),
+        }
+    }
+
+    /// zlibStreamFlush: finalize and remove the stream. Returns the tail
+    /// bytes. For compressors, this emits the format trailer (CRC etc.).
+    /// For decompressors, this drains any buffered input.
+    pub async fn zlib_stream_flush(
+        streams: super::ZlibRegistry,
+        handle: u64,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            let stream = streams
+                .lock()
+                .expect("zlib stream registry lock")
+                .remove(&handle);
+            let Some(stream) = stream else {
+                return Err(format!("zlib stream: handle {handle} not found"));
+            };
+            match stream {
+                super::ZlibStream::Compress(enc) => {
+                    enc.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                }
+                super::ZlibStream::Decompress(mut dec) => {
+                    dec.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
+            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Err(e) => OpOutcome::Failed(format!("zlib stream flush task: {e}")),
+        }
+    }
+
+    /// zlibStreamClose: drop a stream without flushing. Synchronous --
+    /// just removes the entry from the registry. Called by the JS side
+    /// when the Transform stream is destroyed before completion.
+    pub fn zlib_stream_close(streams: &super::ZlibRegistry, handle: u64) {
+        streams
+            .lock()
+            .expect("zlib stream registry lock")
+            .remove(&handle);
     }
 
     /// Async zlib: CPU-bound, so spawn_blocking off the op channel

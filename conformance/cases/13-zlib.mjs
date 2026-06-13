@@ -1,5 +1,7 @@
 // zlib: round trips, formats, unzip auto-detect, async forms, streams,
-// and INTEROP — a gzip blob produced by real Node must decompress here.
+// and INTEROP -- a gzip blob produced by real Node must decompress here.
+// Also: incremental streaming (wave-2): createGzip emits multiple chunks
+// on a large input (not one-shot), and round-trips cleanly.
 import zlib from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -42,3 +44,31 @@ try {
   failed = true;
 }
 console.log(failed);
+// Incremental streaming: a 2 MB payload through createGzip must produce
+// at least 2 distinct chunks (i.e. it is NOT buffering the whole input).
+const LARGE = 2 * 1024 * 1024;
+const large = Buffer.alloc(LARGE);
+for (let i = 0; i < LARGE; i++) large[i] = i & 0xff;
+let gzChunks = 0;
+const gzBufs = [];
+await pipeline(
+  Readable.from([large]),
+  zlib.createGzip(),
+  new Writable({
+    write(c, _e, cb) { gzChunks++; gzBufs.push(c); cb(); },
+  }),
+);
+const gzOut = Buffer.concat(gzBufs);
+const gunzBufs = [];
+await pipeline(
+  Readable.from([gzOut]),
+  zlib.createGunzip(),
+  new Writable({
+    write(c, _e, cb) { gunzBufs.push(c); cb(); },
+  }),
+);
+const gunzOut = Buffer.concat(gunzBufs);
+// At least 2 chunks: incremental, not one-shot.
+console.log(gzChunks >= 2);
+// Round-trip fidelity.
+console.log(gunzOut.equals(large));
