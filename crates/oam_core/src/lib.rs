@@ -535,9 +535,9 @@ pub mod zlib {
         }
         pub fn new_deflate_raw() -> Self {
             Self {
-                inner: DecompressorInner::DeflateRaw(flate2::write::DeflateDecoder::new(
-                    Vec::new(),
-                )),
+                inner: DecompressorInner::DeflateRaw(
+                    flate2::write::DeflateDecoder::new(Vec::new()),
+                ),
             }
         }
         pub fn new_unzip() -> Self {
@@ -559,8 +559,7 @@ pub mod zlib {
             // Resolve auto-detect on first non-empty chunk.
             if matches!(self.inner, DecompressorInner::Unzip) {
                 if chunk.starts_with(&[0x1f, 0x8b]) {
-                    self.inner =
-                        DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()));
+                    self.inner = DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()));
                 } else {
                     self.inner =
                         DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new()));
@@ -630,7 +629,12 @@ pub struct BrotliCompressor {
 impl BrotliCompressor {
     pub fn new() -> Self {
         Self {
-            inner: brotli::CompressorWriter::new(Vec::new(), BROTLI_BUF, BROTLI_QUALITY, BROTLI_LGWIN),
+            inner: brotli::CompressorWriter::new(
+                Vec::new(),
+                BROTLI_BUF,
+                BROTLI_QUALITY,
+                BROTLI_LGWIN,
+            ),
         }
     }
 
@@ -1068,12 +1072,12 @@ pub mod ops {
                 super::ZlibStream::Decompress(dec) => {
                     dec.finish().map_err(|e| format!("zlib stream flush: {e}"))
                 }
-                super::ZlibStream::BrotliCompress(enc) => {
-                    enc.finish().map_err(|e| format!("brotli stream flush: {e}"))
-                }
-                super::ZlibStream::BrotliDecompress(dec) => {
-                    dec.finish().map_err(|e| format!("brotli stream flush: {e}"))
-                }
+                super::ZlibStream::BrotliCompress(enc) => enc
+                    .finish()
+                    .map_err(|e| format!("brotli stream flush: {e}")),
+                super::ZlibStream::BrotliDecompress(dec) => dec
+                    .finish()
+                    .map_err(|e| format!("brotli stream flush: {e}")),
             }
         })
         .await;
