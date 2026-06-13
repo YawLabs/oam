@@ -148,7 +148,8 @@ unsafe fn out<T>(ptr: *mut T, value: T) -> NapiStatus {
     NAPI_OK
 }
 
-/// Callback registration payload (leaked per napi_create_function).
+/// Callback registration payload, owned by `NapiEnv::fn_data`.
+/// Drops when the env drops (i.e. when the owning JsRuntime drops).
 struct FnData {
     cb: unsafe extern "C" fn(Env, *mut CbInfo) -> NapiValue,
     data: *mut c_void,
