@@ -1314,9 +1314,18 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(lines[0], "bigint", "2^53 must be BigInt (above MAX_SAFE)");
-    assert_eq!(lines[1], "number", "2^53-1 must be Number (= MAX_SAFE_INTEGER)");
-    assert_eq!(lines[2], "bigint", "-(2^53) must be BigInt (below -MAX_SAFE)");
-    assert_eq!(lines[3], "number", "-(2^53-1) must be Number (= -MAX_SAFE_INTEGER)");
+    assert_eq!(
+        lines[1], "number",
+        "2^53-1 must be Number (= MAX_SAFE_INTEGER)"
+    );
+    assert_eq!(
+        lines[2], "bigint",
+        "-(2^53) must be BigInt (below -MAX_SAFE)"
+    );
+    assert_eq!(
+        lines[3], "number",
+        "-(2^53-1) must be Number (= -MAX_SAFE_INTEGER)"
+    );
 }
 
 // ------------------------------------------------------------- http server
@@ -4008,7 +4017,10 @@ fn node_url_file_conversions_posix() {
              console.log(code);",
         );
         let lines: Vec<&str> = stdout.lines().collect();
-        assert_eq!(lines[0], "true", "import.meta round trip must hold on Windows");
+        assert_eq!(
+            lines[0], "true",
+            "import.meta round trip must hold on Windows"
+        );
         assert_eq!(
             lines[1], "ERR_INVALID_URL_SCHEME",
             "non-file scheme must throw ERR_INVALID_URL_SCHEME"
@@ -4037,7 +4049,10 @@ fn node_url_file_conversions_posix() {
              console.log(code);",
         );
         let lines: Vec<&str> = stdout.lines().collect();
-        assert_eq!(lines[0], "file:///foo/bar", "pathToFileURL('/foo/bar').href");
+        assert_eq!(
+            lines[0], "file:///foo/bar",
+            "pathToFileURL('/foo/bar').href"
+        );
         assert_eq!(lines[1], "/foo/bar", "fileURLToPath('file:///foo/bar')");
         assert_eq!(
             lines[2], "/foo/bar/baz.txt",
@@ -4068,7 +4083,10 @@ fn node_url_file_conversions_posix() {
 /// accepts both. This companion runs only on non-Windows and fails if the
 /// server returns anything other than 413, preventing an all-platforms
 /// regression that an ERR:* result would otherwise hide.
-#[cfg_attr(target_os = "windows", ignore = "Windows connection-close race on large POST")]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "Windows connection-close race on large POST"
+)]
 #[test]
 fn http_per_request_body_over_cap_413_strict() {
     let stdout = run_ok(
@@ -4141,23 +4159,44 @@ fn url_parity_portable() {
     );
     let lines: Vec<&str> = stdout.lines().collect();
     // Line 0: astral char round-trip via URLSearchParams.
-    assert_eq!(lines[0], "e=%F0%9F%A6%84 true", "astral char in URLSearchParams");
+    assert_eq!(
+        lines[0], "e=%F0%9F%A6%84 true",
+        "astral char in URLSearchParams"
+    );
     // Line 1: live-iteration delete leaves b=2 and d=4 (a and c deleted).
     assert_eq!(lines[1], "b=2&d=4 2", "live-iteration delete during for-of");
     // Line 2: empty-present query: search == "" but href keeps '?'.
-    assert_eq!(lines[2], "\"\" https://x.example/p?", "empty-present query in href");
+    assert_eq!(
+        lines[2], "\"\" https://x.example/p?",
+        "empty-present query in href"
+    );
     // Line 3: setting search to '?' trims to empty query (no trailing '?').
-    assert_eq!(lines[3], "https://x.example/p?", "search='?' trims to empty");
+    assert_eq!(
+        lines[3], "https://x.example/p?",
+        "search='?' trims to empty"
+    );
     // Line 4: port setter accepts '8080 ' (WHATWG leading-digit parse).
-    assert_eq!(lines[4], "http://example.com:8080/", "port setter with trailing space");
+    assert_eq!(
+        lines[4], "http://example.com:8080/",
+        "port setter with trailing space"
+    );
     // Line 5: hostname setter no-ops when value contains ':'.
-    assert_eq!(lines[5], "http://a.com:7/", "hostname setter no-op on colon");
+    assert_eq!(
+        lines[5], "http://a.com:7/",
+        "hostname setter no-op on colon"
+    );
     // Line 6: pathname setter no-ops on data: opaque path.
-    assert_eq!(lines[6], "data:text/plain,abc", "opaque pathname setter no-op");
+    assert_eq!(
+        lines[6], "data:text/plain,abc",
+        "opaque pathname setter no-op"
+    );
     // Lines 7-8: urlToHttpOptions shape.
     assert_eq!(
         lines[7], "::1 number 8080 user:p@ss /x/y",
         "urlToHttpOptions: hostname, port type, port, auth, pathname"
     );
-    assert_eq!(lines[8], "false false", "urlToHttpOptions: port/auth absent for plain URL");
+    assert_eq!(
+        lines[8], "false false",
+        "urlToHttpOptions: port/auth absent for plain URL"
+    );
 }
