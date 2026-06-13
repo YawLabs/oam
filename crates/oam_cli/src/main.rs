@@ -380,6 +380,10 @@ fn repl_command() -> ExitCode {
         env!("CARGO_PKG_VERSION")
     );
     let mut rt = oam_engine::JsRuntime::new();
+    // The REPL doesn't call execute_module/execute_cjs (which run
+    // reset_run_slots and create a CoreRuntime). Init it here so
+    // tick() and repl_eval() have a Tokio runtime to drive ops on.
+    rt.ensure_core_runtime();
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());

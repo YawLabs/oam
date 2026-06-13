@@ -75,7 +75,14 @@ impl JsRuntime {
         isolate.set_host_initialize_import_meta_object_callback(modules::import_meta_callback);
         isolate.set_host_import_module_dynamically_callback(modules::dynamic_import_callback);
         isolate.set_slot(timers::TimerQueue::default());
-        isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
+        // CoreRuntime is NOT created here: execute_module / execute_cjs call
+        // reset_run_slots() which builds a fresh CoreRuntime before any ops
+        // run. Skipping the construction here avoids a wasted multi-thread
+        // Tokio runtime (2 worker threads + TLS init + reqwest Client) that
+        // would be dropped and rebuilt on the first module execution.
+        //
+        // The REPL path (which doesn't call reset_run_slots) lazily inits
+        // via ensure_core_runtime() before its first tick/eval.
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
         isolate.set_slot(napi::AddonRegistry::new());
@@ -89,7 +96,11 @@ impl JsRuntime {
             let context = v8::Context::new(scope, v8::ContextOptions::default());
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
-            install_console(scope, context);
+            // install_console is intentionally omitted: the M0 console it
+            // installs (v8::Object + 5 v8::Function bindings) is immediately
+            // overwritten by installRuntimeGlobals() which installs the
+            // util.inspect-powered console. Skipping it avoids ~0.5-1ms of
+            // dead-code V8 object allocation.
             timers::install(scope, context);
             ops::install(scope, context);
             node_ops::install(scope, context);
@@ -130,6 +141,17 @@ impl JsRuntime {
     /// Call before executing the entry — process.argv reads it lazily.
     pub fn set_process_argv(&mut self, argv: Vec<String>) {
         self.isolate.set_slot(ProcessArgv(argv));
+    }
+
+    /// Lazily create the CoreRuntime if it has not been set yet. The REPL
+    /// path needs this because it calls `tick()` / `repl_eval()` without
+    /// going through `reset_run_slots()`. The normal run_file path skips
+    /// this: `reset_run_slots()` builds a fresh CoreRuntime before any ops.
+    pub fn ensure_core_runtime(&mut self) {
+        if self.isolate.get_slot::<oam_core::CoreRuntime>().is_none() {
+            self.isolate
+                .set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
+        }
     }
 
     /// Read `process.exitCode` after a completed run — Node honors it at
@@ -248,60 +270,11 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
         .expect("runtime globals install cleanly");
 }
 
-/// M0 console: log/info/debug -> stdout, warn/error -> stderr. Replaced at
-/// JsRuntime::new time by node_compat's util.inspect console; kept as the
-/// fallback surface during snapshot bring-up.
-fn install_console(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
-    let global = context.global(scope);
-    let console = v8::Object::new(scope);
-
-    let log = v8::Function::new(scope, console_log_stdout).unwrap();
-    let err = v8::Function::new(scope, console_log_stderr).unwrap();
-
-    for key in ["log", "info", "debug"] {
-        let key_v8 = v8::String::new(scope, key).unwrap();
-        console.set(scope, key_v8.into(), log.into());
-    }
-    for key in ["warn", "error"] {
-        let key_v8 = v8::String::new(scope, key).unwrap();
-        console.set(scope, key_v8.into(), err.into());
-    }
-
-    let console_key = v8::String::new(scope, "console").unwrap();
-    global.set(scope, console_key.into(), console.into());
-}
-
-fn format_args(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-) -> String {
-    let mut parts = Vec::with_capacity(args.length() as usize);
-    for i in 0..args.length() {
-        let part = args
-            .get(i)
-            .to_string(scope)
-            .map(|s| s.to_rust_string_lossy(scope))
-            .unwrap_or_default();
-        parts.push(part);
-    }
-    parts.join(" ")
-}
-
-fn console_log_stdout(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    println!("{}", format_args(scope, &args));
-}
-
-fn console_log_stderr(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    eprintln!("{}", format_args(scope, &args));
-}
+// M0 console (install_console + format_args + console_log_stdout/stderr)
+// removed: installRuntimeGlobals() unconditionally overwrites
+// globalThis.console with the util.inspect-powered version, so the M0
+// bindings were dead code from JsRuntime::new's first call. Removing
+// them saves ~0.5-1ms of V8 object allocation per runtime creation.
 
 #[cfg(test)]
 mod tests {
@@ -596,6 +569,9 @@ mod tests {
             ..Default::default()
         };
         let mut rt = JsRuntime::new_with_permissions(Some(opts));
+        // fetch spawns an async op via CoreRuntime; init it since
+        // execute_script doesn't call reset_run_slots.
+        rt.ensure_core_runtime();
         // The op IS spawned (it returns a pending promise); the permission gate
         // passes, so no exception is thrown synchronously.  We do NOT await
         // (no real HTTP connection in unit tests); just verify no throw.

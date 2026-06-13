@@ -2218,7 +2218,24 @@
     const EventEmitter = registry.get("events");
     const process = new EventEmitter();
 
-    const env = natives.env();
+    // Lazy env: natives.env() crosses the FFI boundary and copies every
+    // environment variable into a JS object (50-200 vars on a typical dev
+    // machine). For programs that never touch process.env, this is pure
+    // waste. A Proxy defers the copy until first property access.
+    let envCache = null;
+    const ensureEnv = () => (envCache ??= natives.env());
+    const env = new Proxy(Object.create(null), {
+      get(_, prop) { return ensureEnv()[prop]; },
+      set(_, prop, value) { ensureEnv()[prop] = value; return true; },
+      has(_, prop) { return prop in ensureEnv(); },
+      deleteProperty(_, prop) { return delete ensureEnv()[prop]; },
+      ownKeys() { return Reflect.ownKeys(ensureEnv()); },
+      getOwnPropertyDescriptor(_, prop) {
+        const obj = ensureEnv();
+        if (!(prop in obj)) return undefined;
+        return { value: obj[prop], writable: true, enumerable: true, configurable: true };
+      },
+    });
     const stdoutIsTTY = natives.isTTY(1);
     const stderrIsTTY = natives.isTTY(2);
 
@@ -5572,7 +5589,19 @@
       now: () => natives.nowMs(),
       timeOrigin: Date.now() - natives.nowMs(),
     };
-    globalThis.crypto = registry.get("crypto").webcrypto;
+    // Lazy: registry.get('crypto') instantiates the ENTIRE crypto factory
+    // (KeyObject, Hash, Hmac, createHash, ...) when only the webcrypto
+    // sub-object {subtle, getRandomValues, randomUUID} is consumed at
+    // boot. Deferring via a getter avoids ~1-2ms of factory init for
+    // programs that never touch globalThis.crypto.
+    Object.defineProperty(globalThis, 'crypto', {
+      get() {
+        const value = registry.get('crypto').webcrypto;
+        Object.defineProperty(globalThis, 'crypto', { value, writable: true, configurable: true });
+        return value;
+      },
+      configurable: true,
+    });
     // oam.serve: defined in bootstrap (snapshot), attached here because
     // the `oam` namespace object is a post-restore native install.
     if (globalThis.oam && globalThis.__oamServe) {
