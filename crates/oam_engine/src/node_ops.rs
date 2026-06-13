@@ -758,7 +758,9 @@ fn url_components(parsed: &url::Url) -> serde_json::Value {
         // Spec: the search GETTER is "" for both null and empty query
         // (href keeps a bare '?' for the empty-present case).
         "search": parsed.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
-        "hash": parsed.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+        // Spec: the hash GETTER returns "" when fragment is null or
+        // empty; returns "#" + fragment only when fragment is non-empty.
+        "hash": parsed.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
         "origin": parsed.origin().ascii_serialization(),
     })
 }
@@ -839,6 +841,29 @@ fn op_url_update(
     }
 }
 
+/// Whether `scheme` is a WHATWG "special" scheme.
+fn is_special_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp" | "file")
+}
+
+/// Strip tab / CR / LF from a setter value (WHATWG common pre-processing).
+fn strip_tab_cr_lf(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect()
+}
+
+/// Truncate `value` at the first occurrence of any char in `terminators`,
+/// returning the portion before the terminator (WHATWG host/hostname
+/// setter truncation for `/`, `?`, `#`, `\`).
+fn truncate_at_delimiters<'a>(value: &'a str, terminators: &[char]) -> &'a str {
+    match value.find(terminators.as_ref()) {
+        Some(pos) => &value[..pos],
+        None => value,
+    }
+}
+
 /// Apply one WHATWG setter to `href`, returning the resulting component
 /// bundle. "__noop" re-serializes unchanged (the panic-recovery path).
 fn update_components(href: &str, part: &str, value: &str) -> Result<String, String> {
@@ -848,7 +873,17 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
     match part {
         "__noop" => {}
         "protocol" => {
-            let _ = parsed.set_scheme(value.trim_end_matches(':'));
+            // WHATWG: scan to the first ':', treat everything before it
+            // as the scheme candidate, ignore the rest.  The url crate's
+            // set_scheme does the actual validation (alpha-start, valid
+            // chars, special <-> special rules).
+            let candidate = match value.find(':') {
+                Some(pos) => &value[..pos],
+                None => value,
+            };
+            // Pre-strip tab/CR/LF per spec.
+            let cleaned = strip_tab_cr_lf(candidate);
+            let _ = parsed.set_scheme(&cleaned);
         }
         "username" => {
             let _ = parsed.set_username(value);
@@ -858,43 +893,100 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
         }
         "host" => {
             // WHATWG host-state (setter form): strip tab/CR/LF, split
-            // host from port respecting IPv6 brackets, port = leading
-            // digits (trailing garbage ignored), file: forbids ':' and
-            // maps localhost to the empty host.
-            let cleaned: String = value
-                .chars()
-                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-                .collect();
+            // host from port respecting IPv6 brackets, truncate at
+            // delimiters, file: forbids ':' and maps localhost/empty to
+            // the empty host.
+            let cleaned = strip_tab_cr_lf(value);
             if parsed.scheme() == "file" {
-                if !cleaned.contains(':') {
-                    if cleaned.eq_ignore_ascii_case("localhost") {
+                // Truncate at '/', '?', '#', '\' for file host.
+                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#', '\\']);
+                if truncated.is_empty() {
+                    let _ = parsed.set_host(None);
+                } else if !truncated.contains(':') {
+                    if is_file_localhost(truncated) {
                         let _ = parsed.set_host(None);
                     } else {
-                        let _ = parsed.set_host(Some(&cleaned));
+                        let _ = parsed.set_host(Some(truncated));
                     }
                 }
-            } else if let Some((host, port_digits)) = split_host_port(&cleaned)
-                && !host.is_empty()
-                && parsed.set_host(Some(host)).is_ok()
-                && let Some(digits) = port_digits
-                && !digits.is_empty()
-                && let Ok(port) = digits.parse::<u32>()
-                && port <= 65535
-            {
-                apply_port(&mut parsed, port as u16);
+            } else if is_special_scheme(parsed.scheme()) {
+                // Special (non-file): truncate at '/', '?', '#', '\'.
+                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#', '\\']);
+                // WHATWG: '@' is a forbidden host code point; if it
+                // appears anywhere in the truncated value, the setter
+                // is a no-op (the entire set fails, not just truncation).
+                if truncated.contains('@') {
+                    // No-op.
+                } else if let Some((host, port_digits)) = split_host_port(truncated)
+                    && !host.is_empty()
+                    && parsed.set_host(Some(host)).is_ok()
+                {
+                    // Host set succeeded; apply port if present.
+                    maybe_apply_port(&mut parsed, port_digits.as_deref());
+                }
+            } else {
+                // Non-special schemes: truncate host part at '/', '?', '#'.
+                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#']);
+                if let Some((host, port_digits)) = split_host_port(truncated) {
+                    // Non-special: empty host with credentials or port
+                    // in the value is a no-op.
+                    let has_creds = !parsed.username().is_empty()
+                        || parsed.password().is_some_and(|p| !p.is_empty());
+                    let has_port_in_value = port_digits.as_ref().is_some_and(|d| !d.is_empty());
+                    if host.is_empty() && (has_creds || has_port_in_value) {
+                        // No-op.
+                    } else if parsed.set_host(Some(host)).is_ok() {
+                        maybe_apply_port(&mut parsed, port_digits.as_deref());
+                    }
+                } else if truncated.is_empty() {
+                    if !parsed.username().is_empty()
+                        || parsed.password().is_some_and(|p| !p.is_empty())
+                    {
+                        // No-op: can't clear host when credentials exist.
+                    } else {
+                        let _ = parsed.set_host(Some(""));
+                    }
+                }
             }
         }
         "hostname" => {
             // The hostname setter FAILS WHOLE on ':' outside brackets.
-            let cleaned: String = value
-                .chars()
-                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-                .collect();
-            if cleaned.starts_with('[') || !cleaned.contains(':') {
-                if parsed.scheme() == "file" && cleaned.eq_ignore_ascii_case("localhost") {
-                    let _ = parsed.set_host(None);
+            let cleaned = strip_tab_cr_lf(value);
+            // Truncate at '/', '?', '#', '\' (for special schemes) before
+            // the colon check.
+            let delims: &[char] = if is_special_scheme(parsed.scheme()) {
+                &['/', '?', '#', '\\']
+            } else {
+                &['/', '?', '#']
+            };
+            let truncated = truncate_at_delimiters(&cleaned, delims);
+            if truncated.starts_with('[') || !truncated.contains(':') {
+                if parsed.scheme() == "file" {
+                    if truncated.is_empty() || is_file_localhost(truncated) {
+                        let _ = parsed.set_host(None);
+                    } else {
+                        let _ = parsed.set_host(Some(truncated));
+                    }
+                } else if is_special_scheme(parsed.scheme()) {
+                    // Special (non-file): '@' is a forbidden host code
+                    // point; if present, the entire setter is a no-op.
+                    if truncated.contains('@') {
+                        // No-op.
+                    } else if !truncated.is_empty() {
+                        let _ = parsed.set_host(Some(truncated));
+                    }
                 } else {
-                    let _ = parsed.set_host(Some(&cleaned));
+                    // Non-special: empty hostname is allowed ONLY if there
+                    // is no username/password. Per WHATWG, setting hostname
+                    // to empty when credentials exist is a no-op.
+                    if truncated.is_empty()
+                        && (!parsed.username().is_empty()
+                            || parsed.password().is_some_and(|p| !p.is_empty()))
+                    {
+                        // No-op: can't clear host when credentials exist.
+                    } else {
+                        let _ = parsed.set_host(Some(truncated));
+                    }
                 }
             }
         }
@@ -902,9 +994,11 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
             if value.is_empty() {
                 let _ = parsed.set_port(None);
             } else {
-                // WHATWG: parse LEADING digits, ignore the rest; out of
-                // range or no digits = keep old.
-                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                // WHATWG: strip tab/CR/LF first, then parse LEADING
+                // digits, ignore the rest; out of range or no digits =
+                // keep old.
+                let cleaned = strip_tab_cr_lf(value);
+                let digits: String = cleaned.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if !digits.is_empty()
                     && let Ok(port) = digits.parse::<u32>()
                     && port <= 65535
@@ -917,7 +1011,36 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
             // Opaque-path URLs (data:, mailto:, ...) ignore the pathname
             // setter entirely, per spec.
             if !parsed.cannot_be_a_base() {
-                parsed.set_path(value);
+                let scheme = parsed.scheme().to_owned();
+                if scheme == "file" {
+                    // WHATWG: for file URLs, '\' in the path setter is
+                    // treated as '/' (special-scheme path-separator
+                    // equivalence). Pre-convert before handing to the
+                    // url crate.
+                    let converted = value.replace('\\', "/");
+                    parsed.set_path(&converted);
+                } else if !is_special_scheme(&scheme) {
+                    // Non-special: percent-encode '?' and '#' because
+                    // the WHATWG pathname setter uses "path state" which
+                    // does NOT terminate at these delimiters (they are
+                    // literal path characters, not query/fragment markers).
+                    let encoded = value.replace('?', "%3F").replace('#', "%23");
+                    if encoded.is_empty() {
+                        // WHATWG: empty pathname on a non-special URL.
+                        // If the URL has authority (host), empty path is
+                        // valid. If it doesn't, the path must be at least
+                        // "/".
+                        if parsed.host_str().is_some() {
+                            parsed.set_path("");
+                        } else {
+                            parsed.set_path("/");
+                        }
+                    } else {
+                        parsed.set_path(&encoded);
+                    }
+                } else {
+                    parsed.set_path(value);
+                }
             }
         }
         "search" => {
@@ -932,18 +1055,56 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
             }
         }
         "hash" => {
-            let trimmed = value.strip_prefix('#').unwrap_or(value);
-            parsed.set_fragment(if trimmed.is_empty() {
-                None
+            if value.is_empty() {
+                // Empty string: clear fragment entirely (null).
+                parsed.set_fragment(None);
             } else {
-                Some(trimmed)
-            });
+                let trimmed = value.strip_prefix('#').unwrap_or(value);
+                // Even if trimmed is empty (value was "#"), set
+                // empty-present fragment: href gets trailing '#',
+                // getter returns "".
+                parsed.set_fragment(Some(trimmed));
+            }
         }
         other => {
             return Err(format!("urlUpdate: unknown part '{other}'"));
         }
     }
     Ok(url_components(&parsed).to_string())
+}
+
+/// Check if a hostname value should be treated as "localhost" for file:
+/// URLs (WHATWG: percent-decode then compare case-insensitively).
+fn is_file_localhost(value: &str) -> bool {
+    // Fast path: exact match without encoding.
+    if value.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Percent-decode and re-check.
+    let decoded: String = percent_decode_str(value);
+    decoded.eq_ignore_ascii_case("localhost")
+}
+
+/// Simple percent-decode (only for hostname localhost check).
+fn percent_decode_str(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(&hex, 16)
+            {
+                result.push(byte as char);
+                continue;
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Split a host-setter value into (host, port-digits), respecting IPv6
@@ -978,6 +1139,17 @@ fn split_host_port(value: &str) -> Option<(&str, Option<String>)> {
             let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             Some((host, Some(digits)))
         }
+    }
+}
+
+/// Parse and apply port digits if present (convenience for host setter).
+fn maybe_apply_port(parsed: &mut url::Url, digits: Option<&str>) {
+    if let Some(digits) = digits
+        && !digits.is_empty()
+        && let Ok(port) = digits.parse::<u32>()
+        && port <= 65535
+    {
+        apply_port(parsed, port as u16);
     }
 }
 
