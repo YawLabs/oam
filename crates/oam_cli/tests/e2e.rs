@@ -3686,7 +3686,7 @@ async fn inspector_reconnects_after_client_disconnect() {
                     }
                 }
                 Ok(Some(Ok(_))) => {} // ping/pong/binary
-                _ => break 'drain,   // timeout, error, or EOF
+                _ => break 'drain,    // timeout, error, or EOF
             }
         }
         assert!(got_response, "first session: no response to Runtime.enable");
