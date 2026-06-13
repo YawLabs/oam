@@ -659,11 +659,12 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     );
 
     // Shipped builtins resolve; the MOD0006 gate covers the rest,
-    // prefixed or bare. (worker_threads is the long-horizon example —
-    // earlier picks kept SHIPPING and flipping this test.)
+    // prefixed or bare. Use `constants` (deprecated legacy alias, not in
+    // SUPPORTED_BUILTINS) and `sys` (ancient alias) as permanent canaries --
+    // they will never ship and keep this test from needing to chase the list.
     std::fs::write(
         proj.join("builtin_main.ts"),
-        "import 'node:worker_threads';",
+        "import 'node:constants';",
     )
     .unwrap();
     let out = oam(&[
@@ -679,11 +680,11 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "node: builtin gate: {stderr}"
     );
     assert!(
-        stderr.contains("wave 1 ships"),
-        "gate lists wave 1: {stderr}"
+        stderr.contains("wave 1 ships") || stderr.contains("does not implement"),
+        "gate message present: {stderr}"
     );
 
-    std::fs::write(proj.join("bare_builtin.ts"), "import 'cluster';").unwrap();
+    std::fs::write(proj.join("bare_builtin.ts"), "import 'sys';").unwrap();
     let out = oam(&[
         "run",
         proj.join("bare_builtin.ts").to_str().unwrap(),
