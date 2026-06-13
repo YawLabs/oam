@@ -3714,14 +3714,16 @@ fn http_per_request_body_over_cap_returns_413_not_503() {
     //         on the GH Windows runner with 200 MB; cap still fired, client
     //         just didn't observe the status).
     // What we MUST reject: 503 (the 413/503 collapse bug) or 200 (cap missed).
+    // Check 503 first so the regression-specific message surfaces instead of
+    // being swallowed by the general "413 or ERR:*" assertion below.
+    assert_ne!(
+        stdout, "503",
+        "413/503 collapse regression: per-request over-cap surfaced as 'busy'"
+    );
     assert!(
         stdout == "413" || stdout.starts_with("ERR:"),
         "per-request over-cap must yield 413 or a network error (cap fired \
          before client read response); got: {stdout}"
-    );
-    assert_ne!(
-        stdout, "503",
-        "413/503 collapse regression: per-request over-cap surfaced as 'busy'"
     );
 }
 

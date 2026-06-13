@@ -228,7 +228,11 @@ pub unsafe extern "C" fn napi_create_int64(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    const MAX_SAFE: i64 = 1_i64 << 53;
+    // Node-parity: Number.MAX_SAFE_INTEGER = 2^53 - 1. Values whose absolute
+    // value EQUALS 2^53 are representable in f64 exactly but the surrounding
+    // integers are not, so Node's napi_create_int64 returns BigInt at the
+    // boundary. Inclusive range against (2^53 - 1) matches.
+    const MAX_SAFE: i64 = (1_i64 << 53) - 1;
     unsafe {
         if (-MAX_SAFE..=MAX_SAFE).contains(&value) {
             out(
