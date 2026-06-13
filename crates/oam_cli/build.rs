@@ -1,7 +1,7 @@
 //! Export the N-API symbol surface from the oam EXECUTABLE — .node addons
 //! resolve `napi_*` from their host process (node.exe's model). Windows
-//! needs an explicit .def; Linux needs --export-dynamic; macOS executables
-//! export by default.
+//! needs an explicit .def; Linux needs --export-dynamic; macOS modern ld
+//! strips unreferenced exports unless told otherwise (-export_dynamic).
 
 const NAPI_EXPORTS: &[&str] = &[
     "napi_get_undefined",
@@ -62,9 +62,14 @@ fn main() {
         "linux" => {
             println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic");
         }
-        _ => {
-            // macOS executables export their symbols by default; addons
-            // link with -undefined dynamic_lookup.
+        "macos" => {
+            // Apple's modern ld DOES strip unreferenced exports from the
+            // dynamic symbol table; addons dlopen-resolving napi_* against
+            // the host process need -export_dynamic to keep them visible.
+            // (The cdylib side defers unresolved symbols to load time via
+            // rustc's default `-undefined dynamic_lookup`.)
+            println!("cargo:rustc-link-arg-bins=-Wl,-export_dynamic");
         }
+        _ => {}
     }
 }
