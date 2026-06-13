@@ -135,9 +135,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadChunk", op_fs_read_chunk),
         ("fsWriteChunk", op_fs_write_chunk),
         ("fsClose", op_fs_close),
-        // node:zlib
+        // node:zlib (one-shot)
         ("zlibSync", op_zlib_sync),
         ("zlibAsync", op_zlib_async),
+        // node:zlib streaming (incremental Transform backing)
+        ("zlibStreamCreate", op_zlib_stream_create),
+        ("zlibStreamWrite", op_zlib_stream_write),
+        ("zlibStreamFlush", op_zlib_stream_flush),
+        ("zlibStreamClose", op_zlib_stream_close),
         // HTTP server
         ("httpServe", op_http_serve),
         ("httpAccept", op_http_accept),
@@ -644,7 +649,90 @@ fn op_zlib_async(
     );
 }
 
-/// Serialize every WHATWG component of a parsed URL in one bundle — the
+/// zlibStreamCreate(format, level, compress) -> Promise<{handle}>.
+/// Allocates an incremental compressor or decompressor in the stream
+/// registry. The handle is passed to subsequent write/flush/close calls.
+fn op_zlib_stream_create(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let format = arg_string(scope, &args, 0).unwrap_or_default();
+    let level = args.get(1).int32_value(scope).unwrap_or(-1);
+    let compress = args.get(2).is_true();
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let streams = core.zlib_streams();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_stream_create(streams, ids, format, level, compress),
+    );
+}
+
+/// zlibStreamWrite(handle, chunk) -> Promise<Uint8Array>.
+/// Feed one chunk into an existing stream. Resolves with bytes produced
+/// immediately (may be empty if the encoder is still filling a block).
+fn op_zlib_stream_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(chunk) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "zlibStreamWrite requires data");
+        return;
+    };
+    let streams = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .zlib_streams();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_stream_write(streams, handle, chunk),
+    );
+}
+
+/// zlibStreamFlush(handle) -> Promise<Uint8Array>.
+/// Finalize the stream and return tail bytes. The stream handle is
+/// removed from the registry after this call.
+fn op_zlib_stream_flush(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let streams = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .zlib_streams();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_stream_flush(streams, handle),
+    );
+}
+
+/// zlibStreamClose(handle) -> void (synchronous).
+/// Discard the stream without flushing. Used when the stream is destroyed
+/// before it completes normally.
+fn op_zlib_stream_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let streams = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .zlib_streams();
+    oam_core::ops::zlib_stream_close(&streams, handle);
+}
+
+/// Serialize every WHATWG component of a parsed URL in one bundle -- the
 /// JS class stores these and re-requests on mutation.
 fn url_components(parsed: &url::Url) -> serde_json::Value {
     serde_json::json!({

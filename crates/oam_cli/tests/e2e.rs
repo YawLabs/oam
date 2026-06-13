@@ -1662,6 +1662,91 @@ fn small_builtins_wave_smoke() {
     assert_eq!(lines[4], "\"sunk 9\\n\"");
 }
 
+#[test]
+fn zlib_incremental_streaming_gzip_roundtrip() {
+    // Goal: pipe a large buffer (> 10 MB) through createGzip, verify the
+    // Transform emits multiple chunks (incremental, not one-shot), then
+    // pipe through createGunzip and assert a byte-for-byte round trip.
+    let stdout = run_ok(
+        "zlib_stream_incremental.mjs",
+        "import { createGzip, createGunzip, createDeflate, createInflate,\n\
+                  createDeflateRaw, createInflateRaw } from 'node:zlib';\n\
+         import { Readable, Writable, Transform, pipeline } from 'node:stream';\n\
+         import { pipeline as pipelineP } from 'node:stream/promises';\n\
+         \n\
+         // 12 MB payload: large enough that a streaming encoder will flush\n\
+         // multiple deflate blocks before _flush is called.\n\
+         const TOTAL = 12 * 1024 * 1024;\n\
+         const payload = Buffer.alloc(TOTAL);\n\
+         // Fill with patterned bytes so compression doesn't trivially collapse.\n\
+         for (let i = 0; i < TOTAL; i++) payload[i] = i & 0xff;\n\
+         \n\
+         // Helper: pipe source through [transform, ...] and collect output\n\
+         // chunks, also counting how many distinct push()ed chunks arrived.\n\
+         function pipeAndCollect(source, transforms) {\n\
+           return new Promise((resolve, reject) => {\n\
+             let chunkCount = 0;\n\
+             const bufs = [];\n\
+             const sink = new Writable({\n\
+               write(chunk, _e, cb) {\n\
+                 chunkCount++;\n\
+                 bufs.push(chunk);\n\
+                 cb();\n\
+               }\n\
+             });\n\
+             let chain = source;\n\
+             for (const t of transforms) chain = chain.pipe(t);\n\
+             chain.pipe(sink);\n\
+             sink.on('finish', () => resolve({ data: Buffer.concat(bufs), chunkCount }));\n\
+             sink.on('error', reject);\n\
+           });\n\
+         }\n\
+         \n\
+         // gzip: compress with createGzip, count >= 2 chunks, decompress, verify.\n\
+         const src1 = Readable.from([payload]);\n\
+         const gz = createGzip();\n\
+         const { data: compressed, chunkCount: gzChunks } = await pipeAndCollect(src1, [gz]);\n\
+         // The compressed output must be smaller than the raw input in practice.\n\
+         const compressed_smaller = compressed.length < payload.length;\n\
+         const src2 = Readable.from([compressed]);\n\
+         const { data: decompressed } = await pipeAndCollect(src2, [createGunzip()]);\n\
+         const roundtripOk = decompressed.equals(payload);\n\
+         console.log('gzip_chunks_gte_2:', gzChunks >= 2);\n\
+         console.log('compressed_smaller:', compressed_smaller);\n\
+         console.log('gzip_roundtrip:', roundtripOk);\n\
+         \n\
+         // deflate / inflate round trip (same incremental path).\n\
+         const srcD = Readable.from([payload]);\n\
+         const { data: defCompressed } = await pipeAndCollect(srcD, [createDeflate()]);\n\
+         const srcDi = Readable.from([defCompressed]);\n\
+         const { data: defDecompressed } = await pipeAndCollect(srcDi, [createInflate()]);\n\
+         console.log('deflate_roundtrip:', defDecompressed.equals(payload));\n\
+         \n\
+         // deflateRaw / inflateRaw round trip.\n\
+         const srcR = Readable.from([payload]);\n\
+         const { data: rawCompressed } = await pipeAndCollect(srcR, [createDeflateRaw()]);\n\
+         const srcRi = Readable.from([rawCompressed]);\n\
+         const { data: rawDecompressed } = await pipeAndCollect(srcRi, [createInflateRaw()]);\n\
+         console.log('deflateRaw_roundtrip:', rawDecompressed.equals(payload));\n\
+         \n\
+         // Chain: compress then decompress in a single pipeline.\n\
+         const srcChain = Readable.from([payload]);\n\
+         const { data: chained } = await pipeAndCollect(srcChain,\n\
+           [createGzip(), createGunzip()]);\n\
+         console.log('chain_roundtrip:', chained.equals(payload));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0], "gzip_chunks_gte_2: true",
+        "expected >= 2 chunks from createGzip on a 12 MB input"
+    );
+    assert_eq!(lines[1], "compressed_smaller: true");
+    assert_eq!(lines[2], "gzip_roundtrip: true");
+    assert_eq!(lines[3], "deflate_roundtrip: true");
+    assert_eq!(lines[4], "deflateRaw_roundtrip: true");
+    assert_eq!(lines[5], "chain_roundtrip: true");
+}
+
 // ------------------------------------------------------------- node:crypto
 
 #[test]

@@ -4062,7 +4062,85 @@
       );
     };
 
-    function transformClass(format, compress) {
+    // Incremental streaming Transform: each _transform call feeds one
+    // chunk into the Rust-side encoder/decoder immediately via
+    // zlibStreamWrite, so memory usage is bounded by the encoder's
+    // internal block size (typically 32-128 kB) rather than the whole
+    // input. _flush finalizes the stream and emits any trailer bytes.
+    //
+    // Supported formats (incremental): gzip, deflate, deflateRaw, unzip.
+    // Brotli uses the legacy buffering path with a clear error gate.
+    //
+    // The stream handle is created lazily on the first _transform call so
+    // that streams that are only used for sync ops (e.g. pipe target with
+    // no actual data) do not allocate a registry slot.
+    function streamingTransformClass(format, compress) {
+      const { Transform } = registry.get("stream");
+      return class extends Transform {
+        constructor(options) {
+          super({});
+          this._zlibLevel = levelOf(options);
+          // _zlibHandle is null until the first chunk arrives.
+          this._zlibHandle = null;
+          // Promise serializing back-to-back _transform calls so we
+          // never have two concurrent zlibStreamWrite ops for the same handle.
+          this._zlibQueue = Promise.resolve();
+        }
+
+        // Lazily allocate the Rust-side stream on first use.
+        _ensureStream() {
+          if (this._zlibHandle !== null) return Promise.resolve();
+          return natives.zlibStreamCreate(format, this._zlibLevel, compress).then(
+            (info) => { this._zlibHandle = info.handle; },
+          );
+        }
+
+        _transform(chunk, _encoding, cb) {
+          const bytes = toBytes(chunk);
+          // Chain onto the queue so writes stay in order.
+          this._zlibQueue = this._zlibQueue.then(() =>
+            this._ensureStream().then(() =>
+              natives.zlibStreamWrite(this._zlibHandle, bytes)
+            )
+          ).then((out) => {
+            if (out && out.length > 0) this.push(asBuffer(out));
+            cb();
+          }, cb);
+        }
+
+        _flush(cb) {
+          this._zlibQueue = this._zlibQueue.then(() => {
+            if (this._zlibHandle === null) {
+              // No data was ever written -- create+immediately flush an
+              // empty stream so the output is a valid (empty) archive.
+              return natives.zlibStreamCreate(format, this._zlibLevel, compress)
+                .then((info) => {
+                  this._zlibHandle = info.handle;
+                  return natives.zlibStreamFlush(this._zlibHandle);
+                });
+            }
+            return natives.zlibStreamFlush(this._zlibHandle);
+          }).then((tail) => {
+            this._zlibHandle = null;
+            if (tail && tail.length > 0) cb(null, asBuffer(tail));
+            else cb();
+          }, cb);
+        }
+
+        // destroy() path: clean up the Rust-side slot without flushing.
+        _destroy(err, cb) {
+          if (this._zlibHandle !== null) {
+            natives.zlibStreamClose(this._zlibHandle);
+            this._zlibHandle = null;
+          }
+          cb(err);
+        }
+      };
+    }
+
+    // Wave-1 buffering fallback: kept for brotli (not yet incrementally
+    // backed) and any format that is not in the streaming set.
+    function bufferingTransformClass(format, compress) {
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
@@ -4088,6 +4166,16 @@
           );
         }
       };
+    }
+
+    // Route: use incremental streaming for gzip/deflate/deflateRaw/unzip;
+    // fall back to the buffering path for anything else (brotli, future modes).
+    const STREAMING_FORMATS = new Set(["gzip", "deflate", "deflateRaw", "unzip"]);
+    function transformClass(format, compress) {
+      if (STREAMING_FORMATS.has(format)) {
+        return streamingTransformClass(format, compress);
+      }
+      return bufferingTransformClass(format, compress);
     }
 
     const brotliGate = () => {
