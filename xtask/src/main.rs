@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod conformance;
 
 #[derive(Parser)]
@@ -14,6 +15,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run micro-benchmarks (cold-start, url-parse, http-throughput, fs-read).
+    ///
+    /// Pass --release to benchmark the release binary instead of debug.
+    Bench {
+        /// Build and benchmark the release binary (cargo build --release).
+        #[arg(long)]
+        release: bool,
+    },
     /// Run the conformance suites (WPT URL, Node differential, builtin
     /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
     ///
@@ -35,6 +44,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Bench { release } => bench::run(release),
         Command::Conformance { release } => conformance::run(release),
         Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
         Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
