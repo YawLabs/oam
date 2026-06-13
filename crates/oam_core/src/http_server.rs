@@ -359,9 +359,7 @@ fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
 ///
 /// Returns `Ok(bytes)` when the body fit, `Err(())` when it exceeded the
 /// cap (the drain has already completed by the time `Err` is returned).
-async fn collect_body(
-    mut body: hyper::body::Incoming,
-) -> Result<bytes::Bytes, ()> {
+async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, ()> {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
     let mut over_cap = false;
