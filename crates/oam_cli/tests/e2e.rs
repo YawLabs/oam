@@ -662,11 +662,7 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
     // prefixed or bare. Use `constants` (deprecated legacy alias, not in
     // SUPPORTED_BUILTINS) and `sys` (ancient alias) as permanent canaries --
     // they will never ship and keep this test from needing to chase the list.
-    std::fs::write(
-        proj.join("builtin_main.ts"),
-        "import 'node:constants';",
-    )
-    .unwrap();
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:constants';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),
