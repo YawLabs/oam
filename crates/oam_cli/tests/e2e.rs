@@ -1664,7 +1664,10 @@ fn zlib_incremental_streaming_gzip_roundtrip() {
          console.log('chain_roundtrip:', chained.equals(payload));",
     );
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines[0], "gzip_chunks_gte_2: true", "expected >= 2 chunks from createGzip on a 12 MB input");
+    assert_eq!(
+        lines[0], "gzip_chunks_gte_2: true",
+        "expected >= 2 chunks from createGzip on a 12 MB input"
+    );
     assert_eq!(lines[1], "compressed_smaller: true");
     assert_eq!(lines[2], "gzip_roundtrip: true");
     assert_eq!(lines[3], "deflate_roundtrip: true");

@@ -429,12 +429,12 @@ pub mod zlib {
                 Compression::default()
             };
             let inner = match format {
-                Format::Gzip => CompressorInner::Gzip(
-                    flate2::write::GzEncoder::new(Vec::new(), level),
-                ),
-                Format::Deflate => CompressorInner::Deflate(
-                    flate2::write::ZlibEncoder::new(Vec::new(), level),
-                ),
+                Format::Gzip => {
+                    CompressorInner::Gzip(flate2::write::GzEncoder::new(Vec::new(), level))
+                }
+                Format::Deflate => {
+                    CompressorInner::Deflate(flate2::write::ZlibEncoder::new(Vec::new(), level))
+                }
                 Format::DeflateRaw => CompressorInner::DeflateRaw(
                     flate2::write::DeflateEncoder::new(Vec::new(), level),
                 ),
@@ -507,16 +507,28 @@ pub mod zlib {
 
     impl StreamDecompressor {
         pub fn new_gzip() -> Self {
-            Self { inner: DecompressorInner::Gzip, input: Vec::new() }
+            Self {
+                inner: DecompressorInner::Gzip,
+                input: Vec::new(),
+            }
         }
         pub fn new_deflate() -> Self {
-            Self { inner: DecompressorInner::Deflate, input: Vec::new() }
+            Self {
+                inner: DecompressorInner::Deflate,
+                input: Vec::new(),
+            }
         }
         pub fn new_deflate_raw() -> Self {
-            Self { inner: DecompressorInner::DeflateRaw, input: Vec::new() }
+            Self {
+                inner: DecompressorInner::DeflateRaw,
+                input: Vec::new(),
+            }
         }
         pub fn new_unzip() -> Self {
-            Self { inner: DecompressorInner::Unzip, input: Vec::new() }
+            Self {
+                inner: DecompressorInner::Unzip,
+                input: Vec::new(),
+            }
         }
 
         /// Accumulate a chunk of compressed data. Returns empty -- the full
@@ -544,12 +556,10 @@ pub mod zlib {
             let mut out = Vec::new();
             match &self.inner {
                 DecompressorInner::Gzip => {
-                    flate2::read::GzDecoder::new(self.input.as_slice())
-                        .read_to_end(&mut out)?;
+                    flate2::read::GzDecoder::new(self.input.as_slice()).read_to_end(&mut out)?;
                 }
                 DecompressorInner::Deflate => {
-                    flate2::read::ZlibDecoder::new(self.input.as_slice())
-                        .read_to_end(&mut out)?;
+                    flate2::read::ZlibDecoder::new(self.input.as_slice()).read_to_end(&mut out)?;
                 }
                 DecompressorInner::DeflateRaw => {
                     flate2::read::DeflateDecoder::new(self.input.as_slice())
@@ -863,11 +873,7 @@ pub mod ops {
                 "deflate" => super::zlib::StreamDecompressor::new_deflate(),
                 "deflateRaw" => super::zlib::StreamDecompressor::new_deflate_raw(),
                 "unzip" => super::zlib::StreamDecompressor::new_unzip(),
-                _ => {
-                    return OpOutcome::Failed(format!(
-                        "zlib stream: unknown format '{format}'"
-                    ))
-                }
+                _ => return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'")),
             };
             super::ZlibStream::Decompress(dec)
         };
@@ -894,12 +900,12 @@ pub mod ops {
                 return Err(format!("zlib stream: handle {handle} not found"));
             };
             match stream {
-                super::ZlibStream::Compress(enc) => {
-                    enc.write_chunk(&chunk).map_err(|e| format!("zlib stream write: {e}"))
-                }
-                super::ZlibStream::Decompress(dec) => {
-                    dec.write_chunk(&chunk).map_err(|e| format!("zlib stream write: {e}"))
-                }
+                super::ZlibStream::Compress(enc) => enc
+                    .write_chunk(&chunk)
+                    .map_err(|e| format!("zlib stream write: {e}")),
+                super::ZlibStream::Decompress(dec) => dec
+                    .write_chunk(&chunk)
+                    .map_err(|e| format!("zlib stream write: {e}")),
             }
         })
         .await;
@@ -913,10 +919,7 @@ pub mod ops {
     /// zlibStreamFlush: finalize and remove the stream. Returns the tail
     /// bytes. For compressors, this emits the format trailer (CRC etc.).
     /// For decompressors, this drains any buffered input.
-    pub async fn zlib_stream_flush(
-        streams: super::ZlibRegistry,
-        handle: u64,
-    ) -> OpOutcome {
+    pub async fn zlib_stream_flush(streams: super::ZlibRegistry, handle: u64) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             let stream = streams
                 .lock()
