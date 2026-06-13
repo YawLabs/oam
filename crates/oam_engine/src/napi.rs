@@ -56,7 +56,11 @@ pub struct NapiEnv {
     pending: Option<v8::Global<v8::Value>>,
     /// Every `FnData` created via `napi_create_function` for this env.
     /// Stored here so they live exactly as long as the env, and the env
-    /// lives exactly as long as the owning `JsRuntime`.
+    /// lives exactly as long as the owning `JsRuntime`. `Box` is required
+    /// for raw-pointer stability: the C ABI hands out `*mut FnData` to
+    /// addons; flat `Vec<FnData>` would move elements on realloc and
+    /// invalidate those pointers.
+    #[allow(clippy::vec_box)]
     fn_data: Vec<Box<FnData>>,
 }
 
@@ -86,8 +90,13 @@ impl NapiEnv {
 ///   drop in declaration order, so `envs` drops before `libraries`.
 ///   Even if a destructor inside the `.node` library calls back through
 ///   the N-API ABI, the `NapiEnv` outlives the library unload.
+#[derive(Default)]
 pub struct AddonRegistry {
     /// Owned `NapiEnv` allocations, one per successfully loaded addon.
+    /// `Box` is required: the C ABI dispenses `*mut NapiEnv` and a flat
+    /// `Vec<NapiEnv>` would move elements on realloc, invalidating those
+    /// pointers (every addon would crash on the next napi callback).
+    #[allow(clippy::vec_box)]
     envs: Vec<Box<NapiEnv>>,
     /// Loaded addon libraries.  Dropping a `Library` unloads the `.node`
     /// DLL; this must happen AFTER the envs are dropped so any destructor
@@ -97,15 +106,13 @@ pub struct AddonRegistry {
 
 impl AddonRegistry {
     pub fn new() -> Self {
-        AddonRegistry {
-            envs: Vec::new(),
-            libraries: Vec::new(),
-        }
+        Self::default()
     }
 }
 
-/// Thread-local drop counter: each `NapiEnv::drop` increments it.
-/// Used only in tests to verify that every load is matched by a drop.
+// Thread-local drop counter: each `NapiEnv::drop` increments it.
+// Used only in tests to verify that every load is matched by a drop.
+// Not a doc comment -- rustdoc can't document items produced by a macro.
 #[cfg(test)]
 thread_local! {
     pub static NAPI_ENV_DROP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
