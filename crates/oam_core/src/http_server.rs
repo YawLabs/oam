@@ -27,6 +27,18 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 /// Per-request body cap (wave-1 buffered bodies).
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
+/// After the per-request cap is hit we drain (discard) up to this many
+/// additional bytes before returning the 413 response.  The drain serves
+/// a single purpose: on Windows, dropping a TcpStream that still has
+/// unread data in the kernel recv-buffer causes an immediate TCP RST.
+/// That RST races with the 413 response bytes in the send-buffer, so the
+/// client reads "connection reset" instead of "413".  Draining clears the
+/// recv-buffer, the connection closes with a clean FIN, and the client
+/// reads the 413 first.  The drain is capped so an adversarial client
+/// cannot pin the connection indefinitely; anything beyond DRAIN_BUDGET
+/// bytes above the cap is still rejected with RST (and the test body is
+/// sized to stay under the drain ceiling -- see e2e.rs).
+const DRAIN_BUDGET: usize = 16 * 1024 * 1024; // 16 MB post-cap drain
 /// Aggregate cap on RETAINED request-body bytes across all in-flight
 /// requests of the run — bounds the body-buffer memory a flood of uploads
 /// can pin. (Per-request transient during collection is bounded by the
@@ -335,22 +347,72 @@ fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
         .expect("static status body builds")
 }
 
+/// Collect up to `MAX_REQUEST_BODY` bytes from `body`, then drain up to
+/// `DRAIN_BUDGET` more (discarding them) before returning.
+///
+/// The drain step is what makes 413 reliable on Windows.  Without it,
+/// closing a TcpStream with unread kernel recv-buffer data sends a TCP RST
+/// instead of FIN.  The RST races with the 413 bytes in the send-buffer;
+/// the client may read "connection reset" instead of "413".  Draining the
+/// recv-buffer lets the OS close the connection gracefully (FIN) so the
+/// 413 response lands first.
+///
+/// Returns `Ok(bytes)` when the body fit, `Err(())` when it exceeded the
+/// cap (the drain has already completed by the time `Err` is returned).
+async fn collect_body(
+    mut body: hyper::body::Incoming,
+) -> Result<bytes::Bytes, ()> {
+    use bytes::BufMut;
+    let mut buf = bytes::BytesMut::new();
+    let mut over_cap = false;
+    let mut drained: usize = 0;
+
+    loop {
+        let frame = match body.frame().await {
+            Some(Ok(f)) => f,
+            Some(Err(_)) | None => break,
+        };
+        let Some(chunk) = frame.into_data().ok() else {
+            // Trailers and other frame types: ignore, keep going.
+            continue;
+        };
+        if over_cap {
+            // Drain phase: discard bytes up to DRAIN_BUDGET to let the
+            // kernel recv-buffer clear so close() can use FIN, not RST.
+            drained += chunk.len();
+            if drained >= DRAIN_BUDGET {
+                break;
+            }
+        } else {
+            buf.put(chunk);
+            if buf.len() > MAX_REQUEST_BODY {
+                over_cap = true;
+                buf.clear(); // release buffered memory immediately
+            }
+        }
+    }
+
+    if over_cap { Err(()) } else { Ok(buf.freeze()) }
+}
+
 async fn handle_request(
     state: Arc<HttpState>,
     queue: mpsc::Sender<IncomingRequest>,
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<BoxedBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
-    // Enforce per-request size cap; the global budget gate below is the
-    // single source of truth for aggregate concurrency limits. Limited::new
-    // erroring means "client sent more than MAX_REQUEST_BODY" -- 413, NOT
-    // 503: the server isn't busy, the client's body is just too big.
-    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(status_body(413, b"request body too large")),
+    // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
+    // drain up to DRAIN_BUDGET additional bytes before returning 413.
+    //
+    // Why drain?  On Windows, dropping a TcpStream that still has unread
+    // data in the kernel recv-buffer triggers an immediate TCP RST.  The RST
+    // races with the 413 response bytes sitting in the send-buffer, so the
+    // client reads "connection reset" instead of "413 Request Entity Too
+    // Large".  Draining empties the recv-buffer so the connection can close
+    // with a clean FIN and the client reliably reads the status line first.
+    let collected = match collect_body(body).await {
+        Ok(bytes) => bytes,
+        Err(()) => return Ok(status_body(413, b"request body too large")),
     };
     // Reserve the retained bytes; refund (RequestGuard) on completion.
     let body_len = collected.len();

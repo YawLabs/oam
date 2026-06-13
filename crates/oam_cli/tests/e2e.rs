@@ -4014,19 +4014,17 @@ fn http_per_request_body_over_cap_returns_413_not_503() {
          const server = http.createServer((req, res) => res.end('ok'));\n\
          await new Promise((r) => server.listen(0, r));\n\
          const base = `http://127.0.0.1:${server.address().port}`;\n\
-         // 200 MB body -- larger than MAX_REQUEST_BODY (100 MB). Fresh server,\n\
+         // 110 MB body -- larger than MAX_REQUEST_BODY (100 MB). Fresh server,\n\
          // empty aggregate budget, so the only reason to reject is per-request.\n\
-         const huge = 'x'.repeat(200 * 1024 * 1024);\n\
+         const huge = 'x'.repeat(110 * 1024 * 1024);\n\
          const res = await fetch(`${base}/big`, { method: 'POST', body: huge })\n\
            .catch((e) => ({ status: 'ERR:' + e.constructor.name }));\n\
          console.log(res.status);\n\
          server.close();",
     );
     // 413 = the per-request size cap fired and the client read the response.
-    // ERR:* = the server killed the connection after rejecting the upload
-    //         before the client finished sending (a fetch-vs-close race seen
-    //         on the GH Windows runner with 200 MB; cap still fired, client
-    //         just didn't observe the status).
+    // ERR:* = server-close race (shouldn't happen with the drain fix, but the
+    //         loose test still accepts it as a safety net).
     // What we MUST reject: 503 (the 413/503 collapse bug) or 200 (cap missed).
     // Check 503 first so the regression-specific message surfaces instead of
     // being swallowed by the general "413 or ERR:*" assertion below.
@@ -4316,19 +4314,24 @@ fn node_url_file_conversions_posix() {
     }
 }
 
-// ----------------------------------------- http 413 strict (non-Windows)
+// ----------------------------------------- http 413 strict (all platforms)
 
 /// Strict variant of `http_per_request_body_over_cap_returns_413_not_503`
-/// that asserts stdout == "413" exactly. On Windows, a large POST body can
-/// hit a race where the server drops the connection before the client reads
-/// the 413 response, yielding ERR:* instead -- hence the original test
-/// accepts both. This companion runs only on non-Windows and fails if the
-/// server returns anything other than 413, preventing an all-platforms
-/// regression that an ERR:* result would otherwise hide.
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "Windows connection-close race on large POST"
-)]
+/// that asserts stdout == "413" exactly on every platform.
+///
+/// The original test was cfg_attr-ignored on Windows because a 200 MB POST
+/// could race: the server rejects after reading 100 MB, drops the connection
+/// while the client is still uploading the remaining 100 MB, and on Windows
+/// the TCP RST from the unread recv-buffer beats the 413 bytes in the
+/// send-buffer.
+///
+/// The fix is two-pronged:
+///   1. The server drains up to DRAIN_BUDGET bytes after the cap fires,
+///      clearing the recv-buffer so the OS can close with a clean FIN.
+///   2. The test body is 110 MB (10 MB over cap) -- within the 16 MB drain
+///      budget -- so the drain always completes and the FIN path wins.
+///
+/// This replaces both the cfg_attr AND the 200 MB body.
 #[test]
 fn http_per_request_body_over_cap_413_strict() {
     let stdout = run_ok(
@@ -4337,8 +4340,10 @@ fn http_per_request_body_over_cap_413_strict() {
          const server = http.createServer((req, res) => res.end('ok'));\n\
          await new Promise((r) => server.listen(0, r));\n\
          const base = `http://127.0.0.1:${server.address().port}`;\n\
-         // 200 MB body -- larger than MAX_REQUEST_BODY (100 MB).\n\
-         const huge = 'x'.repeat(200 * 1024 * 1024);\n\
+         // 110 MB body -- 10 MB over MAX_REQUEST_BODY (100 MB).\n\
+         // Sized to fit within the server's 16 MB post-cap drain budget so\n\
+         // the recv-buffer is clear before close, avoiding the RST race.\n\
+         const huge = 'x'.repeat(110 * 1024 * 1024);\n\
          const res = await fetch(`${base}/big`, { method: 'POST', body: huge })\n\
            .catch((e) => ({ status: 'ERR:' + e.constructor.name }));\n\
          console.log(res.status);\n\
@@ -4346,9 +4351,9 @@ fn http_per_request_body_over_cap_413_strict() {
     );
     assert_eq!(
         stdout, "413",
-        "per-request over-cap must yield exactly 413 on non-Windows; \
-         got: {stdout} (ERR:* means the connection-close race fired -- \
-         investigate or move to the loose variant)"
+        "per-request over-cap must yield exactly 413 on all platforms; \
+         got: {stdout} (ERR:* means the RST race is not fixed -- re-examine \
+         the drain logic in collect_body)"
     );
 }
 
