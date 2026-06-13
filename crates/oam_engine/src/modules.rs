@@ -727,8 +727,8 @@ pub(crate) fn pump_event_loop(
                             let chunk = remaining.min(POLL_INTERVAL);
                             std::thread::sleep(chunk);
                             shared.poll();
-                            remaining = deadline
-                                .saturating_duration_since(std::time::Instant::now());
+                            remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
                         }
                     } else {
                         std::thread::sleep(total);
