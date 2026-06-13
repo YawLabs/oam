@@ -869,14 +869,18 @@ mod tests {
 
     #[test]
     fn inspect_host_port_pair_is_honored() {
-        let (addr, brk) = resolve_inspect(Some("0.0.0.0:7000"), None).unwrap().unwrap();
+        let (addr, brk) = resolve_inspect(Some("0.0.0.0:7000"), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(addr.to_string(), "0.0.0.0:7000");
         assert!(!brk);
     }
 
     #[test]
     fn inspect_brk_wins_over_inspect() {
-        let (_, brk) = resolve_inspect(Some("9229"), Some("9230")).unwrap().unwrap();
+        let (_, brk) = resolve_inspect(Some("9229"), Some("9230"))
+            .unwrap()
+            .unwrap();
         assert!(brk);
     }
 
@@ -903,4 +907,3 @@ mod tests {
         assert!(resolve_inspect(None, None).unwrap().is_none());
     }
 }
-

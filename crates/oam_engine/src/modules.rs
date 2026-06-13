@@ -167,7 +167,11 @@ pub(crate) fn flush_handled_rejections(
     for (promise, reason) in drained {
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
-        emit_process_event(tc, "unhandledRejection", &[reason_local, promise_local.into()]);
+        emit_process_event(
+            tc,
+            "unhandledRejection",
+            &[reason_local, promise_local.into()],
+        );
     }
 }
 
@@ -736,7 +740,11 @@ pub(crate) fn unhandled_rejection_failures(
         // Node: process.emit('unhandledRejection', reason, promise).
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
-        if emit_process_event(tc, "unhandledRejection", &[reason_local, promise_local.into()]) {
+        if emit_process_event(
+            tc,
+            "unhandledRejection",
+            &[reason_local, promise_local.into()],
+        ) {
             continue;
         }
         fatal.push(Diagnostic::new(

@@ -186,7 +186,9 @@ async fn serve(
             outcome = handle_connection(stream, addr, &uuid, &from_client, &mut to_client_rx) => outcome,
         };
         if outcome == Outcome::SessionEnded {
-            eprintln!("inspector: debugger disconnected -- reconnect not supported in this build; restart with --inspect to re-enable");
+            eprintln!(
+                "inspector: debugger disconnected -- reconnect not supported in this build; restart with --inspect to re-enable"
+            );
             return; // single-session: the one debugger detached
         }
     }
@@ -348,8 +350,7 @@ fn ws_accept_key(client_key: &str) -> String {
 /// Standard base64 with padding (enough for the 20-byte WS accept hash; not
 /// a general-purpose codec, but correct for any input).
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -424,7 +425,10 @@ mod tests {
     fn header_lookup_is_case_insensitive() {
         let head = "GET /x HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: abc\r\n\r\n";
         assert!(is_ws_upgrade(head));
-        assert_eq!(header_value(head, "sec-websocket-key").as_deref(), Some("abc"));
+        assert_eq!(
+            header_value(head, "sec-websocket-key").as_deref(),
+            Some("abc")
+        );
         assert_eq!(request_path(head), "/x");
     }
 }

@@ -3544,7 +3544,8 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
                     if text.contains("\"Debugger.paused\"") {
                         paused += 1;
                         resume_id += 1;
-                        let resume = format!("{{\"id\":{resume_id},\"method\":\"Debugger.resume\"}}");
+                        let resume =
+                            format!("{{\"id\":{resume_id},\"method\":\"Debugger.resume\"}}");
                         ws.send(Message::Text(resume)).await.unwrap();
                     }
                 }
@@ -3599,10 +3600,7 @@ fn cjs_require_resolves_via_tsconfig_paths() {
     // CJS target the alias resolves to. Node CJS LOAD_AS_FILE only probes
     // .js/.json/.node (per probe_require); use .js with a "type": "commonjs"
     // package.json to keep this unambiguously CJS.
-    write_temp(
-        "cjspaths/package.json",
-        "{ \"type\": \"commonjs\" }",
-    );
+    write_temp("cjspaths/package.json", "{ \"type\": \"commonjs\" }");
     write_temp(
         "cjspaths/src/lib/util.js",
         "module.exports = { greet: () => 'via cjs paths' };",
@@ -3718,7 +3716,10 @@ fn process_stdout_write_invokes_callback() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], "first");
     assert_eq!(lines[1], "return=true");
-    assert_eq!(lines[2], "calls=2", "callback must fire for both write calls");
+    assert_eq!(
+        lines[2], "calls=2",
+        "callback must fire for both write calls"
+    );
 }
 
 #[test]
@@ -3811,7 +3812,10 @@ fn oam_test_runs_afterall_when_beforeall_throws() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!out.status.success(), "throwing beforeAll must fail the run");
+    assert!(
+        !out.status.success(),
+        "throwing beforeAll must fail the run"
+    );
     assert!(
         combined.contains("CLEANUP_RAN"),
         "afterAll must run even when beforeAll throws; output: {combined}"

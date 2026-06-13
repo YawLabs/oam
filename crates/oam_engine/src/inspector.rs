@@ -103,7 +103,8 @@ impl Shared {
 
     /// End the innermost pause level (V8 calls this on `Debugger.resume`/step).
     fn quit_pause(&self) {
-        self.pause_depth.set(self.pause_depth.get().saturating_sub(1));
+        self.pause_depth
+            .set(self.pause_depth.get().saturating_sub(1));
     }
 
     /// `--inspect-brk`, part 1: block until a debugger attaches and sends
@@ -160,11 +161,7 @@ struct Channel {
 }
 
 impl v8::inspector::ChannelImpl for Channel {
-    fn send_response(
-        &self,
-        _call_id: i32,
-        message: v8::UniquePtr<v8::inspector::StringBuffer>,
-    ) {
+    fn send_response(&self, _call_id: i32, message: v8::UniquePtr<v8::inspector::StringBuffer>) {
         self.shared.send_to_client(message);
     }
     fn send_notification(&self, message: v8::UniquePtr<v8::inspector::StringBuffer>) {

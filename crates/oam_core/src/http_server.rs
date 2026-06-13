@@ -345,7 +345,10 @@ async fn handle_request(
     // single source of truth for aggregate concurrency limits. Limited::new
     // erroring means "client sent more than MAX_REQUEST_BODY" -- 413, NOT
     // 503: the server isn't busy, the client's body is just too big.
-    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY).collect().await {
+    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return Ok(status_body(413, b"request body too large")),
     };
