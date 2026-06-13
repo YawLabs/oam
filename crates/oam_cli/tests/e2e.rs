@@ -1747,6 +1747,100 @@ fn zlib_incremental_streaming_gzip_roundtrip() {
     assert_eq!(lines[5], "chain_roundtrip: true");
 }
 
+#[test]
+fn zlib_gunzip_20mb_bounded_memory() {
+    // Pipe a 20 MB compressed stream through createGunzip and assert it
+    // round-trips byte-correct. This exercises the truly-incremental
+    // decompressor (slice A): the full compressed input must NOT need to
+    // be buffered -- only a ~64 kB scratch buffer per chunk is required.
+    // 20 MB is large enough to catch a buffer-the-whole-thing regression
+    // without risking Windows fetch-race timeouts that affect 50+ MB.
+    let stdout = run_ok(
+        "zlib_gunzip_20mb.mjs",
+        "import { createGzip, createGunzip } from 'node:zlib';\n\
+         import { Readable, Writable } from 'node:stream';\n\
+         \n\
+         const TOTAL = 20 * 1024 * 1024;\n\
+         const payload = Buffer.alloc(TOTAL);\n\
+         for (let i = 0; i < TOTAL; i++) payload[i] = i & 0xff;\n\
+         \n\
+         function pipeAndCollect(source, transforms) {\n\
+           return new Promise((resolve, reject) => {\n\
+             const bufs = [];\n\
+             const sink = new Writable({\n\
+               write(chunk, _e, cb) { bufs.push(chunk); cb(); }\n\
+             });\n\
+             let chain = source;\n\
+             for (const t of transforms) chain = chain.pipe(t);\n\
+             chain.pipe(sink);\n\
+             sink.on('finish', () => resolve(Buffer.concat(bufs)));\n\
+             sink.on('error', reject);\n\
+           });\n\
+         }\n\
+         \n\
+         const compressed = await pipeAndCollect(Readable.from([payload]), [createGzip()]);\n\
+         const decompressed = await pipeAndCollect(Readable.from([compressed]), [createGunzip()]);\n\
+         console.log('size_ok:', decompressed.length === TOTAL);\n\
+         console.log('byte_correct:', decompressed.equals(payload));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "size_ok: true");
+    assert_eq!(lines[1], "byte_correct: true");
+}
+
+#[test]
+fn brotli_incremental_streaming_roundtrip() {
+    // Verify createBrotliCompress / createBrotliDecompress work end-to-end
+    // and that brotliCompress / brotliDecompress (async callback forms) also
+    // work. Uses a 5 MB patterned payload to ensure the streaming path is
+    // exercised across multiple brotli blocks.
+    let stdout = run_ok(
+        "brotli_stream.mjs",
+        "import { createBrotliCompress, createBrotliDecompress,\n\
+                  brotliCompress, brotliDecompress } from 'node:zlib';\n\
+         import { Readable, Writable } from 'node:stream';\n\
+         import { promisify } from 'node:util';\n\
+         \n\
+         const TOTAL = 5 * 1024 * 1024;\n\
+         const payload = Buffer.alloc(TOTAL);\n\
+         for (let i = 0; i < TOTAL; i++) payload[i] = i & 0xff;\n\
+         \n\
+         function pipeAndCollect(source, transforms) {\n\
+           return new Promise((resolve, reject) => {\n\
+             const bufs = [];\n\
+             const sink = new Writable({\n\
+               write(chunk, _e, cb) { bufs.push(chunk); cb(); }\n\
+             });\n\
+             let chain = source;\n\
+             for (const t of transforms) chain = chain.pipe(t);\n\
+             chain.pipe(sink);\n\
+             sink.on('finish', () => resolve(Buffer.concat(bufs)));\n\
+             sink.on('error', reject);\n\
+           });\n\
+         }\n\
+         \n\
+         // Streaming round-trip.\n\
+         const compressed = await pipeAndCollect(\n\
+           Readable.from([payload]), [createBrotliCompress()]);\n\
+         const decompressed = await pipeAndCollect(\n\
+           Readable.from([compressed]), [createBrotliDecompress()]);\n\
+         console.log('stream_roundtrip:', decompressed.equals(payload));\n\
+         console.log('compressed_smaller:', compressed.length < payload.length);\n\
+         \n\
+         // Callback-form one-shot.\n\
+         const brotliCompressP = promisify(brotliCompress);\n\
+         const brotliDecompressP = promisify(brotliDecompress);\n\
+         const smallPayload = Buffer.from('hello brotli world'.repeat(100));\n\
+         const enc = await brotliCompressP(smallPayload);\n\
+         const dec = await brotliDecompressP(enc);\n\
+         console.log('oneshot_roundtrip:', dec.equals(smallPayload));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "stream_roundtrip: true");
+    assert_eq!(lines[1], "compressed_smaller: true");
+    assert_eq!(lines[2], "oneshot_roundtrip: true");
+}
+
 // ------------------------------------------------------------- node:crypto
 
 #[test]

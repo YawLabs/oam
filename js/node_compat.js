@@ -4168,9 +4168,9 @@
       };
     }
 
-    // Route: use incremental streaming for gzip/deflate/deflateRaw/unzip;
-    // fall back to the buffering path for anything else (brotli, future modes).
-    const STREAMING_FORMATS = new Set(["gzip", "deflate", "deflateRaw", "unzip"]);
+    // Route: use incremental streaming for gzip/deflate/deflateRaw/unzip/brotli;
+    // fall back to the buffering path for any unrecognized future formats.
+    const STREAMING_FORMATS = new Set(["gzip", "deflate", "deflateRaw", "unzip", "brotli"]);
     function transformClass(format, compress) {
       if (STREAMING_FORMATS.has(format)) {
         return streamingTransformClass(format, compress);
@@ -4178,8 +4178,37 @@
       return bufferingTransformClass(format, compress);
     }
 
-    const brotliGate = () => {
-      throw new Error("brotli lands with a later zlib wave â€” gzip/deflate work today");
+    // One-shot brotli: create stream, write all data, flush -- returns Buffer.
+    // The streaming Transform class handles incremental paths automatically
+    // (brotli is in STREAMING_FORMATS above).
+    const brotliOneShot = (data, compress) => {
+      const bytes = toBytes(data);
+      return natives.zlibStreamCreate("brotli", -1, compress).then((info) => {
+        const handle = info.handle;
+        return natives.zlibStreamWrite(handle, bytes).then((chunk1) =>
+          natives.zlibStreamFlush(handle).then((chunk2) => {
+            const total = (chunk1 ? chunk1.length : 0) + (chunk2 ? chunk2.length : 0);
+            if (total === 0) return asBuffer(new Uint8Array(0));
+            const out = new Uint8Array(total);
+            let off = 0;
+            if (chunk1 && chunk1.length > 0) { out.set(chunk1, off); off += chunk1.length; }
+            if (chunk2 && chunk2.length > 0) { out.set(chunk2, off); }
+            return asBuffer(out);
+          })
+        );
+      });
+    };
+    const brotliCallbackForm = (compress) => (data, options, callback) => {
+      if (typeof options === "function") { callback = options; }
+      brotliOneShot(data, compress).then(
+        (bytes) => callback(null, bytes),
+        (err) => callback(err),
+      );
+    };
+    const brotliSyncGate = () => {
+      throw new Error(
+        "brotliCompressSync/brotliDecompressSync are not supported -- use brotliCompress/brotliDecompress (async) instead"
+      );
     };
 
     return {
@@ -4204,10 +4233,12 @@
       createDeflateRaw: (o) => new (transformClass("deflateRaw", true))(o),
       createInflateRaw: (o) => new (transformClass("deflateRaw", false))(o),
       createUnzip: (o) => new (transformClass("unzip", false))(o),
-      brotliCompressSync: brotliGate,
-      brotliDecompressSync: brotliGate,
-      brotliCompress: brotliGate,
-      brotliDecompress: brotliGate,
+      createBrotliCompress: (o) => new (transformClass("brotli", true))(o),
+      createBrotliDecompress: (o) => new (transformClass("brotli", false))(o),
+      brotliCompressSync: brotliSyncGate,
+      brotliDecompressSync: brotliSyncGate,
+      brotliCompress: brotliCallbackForm(true),
+      brotliDecompress: brotliCallbackForm(false),
       constants: {
         Z_NO_COMPRESSION: 0,
         Z_BEST_SPEED: 1,
@@ -4216,6 +4247,15 @@
         Z_OK: 0,
         Z_STREAM_END: 1,
         Z_DATA_ERROR: -3,
+        BROTLI_OPERATION_PROCESS: 0,
+        BROTLI_OPERATION_FLUSH: 1,
+        BROTLI_OPERATION_FINISH: 2,
+        BROTLI_DEFAULT_QUALITY: 4,
+        BROTLI_MIN_QUALITY: 0,
+        BROTLI_MAX_QUALITY: 11,
+        BROTLI_DEFAULT_WINDOW: 22,
+        BROTLI_MIN_WINDOW_BITS: 10,
+        BROTLI_MAX_WINDOW_BITS: 24,
       },
     };
   };

@@ -23,3 +23,5 @@ bytes = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 sha1 = { workspace = true }
+# node:zlib brotli backend (pure-Rust; default features only).
+brotli = { workspace = true }
