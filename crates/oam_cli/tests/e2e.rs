@@ -1256,6 +1256,69 @@ fn napi_addon_loads_and_calls_native_functions() {
     assert_eq!(lines[5], "ERR_NATIVE_ARGS");
 }
 
+#[test]
+fn napi_create_int64_boundary_routes_to_number_or_bigint() {
+    // Node-parity: napi_create_int64 must return a JS Number for values
+    // in the range [-(2^53-1), 2^53-1] and a BigInt at/beyond ±2^53.
+    //
+    // makeInt64(hi, lo) reconstructs an i64 from two i32s:
+    //   value = (hi as i64) << 32 | (lo as u32 as i64)
+    //
+    // Boundary values:
+    //   2^53     hi= 2097152 lo= 0  -> BigInt  (just above MAX_SAFE)
+    //   2^53-1   hi= 2097151 lo=-1  -> Number  (= MAX_SAFE_INTEGER)
+    //   -(2^53)  hi=-2097152 lo= 0  -> BigInt  (just below -MAX_SAFE)
+    //   -(2^53-1)hi=-2097152 lo= 1  -> Number  (= -MAX_SAFE_INTEGER)
+    let artifact = if cfg!(windows) {
+        "oam_napi_test_addon.dll"
+    } else if cfg!(target_os = "macos") {
+        "liboam_napi_test_addon.dylib"
+    } else {
+        "liboam_napi_test_addon.so"
+    };
+    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(artifact);
+    if !built.is_file() {
+        panic!(
+            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
+            built.display()
+        );
+    }
+    let addon = write_temp("napi_int64/native.node", "placeholder");
+    std::fs::copy(&built, &addon).expect("copy addon into place");
+
+    write_temp(
+        "napi_int64/main.cjs",
+        "const native = require('./native.node');\n\
+         // 2^53 = BigInt boundary (exclusive on the Number side)\n\
+         const pos_boundary  = native.makeInt64( 2097152,  0); // 2^53\n\
+         const pos_safe      = native.makeInt64( 2097151, -1); // 2^53-1\n\
+         const neg_boundary  = native.makeInt64(-2097152,  0); // -(2^53)\n\
+         const neg_safe      = native.makeInt64(-2097152,  1); // -(2^53-1)\n\
+         console.log(typeof pos_boundary);  // bigint\n\
+         console.log(typeof pos_safe);      // number\n\
+         console.log(typeof neg_boundary);  // bigint\n\
+         console.log(typeof neg_safe);      // number",
+    );
+    let main = write_temp("napi_int64/.anchor", "")
+        .parent()
+        .unwrap()
+        .join("main.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "bigint", "2^53 must be BigInt (above MAX_SAFE)");
+    assert_eq!(lines[1], "number", "2^53-1 must be Number (= MAX_SAFE_INTEGER)");
+    assert_eq!(lines[2], "bigint", "-(2^53) must be BigInt (below -MAX_SAFE)");
+    assert_eq!(lines[3], "number", "-(2^53-1) must be Number (= -MAX_SAFE_INTEGER)");
+}
+
 // ------------------------------------------------------------- http server
 
 #[test]
@@ -3917,4 +3980,184 @@ fn readable_stream_tee_survives_underlying_error() {
         "branch 2 must surface the error, not hang: {}",
         lines[1]
     );
+}
+
+// ------------------------------------------------ node:url POSIX round trip
+
+/// POSIX-only fileURLToPath/pathToFileURL assertions that run on ALL
+/// platforms. The Windows-specific drive-letter and UNC shapes live in
+/// `node_url_file_conversions_round_trip` (cfg_attr-ignored on non-Windows).
+/// This companion test gives Linux + macOS CI coverage of the portable path.
+#[test]
+fn node_url_file_conversions_posix() {
+    // On Windows, POSIX paths without a drive letter are not valid absolute
+    // paths, so we skip the POSIX-specific assertions there.
+    #[cfg(windows)]
+    {
+        // Only verify the non-file-scheme-throws and the round-trip
+        // identity (import.meta.url -> fileURLToPath == import.meta.filename)
+        // which are portable.
+        let stdout = run_ok(
+            "nodeurl_posix_win.mjs",
+            "import { fileURLToPath, pathToFileURL } from 'node:url';\n\
+             // Round trip via import.meta.\n\
+             console.log(fileURLToPath(import.meta.url) === import.meta.filename);\n\
+             // Non-file scheme throws ERR_INVALID_URL_SCHEME on all platforms.\n\
+             let code = '';\n\
+             try { fileURLToPath('https://x.dev/a'); } catch (e) { code = e.code; }\n\
+             console.log(code);",
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines[0], "true", "import.meta round trip must hold on Windows");
+        assert_eq!(
+            lines[1], "ERR_INVALID_URL_SCHEME",
+            "non-file scheme must throw ERR_INVALID_URL_SCHEME"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let stdout = run_ok(
+            "nodeurl_posix.mjs",
+            "import { fileURLToPath, pathToFileURL } from 'node:url';\n\
+             // Simple POSIX path round trip.\n\
+             const url = pathToFileURL('/foo/bar').href;\n\
+             const path = fileURLToPath('file:///foo/bar');\n\
+             console.log(url);\n\
+             console.log(path);\n\
+             // Round trip is identity: pathToFileURL then fileURLToPath.\n\
+             console.log(fileURLToPath(pathToFileURL('/foo/bar/baz.txt').href));\n\
+             // Space encoding.\n\
+             console.log(pathToFileURL('/dir name/file.txt').href);\n\
+             console.log(fileURLToPath('file:///dir%20name/file.txt'));\n\
+             // Round trip via import.meta.\n\
+             console.log(fileURLToPath(import.meta.url) === import.meta.filename);\n\
+             // Non-file scheme throws ERR_INVALID_URL_SCHEME.\n\
+             let code = '';\n\
+             try { fileURLToPath('https://x.dev/a'); } catch (e) { code = e.code; }\n\
+             console.log(code);",
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines[0], "file:///foo/bar", "pathToFileURL('/foo/bar').href");
+        assert_eq!(lines[1], "/foo/bar", "fileURLToPath('file:///foo/bar')");
+        assert_eq!(
+            lines[2], "/foo/bar/baz.txt",
+            "round trip: fileURLToPath(pathToFileURL(path))"
+        );
+        assert_eq!(
+            lines[3], "file:///dir%20name/file.txt",
+            "spaces must be percent-encoded"
+        );
+        assert_eq!(
+            lines[4], "/dir name/file.txt",
+            "percent-decoded space in fileURLToPath"
+        );
+        assert_eq!(lines[5], "true", "import.meta round trip must hold");
+        assert_eq!(
+            lines[6], "ERR_INVALID_URL_SCHEME",
+            "non-file scheme must throw ERR_INVALID_URL_SCHEME"
+        );
+    }
+}
+
+// ----------------------------------------- http 413 strict (non-Windows)
+
+/// Strict variant of `http_per_request_body_over_cap_returns_413_not_503`
+/// that asserts stdout == "413" exactly. On Windows, a large POST body can
+/// hit a race where the server drops the connection before the client reads
+/// the 413 response, yielding ERR:* instead -- hence the original test
+/// accepts both. This companion runs only on non-Windows and fails if the
+/// server returns anything other than 413, preventing an all-platforms
+/// regression that an ERR:* result would otherwise hide.
+#[cfg_attr(target_os = "windows", ignore = "Windows connection-close race on large POST")]
+#[test]
+fn http_per_request_body_over_cap_413_strict() {
+    let stdout = run_ok(
+        "http_413_strict.mjs",
+        "import http from 'node:http';\n\
+         const server = http.createServer((req, res) => res.end('ok'));\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         // 200 MB body -- larger than MAX_REQUEST_BODY (100 MB).\n\
+         const huge = 'x'.repeat(200 * 1024 * 1024);\n\
+         const res = await fetch(`${base}/big`, { method: 'POST', body: huge })\n\
+           .catch((e) => ({ status: 'ERR:' + e.constructor.name }));\n\
+         console.log(res.status);\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout, "413",
+        "per-request over-cap must yield exactly 413 on non-Windows; \
+         got: {stdout} (ERR:* means the connection-close race fired -- \
+         investigate or move to the loose variant)"
+    );
+}
+
+// ------------------------------------------ url: portable parity cases
+
+/// Portable (all-platform) subset of `url_parity_fleet_regressions`.
+/// The parent test is cfg_attr-ignored on non-Windows because several of
+/// its assertions use Windows file:// shapes (drive letters, device paths).
+/// The cases extracted here are purely WHATWG-URL behavior with no
+/// file:// path assumptions: URLSearchParams astral chars, live-iteration
+/// delete, empty-query search, port setter, hostname setter no-op on ':',
+/// opaque-path setter, and urlToHttpOptions shape.
+#[test]
+fn url_parity_portable() {
+    let stdout = run_ok(
+        "url_parity_portable.mjs",
+        "import { urlToHttpOptions } from 'node:url';\n\
+         // Astral chars through URLSearchParams string init.\n\
+         const sp = new URLSearchParams('e=\\u{1F984}');\n\
+         console.log(sp.toString(), sp.get('e') === '\\u{1F984}');\n\
+         // Live (not snapshot) iteration: delete-during-iterate skips every\n\
+         // other entry (deletes current, iterator advances past next).\n\
+         const live = new URLSearchParams('a=1&b=2&c=3&d=4');\n\
+         for (const [k] of live) live.delete(k);\n\
+         console.log(live.toString(), live.size);\n\
+         // search edge: empty-present query reads '' but href keeps '?'.\n\
+         const q = new URL('https://x.example/p?');\n\
+         console.log(JSON.stringify(q.search), q.href);\n\
+         // search setter with '?' alone trims to empty.\n\
+         const q2 = new URL('https://x.example/p?a=1');\n\
+         q2.search = '?';\n\
+         console.log(q2.href);\n\
+         // Port setter: WHATWG leading-digit parse.\n\
+         const pu = new URL('http://example.com:81/');\n\
+         pu.port = '8080 ';\n\
+         console.log(pu.href);\n\
+         // hostname setter no-ops on ':' (host+port separator would be ambiguous).\n\
+         const hu = new URL('http://a.com:7/');\n\
+         hu.hostname = 'b.com:99';\n\
+         console.log(hu.href);\n\
+         // pathname setter no-ops on opaque paths (data: URLs).\n\
+         const du = new URL('data:text/plain,abc');\n\
+         du.pathname = 'xyz';\n\
+         console.log(du.href);\n\
+         // urlToHttpOptions: node shape.\n\
+         const o = urlToHttpOptions(new URL('http://us%65r:p%40ss@[::1]:8080/x/y?q=1#h'));\n\
+         console.log(o.hostname, typeof o.port, o.port, o.auth, o.pathname);\n\
+         const o2 = urlToHttpOptions(new URL('https://example.com/'));\n\
+         console.log('port' in o2, 'auth' in o2);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Line 0: astral char round-trip via URLSearchParams.
+    assert_eq!(lines[0], "e=%F0%9F%A6%84 true", "astral char in URLSearchParams");
+    // Line 1: live-iteration delete leaves b=2 and d=4 (a and c deleted).
+    assert_eq!(lines[1], "b=2&d=4 2", "live-iteration delete during for-of");
+    // Line 2: empty-present query: search == "" but href keeps '?'.
+    assert_eq!(lines[2], "\"\" https://x.example/p?", "empty-present query in href");
+    // Line 3: setting search to '?' trims to empty query (no trailing '?').
+    assert_eq!(lines[3], "https://x.example/p?", "search='?' trims to empty");
+    // Line 4: port setter accepts '8080 ' (WHATWG leading-digit parse).
+    assert_eq!(lines[4], "http://example.com:8080/", "port setter with trailing space");
+    // Line 5: hostname setter no-ops when value contains ':'.
+    assert_eq!(lines[5], "http://a.com:7/", "hostname setter no-op on colon");
+    // Line 6: pathname setter no-ops on data: opaque path.
+    assert_eq!(lines[6], "data:text/plain,abc", "opaque pathname setter no-op");
+    // Lines 7-8: urlToHttpOptions shape.
+    assert_eq!(
+        lines[7], "::1 number 8080 user:p@ss /x/y",
+        "urlToHttpOptions: hostname, port type, port, auth, pathname"
+    );
+    assert_eq!(lines[8], "false false", "urlToHttpOptions: port/auth absent for plain URL");
 }
