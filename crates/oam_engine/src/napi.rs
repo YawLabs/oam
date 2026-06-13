@@ -22,7 +22,6 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{c_char, c_void};
-use std::sync::Mutex;
 
 // napi_value == Local<Value> (pointer-sized, non-null). Compile-time proof.
 const _: () = assert!(
@@ -43,8 +42,11 @@ pub const NAPI_ARRAY_EXPECTED: NapiStatus = 8;
 pub const NAPI_GENERIC_FAILURE: NapiStatus = 9;
 pub const NAPI_PENDING_EXCEPTION: NapiStatus = 10;
 
-/// One env per loaded addon (Node's model). Leaked for the process
-/// lifetime, like the addon library itself.
+/// One env per loaded addon (Node's model).
+///
+/// Previously leaked for the process lifetime; now owned by an
+/// `AddonRegistry` stored on `JsRuntime`.  The env drops when the
+/// runtime drops, which also drops every `FnData` it owns.
 #[repr(C)]
 pub struct NapiEnv {
     /// `*mut v8::PinScope<'_, '_>` while inside a native entry; null
@@ -52,14 +54,67 @@ pub struct NapiEnv {
     scope: *mut c_void,
     /// Deferred exception, thrown into V8 when the native frame returns.
     pending: Option<v8::Global<v8::Value>>,
+    /// Every `FnData` created via `napi_create_function` for this env.
+    /// Stored here so they live exactly as long as the env, and the env
+    /// lives exactly as long as the owning `JsRuntime`.
+    fn_data: Vec<Box<FnData>>,
 }
 
 impl NapiEnv {
-    fn new() -> &'static mut NapiEnv {
-        Box::leak(Box::new(NapiEnv {
+    fn new() -> Box<NapiEnv> {
+        Box::new(NapiEnv {
             scope: std::ptr::null_mut(),
             pending: None,
-        }))
+            fn_data: Vec::new(),
+        })
+    }
+}
+
+/// Per-runtime owner of all heap allocations made on behalf of N-API
+/// addons: the `NapiEnv` boxes (one per loaded addon) and the
+/// `libloading::Library` handles for the `.node` files.
+///
+/// Drop order relative to `JsRuntime` fields matters:
+///
+/// * `AddonRegistry` is declared AFTER `isolate` in `JsRuntime`, so in
+///   Rust's field-drop order (declaration order, top to bottom) the
+///   registry drops AFTER the isolate.  Once the isolate is gone the V8
+///   heap is gone; any V8 `External` that pointed at a `FnData` has
+///   already been collected, so dropping `FnData` at this point is safe.
+/// * The `Library` handles live at least as long as the `NapiEnv` boxes
+///   because they are stored together in `AddonRegistry`; the vecs
+///   drop in declaration order, so `envs` drops before `libraries`.
+///   Even if a destructor inside the `.node` library calls back through
+///   the N-API ABI, the `NapiEnv` outlives the library unload.
+pub struct AddonRegistry {
+    /// Owned `NapiEnv` allocations, one per successfully loaded addon.
+    envs: Vec<Box<NapiEnv>>,
+    /// Loaded addon libraries.  Dropping a `Library` unloads the `.node`
+    /// DLL; this must happen AFTER the envs are dropped so any destructor
+    /// in the library can still reach the env.
+    libraries: Vec<libloading::Library>,
+}
+
+impl AddonRegistry {
+    pub fn new() -> Self {
+        AddonRegistry {
+            envs: Vec::new(),
+            libraries: Vec::new(),
+        }
+    }
+}
+
+/// Thread-local drop counter: each `NapiEnv::drop` increments it.
+/// Used only in tests to verify that every load is matched by a drop.
+#[cfg(test)]
+thread_local! {
+    pub static NAPI_ENV_DROP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for NapiEnv {
+    fn drop(&mut self) {
+        NAPI_ENV_DROP_COUNT.with(|c| c.set(c.get() + 1));
     }
 }
 
@@ -724,8 +779,13 @@ pub unsafe extern "C" fn napi_create_function(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    let fn_data = Box::leak(Box::new(FnData { cb, data, env }));
-    let external = v8::External::new(scope, fn_data as *mut FnData as *mut c_void);
+    // Store FnData in the env's owned vec so it drops with the env.
+    // SAFETY: env is valid (env_scope checked it above); we push before
+    // the External is created, so the pointer is stable for V8's lifetime.
+    let env_ref = unsafe { &mut *env };
+    env_ref.fn_data.push(Box::new(FnData { cb, data, env }));
+    let fn_data: *mut FnData = &mut **env_ref.fn_data.last_mut().unwrap();
+    let external = v8::External::new(scope, fn_data as *mut c_void);
     let Some(function) = v8::Function::builder(napi_trampoline)
         .data(external.into())
         .build(scope)
@@ -940,14 +1000,14 @@ pub unsafe extern "C" fn napi_get_version(env: Env, result: *mut u32) -> NapiSta
 
 // =========================================================== addon loading
 
-/// Loaded addon libraries — leaked for the process lifetime (Node never
-/// unloads addons either).
-static LIBRARIES: Mutex<Vec<libloading::Library>> = Mutex::new(Vec::new());
-
 type RegisterFn = unsafe extern "C" fn(Env, NapiValue) -> NapiValue;
 
 /// Load a .node addon and run its napi_register_module_v1. Returns the
 /// module's exports value, or None with a pending JS exception.
+///
+/// The `AddonRegistry` is retrieved from the isolate slot; both the
+/// `NapiEnv` allocation and the `libloading::Library` handle are pushed
+/// into it so they live until the owning `JsRuntime` drops.
 pub(crate) fn load_addon<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &std::path::Path,
@@ -975,20 +1035,39 @@ pub(crate) fn load_addon<'s>(
         };
     let register: RegisterFn = *register;
 
-    let env = NapiEnv::new();
+    // Allocate a fresh NapiEnv.  Push it into the AddonRegistry slot so
+    // its lifetime is tied to the JsRuntime.  We hold a raw pointer for
+    // use during registration (the Box heap address is stable even as the
+    // registry's Vec reallocates).
+    let mut env_box = NapiEnv::new();
+    let env: Env = &mut *env_box as *mut NapiEnv;
+    scope
+        .get_slot_mut::<AddonRegistry>()
+        .expect("AddonRegistry slot installed")
+        .envs
+        .push(env_box);
+
     let exports = v8::Object::new(scope);
     let exports_value: v8::Local<v8::Value> = exports.into();
 
-    env.scope = scope as *mut v8::PinScope<'_, '_> as *mut c_void;
-    let result = unsafe { register(env as *mut NapiEnv, from_local(exports_value)) };
-    env.scope = std::ptr::null_mut();
+    unsafe {
+        (*env).scope = scope as *mut v8::PinScope<'_, '_> as *mut c_void;
+    }
+    let result = unsafe { register(env, from_local(exports_value)) };
+    unsafe {
+        (*env).scope = std::ptr::null_mut();
+    }
 
-    if let Some(pending) = env.pending.take() {
+    if let Some(pending) = unsafe { (*env).pending.take() } {
         let exception = v8::Local::new(scope, &pending);
         scope.throw_exception(exception);
         return None;
     }
-    LIBRARIES.lock().expect("napi library list").push(library);
+    scope
+        .get_slot_mut::<AddonRegistry>()
+        .expect("AddonRegistry slot installed")
+        .libraries
+        .push(library);
 
     match unsafe { to_local(result) } {
         Some(returned) => Some(returned),
