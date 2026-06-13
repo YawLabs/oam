@@ -48,6 +48,9 @@ getrandom = "0.3"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"
+# node:zlib brotli backend -- pure-Rust, default features only (std + alloc-stdlib).
+# No native deps, no ffi-api, no simd -- builds on every tier-1 target.
+brotli = { version = "8", default-features = false, features = ["std"] }
 # HTTP server: hyper + adapters (already in-tree transitively through
 # reqwest — declaring them adds no new compilation units).
 hyper = { version = "1", features = ["server", "http1"] }
