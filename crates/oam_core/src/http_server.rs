@@ -494,9 +494,11 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         .get_mut(&server_id)
         .and_then(|entry| entry.queue.take());
     let Some(mut queue) = queue else {
-        return super::OpOutcome::Failed(format!(
-            "http server {server_id} is gone or accept is already pending"
-        ));
+        // Server was already closed (close_server removed the entry) or
+        // another accept is in flight.  Either way, signal Done so the JS
+        // accept loop exits cleanly instead of surfacing an unhandled
+        // rejection.
+        return super::OpOutcome::Done;
     };
     let next = queue.recv().await;
     if let Some(entry) = state
