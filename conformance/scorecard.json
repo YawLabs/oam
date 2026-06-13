@@ -1,5 +1,5 @@
 {
-  "commit": "82e8f5b",
+  "commit": "293040f",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -76,15 +76,15 @@
         "detail": {
           "AbortController": true,
           "AbortSignal": true,
-          "Blob": true,
-          "BroadcastChannel": true,
+          "Blob": false,
+          "BroadcastChannel": false,
           "Buffer": true,
           "Event": true,
           "EventTarget": true,
-          "FormData": true,
+          "FormData": false,
           "Headers": true,
           "ReadableStream": true,
-          "Request": true,
+          "Request": false,
           "Response": true,
           "TextDecoder": true,
           "TextDecoderStream": true,
@@ -105,9 +105,9 @@
           "setImmediate": true,
           "setInterval": true,
           "setTimeout": true,
-          "structuredClone": true
+          "structuredClone": false
         },
-        "have": 31,
+        "have": 26,
         "total": 32
       },
       "modules": {
@@ -115,89 +115,65 @@
           "assert": true,
           "async_hooks": true,
           "buffer": true,
-          "child_process": true,
-          "cluster": true,
+          "child_process": false,
+          "cluster": false,
           "console": true,
           "crypto": true,
-          "dgram": true,
-          "diagnostics_channel": true,
-          "dns": true,
-          "domain": true,
+          "dgram": false,
+          "diagnostics_channel": false,
+          "dns": false,
+          "domain": false,
           "events": true,
           "fs": true,
           "fs/promises": true,
           "http": true,
-          "http2": true,
-          "https": true,
-          "inspector": true,
+          "http2": false,
+          "https": false,
+          "inspector": false,
           "module": true,
           "net": true,
           "os": true,
           "path": true,
-          "perf_hooks": true,
+          "perf_hooks": false,
           "process": true,
-          "punycode": true,
+          "punycode": false,
           "querystring": true,
-          "readline": true,
-          "repl": true,
+          "readline": false,
+          "repl": false,
           "stream": true,
           "stream/consumers": true,
           "stream/promises": true,
           "stream/web": true,
           "string_decoder": true,
-          "timers": true,
+          "timers": false,
           "timers/promises": true,
-          "tls": true,
-          "trace_events": true,
+          "tls": false,
+          "trace_events": false,
           "tty": true,
           "url": true,
           "util": true,
-          "v8": true,
-          "vm": true,
-          "worker_threads": true,
+          "v8": false,
+          "vm": false,
+          "worker_threads": false,
           "zlib": true
         },
-        "have": 44,
+        "have": 25,
         "total": 44
       }
     },
     "wptUrl": {
       "constructor": {
-        "pass": 820,
+        "pass": 827,
         "total": 888
       },
-      "failureCount": 125,
+      "failureCount": 64,
       "failureSample": [
-        {
-          "base": "http://example.org/foo/bar",
-          "expected": "",
-          "field": "hash",
-          "got": "#",
-          "input": ":#",
-          "suite": "constructor"
-        },
-        {
-          "base": "http://example.org/foo/bar",
-          "expected": "",
-          "field": "hash",
-          "got": "#",
-          "input": "#",
-          "suite": "constructor"
-        },
         {
           "base": null,
           "expected": "file:///w:/m",
           "field": "href",
           "got": "file:///w|/m",
           "input": "file:///w|/m",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "",
-          "field": "hash",
-          "got": "#",
-          "input": "http://www.google.com/foo?bar=baz#",
           "suite": "constructor"
         },
         {
@@ -238,22 +214,6 @@
           "field": "href",
           "got": "non-special:opaque   #hi",
           "input": "non-special:opaque\t\t  \r #hi",
-          "suite": "constructor"
-        },
-        {
-          "base": "test:test",
-          "expected": "",
-          "field": "hash",
-          "got": "#",
-          "input": "#",
-          "suite": "constructor"
-        },
-        {
-          "base": "test:test?test",
-          "expected": "",
-          "field": "hash",
-          "got": "#",
-          "input": "#",
           "suite": "constructor"
         },
         {
@@ -348,7 +308,7 @@
           "base": "file://lion/",
           "expected": "file:////pig",
           "field": "href",
-          "got": "file:////pig",
+          "got": "file:///pig",
           "input": "//localhost//pig",
           "suite": "constructor"
         },
@@ -367,10 +327,50 @@
           "got": "file:///C:",
           "input": "C|",
           "suite": "constructor"
+        },
+        {
+          "base": "file://host/D:/dir1/dir2/file",
+          "expected": "file://host/C:",
+          "field": "href",
+          "got": "file:///C:",
+          "input": "C|",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:#",
+          "field": "href",
+          "got": "file:///C:#",
+          "input": "C|#",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:?",
+          "field": "href",
+          "got": "file:///C:?",
+          "input": "C|?",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "C|/",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "C|\n/",
+          "suite": "constructor"
         }
       ],
       "setters": {
-        "pass": 221,
+        "pass": 275,
         "total": 278
       },
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
