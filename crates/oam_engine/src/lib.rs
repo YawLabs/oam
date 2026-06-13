@@ -70,6 +70,7 @@ impl JsRuntime {
         isolate.set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
+        isolate.set_slot(napi::AddonRegistry::new());
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's default context: bootstrap.js is
@@ -178,6 +179,17 @@ impl Default for JsRuntime {
     }
 }
 
+#[cfg(test)]
+impl JsRuntime {
+    /// Load a `.node` addon directly — used by the lifecycle drop-counter
+    /// test only.  Returns `true` if the addon registered without a pending
+    /// exception.
+    pub(crate) fn load_test_addon(&mut self, path: &std::path::Path) -> bool {
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        napi::load_addon(scope, path).is_some()
+    }
+}
+
 impl Drop for JsRuntime {
     fn drop(&mut self) {
         // Tear the V8 inspector down explicitly, with the isolate entered and
@@ -283,6 +295,7 @@ fn console_log_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use napi::NAPI_ENV_DROP_COUNT;
 
     #[test]
     fn executes_script_and_returns_value() {
@@ -336,6 +349,63 @@ mod tests {
         assert_eq!(
             rt2.execute_script("snap2.js", "typeof fetch").unwrap(),
             "function"
+        );
+    }
+
+    /// Verify that NapiEnv (and its owned FnData) is dropped exactly once per
+    /// JsRuntime drop when the runtime loaded an N-API addon.
+    ///
+    /// Without the fix (Box::leak), drop_count would stay at 0 because nothing
+    /// ever drops the leaked allocation.  With the AddonRegistry fix, each
+    /// runtime drop decrements its slot, and the slot drops all envs.
+    ///
+    /// NOTE: the test addon DLL must already be built (`cargo build
+    /// -p oam_napi_test_addon`) before running this test.  The CI workflow
+    /// builds all workspace members before running tests, so this is
+    /// satisfied automatically.
+    #[test]
+    fn napienv_lifecycle_drops_with_runtime() {
+        // Determine the path to the compiled test addon.
+        let addon_file = if cfg!(windows) {
+            "oam_napi_test_addon.dll"
+        } else if cfg!(target_os = "macos") {
+            "liboam_napi_test_addon.dylib"
+        } else {
+            "liboam_napi_test_addon.so"
+        };
+        let addon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug")
+            .join(addon_file);
+
+        if !addon_path.is_file() {
+            // Soft-skip rather than hard-fail when the addon hasn't been
+            // compiled yet (e.g. a bare `cargo test -p oam_engine` without
+            // first building the workspace).
+            eprintln!(
+                "SKIP napienv_lifecycle_drops_with_runtime: addon not found at {}",
+                addon_path.display()
+            );
+            return;
+        }
+
+        // Reset the drop counter on this thread (tests may run on the same
+        // thread as other napi tests).
+        NAPI_ENV_DROP_COUNT.with(|c| c.set(0));
+
+        const ITERATIONS: usize = 100;
+        for _ in 0..ITERATIONS {
+            let mut rt = JsRuntime::new();
+            let loaded = rt.load_test_addon(&addon_path);
+            assert!(loaded, "test addon must load without exception");
+            // rt drops here -- AddonRegistry slot drops, which drops
+            // the Box<NapiEnv>, which increments NAPI_ENV_DROP_COUNT.
+        }
+
+        let drops = NAPI_ENV_DROP_COUNT.with(|c| c.get());
+        assert_eq!(
+            drops, ITERATIONS,
+            "expected {ITERATIONS} NapiEnv drops (one per runtime), got {drops}; \
+             the AddonRegistry fix is not working correctly"
         );
     }
 }
