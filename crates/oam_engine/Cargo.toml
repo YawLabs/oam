@@ -24,10 +24,6 @@ hmac = { workspace = true }
 getrandom = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
-# Inspector reconnect signals an UnboundedSender across the engine/core
-# boundary. TODO: hide tokio behind an opaque oam_core type so engine
-# doesn't need tokio as a direct dep.
-tokio = { workspace = true }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

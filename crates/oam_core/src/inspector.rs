@@ -27,6 +27,24 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use futures_util::{SinkExt, StreamExt};
 
+/// Opaque zero-cost wrapper around `tokio::sync::mpsc::UnboundedSender<String>`.
+///
+/// Defined here so that crates above `oam_core` (e.g. `oam_engine`) can name
+/// the reconnect sender type without taking a direct `tokio` dependency.
+/// `#[repr(transparent)]` makes this a zero-cost abstraction: the compiler
+/// treats it identically to the inner type in every layout and ABI sense.
+#[repr(transparent)]
+pub struct OutboundSender(UnboundedSender<String>);
+
+impl OutboundSender {
+    /// Forward a CDP message to the attached debugger client.
+    /// Silently discards if the channel is closed (receiver gone).
+    #[inline]
+    pub fn send(&self, message: String) {
+        let _ = self.0.send(message);
+    }
+}
+
 /// How long a peer may take to send its full HTTP head before we drop the
 /// connection. Bounds head-of-line blocking on the single accept loop and
 /// guarantees a stalled client can never wedge process exit.
@@ -45,9 +63,9 @@ pub enum FromClient {
     /// The client went away (close frame, socket error, or EOF).
     Disconnected,
     /// A new client connected after the previous one disconnected (reconnect).
-    /// Carries the fresh `UnboundedSender` the engine must use for outbound
+    /// Carries the fresh `OutboundSender` the engine must use for outbound
     /// CDP messages going forward; the old sender is now dead.
-    Reconnected(UnboundedSender<String>),
+    Reconnected(OutboundSender),
 }
 
 /// Handle to a running inspector transport. The engine holds this for the
@@ -68,7 +86,7 @@ pub struct InspectorHandle {
     /// CDP messages to the current client. On reconnect the engine replaces
     /// this sender via `swap_sender`; the old sender is dead (recv side went
     /// away with the previous session's channel).
-    to_client: RefCell<UnboundedSender<String>>,
+    to_client: RefCell<OutboundSender>,
     /// Level-triggered shutdown. A `watch` (not a `Notify`) so the signal
     /// cannot be lost: the server task sees `changed()` resolve even if it
     /// registers AFTER `send(true)`, which a lost-wakeup `notify_waiters`
@@ -87,13 +105,13 @@ impl InspectorHandle {
     /// drops if no client is attached (the protocol tolerates this: V8 only
     /// emits while a session is connected).
     pub fn send_to_client(&self, message: String) {
-        let _ = self.to_client.borrow().send(message);
+        self.to_client.borrow().send(message);
     }
 
     /// Replace the outbound sender with a new one after a reconnect. The
     /// previous sender is dropped here (its receive side went away when the
     /// prior session's channel was discarded by the transport).
-    pub fn swap_sender(&self, new_tx: UnboundedSender<String>) {
+    pub fn swap_sender(&self, new_tx: OutboundSender) {
         *self.to_client.borrow_mut() = new_tx;
     }
 }
@@ -158,7 +176,7 @@ pub fn start(addr: SocketAddr, uuid: String) -> std::io::Result<InspectorHandle>
         addr: bound_addr,
         uuid,
         from_client: from_client_rx,
-        to_client: RefCell::new(to_client_tx),
+        to_client: RefCell::new(OutboundSender(to_client_tx)),
         shutdown: shutdown_tx,
         thread: Some(thread),
     })
@@ -215,7 +233,7 @@ async fn serve(
             let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             to_client_rx = Some(new_rx);
             // If the engine has already exited (sender disconnected), stop.
-            if from_client.send(FromClient::Reconnected(new_tx)).is_err() {
+            if from_client.send(FromClient::Reconnected(OutboundSender(new_tx))).is_err() {
                 return;
             }
             // Fall through to the top of the loop to accept the next client.

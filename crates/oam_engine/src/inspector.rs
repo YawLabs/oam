@@ -21,7 +21,7 @@ use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use oam_core::inspector::{FromClient, InspectorHandle};
+use oam_core::inspector::{FromClient, InspectorHandle, OutboundSender};
 
 /// One context group; oam runs a single context per isolate.
 const CONTEXT_GROUP_ID: i32 = 1;
@@ -88,7 +88,7 @@ impl Shared {
     /// A new debugger client connected after the previous one left.  Swap the
     /// outbound sender and clear per-session state so `wait_for_attach` and
     /// the pause loop behave correctly for the fresh session.
-    fn apply_reconnect(&self, new_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    fn apply_reconnect(&self, new_tx: OutboundSender) {
         self.handle.swap_sender(new_tx);
         // `run_requested` is set by `Runtime.runIfWaitingForDebugger` which
         // the new client must re-send.  Clear it so --inspect-brk wait loops
