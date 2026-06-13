@@ -724,13 +724,7 @@ pub(crate) fn unhandled_rejection_failures(
 ) -> Option<Vec<Diagnostic>> {
     let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>, String)> = tc
         .get_slot_mut::<RejectionLedger>()
-        .map(|ledger| {
-            ledger
-                .unhandled
-                .drain(..)
-                .map(|(promise, reason, message)| (promise, reason, message))
-                .collect()
-        })
+        .map(|ledger| ledger.unhandled.drain(..).collect())
         .unwrap_or_default();
     if unhandled.is_empty() {
         return None;

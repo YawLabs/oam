@@ -230,7 +230,7 @@ pub unsafe extern "C" fn napi_create_int64(
     };
     const MAX_SAFE: i64 = 1_i64 << 53;
     unsafe {
-        if value >= -MAX_SAFE && value <= MAX_SAFE {
+        if (-MAX_SAFE..=MAX_SAFE).contains(&value) {
             out(
                 result,
                 from_local(v8::Number::new(scope, value as f64).into()),

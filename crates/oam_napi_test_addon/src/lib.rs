@@ -193,6 +193,11 @@ unsafe extern "C" fn boom(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
     }
 }
 
+/// # Safety
+///
+/// N-API entry point: the host runtime must pass a valid `env` and `exports`
+/// per the N-API ABI (Node 18+ shape). Called exactly once per addon load
+/// by `dlopen`/`LoadLibrary` resolution; concurrent calls are a host bug.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValue) -> NapiValue {
     unsafe {
