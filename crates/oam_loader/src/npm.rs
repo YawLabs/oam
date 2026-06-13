@@ -194,12 +194,13 @@ pub(crate) fn resolve_bare(
             return Ok(PathBuf::from(format!("node:{name}")));
         }
         if is_node_builtin(specifier) {
+            let preview = SUPPORTED_BUILTINS[..6].join(", ");
             return Err(diag(
                 "OAM-MOD0006",
                 format!(
                     "'{specifier}' is a Node builtin oam does not implement yet \
-                     (wave 1 ships: {}); the rest land with later compat waves",
-                    SUPPORTED_BUILTINS.join(", ")
+                     (wave 1 ships: {preview}, ..., others -- see docs); \
+                     the rest land with later compat waves",
                 ),
             ));
         }
@@ -272,7 +273,25 @@ pub fn resolve_require(specifier: &str, referrer: &Path) -> Result<PathBuf, Diag
             )
         });
     }
-    resolve_bare(specifier, referrer, ResolveMode::Require)
+    // Bare specifier: tsconfig paths get first crack (mirrors lib.rs:158-176),
+    // then the Node CJS node_modules walk.
+    let mut consulted_paths = false;
+    if let Some(config) = crate::tsconfig::load_for(referrer) {
+        consulted_paths = true;
+        for raw in crate::tsconfig::match_specifier(&config, specifier) {
+            if let Some(found) = ResolveMode::Require.probe(&raw) {
+                return Ok(found);
+            }
+        }
+    }
+    resolve_bare(specifier, referrer, ResolveMode::Require).map_err(|mut failure| {
+        if consulted_paths && failure.code == "OAM-MOD0002" {
+            failure
+                .message
+                .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
+        }
+        failure
+    })
 }
 
 /// "pkg" / "pkg/sub" / "@scope/pkg" / "@scope/pkg/sub" -> (name, "." or "./sub")

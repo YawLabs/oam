@@ -228,11 +228,19 @@ pub unsafe extern "C" fn napi_create_int64(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    const MAX_SAFE: i64 = 1_i64 << 53;
     unsafe {
-        out(
-            result,
-            from_local(v8::Number::new(scope, value as f64).into()),
-        )
+        if value >= -MAX_SAFE && value <= MAX_SAFE {
+            out(
+                result,
+                from_local(v8::Number::new(scope, value as f64).into()),
+            )
+        } else {
+            out(
+                result,
+                from_local(v8::BigInt::new_from_i64(scope, value).into()),
+            )
+        }
     }
 }
 

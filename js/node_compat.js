@@ -144,7 +144,7 @@
       let out = "";
       const fail = (at) => {
         if (this.fatal) throw new TypeError(`TextDecoder: invalid UTF-8 at byte ${at}`);
-        out += "ï¿½";
+        out += "�";
       };
       while (i < bytes.length) {
         const b = bytes[i];
@@ -1343,6 +1343,7 @@
       homedir: () => natives.homedir(),
       tmpdir: () => natives.tmpdir(),
       hostname: () => natives.hostname(),
+      // oam targets x86/arm64 (both LE); hardcoded -- revisit for BE platforms
       endianness: () => "LE",
       availableParallelism: () => natives.cpuCount,
       cpus: () =>
@@ -2138,7 +2139,7 @@
               }
               const chunk = await natives.fsReadChunk(handle, size || highWaterMark);
               if (chunk === undefined) {
-                natives.fsClose(handle);
+                await Promise.resolve(natives.fsClose(handle)).catch(() => {});
                 handle = null;
                 this.push(null);
               } else {
@@ -2152,7 +2153,7 @@
           },
           destroy(err, cb) {
             if (handle !== null) {
-              natives.fsClose(handle);
+              Promise.resolve(natives.fsClose(handle)).catch(() => {});
               handle = null;
             }
             cb(err);
@@ -2299,8 +2300,9 @@
       stdout: {
         fd: 1,
         isTTY: stdoutIsTTY,
-        write(chunk) {
+        write(chunk, cb) {
           natives.stdoutWrite(chunk);
+          if (typeof cb === "function") queueMicrotask(cb);
           return true;
         },
         columns: stdoutIsTTY ? 80 : undefined,
@@ -2309,8 +2311,9 @@
       stderr: {
         fd: 2,
         isTTY: stderrIsTTY,
-        write(chunk) {
+        write(chunk, cb) {
           natives.stderrWrite(chunk);
+          if (typeof cb === "function") queueMicrotask(cb);
           return true;
         },
         columns: stderrIsTTY ? 80 : undefined,
@@ -2967,7 +2970,7 @@
         if (s.ending || s.destroyed) {
           const err = new Error("write after end");
           if (cb) microtask(() => cb(err));
-          microtask(() => this.emit("error", err));
+          if (this.listenerCount("error") > 0) microtask(() => this.emit("error", err));
           return false;
         }
         let data = chunk;
@@ -4229,10 +4232,52 @@
     function promisedImmediate(value) {
       return new Promise((resolve) => globalThis.setTimeout(() => resolve(value), 0));
     }
-    async function* intervalIterator(delay, value) {
-      for (;;) {
-        await promisedTimeout(delay, undefined);
-        yield value;
+    async function* intervalIterator(delay, value, options) {
+      const signal = options?.signal;
+      if (signal?.aborted) {
+        const e = new Error("AbortError");
+        e.name = "AbortError";
+        throw e;
+      }
+      // Own the timer id so we can clearTimeout on abort -- promisedTimeout
+      // does not expose its handle, and a fire-and-forget timer per tick
+      // would retain a slot until natural expiry on every aborted interval.
+      let timerId = null;
+      let abortListener = null;
+      try {
+        for (;;) {
+          const aborted = await new Promise((resolve) => {
+            timerId = globalThis.setTimeout(() => {
+              timerId = null;
+              resolve(false);
+            }, delay);
+            if (signal) {
+              abortListener = () => resolve(true);
+              signal.addEventListener("abort", abortListener, { once: true });
+            }
+          });
+          if (signal && abortListener) {
+            signal.removeEventListener("abort", abortListener);
+            abortListener = null;
+          }
+          if (aborted) {
+            if (timerId !== null) {
+              globalThis.clearTimeout(timerId);
+              timerId = null;
+            }
+            const e = new Error("AbortError");
+            e.name = "AbortError";
+            throw e;
+          }
+          yield value;
+        }
+      } finally {
+        if (timerId !== null) {
+          globalThis.clearTimeout(timerId);
+        }
+        if (signal && abortListener) {
+          signal.removeEventListener("abort", abortListener);
+        }
       }
     }
     return {

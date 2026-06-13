@@ -234,21 +234,25 @@ pub fn check_via_daemon(target: &Path) -> Result<Vec<Diagnostic>, String> {
     let target = std::path::absolute(target).map_err(|e| e.to_string())?;
     let tsconfig = find_tsconfig(&target).ok_or("no tsconfig: single-file checks stay one-shot")?;
 
-    if let Some(diagnostics) = try_existing(&tsconfig) {
-        return Ok(diagnostics);
+    match try_existing(&tsconfig) {
+        Some(Ok(diagnostics)) => return Ok(diagnostics),
+        Some(Err(reason)) => return Err(reason),
+        None => {}
     }
     spawn_daemon(&tsconfig)?;
     let deadline = Instant::now() + SPAWN_WAIT;
     while Instant::now() < deadline {
-        if let Some(diagnostics) = try_existing(&tsconfig) {
-            return Ok(diagnostics);
+        match try_existing(&tsconfig) {
+            Some(Ok(diagnostics)) => return Ok(diagnostics),
+            Some(Err(reason)) => return Err(reason),
+            None => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     Err("daemon did not come up in time".into())
 }
 
-fn try_existing(tsconfig: &Path) -> Option<Vec<Diagnostic>> {
+fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     let state = read_state(tsconfig)?;
     if state.version != env!("CARGO_PKG_VERSION") {
         // Version skew: retire the old daemon, caller respawns.
@@ -268,9 +272,11 @@ fn try_existing(tsconfig: &Path) -> Option<Vec<Diagnostic>> {
         },
     )?;
     if response.ok {
-        response.diagnostics
+        Some(Ok(response.diagnostics.unwrap_or_default()))
     } else {
-        None
+        Some(Err(response
+            .error
+            .unwrap_or_else(|| "daemon returned ok:false".into())))
     }
 }
 
@@ -460,7 +466,13 @@ pub fn serve(tsconfig: &Path) -> std::io::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => {
+                if last_activity.elapsed() > idle_shutdown() {
+                    let _ = std::fs::remove_file(&state_file);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 }

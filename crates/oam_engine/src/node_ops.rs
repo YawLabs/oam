@@ -856,9 +856,16 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
 /// the LEADING digits after ':' (WHATWG port-state with state override).
 fn split_host_port(value: &str) -> Option<(&str, Option<String>)> {
     if let Some(rest) = value.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let host = &value[..close + 2];
-        let after = &value[close + 2..];
+        // Walk char_indices to find ']' so the slice end is guaranteed to
+        // land on a char boundary even if non-ASCII bytes precede the ']'.
+        let close_byte = rest.char_indices()
+            .find(|(_, c)| *c == ']')
+            .map(|(i, _)| i)?;
+        // +1 for the leading '[' we stripped, +']'.len_utf8() (always 1).
+        let end = close_byte + 2;
+        assert!(value.is_char_boundary(end), "split_host_port: end is not a char boundary");
+        let host = &value[..end];
+        let after = &value[end..];
         if after.is_empty() {
             return Some((host, None));
         }

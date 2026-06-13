@@ -117,12 +117,16 @@ fn to_odif(
 
 /// Resolve an import specifier as written in the module at `referrer`.
 ///
-/// M1 slice: relative + absolute paths only. Candidate order for './x':
-/// exact (if it has an extension), TS-source fallback for JS extensions
-/// ('./x.js' -> x.ts, the tsgo rewrite convention), then extensionless
-/// probing (.ts, .mts, .js, .mjs) and directory index (index.ts, index.js).
-/// Bare and node: specifiers are a clear diagnostic until npm resolution
-/// lands (M2).
+/// Relative + absolute paths: candidate order for './x' is exact (if it has
+/// an extension), TS-source fallback for JS extensions ('./x.js' -> x.ts,
+/// the tsgo rewrite convention), then extensionless probing (.ts, .mts, .js,
+/// .mjs) and directory index (index.ts, index.js).
+///
+/// Bare specifiers resolve via tsconfig paths (if a tsconfig.json is found
+/// in the referrer's ancestor tree) then the Node ESM node_modules walk.
+///
+/// `node:` / `oam:` specifiers resolve to virtual builtin paths.
+/// `node:`-prefixed builtins not yet in wave 1 surface OAM-MOD0006.
 pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
     // Shapes that are invalid as ESM specifiers everywhere — npm resolution
     // will never fix these, so they get their own diagnostic, not MOD0002.

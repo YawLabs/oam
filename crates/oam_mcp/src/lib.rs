@@ -116,7 +116,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "oam_check",
-            "description": "Type-check a TypeScript file or project with tsgo (TypeScript 7 native). Returns ODIF diagnostics: stable codes (OAM-TS*), file:line:col spans, severities. Empty diagnostics = clean.",
+            "description": "Type-check a TypeScript file or project with tsgo (TypeScript 7 native). Uses the per-project daemon for instant repeat checks; falls back to a one-shot check if the daemon is unavailable. Returns ODIF diagnostics: stable codes (OAM-TS*), file:line:col spans, severities. Empty diagnostics = clean.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -159,7 +159,11 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
     match name {
         "oam_check" => {
             let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-            match oam_ts::check(&PathBuf::from(path)) {
+            let check_result = match oam_ts::daemon::check_via_daemon(&PathBuf::from(path)) {
+                Ok(diagnostics) => Ok(diagnostics),
+                Err(_) => oam_ts::check(&PathBuf::from(path)),
+            };
+            match check_result {
                 Ok(diagnostics) => {
                     let lines: Vec<Value> = diagnostics
                         .iter()

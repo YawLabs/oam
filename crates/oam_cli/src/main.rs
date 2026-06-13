@@ -202,14 +202,14 @@ fn resolve_inspect(
         (None, Some(v)) => (v, false),
         (None, None) => return Ok(None),
     };
-    let with_host = if value.contains(':') {
-        value.to_string()
-    } else {
+    let with_host = if value.parse::<u16>().is_ok() {
         format!("127.0.0.1:{value}")
+    } else {
+        value.to_string()
     };
     let addr = with_host
         .parse::<std::net::SocketAddr>()
-        .map_err(|_| format!("invalid --inspect address '{value}' (expected [host:]port)"))?;
+        .map_err(|_| format!("invalid --inspect address '{with_host}' (expected [host:]port)"))?;
     Ok(Some((addr, brk)))
 }
 
@@ -855,3 +855,52 @@ fn run_file(
     };
     result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_inspect;
+
+    #[test]
+    fn inspect_bare_port_binds_127_0_0_1() {
+        let (addr, brk) = resolve_inspect(Some("9229"), None).unwrap().unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:9229");
+        assert!(!brk);
+    }
+
+    #[test]
+    fn inspect_host_port_pair_is_honored() {
+        let (addr, brk) = resolve_inspect(Some("0.0.0.0:7000"), None).unwrap().unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:7000");
+        assert!(!brk);
+    }
+
+    #[test]
+    fn inspect_brk_wins_over_inspect() {
+        let (_, brk) = resolve_inspect(Some("9229"), Some("9230")).unwrap().unwrap();
+        assert!(brk);
+    }
+
+    #[test]
+    fn inspect_ipv6_bracketed_host_port_parses() {
+        // [::1]:9229 must NOT trip the bare-port heuristic. The whole string
+        // is a valid SocketAddr literal; pass-through must succeed.
+        let (addr, _) = resolve_inspect(Some("[::1]:9229"), None).unwrap().unwrap();
+        assert_eq!(addr.to_string(), "[::1]:9229");
+    }
+
+    #[test]
+    fn inspect_bare_ipv6_host_fails_with_with_host_in_message() {
+        // A bare IPv6 address (no port) is a user error. The error message
+        // must surface what was actually parsed -- previously the message
+        // echoed the raw input, hiding that ':' triggered the host branch.
+        let err = resolve_inspect(Some("::1"), None).unwrap_err();
+        assert!(err.contains("::1"), "err: {err}");
+        assert!(err.contains("[host:]port"), "err: {err}");
+    }
+
+    #[test]
+    fn inspect_neither_flag_returns_none() {
+        assert!(resolve_inspect(None, None).unwrap().is_none());
+    }
+}
+

@@ -452,12 +452,8 @@
           }
           const next = this._queue.sort((a, b) => a.due - b.due || a.id - b.id)[0];
           this._now = Math.max(this._now, next.due);
-          if (next.interval != null) {
-            // Intervals never drain; drop them in runAll (Node test parity).
-            this._queue = this._queue.filter((t) => t.id !== next.id);
-          } else {
-            this._queue = this._queue.filter((t) => t.id !== next.id);
-          }
+          // Unlike tick(), runAll drops intervals by design (Node test parity).
+          this._queue = this._queue.filter((t) => t.id !== next.id);
           next.fn(...next.args);
         }
       }
@@ -630,12 +626,29 @@
     }
 
     async function runSuite(suite, results, filter) {
-      for (const hook of suite.beforeAll) await callHook(hook);
-      for (const child of suite.children) {
-        if (child.kind === "suite") await runSuite(child.suite, results, filter);
-        else await runTest(child, results, filter);
+      try {
+        for (const hook of suite.beforeAll) await callHook(hook);
+        for (const child of suite.children) {
+          if (child.kind === "suite") await runSuite(child.suite, results, filter);
+          else await runTest(child, results, filter);
+        }
+      } finally {
+        for (const hook of suite.afterAll) {
+          try {
+            await callHook(hook);
+          } catch (e) {
+            results.push({
+              name: `${suite.name} > afterAll`,
+              status: "fail",
+              durationMs: 0,
+              error: {
+                message: e instanceof Error ? e.message : String(e),
+                stack: e instanceof Error ? trimStack(e.stack) : null,
+              },
+            });
+          }
+        }
       }
-      for (const hook of suite.afterAll) await callHook(hook);
     }
 
     async function __run(filter) {

@@ -411,6 +411,7 @@ pub mod ops {
             "size": meta.len(),
             "mtimeMs": ms(meta.modified()),
             "atimeMs": ms(meta.accessed()),
+            // ctime not available on stable Rust; approximating with mtime
             "ctimeMs": ms(meta.modified()),
             "birthtimeMs": ms(meta.created()),
             "mode": 0,

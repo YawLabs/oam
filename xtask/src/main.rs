@@ -16,7 +16,14 @@ struct Cli {
 enum Command {
     /// Run the conformance suites (WPT URL, Node differential, builtin
     /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
-    Conformance,
+    ///
+    /// Pass --release to test the release binary instead of debug.
+    /// Alternatively set CONFORMANCE_RELEASE=1 in the environment.
+    Conformance {
+        /// Build and test the release binary (cargo build --release).
+        #[arg(long)]
+        release: bool,
+    },
     /// Open a PR bumping the pinned rusty_v8/V8 version (4-week cadence; never >2 majors behind).
     V8Bump,
     /// Rebuild the startup snapshot blobs.
@@ -28,7 +35,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Conformance => conformance::run(),
+        Command::Conformance { release } => conformance::run(release),
         Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
         Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
         Command::Package => bail!("not implemented: lands with first public release"),

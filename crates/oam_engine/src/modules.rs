@@ -160,13 +160,14 @@ pub(crate) fn flush_handled_rejections(
     if !process_has_listener(tc, "unhandledRejection") {
         return;
     }
-    let drained: Vec<v8::Global<v8::Value>> = tc
+    let drained: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
-        .map(|ledger| ledger.unhandled.drain(..).map(|(_, r, _)| r).collect())
+        .map(|ledger| ledger.unhandled.drain(..).map(|(p, r, _)| (p, r)).collect())
         .unwrap_or_default();
-    for reason in drained {
-        let local = v8::Local::new(tc, &reason);
-        emit_process_event(tc, "unhandledRejection", &[local]);
+    for (promise, reason) in drained {
+        let reason_local = v8::Local::new(tc, &reason);
+        let promise_local = v8::Local::new(tc, &promise);
+        emit_process_event(tc, "unhandledRejection", &[reason_local, promise_local.into()]);
     }
 }
 
@@ -468,6 +469,14 @@ impl JsRuntime {
                 return Err((false, format!("Uncaught {message}")));
             };
             tc.perform_microtask_checkpoint();
+            if let Some(entries) = drain_uncaught(tc) {
+                let text = entries
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err((false, text));
+            }
 
             // Settle a returned promise (the await wrapper, or any
             // promise the user typed) by pumping the loop.
@@ -709,13 +718,13 @@ pub(crate) fn pump_event_loop(
 pub(crate) fn unhandled_rejection_failures(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
-    let unhandled: Vec<(v8::Global<v8::Value>, String)> = tc
+    let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>, String)> = tc
         .get_slot_mut::<RejectionLedger>()
         .map(|ledger| {
             ledger
                 .unhandled
                 .drain(..)
-                .map(|(_, reason, message)| (reason, message))
+                .map(|(promise, reason, message)| (promise, reason, message))
                 .collect()
         })
         .unwrap_or_default();
@@ -723,12 +732,11 @@ pub(crate) fn unhandled_rejection_failures(
         return None;
     }
     let mut fatal = Vec::new();
-    for (reason, message) in unhandled {
-        // Node: process.emit('unhandledRejection', reason, promise). We
-        // pass the reason (the promise arg is a wave-1 gap; few handlers
-        // use it). A present listener suppresses the fatal exit.
-        let local = v8::Local::new(tc, &reason);
-        if emit_process_event(tc, "unhandledRejection", &[local]) {
+    for (promise, reason, message) in unhandled {
+        // Node: process.emit('unhandledRejection', reason, promise).
+        let reason_local = v8::Local::new(tc, &reason);
+        let promise_local = v8::Local::new(tc, &promise);
+        if emit_process_event(tc, "unhandledRejection", &[reason_local, promise_local.into()]) {
             continue;
         }
         fatal.push(Diagnostic::new(

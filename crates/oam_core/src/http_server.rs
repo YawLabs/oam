@@ -341,17 +341,12 @@ async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<BoxedBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
-    // Read at most the smaller of the per-request cap and the budget still
-    // available — a near-full budget shrinks the cap so one request can't
-    // exhaust it.
-    let already = state.body_bytes.load(Ordering::Acquire);
-    let limit = MAX_REQUEST_BODY.min(GLOBAL_BODY_BUDGET.saturating_sub(already));
-    let budget_constrained = limit < MAX_REQUEST_BODY;
-    let collected = match http_body_util::Limited::new(body, limit).collect().await {
+    // Enforce per-request size cap; the global budget gate below is the
+    // single source of truth for aggregate concurrency limits. Limited::new
+    // erroring means "client sent more than MAX_REQUEST_BODY" -- 413, NOT
+    // 503: the server isn't busy, the client's body is just too big.
+    let collected = match http_body_util::Limited::new(body, MAX_REQUEST_BODY).collect().await {
         Ok(collected) => collected.to_bytes(),
-        // Budget-constrained over-limit is "busy" (503); a true oversized
-        // body under a full budget is "too large" (413).
-        Err(_) if budget_constrained => return Ok(status_body(503, b"server is busy")),
         Err(_) => return Ok(status_body(413, b"request body too large")),
     };
     // Reserve the retained bytes; refund (RequestGuard) on completion.

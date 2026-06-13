@@ -186,6 +186,7 @@ async fn serve(
             outcome = handle_connection(stream, addr, &uuid, &from_client, &mut to_client_rx) => outcome,
         };
         if outcome == Outcome::SessionEnded {
+            eprintln!("inspector: debugger disconnected -- reconnect not supported in this build; restart with --inspect to re-enable");
             return; // single-session: the one debugger detached
         }
     }

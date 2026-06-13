@@ -219,6 +219,9 @@
               for (const q of queues) {
                 q.push(result.done ? { done: true } : { done: false, value: result.value });
               }
+            }).catch((err) => {
+              pulling = null;
+              throw err;
             });
             await pulling;
             const item = queues[index].shift();

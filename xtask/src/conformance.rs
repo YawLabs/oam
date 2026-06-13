@@ -18,9 +18,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn run() -> Result<()> {
+pub fn run(release: bool) -> Result<()> {
+    let release = release
+        || std::env::var("CONFORMANCE_RELEASE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
     let repo = repo_root()?;
-    let oam = ensure_oam_built(&repo)?;
+    let oam = ensure_oam_built(&repo, release)?;
     let node = which_node();
     let cache = std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()));
     std::fs::create_dir_all(&cache)?;
@@ -113,6 +117,11 @@ pub fn run() -> Result<()> {
             Command::new(node).arg(case).current_dir(&repo),
             Duration::from_secs(60),
         )?;
+        if oam_out.timed_out || node_out.timed_out {
+            println!("  TIMEOUT {name}");
+            diff_results.push(json!({ "case": name, "status": "timeout" }));
+            continue;
+        }
         let same_stdout = normalize(&oam_out.stdout) == normalize(&node_out.stdout);
         let same_exit = oam_out.code == node_out.code;
         if same_stdout && same_exit {
@@ -243,14 +252,19 @@ fn repo_root() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-fn ensure_oam_built(repo: &Path) -> Result<PathBuf> {
+fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
+    let profile = if release { "release" } else { "debug" };
     let exe = repo
-        .join("target/debug")
+        .join(format!("target/{profile}"))
         .join(format!("oam{}", std::env::consts::EXE_SUFFIX));
     if !exe.is_file() {
-        println!("building oam (debug)...");
+        println!("building oam ({profile})...");
+        let mut args = vec!["build", "-p", "oam_cli"];
+        if release {
+            args.push("--release");
+        }
         let status = Command::new("cargo")
-            .args(["build", "-p", "oam_cli"])
+            .args(&args)
             .current_dir(repo)
             .status()?;
         if !status.success() {
@@ -297,6 +311,7 @@ struct Captured {
     stdout: String,
     stderr: String,
     code: i32,
+    timed_out: bool,
 }
 
 /// Spawn with piped output and a hard deadline (the oam_mcp try_wait
@@ -324,6 +339,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     });
 
     let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
     let code = loop {
         if let Some(status) = child.try_wait()? {
             break status.code().unwrap_or(-1);
@@ -331,6 +347,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            timed_out = true;
             break -2; // timeout sentinel
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -339,6 +356,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
         stdout: stdout_thread.join().unwrap_or_default(),
         stderr: stderr_thread.join().unwrap_or_default(),
         code,
+        timed_out,
     })
 }
 

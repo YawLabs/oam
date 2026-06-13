@@ -15,7 +15,18 @@
 //! before serde sees it.
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// Dedupe the bare-package-extends warning: `load_for` has no cache and is
+/// called per-resolve, so an un-deduped eprintln would fire N times for a
+/// project with N resolves. Insert returns true the first time a given
+/// tsconfig path warns -- gate the eprintln on that.
+fn warned_bare_extends() -> &'static Mutex<HashSet<PathBuf>> {
+    static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 #[derive(Debug)]
 pub(crate) struct PathsConfig {
@@ -101,6 +112,16 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
     // No paths here: a relative extends may carry them.
     let extends = parsed.extends?;
     if !(extends.starts_with("./") || extends.starts_with("../")) {
+        let mut set = warned_bare_extends()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if set.insert(tsconfig.to_path_buf()) {
+            eprintln!(
+                "OAM-MOD: bare-package tsconfig extends ({:?}) is not yet resolved; \
+                 tsconfig paths from {:?} will be unavailable",
+                extends, tsconfig
+            );
+        }
         return None; // bare-package extends: needs npm resolution (M2)
     }
     // TS resolves './tsconfig.base' by trying the exact path, then with
@@ -243,6 +264,7 @@ pub(crate) fn strip_jsonc(input: &str) -> String {
                 cleaned.push(c);
             }
             ',' => {
+                // bytes[i+1..] is empty when comma is last char; .iter().find() returns None, comma is preserved, downstream serde_json::from_str(...).ok()? handles the malformed JSON cleanly.
                 let next_meaningful = bytes[i + 1..].iter().find(|c| !c.is_whitespace());
                 if matches!(next_meaningful, Some('}') | Some(']')) {
                     continue; // trailing comma: drop

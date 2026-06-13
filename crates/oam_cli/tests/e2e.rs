@@ -3580,3 +3580,307 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
         "missing listening banner: {stderr}"
     );
 }
+
+// ---------------------------------------------------- coverage backfill (recent regressions)
+//
+// These tests cover the specific code paths surfaced in the post-M2 review:
+// edits whose absence is silent in normal runs but whose regression would be
+// real-world wrong-result class.
+
+#[test]
+fn cjs_require_resolves_via_tsconfig_paths() {
+    // Regression guard: resolve_require used to skip the tsconfig paths
+    // consultation that resolve_import does -- so `require('@lib/x')` would
+    // 404 while `import '@lib/x'` worked. Both paths must agree.
+    write_temp(
+        "cjspaths/tsconfig.json",
+        "{\n  \"compilerOptions\": {\n    \"paths\": { \"@lib/*\": [\"./src/lib/*\"] }\n  }\n}",
+    );
+    // CJS target the alias resolves to. Node CJS LOAD_AS_FILE only probes
+    // .js/.json/.node (per probe_require); use .js with a "type": "commonjs"
+    // package.json to keep this unambiguously CJS.
+    write_temp(
+        "cjspaths/package.json",
+        "{ \"type\": \"commonjs\" }",
+    );
+    write_temp(
+        "cjspaths/src/lib/util.js",
+        "module.exports = { greet: () => 'via cjs paths' };",
+    );
+    let main = write_temp(
+        "cjspaths/main.cjs",
+        "const { greet } = require('@lib/util');\nconsole.log(greet());",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "via cjs paths");
+
+    // Negative path: unmatched alias still surfaces the paths-consulted
+    // note. (CJS require() failures surface at runtime as OAM-RT0001
+    // wrapping the underlying loader message; the consulted-paths suffix
+    // is what proves resolve_require ACTUALLY ran the consultation.)
+    let miss = write_temp("cjspaths/miss.cjs", "require('@nope/never');");
+    let out = oam(&["run", miss.to_str().unwrap(), "--json", "--no-check"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("tsconfig paths were consulted"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn unhandled_rejection_handler_receives_promise_as_second_arg() {
+    // Node's contract is process.emit('unhandledRejection', reason, promise).
+    // The mid-run drain used to pass only reason; APMs and test runners that
+    // chain off the promise (e.g. promise.catch in the handler) silently saw
+    // undefined. This test exercises both the mid-run path (handler present
+    // BEFORE rejection) and that the promise IS the originating promise.
+    let stdout = run_ok(
+        "rej_two_arg.mjs",
+        "const seen = [];\n\
+         process.on('unhandledRejection', (reason, promise) => {\n\
+           seen.push([\n\
+             reason?.message ?? String(reason),\n\
+             promise instanceof Promise,\n\
+             typeof promise?.then === 'function',\n\
+           ]);\n\
+         });\n\
+         const original = Promise.reject(new Error('two-arg-shape'));\n\
+         // Capture the identity check too: handler must be passed THE SAME\n\
+         // promise object (not a wrapper).\n\
+         process.on('unhandledRejection', (_reason, promise) => {\n\
+           seen.push(['same?', promise === original]);\n\
+         });\n\
+         await new Promise((r) => setTimeout(r, 30));\n\
+         console.log(JSON.stringify(seen));",
+    );
+    // Both handlers fire for the same rejection; both see a real Promise.
+    assert!(
+        stdout.contains("\"two-arg-shape\",true,true"),
+        "missing (reason, promise) two-arg shape: {stdout}"
+    );
+    assert!(
+        stdout.contains("[\"same?\",true]"),
+        "promise identity broken: {stdout}"
+    );
+}
+
+#[test]
+fn http_per_request_body_over_cap_returns_413_not_503() {
+    // The HTTP body-budget gate has two distinct failure modes:
+    //   413 -- this ONE request exceeded MAX_REQUEST_BODY (per-request cap).
+    //   503 -- the aggregate global budget is full (server is busy).
+    // The simplification collapsed both to 503 in one earlier pass; the fix
+    // restores the distinction. A 413 -> 503 collapse means a clearly-buggy
+    // client gets told "try again later," which it does, forever.
+    let stdout = run_ok(
+        "http_413.mjs",
+        "import http from 'node:http';\n\
+         const server = http.createServer((req, res) => res.end('ok'));\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         // 200 MB body -- larger than MAX_REQUEST_BODY (100 MB). Fresh server,\n\
+         // empty aggregate budget, so the only reason to reject is per-request.\n\
+         const huge = 'x'.repeat(200 * 1024 * 1024);\n\
+         const res = await fetch(`${base}/big`, { method: 'POST', body: huge })\n\
+           .catch((e) => ({ status: 'ERR:' + e.constructor.name }));\n\
+         console.log(res.status);\n\
+         server.close();",
+    );
+    // 413 = the per-request size cap fired; not 503 (busy) and not a reset.
+    assert_eq!(
+        stdout, "413",
+        "per-request over-cap must be 413, not 503; got: {stdout}"
+    );
+}
+
+#[test]
+fn process_stdout_write_invokes_callback() {
+    // Regression guard: process.stdout/stderr.write used to ignore the cb
+    // argument silently. stream.pipeline + writable.end depend on the cb to
+    // sequence chunks; dropping it broke piping into stdout.
+    let stdout = run_ok(
+        "stdout_cb.mjs",
+        "let calls = 0;\n\
+         const r = process.stdout.write('first\\n', () => { calls++; });\n\
+         process.stderr.write('side\\n', () => { calls++; });\n\
+         await new Promise((r) => setTimeout(r, 10));\n\
+         // Return value is always true (no backpressure shape), AND both\n\
+         // callbacks fired.\n\
+         console.log('return=' + r);\n\
+         console.log('calls=' + calls);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "first");
+    assert_eq!(lines[1], "return=true");
+    assert_eq!(lines[2], "calls=2", "callback must fire for both write calls");
+}
+
+#[test]
+fn writable_write_after_end_without_error_listener_does_not_crash() {
+    // Bug: Writable.write on an already-ended stream emitted 'error'
+    // unconditionally. EventEmitter throws on 'error' with no listener -- so
+    // a graceful no-op write killed the process. ServerResponse.write had the
+    // listener-count guard; the base Writable did not.
+    let stdout = run_ok(
+        "writable_after_end.mjs",
+        "import { Writable } from 'node:stream';\n\
+         const sink = new Writable({ write(_c, _e, cb) { cb(); } });\n\
+         // No 'error' listener attached.\n\
+         sink.end('first');\n\
+         await new Promise((r) => setTimeout(r, 10));\n\
+         // This SHOULD return false (per Node) and NOT crash.\n\
+         const ret = sink.write('after-end');\n\
+         await new Promise((r) => setTimeout(r, 10));\n\
+         console.log('survived=' + (ret === false));",
+    );
+    assert_eq!(
+        stdout, "survived=true",
+        "write-after-end must not crash without an error listener"
+    );
+}
+
+#[test]
+fn timers_promises_set_interval_aborts_via_signal() {
+    // The setInterval async iterator gained AbortSignal support and a
+    // clearTimeout on abort. This test exercises BOTH: the iterator must
+    // throw AbortError on abort, and the pending timer must be cleared so a
+    // run with a tight signal doesn't pile up timer slots.
+    let stdout = run_ok(
+        "interval_abort.mjs",
+        "import { setInterval as every } from 'node:timers/promises';\n\
+         const ac = new AbortController();\n\
+         let ticks = 0;\n\
+         let name = '';\n\
+         setTimeout(() => ac.abort(), 50);\n\
+         try {\n\
+           for await (const _ of every(20, null, { signal: ac.signal })) {\n\
+             ticks++;\n\
+             if (ticks > 50) break;\n\
+           }\n\
+         } catch (e) {\n\
+           name = e.name;\n\
+         }\n\
+         // At ~50ms with a 20ms interval we get 1-3 ticks before abort.\n\
+         console.log('aborted=' + (name === 'AbortError'));\n\
+         console.log('boundedTicks=' + (ticks <= 10));\n\
+         // Already-aborted signal throws immediately.\n\
+         let name2 = '';\n\
+         try {\n\
+           for await (const _ of every(100, null, { signal: AbortSignal.abort() })) {}\n\
+         } catch (e) { name2 = e.name; }\n\
+         console.log('preAborted=' + (name2 === 'AbortError'));",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "aborted=true");
+    assert_eq!(lines[1], "boundedTicks=true");
+    assert_eq!(lines[2], "preAborted=true");
+}
+
+#[test]
+fn oam_test_runs_afterall_when_beforeall_throws() {
+    // Resource-leak class regression: beforeAll throws -> runSuite used to
+    // abandon afterAll, so DB connections / temp dirs / lock files installed
+    // by beforeAll (even partially) never got torn down. The try/finally
+    // wrap guarantees afterAll runs regardless.
+    write_temp(
+        "runner_hook_throw/leak.test.ts",
+        "import { test, describe, beforeAll, afterAll } from 'oam:test';\n\
+         describe('with throwing beforeAll', () => {\n\
+           beforeAll(() => { throw new Error('setup-boom'); });\n\
+           afterAll(() => { console.log('CLEANUP_RAN'); });\n\
+           test('never runs', () => {});\n\
+         });",
+    );
+    let dir = write_temp("runner_hook_throw/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    // The run fails (beforeAll threw), but the afterAll cleanup MUST land.
+    // The test runner emits user `console.log` to stdout; suite failures go
+    // to stderr. Check both streams since the runner may surface differently
+    // depending on the failure path.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "throwing beforeAll must fail the run");
+    assert!(
+        combined.contains("CLEANUP_RAN"),
+        "afterAll must run even when beforeAll throws; output: {combined}"
+    );
+}
+
+#[test]
+fn text_decoder_replacement_char_is_single_codepoint() {
+    // Bug: the source literal for the U+FFFD replacement was three Latin-1
+    // chars (UTF-8 of EF BF BD), yielding string length 3 instead of 1.
+    // Any consumer comparing `ch === '�'` saw it as not-equal.
+    let stdout = run_ok(
+        "fffd.mjs",
+        "// Invalid lead byte 0xFF -> non-fatal decoder emits U+FFFD.\n\
+         const td = new TextDecoder();\n\
+         const decoded = td.decode(new Uint8Array([0xff]));\n\
+         console.log(decoded.length);\n\
+         console.log(decoded.codePointAt(0).toString(16));\n\
+         console.log(decoded === '\\uFFFD');",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "1", "replacement char must be one codepoint");
+    assert_eq!(lines[1], "fffd", "must be U+FFFD specifically");
+    assert_eq!(lines[2], "true", "must compare equal to the FFFD literal");
+}
+
+#[test]
+fn readable_stream_tee_survives_underlying_error() {
+    // The tee() implementation shared a `pulling` promise across branches.
+    // An underlying-stream error used to poison `pulling` permanently --
+    // both branches then awaited a stale rejected promise forever. The fix
+    // resets `pulling` on rejection; the live branches must both observe
+    // the same error (not deadlock).
+    let stdout = run_ok(
+        "tee_error.mjs",
+        "const src = new ReadableStream({\n\
+           start(c) {\n\
+             c.enqueue('a');\n\
+             // Defer the error so both readers acquire before it hits.\n\
+             setTimeout(() => c.error(new Error('source-boom')), 10);\n\
+           },\n\
+         });\n\
+         const [t1, t2] = src.tee();\n\
+         async function readToError(branch) {\n\
+           const reader = branch.getReader();\n\
+           const collected = [];\n\
+           try {\n\
+             for (;;) {\n\
+               const { value, done } = await reader.read();\n\
+               if (done) return 'done:' + collected.join(',');\n\
+               collected.push(value);\n\
+             }\n\
+           } catch (e) {\n\
+             return 'err:' + e.message + ':' + collected.join(',');\n\
+           }\n\
+         }\n\
+         const [r1, r2] = await Promise.all([readToError(t1), readToError(t2)]);\n\
+         console.log(r1);\n\
+         console.log(r2);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].starts_with("err:source-boom"),
+        "branch 1 must surface the error, not hang: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("err:source-boom"),
+        "branch 2 must surface the error, not hang: {}",
+        lines[1]
+    );
+}

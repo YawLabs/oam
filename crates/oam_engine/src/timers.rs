@@ -44,8 +44,11 @@ impl Default for TimerQueue {
 
 impl TimerQueue {
     fn schedule(&mut self, entry: TimerEntry, delay: Duration) -> u32 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let mut id = self.next_id;
+        while self.active.contains_key(&id) {
+            id = id.wrapping_add(1).max(1);
+        }
+        self.next_id = id.wrapping_add(1).max(1);
         self.seq += 1;
         self.heap
             .push(Reverse((Instant::now() + delay, self.seq, id)));

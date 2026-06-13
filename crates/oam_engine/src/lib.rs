@@ -158,12 +158,16 @@ impl JsRuntime {
             let Some(value) = script.run(tc) else {
                 return Err(exception_to_error(tc, name));
             };
-            value
+            let result_str = value
                 .to_string(tc)
                 .map(|s| s.to_rust_string_lossy(tc))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            tc.perform_microtask_checkpoint();
+            if tc.has_caught() {
+                return Err(exception_to_error(tc, name));
+            }
+            result_str
         };
-        self.isolate.perform_microtask_checkpoint();
         Ok(result)
     }
 }

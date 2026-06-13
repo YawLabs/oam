@@ -56,6 +56,7 @@
     }
     addEventListener(type, listener, options) {
       if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
+      // useCapture (boolean true) is a no-op in this non-DOM EventTarget; once only comes from options.once
       const once = options === true ? false : options?.once === true;
       const list = this._listeners.get(type) ?? [];
       if (!list.some((e) => e.fn === listener)) {
