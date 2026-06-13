@@ -233,7 +233,10 @@ async fn serve(
             let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             to_client_rx = Some(new_rx);
             // If the engine has already exited (sender disconnected), stop.
-            if from_client.send(FromClient::Reconnected(OutboundSender(new_tx))).is_err() {
+            if from_client
+                .send(FromClient::Reconnected(OutboundSender(new_tx)))
+                .is_err()
+            {
                 return;
             }
             // Fall through to the top of the loop to accept the next client.
