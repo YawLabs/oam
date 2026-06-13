@@ -105,36 +105,56 @@ const NODE_BUILTINS: [&str; 41] = [
     "zlib",
 ];
 
-/// node: compat wave 1 — builtins that resolve to virtual node:NAME paths
-/// the engine instantiates from the snapshot registry. Recognized names
-/// outside this list gate on OAM-MOD0006 with a precise pointer.
-const SUPPORTED_BUILTINS: [&str; 27] = [
+/// node: compat wave 1 + wave 2 stubs — builtins that resolve to virtual
+/// node:NAME paths the engine instantiates from the snapshot registry.
+/// Recognized names outside this list gate on OAM-MOD0006 with a precise
+/// pointer.
+const SUPPORTED_BUILTINS: [&str; 46] = [
     "assert",
     "async_hooks",
     "buffer",
+    "child_process",
+    "cluster",
     "console",
     "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
     "events",
     "fs",
     "fs/promises",
     "http",
+    "http2",
+    "https",
+    "inspector",
     "module",
     "net",
     "os",
     "path",
     "path/posix",
     "path/win32",
+    "perf_hooks",
     "process",
+    "punycode",
     "querystring",
+    "readline",
+    "repl",
     "stream",
     "stream/consumers",
     "stream/promises",
     "stream/web",
     "string_decoder",
+    "timers",
     "timers/promises",
+    "tls",
+    "trace_events",
     "tty",
     "url",
     "util",
+    "v8",
+    "vm",
+    "worker_threads",
     "zlib",
 ];
 

@@ -228,6 +228,296 @@
   }
   globalThis.Response = Response;
 
+  // ------------------------------------------------------------ structuredClone
+  // Deep-clone primitive and JSON-structured values. Does not support
+  // transferables (ArrayBuffer transfer) in this pure-JS wave; that lands
+  // with the native structured-clone op. Handles circular references via a
+  // WeakMap memo.
+  if (typeof globalThis.structuredClone !== "function") {
+    globalThis.structuredClone = function structuredClone(value, options) {
+      if (options && options.transfer && options.transfer.length > 0) {
+        throw new DOMException(
+          "structuredClone: transferable objects are not supported in oam wave-1",
+          "DataCloneError",
+        );
+      }
+      // Fast path: primitives and null clone as-is.
+      if (value === null || typeof value !== "object" && typeof value !== "function") return value;
+      const memo = new WeakMap();
+      function cloneInner(v) {
+        if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
+        if (memo.has(v)) return memo.get(v);
+        if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
+        if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
+        if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
+          const c = v.slice(0); memo.set(v, c); return c;
+        }
+        if (ArrayBuffer.isView(v)) {
+          const buf = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+          const c = new v.constructor(buf); memo.set(v, c); return c;
+        }
+        if (v instanceof Map) {
+          const c = new Map(); memo.set(v, c);
+          for (const [k, val] of v) c.set(cloneInner(k), cloneInner(val));
+          return c;
+        }
+        if (v instanceof Set) {
+          const c = new Set(); memo.set(v, c);
+          for (const val of v) c.add(cloneInner(val));
+          return c;
+        }
+        if (Array.isArray(v)) {
+          const c = new Array(v.length); memo.set(v, c);
+          for (let i = 0; i < v.length; i++) c[i] = cloneInner(v[i]);
+          return c;
+        }
+        // Plain object (or unknown class -- clone own enumerable props).
+        const c = Object.create(Object.getPrototypeOf(v));
+        memo.set(v, c);
+        for (const key of Object.keys(v)) c[key] = cloneInner(v[key]);
+        return c;
+      }
+      return cloneInner(value);
+    };
+  }
+
+  // -------------------------------------------------------------------- Blob
+  // WHATWG Blob: an immutable byte sequence with a type string. Backed by
+  // a flat Uint8Array, zero-copy subarray for slice(). text/arrayBuffer/stream
+  // return the expected types. size and type are read-only.
+  if (typeof globalThis.Blob !== "function") {
+    class Blob {
+      constructor(parts, options) {
+        let size = 0;
+        const pieces = [];
+        if (parts != null) {
+          for (const part of parts) {
+            if (typeof part === "string") {
+              const enc = new TextEncoder().encode(part);
+              pieces.push(enc);
+              size += enc.length;
+            } else if (part instanceof Blob) {
+              pieces.push(part._bytes);
+              size += part._bytes.length;
+            } else if (part instanceof ArrayBuffer) {
+              const view = new Uint8Array(part);
+              pieces.push(view);
+              size += view.length;
+            } else if (ArrayBuffer.isView(part)) {
+              const view = new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+              pieces.push(view);
+              size += view.length;
+            } else {
+              const enc = new TextEncoder().encode(String(part));
+              pieces.push(enc);
+              size += enc.length;
+            }
+          }
+        }
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
+        this._bytes = bytes;
+        this._type = (options && typeof options.type === "string")
+          ? options.type.toLowerCase() : "";
+      }
+      get size() { return this._bytes.length; }
+      get type() { return this._type; }
+      slice(start, end, type) {
+        const len = this._bytes.length;
+        let s = start === undefined ? 0 : start < 0 ? Math.max(0, len + start) : Math.min(start, len);
+        let e = end === undefined ? len : end < 0 ? Math.max(0, len + end) : Math.min(end, len);
+        if (s >= e) s = e = 0;
+        const result = new Blob([], { type: type !== undefined ? String(type) : this._type });
+        result._bytes = this._bytes.subarray(s, e);
+        return result;
+      }
+      async arrayBuffer() { return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.length); }
+      async bytes() { return this._bytes.slice(); }
+      async text() { return new TextDecoder().decode(this._bytes); }
+      stream() {
+        const bytes = this._bytes;
+        return new ReadableStream({
+          start(controller) { controller.enqueue(bytes); controller.close(); },
+        });
+      }
+      toString() { return "[object Blob]"; }
+      get [Symbol.toStringTag]() { return "Blob"; }
+    }
+    globalThis.Blob = Blob;
+  }
+
+  // ----------------------------------------------------------------- FormData
+  // WHATWG FormData: a multipart/form-data key-value store. Supports multiple
+  // values per key. File / Blob entries are included as-is; streaming encoding
+  // lands with the fetch body rework.
+  if (typeof globalThis.FormData !== "function") {
+    class FormData {
+      constructor() { this._entries = []; }
+      append(name, value, filename) {
+        this._entries.push([String(name), this._normalizeValue(value, filename)]);
+      }
+      set(name, value, filename) {
+        const key = String(name);
+        const val = this._normalizeValue(value, filename);
+        let replaced = false;
+        this._entries = this._entries.filter(([k]) => {
+          if (k !== key) return true;
+          if (!replaced) { replaced = true; return true; }
+          return false;
+        });
+        if (!replaced) { this._entries.push([key, val]); }
+        else {
+          const idx = this._entries.findIndex(([k]) => k === key);
+          this._entries[idx] = [key, val];
+        }
+      }
+      get(name) {
+        const entry = this._entries.find(([k]) => k === String(name));
+        return entry ? entry[1] : null;
+      }
+      getAll(name) {
+        return this._entries.filter(([k]) => k === String(name)).map(([, v]) => v);
+      }
+      has(name) { return this._entries.some(([k]) => k === String(name)); }
+      delete(name) { this._entries = this._entries.filter(([k]) => k !== String(name)); }
+      forEach(fn, thisArg) {
+        for (const [key, value] of this._entries) fn.call(thisArg, value, key, this);
+      }
+      *entries() { yield* this._entries; }
+      *keys() { for (const [k] of this._entries) yield k; }
+      *values() { for (const [, v] of this._entries) yield v; }
+      [Symbol.iterator]() { return this.entries(); }
+      _normalizeValue(value, filename) {
+        if (typeof globalThis.Blob !== "undefined" && value instanceof globalThis.Blob) return value;
+        if (typeof value === "string") return value;
+        return String(value);
+      }
+      get [Symbol.toStringTag]() { return "FormData"; }
+    }
+    globalThis.FormData = FormData;
+  }
+
+  // ----------------------------------------------------------------- Request
+  // WHATWG Request: the fetch()-input request object. Minimal but spec-shaped:
+  // method, url, headers, body. Used by frameworks that pass Request objects
+  // instead of URLs to fetch().
+  if (typeof globalThis.Request !== "function") {
+    class Request {
+      constructor(input, init) {
+        let url, method, headers, body;
+        if (input instanceof Request) {
+          url = input.url; method = input.method; headers = new Headers(input.headers);
+          body = input._body;
+        } else {
+          url = String(input);
+          method = "GET"; headers = new Headers(); body = null;
+        }
+        if (init) {
+          if (init.method) method = String(init.method).toUpperCase();
+          if (init.headers) headers = new Headers(init.headers);
+          if (init.body != null) body = init.body;
+        }
+        this.url = url;
+        this.method = method;
+        this.headers = headers;
+        this._body = body;
+        this.bodyUsed = false;
+      }
+      get body() {
+        if (this._body == null) return null;
+        if (typeof ReadableStream !== "undefined" && this._body instanceof ReadableStream) return this._body;
+        const bytes = typeof this._body === "string"
+          ? new TextEncoder().encode(this._body)
+          : this._body;
+        return new ReadableStream({
+          start(controller) { controller.enqueue(bytes); controller.close(); },
+        });
+      }
+      async text() {
+        if (this.bodyUsed) throw new TypeError("Body already consumed");
+        this.bodyUsed = true;
+        if (this._body == null) return "";
+        if (typeof this._body === "string") return this._body;
+        const bytes = this._body instanceof Uint8Array ? this._body
+          : new Uint8Array(this._body);
+        return new TextDecoder().decode(bytes);
+      }
+      async json() { return JSON.parse(await this.text()); }
+      async arrayBuffer() {
+        if (this.bodyUsed) throw new TypeError("Body already consumed");
+        this.bodyUsed = true;
+        if (this._body == null) return new ArrayBuffer(0);
+        if (typeof this._body === "string") return new TextEncoder().encode(this._body).buffer;
+        const bytes = this._body instanceof Uint8Array ? this._body : new Uint8Array(this._body);
+        return bytes.buffer;
+      }
+      clone() {
+        if (this.bodyUsed) throw new TypeError("Cannot clone a Request whose body has already been consumed");
+        return new Request(this);
+      }
+      get [Symbol.toStringTag]() { return "Request"; }
+    }
+    globalThis.Request = Request;
+  }
+
+  // --------------------------------------------------------- BroadcastChannel
+  // In-process BroadcastChannel: messages are dispatched synchronously within
+  // the same oam runtime (single-process, single-thread). Cross-process
+  // broadcast (via SharedArrayBuffer or IPC) lands with worker_threads.
+  if (typeof globalThis.BroadcastChannel !== "function") {
+    const _bcChannels = new Map(); // name -> Set<BroadcastChannel>
+    class BroadcastChannel extends EventTarget {
+      constructor(name) {
+        super();
+        this.name = String(name);
+        this._closed = false;
+        this.onmessage = null;
+        this.onmessageerror = null;
+        if (!_bcChannels.has(this.name)) _bcChannels.set(this.name, new Set());
+        _bcChannels.get(this.name).add(this);
+      }
+      postMessage(message) {
+        if (this._closed) throw new DOMException("BroadcastChannel is closed", "InvalidStateError");
+        const cloned = globalThis.structuredClone ? globalThis.structuredClone(message) : message;
+        const peers = _bcChannels.get(this.name);
+        if (peers) {
+          for (const peer of peers) {
+            if (peer === this || peer._closed) continue;
+            queueMicrotask(() => {
+              const ev = new MessageEvent("message", { data: cloned });
+              peer.dispatchEvent(ev);
+              if (typeof peer.onmessage === "function") peer.onmessage(ev);
+            });
+          }
+        }
+      }
+      close() {
+        if (this._closed) return;
+        this._closed = true;
+        const peers = _bcChannels.get(this.name);
+        if (peers) {
+          peers.delete(this);
+          if (peers.size === 0) _bcChannels.delete(this.name);
+        }
+      }
+      get [Symbol.toStringTag]() { return "BroadcastChannel"; }
+    }
+    // MessageEvent: minimal shape for BroadcastChannel messages.
+    class MessageEvent extends Event {
+      constructor(type, init) {
+        super(type, init);
+        this.data = init ? init.data : undefined;
+        this.origin = (init && init.origin) || "";
+        this.lastEventId = (init && init.lastEventId) || "";
+        this.source = null;
+        this.ports = [];
+      }
+    }
+    globalThis.BroadcastChannel = BroadcastChannel;
+    globalThis.MessageEvent = globalThis.MessageEvent || MessageEvent;
+  }
+
   function makeHeaders(pairs) {
     const headers = new Headers();
     for (const [name, value] of pairs) headers.append(name, value);

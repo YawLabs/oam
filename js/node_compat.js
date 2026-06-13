@@ -2345,29 +2345,48 @@
       "assert",
       "async_hooks",
       "buffer",
+      "child_process",
+      "cluster",
       "console",
       "crypto",
+      "dgram",
+      "diagnostics_channel",
+      "dns",
+      "domain",
       "events",
       "fs",
       "fs/promises",
       "http",
+      "http2",
+      "https",
+      "inspector",
       "module",
       "net",
       "os",
       "path",
       "path/posix",
       "path/win32",
+      "perf_hooks",
       "process",
+      "punycode",
       "querystring",
+      "readline",
+      "repl",
       "stream",
       "stream/consumers",
       "stream/promises",
       "stream/web",
       "string_decoder",
+      "timers",
       "timers/promises",
+      "tls",
+      "trace_events",
       "tty",
       "url",
       "util",
+      "v8",
+      "vm",
+      "worker_threads",
       "zlib",
     ];
 
@@ -4785,6 +4804,761 @@
       return true;
     },
   });
+
+  // --------------------------------------------------------------- timers
+  // Node's `timers` module: re-exports the global timer functions so that
+  // require('timers') / import * from 'node:timers' works as expected.
+  registry.factories.timers = () => ({
+    setTimeout: (fn, ms, ...args) => globalThis.setTimeout(fn, ms, ...args),
+    clearTimeout: (id) => globalThis.clearTimeout(id),
+    setInterval: (fn, ms, ...args) => globalThis.setInterval(fn, ms, ...args),
+    clearInterval: (id) => globalThis.clearInterval(id),
+    setImmediate: (fn, ...args) => globalThis.setImmediate(fn, ...args),
+    clearImmediate: (id) => globalThis.clearImmediate(id),
+  });
+
+  // ------------------------------------------------------------- punycode
+  // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
+  // in widespread use via the `url` module and idn-related libraries.
+  registry.factories.punycode = () => {
+    const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700, BIAS_INIT = 72;
+    const MAXINT = 2147483647;
+    const DELIMITER = "\x2D";
+
+    function adapt(delta, numPoints, firstTime) {
+      delta = firstTime ? Math.floor(delta / DAMP) : delta >>> 1;
+      delta += Math.floor(delta / numPoints);
+      let k = 0;
+      while (delta > Math.floor(((BASE - TMIN) * TMAX) / 2)) {
+        delta = Math.floor(delta / (BASE - TMIN));
+        k += BASE;
+      }
+      return k + Math.floor(((BASE - TMIN + 1) * delta) / (delta + SKEW));
+    }
+
+    function digitToBasic(digit) {
+      return digit + (digit < 26 ? 97 : 22);
+    }
+
+    function basicToDigit(codePoint) {
+      if (codePoint >= 48 && codePoint < 58) return codePoint - 22;
+      if (codePoint >= 65 && codePoint < 91) return codePoint - 65;
+      if (codePoint >= 97 && codePoint < 123) return codePoint - 97;
+      return BASE;
+    }
+
+    function decode(input) {
+      const output = [];
+      let i = 0;
+      let n = 128;
+      let bias = BIAS_INIT;
+      const basic = input.lastIndexOf(DELIMITER);
+      const start = basic < 0 ? 0 : basic;
+      for (let j = 0; j < start; j++) {
+        if (input.charCodeAt(j) >= 128) throw new RangeError("Illegal input characters");
+        output.push(input.charCodeAt(j));
+      }
+      let ic = basic > 0 ? basic + 1 : 0;
+      while (ic < input.length) {
+        const oldi = i;
+        let w = 1;
+        for (let k = BASE; ; k += BASE) {
+          if (ic >= input.length) throw new RangeError("Invalid input");
+          const digit = basicToDigit(input.charCodeAt(ic++));
+          if (digit >= BASE || digit > Math.floor((MAXINT - i) / w)) throw new RangeError("Overflow");
+          i += digit * w;
+          const t = k <= bias ? TMIN : k >= bias + TMAX ? TMAX : k - bias;
+          if (digit < t) break;
+          const baseMinusT = BASE - t;
+          if (w > Math.floor(MAXINT / baseMinusT)) throw new RangeError("Overflow");
+          w *= baseMinusT;
+        }
+        const out = output.length + 1;
+        bias = adapt(i - oldi, out, oldi === 0);
+        if (Math.floor(i / out) > MAXINT - n) throw new RangeError("Overflow");
+        n += Math.floor(i / out);
+        i %= out;
+        output.splice(i++, 0, n);
+      }
+      return String.fromCodePoint(...output);
+    }
+
+    function encode(input) {
+      const output = [];
+      const cps = [...input].map((c) => c.codePointAt(0));
+      const basic = cps.filter((cp) => cp < 128);
+      let handled = basic.length;
+      for (const cp of basic) output.push(String.fromCodePoint(cp));
+      if (handled > 0) output.push(DELIMITER);
+      let n = 128;
+      let delta = 0;
+      let bias = BIAS_INIT;
+      while (handled < cps.length) {
+        const m = cps.filter((cp) => cp >= n).reduce((a, b) => Math.min(a, b), MAXINT);
+        if (m - n > Math.floor((MAXINT - delta) / (handled + 1))) throw new RangeError("Overflow");
+        delta += (m - n) * (handled + 1);
+        n = m;
+        for (const cp of cps) {
+          if (cp < n) {
+            delta++;
+            if (delta > MAXINT) throw new RangeError("Overflow");
+          }
+          if (cp === n) {
+            let q = delta;
+            for (let k = BASE; ; k += BASE) {
+              const t = k <= bias ? TMIN : k >= bias + TMAX ? TMAX : k - bias;
+              if (q < t) break;
+              output.push(String.fromCodePoint(digitToBasic(t + ((q - t) % (BASE - t)))));
+              q = Math.floor((q - t) / (BASE - t));
+            }
+            output.push(String.fromCodePoint(digitToBasic(q)));
+            bias = adapt(delta, handled + 1, handled === basic.length);
+            delta = 0;
+            handled++;
+          }
+        }
+        delta++;
+        n++;
+      }
+      return output.join("");
+    }
+
+    function toASCII(domain) {
+      return domain.split(".").map((label) => {
+        if (/[^\x00-\x7F]/.test(label)) return "xn--" + encode(label);
+        return label;
+      }).join(".");
+    }
+
+    function toUnicode(domain) {
+      return domain.split(".").map((label) => {
+        if (label.startsWith("xn--")) {
+          try { return decode(label.slice(4)); } catch { return label; }
+        }
+        return label;
+      }).join(".");
+    }
+
+    return {
+      decode, encode, toASCII, toUnicode,
+      ucs2: {
+        decode: (str) => [...str].map((c) => c.codePointAt(0)),
+        encode: (cps) => String.fromCodePoint(...cps),
+      },
+    };
+  };
+
+  // ----------------------------------------------------------- perf_hooks
+  // Wrap globalThis.performance (installed post-restore). Factory defers the
+  // lookup to call time so requiring perf_hooks before installRuntimeGlobals
+  // still works (performance will be live when methods are invoked).
+  registry.factories.perf_hooks = () => {
+    class PerformanceObserver {
+      constructor(cb) { this._cb = cb; this._types = []; }
+      observe(options) { this._types = (options && options.entryTypes) || []; }
+      disconnect() { this._types = []; }
+    }
+    PerformanceObserver.supportedEntryTypes = Object.freeze(["measure", "mark"]);
+    return {
+      get performance() { return globalThis.performance; },
+      PerformanceObserver,
+      createHistogram: () => ({
+        record: () => {},
+        percentile: () => 0,
+        mean: 0,
+        max: 0,
+        min: 0,
+        count: 0,
+      }),
+      monitorEventLoopDelay: () => ({
+        enable() {},
+        disable() {},
+        reset() {},
+        mean: 0,
+        max: 0,
+        min: 0,
+        stddev: 0,
+        percentile: () => 0,
+        percentiles: new Map(),
+      }),
+    };
+  };
+
+  // ------------------------------------------------------- diagnostics_channel
+  // Minimal pub/sub bus. Used by OpenTelemetry auto-instrumentation and http
+  // tracing shims: subscribe/unsubscribe/publish + channel objects.
+  registry.factories.diagnostics_channel = () => {
+    const _channels = new Map();
+    class Channel {
+      constructor(name) {
+        this.name = name;
+        this._subs = [];
+      }
+      get hasSubscribers() { return this._subs.length > 0; }
+      subscribe(fn) { if (typeof fn === "function") this._subs.push(fn); }
+      unsubscribe(fn) {
+        const i = this._subs.indexOf(fn);
+        if (i >= 0) this._subs.splice(i, 1);
+        return i >= 0;
+      }
+      publish(message) {
+        const subs = this._subs.slice();
+        for (const fn of subs) { try { fn(message, this.name); } catch {} }
+        return subs.length > 0;
+      }
+      bindStore() {}
+      runStores(context, fn) { if (typeof fn === "function") fn(); }
+    }
+    function channel(name) {
+      if (!_channels.has(name)) _channels.set(name, new Channel(String(name)));
+      return _channels.get(name);
+    }
+    function hasSubscribers(name) {
+      return _channels.has(name) && _channels.get(name).hasSubscribers;
+    }
+    function subscribe(name, fn) { channel(name).subscribe(fn); }
+    function unsubscribe(name, fn) { return channel(name).unsubscribe(fn); }
+    return { channel, hasSubscribers, subscribe, unsubscribe, Channel };
+  };
+
+  // -------------------------------------------------------------- readline
+  // Minimal stub: enough for `readline.createInterface` and the async-
+  // iterator line-reading pattern used by CLI utilities.
+  registry.factories.readline = () => {
+    const EventEmitter = registry.get("events");
+    class Interface extends EventEmitter {
+      constructor(options) {
+        super();
+        this.input = (options && options.input) || null;
+        this.output = (options && options.output) || null;
+        this.terminal = options && options.terminal === true;
+        this._closed = false;
+        if (this.input && typeof this.input.on === "function") {
+          const dec = new TextDecoder();
+          let buf = "";
+          this.input.on("data", (chunk) => {
+            buf += typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true });
+            const parts = buf.split(/\r?\n/);
+            buf = parts.pop() || "";
+            for (const line of parts) this.emit("line", line);
+          });
+          this.input.on("end", () => {
+            if (buf.length) { this.emit("line", buf); buf = ""; }
+            this.close();
+          });
+        }
+      }
+      close() {
+        if (this._closed) return;
+        this._closed = true;
+        this.emit("close");
+      }
+      question(prompt, cb) {
+        if (this.output && typeof this.output.write === "function") this.output.write(prompt);
+        const onLine = (line) => { this.removeListener("line", onLine); cb(line); };
+        this.once("line", onLine);
+      }
+      setPrompt() {}
+      prompt() {}
+      write() {}
+      pause() { return this; }
+      resume() { return this; }
+      [Symbol.asyncIterator]() {
+        const self = this;
+        const queue = [];
+        let resolver = null;
+        let done = false;
+        self.on("line", (line) => {
+          if (resolver) { const r = resolver; resolver = null; r({ value: line, done: false }); }
+          else queue.push(line);
+        });
+        self.once("close", () => {
+          done = true;
+          if (resolver) { const r = resolver; resolver = null; r({ value: undefined, done: true }); }
+        });
+        return {
+          next() {
+            if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+            if (done) return Promise.resolve({ value: undefined, done: true });
+            return new Promise((r) => { resolver = r; });
+          },
+        };
+      }
+    }
+    function createInterface(options) {
+      if (typeof options === "string" || (options && !("input" in options) && !("output" in options))) {
+        return new Interface(typeof options === "string" ? { prompt: options } : options || {});
+      }
+      return new Interface(options || {});
+    }
+    function clearLine(stream, dir, cb) { if (typeof cb === "function") queueMicrotask(cb); }
+    function clearScreenDown(stream, cb) { if (typeof cb === "function") queueMicrotask(cb); }
+    function cursorTo(stream, x, y, cb) {
+      if (typeof y === "function") { cb = y; }
+      if (typeof cb === "function") queueMicrotask(cb);
+    }
+    function moveCursor(stream, dx, dy, cb) { if (typeof cb === "function") queueMicrotask(cb); }
+    function emitKeypressEvents() {}
+    return {
+      Interface, createInterface,
+      clearLine, clearScreenDown, cursorTo, moveCursor, emitKeypressEvents,
+    };
+  };
+
+  // --------------------------------------------------------- trace_events
+  // Node's trace_events module: used by tooling to conditionally enable
+  // category-based tracing. oam has no kernel trace backend yet; this stub
+  // keeps category checks and enable/disable calls from throwing.
+  registry.factories.trace_events = () => {
+    class Tracing {
+      constructor(categories) {
+        this._categories = Array.isArray(categories) ? categories.slice() : [];
+        this._enabled = false;
+      }
+      get enabled() { return this._enabled; }
+      get categories() { return this._categories.join(","); }
+      enable() { this._enabled = true; }
+      disable() { this._enabled = false; }
+    }
+    function createTracing(options) {
+      return new Tracing((options && options.categories) || []);
+    }
+    function getEnabledCategories() { return ""; }
+    return { createTracing, getEnabledCategories };
+  };
+
+  // ----------------------------------------------------------------------- vm
+  // vm module stub: Script.runInThisContext / runInNewContext cover the
+  // most-used APIs (module bundlers, Jest, etc.).
+  registry.factories.vm = () => {
+    class Script {
+      constructor(code, _options) {
+        this._code = String(code);
+        this._fn = null;
+      }
+      _compile() {
+        if (!this._fn) {
+          // eslint-disable-next-line no-new-func
+          this._fn = new Function(`with(this){${this._code}}`);
+        }
+        return this._fn;
+      }
+      runInThisContext(_options) {
+        return this._compile().call(globalThis);
+      }
+      runInContext(ctx, _options) {
+        return this._compile().call(ctx != null ? ctx : globalThis);
+      }
+      runInNewContext(sandbox, _options) {
+        const ctx = Object.assign(Object.create(null), sandbox);
+        return this._compile().call(ctx);
+      }
+      createCachedData() { return new Uint8Array(0); }
+    }
+    function createContext(sandbox, _options) {
+      return Object.assign(Object.create(null), sandbox || {});
+    }
+    function isContext(value) {
+      return value !== null && typeof value === "object";
+    }
+    function runInThisContext(code, _options) {
+      return new Script(code).runInThisContext();
+    }
+    function runInNewContext(code, sandbox, _options) {
+      return new Script(code).runInNewContext(sandbox);
+    }
+    function runInContext(code, ctx, _options) {
+      return new Script(code).runInContext(ctx);
+    }
+    function compileFunction(code, params, _options) {
+      // eslint-disable-next-line no-new-func
+      return new Function(...(params || []), code);
+    }
+    function measureMemory() {
+      return Promise.resolve({ total: { jsMemoryEstimate: 0 } });
+    }
+    return {
+      Script, createContext, isContext,
+      runInThisContext, runInNewContext, runInContext,
+      compileFunction, measureMemory,
+    };
+  };
+
+  // ---------------------------------------------------------------------- v8
+  // v8 module stub: expose minimal heap / serialization surface. Real V8
+  // bindings land with the diagnostics wave; for now, feature-detect callers
+  // get safe defaults and serialization uses JSON under a V8 wire header.
+  registry.factories.v8 = () => {
+    // V8 serialization wire format sentinel bytes: 0xff 0x0d (version 13).
+    function serialize(value) {
+      const json = JSON.stringify(value);
+      const enc = new TextEncoder().encode(json);
+      const out = new Uint8Array(2 + enc.length);
+      out[0] = 0xff; out[1] = 0x0d;
+      out.set(enc, 2);
+      return out;
+    }
+    function deserialize(buffer) {
+      const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+      const start = (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0x0d) ? 2 : 0;
+      return JSON.parse(new TextDecoder().decode(bytes.subarray(start)));
+    }
+    class Serializer {
+      constructor() { this._chunks = []; }
+      writeHeader() { this._chunks.push(new Uint8Array([0xff, 0x0d])); }
+      writeValue(value) { this._chunks.push(new TextEncoder().encode(JSON.stringify(value))); }
+      releaseBuffer() {
+        let total = 0;
+        for (const c of this._chunks) total += c.length;
+        const out = new Uint8Array(total);
+        let off = 0;
+        for (const c of this._chunks) { out.set(c, off); off += c.length; }
+        this._chunks = [];
+        return out;
+      }
+    }
+    class Deserializer {
+      constructor(buffer) {
+        const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+        const start = (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0x0d) ? 2 : 0;
+        this._text = new TextDecoder().decode(bytes.subarray(start));
+      }
+      readHeader() { return true; }
+      readValue() { return JSON.parse(this._text); }
+    }
+    function getHeapStatistics() {
+      return {
+        total_heap_size: 0, total_heap_size_executable: 0, total_physical_size: 0,
+        total_available_size: 0, used_heap_size: 0, heap_size_limit: 0,
+        malloced_memory: 0, peak_malloced_memory: 0, does_zap_garbage: 0,
+        number_of_native_contexts: 0, number_of_detached_contexts: 0,
+        external_memory: 0,
+      };
+    }
+    function getHeapSpaceStatistics() { return []; }
+    function getHeapCodeStatistics() {
+      return { code_and_metadata_size: 0, bytecode_and_metadata_size: 0, external_script_source_size: 0 };
+    }
+    function setFlagsFromString() {}
+    function writeHeapSnapshot() { return ""; }
+    function cachedDataVersionTag() { return 0; }
+    function stopCoverage() {}
+    function takeCoverage() {}
+    const startupSnapshot = {
+      addDeserializeCallback() {},
+      addSerializeCallback() {},
+      isBuildingSnapshot() { return false; },
+    };
+    return {
+      serialize, deserialize, Serializer, Deserializer,
+      getHeapStatistics, getHeapSpaceStatistics, getHeapCodeStatistics,
+      setFlagsFromString, writeHeapSnapshot, cachedDataVersionTag,
+      stopCoverage, takeCoverage, startupSnapshot,
+      constants: {
+        ALL_PROPERTIES: 0, ONLY_WRITABLE: 1, ONLY_ENUMERABLE: 2, ONLY_CONFIGURABLE: 4,
+        SKIP_STRINGS: 8, SKIP_SYMBOLS: 16,
+      },
+    };
+  };
+
+  // -------------------------------------------------------------- https
+  // Node's `https` module: re-exports the http module. oam has no TLS
+  // handshake client yet; most callers either use fetch() (which supports
+  // https) or just need the module to resolve. Documented divergence: no
+  // client-cert or CA-bundle options; TLS termination is handled by the
+  // upstream or by oam's fetch op.
+  registry.factories.https = () => registry.get("http");
+
+  // --------------------------------------------------------------- domain
+  // Node's `domain` module (deprecated since Node 4, still pulled in by
+  // legacy error-handling middleware). Minimal bind/intercept API shape
+  // without actual uncaught-exception routing.
+  registry.factories.domain = () => {
+    const EventEmitter = registry.get("events");
+    class Domain extends EventEmitter {
+      constructor() {
+        super();
+        this.members = [];
+      }
+      enter() {}
+      exit() {}
+      add(obj) { this.members.push(obj); return this; }
+      remove(obj) {
+        const i = this.members.indexOf(obj);
+        if (i >= 0) this.members.splice(i, 1);
+        return this;
+      }
+      bind(fn) {
+        const d = this;
+        return function (...args) {
+          try { return fn.apply(this, args); }
+          catch (e) { d.emit("error", e); }
+        };
+      }
+      intercept(fn) {
+        const d = this;
+        return function (err, ...args) {
+          if (err) { d.emit("error", err); return; }
+          try { fn.apply(this, args); }
+          catch (e) { d.emit("error", e); }
+        };
+      }
+      run(fn, ...args) {
+        try { return fn.apply(this, args); }
+        catch (e) { this.emit("error", e); }
+      }
+    }
+    function create() { return new Domain(); }
+    const active = null;
+    return { Domain, create, active };
+  };
+
+  // ---------------------------------------------------------------- repl
+  // Stub for code that imports the `repl` module for inspection/extension
+  // without starting an interactive REPL session.
+  registry.factories.repl = () => {
+    const EventEmitter = registry.get("events");
+    class REPLServer extends EventEmitter {
+      constructor() { super(); this.context = globalThis; }
+      start() { return this; }
+      close() { this.emit("exit"); }
+      defineCommand() {}
+      displayPrompt() {}
+      clearBufferedCommand() {}
+      setupHistory(file, cb) { if (typeof cb === "function") queueMicrotask(() => cb(null, this)); }
+    }
+    function start(_options) {
+      const server = new REPLServer();
+      queueMicrotask(() => server.emit("exit"));
+      return server;
+    }
+    return { start, REPLServer, builtinModules: registry.get("module").builtinModules };
+  };
+
+  // ------------------------------------------------------------ inspector
+  // Node's `inspector` module: wire-level CDP is implemented in oam's Rust
+  // core; the JS module surface exposes open/close/url and a Session class
+  // so library detection code (clinic, node --inspect integrations) works.
+  registry.factories.inspector = () => {
+    const EventEmitter = registry.get("events");
+    class Session extends EventEmitter {
+      connect() {}
+      connectToMainThread() {}
+      disconnect() {}
+      post(method, params, cb) {
+        if (typeof params === "function") { cb = params; }
+        if (typeof cb === "function") queueMicrotask(() => cb(null, {}));
+      }
+    }
+    let _opened = false;
+    function open(_port, _host, _wait) { _opened = true; }
+    function close() { _opened = false; }
+    function url() { return _opened ? "ws://127.0.0.1:9229/0" : undefined; }
+    function waitForDebugger() {}
+    return { Session, open, close, url, waitForDebugger, console: globalThis.console || {} };
+  };
+
+  // ------------------------------------------------------ child_process
+  // Stub: throws a clear "not implemented" error. Subprocess ops land with a
+  // later wave.
+  registry.factories.child_process = () => {
+    function notImpl(name) {
+      return () => {
+        throw new Error(
+          `child_process.${name} is not implemented in oam -- subprocess ops land with a later wave`,
+        );
+      };
+    }
+    return {
+      exec: notImpl("exec"),
+      execFile: notImpl("execFile"),
+      spawn: notImpl("spawn"),
+      spawnSync: notImpl("spawnSync"),
+      execSync: notImpl("execSync"),
+      execFileSync: notImpl("execFileSync"),
+      fork: notImpl("fork"),
+    };
+  };
+
+  // ---------------------------------------------------------------- cluster
+  registry.factories.cluster = () => {
+    const EventEmitter = registry.get("events");
+    class Cluster extends EventEmitter {
+      constructor() {
+        super();
+        this.isMaster = true;
+        this.isPrimary = true;
+        this.isWorker = false;
+        this.workers = {};
+        this.settings = {};
+        this.SCHED_NONE = 1;
+        this.SCHED_RR = 2;
+        this.schedulingPolicy = this.SCHED_RR;
+      }
+      fork() { throw new Error("cluster.fork is not implemented in oam"); }
+      setupMaster() {}
+      setupPrimary() {}
+      disconnect(cb) { if (typeof cb === "function") queueMicrotask(cb); }
+    }
+    return new Cluster();
+  };
+
+  // ------------------------------------------------------------------ dgram
+  registry.factories.dgram = () => {
+    function notImpl(name) {
+      return () => {
+        throw new Error(
+          `dgram.${name} is not implemented in oam -- UDP sockets land with a later wave`,
+        );
+      };
+    }
+    return { createSocket: notImpl("createSocket") };
+  };
+
+  // -------------------------------------------------------------------- dns
+  registry.factories.dns = () => {
+    function notImpl(name) {
+      return (...args) => {
+        const cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+        const err = Object.assign(
+          new Error(`dns.${name} is not implemented in oam -- DNS ops land with a later wave`),
+          { code: "ENOSYS" },
+        );
+        if (cb) queueMicrotask(() => cb(err));
+        else throw err;
+      };
+    }
+    function notImplPromise(name) {
+      return () => Promise.reject(
+        Object.assign(
+          new Error(`dns.promises.${name} is not implemented in oam -- DNS ops land with a later wave`),
+          { code: "ENOSYS" },
+        ),
+      );
+    }
+    const promises = {
+      lookup: notImplPromise("lookup"),
+      resolve: notImplPromise("resolve"),
+      resolve4: notImplPromise("resolve4"),
+      resolve6: notImplPromise("resolve6"),
+      resolveAny: notImplPromise("resolveAny"),
+      resolveCname: notImplPromise("resolveCname"),
+      resolveMx: notImplPromise("resolveMx"),
+      resolveTxt: notImplPromise("resolveTxt"),
+    };
+    class Resolver {
+      lookup(...args) { notImpl("Resolver.lookup")(...args); }
+      resolve(...args) { notImpl("Resolver.resolve")(...args); }
+      cancel() {}
+      getServers() { return []; }
+      setServers() {}
+    }
+    return {
+      lookup: notImpl("lookup"),
+      resolve: notImpl("resolve"),
+      resolve4: notImpl("resolve4"),
+      resolve6: notImpl("resolve6"),
+      Resolver,
+      promises,
+      setDefaultResultOrder() {},
+      setServers() {},
+      getServers: () => [],
+    };
+  };
+
+  // ------------------------------------------------------------------ http2
+  registry.factories.http2 = () => {
+    function notImpl(name) {
+      return () => {
+        throw new Error(
+          `http2.${name} is not implemented in oam -- HTTP/2 lands with a later wave`,
+        );
+      };
+    }
+    return {
+      createServer: notImpl("createServer"),
+      createSecureServer: notImpl("createSecureServer"),
+      connect: notImpl("connect"),
+      constants: {},
+      sensitiveHeaders: Symbol.for("nodejs.http2.sensitiveHeaders"),
+    };
+  };
+
+  // ------------------------------------------------------------------- tls
+  registry.factories.tls = () => {
+    function notImpl(name) {
+      return () => {
+        throw new Error(
+          `tls.${name} is not implemented in oam -- TLS client sockets land with a later wave`,
+        );
+      };
+    }
+    return {
+      connect: notImpl("connect"),
+      createServer: notImpl("createServer"),
+      createSecureContext: notImpl("createSecureContext"),
+      TLSSocket: class TLSSocket { constructor() { notImpl("TLSSocket")(); } },
+      DEFAULT_ECDH_CURVE: "auto",
+      DEFAULT_MAX_VERSION: "TLSv1.3",
+      DEFAULT_MIN_VERSION: "TLSv1.2",
+      rootCertificates: [],
+      getCiphers: () => [],
+      checkServerIdentity: () => undefined,
+    };
+  };
+
+  // --------------------------------------------------------- worker_threads
+  // MessageChannel / MessagePort are fully functional (in-process). Worker
+  // class throws on construction (thread spawn needs native ops).
+  registry.factories.worker_threads = () => {
+    const EventEmitter = registry.get("events");
+    class MessagePort extends EventEmitter {
+      constructor() { super(); this._twin = null; this._active = true; }
+      postMessage(data) {
+        const twin = this._twin;
+        if (twin && twin._active) queueMicrotask(() => twin.emit("message", data));
+      }
+      start() { return this; }
+      close() { this._active = false; this.emit("close"); }
+      ref() { return this; }
+      unref() { return this; }
+      addEventListener(type, fn) { this.on(type, fn); }
+      removeEventListener(type, fn) { this.off(type, fn); }
+    }
+    class MessageChannel {
+      constructor() {
+        this.port1 = new MessagePort();
+        this.port2 = new MessagePort();
+        this.port1._twin = this.port2;
+        this.port2._twin = this.port1;
+      }
+    }
+    class Worker extends EventEmitter {
+      constructor() {
+        super();
+        throw new Error(
+          "Worker threads are not implemented in oam -- multi-thread ops land with a later wave",
+        );
+      }
+    }
+    const _bc = typeof globalThis.BroadcastChannel !== "undefined" ? globalThis.BroadcastChannel : null;
+    return {
+      isMainThread: true,
+      parentPort: null,
+      workerData: null,
+      threadId: 0,
+      resourceLimits: {},
+      MessageChannel,
+      MessagePort,
+      Worker,
+      BroadcastChannel: _bc || class BroadcastChannel { constructor() { throw new Error("BroadcastChannel not available"); } },
+      receiveMessageOnPort: () => undefined,
+      markAsUntransferable: () => {},
+      moveMessagePortToContext: () => { throw new Error("moveMessagePortToContext is not supported in oam"); },
+      getEnvironmentData: () => undefined,
+      setEnvironmentData: () => {},
+    };
+  };
 
   // ------------------------------------------------- runtime global setup
   // Called from Rust after snapshot restore + native install. Installs the
