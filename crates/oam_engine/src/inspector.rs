@@ -77,10 +77,27 @@ impl Shared {
     /// event-loop checkpoints while the program runs.
     pub(crate) fn poll(&self) {
         while let Ok(message) = self.handle.from_client.try_recv() {
-            if let FromClient::Message(text) = message {
-                self.dispatch(&text);
+            match message {
+                FromClient::Message(text) => self.dispatch(&text),
+                FromClient::Reconnected(new_tx) => self.apply_reconnect(new_tx),
+                FromClient::Connected | FromClient::Disconnected => {}
             }
         }
+    }
+
+    /// A new debugger client connected after the previous one left.  Swap the
+    /// outbound sender and clear per-session state so `wait_for_attach` and
+    /// the pause loop behave correctly for the fresh session.
+    fn apply_reconnect(&self, new_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.handle.swap_sender(new_tx);
+        // `run_requested` is set by `Runtime.runIfWaitingForDebugger` which
+        // the new client must re-send.  Clear it so --inspect-brk wait loops
+        // don't immediately pass on the second attach.
+        self.run_requested.set(false);
+        // If a prior session left a stale pause (e.g. client vanished mid-
+        // break), clear the depth so the engine can make progress while
+        // waiting for the new client to re-issue Debugger commands.
+        self.pause_depth.set(0);
     }
 
     /// V8 paused execution: block, dispatching debugger commands, until this
@@ -97,6 +114,13 @@ impl Shared {
                 // Client vanished while paused — drop all pause levels so the
                 // process can make progress / exit rather than hang.
                 Ok(FromClient::Disconnected) | Err(_) => self.pause_depth.set(0),
+                // New client arrived after disconnect: swap sender and clear
+                // the pause so the engine is not stuck waiting for a resume
+                // that can never come from the now-disconnected prior client.
+                Ok(FromClient::Reconnected(new_tx)) => {
+                    self.apply_reconnect(new_tx);
+                    // pause_depth already zeroed by apply_reconnect.
+                }
             }
         }
     }
@@ -117,6 +141,9 @@ impl Shared {
                 Ok(FromClient::Message(text)) => self.dispatch(&text),
                 Ok(FromClient::Connected) => {}
                 Ok(FromClient::Disconnected) | Err(_) => return false,
+                // A reconnect while waiting: swap sender and keep waiting for
+                // the new client to send runIfWaitingForDebugger.
+                Ok(FromClient::Reconnected(new_tx)) => self.apply_reconnect(new_tx),
             }
         }
         true

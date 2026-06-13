@@ -3757,6 +3757,163 @@ async fn inspector_attaches_pauses_on_debugger_and_resumes() {
     );
 }
 
+/// End-to-end reconnect: spawn `oam run --inspect`, attach a first WebSocket
+/// client, drive the enable/run handshake, send `Debugger.enable`, then close
+/// the WebSocket gracefully.  Re-connect a second WebSocket to the same
+/// process and verify the new session responds to `Runtime.enable` (i.e. the
+/// inspector transport is still live and the engine dispatches CDP messages to
+/// the new client).  The program runs to completion after the second client
+/// disconnects.
+///
+/// Uses `--inspect` (not `--inspect-brk`) so the program runs freely and the
+/// reconnect window is driven by the test, not by a breakpoint.
+#[tokio::test]
+async fn inspector_reconnects_after_client_disconnect() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Grab a free port, then release it so the child can bind it.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    // A script with a deliberate pause so we have time to disconnect and
+    // reconnect before the process exits naturally.  3 s is generous; the
+    // whole test is time-boxed to 20 s, well below the CI job limit.
+    let file = write_temp(
+        "inspector/reconnect.mjs",
+        "console.log('start');\n\
+         await new Promise(r => setTimeout(r, 3000));\n\
+         console.log('end');",
+    );
+    let cache = write_temp("oam-cache-reconn/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args([
+            "run",
+            &format!("--inspect=127.0.0.1:{port}"),
+            file.to_str().unwrap(),
+        ])
+        .env("OAM_CACHE_DIR", cache)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oam binary spawns");
+
+    let drive = tokio::time::timeout(Duration::from_secs(20), async {
+        let url = format!("ws://127.0.0.1:{port}/oam");
+
+        // --- First client ---
+        let mut ws1 = None;
+        // Up to 5 s for the process to start and bind.
+        for _ in 0..50 {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((stream, _)) => {
+                    ws1 = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut ws1 = ws1.expect("first client connects");
+
+        // Standard attach handshake.
+        for msg in [
+            r#"{"id":1,"method":"Runtime.enable"}"#,
+            r#"{"id":2,"method":"Debugger.enable"}"#,
+        ] {
+            ws1.send(Message::Text(msg.to_string())).await.unwrap();
+        }
+
+        // Drain responses until we see one with an id field (a CDP response
+        // to one of our requests), confirming the session is active.
+        let mut got_response = false;
+        'drain: for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_millis(500), ws1.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("\"id\"") {
+                        got_response = true;
+                        break 'drain;
+                    }
+                }
+                Ok(Some(Ok(_))) => {} // ping/pong/binary
+                _ => break 'drain,    // timeout, error, or EOF
+            }
+        }
+        assert!(got_response, "first session: no response to Runtime.enable");
+
+        // Gracefully close the first WebSocket session.
+        let _ = ws1.close(None).await;
+        drop(ws1);
+
+        // Give the transport a moment to process the disconnect and refresh
+        // its channel state before the second client attempts to connect.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // --- Second client ---
+        let mut ws2 = None;
+        for _ in 0..30 {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((stream, _)) => {
+                    ws2 = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let mut ws2 = ws2.expect("second client connects after disconnect");
+
+        // The new session must respond to CDP commands.
+        ws2.send(Message::Text(
+            r#"{"id":10,"method":"Runtime.enable"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut second_session_ok = false;
+        'drain2: for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_millis(500), ws2.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("\"id\":10") {
+                        second_session_ok = true;
+                        break 'drain2;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => break 'drain2,
+            }
+        }
+
+        let _ = ws2.close(None).await;
+        second_session_ok
+    });
+
+    let second_session_ok = drive.await.expect("reconnect drive did not time out");
+
+    let output = child.wait_with_output().expect("child exits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        second_session_ok,
+        "second inspector session did not respond to Runtime.enable; stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "program should complete after reconnect; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("start") && stdout.contains("end"),
+        "program output incomplete: {stdout:?}"
+    );
+}
+
 // ---------------------------------------------------- coverage backfill (recent regressions)
 //
 // These tests cover the specific code paths surfaced in the post-M2 review:

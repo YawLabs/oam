@@ -710,7 +710,29 @@ pub(crate) fn pump_event_loop(
             (Some(deadline), false) => {
                 let now = std::time::Instant::now();
                 if deadline > now {
-                    std::thread::sleep(deadline - now);
+                    let total = deadline - now;
+                    // When the inspector is attached, interleave the sleep with
+                    // polls so CDP messages from a debugger client aren't
+                    // deferred until the timer fires. Without this, a script
+                    // sleeping (setTimeout) is unresponsive to DevTools for the
+                    // full sleep duration.
+                    let inspector = tc
+                        .get_slot::<crate::inspector::InspectorSlot>()
+                        .map(|slot| slot.0.clone());
+                    if let Some(shared) = inspector {
+                        const POLL_INTERVAL: std::time::Duration =
+                            std::time::Duration::from_millis(50);
+                        let mut remaining = total;
+                        while remaining > std::time::Duration::ZERO {
+                            let chunk = remaining.min(POLL_INTERVAL);
+                            std::thread::sleep(chunk);
+                            shared.poll();
+                            remaining =
+                                deadline.saturating_duration_since(std::time::Instant::now());
+                        }
+                    } else {
+                        std::thread::sleep(total);
+                    }
                 }
             }
         }

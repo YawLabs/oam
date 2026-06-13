@@ -5,13 +5,15 @@
 //! protocol; this module only moves bytes. Keeping it here preserves
 //! oam_core's v8-free boundary and reuses the in-tree tokio runtime stack.
 //!
-//! Model: ONE debugger session for the process lifetime (attach, debug,
-//! detach). A second concurrent client is rejected; reconnect after the
-//! first client leaves is not supported in this slice (documented). The
-//! Chrome DevTools Protocol is JSON over a single WebSocket; the discovery
-//! endpoints (`/json`, `/json/version`) let `chrome://inspect` and VS Code
-//! find the target.
+//! Model: ONE active debugger session at a time. A second concurrent client
+//! while one is already connected is rejected with 503. After the connected
+//! client disconnects, the accept loop refreshes its channel state and waits
+//! for the next client -- reconnect is supported for the lifetime of the
+//! process. The Chrome DevTools Protocol is JSON over a single WebSocket; the
+//! discovery endpoints (`/json`, `/json/version`) let `chrome://inspect` and
+//! VS Code find the target.
 
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -42,10 +44,19 @@ pub enum FromClient {
     Message(String),
     /// The client went away (close frame, socket error, or EOF).
     Disconnected,
+    /// A new client connected after the previous one disconnected (reconnect).
+    /// Carries the fresh `UnboundedSender` the engine must use for outbound
+    /// CDP messages going forward; the old sender is now dead.
+    Reconnected(UnboundedSender<String>),
 }
 
 /// Handle to a running inspector transport. The engine holds this for the
 /// life of the run; dropping it shuts the server thread down.
+///
+/// The handle is created on one thread and then held exclusively by the
+/// engine (isolate) thread, so the interior-mutable sender uses `RefCell`
+/// rather than a lock. `InspectorHandle` is therefore `!Sync` (which is
+/// already the case via `Receiver<FromClient>`).
 pub struct InspectorHandle {
     /// The bound address (useful when the caller asked for port 0).
     pub addr: SocketAddr,
@@ -54,9 +65,10 @@ pub struct InspectorHandle {
     /// CDP messages + lifecycle from the client. The engine drains this
     /// (blocking while paused, non-blocking while running).
     pub from_client: Receiver<FromClient>,
-    /// CDP messages to the client. The engine's V8 inspector Channel pushes
-    /// here; a no-op (dropped) when no client is attached.
-    to_client: UnboundedSender<String>,
+    /// CDP messages to the current client. On reconnect the engine replaces
+    /// this sender via `swap_sender`; the old sender is dead (recv side went
+    /// away with the previous session's channel).
+    to_client: RefCell<UnboundedSender<String>>,
     /// Level-triggered shutdown. A `watch` (not a `Notify`) so the signal
     /// cannot be lost: the server task sees `changed()` resolve even if it
     /// registers AFTER `send(true)`, which a lost-wakeup `notify_waiters`
@@ -75,7 +87,14 @@ impl InspectorHandle {
     /// drops if no client is attached (the protocol tolerates this: V8 only
     /// emits while a session is connected).
     pub fn send_to_client(&self, message: String) {
-        let _ = self.to_client.send(message);
+        let _ = self.to_client.borrow().send(message);
+    }
+
+    /// Replace the outbound sender with a new one after a reconnect. The
+    /// previous sender is dropped here (its receive side went away when the
+    /// prior session's channel was discarded by the transport).
+    pub fn swap_sender(&self, new_tx: UnboundedSender<String>) {
+        *self.to_client.borrow_mut() = new_tx;
     }
 }
 
@@ -139,7 +158,7 @@ pub fn start(addr: SocketAddr, uuid: String) -> std::io::Result<InspectorHandle>
         addr: bound_addr,
         uuid,
         from_client: from_client_rx,
-        to_client: to_client_tx,
+        to_client: RefCell::new(to_client_tx),
         shutdown: shutdown_tx,
         thread: Some(thread),
     })
@@ -153,7 +172,10 @@ enum Outcome {
 }
 
 /// Accept loop: serve discovery GETs to anyone, hand the first WebSocket
-/// upgrade to the bridge, and stop after that client leaves.
+/// upgrade to the bridge. After a client disconnects, a fresh channel pair is
+/// created and the engine is notified via `FromClient::Reconnected` so that
+/// the next client starts with a live sender. Two concurrent clients are still
+/// rejected with 503; reconnect only fires AFTER the prior session ends.
 ///
 /// Every per-connection await is wrapped in a `shutdown.changed()` select, so
 /// a parked read/write is cancelled the instant the handle is dropped and the
@@ -186,10 +208,17 @@ async fn serve(
             outcome = handle_connection(stream, addr, &uuid, &from_client, &mut to_client_rx) => outcome,
         };
         if outcome == Outcome::SessionEnded {
-            eprintln!(
-                "inspector: debugger disconnected -- reconnect not supported in this build; restart with --inspect to re-enable"
-            );
-            return; // single-session: the one debugger detached
+            eprintln!("inspector: debugger disconnected -- waiting for reconnect");
+            // Create a fresh channel pair for the next session.  Send the new
+            // sender to the engine so it can swap out the dead one; keep the
+            // new receiver here so the next WebSocket bridge can use it.
+            let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            to_client_rx = Some(new_rx);
+            // If the engine has already exited (sender disconnected), stop.
+            if from_client.send(FromClient::Reconnected(new_tx)).is_err() {
+                return;
+            }
+            // Fall through to the top of the loop to accept the next client.
         }
     }
 }
