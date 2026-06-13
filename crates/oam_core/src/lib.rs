@@ -83,8 +83,12 @@ pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 pub enum ZlibStream {
     Compress(zlib::StreamCompressor),
     Decompress(zlib::StreamDecompressor),
-    BrotliCompress(BrotliCompressor),
-    BrotliDecompress(BrotliDecompressor),
+    // Brotli state is large (~5 KB for the compressor); Box keeps the enum
+    // discriminant compact so the gzip/deflate variants (the hot path) don't
+    // pay for brotli's footprint in the HashMap registry. Heap indirection
+    // is paid once per brotli stream, never on the per-chunk write path.
+    BrotliCompress(Box<BrotliCompressor>),
+    BrotliDecompress(Box<BrotliDecompressor>),
 }
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
@@ -626,6 +630,12 @@ pub struct BrotliCompressor {
     inner: brotli::CompressorWriter<Vec<u8>>,
 }
 
+impl Default for BrotliCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BrotliCompressor {
     pub fn new() -> Self {
         Self {
@@ -662,6 +672,12 @@ unsafe impl Send for BrotliCompressor {}
 /// Incremental brotli decompressor wrapping `brotli::DecompressorWriter`.
 pub struct BrotliDecompressor {
     inner: brotli::DecompressorWriter<Vec<u8>>,
+}
+
+impl Default for BrotliDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BrotliDecompressor {
@@ -988,9 +1004,9 @@ pub mod ops {
         let stream = if format == "brotli" {
             // Brotli: pure-Rust incremental backend.
             if compress {
-                super::ZlibStream::BrotliCompress(super::BrotliCompressor::new())
+                super::ZlibStream::BrotliCompress(Box::default())
             } else {
-                super::ZlibStream::BrotliDecompress(super::BrotliDecompressor::new())
+                super::ZlibStream::BrotliDecompress(Box::default())
             }
         } else if compress {
             let Some(fmt) = super::zlib::Format::parse(&format) else {
