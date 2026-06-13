@@ -36,6 +36,7 @@ struct Host {
     set_named_property:
         unsafe extern "C" fn(NapiEnv, NapiValue, *const c_char, NapiValue) -> NapiStatus,
     create_int32: unsafe extern "C" fn(NapiEnv, i32, *mut NapiValue) -> NapiStatus,
+    create_int64: unsafe extern "C" fn(NapiEnv, i64, *mut NapiValue) -> NapiStatus,
     get_value_int32: unsafe extern "C" fn(NapiEnv, NapiValue, *mut i32) -> NapiStatus,
     create_string_utf8:
         unsafe extern "C" fn(NapiEnv, *const c_char, usize, *mut NapiValue) -> NapiStatus,
@@ -72,6 +73,7 @@ unsafe fn resolve_host() -> Option<Host> {
             get_cb_info: sym!(b"napi_get_cb_info"),
             set_named_property: sym!(b"napi_set_named_property"),
             create_int32: sym!(b"napi_create_int32"),
+            create_int64: sym!(b"napi_create_int64"),
             get_value_int32: sym!(b"napi_get_value_int32"),
             create_string_utf8: sym!(b"napi_create_string_utf8"),
             get_value_string_utf8: sym!(b"napi_get_value_string_utf8"),
@@ -184,6 +186,43 @@ unsafe extern "C" fn concat(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     }
 }
 
+/// makeInt64(hi: i32, lo: i32) -> number | bigint
+///
+/// Assembles hi and lo (each a signed i32) into a 64-bit signed integer as
+/// `(hi as i64) << 32 | (lo as u32 as i64)`, then routes through
+/// napi_create_int64. The JS side can inspect typeof to verify Node parity:
+/// values in [-2^53+1, 2^53-1] -> "number"; outside that range -> "bigint".
+unsafe extern "C" fn make_int64(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    unsafe {
+        let mut argc = 2usize;
+        let mut argv: [NapiValue; 2] = [std::ptr::null_mut(); 2];
+        (host().get_cb_info)(
+            env,
+            info,
+            &mut argc,
+            argv.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let (mut hi, mut lo) = (0i32, 0i32);
+        if (host().get_value_int32)(env, argv[0], &mut hi) != 0
+            || (host().get_value_int32)(env, argv[1], &mut lo) != 0
+        {
+            (host().throw_type_error)(
+                env,
+                c"ERR_NATIVE_ARGS".as_ptr(),
+                c"makeInt64(hi, lo) wants two i32s".as_ptr(),
+            );
+            return std::ptr::null_mut();
+        }
+        // Reconstruct i64: hi occupies the high 32 bits, lo the low 32.
+        let value: i64 = ((hi as i64) << 32) | (lo as u32 as i64);
+        let mut result: NapiValue = std::ptr::null_mut();
+        (host().create_int64)(env, value, &mut result);
+        result
+    }
+}
+
 unsafe extern "C" fn boom(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
     unsafe {
         (host().throw_type_error)(env, c"ERR_NATIVE_BOOM".as_ptr(), c"native says no".as_ptr());
@@ -206,11 +245,12 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
         };
         let _ = HOST.set(resolved);
 
-        let bindings: [(&std::ffi::CStr, NapiCallback); 4] = [
+        let bindings: [(&std::ffi::CStr, NapiCallback); 5] = [
             (c"add", add),
             (c"greet", greet),
             (c"concat", concat),
             (c"boom", boom),
+            (c"makeInt64", make_int64),
         ];
         for (name, callback) in bindings {
             let mut function: NapiValue = std::ptr::null_mut();
