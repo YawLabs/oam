@@ -27,15 +27,18 @@ fn main() {
 
     // Evaluated in order: web surface first, then the node: compat layer
     // (node_compat.js installs Buffer/TextEncoder globals and the builtin
-    // factory registry — all pure JS, natives looked up at call time),
+    // factory registry -- all pure JS, natives looked up at call time),
     // then the test runner (registers the oam:test factory on that
-    // registry, so it must come after node_compat).
+    // registry, so it must come after node_compat), then the permissions
+    // module (registers oam:permissions factory, also after node_compat).
     let js_files = [
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/node_compat.js"),
         // streams.js: TextDecoderStream needs node_compat's TextDecoder.
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/streams.js"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/test_runner.js"),
+        // permissions.js: oam:permissions factory (after node_compat).
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
     ];
     let sources: Vec<(String, String)> = js_files
         .iter()

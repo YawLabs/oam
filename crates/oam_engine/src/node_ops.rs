@@ -160,6 +160,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoHashCopy", op_crypto_hash_copy),
         ("cryptoRandomFill", op_crypto_random_fill),
         ("cryptoTimingSafeEqual", op_crypto_timing_safe_equal),
+        // oam:permissions query surface
+        ("permissionsQuery", op_permissions_query),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -484,6 +486,11 @@ fn op_http_serve(
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    // Net gate: "host:port" is the resource being bound.
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
     let state = http_state(scope);
     crate::ops::spawn_op(
         scope,
@@ -1035,6 +1042,9 @@ fn op_fs_read_file_sync(
         throw_type_error(scope, "readFileSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     // Always raw bytes: encodings decode JS-side via Buffer#toString, so
     // 'base64'/'hex'/'latin1' behave instead of utf8-lossy garbage.
     match std::fs::read(&path) {
@@ -1056,6 +1066,9 @@ fn op_fs_write_file_sync(
         throw_type_error(scope, "writeFileSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeFileSync requires data");
         return;
@@ -1097,6 +1110,9 @@ fn op_fs_stat_sync(
         throw_type_error(scope, "statSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     let lstat = args.get(1).is_true();
     let meta = if lstat {
         std::fs::symlink_metadata(&path)
@@ -1118,6 +1134,9 @@ fn op_fs_readdir_sync(
         throw_type_error(scope, "readdirSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     match oam_core::ops::readdir_to_json(&path) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_node_error(scope, "scandir", &path, &e),
@@ -1268,6 +1287,9 @@ fn op_fs_read_file(
         throw_type_error(scope, "readFile requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     // Always raw bytes; encodings decode JS-side (see the sync twin).
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_read_file(path));
 }
@@ -1281,6 +1303,9 @@ fn op_fs_write_file(
         throw_type_error(scope, "writeFile requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeFile requires data");
         return;
@@ -1418,6 +1443,15 @@ fn op_fs_open(
         return;
     };
     let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
+    // Gate on read for read modes ("r", "r+"), write for write modes.
+    let is_write = mode.contains('w') || mode.contains('a');
+    if is_write {
+        if !check_write_perm(scope, &path) {
+            return;
+        }
+    } else if !check_read_perm(scope, &path) {
+        return;
+    }
     let core = scope
         .get_slot::<oam_core::CoreRuntime>()
         .expect("core runtime installed");
@@ -1482,9 +1516,92 @@ fn op_fs_close(
         .files();
     let mut guard = files.lock().expect("file registry lock");
     // If the File is in flight (removed by a chunk op for its IO await),
-    // it is absent here — record the close so the op's reinsert drops it
+    // it is absent here -- record the close so the op's reinsert drops it
     // instead of resurrecting a leaked fd (destroy()-during-read race).
     if guard.files.remove(&handle).is_none() {
         guard.closed.insert(handle);
     }
+}
+
+// ------------------------------------------------- permission helpers / query
+
+/// Throw an `Error` with `.code = "ERR_PERMISSION_DENIED"` and return.
+/// The message is the full Deno-shaped description from `Permissions`.
+fn throw_permission_denied(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let msg_v8 = v8::String::new(scope, message)
+        .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
+    let exception = v8::Exception::error(scope, msg_v8);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let key = v8::String::new(scope, "code").unwrap();
+        if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
+            obj.set(scope, key.into(), code.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// Get a clone of the current `Permissions` slot, or an all-granted default.
+/// Clone is cheap (three enum variants, no heap except for List paths).
+fn get_permissions(scope: &v8::PinScope<'_, '_>) -> crate::permissions::Permissions {
+    scope
+        .get_slot::<crate::permissions::Permissions>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Check `read` permission for `path`; throw and return `false` if denied.
+/// Usage:
+/// ```ignore
+/// if !check_read_perm(scope, &path) { return; }
+/// ```
+fn check_read_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
+    if let Err(msg) = get_permissions(scope).check_read(path) {
+        throw_permission_denied(scope, &msg);
+        false
+    } else {
+        true
+    }
+}
+
+/// Check `write` permission for `path`.
+fn check_write_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
+    if let Err(msg) = get_permissions(scope).check_write(path) {
+        throw_permission_denied(scope, &msg);
+        false
+    } else {
+        true
+    }
+}
+
+/// Check `net` permission for `host`.
+fn check_net_perm(scope: &mut v8::PinScope<'_, '_>, host: &str) -> bool {
+    if let Err(msg) = get_permissions(scope).check_net(host) {
+        throw_permission_denied(scope, &msg);
+        false
+    } else {
+        true
+    }
+}
+
+/// permissionsQuery(name: string, target: string | null) -> {state: string}
+///
+/// Called by js/permissions.js to implement `permissions.query()`.
+fn op_permissions_query(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let name = arg_string(scope, &args, 0).unwrap_or_default();
+    // Second arg is null (no target) or a string path/host.
+    let target = if args.get(1).is_null_or_undefined() {
+        None
+    } else {
+        arg_string(scope, &args, 1)
+    };
+    let state = get_permissions(scope).query_state(&name, target.as_deref());
+    let result = v8::Object::new(scope);
+    let state_key = v8::String::new(scope, "state").unwrap();
+    let state_val = v8::String::new(scope, state).unwrap();
+    result.set(scope, state_key.into(), state_val.into());
+    rv.set(result.into());
 }

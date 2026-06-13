@@ -14,7 +14,8 @@ oam_core = { workspace = true }
 oam_loader = { workspace = true }
 # Facade generation JSON-escapes paths/export names.
 serde_json = { workspace = true }
-# WHATWG URL parse/mutate natives for the JS URL class.
+# WHATWG URL parse/mutate natives for the JS URL class, and permission
+# net-gate host extraction in ops.rs.
 url = { workspace = true }
 # node:crypto natives: streaming digests, HMAC, OS randomness.
 sha1 = { workspace = true }
