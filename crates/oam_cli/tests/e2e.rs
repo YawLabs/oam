@@ -5151,3 +5151,59 @@ cp.on("close", (code) => {
     assert!(stdout.contains("exec: exec-cb-test err: null"), "{stdout}");
     assert!(stdout.contains("DONE"), "{stdout}");
 }
+
+#[test]
+fn dns_lookup_resolves_localhost() {
+    let f = write_temp(
+        "dns_lookup.mjs",
+        r#"
+import dns from 'node:dns';
+import { promises as dnsPromises } from 'node:dns';
+
+// 1. callback-style lookup
+dns.lookup('localhost', (err, address, family) => {
+  console.log('cb-err:', err);
+  console.log('cb-addr:', address);
+  console.log('cb-fam:', family);
+});
+
+// 2. promise-style lookup
+const result = await dnsPromises.lookup('localhost');
+console.log('p-addr:', result.address);
+console.log('p-fam:', result.family);
+
+// 3. lookup with all:true
+const all = await dnsPromises.lookup('localhost', { all: true });
+console.log('all-len:', all.length > 0);
+console.log('all-addr:', all[0].address);
+
+// 4. resolve4 (A records via OS resolver)
+const addrs = await dnsPromises.resolve4('localhost');
+console.log('resolve4-len:', addrs.length > 0);
+console.log('resolve4-type:', typeof addrs[0]);
+
+// 5. ENOTFOUND on bogus hostname
+try {
+  await dnsPromises.lookup('this.host.definitely.does.not.exist.invalid');
+  console.log('bogus: no error');
+} catch (e) {
+  console.log('bogus-code:', e.code);
+}
+"#,
+    );
+    let out = oam(&["run", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "dns test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert!(lines.iter().any(|l| l.starts_with("cb-err: null")), "callback error should be null: {stdout}");
+    assert!(lines.iter().any(|l| l.starts_with("cb-addr: ")), "callback should return address: {stdout}");
+    assert!(lines.iter().any(|l| l.starts_with("p-addr: ")), "promise should return address: {stdout}");
+    assert!(lines.iter().any(|l| l == &"all-len: true"), "all:true should return results: {stdout}");
+    assert!(lines.iter().any(|l| l == &"resolve4-len: true"), "resolve4 should return results: {stdout}");
+    assert!(lines.iter().any(|l| l == &"resolve4-type: string"), "resolve4 should return strings: {stdout}");
+    assert!(lines.iter().any(|l| l == &"bogus-code: ENOTFOUND"), "bogus hostname should ENOTFOUND: {stdout}");
+}

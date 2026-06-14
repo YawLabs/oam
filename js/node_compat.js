@@ -6126,12 +6126,12 @@
   };
 
   // -------------------------------------------------------------------- dns
-  registry.factories.dns = () => {
+  registry.factories.dns = (natives) => {
     function notImpl(name) {
       return (...args) => {
         const cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
         const err = Object.assign(
-          new Error(`dns.${name} is not implemented in oam -- DNS ops land with a later wave`),
+          new Error(`dns.${name} is not implemented in oam -- DNS record-type queries land with a later wave`),
           { code: "ENOSYS" },
         );
         if (cb) queueMicrotask(() => cb(err));
@@ -6141,38 +6141,152 @@
     function notImplPromise(name) {
       return () => Promise.reject(
         Object.assign(
-          new Error(`dns.promises.${name} is not implemented in oam -- DNS ops land with a later wave`),
+          new Error(`dns.promises.${name} is not implemented in oam -- DNS record-type queries land with a later wave`),
           { code: "ENOSYS" },
         ),
       );
     }
+
+    function lookup(hostname, options, callback) {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      if (typeof options === "number") options = { family: options };
+      const opts = options || {};
+      const family = opts.family || 0;
+      const all = !!opts.all;
+
+      natives.dnsLookup(String(hostname), family, all).then(
+        (result) => {
+          if (all) {
+            callback(null, result);
+          } else {
+            callback(null, result.address, result.family);
+          }
+        },
+        (err) => {
+          callback(err);
+        },
+      );
+    }
+
+    function resolve(hostname, rrtype, callback) {
+      if (typeof rrtype === "function") {
+        callback = rrtype;
+        rrtype = "A";
+      }
+      rrtype = (rrtype || "A").toUpperCase();
+      if (rrtype === "A") {
+        natives.dnsLookup(String(hostname), 4, true).then(
+          (results) => callback(null, results.map((r) => r.address)),
+          (err) => callback(err),
+        );
+      } else if (rrtype === "AAAA") {
+        natives.dnsLookup(String(hostname), 6, true).then(
+          (results) => callback(null, results.map((r) => r.address)),
+          (err) => callback(err),
+        );
+      } else {
+        notImpl(`resolve(${rrtype})`)(hostname, callback);
+      }
+    }
+
+    function resolve4(hostname, options, callback) {
+      if (typeof options === "function") { callback = options; options = {}; }
+      natives.dnsLookup(String(hostname), 4, true).then(
+        (results) => {
+          if (options && options.ttl) {
+            callback(null, results.map((r) => ({ address: r.address, ttl: 0 })));
+          } else {
+            callback(null, results.map((r) => r.address));
+          }
+        },
+        (err) => callback(err),
+      );
+    }
+
+    function resolve6(hostname, options, callback) {
+      if (typeof options === "function") { callback = options; options = {}; }
+      natives.dnsLookup(String(hostname), 6, true).then(
+        (results) => {
+          if (options && options.ttl) {
+            callback(null, results.map((r) => ({ address: r.address, ttl: 0 })));
+          } else {
+            callback(null, results.map((r) => r.address));
+          }
+        },
+        (err) => callback(err),
+      );
+    }
+
+    const RRTYPE_OK = new Set(["A", "AAAA"]);
+
     const promises = {
-      lookup: notImplPromise("lookup"),
-      resolve: notImplPromise("resolve"),
-      resolve4: notImplPromise("resolve4"),
-      resolve6: notImplPromise("resolve6"),
+      lookup(hostname, options) {
+        const opts = typeof options === "number" ? { family: options } : (options || {});
+        const family = opts.family || 0;
+        const all = !!opts.all;
+        return natives.dnsLookup(String(hostname), family, all);
+      },
+      resolve(hostname, rrtype) {
+        rrtype = (rrtype || "A").toUpperCase();
+        if (rrtype === "A") {
+          return natives.dnsLookup(String(hostname), 4, true).then((r) => r.map((x) => x.address));
+        }
+        if (rrtype === "AAAA") {
+          return natives.dnsLookup(String(hostname), 6, true).then((r) => r.map((x) => x.address));
+        }
+        return notImplPromise(`resolve(${rrtype})`)();
+      },
+      resolve4(hostname, options) {
+        return natives.dnsLookup(String(hostname), 4, true).then((r) => {
+          if (options && options.ttl) return r.map((x) => ({ address: x.address, ttl: 0 }));
+          return r.map((x) => x.address);
+        });
+      },
+      resolve6(hostname, options) {
+        return natives.dnsLookup(String(hostname), 6, true).then((r) => {
+          if (options && options.ttl) return r.map((x) => ({ address: x.address, ttl: 0 }));
+          return r.map((x) => x.address);
+        });
+      },
       resolveAny: notImplPromise("resolveAny"),
       resolveCname: notImplPromise("resolveCname"),
       resolveMx: notImplPromise("resolveMx"),
       resolveTxt: notImplPromise("resolveTxt"),
     };
+
     class Resolver {
-      lookup(...args) { notImpl("Resolver.lookup")(...args); }
-      resolve(...args) { notImpl("Resolver.resolve")(...args); }
+      constructor() { this._servers = []; }
+      resolve(hostname, rrtype, cb) {
+        if (typeof rrtype === "function") { cb = rrtype; rrtype = "A"; }
+        resolve(hostname, rrtype, cb);
+      }
+      resolve4(hostname, opts, cb) { resolve4(hostname, opts, cb); }
+      resolve6(hostname, opts, cb) { resolve6(hostname, opts, cb); }
       cancel() {}
-      getServers() { return []; }
-      setServers() {}
+      getServers() { return this._servers.slice(); }
+      setServers(servers) { this._servers = (servers || []).slice(); }
     }
+
+    const ADDRCONFIG = 0;
+    const V4MAPPED = 0;
+    const ALL = 0;
+
     return {
-      lookup: notImpl("lookup"),
-      resolve: notImpl("resolve"),
-      resolve4: notImpl("resolve4"),
-      resolve6: notImpl("resolve6"),
+      lookup,
+      resolve,
+      resolve4,
+      resolve6,
       Resolver,
       promises,
       setDefaultResultOrder() {},
       setServers() {},
       getServers: () => [],
+      ADDRCONFIG,
+      V4MAPPED,
+      ALL,
     };
   };
 

@@ -213,6 +213,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("spawnReadStderr", op_spawn_read_stderr),
         ("spawnWrite", op_spawn_write),
         ("spawnWait", op_spawn_wait),
+        // dns
+        ("dnsLookup", op_dns_lookup),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2280,5 +2282,28 @@ fn op_spawn_wait(
         scope,
         &mut rv,
         oam_core::child::child_wait(children, handle),
+    );
+}
+
+// ================================================================ dns
+
+fn op_dns_lookup(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let hostname: String = args.get(0).to_rust_string_lossy(scope);
+
+    let family = if args.get(1).is_number() {
+        args.get(1).number_value(scope).unwrap_or(0.0) as i32
+    } else {
+        0
+    };
+    let all = args.get(2).is_true();
+
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::dns::dns_lookup(hostname, family, all),
     );
 }
