@@ -4451,16 +4451,194 @@
       return natives.cryptoTimingSafeEqual(toBytes(a), toBytes(b));
     }
 
+    function webcryptoAlgoName(algorithm) {
+      if (typeof algorithm === "string") return algorithm;
+      return (algorithm && algorithm.name) || "";
+    }
+    function webcryptoHashName(algorithm) {
+      var n = webcryptoAlgoName(algorithm);
+      var h = (algorithm && algorithm.hash) ? webcryptoAlgoName(algorithm.hash) : n;
+      return h.replace("-", "").toUpperCase();
+    }
+
+    var _importedKeys = new Map();
+    var _keyIdCounter = 1;
+
+    function CryptoKey(algorithm, type, extractable, usages, _id) {
+      this.algorithm = algorithm;
+      this.type = type;
+      this.extractable = extractable;
+      this.usages = usages;
+      this._id = _id;
+    }
+
     const subtle = {
       async digest(algorithm, data) {
         const name = typeof algorithm === "string" ? algorithm : algorithm?.name;
         const id = natives.cryptoHashCreate(String(name));
         natives.cryptoHashUpdate(id, toBytes(data));
         const bytes = natives.cryptoHashDigest(id);
-        // WebCrypto returns a fresh ArrayBuffer.
         return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
       },
+
+      async importKey(format, keyData, algorithm, extractable, keyUsages) {
+        var algoObj = typeof algorithm === "string" ? { name: algorithm } : algorithm;
+        var algoName = algoObj.name.toUpperCase();
+        var id = _keyIdCounter++;
+        var keyType;
+        var pem;
+
+        if (format === "raw") {
+          if (algoName === "HMAC") {
+            var material = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
+            _importedKeys.set(id, { format: "raw", data: material, algo: algoObj });
+            keyType = "secret";
+          } else {
+            throw new Error("subtle.importKey: raw format only supported for HMAC");
+          }
+        } else if (format === "pkcs8") {
+          var der = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
+          pem = derToPem(der, "PRIVATE KEY");
+          _importedKeys.set(id, { format: "pkcs8", pem: pem, algo: algoObj });
+          keyType = "private";
+        } else if (format === "spki") {
+          var der2 = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
+          pem = derToPem(der2, "PUBLIC KEY");
+          _importedKeys.set(id, { format: "spki", pem: pem, algo: algoObj });
+          keyType = "public";
+        } else if (format === "jwk") {
+          throw new Error("subtle.importKey: JWK format not yet supported in oam");
+        } else {
+          throw new Error("subtle.importKey: unsupported format " + format);
+        }
+
+        return new CryptoKey(algoObj, keyType, extractable, keyUsages, id);
+      },
+
+      async exportKey(format, key) {
+        var stored = _importedKeys.get(key._id);
+        if (!stored) throw new Error("subtle.exportKey: unknown key");
+        if (!key.extractable) throw new Error("subtle.exportKey: key is not extractable");
+
+        if (format === "raw" && stored.format === "raw") {
+          return stored.data.buffer.slice(stored.data.byteOffset, stored.data.byteOffset + stored.data.byteLength);
+        }
+        if (format === "pkcs8" && stored.pem) {
+          return pemToDer(stored.pem);
+        }
+        if (format === "spki" && stored.pem) {
+          return pemToDer(stored.pem);
+        }
+        throw new Error("subtle.exportKey: unsupported format " + format + " for key type " + stored.format);
+      },
+
+      async sign(algorithm, key, data) {
+        var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        var stored = _importedKeys.get(key._id);
+        if (!stored) throw new Error("subtle.sign: unknown key");
+
+        if (algoName === "HMAC") {
+          var hashName = webcryptoHashName(stored.algo);
+          var hmacId = natives.cryptoHmacCreate(hashName, stored.data);
+          natives.cryptoHashUpdate(hmacId, toBytes(data));
+          var result = natives.cryptoHashDigest(hmacId);
+          return result.buffer.slice(result.byteOffset, result.byteOffset + result.length);
+        }
+
+        if (algoName === "ED25519") {
+          var sigBytes = natives.cryptoSign("ed25519", toBytes(data), stored.pem, "ed25519");
+          return sigBytes.buffer.slice(sigBytes.byteOffset, sigBytes.byteOffset + sigBytes.length);
+        }
+
+        if (algoName === "RSASSA-PKCS1-V1_5") {
+          var hashN = webcryptoHashName(algorithm);
+          var sigBytes2 = natives.cryptoSign(hashN, toBytes(data), stored.pem, "rsa");
+          return sigBytes2.buffer.slice(sigBytes2.byteOffset, sigBytes2.byteOffset + sigBytes2.length);
+        }
+
+        if (algoName === "ECDSA") {
+          var hashN2 = webcryptoHashName(algorithm);
+          var sigBytes3 = natives.cryptoSign(hashN2, toBytes(data), stored.pem, "ec");
+          return sigBytes3.buffer.slice(sigBytes3.byteOffset, sigBytes3.byteOffset + sigBytes3.length);
+        }
+
+        throw new Error("subtle.sign: unsupported algorithm " + algoName);
+      },
+
+      async verify(algorithm, key, signature, data) {
+        var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        var stored = _importedKeys.get(key._id);
+        if (!stored) throw new Error("subtle.verify: unknown key");
+
+        if (algoName === "HMAC") {
+          var hashName = webcryptoHashName(stored.algo);
+          var hmacId = natives.cryptoHmacCreate(hashName, stored.data);
+          natives.cryptoHashUpdate(hmacId, toBytes(data));
+          var expected = natives.cryptoHashDigest(hmacId);
+          var sigArr = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
+          if (expected.length !== sigArr.length) return false;
+          return natives.cryptoTimingSafeEqual(expected, sigArr);
+        }
+
+        if (algoName === "ED25519") {
+          var sigBuf = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
+          return natives.cryptoVerify("ed25519", toBytes(data), stored.pem, sigBuf, "ed25519");
+        }
+
+        if (algoName === "RSASSA-PKCS1-V1_5") {
+          var hashN = webcryptoHashName(algorithm);
+          var sigBuf2 = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
+          return natives.cryptoVerify(hashN, toBytes(data), stored.pem, sigBuf2, "rsa");
+        }
+
+        if (algoName === "ECDSA") {
+          var hashN2 = webcryptoHashName(algorithm);
+          var sigBuf3 = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
+          return natives.cryptoVerify(hashN2, toBytes(data), stored.pem, sigBuf3, "ec");
+        }
+
+        throw new Error("subtle.verify: unsupported algorithm " + algoName);
+      },
+
+      async generateKey(algorithm, extractable, keyUsages) {
+        var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        if (algoName === "ED25519") {
+          var pair = natives.cryptoGenerateKeyPair("ed25519");
+          var privId = _keyIdCounter++;
+          var pubId = _keyIdCounter++;
+          _importedKeys.set(privId, { format: "pkcs8", pem: pair.privateKey, algo: { name: "Ed25519" } });
+          _importedKeys.set(pubId, { format: "spki", pem: pair.publicKey, algo: { name: "Ed25519" } });
+          return {
+            privateKey: new CryptoKey({ name: "Ed25519" }, "private", extractable, keyUsages.filter(function(u) { return u === "sign"; }), privId),
+            publicKey: new CryptoKey({ name: "Ed25519" }, "public", extractable, keyUsages.filter(function(u) { return u === "verify"; }), pubId),
+          };
+        }
+        if (algoName === "HMAC") {
+          var len = (algorithm.length || 256) / 8;
+          var raw = natives.cryptoRandomFill(len);
+          var kid = _keyIdCounter++;
+          _importedKeys.set(kid, { format: "raw", data: raw, algo: algorithm });
+          return new CryptoKey(algorithm, "secret", extractable, keyUsages, kid);
+        }
+        throw new Error("subtle.generateKey: unsupported algorithm " + algoName);
+      },
     };
+
+    function derToPem(der, label) {
+      var b64 = BufferCtor.from(der).toString("base64");
+      var pem = "-----BEGIN " + label + "-----\n";
+      for (var i = 0; i < b64.length; i += 64) {
+        pem += b64.slice(i, i + 64) + "\n";
+      }
+      pem += "-----END " + label + "-----\n";
+      return pem;
+    }
+
+    function pemToDer(pem) {
+      var lines = pem.split("\n").filter(function(l) { return l.length > 0 && l.charAt(0) !== "-"; });
+      var buf = BufferCtor.from(lines.join(""), "base64");
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    }
 
     function getRandomValues(typedArray) {
       if (

@@ -5896,3 +5896,94 @@ crypto.generateKeyPair('ed25519', (err, pub2, priv2) => {
         );
     }
 }
+
+#[test]
+fn webcrypto_subtle_sign_verify_hmac() {
+    let file = write_temp(
+        "webcrypto_subtle.mjs",
+        r#"
+import crypto from 'node:crypto';
+const { subtle } = crypto.webcrypto || crypto;
+
+// 1. HMAC sign/verify via subtle
+const hmacKey = await subtle.generateKey(
+  { name: 'HMAC', hash: 'SHA-256' },
+  true, ['sign', 'verify']
+);
+console.log('hmacKeyType=' + (hmacKey.type === 'secret'));
+console.log('hmacExtract=' + hmacKey.extractable);
+
+const sig = await subtle.sign('HMAC', hmacKey, new TextEncoder().encode('hello'));
+console.log('hmacSigType=' + (sig instanceof ArrayBuffer));
+console.log('hmacSigLen=' + (sig.byteLength === 32));
+
+const ok = await subtle.verify('HMAC', hmacKey, sig, new TextEncoder().encode('hello'));
+console.log('hmacVerify=' + ok);
+
+const bad = await subtle.verify('HMAC', hmacKey, sig, new TextEncoder().encode('wrong'));
+console.log('hmacVerifyBad=' + (bad === false));
+
+// 2. Export raw HMAC key
+const rawKey = await subtle.exportKey('raw', hmacKey);
+console.log('hmacExport=' + (rawKey instanceof ArrayBuffer));
+
+// 3. Import raw HMAC key and re-verify
+const imported = await subtle.importKey(
+  'raw', rawKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
+);
+const ok2 = await subtle.verify('HMAC', imported, sig, new TextEncoder().encode('hello'));
+console.log('hmacImportVerify=' + ok2);
+
+// 4. Ed25519 generateKey + sign/verify via subtle
+const ed25519Pair = await subtle.generateKey('Ed25519', true, ['sign', 'verify']);
+console.log('ed25519Priv=' + (ed25519Pair.privateKey.type === 'private'));
+console.log('ed25519Pub=' + (ed25519Pair.publicKey.type === 'public'));
+
+const edSig = await subtle.sign('Ed25519', ed25519Pair.privateKey, new TextEncoder().encode('test'));
+console.log('edSigType=' + (edSig instanceof ArrayBuffer));
+
+const edOk = await subtle.verify('Ed25519', ed25519Pair.publicKey, edSig, new TextEncoder().encode('test'));
+console.log('edVerify=' + edOk);
+
+const edBad = await subtle.verify('Ed25519', ed25519Pair.publicKey, edSig, new TextEncoder().encode('wrong'));
+console.log('edVerifyBad=' + (edBad === false));
+
+// 5. subtle.digest
+const hash = await subtle.digest('SHA-256', new TextEncoder().encode('abc'));
+console.log('digestType=' + (hash instanceof ArrayBuffer));
+console.log('digestLen=' + (hash.byteLength === 32));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "webcrypto subtle failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "hmacKeyType=true",
+        "hmacExtract=true",
+        "hmacSigType=true",
+        "hmacSigLen=true",
+        "hmacVerify=true",
+        "hmacVerifyBad=true",
+        "hmacExport=true",
+        "hmacImportVerify=true",
+        "ed25519Priv=true",
+        "ed25519Pub=true",
+        "edSigType=true",
+        "edVerify=true",
+        "edVerifyBad=true",
+        "digestType=true",
+        "digestLen=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
