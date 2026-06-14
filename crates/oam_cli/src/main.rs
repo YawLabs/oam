@@ -100,6 +100,11 @@ enum Command {
         /// Bind address (sets the HOST env var; default 0.0.0.0).
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
+        /// Number of worker isolates for request dispatch. 0 = single-process
+        /// (handler file runs directly). >0 = pool mode (handler file must
+        /// export a default `(req, res) => ...` function).
+        #[arg(short, long, default_value = "0")]
+        workers: u16,
         /// Attach the V8 Inspector (Chrome DevTools Protocol). Optional
         /// value is `[host:]port` (default 127.0.0.1:9229).
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
@@ -183,6 +188,7 @@ fn main() -> ExitCode {
             file,
             port,
             host,
+            workers,
             inspect,
             inspect_brk,
         } => {
@@ -198,7 +204,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
+            if *workers > 0 {
+                serve_with_workers(file, *workers, cli.json, inspect)
+            } else {
+                run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
+            }
         }
         Command::DaemonServe { tsconfig } => match oam_ts::daemon::serve(tsconfig) {
             Ok(()) => ExitCode::SUCCESS,
@@ -822,6 +832,228 @@ impl oam_engine::ModuleHost for CliHost {
         }
     }
 }
+
+/// Worker-pool mode: write a dispatcher + worker shim to temp, run the
+/// dispatcher. The dispatcher creates the http server in the main isolate,
+/// spawns N worker isolates, and round-robins requests via postMessage.
+/// Bodies cross the channel as base64 (M3; approach C fd-transfer is the
+/// perf endgame).
+fn serve_with_workers(
+    handler: &Path,
+    workers: u16,
+    json: bool,
+    inspect: Option<(std::net::SocketAddr, bool)>,
+) -> ExitCode {
+    let handler_abs = std::path::absolute(handler)
+        .unwrap_or_else(|_| handler.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+        .replace('\\', "/");
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-serve-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let worker_path = dir.join("_pool_worker.cjs");
+    std::fs::write(&worker_path, POOL_WORKER_CJS).expect("write worker shim");
+
+    let worker_path_str = worker_path
+        .to_string_lossy()
+        .into_owned()
+        .replace('\\', "/");
+
+    let dispatcher_src = POOL_DISPATCHER_CJS
+        .replace("__OAM_WORKERS__", &workers.to_string())
+        .replace("__OAM_HANDLER__", &handler_abs)
+        .replace("__OAM_WORKER_SCRIPT__", &worker_path_str);
+
+    let dispatcher_path = dir.join("_pool_dispatcher.cjs");
+    std::fs::write(&dispatcher_path, &dispatcher_src).expect("write dispatcher");
+
+    let result = run_file(&dispatcher_path, &[], inspect);
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Ok(code) => ExitCode::from(code),
+        Err(diagnostics) => {
+            for d in &diagnostics {
+                render(d, json);
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+const POOL_DISPATCHER_CJS: &str = r#"
+const http = require("http");
+const { Worker } = require("worker_threads");
+
+const WORKER_COUNT = __OAM_WORKERS__;
+const HANDLER = "__OAM_HANDLER__";
+const WORKER_SCRIPT = "__OAM_WORKER_SCRIPT__";
+
+const workers = [];
+for (let i = 0; i < WORKER_COUNT; i++) {
+  const w = new Worker(WORKER_SCRIPT, {
+    workerData: { handler: HANDLER, workerId: i },
+  });
+  w.on("error", (err) => {
+    console.error("worker " + i + " error:", err.message);
+  });
+  workers.push(w);
+}
+
+const pending = new Map();
+let nextId = 1;
+let nextWorker = 0;
+
+for (const w of workers) {
+  w.on("message", (msg) => {
+    const res = pending.get(msg.id);
+    if (!res) return;
+    pending.delete(msg.id);
+    res.writeHead(msg.status, msg.headers || {});
+    res.end(msg.body ? Buffer.from(msg.body, "base64") : undefined);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const id = nextId++;
+  pending.set(id, res);
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
+  req.on("end", () => {
+    const body = Buffer.concat(chunks);
+    const worker = workers[nextWorker % WORKER_COUNT];
+    nextWorker++;
+    worker.postMessage({
+      id: id,
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: body.length > 0 ? body.toString("base64") : null,
+    });
+  });
+});
+
+const port = parseInt(process.env.PORT) || 3000;
+const host = process.env.HOST || "0.0.0.0";
+server.listen(port, host, () => {
+  const addr = server.address();
+  console.log(
+    "oam serve: " + addr.address + ":" + addr.port + " (" + WORKER_COUNT + " workers)"
+  );
+});
+"#;
+
+const POOL_WORKER_CJS: &str = r#"
+const { parentPort, workerData } = require("worker_threads");
+const { Readable } = require("stream");
+
+const mod = require(workerData.handler);
+const handler = typeof mod === "function" ? mod : mod.default;
+if (typeof handler !== "function") {
+  throw new Error(
+    "oam serve --workers: handler file must export a (req, res) => ... function, " +
+    "got " + typeof handler
+  );
+}
+
+parentPort.on("message", (msg) => {
+  const req = new Readable({ read() {} });
+  req.method = msg.method;
+  req.url = msg.url;
+  req.headers = msg.headers;
+  req.httpVersion = "1.1";
+  req.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+  if (msg.body) req.push(Buffer.from(msg.body, "base64"));
+  req.push(null);
+
+  let statusCode = 200;
+  const resHeaders = {};
+  const bodyChunks = [];
+  let ended = false;
+
+  const res = {
+    statusCode: 200,
+    headersSent: false,
+    setHeader(name, value) {
+      resHeaders[String(name).toLowerCase()] = String(value);
+    },
+    getHeader(name) {
+      return resHeaders[String(name).toLowerCase()];
+    },
+    removeHeader(name) {
+      delete resHeaders[String(name).toLowerCase()];
+    },
+    writeHead(status, headers) {
+      statusCode = status;
+      res.statusCode = status;
+      res.headersSent = true;
+      if (headers) {
+        if (typeof headers === "object") {
+          for (const k of Object.keys(headers)) {
+            resHeaders[k.toLowerCase()] = String(headers[k]);
+          }
+        }
+      }
+      return res;
+    },
+    write(chunk, encoding) {
+      if (typeof chunk === "string") chunk = Buffer.from(chunk, encoding);
+      else if (!(chunk instanceof Uint8Array)) chunk = Buffer.from(String(chunk));
+      bodyChunks.push(chunk);
+      return true;
+    },
+    end(chunk, encoding) {
+      if (ended) return res;
+      ended = true;
+      if (chunk !== undefined && chunk !== null) {
+        if (typeof chunk === "string") chunk = Buffer.from(chunk, encoding);
+        else if (!(chunk instanceof Uint8Array)) chunk = Buffer.from(String(chunk));
+        bodyChunks.push(chunk);
+      }
+      const body = Buffer.concat(bodyChunks);
+      parentPort.postMessage({
+        id: msg.id,
+        status: statusCode,
+        headers: resHeaders,
+        body: body.length > 0 ? body.toString("base64") : null,
+      });
+      return res;
+    },
+  };
+
+  try {
+    const result = handler(req, res);
+    if (result && typeof result.catch === "function") {
+      result.catch((err) => {
+        if (!ended) {
+          ended = true;
+          parentPort.postMessage({
+            id: msg.id,
+            status: 500,
+            headers: { "content-type": "text/plain" },
+            body: Buffer.from(err.message || "Internal Server Error").toString("base64"),
+          });
+        }
+      });
+    }
+  } catch (err) {
+    if (!ended) {
+      ended = true;
+      parentPort.postMessage({
+        id: msg.id,
+        status: 500,
+        headers: { "content-type": "text/plain" },
+        body: Buffer.from(err.message || "Internal Server Error").toString("base64"),
+      });
+    }
+  }
+});
+"#;
 
 /// Run the entry; Ok carries the process exit code (0, or a natural-exit
 /// process.exitCode the script declared — Node honors it, so does oam).

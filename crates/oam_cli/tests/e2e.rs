@@ -4951,3 +4951,125 @@ console.log('HOST=' + process.env.HOST);
     assert_eq!(lines[0], "PORT=3000");
     assert_eq!(lines[1], "HOST=0.0.0.0");
 }
+
+#[test]
+fn oam_serve_worker_pool_dispatches_requests() {
+    use std::io::{BufRead, Read, Write};
+
+    // Handler that echoes method + url + a marker proving it ran in a worker.
+    // Uses CJS module.exports so the worker shim can require() it.
+    let handler = write_temp(
+        "pool_handler.cjs",
+        r#"
+const { threadId } = require("worker_threads");
+module.exports = function handler(req, res) {
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    const body = Buffer.concat(chunks).toString();
+    res.writeHead(200, { "content-type": "application/json", "x-worker": String(threadId) });
+    res.end(JSON.stringify({ method: req.method, url: req.url, body: body, worker: threadId }));
+  });
+};
+"#,
+    );
+
+    // Pick a port unlikely to collide. Start oam serve with 2 workers.
+    let port = 19876u16;
+    let cache = write_temp("pool-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args([
+            "serve",
+            handler.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
+            "--workers",
+            "2",
+        ])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam serve spawns");
+
+    // Wait for "listening" on stdout (the dispatcher prints it).
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::io::BufReader::new(stdout);
+    let mut listening = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    for line in reader.lines() {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        let line = line.unwrap_or_default();
+        if line.contains("workers)") {
+            listening = true;
+            break;
+        }
+    }
+    assert!(
+        listening,
+        "server did not print listening line within timeout"
+    );
+
+    // Make two HTTP requests to verify dispatch works.
+    let client = std::net::TcpStream::connect(format!("127.0.0.1:{port}"));
+    assert!(client.is_ok(), "could not connect to server");
+
+    // Request 1: GET /hello
+    let mut stream = client.unwrap();
+    stream
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response1 = String::new();
+    stream.read_to_string(&mut response1).unwrap();
+    drop(stream);
+
+    // Request 2: POST /data with body
+    let mut stream2 = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    let post_body = r#"{"key":"value"}"#;
+    let req2 = format!(
+        "POST /data HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+        post_body.len(),
+        post_body
+    );
+    stream2.write_all(req2.as_bytes()).unwrap();
+    let mut response2 = String::new();
+    stream2.read_to_string(&mut response2).unwrap();
+    drop(stream2);
+
+    // Kill the server.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Verify response 1: GET /hello
+    assert!(
+        response1.contains("200 OK"),
+        "response1 not 200: {response1}"
+    );
+    let body1_start = response1.find('{').expect("JSON body in response1");
+    let body1: serde_json::Value =
+        serde_json::from_str(&response1[body1_start..]).expect("parse response1 JSON");
+    assert_eq!(body1["method"], "GET");
+    assert_eq!(body1["url"], "/hello");
+    assert!(body1["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
+
+    // Verify response 2: POST /data
+    assert!(
+        response2.contains("200 OK"),
+        "response2 not 200: {response2}"
+    );
+    let body2_start = response2.find('{').expect("JSON body in response2");
+    let body2: serde_json::Value =
+        serde_json::from_str(&response2[body2_start..]).expect("parse response2 JSON");
+    assert_eq!(body2["method"], "POST");
+    assert_eq!(body2["url"], "/data");
+    assert_eq!(body2["body"], r#"{"key":"value"}"#);
+    assert!(body2["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
+}
