@@ -111,6 +111,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("setContinuationData", op_set_continuation_data),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
+        ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
         ("fsWriteFileSync", op_fs_write_file_sync),
         ("fsExistsSync", op_fs_exists_sync),
         ("fsStatSync", op_fs_stat_sync),
@@ -288,6 +289,33 @@ fn return_json(
     {
         rv.set(value);
     }
+}
+
+fn return_url_obj(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    c: &UrlComponents,
+) {
+    let obj = v8::Object::new(scope);
+    let props: [(&str, &str); 11] = [
+        ("href", &c.href),
+        ("protocol", &c.protocol),
+        ("username", &c.username),
+        ("password", &c.password),
+        ("hostname", &c.hostname),
+        ("port", &c.port),
+        ("host", &c.host),
+        ("pathname", &c.pathname),
+        ("search", &c.search),
+        ("hash", &c.hash),
+        ("origin", &c.origin),
+    ];
+    for (key, val) in &props {
+        if let (Some(k), Some(v)) = (v8::String::new(scope, key), v8::String::new(scope, val)) {
+            obj.set(scope, k.into(), v.into());
+        }
+    }
+    rv.set(obj.into());
 }
 
 // ----------------------------------------------------- process / os natives
@@ -933,9 +961,21 @@ fn blob_origin(parsed: &url::Url) -> String {
     }
 }
 
-/// Serialize every WHATWG component of a parsed URL in one bundle -- the
-/// JS class stores these and re-requests on mutation.
-fn url_components(parsed: &url::Url) -> serde_json::Value {
+struct UrlComponents {
+    href: String,
+    protocol: String,
+    username: String,
+    password: String,
+    hostname: String,
+    port: String,
+    host: String,
+    pathname: String,
+    search: String,
+    hash: String,
+    origin: String,
+}
+
+fn url_components(parsed: &url::Url) -> UrlComponents {
     // --- Post-process href for non-special opaque-path URLs ---
     // The url crate leaves spaces literal in opaque paths; WHATWG
     // encodes only the trailing space (immediately before ?, #, or
@@ -1010,34 +1050,38 @@ fn url_components(parsed: &url::Url) -> serde_json::Value {
         parsed.origin().ascii_serialization()
     };
 
-    serde_json::json!({
-        "href": href,
-        "protocol": format!("{}:", parsed.scheme()),
-        "username": parsed.username(),
-        "password": parsed.password().unwrap_or(""),
-        "hostname": parsed.host_str().unwrap_or(""),
-        "port": parsed.port().map(|p| p.to_string()).unwrap_or_default(),
-        "host": match (parsed.host_str(), parsed.port()) {
+    UrlComponents {
+        href,
+        protocol: format!("{}:", parsed.scheme()),
+        username: parsed.username().to_string(),
+        password: parsed.password().unwrap_or("").to_string(),
+        hostname: parsed.host_str().unwrap_or("").to_string(),
+        port: parsed.port().map(|p| p.to_string()).unwrap_or_default(),
+        host: match (parsed.host_str(), parsed.port()) {
             (Some(host), Some(port)) => format!("{host}:{port}"),
             (Some(host), None) => host.to_string(),
             _ => String::new(),
         },
-        "pathname": pathname,
-        // Spec: the search GETTER is "" for both null and empty query
-        // (href keeps a bare '?' for the empty-present case).
-        "search": parsed.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
-        // Spec: the hash GETTER returns "" when fragment is null or
-        // empty; returns "#" + fragment only when fragment is non-empty.
-        "hash": parsed.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
-        "origin": origin,
-    })
+        pathname,
+        search: parsed
+            .query()
+            .filter(|q| !q.is_empty())
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default(),
+        hash: parsed
+            .fragment()
+            .filter(|f| !f.is_empty())
+            .map(|f| format!("#{f}"))
+            .unwrap_or_default(),
+        origin,
+    }
 }
 
 /// Parse with a PANIC boundary: rust-url carries debug assertions that
 /// hostile inputs (the WPT corpus reaches them) can trip; a library panic
 /// must surface as a JS TypeError, never unwind into V8's callback frames
 /// (that aborts the process). Err is the user-facing message.
-fn parse_components(input: &str, base: Option<&str>) -> Result<String, String> {
+fn parse_components(input: &str, base: Option<&str>) -> Result<UrlComponents, String> {
     std::panic::catch_unwind(|| {
         // --- Pre-process: file:///X| -> file:///X: (WHATWG legacy pipe
         // as drive-letter delimiter) ---
@@ -1094,7 +1138,7 @@ fn parse_components(input: &str, base: Option<&str>) -> Result<String, String> {
             },
         };
         match parsed {
-            Ok(parsed) => Ok(url_components(&parsed).to_string()),
+            Ok(parsed) => Ok(url_components(&parsed)),
             Err(_) => Err(format!("Invalid URL: {input}")),
         }
     })
@@ -1124,7 +1168,7 @@ fn op_url_parse(
         }
     };
     match parse_components(&input, base.as_deref()) {
-        Ok(json) => return_json(scope, &mut rv, &json),
+        Ok(components) => return_url_obj(scope, &mut rv, &components),
         Err(message) => throw_type_error(scope, &message),
     }
 }
@@ -1151,7 +1195,7 @@ fn op_url_update(
     let updated = std::panic::catch_unwind(|| update_components(&href, &part, &value))
         .unwrap_or_else(|_| update_components(&href, "__noop", ""));
     match updated {
-        Ok(json) => return_json(scope, &mut rv, &json),
+        Ok(components) => return_url_obj(scope, &mut rv, &components),
         Err(message) => throw_type_error(scope, &message),
     }
 }
@@ -1181,7 +1225,7 @@ fn truncate_at_delimiters<'a>(value: &'a str, terminators: &[char]) -> &'a str {
 
 /// Apply one WHATWG setter to `href`, returning the resulting component
 /// bundle. "__noop" re-serializes unchanged (the panic-recovery path).
-fn update_components(href: &str, part: &str, value: &str) -> Result<String, String> {
+fn update_components(href: &str, part: &str, value: &str) -> Result<UrlComponents, String> {
     let Ok(mut parsed) = url::Url::parse(href) else {
         return Err(format!("Invalid URL: {href}"));
     };
@@ -1385,7 +1429,7 @@ fn update_components(href: &str, part: &str, value: &str) -> Result<String, Stri
             return Err(format!("urlUpdate: unknown part '{other}'"));
         }
     }
-    Ok(url_components(&parsed).to_string())
+    Ok(url_components(&parsed))
 }
 
 /// Check if a hostname value should be treated as "localhost" for file:
@@ -1538,6 +1582,28 @@ fn op_fs_read_file_sync(
         Ok(bytes) => {
             if let Some(value) = bytes_to_uint8array(scope, bytes) {
                 rv.set(value);
+            }
+        }
+        Err(e) => throw_node_error(scope, "open", &path, &e),
+    }
+}
+
+fn op_fs_read_file_utf8_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "readFileSync requires a path");
+        return;
+    };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if let Some(s) = v8::String::new_from_utf8(scope, &bytes, v8::NewStringType::Normal) {
+                rv.set(s.into());
             }
         }
         Err(e) => throw_node_error(scope, "open", &path, &e),

@@ -2060,8 +2060,12 @@
       constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
 
       readFileSync: (path, options) => {
+        const enc = readOptions(options).encoding;
+        if (enc === "utf8" || enc === "utf-8") {
+          return natives.fsReadFileUtf8Sync(String(path));
+        }
         const bytes = natives.fsReadFileSync(String(path));
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
+        return decodeRead(bytes, enc ?? null);
       },
       writeFileSync: (path, data, options) => {
         natives.fsWriteFileSync(String(path), encodeWrite(data, options), false);
