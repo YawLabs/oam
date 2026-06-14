@@ -4022,6 +4022,37 @@
       },
       isErrored: (s) => Boolean(s._rState?.errored),
       isReadable: (s) => Boolean(s._rState && !s._rState.destroyed && !s._rState.endEmitted),
+      addAbortSignal: (signal, stream) => {
+        if (signal.aborted) {
+          stream.destroy(signal.reason ?? new Error("This operation was aborted"));
+        } else {
+          signal.addEventListener("abort", () => {
+            stream.destroy(signal.reason ?? new Error("This operation was aborted"));
+          }, { once: true });
+        }
+        return stream;
+      },
+      compose: (...streams) => {
+        if (streams.length === 0) throw new TypeError("stream.compose requires at least one stream");
+        if (streams.length === 1) return streams[0];
+        for (let i = 0; i < streams.length - 1; i++) {
+          streams[i].pipe(streams[i + 1]);
+        }
+        var head = streams[0];
+        var tail = streams[streams.length - 1];
+        var composed = new Duplex({
+          write(chunk, enc, cb) { head.write(chunk, enc, cb); },
+          read() {},
+          final(cb) { head.end(); cb(); },
+        });
+        tail.on("data", (chunk) => { if (!composed.push(chunk)) tail.pause(); });
+        tail.on("end", () => composed.push(null));
+        composed._read = () => tail.resume();
+        for (var si = 0; si < streams.length; si++) {
+          streams[si].on("error", (err) => composed.destroy(err));
+        }
+        return composed;
+      },
     });
     return Stream;
   };
@@ -4854,13 +4885,9 @@
         var pem;
 
         if (format === "raw") {
-          if (algoName === "HMAC") {
-            var material = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
-            _importedKeys.set(id, { format: "raw", data: material, algo: algoObj });
-            keyType = "secret";
-          } else {
-            throw new Error("subtle.importKey: raw format only supported for HMAC");
-          }
+          var material = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
+          _importedKeys.set(id, { format: "raw", data: material, algo: algoObj });
+          keyType = "secret";
         } else if (format === "pkcs8") {
           var der = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength);
           pem = derToPem(der, "PRIVATE KEY");
@@ -4986,6 +5013,51 @@
           return new CryptoKey(algorithm, "secret", extractable, keyUsages, kid);
         }
         throw new Error("subtle.generateKey: unsupported algorithm " + algoName);
+      },
+      async deriveBits(algorithm, baseKey, length) {
+        var algoName = webcryptoAlgoName(typeof algorithm === "string" ? algorithm : algorithm.name);
+        var stored = _importedKeys.get(baseKey._id);
+        if (!stored) throw new Error("subtle.deriveBits: unknown key");
+        var keyData = stored.data instanceof ArrayBuffer ? new Uint8Array(stored.data) : stored.data;
+        if (algoName === "PBKDF2") {
+          var salt = new Uint8Array(algorithm.salt);
+          var iterations = algorithm.iterations;
+          var hashName = webcryptoHashName(algorithm.hash);
+          var result = natives.cryptoPbkdf2Sync(
+            BufferCtor.from(keyData),
+            BufferCtor.from(salt),
+            iterations,
+            Math.ceil(length / 8),
+            hashName
+          );
+          return result.buffer.slice(result.byteOffset, result.byteOffset + result.byteLength);
+        }
+        if (algoName === "HKDF") {
+          var hSalt = new Uint8Array(algorithm.salt);
+          var hInfo = new Uint8Array(algorithm.info);
+          var hHash = webcryptoHashName(algorithm.hash);
+          var result2 = natives.cryptoHkdfSync(
+            hHash,
+            BufferCtor.from(keyData),
+            BufferCtor.from(hSalt),
+            BufferCtor.from(hInfo),
+            Math.ceil(length / 8)
+          );
+          return result2.buffer.slice(result2.byteOffset, result2.byteOffset + result2.byteLength);
+        }
+        throw new Error("subtle.deriveBits: unsupported algorithm " + algoName);
+      },
+      async deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
+        var dkAlgoName = webcryptoAlgoName(typeof derivedKeyType === "string" ? derivedKeyType : derivedKeyType.name);
+        var length = derivedKeyType.length;
+        if (!length && dkAlgoName === "AES-CBC") length = 256;
+        if (!length && dkAlgoName === "AES-GCM") length = 256;
+        if (!length && dkAlgoName === "AES-CTR") length = 256;
+        if (!length && dkAlgoName === "HMAC") {
+          length = 256;
+        }
+        var bits = await this.deriveBits(algorithm, baseKey, length);
+        return this.importKey("raw", bits, derivedKeyType, extractable, keyUsages);
       },
     };
 
@@ -6396,6 +6468,10 @@
   // --------------------------------------------------------------- buffer
   registry.factories.buffer = () => ({
     Buffer: globalThis.Buffer,
+    Blob: globalThis.Blob,
+    File: globalThis.File || class File extends globalThis.Blob {
+      constructor(bits, name, options) { super(bits, options); this.name = name; this.lastModified = (options && options.lastModified) || Date.now(); }
+    },
     atob: globalThis.atob,
     btoa: globalThis.btoa,
     constants: { MAX_LENGTH: 4294967295, MAX_STRING_LENGTH: 536870888 },

@@ -6499,6 +6499,177 @@ console.log('map_enoent=' + map.get(-2)[0]);
 }
 
 #[test]
+fn stream_add_abort_signal_and_compose() {
+    let file = write_temp(
+        "stream_extras.mjs",
+        r#"
+import { Readable, Writable, Transform, addAbortSignal, compose } from 'node:stream';
+
+// addAbortSignal
+const ac = new AbortController();
+const chunks = [];
+const w = new Writable({
+  write(chunk, enc, cb) { chunks.push(chunk.toString()); cb(); },
+});
+addAbortSignal(ac.signal, w);
+w.on('error', () => {}); // swallow expected abort error
+w.write('hello');
+ac.abort();
+// After abort the stream should be destroyed
+console.log('abort_destroyed=' + w.destroyed);
+
+// compose: chain a transform into a readable -> writable pipeline
+const upper = new Transform({
+  transform(chunk, enc, cb) {
+    cb(null, chunk.toString().toUpperCase());
+  },
+});
+const collector = [];
+const sink = new Writable({
+  write(chunk, enc, cb) { collector.push(chunk.toString()); cb(); },
+});
+const composed = compose(upper, sink);
+composed.write('hello');
+composed.write('world');
+composed.end();
+await new Promise(r => composed.on('finish', r));
+console.log('compose_result=' + collector.join(','));
+
+// addAbortSignal with already-aborted signal
+const ac2 = new AbortController();
+ac2.abort();
+const r = new Readable({ read() {} });
+r.on('error', () => {}); // swallow expected abort error
+addAbortSignal(ac2.signal, r);
+console.log('pre_aborted=' + r.destroyed);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "stream extras failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "abort_destroyed=true",
+        "compose_result=HELLO,WORLD",
+        "pre_aborted=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn webcrypto_subtle_derive_bits_and_key() {
+    let file = write_temp(
+        "subtle_derive.mjs",
+        r#"
+const { subtle } = globalThis.crypto;
+
+// PBKDF2 deriveBits
+const keyMaterial = await subtle.importKey(
+  'raw',
+  new TextEncoder().encode('password'),
+  'PBKDF2',
+  false,
+  ['deriveBits', 'deriveKey']
+);
+
+const salt = new Uint8Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+const bits = await subtle.deriveBits(
+  { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+  keyMaterial,
+  256
+);
+console.log('pbkdf2_type=' + (bits instanceof ArrayBuffer));
+console.log('pbkdf2_len=' + bits.byteLength);
+
+// PBKDF2 deriveKey
+const aesKey = await subtle.deriveKey(
+  { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+  keyMaterial,
+  { name: 'AES-GCM', length: 256 },
+  true,
+  ['sign']
+);
+console.log('deriveKey_type=' + aesKey.constructor.name);
+console.log('deriveKey_algo=' + aesKey.algorithm.name);
+console.log('deriveKey_extractable=' + aesKey.extractable);
+
+// HKDF deriveBits
+const hkdfMaterial = await subtle.importKey(
+  'raw',
+  new TextEncoder().encode('secret'),
+  'HKDF',
+  false,
+  ['deriveBits']
+);
+const hkdfBits = await subtle.deriveBits(
+  { name: 'HKDF', salt, info: new TextEncoder().encode('info'), hash: 'SHA-256' },
+  hkdfMaterial,
+  128
+);
+console.log('hkdf_type=' + (hkdfBits instanceof ArrayBuffer));
+console.log('hkdf_len=' + hkdfBits.byteLength);
+
+// deterministic: same inputs = same output
+const bits2 = await subtle.deriveBits(
+  { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+  keyMaterial,
+  256
+);
+const a = new Uint8Array(bits);
+const b = new Uint8Array(bits2);
+let same = true;
+for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) same = false;
+console.log('deterministic=' + same);
+
+// buffer.Blob exists (use global Blob)
+const BlobCtor = globalThis.Blob;
+const blob = new BlobCtor(['hello']);
+console.log('blob_size=' + blob.size);
+console.log('blob_type=' + blob.type);
+const text = await blob.text();
+console.log('blob_text=' + text);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "subtle derive test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "pbkdf2_type=true",
+        "pbkdf2_len=32",
+        "deriveKey_type=CryptoKey",
+        "deriveKey_algo=AES-GCM",
+        "deriveKey_extractable=true",
+        "hkdf_type=true",
+        "hkdf_len=16",
+        "deterministic=true",
+        "blob_size=5",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert!(stdout.contains("blob_text=hello"), "missing blob_text.\nstdout: {stdout}\nstderr: {stderr}");
+}
+
+#[test]
 fn performance_mark_measure_entries() {
     let file = write_temp(
         "perf_mark.mjs",
