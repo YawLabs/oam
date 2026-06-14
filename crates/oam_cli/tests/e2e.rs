@@ -5535,3 +5535,49 @@ fn submodule_imports_resolve() {
         );
     }
 }
+
+#[test]
+fn fs_promises_open_file_handle() {
+    let stdout = run_ok(
+        "fsp_open.mjs",
+        "import fsp from 'node:fs/promises';\n\
+         import fs from 'node:fs';\n\
+         import path from 'node:path';\n\
+         import os from 'node:os';\n\
+         \n\
+         const dir = await fsp.mkdtemp('oam-fh-');\n\
+         const filePath = path.join(dir, 'test.txt');\n\
+         \n\
+         // Open for write\n\
+         const wh = await fsp.open(filePath, 'w');\n\
+         await wh.writeFile('hello filehandle');\n\
+         await wh.close();\n\
+         \n\
+         // Open for read, use readFile\n\
+         const rh = await fsp.open(filePath, 'r');\n\
+         const content = await rh.readFile({ encoding: 'utf8' });\n\
+         console.log('readFile:', content === 'hello filehandle');\n\
+         \n\
+         // stat\n\
+         const s = await rh.stat();\n\
+         console.log('stat:', s.isFile());\n\
+         console.log('size:', s.size === 16);\n\
+         await rh.close();\n\
+         \n\
+         // write with buffer\n\
+         const wh2 = await fsp.open(filePath, 'w');\n\
+         const result = await wh2.write(Buffer.from('abc'));\n\
+         console.log('write_bytes:', result.bytesWritten === 3);\n\
+         await wh2.close();\n\
+         \n\
+         // cleanup\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n\
+         console.log('done:', true);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}

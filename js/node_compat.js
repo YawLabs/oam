@@ -2039,6 +2039,67 @@
       link: (existing, newPath) => natives.fsLink(String(existing), String(newPath)),
       chmod: (path, mode) => natives.fsChmod(String(path), mode),
       truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
+      open: async function (path, flags, mode) {
+        flags = flags || "r";
+        var info = await natives.fsOpen(String(path), String(flags));
+        var h = info.handle;
+        var closed = false;
+        var fh = {
+          fd: h,
+          readFile: async function (options) {
+            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
+            var chunks = [];
+            while (true) {
+              var chunk = await natives.fsReadChunk(h, 65536);
+              if (chunk === undefined) break;
+              chunks.push(chunk);
+            }
+            if (chunks.length === 0) return enc ? "" : globalThis.Buffer.alloc(0);
+            var total = 0;
+            for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+            var buf = globalThis.Buffer.alloc(total);
+            var off = 0;
+            for (var i = 0; i < chunks.length; i++) {
+              buf.set(chunks[i], off);
+              off += chunks[i].length;
+            }
+            return enc ? buf.toString(enc) : buf;
+          },
+          writeFile: async function (data, options) {
+            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : "utf8");
+            if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
+            await natives.fsWriteChunk(h, data);
+          },
+          write: async function (buffer, offset, length, position) {
+            if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
+            var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
+            await natives.fsWriteChunk(h, slice);
+            return { bytesWritten: slice.length, buffer: buffer };
+          },
+          read: async function (buffer, offset, length, position) {
+            var chunk = await natives.fsReadChunk(h, length || 65536);
+            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
+            if (buffer) {
+              var dest = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
+              dest.set(chunk);
+            }
+            return { bytesRead: chunk.length, buffer: buffer || globalThis.Buffer.from(chunk) };
+          },
+          stat: async function () {
+            return wrapStat(await natives.fsStat(String(path), false));
+          },
+          close: async function () {
+            if (!closed) {
+              closed = true;
+              await Promise.resolve(natives.fsClose(h)).catch(function () {});
+            }
+          },
+          [Symbol.asyncDispose]: async function () {
+            await fh.close();
+          },
+        };
+        return fh;
+      },
     };
   };
 
