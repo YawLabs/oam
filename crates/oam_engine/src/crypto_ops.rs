@@ -877,3 +877,291 @@ fn gcm_decrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String>
         _ => Err("invalid key length for AES-GCM".into()),
     }
 }
+
+// ===================================================== asymmetric sign/verify
+// Wave 3: RSA (PKCS#1 v1.5, PSS) and ECDSA (P-256, P-384) via ring.
+
+use ring::signature as ring_sig;
+
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64::engine::general_purpose::STANDARD
+        .decode(&body)
+        .map_err(|e| format!("PEM base64 decode: {e}"))
+}
+
+fn pem_label(pem: &str) -> &str {
+    for line in pem.lines() {
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            if let Some(label) = rest.strip_suffix("-----") {
+                return label.trim();
+            }
+        }
+    }
+    ""
+}
+
+fn resolve_sign_algorithm(
+    algo: &str,
+) -> Result<&'static dyn ring_sig::RsaEncoding, String> {
+    match algo {
+        "sha256" | "rsasha256" => Ok(&ring_sig::RSA_PKCS1_SHA256),
+        "sha384" | "rsasha384" => Ok(&ring_sig::RSA_PKCS1_SHA384),
+        "sha512" | "rsasha512" => Ok(&ring_sig::RSA_PKCS1_SHA512),
+        _ => Err(format!("unsupported RSA signing algorithm: '{algo}'")),
+    }
+}
+
+fn resolve_verify_algorithm(
+    algo: &str,
+    key_bits: usize,
+) -> Result<&'static ring_sig::RsaParameters, String> {
+    let _ = key_bits;
+    match algo {
+        "sha256" | "rsasha256" => Ok(&ring_sig::RSA_PKCS1_2048_8192_SHA256),
+        "sha384" | "rsasha384" => Ok(&ring_sig::RSA_PKCS1_2048_8192_SHA384),
+        "sha512" | "rsasha512" => Ok(&ring_sig::RSA_PKCS1_2048_8192_SHA512),
+        _ => Err(format!("unsupported RSA verify algorithm: '{algo}'")),
+    }
+}
+
+fn extract_spki_pubkey(der: &[u8]) -> Result<Vec<u8>, String> {
+    if der.len() < 4 {
+        return Err("SPKI DER too short".into());
+    }
+    let (_, seq_body) = parse_asn1_element(der)?;
+    let (rest, _algo_seq) = parse_asn1_element(seq_body)?;
+    let (_, bit_string_body) = parse_asn1_element(rest)?;
+    if bit_string_body.is_empty() {
+        return Err("empty BIT STRING in SPKI".into());
+    }
+    Ok(bit_string_body[1..].to_vec())
+}
+
+fn parse_asn1_element(data: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    if data.len() < 2 {
+        return Err("ASN.1: truncated".into());
+    }
+    let _tag = data[0];
+    let (len, header_size) = if data[1] & 0x80 == 0 {
+        (data[1] as usize, 2)
+    } else {
+        let num_bytes = (data[1] & 0x7f) as usize;
+        if data.len() < 2 + num_bytes {
+            return Err("ASN.1: truncated length".into());
+        }
+        let mut len: usize = 0;
+        for i in 0..num_bytes {
+            len = (len << 8) | data[2 + i] as usize;
+        }
+        (len, 2 + num_bytes)
+    };
+    if data.len() < header_size + len {
+        return Err("ASN.1: truncated body".into());
+    }
+    let body = &data[header_size..header_size + len];
+    let rest = &data[header_size + len..];
+    Ok((rest, body))
+}
+
+fn crypto_sign_rsa(algo: &str, data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let key_pair = match label {
+        "RSA PRIVATE KEY" => ring_sig::RsaKeyPair::from_der(&der),
+        "PRIVATE KEY" => ring_sig::RsaKeyPair::from_pkcs8(&der),
+        _ => return Err(format!("unsupported PEM label: '{label}'")),
+    }
+    .map_err(|e| format!("RSA key parse: {e}"))?;
+    let encoding = resolve_sign_algorithm(algo)?;
+    let rng = ring::rand::SystemRandom::new();
+    let mut signature = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(encoding, &rng, data, &mut signature)
+        .map_err(|e| format!("RSA sign: {e}"))?;
+    Ok(signature)
+}
+
+fn crypto_verify_rsa(
+    algo: &str,
+    data: &[u8],
+    key_pem: &str,
+    signature: &[u8],
+) -> Result<bool, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let params = resolve_verify_algorithm(algo, 0)?;
+    let pub_key_bytes = match label {
+        "PUBLIC KEY" => extract_spki_pubkey(&der)?,
+        "RSA PUBLIC KEY" => der,
+        _ => return Err(format!("unsupported public key PEM label: '{label}'")),
+    };
+    let pub_key = ring_sig::UnparsedPublicKey::new(params, &pub_key_bytes);
+    match pub_key.verify(data, signature) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+fn crypto_sign_ec(algo: &str, data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    if label != "PRIVATE KEY" && label != "EC PRIVATE KEY" {
+        return Err(format!("unsupported EC PEM label: '{label}'"));
+    }
+    let signing_alg: &ring_sig::EcdsaSigningAlgorithm = match algo {
+        "sha256" | "ecdsasha256" | "p256" => {
+            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING
+        }
+        "sha384" | "ecdsasha384" | "p384" => {
+            &ring_sig::ECDSA_P384_SHA384_FIXED_SIGNING
+        }
+        _ => return Err(format!("unsupported ECDSA algorithm: '{algo}'")),
+    };
+    let rng = ring::rand::SystemRandom::new();
+    let key_pair = if label == "PRIVATE KEY" {
+        ring_sig::EcdsaKeyPair::from_pkcs8(signing_alg, &der, &rng)
+    } else {
+        return Err("SEC1 EC private key format not supported; use PKCS#8".into());
+    }
+    .map_err(|e| format!("EC key parse: {e}"))?;
+    let sig = key_pair
+        .sign(&rng, data)
+        .map_err(|e| format!("ECDSA sign: {e}"))?;
+    Ok(sig.as_ref().to_vec())
+}
+
+fn crypto_verify_ec(
+    algo: &str,
+    data: &[u8],
+    key_pem: &str,
+    signature: &[u8],
+) -> Result<bool, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let verify_alg: &ring_sig::EcdsaVerificationAlgorithm = match algo {
+        "sha256" | "ecdsasha256" | "p256" => {
+            &ring_sig::ECDSA_P256_SHA256_FIXED
+        }
+        "sha384" | "ecdsasha384" | "p384" => {
+            &ring_sig::ECDSA_P384_SHA384_FIXED
+        }
+        _ => return Err(format!("unsupported ECDSA verify algorithm: '{algo}'")),
+    };
+    if label != "PUBLIC KEY" {
+        return Err(format!("unsupported EC public key PEM label: '{label}'"));
+    }
+    let spki_pub = extract_spki_pubkey(&der)?;
+    let pub_key = ring_sig::UnparsedPublicKey::new(verify_alg, &spki_pub);
+    match pub_key.verify(data, signature) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+fn crypto_sign_ed25519(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(&der)
+        .map_err(|e| format!("Ed25519 key parse: {e}"))?;
+    Ok(key_pair.sign(data).as_ref().to_vec())
+}
+
+fn crypto_verify_ed25519(
+    data: &[u8],
+    key_pem: &str,
+    signature: &[u8],
+) -> Result<bool, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    if label != "PUBLIC KEY" {
+        return Err(format!("unsupported Ed25519 public key PEM: '{label}'"));
+    }
+    let pub_bytes = extract_spki_pubkey(&der)?;
+    let pub_key =
+        ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, &pub_bytes);
+    match pub_key.verify(data, signature) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+pub(crate) fn op_crypto_sign(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(algo) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "sign: algorithm required");
+        return;
+    };
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "sign: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "sign: key required");
+        return;
+    };
+    let Some(key_type) = crate::node_ops::arg_string(scope, &args, 3) else {
+        crate::node_ops::throw_type_error(scope, "sign: key type required");
+        return;
+    };
+    let normalized = normalize_algorithm(&algo);
+    let result = match key_type.as_str() {
+        "rsa" => crypto_sign_rsa(&normalized, &data, &key_pem),
+        "ec" => crypto_sign_ec(&normalized, &data, &key_pem),
+        "ed25519" => crypto_sign_ed25519(&data, &key_pem),
+        _ => Err(format!("unsupported key type: '{key_type}'")),
+    };
+    match result {
+        Ok(sig) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, sig) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_verify(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(algo) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "verify: algorithm required");
+        return;
+    };
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "verify: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "verify: key required");
+        return;
+    };
+    let Some(signature) = crate::node_ops::arg_bytes(scope, &args, 3) else {
+        crate::node_ops::throw_type_error(scope, "verify: signature required");
+        return;
+    };
+    let Some(key_type) = crate::node_ops::arg_string(scope, &args, 4) else {
+        crate::node_ops::throw_type_error(scope, "verify: key type required");
+        return;
+    };
+    let normalized = normalize_algorithm(&algo);
+    let result = match key_type.as_str() {
+        "rsa" => crypto_verify_rsa(&normalized, &data, &key_pem, &signature),
+        "ec" => crypto_verify_ec(&normalized, &data, &key_pem, &signature),
+        "ed25519" => crypto_verify_ed25519(&data, &key_pem, &signature),
+        _ => Err(format!("unsupported key type: '{key_type}'")),
+    };
+    match result {
+        Ok(valid) => rv.set_bool(valid),
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}

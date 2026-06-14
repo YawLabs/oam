@@ -55,6 +55,11 @@ cipher = "0.4"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 hkdf = "0.12"
+# node:crypto wave 3: asymmetric sign/verify (RSA, ECDSA, Ed25519).
+# ring is already compiled as a transitive dep via rustls; promoting it
+# to a direct dep adds zero new compilation units.
+ring = "0.17"
+base64 = "0.22"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

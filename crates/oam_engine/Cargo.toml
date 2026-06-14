@@ -32,6 +32,9 @@ cipher = { workspace = true }
 pbkdf2 = { workspace = true }
 scrypt = { workspace = true }
 hkdf = { workspace = true }
+# node:crypto wave 3: asymmetric sign/verify.
+ring = { workspace = true }
+base64 = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.

@@ -2500,6 +2500,18 @@
           );
         }
       },
+      cpuUsage: (prev) => {
+        var usage = natives.processCpuUsage();
+        if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
+        return usage;
+      },
+      kill: (pid, signal) => {
+        var sigMap = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1, SIGUSR1: 10, SIGUSR2: 12, SIGPIPE: 13 };
+        var sig = typeof signal === "string" ? (sigMap[signal] || 15) : (signal !== undefined ? signal : 15);
+        if (sig === 0) { natives.processKill(pid, 0); return true; }
+        natives.processKill(pid, sig);
+        return true;
+      },
       umask: () => 0,
       release: { name: "node" },
       config: { variables: {} },
@@ -4083,11 +4095,149 @@
       return new KeyObject("secret", new Uint8Array(material));
     }
 
-    function asymmetricUnsupported() {
-      throw makeNodeError(
-        "ERR_CRYPTO_UNSUPPORTED_OPERATION",
-        "asymmetric keys (RSA/EC) land with a later crypto wave â€” HS* (HMAC) algorithms work today",
-      );
+    function detectKeyType(pem) {
+      if (typeof pem !== "string") return "unknown";
+      if (pem.includes("EC PRIVATE") || pem.includes("EC PUBLIC")) return "ec";
+      if (pem.includes("ED25519") || pem.includes("ed25519")) return "ed25519";
+      if (pem.includes("RSA PRIVATE") || pem.includes("RSA PUBLIC")) return "rsa";
+      if (pem.includes("BEGIN PRIVATE KEY") || pem.includes("BEGIN PUBLIC KEY")) return "rsa";
+      return "rsa";
+    }
+
+    function createPrivateKey(input) {
+      var pem;
+      if (typeof input === "string") {
+        pem = input;
+      } else if (input && typeof input === "object") {
+        if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
+          pem = new TextDecoder().decode(input.key);
+        } else {
+          pem = String(input.key);
+        }
+      } else {
+        throw new TypeError("createPrivateKey: input must be a string or object");
+      }
+      var ko = new KeyObject("private", null);
+      ko._pem = pem;
+      ko._keyType = detectKeyType(pem);
+      ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
+      ko.asymmetricKeySize = undefined;
+      ko.export = function(options) {
+        if (!options || options.type === "pkcs8" || options.format === "pem") return pem;
+        return BufferCtor.from(pem);
+      };
+      return ko;
+    }
+
+    function createPublicKey(input) {
+      var pem;
+      if (typeof input === "string") {
+        pem = input;
+      } else if (input && typeof input === "object") {
+        if (input instanceof KeyObject && input.type === "private") {
+          throw new TypeError("createPublicKey from private KeyObject not yet supported -- pass PEM string");
+        }
+        if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
+          pem = new TextDecoder().decode(input.key);
+        } else {
+          pem = String(input.key);
+        }
+      } else {
+        throw new TypeError("createPublicKey: input must be a string or object");
+      }
+      var ko = new KeyObject("public", null);
+      ko._pem = pem;
+      ko._keyType = detectKeyType(pem);
+      ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
+      ko.asymmetricKeySize = undefined;
+      ko.export = function(options) {
+        if (!options || options.type === "spki" || options.format === "pem") return pem;
+        return BufferCtor.from(pem);
+      };
+      return ko;
+    }
+
+    class Sign {
+      constructor(algorithm) {
+        this._algorithm = algorithm;
+        this._data = [];
+      }
+      update(data, inputEncoding) {
+        this._data.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      sign(key, outputEncoding) {
+        var pem, keyType;
+        if (key instanceof KeyObject) {
+          pem = key._pem || new TextDecoder().decode(key._material);
+          keyType = key._keyType || "rsa";
+        } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
+          pem = typeof key.key === "string" ? key.key : new TextDecoder().decode(key.key);
+          keyType = detectKeyType(pem);
+        } else {
+          pem = typeof key === "string" ? key : new TextDecoder().decode(key);
+          keyType = detectKeyType(pem);
+        }
+        var total = 0;
+        for (var i = 0; i < this._data.length; i++) total += this._data[i].length;
+        var merged = new Uint8Array(total);
+        var off = 0;
+        for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
+        var sig = asBuffer(natives.cryptoSign(this._algorithm, merged, pem, keyType));
+        return outputEncoding ? sig.toString(outputEncoding) : sig;
+      }
+    }
+
+    class Verify {
+      constructor(algorithm) {
+        this._algorithm = algorithm;
+        this._data = [];
+      }
+      update(data, inputEncoding) {
+        this._data.push(toBytes(data, inputEncoding));
+        return this;
+      }
+      verify(key, signature, signatureEncoding) {
+        var pem, keyType;
+        if (key instanceof KeyObject) {
+          pem = key._pem || new TextDecoder().decode(key._material);
+          keyType = key._keyType || "rsa";
+        } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
+          pem = typeof key.key === "string" ? key.key : new TextDecoder().decode(key.key);
+          keyType = detectKeyType(pem);
+        } else {
+          pem = typeof key === "string" ? key : new TextDecoder().decode(key);
+          keyType = detectKeyType(pem);
+        }
+        var total = 0;
+        for (var i = 0; i < this._data.length; i++) total += this._data[i].length;
+        var merged = new Uint8Array(total);
+        var off = 0;
+        for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
+        var sigBuf = typeof signature === "string"
+          ? BufferCtor.from(signature, signatureEncoding || "base64")
+          : toBytes(signature);
+        return natives.cryptoVerify(this._algorithm, merged, pem, sigBuf, keyType);
+      }
+    }
+
+    function createSign(algorithm) { return new Sign(normalizeAlgo(algorithm)); }
+    function createVerify(algorithm) { return new Verify(normalizeAlgo(algorithm)); }
+
+    function normalizeAlgo(raw) {
+      var s = raw.toUpperCase();
+      if (s === "RSA-SHA256" || s === "SHA256WITHRSA") return "SHA256";
+      if (s === "RSA-SHA384" || s === "SHA384WITHRSA") return "SHA384";
+      if (s === "RSA-SHA512" || s === "SHA512WITHRSA") return "SHA512";
+      if (s === "RSA-SHA1" || s === "SHA1WITHRSA") return "SHA1";
+      return raw;
+    }
+
+    function signOneShot(algorithm, data, key) {
+      return createSign(algorithm).update(data).sign(key);
+    }
+    function verifyOneShot(algorithm, data, key, signature) {
+      return createVerify(algorithm).update(data).verify(key, signature);
     }
 
     const asBuffer = (bytes) =>
@@ -4399,8 +4549,14 @@
       getCiphers,
       KeyObject,
       createSecretKey,
-      createPrivateKey: asymmetricUnsupported,
-      createPublicKey: asymmetricUnsupported,
+      createPrivateKey,
+      createPublicKey,
+      createSign,
+      createVerify,
+      sign: signOneShot,
+      verify: verifyOneShot,
+      Sign,
+      Verify,
       createCipheriv,
       createDecipheriv,
       pbkdf2Sync,

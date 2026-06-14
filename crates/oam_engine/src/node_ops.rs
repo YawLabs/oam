@@ -13,7 +13,7 @@ use crate::crypto_ops::{
     op_crypto_cipher_set_auto_padding, op_crypto_cipher_update, op_crypto_hash_copy,
     op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update, op_crypto_hkdf_sync,
     op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_random_fill, op_crypto_scrypt_sync,
-    op_crypto_timing_safe_equal,
+    op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -210,6 +210,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             "cryptoCipherSetAutoPadding",
             op_crypto_cipher_set_auto_padding
         ),
+        // node:crypto wave 3: asymmetric sign/verify (RSA, ECDSA, Ed25519)
+        ("cryptoSign", op_crypto_sign),
+        ("cryptoVerify", op_crypto_verify),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -246,6 +249,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cpuSpeed", op_cpu_speed),
         // network interfaces
         ("networkInterfaces", op_network_interfaces),
+        // process.cpuUsage / process.kill
+        ("processCpuUsage", op_process_cpu_usage),
+        ("processKill", op_process_kill),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -3070,4 +3076,138 @@ fn parent_pid() -> u32 {
             s[after_comm + 2..].split_whitespace().nth(1)?.parse().ok()
         })
         .unwrap_or(0)
+}
+
+// ========================================================== process.cpuUsage
+
+fn op_process_cpu_usage(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let (user, system) = cpu_usage_us();
+    let json = format!("{{\"user\":{user},\"system\":{system}}}");
+    return_json(scope, &mut rv, &json);
+}
+
+#[cfg(windows)]
+fn cpu_usage_us() -> (u64, u64) {
+    #[repr(C)]
+    struct FILETIME {
+        lo: u32,
+        hi: u32,
+    }
+    impl FILETIME {
+        fn to_us(&self) -> u64 {
+            let ticks = (self.hi as u64) << 32 | self.lo as u64;
+            ticks / 10
+        }
+    }
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            h: isize,
+            creation: *mut FILETIME,
+            exit: *mut FILETIME,
+            kernel: *mut FILETIME,
+            user: *mut FILETIME,
+        ) -> i32;
+    }
+
+    let mut creation = FILETIME { lo: 0, hi: 0 };
+    let mut exit = FILETIME { lo: 0, hi: 0 };
+    let mut kernel = FILETIME { lo: 0, hi: 0 };
+    let mut user = FILETIME { lo: 0, hi: 0 };
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+    }
+    (user.to_us(), kernel.to_us())
+}
+
+#[cfg(not(windows))]
+fn cpu_usage_us() -> (u64, u64) {
+    #[repr(C)]
+    struct timeval {
+        tv_sec: i64,
+        tv_usec: i64,
+    }
+    #[repr(C)]
+    struct rusage {
+        ru_utime: timeval,
+        ru_stime: timeval,
+        _pad: [u8; 112],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut rusage) -> i32;
+    }
+    let mut usage = rusage {
+        ru_utime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        _pad: [0; 112],
+    };
+    unsafe { getrusage(0, &mut usage) };
+    let user = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
+    let system = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
+    (user, system)
+}
+
+// ========================================================== process.kill
+
+fn op_process_kill(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pid = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
+    let signal = args.get(1).number_value(scope).unwrap_or(15.0) as i32;
+    if let Err(msg) = kill_process(pid, signal) {
+        throw_type_error(scope, &msg);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    if signal == 0 {
+        let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+        if handle == 0 {
+            return Err(format!("kill: no such process {pid}"));
+        }
+        unsafe { CloseHandle(handle) };
+        return Ok(());
+    }
+    let handle = unsafe { OpenProcess(0x0001, 0, pid) };
+    if handle == 0 {
+        return Err(format!("kill: no such process {pid}"));
+    }
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return Err(format!("kill: could not terminate process {pid}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let ret = unsafe { kill(pid as i32, signal) };
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(format!("kill({pid}, {signal}): {errno}"));
+    }
+    Ok(())
 }
