@@ -60,7 +60,7 @@ bytes = "1"
 # V8 Inspector (CDP) transport: WebSocket framing for the debugger socket.
 # default-features=false drops the TLS backends — the inspector is
 # plaintext localhost only.
-tokio-tungstenite = { version = "0.24", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # N-API: dlopen for .node addons (and the test addon's host-symbol lookup).
 libloading = "0.8"

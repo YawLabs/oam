@@ -25,6 +25,8 @@ hmac = { workspace = true }
 getrandom = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
+# WebSocket ops: Message type for wsSend framing.
+tokio-tungstenite = { workspace = true }
 
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).

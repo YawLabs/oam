@@ -4468,6 +4468,73 @@ fn http_per_request_body_over_cap_413_strict() {
 /// delete, empty-query search, port setter, hostname setter no-op on ':',
 /// opaque-path setter, and urlToHttpOptions shape.
 #[test]
+fn websocket_echo_round_trip() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let stream = tokio::net::TcpStream::from_std(stream).unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            while let Some(Ok(msg)) = ws.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        ws.send(Message::Text(text)).await.ok();
+                    }
+                    Message::Binary(data) => {
+                        ws.send(Message::Binary(data)).await.ok();
+                    }
+                    Message::Close(frame) => {
+                        ws.send(Message::Close(frame)).await.ok();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+
+    let source = format!(
+        r#"
+const ws = new WebSocket("ws://127.0.0.1:{port}");
+const msgs = [];
+ws.addEventListener("open", () => {{
+  ws.send("hello");
+  ws.send("world");
+}});
+ws.addEventListener("message", (ev) => {{
+  msgs.push(ev.data);
+  if (msgs.length === 2) {{
+    console.log(msgs.join(","));
+    ws.close();
+  }}
+}});
+ws.addEventListener("close", (ev) => {{
+  console.log("closed", ev.code, ev.wasClean);
+}});
+"#,
+        port = addr.port(),
+    );
+    let stdout = run_ok("websocket_echo.mjs", &source);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "hello,world", "echoed messages");
+    assert!(
+        lines[1].starts_with("closed 1000"),
+        "clean close: {}",
+        lines[1]
+    );
+}
+
+#[test]
 fn url_parity_portable() {
     let stdout = run_ok(
         "url_parity_portable.mjs",

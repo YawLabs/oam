@@ -19,6 +19,7 @@ pub use oam_diagnostics as diagnostics;
 
 pub mod http_server;
 pub mod inspector;
+pub mod websocket;
 
 pub type OpId = u64;
 
@@ -107,6 +108,7 @@ pub struct CoreRuntime {
     files: FileRegistry,
     zlib_streams: ZlibRegistry,
     http_state: std::sync::Arc<http_server::HttpState>,
+    ws: websocket::WsRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -140,6 +142,7 @@ impl CoreRuntime {
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
+            ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -174,6 +177,11 @@ impl CoreRuntime {
     /// HTTP server state (Arc clone; servers die with the run).
     pub fn http(&self) -> std::sync::Arc<http_server::HttpState> {
         self.http_state.clone()
+    }
+
+    /// WebSocket connection registry (Arc clone; dies with the run).
+    pub fn ws(&self) -> websocket::WsRegistry {
+        self.ws.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /

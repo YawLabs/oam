@@ -48,7 +48,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 3] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 8] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         (
             "fetchBodyRead",
@@ -58,6 +58,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             "fetchBodyCancel",
             v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
         ),
+        (
+            "wsConnect",
+            v8::Function::new(scope, op_ws_connect).unwrap(),
+        ),
+        ("wsSend", v8::Function::new(scope, op_ws_send).unwrap()),
+        ("wsRecv", v8::Function::new(scope, op_ws_recv).unwrap()),
+        ("wsClose", v8::Function::new(scope, op_ws_close).unwrap()),
+        ("wsDrop", v8::Function::new(scope, op_ws_drop).unwrap()),
     ];
     for (name, function) in internal_bindings {
         let key = v8::String::new(scope, name).unwrap();
@@ -232,6 +240,167 @@ fn op_fetch_body_cancel(
         .expect("core runtime installed")
         .bodies();
     bodies.lock().expect("body registry lock").remove(&handle);
+}
+
+fn op_ws_connect(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(wire) = args.get(0).to_string(scope) else {
+        let message = v8::String::new(scope, "wsConnect requires a JSON payload").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let wire = wire.to_rust_string_lossy(scope);
+    let parsed: serde_json::Value = match serde_json::from_str(&wire) {
+        Ok(v) => v,
+        Err(e) => {
+            let message =
+                v8::String::new(scope, &format!("wsConnect: malformed payload: {e}")).unwrap();
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+            return;
+        }
+    };
+    let url = parsed["url"].as_str().unwrap_or("").to_string();
+    let protocols: Vec<String> = parsed["protocols"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    {
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+        if let Err(msg) = scope
+            .get_slot::<crate::permissions::Permissions>()
+            .cloned()
+            .unwrap_or_default()
+            .check_net(&host)
+        {
+            let msg_v8 = v8::String::new(scope, &msg)
+                .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
+            let exception = v8::Exception::error(scope, msg_v8);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+                let key = v8::String::new(scope, "code").unwrap();
+                if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
+                    obj.set(scope, key.into(), code.into());
+                }
+            }
+            scope.throw_exception(exception);
+            return;
+        }
+    }
+    let core = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed");
+    let registry = core.ws();
+    let ids = core.body_ids();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::websocket::ws_connect(registry, ids, url, protocols),
+    );
+}
+
+fn op_ws_send(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let is_binary = args.get(2).boolean_value(scope);
+    let message = if is_binary {
+        if let Ok(ab) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(1)) {
+            let len = ab.byte_length();
+            let mut buf = vec![0u8; len];
+            ab.copy_contents(&mut buf);
+            tokio_tungstenite::tungstenite::Message::Binary(buf)
+        } else {
+            let text = args
+                .get(1)
+                .to_string(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .unwrap_or_default();
+            tokio_tungstenite::tungstenite::Message::Binary(text.into_bytes())
+        }
+    } else {
+        let text = args
+            .get(1)
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        tokio_tungstenite::tungstenite::Message::Text(text)
+    };
+    let registry = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .ws();
+    if let Err(msg) = oam_core::websocket::ws_send_sync(&registry, handle, message) {
+        let msg_v8 = v8::String::new(scope, &msg).unwrap();
+        let exception = v8::Exception::error(scope, msg_v8);
+        scope.throw_exception(exception);
+    }
+}
+
+fn op_ws_recv(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let registry = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .ws();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::websocket::ws_recv(registry, handle),
+    );
+}
+
+fn op_ws_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let code = args.get(1).number_value(scope).unwrap_or(1000.0) as u16;
+    let reason = args
+        .get(2)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+    let registry = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .ws();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::websocket::ws_close(registry, handle, code, reason),
+    );
+}
+
+fn op_ws_drop(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let registry = scope
+        .get_slot::<CoreRuntime>()
+        .expect("core runtime installed")
+        .ws();
+    oam_core::websocket::ws_drop(&registry, handle);
 }
 
 /// Settle one completed op against its parked resolver. Runs on the isolate

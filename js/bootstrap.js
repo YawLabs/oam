@@ -749,4 +749,173 @@
   // Attached to the oam namespace post-restore (ops.rs installs `oam`
   // before this runs at runtime? No — snapshot time. Lazy attach instead).
   globalThis.__oamServe = serve;
+
+  // ------------------------------------------------------------ CloseEvent
+  if (typeof globalThis.CloseEvent !== "function") {
+    class CloseEvent extends Event {
+      constructor(type, init) {
+        super(type, init);
+        this.code = (init && init.code) || 0;
+        this.reason = (init && init.reason) || "";
+        this.wasClean = (init && init.wasClean) === true;
+      }
+    }
+    globalThis.CloseEvent = CloseEvent;
+  }
+
+  // ------------------------------------------------------------ WebSocket
+  const CONNECTING = 0;
+  const OPEN = 1;
+  const CLOSING = 2;
+  const CLOSED = 3;
+
+  class WebSocket extends EventTarget {
+    static get CONNECTING() { return CONNECTING; }
+    static get OPEN() { return OPEN; }
+    static get CLOSING() { return CLOSING; }
+    static get CLOSED() { return CLOSED; }
+
+    constructor(url, protocols) {
+      super();
+      if (arguments.length === 0) throw new TypeError("WebSocket requires a url argument");
+      const parsed = new URL(url);
+      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+        throw new DOMException(
+          "WebSocket url must use ws: or wss: scheme",
+          "SyntaxError",
+        );
+      }
+      this._url = parsed.href;
+      this._readyState = CONNECTING;
+      this._protocol = "";
+      this._extensions = "";
+      this._binaryType = "blob";
+      this._handle = null;
+      this._bufferedAmount = 0;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onclose = null;
+      this.onerror = null;
+
+      const protoList = typeof protocols === "string" ? [protocols]
+        : Array.isArray(protocols) ? protocols : [];
+
+      const wire = JSON.stringify({ url: this._url, protocols: protoList });
+      globalThis.__oam.wsConnect(wire).then(
+        (result) => {
+          this._handle = result.handle;
+          this._protocol = result.protocol || "";
+          this._extensions = result.extensions || "";
+          this._readyState = OPEN;
+          const ev = new Event("open");
+          if (typeof this.onopen === "function") this.onopen(ev);
+          this.dispatchEvent(ev);
+          this._recvLoop();
+        },
+        (err) => {
+          this._readyState = CLOSED;
+          const ev = new Event("error");
+          if (typeof this.onerror === "function") this.onerror(ev);
+          this.dispatchEvent(ev);
+          this._fireClose(1006, "", false);
+        },
+      );
+    }
+
+    get url() { return this._url; }
+    get readyState() { return this._readyState; }
+    get protocol() { return this._protocol; }
+    get extensions() { return this._extensions; }
+    get bufferedAmount() { return this._bufferedAmount; }
+    get binaryType() { return this._binaryType; }
+    set binaryType(v) {
+      if (v === "blob" || v === "arraybuffer") this._binaryType = v;
+    }
+
+    get CONNECTING() { return CONNECTING; }
+    get OPEN() { return OPEN; }
+    get CLOSING() { return CLOSING; }
+    get CLOSED() { return CLOSED; }
+
+    send(data) {
+      if (this._readyState === CONNECTING) {
+        throw new DOMException(
+          "WebSocket is not open: readyState 0 (CONNECTING)",
+          "InvalidStateError",
+        );
+      }
+      if (this._readyState !== OPEN) return;
+      let isBinary = false;
+      if (typeof data !== "string") {
+        isBinary = true;
+        if (ArrayBuffer.isView(data)) {
+          data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } else if (data instanceof ArrayBuffer) {
+          data = new Uint8Array(data);
+        }
+      }
+      globalThis.__oam.wsSend(this._handle, data, isBinary);
+    }
+
+    close(code, reason) {
+      if (this._readyState === CLOSING || this._readyState === CLOSED) return;
+      if (code !== undefined) {
+        if (code !== 1000 && (code < 3000 || code > 4999)) {
+          throw new DOMException(
+            "Invalid close code: " + code,
+            "InvalidAccessError",
+          );
+        }
+      }
+      this._readyState = CLOSING;
+      globalThis.__oam.wsClose(
+        this._handle,
+        code === undefined ? 1000 : code,
+        reason || "",
+      );
+    }
+
+    async _recvLoop() {
+      while (this._readyState === OPEN || this._readyState === CLOSING) {
+        let frame;
+        try {
+          frame = await globalThis.__oam.wsRecv(this._handle);
+        } catch {
+          break;
+        }
+        if (frame === undefined) break;
+
+        if (frame instanceof Uint8Array) {
+          const data = this._binaryType === "arraybuffer"
+            ? frame.buffer : frame;
+          const ev = new MessageEvent("message", { data });
+          if (typeof this.onmessage === "function") this.onmessage(ev);
+          this.dispatchEvent(ev);
+        } else if (frame.type === "text") {
+          const ev = new MessageEvent("message", { data: frame.data });
+          if (typeof this.onmessage === "function") this.onmessage(ev);
+          this.dispatchEvent(ev);
+        } else if (frame.type === "close") {
+          this._fireClose(frame.code, frame.reason, true);
+          break;
+        }
+      }
+      if (this._handle !== null) {
+        globalThis.__oam.wsDrop(this._handle);
+        this._handle = null;
+      }
+      if (this._readyState !== CLOSED) {
+        const wasClean = this._readyState === CLOSING;
+        this._fireClose(wasClean ? 1000 : 1006, "", wasClean);
+      }
+    }
+
+    _fireClose(code, reason, wasClean) {
+      this._readyState = CLOSED;
+      const ev = new CloseEvent("close", { code, reason, wasClean });
+      if (typeof this.onclose === "function") this.onclose(ev);
+      this.dispatchEvent(ev);
+    }
+  }
+  globalThis.WebSocket = WebSocket;
 })();
