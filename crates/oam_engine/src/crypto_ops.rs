@@ -351,10 +351,7 @@ pub(crate) fn op_crypto_scrypt_sync(
     let params = match scrypt::Params::new(log_n, r, p, keylen) {
         Ok(params) => params,
         Err(e) => {
-            crate::node_ops::throw_type_error(
-                scope,
-                &format!("scrypt: invalid parameters: {e}"),
-            );
+            crate::node_ops::throw_type_error(scope, &format!("scrypt: invalid parameters: {e}"));
             return;
         }
     };
@@ -392,7 +389,11 @@ pub(crate) fn op_crypto_hkdf_sync(
     let keylen = args.get(4).number_value(scope).unwrap_or(0.0) as usize;
 
     let normalized = normalize_algorithm(&digest);
-    let salt_opt = if salt.is_empty() { None } else { Some(&salt[..]) };
+    let salt_opt = if salt.is_empty() {
+        None
+    } else {
+        Some(&salt[..])
+    };
     macro_rules! hkdf_expand {
         ($hash:ty) => {{
             let hk = hkdf::Hkdf::<$hash>::new(salt_opt, &ikm);
@@ -482,7 +483,6 @@ impl CipherMode {
             Self::Aes128Gcm | Self::Aes256Gcm => 12,
         }
     }
-
 }
 
 pub(crate) fn op_crypto_cipher_create(
@@ -710,7 +710,7 @@ fn cipher_decrypt(instance: CipherInstance) -> Result<Vec<u8>, String> {
 
 fn cbc_encrypt(c: &CipherInstance) -> Result<Vec<u8>, String> {
     let data = &c.buffer;
-    if !c.auto_padding && data.len() % 16 != 0 {
+    if !c.auto_padding && !data.len().is_multiple_of(16) {
         return Err(format!(
             "data length {} not a multiple of block size 16 (autoPadding is off)",
             data.len()
@@ -739,7 +739,7 @@ fn cbc_encrypt(c: &CipherInstance) -> Result<Vec<u8>, String> {
 
 fn cbc_decrypt(c: &CipherInstance) -> Result<Vec<u8>, String> {
     let data = &c.buffer;
-    if data.len() % 16 != 0 {
+    if !data.len().is_multiple_of(16) {
         return Err(format!(
             "ciphertext length {} not a multiple of block size 16",
             data.len()
@@ -807,15 +807,13 @@ pub(crate) fn op_crypto_cipher_final_gcm(
     };
     match result {
         Ok((data, tag)) => {
-            if instance.encrypt {
-                if let Some(tag) = tag {
-                    instance.auth_tag = Some(tag);
-                    scope
-                        .get_slot_mut::<CryptoState>()
-                        .expect("crypto state installed")
-                        .ciphers
-                        .insert(id, instance);
-                }
+            if instance.encrypt && let Some(tag) = tag {
+                instance.auth_tag = Some(tag);
+                scope
+                    .get_slot_mut::<CryptoState>()
+                    .expect("crypto state installed")
+                    .ciphers
+                    .insert(id, instance);
             }
             if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, data) {
                 rv.set(value);
@@ -834,10 +832,10 @@ fn gcm_encrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String>
     };
     macro_rules! do_gcm_enc {
         ($gcm:ty) => {{
-            let cipher =
-                <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
-            let mut ct =
-                cipher.encrypt(nonce, payload).map_err(|e| format!("gcm encrypt: {e}"))?;
+            let cipher = <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
+            let mut ct = cipher
+                .encrypt(nonce, payload)
+                .map_err(|e| format!("gcm encrypt: {e}"))?;
             let tag = ct.split_off(ct.len() - 16);
             Ok((ct, Some(tag)))
         }};
@@ -864,8 +862,7 @@ fn gcm_decrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String>
     };
     macro_rules! do_gcm_dec {
         ($gcm:ty) => {{
-            let cipher =
-                <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
+            let cipher = <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
             let pt = cipher
                 .decrypt(nonce, payload)
                 .map_err(|_| "gcm decrypt: authentication failed".to_string())?;

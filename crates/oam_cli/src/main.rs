@@ -90,6 +90,25 @@ enum Command {
     /// Serve oam's introspection to coding agents over MCP (stdio transport).
     /// Register with e.g.: claude mcp add oam -- oam mcp
     Mcp,
+    /// Start a server from a JS/TS entry file. Equivalent to `oam run`
+    /// with `PORT` and `HOST` env vars set from `--port` / `--host`.
+    Serve {
+        file: PathBuf,
+        /// Port to listen on (sets the PORT env var; default 3000).
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+        /// Bind address (sets the HOST env var; default 0.0.0.0).
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// Attach the V8 Inspector (Chrome DevTools Protocol). Optional
+        /// value is `[host:]port` (default 127.0.0.1:9229).
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        inspect: Option<String>,
+        /// Like --inspect, but wait for a debugger to attach and break on the
+        /// first line. Optional value is `[host:]port`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        inspect_brk: Option<String>,
+    },
     /// Internal: type-check daemon server process. Not for direct use.
     #[command(name = "__oamd-ts", hide = true)]
     DaemonServe { tsconfig: PathBuf },
@@ -160,6 +179,27 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Serve {
+            file,
+            port,
+            host,
+            inspect,
+            inspect_brk,
+        } => {
+            // Safety: single-threaded at this point (before JsRuntime::new).
+            unsafe {
+                std::env::set_var("PORT", port.to_string());
+                std::env::set_var("HOST", host);
+            }
+            let inspect = match resolve_inspect(inspect.as_deref(), inspect_brk.as_deref()) {
+                Ok(value) => value,
+                Err(message) => {
+                    eprintln!("oam serve: {message}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
+        }
         Command::DaemonServe { tsconfig } => match oam_ts::daemon::serve(tsconfig) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

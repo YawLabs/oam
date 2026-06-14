@@ -4842,3 +4842,112 @@ fn url_parity_portable() {
         "urlToHttpOptions: port/auth absent for plain URL"
     );
 }
+
+#[test]
+fn oam_ai_sse_parser_and_stream_chat() {
+    let addr = spawn_echo_server();
+    let file = write_temp(
+        "ai_sse.mjs",
+        &format!(
+            r#"import {{ parseSSEStream, streamChat, openai, anthropic, defaultExtractDelta }} from 'oam:ai';
+
+// 1. parseSSEStream: parse raw SSE bytes from the /stream endpoint
+const resp = await fetch('http://{addr}/stream');
+const events = [];
+for await (const ev of parseSSEStream(resp.body)) {{
+  events.push(ev);
+}}
+// /stream sends: data: tok1, data: tok2, data: [DONE]
+console.log('events=' + events.length);
+console.log('e0=' + events[0].data);
+console.log('e1=' + events[1].data);
+console.log('e2=' + events[2].data);
+
+// 2. streamChat: wraps fetch+SSE, yields deltas, stops on [DONE]
+const chunks = [];
+for await (const chunk of streamChat({{
+  url: 'http://{addr}/stream',
+  headers: {{}},
+  body: {{}},
+}})) {{
+  chunks.push(chunk);
+}}
+// defaultExtractDelta: tok1/tok2 are not valid JSON, so they get skipped.
+// [DONE] triggers return. Should yield 0 chunks (non-JSON data lines).
+console.log('chunks=' + chunks.length);
+
+// 3. Exports exist
+console.log('openai=' + typeof openai);
+console.log('anthropic=' + typeof anthropic);
+console.log('defaultExtractDelta=' + typeof defaultExtractDelta);
+"#,
+            addr = addr,
+        ),
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "oam:ai test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "events=3", "SSE parser yielded 3 events");
+    assert_eq!(lines[1], "e0=tok1", "first event data");
+    assert_eq!(lines[2], "e1=tok2", "second event data");
+    assert_eq!(lines[3], "e2=[DONE]", "third event data");
+    assert_eq!(lines[4], "chunks=0", "streamChat skips non-JSON data lines");
+    assert_eq!(lines[5], "openai=function");
+    assert_eq!(lines[6], "anthropic=function");
+    assert_eq!(lines[7], "defaultExtractDelta=function");
+}
+
+#[test]
+fn oam_serve_sets_port_and_host_env() {
+    // Verify that `oam serve --port X --host Y` sets PORT and HOST env vars
+    // visible to the script. The script prints them and exits immediately.
+    let file = write_temp(
+        "serve_env.mjs",
+        r#"console.log('PORT=' + process.env.PORT);
+console.log('HOST=' + process.env.HOST);
+"#,
+    );
+    let out = oam(&[
+        "serve",
+        file.to_str().unwrap(),
+        "--port",
+        "4567",
+        "--host",
+        "127.0.0.1",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "oam serve env test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "PORT=4567");
+    assert_eq!(lines[1], "HOST=127.0.0.1");
+}
+
+#[test]
+fn oam_serve_defaults_port_3000_host_0000() {
+    // Without --port/--host flags, defaults should be PORT=3000 HOST=0.0.0.0
+    let file = write_temp(
+        "serve_defaults.mjs",
+        r#"console.log('PORT=' + process.env.PORT);
+console.log('HOST=' + process.env.HOST);
+"#,
+    );
+    let out = oam(&["serve", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "oam serve defaults test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "PORT=3000");
+    assert_eq!(lines[1], "HOST=0.0.0.0");
+}

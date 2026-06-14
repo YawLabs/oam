@@ -39,6 +39,8 @@ fn main() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/test_runner.js"),
         // permissions.js: oam:permissions factory (after node_compat).
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
+        // ai.js: oam:ai factory (SSE parser, streaming chat, tool-use loop).
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/ai.js"),
     ];
     let sources: Vec<(String, String)> = js_files
         .iter()

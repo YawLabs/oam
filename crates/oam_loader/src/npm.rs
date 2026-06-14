@@ -194,18 +194,19 @@ pub(crate) fn resolve_bare(
     referrer: &Path,
     mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
-    // oam: runtime modules (oam:test, oam:permissions). Same virtual-path
-    // mechanism as node: builtins; the registry key is the FULL specifier.
+    // oam: runtime modules. Same virtual-path mechanism as node: builtins;
+    // the registry key is the FULL specifier.
     if let Some(rest) = specifier.strip_prefix("oam:") {
         match rest {
             "test" => return Ok(PathBuf::from("oam:test")),
             "permissions" => return Ok(PathBuf::from("oam:permissions")),
+            "ai" => return Ok(PathBuf::from("oam:ai")),
             _ => {}
         }
         return Err(diag(
             "OAM-MOD0006",
             format!(
-                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions)"
+                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions, oam:ai)"
             ),
         ));
     }

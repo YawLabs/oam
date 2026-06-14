@@ -101,9 +101,9 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
                 WorkerEvent::Error(msg) => OpOutcome::Json(
                     serde_json::json!({"type": "error", "message": msg}).to_string(),
                 ),
-                WorkerEvent::Exit(code) => OpOutcome::Json(
-                    serde_json::json!({"type": "exit", "code": code}).to_string(),
-                ),
+                WorkerEvent::Exit(code) => {
+                    OpOutcome::Json(serde_json::json!({"type": "exit", "code": code}).to_string())
+                }
             }
         }
         Ok((_, Err(_))) => OpOutcome::Done,
