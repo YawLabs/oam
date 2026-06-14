@@ -5492,3 +5492,46 @@ fn http_request_and_get_client() {
         );
     }
 }
+
+#[test]
+fn submodule_imports_resolve() {
+    let stdout = run_ok(
+        "submod_imports.mjs",
+        "import types from 'node:util/types';\n\
+         import dnsp from 'node:dns/promises';\n\
+         import rlp from 'node:readline/promises';\n\
+         import fsp from 'node:fs/promises';\n\
+         import stp from 'node:stream/promises';\n\
+         import tp from 'node:timers/promises';\n\
+         import pp from 'node:path/posix';\n\
+         \n\
+         // util/types works\n\
+         console.log('isDate:', types.isDate(new Date()));\n\
+         console.log('isRegExp:', types.isRegExp(/abc/));\n\
+         console.log('isArrayBuffer:', types.isArrayBuffer(new ArrayBuffer(1)));\n\
+         \n\
+         // dns/promises has lookup\n\
+         console.log('dns_promises:', typeof dnsp.lookup === 'function');\n\
+         \n\
+         // readline/promises has createInterface\n\
+         console.log('readline_promises:', typeof rlp.createInterface === 'function');\n\
+         \n\
+         // fs/promises has readFile\n\
+         console.log('fs_promises:', typeof fsp.readFile === 'function');\n\
+         \n\
+         // stream/promises has pipeline\n\
+         console.log('stream_promises:', typeof stp.pipeline === 'function');\n\
+         \n\
+         // timers/promises has setTimeout\n\
+         console.log('timers_promises:', typeof tp.setTimeout === 'function');\n\
+         \n\
+         // path/posix has join\n\
+         console.log('path_posix:', pp.join('a', 'b') === 'a/b');",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}

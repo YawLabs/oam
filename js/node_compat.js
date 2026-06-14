@@ -1699,7 +1699,9 @@
   };
 
   // --------------------------------------------------------------- assert
-  registry.factories.assert = () => {
+  registry.factories["util/types"] = () => registry.get("util").types;
+
+    registry.factories.assert = () => {
     const util = registry.get("util");
     const deepEqual = util._deepEqual;
 
@@ -2460,6 +2462,7 @@
       "dgram",
       "diagnostics_channel",
       "dns",
+      "dns/promises",
       "domain",
       "events",
       "fs",
@@ -2479,6 +2482,7 @@
       "punycode",
       "querystring",
       "readline",
+      "readline/promises",
       "repl",
       "stream",
       "stream/consumers",
@@ -2492,6 +2496,7 @@
       "tty",
       "url",
       "util",
+      "util/types",
       "v8",
       "vm",
       "worker_threads",
@@ -5780,6 +5785,25 @@
     };
   };
 
+  registry.factories["readline/promises"] = () => {
+    var rl = registry.get("readline");
+    class Interface extends rl.Interface {
+      question(prompt) {
+        return new Promise(function (resolve) {
+          rl.Interface.prototype.question.call(this, prompt, resolve);
+        }.bind(this));
+      }
+    }
+    return {
+      createInterface: function (options) {
+        var iface = rl.createInterface(options);
+        Object.setPrototypeOf(iface, Interface.prototype);
+        return iface;
+      },
+      Interface: Interface,
+    };
+  };
+
   // --------------------------------------------------------- trace_events
   // Node's trace_events module: used by tooling to conditionally enable
   // category-based tracing. oam has no kernel trace backend yet; this stub
@@ -6470,6 +6494,8 @@
       ALL,
     };
   };
+
+  registry.factories["dns/promises"] = () => registry.get("dns").promises;
 
   // ------------------------------------------------------------------ http2
   registry.factories.http2 = () => {

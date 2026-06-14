@@ -109,7 +109,7 @@ const NODE_BUILTINS: [&str; 41] = [
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 46] = [
+const SUPPORTED_BUILTINS: [&str; 49] = [
     "assert",
     "async_hooks",
     "buffer",
@@ -120,6 +120,7 @@ const SUPPORTED_BUILTINS: [&str; 46] = [
     "dgram",
     "diagnostics_channel",
     "dns",
+    "dns/promises",
     "domain",
     "events",
     "fs",
@@ -139,6 +140,7 @@ const SUPPORTED_BUILTINS: [&str; 46] = [
     "punycode",
     "querystring",
     "readline",
+    "readline/promises",
     "repl",
     "stream",
     "stream/consumers",
@@ -152,6 +154,7 @@ const SUPPORTED_BUILTINS: [&str; 46] = [
     "tty",
     "url",
     "util",
+    "util/types",
     "v8",
     "vm",
     "worker_threads",
