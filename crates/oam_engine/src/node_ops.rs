@@ -152,6 +152,15 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBodyPush", op_http_body_push),
         ("httpBodyEnd", op_http_body_end),
         ("httpClose", op_http_close),
+        // TCP sockets (node:net)
+        ("tcpConnect", op_tcp_connect),
+        ("tcpRead", op_tcp_read),
+        ("tcpWrite", op_tcp_write),
+        ("tcpClose", op_tcp_close),
+        ("tcpShutdown", op_tcp_shutdown),
+        ("tcpListen", op_tcp_listen),
+        ("tcpAccept", op_tcp_accept),
+        ("tcpServerClose", op_tcp_server_close),
         // node:crypto (crypto_ops.rs)
         ("cryptoHashCreate", op_crypto_hash_create),
         ("cryptoHmacCreate", op_crypto_hmac_create),
@@ -589,6 +598,148 @@ fn op_http_close(
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     http_state(scope).close_server(server_id);
+}
+
+// ------------------------------------------------------------------- TCP
+
+fn op_tcp_connect(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "tcpConnect requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_connect(tcp, ids, host, port),
+    );
+}
+
+fn op_tcp_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let tcp = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tcp();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_read(tcp, handle, len));
+}
+
+fn op_tcp_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "tcpWrite requires data");
+        return;
+    };
+    let tcp = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tcp();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
+}
+
+fn op_tcp_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tcp();
+    oam_core::tcp::tcp_close(&tcp, handle);
+}
+
+fn op_tcp_shutdown(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tcp();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
+}
+
+fn op_tcp_listen(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "tcpListen requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_listen(tcp, ids, host, port),
+    );
+}
+
+fn op_tcp_accept(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_accept(tcp, server_id, ids),
+    );
+}
+
+fn op_tcp_server_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tcp = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tcp();
+    oam_core::tcp::tcp_server_close(&tcp, server_id);
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

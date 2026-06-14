@@ -4458,6 +4458,58 @@ fn http_per_request_body_over_cap_413_strict() {
     );
 }
 
+// ------------------------------------------ net: TCP socket round-trip
+
+#[test]
+fn net_tcp_echo_round_trip() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Simple TCP echo server
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    stream.write_all(&buf[..n]).unwrap();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let source = format!(
+        r#"
+import net from 'node:net';
+const socket = net.createConnection({{ port: {port}, host: '127.0.0.1' }});
+const chunks = [];
+socket.on('connect', () => {{
+  socket.write('hello');
+  socket.write(' world');
+  socket.end();
+}});
+socket.on('data', (chunk) => {{
+  chunks.push(chunk.toString());
+}});
+socket.on('end', () => {{
+  console.log(chunks.join(''));
+}});
+socket.on('close', () => {{
+  console.log('closed');
+}});
+"#,
+        port = addr.port(),
+    );
+    let stdout = run_ok("net_tcp_echo.mjs", &source);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "hello world", "echoed data");
+    assert_eq!(lines[1], "closed", "socket closed");
+}
+
 // ------------------------------------------ url: portable parity cases
 
 /// Portable (all-platform) subset of `url_parity_fleet_regressions`.

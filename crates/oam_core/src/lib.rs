@@ -19,6 +19,7 @@ pub use oam_diagnostics as diagnostics;
 
 pub mod http_server;
 pub mod inspector;
+pub mod tcp;
 pub mod websocket;
 
 pub type OpId = u64;
@@ -108,6 +109,7 @@ pub struct CoreRuntime {
     files: FileRegistry,
     zlib_streams: ZlibRegistry,
     http_state: std::sync::Arc<http_server::HttpState>,
+    tcp: tcp::TcpRegistry,
     ws: websocket::WsRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -142,6 +144,7 @@ impl CoreRuntime {
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
@@ -177,6 +180,11 @@ impl CoreRuntime {
     /// HTTP server state (Arc clone; servers die with the run).
     pub fn http(&self) -> std::sync::Arc<http_server::HttpState> {
         self.http_state.clone()
+    }
+
+    /// TCP socket registry (Arc clone; dies with the run).
+    pub fn tcp(&self) -> tcp::TcpRegistry {
+        self.tcp.clone()
     }
 
     /// WebSocket connection registry (Arc clone; dies with the run).

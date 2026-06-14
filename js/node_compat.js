@@ -4746,10 +4746,10 @@
   };
 
   // ------------------------------------------------------------- node:net
-  // Wave-1 subset: the address-classification helpers framework stacks
-  // require at load (proxy-addr -> express). Sockets land with a later
-  // wave; everything socket-shaped throws with a pointer.
-  registry.factories.net = () => {
+  // TCP sockets and servers backed by __oam.node tcp* ops.
+  registry.factories.net = (natives) => {
+    const EventEmitter = registry.get("events");
+
     const V4_SEGMENT = /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
     function isIPv4(input) {
       const parts = String(input).split(".");
@@ -4775,21 +4775,297 @@
       const expected = hasV4Tail ? 7 : 8;
       return groups.length === expected && check(text);
     }
-    const socketGate = () => {
-      throw new Error("net sockets land with a later wave â€” wave 1 ships isIP/isIPv4/isIPv6");
-    };
-    return {
-      isIPv4,
-      isIPv6,
-      isIP: (input) => (isIPv4(input) ? 4 : isIPv6(input) ? 6 : 0),
-      createConnection: socketGate,
-      connect: socketGate,
-      createServer: socketGate,
-      Socket: class Socket {
-        constructor() {
-          socketGate();
+    function isIP(input) {
+      return isIPv4(input) ? 4 : isIPv6(input) ? 6 : 0;
+    }
+
+    function toBytes(data, encoding) {
+      if (data === null || data === undefined) return new Uint8Array(0);
+      if (typeof data === "string") return globalThis.Buffer.from(data, encoding || "utf8");
+      if (data instanceof Uint8Array) return data;
+      if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      return globalThis.Buffer.from(String(data));
+    }
+
+    class Socket extends EventEmitter {
+      constructor(options) {
+        super();
+        this._handle = null;
+        this._encoding = null;
+        this._chain = Promise.resolve();
+        this.connecting = false;
+        this.destroyed = false;
+        this.writable = true;
+        this.readable = true;
+        this.remoteAddress = undefined;
+        this.remotePort = undefined;
+        this.remoteFamily = undefined;
+        this.localAddress = undefined;
+        this.localPort = undefined;
+        this.bytesRead = 0;
+        this.bytesWritten = 0;
+        this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        if (options && options._handle !== undefined) {
+          this._handle = options._handle;
+          this.connecting = false;
+          if (options._remoteAddr) {
+            this.remoteAddress = options._remoteAddr.address;
+            this.remotePort = options._remoteAddr.port;
+            this.remoteFamily = options._remoteAddr.family;
+          }
         }
-      },
+      }
+
+      connect(...args) {
+        let port, host, cb;
+        if (typeof args[0] === "object" && args[0] !== null) {
+          const opts = args[0];
+          port = opts.port;
+          host = opts.host || "127.0.0.1";
+          cb = args[1];
+        } else {
+          port = args[0];
+          host = typeof args[1] === "string" ? args[1] : "127.0.0.1";
+          cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+        }
+        if (cb) this.once("connect", cb);
+        this.connecting = true;
+        natives.tcpConnect(host, port).then(
+          (result) => {
+            this._handle = result.handle;
+            this.connecting = false;
+            if (result.remoteAddr) {
+              this.remoteAddress = result.remoteAddr.address;
+              this.remotePort = result.remoteAddr.port;
+              this.remoteFamily = result.remoteAddr.family;
+            }
+            if (result.localAddr) {
+              this.localAddress = result.localAddr.address;
+              this.localPort = result.localAddr.port;
+            }
+            this.emit("connect");
+            this.emit("ready");
+            this._readLoop();
+          },
+          (err) => {
+            this.connecting = false;
+            this.destroy(err);
+          },
+        );
+        return this;
+      }
+
+      write(data, encoding, cb) {
+        if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+        if (this.destroyed || !this.writable) {
+          const err = new Error("This socket has been ended");
+          if (cb) cb(err);
+          else this.emit("error", err);
+          return false;
+        }
+        const bytes = toBytes(data, encoding);
+        this.bytesWritten += bytes.length;
+        this._chain = this._chain.then(() => {
+          if (this.destroyed) return;
+          return natives.tcpWrite(this._handle, bytes).then(
+            () => { if (cb) cb(); },
+            (err) => { if (cb) cb(err); else this.emit("error", err); },
+          );
+        });
+        return true;
+      }
+
+      end(data, encoding, cb) {
+        if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
+        else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+        if (data !== undefined && data !== null) this.write(data, encoding);
+        this.writable = false;
+        this._chain = this._chain.then(() => {
+          if (this._handle !== null) return natives.tcpShutdown(this._handle);
+        }).then(() => {
+          this.emit("finish");
+          if (cb) cb();
+          if (!this.readable) this._doClose();
+        });
+        return this;
+      }
+
+      destroy(err) {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.readable = false;
+        this.writable = false;
+        this.connecting = false;
+        if (this._handle !== null) {
+          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
+          this._handle = null;
+        }
+        if (err) this.emit("error", err);
+        this.emit("close", !!err);
+        return this;
+      }
+
+      async _readLoop() {
+        while (!this.destroyed) {
+          let chunk;
+          try {
+            chunk = await natives.tcpRead(this._handle, 65536);
+          } catch (err) {
+            this.destroy(err);
+            return;
+          }
+          if (chunk === undefined) {
+            this.readable = false;
+            this.emit("end");
+            if (!this.writable) this._doClose();
+            break;
+          }
+          this.bytesRead += chunk.length;
+          if (this._encoding) {
+            this.emit("data", new TextDecoder(this._encoding).decode(chunk));
+          } else {
+            this.emit("data", globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          }
+        }
+      }
+
+      _doClose() {
+        if (this._handle !== null) {
+          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
+          this._handle = null;
+        }
+        if (!this.destroyed) {
+          this.destroyed = true;
+          this.emit("close", false);
+        }
+      }
+
+      setEncoding(encoding) { this._encoding = encoding; return this; }
+      setTimeout(ms, cb) { if (cb) this.once("timeout", cb); return this; }
+      setNoDelay() { return this; }
+      setKeepAlive() { return this; }
+      ref() { return this; }
+      unref() { return this; }
+      address() {
+        return { address: this.localAddress, port: this.localPort, family: this.remoteFamily || "IPv4" };
+      }
+      get readyState() {
+        if (this.connecting) return "opening";
+        if (this.readable && this.writable) return "open";
+        if (this.readable) return "readOnly";
+        if (this.writable) return "writeOnly";
+        return "closed";
+      }
+      pipe(dest) {
+        this.on("data", (chunk) => dest.write(chunk));
+        this.on("end", () => { if (typeof dest.end === "function") dest.end(); });
+        return dest;
+      }
+      pause() { return this; }
+      resume() { return this; }
+    }
+
+    class Server extends EventEmitter {
+      constructor(options, connectionListener) {
+        super();
+        if (typeof options === "function") { connectionListener = options; options = {}; }
+        if (connectionListener) this.on("connection", connectionListener);
+        this._serverId = null;
+        this._port = null;
+        this._host = null;
+        this.listening = false;
+      }
+
+      listen(...args) {
+        let port, host, cb;
+        if (typeof args[0] === "object" && args[0] !== null) {
+          const opts = args[0];
+          port = opts.port;
+          host = opts.host;
+          cb = typeof args[1] === "function" ? args[1] : undefined;
+        } else {
+          port = args[0];
+          let idx = 1;
+          if (typeof args[idx] === "string") { host = args[idx]; idx++; }
+          if (typeof args[idx] === "number") { idx++; }
+          if (typeof args[idx] === "function") { cb = args[idx]; }
+        }
+        if (typeof cb === "function") this.once("listening", cb);
+        const hostname = host || "0.0.0.0";
+        natives.tcpListen(hostname, port || 0).then(
+          (bound) => {
+            this._serverId = bound.serverId;
+            this._port = bound.port;
+            this._host = bound.hostname || hostname;
+            this.listening = true;
+            this.emit("listening");
+            this._acceptLoop();
+          },
+          (err) => this.emit("error", err),
+        );
+        return this;
+      }
+
+      async _acceptLoop() {
+        for (;;) {
+          let accepted;
+          try {
+            accepted = await natives.tcpAccept(this._serverId);
+          } catch (err) {
+            if (this.listening) this.emit("error", err);
+            break;
+          }
+          if (accepted === undefined) break;
+          const socket = new Socket({
+            _handle: accepted.handle,
+            _remoteAddr: accepted.remoteAddr,
+          });
+          socket._readLoop();
+          this.emit("connection", socket);
+        }
+        this.emit("close");
+      }
+
+      address() {
+        return this.listening
+          ? { port: this._port, address: this._host, family: "IPv4" }
+          : null;
+      }
+
+      close(cb) {
+        if (this._serverId !== null) {
+          natives.tcpServerClose(this._serverId);
+          this.listening = false;
+        }
+        if (cb) this.once("close", cb);
+        return this;
+      }
+
+      getConnections(cb) { if (cb) cb(null, 0); return this; }
+      ref() { return this; }
+      unref() { return this; }
+    }
+
+    function createConnection(options, cb) {
+      if (typeof options === "number") {
+        const host = typeof arguments[1] === "string" ? arguments[1] : undefined;
+        cb = typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : undefined;
+        options = { port: options, host: host };
+      }
+      const socket = new Socket();
+      socket.connect(options, cb);
+      return socket;
+    }
+
+    function createServer(options, connectionListener) {
+      if (typeof options === "function") { connectionListener = options; options = {}; }
+      return new Server(options, connectionListener);
+    }
+
+    return {
+      isIPv4, isIPv6, isIP,
+      Socket, Server,
+      createConnection, connect: createConnection, createServer,
     };
   };
 

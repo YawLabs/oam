@@ -1,5 +1,5 @@
 {
-  "commit": "3bfe945",
+  "commit": "b0472c2",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -93,7 +93,7 @@
           "TransformStream": true,
           "URL": true,
           "URLSearchParams": true,
-          "WebSocket": false,
+          "WebSocket": true,
           "WritableStream": true,
           "atob": true,
           "btoa": true,
@@ -107,7 +107,7 @@
           "setTimeout": true,
           "structuredClone": true
         },
-        "have": 31,
+        "have": 32,
         "total": 32
       },
       "modules": {
