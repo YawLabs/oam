@@ -5987,3 +5987,75 @@ console.log('digestLen=' + (hash.byteLength === 32));
         );
     }
 }
+
+#[test]
+fn events_on_async_iterator() {
+    let file = write_temp(
+        "events_on.mjs",
+        r#"
+import { EventEmitter, on, once, getEventListeners, setMaxListeners } from 'node:events';
+
+// 1. events.on returns an async iterator
+const ee = new EventEmitter();
+const iter = on(ee, 'data');
+console.log('hasAsyncIter=' + (typeof iter[Symbol.asyncIterator] === 'function'));
+
+// 2. Emit events, consume with async iterator
+setTimeout(() => {
+  ee.emit('data', 'hello');
+  ee.emit('data', 'world');
+  setTimeout(() => iter.return(), 10);
+}, 10);
+
+const results = [];
+for await (const [value] of iter) {
+  results.push(value);
+}
+console.log('iterValues=' + results.join(','));
+
+// 3. events.once returns a promise
+const ee2 = new EventEmitter();
+setTimeout(() => ee2.emit('ready', 42), 10);
+const [val] = await once(ee2, 'ready');
+console.log('onceVal=' + (val === 42));
+
+// 4. getEventListeners
+const ee3 = new EventEmitter();
+const fn1 = () => {};
+const fn2 = () => {};
+ee3.on('test', fn1);
+ee3.on('test', fn2);
+console.log('listeners=' + (getEventListeners(ee3, 'test').length === 2));
+
+// 5. setMaxListeners (should not throw)
+setMaxListeners(20, ee3);
+console.log('setMax=true');
+
+// 6. EventEmitter.on === on
+console.log('staticOn=' + (EventEmitter.on === on));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "events.on test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "hasAsyncIter=true",
+        "iterValues=hello,world",
+        "onceVal=true",
+        "listeners=true",
+        "setMax=true",
+        "staticOn=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

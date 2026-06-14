@@ -999,9 +999,101 @@
       });
     }
 
+    function on(emitter, event, options) {
+      var signal = options && options.signal;
+      var unconsumed = [];
+      var waiting = [];
+      var error = null;
+      var done = false;
+
+      function eventHandler() {
+        var args = [];
+        for (var i = 0; i < arguments.length; i++) args.push(arguments[i]);
+        if (waiting.length > 0) {
+          waiting.shift().resolve({ value: args, done: false });
+        } else {
+          unconsumed.push(args);
+        }
+      }
+
+      function errorHandler(err) {
+        error = err;
+        var w = waiting.slice();
+        waiting.length = 0;
+        for (var i = 0; i < w.length; i++) w[i].reject(err);
+      }
+
+      function abortHandler() {
+        var err = new Error("The operation was aborted");
+        err.code = "ABORT_ERR";
+        err.name = "AbortError";
+        errorHandler(err);
+      }
+
+      emitter.on(event, eventHandler);
+      if (event !== "error") emitter.on("error", errorHandler);
+      if (signal) {
+        if (signal.aborted) { abortHandler(); }
+        else { signal.addEventListener("abort", abortHandler, { once: true }); }
+      }
+
+      var iterator = {
+        next: function() {
+          if (unconsumed.length > 0) {
+            return Promise.resolve({ value: unconsumed.shift(), done: false });
+          }
+          if (error) {
+            var e = error;
+            return Promise.reject(e);
+          }
+          if (done) {
+            return Promise.resolve({ value: undefined, done: true });
+          }
+          return new Promise(function(resolve, reject) {
+            waiting.push({ resolve: resolve, reject: reject });
+          });
+        },
+        return: function() {
+          done = true;
+          emitter.removeListener(event, eventHandler);
+          if (event !== "error") emitter.removeListener("error", errorHandler);
+          var w = waiting.slice();
+          waiting.length = 0;
+          for (var i = 0; i < w.length; i++) w[i].resolve({ value: undefined, done: true });
+          return Promise.resolve({ value: undefined, done: true });
+        },
+        throw: function(err) {
+          error = err;
+          emitter.removeListener(event, eventHandler);
+          if (event !== "error") emitter.removeListener("error", errorHandler);
+          return Promise.reject(err);
+        },
+      };
+      iterator[Symbol.asyncIterator] = function() { return iterator; };
+      return iterator;
+    }
+
+    function getEventListeners(emitter, name) {
+      if (typeof emitter.listeners === "function") return emitter.listeners(name);
+      return [];
+    }
+
+    function setMaxListeners(n) {
+      if (arguments.length > 1) {
+        for (var i = 1; i < arguments.length; i++) {
+          if (typeof arguments[i].setMaxListeners === "function") {
+            arguments[i].setMaxListeners(n);
+          }
+        }
+      }
+    }
+
     // require('events') === EventEmitter, with the named forms attached.
     EventEmitter.EventEmitter = EventEmitter;
     EventEmitter.once = once;
+    EventEmitter.on = on;
+    EventEmitter.getEventListeners = getEventListeners;
+    EventEmitter.setMaxListeners = setMaxListeners;
     EventEmitter.listenerCount = (emitter, type) => emitter.listenerCount(type);
     return EventEmitter;
   };
