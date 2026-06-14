@@ -15,13 +15,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run micro-benchmarks (cold-start, url-parse, http-throughput, fs-read).
+    /// Run micro-benchmarks against oam (and optionally node/bun/deno).
     ///
     /// Pass --release to benchmark the release binary instead of debug.
+    /// Pass --compare to also run the same scripts under other runtimes.
     Bench {
         /// Build and benchmark the release binary (cargo build --release).
         #[arg(long)]
         release: bool,
+        /// Also run benchmarks under node, bun, deno (if found on PATH).
+        #[arg(long)]
+        compare: bool,
     },
     /// Run the conformance suites (WPT URL, Node differential, builtin
     /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
@@ -44,7 +48,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench { release } => bench::run(release),
+        Command::Bench { release, compare } => bench::run(release, compare),
         Command::Conformance { release } => conformance::run(release),
         Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
         Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
