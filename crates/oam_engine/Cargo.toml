@@ -23,6 +23,15 @@ sha2 = { workspace = true }
 md-5 = { workspace = true }
 hmac = { workspace = true }
 getrandom = { workspace = true }
+# node:crypto wave 2: symmetric ciphers + key derivation.
+aes = { workspace = true }
+cbc = { workspace = true }
+ctr = { workspace = true }
+aes-gcm = { workspace = true }
+cipher = { workspace = true }
+pbkdf2 = { workspace = true }
+scrypt = { workspace = true }
+hkdf = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.

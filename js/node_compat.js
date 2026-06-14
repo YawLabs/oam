@@ -4044,6 +4044,172 @@
       return typedArray;
     }
 
+
+    // ---- wave 2: key derivation (pbkdf2 / scrypt / hkdf) ----
+
+    function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+      const result = natives.cryptoPbkdf2Sync(
+        toBytes(password), toBytes(salt), iterations, keylen, String(digest),
+      );
+      return asBuffer(result);
+    }
+
+    function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+      try {
+        const result = pbkdf2Sync(password, salt, iterations, keylen, digest);
+        queueMicrotask(() => callback(null, result));
+      } catch (err) {
+        queueMicrotask(() => callback(err));
+      }
+    }
+
+    function scryptSync(password, salt, keylen, options) {
+      const N = options?.N ?? options?.cost ?? 16384;
+      const r = options?.r ?? options?.blockSize ?? 8;
+      const p = options?.p ?? options?.parallelization ?? 1;
+      const result = natives.cryptoScryptSync(
+        toBytes(password), toBytes(salt), keylen, N, r, p,
+      );
+      return asBuffer(result);
+    }
+
+    function scrypt(password, salt, keylen, options, callback) {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      try {
+        const result = scryptSync(password, salt, keylen, options);
+        queueMicrotask(() => callback(null, result));
+      } catch (err) {
+        queueMicrotask(() => callback(err));
+      }
+    }
+
+    function hkdfSync(digest, ikm, salt, info, keylen) {
+      const result = natives.cryptoHkdfSync(
+        String(digest), toBytes(ikm), toBytes(salt), toBytes(info), keylen,
+      );
+      return result.buffer.slice(result.byteOffset, result.byteOffset + result.length);
+    }
+
+    function hkdf(digest, ikm, salt, info, keylen, callback) {
+      try {
+        const result = hkdfSync(digest, ikm, salt, info, keylen);
+        queueMicrotask(() => callback(null, result));
+      } catch (err) {
+        queueMicrotask(() => callback(err));
+      }
+    }
+
+    // ---- wave 2: symmetric ciphers (AES-CBC / CTR / GCM) ----
+
+    const SUPPORTED_CIPHERS = [
+      "aes-128-cbc", "aes-256-cbc",
+      "aes-128-ctr", "aes-256-ctr",
+      "aes-128-gcm", "aes-256-gcm",
+    ];
+
+    class Cipher {
+      constructor(handle, isGcm) {
+        this._handle = handle;
+        this._isGcm = isGcm;
+        this._finalized = false;
+        this._authTag = null;
+      }
+      update(data, inputEncoding, outputEncoding) {
+        if (this._finalized) throw new Error("Attempting to use a finalized cipher");
+        natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding));
+        const empty = BufferCtor.alloc(0);
+        return outputEncoding ? empty.toString(outputEncoding) : empty;
+      }
+      final(outputEncoding) {
+        if (this._finalized) throw new Error("Attempting to use a finalized cipher");
+        this._finalized = true;
+        let result;
+        if (this._isGcm) {
+          result = asBuffer(natives.cryptoCipherFinalGcm(this._handle));
+          this._authTag = asBuffer(natives.cryptoCipherGetAuthTag(this._handle));
+        } else {
+          result = asBuffer(natives.cryptoCipherFinal(this._handle));
+        }
+        return outputEncoding ? result.toString(outputEncoding) : result;
+      }
+      setAutoPadding(autoPadding) {
+        natives.cryptoCipherSetAutoPadding(
+          this._handle, autoPadding === undefined ? true : !!autoPadding,
+        );
+        return this;
+      }
+      setAAD(buffer) {
+        natives.cryptoCipherSetAad(this._handle, toBytes(buffer));
+        return this;
+      }
+      getAuthTag() {
+        if (!this._authTag) {
+          throw new Error("getAuthTag: not available (call final() first for GCM encrypt)");
+        }
+        return this._authTag;
+      }
+    }
+
+    class Decipher {
+      constructor(handle, isGcm) {
+        this._handle = handle;
+        this._isGcm = isGcm;
+        this._finalized = false;
+      }
+      update(data, inputEncoding, outputEncoding) {
+        if (this._finalized) throw new Error("Attempting to use a finalized decipher");
+        natives.cryptoCipherUpdate(this._handle, toBytes(data, inputEncoding));
+        const empty = BufferCtor.alloc(0);
+        return outputEncoding ? empty.toString(outputEncoding) : empty;
+      }
+      final(outputEncoding) {
+        if (this._finalized) throw new Error("Attempting to use a finalized decipher");
+        this._finalized = true;
+        let result;
+        if (this._isGcm) {
+          result = asBuffer(natives.cryptoCipherFinalGcm(this._handle));
+        } else {
+          result = asBuffer(natives.cryptoCipherFinal(this._handle));
+        }
+        return outputEncoding ? result.toString(outputEncoding) : result;
+      }
+      setAutoPadding(autoPadding) {
+        natives.cryptoCipherSetAutoPadding(
+          this._handle, autoPadding === undefined ? true : !!autoPadding,
+        );
+        return this;
+      }
+      setAAD(buffer) {
+        natives.cryptoCipherSetAad(this._handle, toBytes(buffer));
+        return this;
+      }
+      setAuthTag(tag) {
+        natives.cryptoCipherSetAuthTag(this._handle, toBytes(tag));
+        return this;
+      }
+    }
+
+    function createCipheriv(algorithm, key, iv) {
+      const alg = String(algorithm).toLowerCase();
+      const isGcm = alg.endsWith("-gcm");
+      const handle = natives.cryptoCipherCreate(alg, toBytes(key), toBytes(iv), true);
+      return new Cipher(handle, isGcm);
+    }
+
+    function createDecipheriv(algorithm, key, iv) {
+      const alg = String(algorithm).toLowerCase();
+      const isGcm = alg.endsWith("-gcm");
+      const handle = natives.cryptoCipherCreate(alg, toBytes(key), toBytes(iv), false);
+      return new Decipher(handle, isGcm);
+    }
+
+    function getCiphers() {
+      return SUPPORTED_CIPHERS.slice();
+    }
+
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
     return {
@@ -4055,10 +4221,19 @@
       randomInt,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
+      getCiphers,
       KeyObject,
       createSecretKey,
       createPrivateKey: asymmetricUnsupported,
       createPublicKey: asymmetricUnsupported,
+      createCipheriv,
+      createDecipheriv,
+      pbkdf2Sync,
+      pbkdf2,
+      scryptSync,
+      scrypt,
+      hkdfSync,
+      hkdf,
       webcrypto,
       subtle,
       getRandomValues,

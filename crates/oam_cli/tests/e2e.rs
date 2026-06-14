@@ -1927,6 +1927,113 @@ fn crypto_randomness_and_webcrypto() {
     assert_eq!(lines[7], "true string");
 }
 
+#[test]
+fn crypto_key_derivation_pbkdf2_scrypt_hkdf() {
+    let stdout = run_ok(
+        "crypto_kdf.mjs",
+        "import { pbkdf2Sync, scryptSync, hkdfSync } from 'node:crypto';\n\
+         // RFC 6070 vector 2: PBKDF2-HMAC-SHA1, 'password'/'salt', 4096 iters, 20 bytes.\n\
+         const dk1 = pbkdf2Sync('password', 'salt', 4096, 20, 'sha1');\n\
+         console.log(dk1.toString('hex'));\n\
+         // PBKDF2-SHA256 smoke.\n\
+         const dk2 = pbkdf2Sync('pass', Buffer.from('NaCl'), 1, 32, 'sha256');\n\
+         console.log(dk2.length);\n\
+         // scrypt smoke (N=16384, r=8, p=1, 64 bytes).\n\
+         const dk3 = scryptSync('password', 'NaCl', 64, { N: 16384, r: 8, p: 1 });\n\
+         console.log(dk3.length, Buffer.isBuffer(dk3));\n\
+         // scrypt with options aliases.\n\
+         const dk4 = scryptSync('password', 'NaCl', 32, { cost: 1024, blockSize: 8, parallelization: 1 });\n\
+         console.log(dk4.length);\n\
+         // HKDF-SHA256 smoke.\n\
+         const okm = hkdfSync('sha256', 'ikm-value', 'salt-value', 'info-value', 42);\n\
+         console.log(okm instanceof ArrayBuffer, okm.byteLength);\n\
+         // HKDF empty salt.\n\
+         const okm2 = hkdfSync('sha256', 'ikm', '', '', 16);\n\
+         console.log(okm2.byteLength);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "4b007901b765489abead49d926f721d065a429c1");
+    assert_eq!(lines[1], "32");
+    assert_eq!(lines[2], "64 true");
+    assert_eq!(lines[3], "32");
+    assert_eq!(lines[4], "true 42");
+    assert_eq!(lines[5], "16");
+}
+
+#[test]
+fn crypto_ciphers_aes_cbc_ctr_gcm() {
+    let stdout = run_ok(
+        "crypto_ciphers.mjs",
+        "import { createCipheriv, createDecipheriv, getCiphers, randomBytes } from 'node:crypto';\n\
+         // AES-256-CBC round-trip.\n\
+         const key = randomBytes(32);\n\
+         const iv = randomBytes(16);\n\
+         const enc = createCipheriv('aes-256-cbc', key, iv);\n\
+         enc.update('hello world');\n\
+         const ct = enc.final();\n\
+         const dec = createDecipheriv('aes-256-cbc', key, iv);\n\
+         dec.update(ct);\n\
+         const pt = dec.final();\n\
+         console.log(pt.toString());\n\
+         // AES-128-CTR round-trip (symmetric: same op for enc/dec).\n\
+         const key128 = randomBytes(16);\n\
+         const ivCtr = randomBytes(16);\n\
+         const encCtr = createCipheriv('aes-128-ctr', key128, ivCtr);\n\
+         encCtr.update('symmetric stream');\n\
+         const ctCtr = encCtr.final();\n\
+         const decCtr = createDecipheriv('aes-128-ctr', key128, ivCtr);\n\
+         decCtr.update(ctCtr);\n\
+         console.log(decCtr.final().toString());\n\
+         // AES-256-GCM round-trip with AAD + auth tag.\n\
+         const gcmKey = randomBytes(32);\n\
+         const gcmIv = randomBytes(12);\n\
+         const aad = Buffer.from('additional data');\n\
+         const gcmEnc = createCipheriv('aes-256-gcm', gcmKey, gcmIv);\n\
+         gcmEnc.setAAD(aad);\n\
+         gcmEnc.update('authenticated!');\n\
+         const gcmCt = gcmEnc.final();\n\
+         const tag = gcmEnc.getAuthTag();\n\
+         console.log(tag.length);\n\
+         const gcmDec = createDecipheriv('aes-256-gcm', gcmKey, gcmIv);\n\
+         gcmDec.setAAD(aad);\n\
+         gcmDec.setAuthTag(tag);\n\
+         gcmDec.update(gcmCt);\n\
+         console.log(gcmDec.final().toString());\n\
+         // GCM tampered tag fails.\n\
+         const badTag = Buffer.from(tag);\n\
+         badTag[0] ^= 0xff;\n\
+         const gcmBad = createDecipheriv('aes-256-gcm', gcmKey, gcmIv);\n\
+         gcmBad.setAAD(aad);\n\
+         gcmBad.setAuthTag(badTag);\n\
+         gcmBad.update(gcmCt);\n\
+         let authFailed = false;\n\
+         try { gcmBad.final(); } catch { authFailed = true; }\n\
+         console.log(authFailed);\n\
+         // getCiphers returns the known set.\n\
+         const ciphers = getCiphers();\n\
+         console.log(ciphers.includes('aes-256-cbc'), ciphers.includes('aes-128-gcm'), ciphers.length);\n\
+         // CBC no-padding mode: block-aligned data only.\n\
+         const npKey = randomBytes(16);\n\
+         const npIv = randomBytes(16);\n\
+         const npEnc = createCipheriv('aes-128-cbc', npKey, npIv);\n\
+         npEnc.setAutoPadding(false);\n\
+         npEnc.update(Buffer.alloc(16, 0x42));\n\
+         const npCt = npEnc.final();\n\
+         const npDec = createDecipheriv('aes-128-cbc', npKey, npIv);\n\
+         npDec.setAutoPadding(false);\n\
+         npDec.update(npCt);\n\
+         console.log(npDec.final()[0] === 0x42);",
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "hello world");
+    assert_eq!(lines[1], "symmetric stream");
+    assert_eq!(lines[2], "16");
+    assert_eq!(lines[3], "authenticated!");
+    assert_eq!(lines[4], "true");
+    assert_eq!(lines[5], "true true 6");
+    assert_eq!(lines[6], "true");
+}
+
 // -------------------------------------------------------------------- URL
 
 #[test]

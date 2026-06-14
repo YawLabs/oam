@@ -7,6 +7,8 @@
 //! consumes the entry; copy() clones it (every RustCrypto hasher is
 //! Clone, which is what makes Node's hash.copy() cheap here).
 
+use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit};
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
 use hmac::Mac;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -95,6 +97,7 @@ impl Hasher {
 pub(crate) struct CryptoState {
     next: u64,
     map: HashMap<u64, Hasher>,
+    ciphers: HashMap<u64, CipherInstance>,
 }
 
 impl CryptoState {
@@ -277,4 +280,601 @@ pub(crate) fn op_crypto_timing_safe_equal(
         acc |= x ^ y;
     }
     rv.set_bool(acc == 0);
+}
+
+// ===================================================== key derivation
+
+pub(crate) fn op_crypto_pbkdf2_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(password) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "pbkdf2: password required");
+        return;
+    };
+    let Some(salt) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "pbkdf2: salt required");
+        return;
+    };
+    let iterations = args.get(2).number_value(scope).unwrap_or(0.0) as u32;
+    let keylen = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
+    let Some(digest) = crate::node_ops::arg_string(scope, &args, 4) else {
+        crate::node_ops::throw_type_error(scope, "pbkdf2: digest required");
+        return;
+    };
+    if iterations == 0 {
+        crate::node_ops::throw_type_error(scope, "pbkdf2: iterations must be > 0");
+        return;
+    }
+    let mut dk = vec![0u8; keylen];
+    let normalized = normalize_algorithm(&digest);
+    match normalized.as_str() {
+        "sha256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(&password, &salt, iterations, &mut dk),
+        "sha384" => pbkdf2::pbkdf2_hmac::<sha2::Sha384>(&password, &salt, iterations, &mut dk),
+        "sha512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(&password, &salt, iterations, &mut dk),
+        "sha1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(&password, &salt, iterations, &mut dk),
+        "md5" => pbkdf2::pbkdf2_hmac::<md5::Md5>(&password, &salt, iterations, &mut dk),
+        _ => {
+            throw_unknown_digest(scope, &digest);
+            return;
+        }
+    }
+    if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, dk) {
+        rv.set(value);
+    }
+}
+
+pub(crate) fn op_crypto_scrypt_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(password) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "scrypt: password required");
+        return;
+    };
+    let Some(salt) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "scrypt: salt required");
+        return;
+    };
+    let keylen = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
+    let n = args.get(3).number_value(scope).unwrap_or(16384.0) as u64;
+    let r = args.get(4).number_value(scope).unwrap_or(8.0) as u32;
+    let p = args.get(5).number_value(scope).unwrap_or(1.0) as u32;
+
+    if n == 0 || !n.is_power_of_two() {
+        crate::node_ops::throw_type_error(scope, "scrypt: N must be a power of 2");
+        return;
+    }
+    let log_n = 63 - n.leading_zeros() as u8;
+    let params = match scrypt::Params::new(log_n, r, p, keylen) {
+        Ok(params) => params,
+        Err(e) => {
+            crate::node_ops::throw_type_error(
+                scope,
+                &format!("scrypt: invalid parameters: {e}"),
+            );
+            return;
+        }
+    };
+    let mut dk = vec![0u8; keylen];
+    if scrypt::scrypt(&password, &salt, &params, &mut dk).is_err() {
+        crate::node_ops::throw_type_error(scope, "scrypt: derivation failed");
+        return;
+    }
+    if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, dk) {
+        rv.set(value);
+    }
+}
+
+pub(crate) fn op_crypto_hkdf_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(digest) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "hkdf: digest required");
+        return;
+    };
+    let Some(ikm) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "hkdf: ikm required");
+        return;
+    };
+    let Some(salt) = crate::node_ops::arg_bytes(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "hkdf: salt required");
+        return;
+    };
+    let Some(info) = crate::node_ops::arg_bytes(scope, &args, 3) else {
+        crate::node_ops::throw_type_error(scope, "hkdf: info required");
+        return;
+    };
+    let keylen = args.get(4).number_value(scope).unwrap_or(0.0) as usize;
+
+    let normalized = normalize_algorithm(&digest);
+    let salt_opt = if salt.is_empty() { None } else { Some(&salt[..]) };
+    macro_rules! hkdf_expand {
+        ($hash:ty) => {{
+            let hk = hkdf::Hkdf::<$hash>::new(salt_opt, &ikm);
+            let mut okm = vec![0u8; keylen];
+            match hk.expand(&info, &mut okm) {
+                Ok(()) => okm,
+                Err(_) => {
+                    crate::node_ops::throw_type_error(
+                        scope,
+                        "hkdf: output length too large for digest",
+                    );
+                    return;
+                }
+            }
+        }};
+    }
+    let okm = match normalized.as_str() {
+        "sha256" => hkdf_expand!(sha2::Sha256),
+        "sha384" => hkdf_expand!(sha2::Sha384),
+        "sha512" => hkdf_expand!(sha2::Sha512),
+        "sha1" => hkdf_expand!(sha1::Sha1),
+        _ => {
+            throw_unknown_digest(scope, &digest);
+            return;
+        }
+    };
+    if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, okm) {
+        rv.set(value);
+    }
+}
+
+// ===================================================== symmetric ciphers
+
+pub(crate) const SUPPORTED_CIPHERS: [&str; 6] = [
+    "aes-128-cbc",
+    "aes-256-cbc",
+    "aes-128-ctr",
+    "aes-256-ctr",
+    "aes-128-gcm",
+    "aes-256-gcm",
+];
+
+enum CipherMode {
+    Aes128Cbc,
+    Aes256Cbc,
+    Aes128Ctr,
+    Aes256Ctr,
+    Aes128Gcm,
+    Aes256Gcm,
+}
+
+struct CipherInstance {
+    mode: CipherMode,
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    encrypt: bool,
+    buffer: Vec<u8>,
+    aad: Vec<u8>,
+    auth_tag: Option<Vec<u8>>,
+    auto_padding: bool,
+}
+
+impl CipherMode {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "aes-128-cbc" => Self::Aes128Cbc,
+            "aes-256-cbc" => Self::Aes256Cbc,
+            "aes-128-ctr" => Self::Aes128Ctr,
+            "aes-256-ctr" => Self::Aes256Ctr,
+            "aes-128-gcm" => Self::Aes128Gcm,
+            "aes-256-gcm" => Self::Aes256Gcm,
+            _ => return None,
+        })
+    }
+
+    fn key_len(&self) -> usize {
+        match self {
+            Self::Aes128Cbc | Self::Aes128Ctr | Self::Aes128Gcm => 16,
+            Self::Aes256Cbc | Self::Aes256Ctr | Self::Aes256Gcm => 32,
+        }
+    }
+
+    fn iv_len(&self) -> usize {
+        match self {
+            Self::Aes128Cbc | Self::Aes256Cbc => 16,
+            Self::Aes128Ctr | Self::Aes256Ctr => 16,
+            Self::Aes128Gcm | Self::Aes256Gcm => 12,
+        }
+    }
+
+}
+
+pub(crate) fn op_crypto_cipher_create(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(algorithm) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "createCipheriv: algorithm required");
+        return;
+    };
+    let Some(key) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "createCipheriv: key required");
+        return;
+    };
+    let Some(iv) = crate::node_ops::arg_bytes(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "createCipheriv: iv required");
+        return;
+    };
+    let encrypt = args.get(3).boolean_value(scope);
+    let name = algorithm.to_ascii_lowercase();
+    let Some(mode) = CipherMode::from_name(&name) else {
+        let message = format!(
+            "Unknown cipher: '{}' (oam ships {})",
+            algorithm,
+            SUPPORTED_CIPHERS.join(", ")
+        );
+        crate::node_ops::throw_type_error(scope, &message);
+        return;
+    };
+    if key.len() != mode.key_len() {
+        crate::node_ops::throw_type_error(
+            scope,
+            &format!(
+                "Invalid key length: expected {} bytes, got {}",
+                mode.key_len(),
+                key.len()
+            ),
+        );
+        return;
+    }
+    if iv.len() != mode.iv_len() {
+        crate::node_ops::throw_type_error(
+            scope,
+            &format!(
+                "Invalid IV length: expected {} bytes, got {}",
+                mode.iv_len(),
+                iv.len()
+            ),
+        );
+        return;
+    }
+    let instance = CipherInstance {
+        mode,
+        key,
+        iv,
+        encrypt,
+        buffer: Vec::new(),
+        aad: Vec::new(),
+        auth_tag: None,
+        auto_padding: true,
+    };
+    let state = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed");
+    state.next += 1;
+    let id = state.next;
+    state.ciphers.insert(id, instance);
+    rv.set_double(id as f64);
+}
+
+pub(crate) fn op_crypto_cipher_update(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "cipher update requires data");
+        return;
+    };
+    let state = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed");
+    match state.ciphers.get_mut(&id) {
+        Some(c) => c.buffer.extend_from_slice(&data),
+        None => crate::node_ops::throw_type_error(scope, "cipher: invalid handle"),
+    }
+}
+
+pub(crate) fn op_crypto_cipher_final(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let instance = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed")
+        .ciphers
+        .remove(&id);
+    let Some(instance) = instance else {
+        crate::node_ops::throw_type_error(scope, "cipher: invalid handle");
+        return;
+    };
+    let result = if instance.encrypt {
+        cipher_encrypt(instance)
+    } else {
+        cipher_decrypt(instance)
+    };
+    match result {
+        Ok(bytes) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, bytes) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_cipher_set_aad(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "setAAD requires data");
+        return;
+    };
+    let state = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed");
+    match state.ciphers.get_mut(&id) {
+        Some(c) => c.aad = data,
+        None => crate::node_ops::throw_type_error(scope, "cipher: invalid handle"),
+    }
+}
+
+pub(crate) fn op_crypto_cipher_get_auth_tag(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tag_data = {
+        let state = scope
+            .get_slot_mut::<CryptoState>()
+            .expect("crypto state installed");
+        match state.ciphers.get(&id) {
+            Some(c) => c.auth_tag.clone(),
+            None => {
+                crate::node_ops::throw_type_error(scope, "cipher: invalid handle");
+                return;
+            }
+        }
+    };
+    match tag_data {
+        Some(tag) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, tag) {
+                rv.set(value);
+            }
+        }
+        None => crate::node_ops::throw_type_error(
+            scope,
+            "getAuthTag: not available (call final() first for GCM encrypt)",
+        ),
+    }
+}
+
+pub(crate) fn op_crypto_cipher_set_auth_tag(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "setAuthTag requires data");
+        return;
+    };
+    let state = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed");
+    match state.ciphers.get_mut(&id) {
+        Some(c) => c.auth_tag = Some(data),
+        None => crate::node_ops::throw_type_error(scope, "cipher: invalid handle"),
+    }
+}
+
+pub(crate) fn op_crypto_cipher_set_auto_padding(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let auto_pad = args.get(1).boolean_value(scope);
+    let state = scope
+        .get_slot_mut::<CryptoState>()
+        .expect("crypto state installed");
+    match state.ciphers.get_mut(&id) {
+        Some(c) => c.auto_padding = auto_pad,
+        None => crate::node_ops::throw_type_error(scope, "cipher: invalid handle"),
+    }
+}
+
+fn cipher_encrypt(instance: CipherInstance) -> Result<Vec<u8>, String> {
+    match instance.mode {
+        CipherMode::Aes128Cbc | CipherMode::Aes256Cbc => cbc_encrypt(&instance),
+        CipherMode::Aes128Ctr | CipherMode::Aes256Ctr => ctr_process(&instance),
+        CipherMode::Aes128Gcm | CipherMode::Aes256Gcm => {
+            Err("GCM encrypt uses cipher_encrypt_gcm".into())
+        }
+    }
+}
+
+fn cipher_decrypt(instance: CipherInstance) -> Result<Vec<u8>, String> {
+    match instance.mode {
+        CipherMode::Aes128Cbc | CipherMode::Aes256Cbc => cbc_decrypt(&instance),
+        CipherMode::Aes128Ctr | CipherMode::Aes256Ctr => ctr_process(&instance),
+        CipherMode::Aes128Gcm | CipherMode::Aes256Gcm => {
+            Err("GCM decrypt uses cipher_decrypt_gcm".into())
+        }
+    }
+}
+
+fn cbc_encrypt(c: &CipherInstance) -> Result<Vec<u8>, String> {
+    let data = &c.buffer;
+    if !c.auto_padding && data.len() % 16 != 0 {
+        return Err(format!(
+            "data length {} not a multiple of block size 16 (autoPadding is off)",
+            data.len()
+        ));
+    }
+    macro_rules! do_cbc_enc {
+        ($aes:ty) => {{
+            let enc = cbc::Encryptor::<$aes>::new_from_slices(&c.key, &c.iv)
+                .map_err(|e| format!("cbc: {e}"))?;
+            if c.auto_padding {
+                Ok(enc.encrypt_padded_vec_mut::<cipher::block_padding::Pkcs7>(data))
+            } else {
+                let mut buf = data.to_vec();
+                enc.encrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut buf, data.len())
+                    .map_err(|e| format!("cbc encrypt: {e}"))?;
+                Ok(buf)
+            }
+        }};
+    }
+    match c.key.len() {
+        16 => do_cbc_enc!(aes::Aes128),
+        32 => do_cbc_enc!(aes::Aes256),
+        _ => Err("invalid key length for AES-CBC".into()),
+    }
+}
+
+fn cbc_decrypt(c: &CipherInstance) -> Result<Vec<u8>, String> {
+    let data = &c.buffer;
+    if data.len() % 16 != 0 {
+        return Err(format!(
+            "ciphertext length {} not a multiple of block size 16",
+            data.len()
+        ));
+    }
+    macro_rules! do_cbc_dec {
+        ($aes:ty) => {{
+            let dec = cbc::Decryptor::<$aes>::new_from_slices(&c.key, &c.iv)
+                .map_err(|e| format!("cbc: {e}"))?;
+            if c.auto_padding {
+                dec.decrypt_padded_vec_mut::<cipher::block_padding::Pkcs7>(data)
+                    .map_err(|_| "cbc decrypt: invalid padding".into())
+            } else {
+                dec.decrypt_padded_vec_mut::<cipher::block_padding::NoPadding>(data)
+                    .map_err(|_| "cbc decrypt: decryption failed".into())
+            }
+        }};
+    }
+    match c.key.len() {
+        16 => do_cbc_dec!(aes::Aes128),
+        32 => do_cbc_dec!(aes::Aes256),
+        _ => Err("invalid key length for AES-CBC".into()),
+    }
+}
+
+fn ctr_process(c: &CipherInstance) -> Result<Vec<u8>, String> {
+    let mut buf = c.buffer.clone();
+    macro_rules! do_ctr {
+        ($aes:ty) => {{
+            let mut cipher = ctr::Ctr128BE::<$aes>::new_from_slices(&c.key, &c.iv)
+                .map_err(|e| format!("ctr: {e}"))?;
+            cipher.apply_keystream(&mut buf);
+        }};
+    }
+    match c.key.len() {
+        16 => do_ctr!(aes::Aes128),
+        32 => do_ctr!(aes::Aes256),
+        _ => return Err("invalid key length for AES-CTR".into()),
+    }
+    Ok(buf)
+}
+
+pub(crate) fn op_crypto_cipher_final_gcm(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let mut instance = {
+        let state = scope
+            .get_slot_mut::<CryptoState>()
+            .expect("crypto state installed");
+        match state.ciphers.remove(&id) {
+            Some(i) => i,
+            None => {
+                crate::node_ops::throw_type_error(scope, "cipher: invalid handle");
+                return;
+            }
+        }
+    };
+    let result = if instance.encrypt {
+        gcm_encrypt(&instance)
+    } else {
+        gcm_decrypt(&instance)
+    };
+    match result {
+        Ok((data, tag)) => {
+            if instance.encrypt {
+                if let Some(tag) = tag {
+                    instance.auth_tag = Some(tag);
+                    scope
+                        .get_slot_mut::<CryptoState>()
+                        .expect("crypto state installed")
+                        .ciphers
+                        .insert(id, instance);
+                }
+            }
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, data) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+fn gcm_encrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    use aes_gcm::aead::Payload;
+    let nonce = aes_gcm::Nonce::from_slice(&c.iv);
+    let payload = Payload {
+        msg: &c.buffer,
+        aad: &c.aad,
+    };
+    macro_rules! do_gcm_enc {
+        ($gcm:ty) => {{
+            let cipher =
+                <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
+            let mut ct =
+                cipher.encrypt(nonce, payload).map_err(|e| format!("gcm encrypt: {e}"))?;
+            let tag = ct.split_off(ct.len() - 16);
+            Ok((ct, Some(tag)))
+        }};
+    }
+    match c.key.len() {
+        16 => do_gcm_enc!(aes_gcm::Aes128Gcm),
+        32 => do_gcm_enc!(aes_gcm::Aes256Gcm),
+        _ => Err("invalid key length for AES-GCM".into()),
+    }
+}
+
+fn gcm_decrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    use aes_gcm::aead::Payload;
+    let nonce = aes_gcm::Nonce::from_slice(&c.iv);
+    let tag = c
+        .auth_tag
+        .as_deref()
+        .ok_or("gcm decrypt: auth tag required (call setAuthTag before final)")?;
+    let mut ciphertext_with_tag = c.buffer.clone();
+    ciphertext_with_tag.extend_from_slice(tag);
+    let payload = Payload {
+        msg: &ciphertext_with_tag,
+        aad: &c.aad,
+    };
+    macro_rules! do_gcm_dec {
+        ($gcm:ty) => {{
+            let cipher =
+                <$gcm>::new_from_slice(&c.key).map_err(|e| format!("gcm: {e}"))?;
+            let pt = cipher
+                .decrypt(nonce, payload)
+                .map_err(|_| "gcm decrypt: authentication failed".to_string())?;
+            Ok((pt, None))
+        }};
+    }
+    match c.key.len() {
+        16 => do_gcm_dec!(aes_gcm::Aes128Gcm),
+        32 => do_gcm_dec!(aes_gcm::Aes256Gcm),
+        _ => Err("invalid key length for AES-GCM".into()),
+    }
 }

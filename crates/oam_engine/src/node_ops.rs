@@ -8,8 +8,12 @@
 //! the ecosystem branches on codes, not messages.
 
 use crate::crypto_ops::{
-    op_crypto_hash_copy, op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update,
-    op_crypto_hmac_create, op_crypto_random_fill, op_crypto_timing_safe_equal,
+    op_crypto_cipher_create, op_crypto_cipher_final, op_crypto_cipher_final_gcm,
+    op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad, op_crypto_cipher_set_auth_tag,
+    op_crypto_cipher_set_auto_padding, op_crypto_cipher_update, op_crypto_hash_copy,
+    op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update, op_crypto_hkdf_sync,
+    op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_random_fill,
+    op_crypto_scrypt_sync, op_crypto_timing_safe_equal,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -169,6 +173,18 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoHashCopy", op_crypto_hash_copy),
         ("cryptoRandomFill", op_crypto_random_fill),
         ("cryptoTimingSafeEqual", op_crypto_timing_safe_equal),
+        // node:crypto wave 2: key derivation + symmetric ciphers
+        ("cryptoPbkdf2Sync", op_crypto_pbkdf2_sync),
+        ("cryptoScryptSync", op_crypto_scrypt_sync),
+        ("cryptoHkdfSync", op_crypto_hkdf_sync),
+        ("cryptoCipherCreate", op_crypto_cipher_create),
+        ("cryptoCipherUpdate", op_crypto_cipher_update),
+        ("cryptoCipherFinal", op_crypto_cipher_final),
+        ("cryptoCipherFinalGcm", op_crypto_cipher_final_gcm),
+        ("cryptoCipherSetAad", op_crypto_cipher_set_aad),
+        ("cryptoCipherGetAuthTag", op_crypto_cipher_get_auth_tag),
+        ("cryptoCipherSetAuthTag", op_crypto_cipher_set_auth_tag),
+        ("cryptoCipherSetAutoPadding", op_crypto_cipher_set_auto_padding),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads

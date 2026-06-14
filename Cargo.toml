@@ -45,6 +45,16 @@ sha2 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"
 getrandom = "0.3"
+# node:crypto wave 2: symmetric ciphers (AES-CBC/CTR/GCM) and key
+# derivation (pbkdf2/scrypt/hkdf). All digest-0.10 / cipher-0.4 family.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+ctr = "0.9"
+aes-gcm = "0.10"
+cipher = "0.4"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+scrypt = { version = "0.11", default-features = false }
+hkdf = "0.12"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"
