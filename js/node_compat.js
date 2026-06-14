@@ -3643,16 +3643,12 @@
 
     class URL {
       constructor(input, base) {
-        this._c = globalThis.__oam.node.urlParse(String(input), base ?? undefined);
+        this._href = globalThis.__oam.node.urlParseHref(String(input), base ?? undefined);
+        this._c = null;
         this._params = null;
       }
       static canParse(input, base) {
-        try {
-          new URL(input, base);
-          return true;
-        } catch {
-          return false;
-        }
+        return globalThis.__oam.node.urlCanParse(String(input), base != null ? String(base) : undefined);
       }
       static parse(input, base) {
         try {
@@ -3661,75 +3657,93 @@
           return null;
         }
       }
+      _ensure() {
+        if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
+      }
       _update(part, value) {
-        this._c = globalThis.__oam.node.urlUpdate(this._c.href, part, String(value));
+        this._c = globalThis.__oam.node.urlUpdate(this._href, part, String(value));
+        this._href = this._c.href;
         if (this._params && (part === "search" || part === "href")) {
           this._params._parse(this._c.search);
         }
       }
       _setSearchFromParams(serialized) {
-        // Called by the linked URLSearchParams; must not re-parse params.
-        this._c = globalThis.__oam.node.urlUpdate(this._c.href, "search", serialized);
+        this._c = globalThis.__oam.node.urlUpdate(this._href, "search", serialized);
+        this._href = this._c.href;
       }
       get href() {
-        return this._c.href;
+        return this._href;
       }
       set href(value) {
-        this._c = globalThis.__oam.node.urlParse(String(value));
-        if (this._params) this._params._parse(this._c.search);
+        this._href = globalThis.__oam.node.urlParseHref(String(value));
+        this._c = null;
+        if (this._params) {
+          this._ensure();
+          this._params._parse(this._c.search);
+        }
       }
       get origin() {
+        this._ensure();
         return this._c.origin;
       }
       get protocol() {
+        this._ensure();
         return this._c.protocol;
       }
       set protocol(v) {
         this._update("protocol", v);
       }
       get username() {
+        this._ensure();
         return this._c.username;
       }
       set username(v) {
         this._update("username", v);
       }
       get password() {
+        this._ensure();
         return this._c.password;
       }
       set password(v) {
         this._update("password", v);
       }
       get host() {
+        this._ensure();
         return this._c.host;
       }
       set host(v) {
         this._update("host", v);
       }
       get hostname() {
+        this._ensure();
         return this._c.hostname;
       }
       set hostname(v) {
         this._update("hostname", v);
       }
       get port() {
+        this._ensure();
         return this._c.port;
       }
       set port(v) {
         this._update("port", v);
       }
       get pathname() {
+        this._ensure();
         return this._c.pathname;
       }
       set pathname(v) {
         this._update("pathname", v);
       }
       get search() {
+        this._ensure();
         return this._c.search;
       }
       set search(v) {
         this._update("search", v);
       }
       get hash() {
+        this._ensure();
         return this._c.hash;
       }
       set hash(v) {
@@ -3737,16 +3751,17 @@
       }
       get searchParams() {
         if (this._params === null) {
+          this._ensure();
           this._params = new URLSearchParams(this._c.search);
           this._params._url = this;
         }
         return this._params;
       }
       toString() {
-        return this._c.href;
+        return this._href;
       }
       toJSON() {
-        return this._c.href;
+        return this._href;
       }
     }
 

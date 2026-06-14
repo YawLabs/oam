@@ -103,6 +103,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("username", op_username),
         ("makeRequire", op_make_require),
         // WHATWG URL (ada parser, same as Node.js): parse + mutation.
+        // urlParseHref: validate + return canonical href (no component extraction).
+        // urlParse: full extraction (called lazily on first property access).
+        ("urlParseHref", op_url_parse_href),
+        ("urlCanParse", op_url_can_parse),
         ("urlParse", op_url_parse),
         ("urlUpdate", op_url_update),
         // AsyncLocalStorage substrate: V8's continuation-preserved embedder
@@ -946,6 +950,62 @@ fn op_zlib_stream_close(
         .expect("core runtime installed")
         .zlib_streams();
     oam_core::ops::zlib_stream_close(&streams, handle);
+}
+
+fn op_url_parse_href(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(input) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "Invalid URL");
+        return;
+    };
+    let base = args.get(1);
+    let base = if base.is_null_or_undefined() {
+        None
+    } else {
+        match base.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) {
+            Some(base) => Some(base),
+            None => {
+                throw_type_error(scope, "Invalid base URL");
+                return;
+            }
+        }
+    };
+    match ada_url::Url::parse(&input, base.as_deref()) {
+        Ok(parsed) => {
+            if let Some(s) = v8::String::new(scope, parsed.href()) {
+                rv.set(s.into());
+            }
+        }
+        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    }
+}
+
+fn op_url_can_parse(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(input) = arg_string(scope, &args, 0) else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    let base = args.get(1);
+    let base = if base.is_null_or_undefined() {
+        None
+    } else {
+        match base.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) {
+            Some(base) => Some(base),
+            None => {
+                rv.set(v8::Boolean::new(scope, false).into());
+                return;
+            }
+        }
+    };
+    let ok = ada_url::Url::can_parse(&input, base.as_deref());
+    rv.set(v8::Boolean::new(scope, ok).into());
 }
 
 fn op_url_parse(
