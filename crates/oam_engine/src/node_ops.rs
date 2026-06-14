@@ -227,6 +227,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // cpu info
         ("cpuModel", op_cpu_model),
         ("cpuSpeed", op_cpu_speed),
+        // network interfaces
+        ("networkInterfaces", op_network_interfaces),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2707,4 +2709,65 @@ fn cpu_speed_mhz() -> u32 {
                 .map(|f| f as u32)
         })
         .unwrap_or(0)
+}
+
+// ====================================================== network interfaces
+
+fn op_network_interfaces(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let json = serde_json::to_string(&network_interfaces()).unwrap_or_else(|_| "{}".into());
+    let val = v8::String::new(scope, &json).unwrap();
+    rv.set(val.into());
+}
+
+fn network_interfaces() -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    use std::net::UdpSocket;
+
+    let mut result = Map::new();
+
+    let lo_name = if cfg!(windows) { "Loopback Pseudo-Interface 1" } else { "lo" };
+    result.insert(lo_name.to_string(), json!([
+        {
+            "address": "127.0.0.1",
+            "netmask": "255.0.0.0",
+            "family": "IPv4",
+            "mac": "00:00:00:00:00:00",
+            "internal": true,
+            "cidr": "127.0.0.1/8"
+        },
+        {
+            "address": "::1",
+            "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "family": "IPv6",
+            "mac": "00:00:00:00:00:00",
+            "internal": true,
+            "cidr": "::1/128",
+            "scopeid": 0
+        }
+    ]));
+
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip().to_string();
+                let iface_name = if cfg!(windows) { "Ethernet" } else { "eth0" };
+                result.insert(iface_name.to_string(), json!([
+                    {
+                        "address": ip,
+                        "netmask": "255.255.255.0",
+                        "family": "IPv4",
+                        "mac": "00:00:00:00:00:00",
+                        "internal": false,
+                        "cidr": format!("{}/24", ip)
+                    }
+                ]));
+            }
+        }
+    }
+
+    Value::Object(result)
 }

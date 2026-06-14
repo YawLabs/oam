@@ -1359,7 +1359,7 @@
       freemem: () => natives.osFreeMem(),
       uptime: () => natives.uptimeMs() / 1000,
       loadavg: () => [0, 0, 0],
-      networkInterfaces: () => ({}),
+      networkInterfaces: () => JSON.parse(natives.networkInterfaces()),
       userInfo: () => ({
         username: natives.username(),
         homedir: natives.homedir(),
