@@ -807,7 +807,9 @@ pub(crate) fn op_crypto_cipher_final_gcm(
     };
     match result {
         Ok((data, tag)) => {
-            if instance.encrypt && let Some(tag) = tag {
+            if instance.encrypt
+                && let Some(tag) = tag
+            {
                 instance.auth_tag = Some(tag);
                 scope
                     .get_slot_mut::<CryptoState>()
