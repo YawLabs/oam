@@ -6757,3 +6757,212 @@ console.log('opt_measure=' + m2.name);
         );
     }
 }
+
+// ------------------------------------------------------------------ M3-9
+#[test]
+fn webcrypto_subtle_encrypt_decrypt() {
+    let file = write_temp(
+        "subtle_enc.mjs",
+        r#"
+const subtle = globalThis.crypto.subtle;
+
+// -- AES-GCM round-trip --
+const gcmKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+console.log('gcmKey_type=' + gcmKey.type);
+console.log('gcmKey_algo=' + gcmKey.algorithm.name);
+
+const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+const plain = new TextEncoder().encode('hello webcrypto');
+const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, gcmKey, plain);
+console.log('gcm_ct_type=' + (ct instanceof ArrayBuffer));
+console.log('gcm_ct_longer=' + (ct.byteLength > plain.length));
+
+const pt = await subtle.decrypt({ name: 'AES-GCM', iv }, gcmKey, ct);
+const decoded = new TextDecoder().decode(pt);
+console.log('gcm_roundtrip=' + decoded);
+
+// -- AES-GCM with AAD --
+const aad = new TextEncoder().encode('associated data');
+const ct2 = await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, gcmKey, plain);
+const pt2 = await subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, gcmKey, ct2);
+console.log('gcm_aad_roundtrip=' + new TextDecoder().decode(pt2));
+
+// -- AES-GCM wrong key fails --
+const wrongKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+try {
+  await subtle.decrypt({ name: 'AES-GCM', iv }, wrongKey, ct);
+  console.log('gcm_wrong_key=no_error');
+} catch (e) {
+  console.log('gcm_wrong_key=error');
+}
+
+// -- AES-CBC round-trip --
+const cbcKeyData = globalThis.crypto.getRandomValues(new Uint8Array(16));
+const cbcKey = await subtle.importKey('raw', cbcKeyData, { name: 'AES-CBC' }, true, ['encrypt', 'decrypt']);
+const cbcIv = globalThis.crypto.getRandomValues(new Uint8Array(16));
+const cbcCt = await subtle.encrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, plain);
+console.log('cbc_ct_type=' + (cbcCt instanceof ArrayBuffer));
+const cbcPt = await subtle.decrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, cbcCt);
+console.log('cbc_roundtrip=' + new TextDecoder().decode(cbcPt));
+
+// -- AES-CTR round-trip --
+const ctrKeyData = globalThis.crypto.getRandomValues(new Uint8Array(32));
+const ctrKey = await subtle.importKey('raw', ctrKeyData, { name: 'AES-CTR' }, true, ['encrypt', 'decrypt']);
+const counter = new Uint8Array(16);
+counter[15] = 1;
+const ctrCt = await subtle.encrypt({ name: 'AES-CTR', counter, length: 64 }, ctrKey, plain);
+const ctrPt = await subtle.decrypt({ name: 'AES-CTR', counter, length: 64 }, ctrKey, ctrCt);
+console.log('ctr_roundtrip=' + new TextDecoder().decode(ctrPt));
+
+// -- wrapKey / unwrapKey --
+const wrapKey = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['wrapKey', 'unwrapKey']);
+const innerKey = await subtle.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt']);
+const wrapIv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+const wrapped = await subtle.wrapKey('raw', innerKey, wrapKey, { name: 'AES-GCM', iv: wrapIv });
+console.log('wrapped_type=' + (wrapped instanceof ArrayBuffer));
+const unwrapped = await subtle.unwrapKey(
+  'raw', wrapped, wrapKey, { name: 'AES-GCM', iv: wrapIv },
+  { name: 'AES-GCM', length: 128 }, true, ['encrypt']
+);
+console.log('unwrap_type=' + unwrapped.type);
+console.log('unwrap_algo=' + unwrapped.algorithm.name);
+
+// -- AES-128 generateKey --
+const aes128 = await subtle.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt']);
+const exported = await subtle.exportKey('raw', aes128);
+console.log('aes128_keylen=' + new Uint8Array(exported).length);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "subtle encrypt/decrypt failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "gcmKey_type=secret",
+        "gcmKey_algo=AES-GCM",
+        "gcm_ct_type=true",
+        "gcm_ct_longer=true",
+        "gcm_roundtrip=hello webcrypto",
+        "gcm_aad_roundtrip=hello webcrypto",
+        "gcm_wrong_key=error",
+        "cbc_ct_type=true",
+        "cbc_roundtrip=hello webcrypto",
+        "ctr_roundtrip=hello webcrypto",
+        "wrapped_type=true",
+        "unwrap_type=secret",
+        "unwrap_algo=AES-GCM",
+        "aes128_keylen=16",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+// ------------------------------------------------------------------ M3-10
+#[test]
+fn readable_async_helpers() {
+    let file = write_temp(
+        "readable_helpers.mjs",
+        r#"
+import { Readable } from 'node:stream';
+
+// map
+const mapped = await Readable.from([1, 2, 3]).map(x => x * 10).toArray();
+console.log('map=' + mapped.join(','));
+
+// filter
+const filtered = await Readable.from([1, 2, 3, 4, 5]).filter(x => x % 2 === 0).toArray();
+console.log('filter=' + filtered.join(','));
+
+// reduce
+const sum = await Readable.from([1, 2, 3, 4]).reduce((a, b) => a + b, 0);
+console.log('reduce=' + sum);
+
+// reduce without initial
+const product = await Readable.from([2, 3, 4]).reduce((a, b) => a * b);
+console.log('reduce_no_init=' + product);
+
+// forEach
+const collected = [];
+await Readable.from(['a', 'b', 'c']).forEach(x => collected.push(x.toUpperCase()));
+console.log('forEach=' + collected.join(','));
+
+// some
+const hasEven = await Readable.from([1, 3, 4, 5]).some(x => x % 2 === 0);
+console.log('some_true=' + hasEven);
+const allOdd = await Readable.from([1, 3, 5]).some(x => x % 2 === 0);
+console.log('some_false=' + allOdd);
+
+// every
+const allPos = await Readable.from([1, 2, 3]).every(x => x > 0);
+console.log('every_true=' + allPos);
+const notAll = await Readable.from([1, -1, 3]).every(x => x > 0);
+console.log('every_false=' + notAll);
+
+// find
+const found = await Readable.from([10, 20, 30]).find(x => x > 15);
+console.log('find=' + found);
+const notFound = await Readable.from([1, 2, 3]).find(x => x > 100);
+console.log('find_none=' + notFound);
+
+// drop
+const dropped = await Readable.from([1, 2, 3, 4, 5]).drop(2).toArray();
+console.log('drop=' + dropped.join(','));
+
+// take
+const taken = await Readable.from([1, 2, 3, 4, 5]).take(3).toArray();
+console.log('take=' + taken.join(','));
+
+// flatMap
+const flatMapped = await Readable.from([1, 2, 3]).flatMap(x => [x, x * 10]).toArray();
+console.log('flatMap=' + flatMapped.join(','));
+
+// chaining: filter -> map -> toArray
+const chained = await Readable.from([1, 2, 3, 4, 5, 6])
+  .filter(x => x % 2 === 0)
+  .map(x => x * x)
+  .toArray();
+console.log('chain=' + chained.join(','));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "readable helpers failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "map=10,20,30",
+        "filter=2,4",
+        "reduce=10",
+        "reduce_no_init=24",
+        "forEach=A,B,C",
+        "some_true=true",
+        "some_false=false",
+        "every_true=true",
+        "every_false=false",
+        "find=20",
+        "find_none=undefined",
+        "drop=3,4,5",
+        "take=1,2,3",
+        "flatMap=1,10,2,20,3,30",
+        "chain=4,16,36",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

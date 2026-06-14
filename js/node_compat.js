@@ -3538,7 +3538,145 @@
         };
       }
 
-      static from(iterable) {
+      map(fn) {
+        const src = this;
+        return new Readable({
+          objectMode: true,
+          async read() {
+            for await (const chunk of src) {
+              var result = fn(chunk);
+              if (result && typeof result.then === "function") result = await result;
+              this.push(result);
+            }
+            this.push(null);
+          },
+        });
+      }
+
+      filter(fn) {
+        const src = this;
+        return new Readable({
+          objectMode: true,
+          async read() {
+            for await (const chunk of src) {
+              var keep = fn(chunk);
+              if (keep && typeof keep.then === "function") keep = await keep;
+              if (keep) this.push(chunk);
+            }
+            this.push(null);
+          },
+        });
+      }
+
+      async reduce(fn, initial) {
+        var acc = initial;
+        var first = true;
+        for await (const chunk of this) {
+          if (first && acc === undefined) {
+            acc = chunk;
+            first = false;
+            continue;
+          }
+          first = false;
+          acc = fn(acc, chunk);
+          if (acc && typeof acc.then === "function") acc = await acc;
+        }
+        return acc;
+      }
+
+      async toArray() {
+        const arr = [];
+        for await (const chunk of this) arr.push(chunk);
+        return arr;
+      }
+
+      async forEach(fn) {
+        for await (const chunk of this) {
+          var r = fn(chunk);
+          if (r && typeof r.then === "function") await r;
+        }
+      }
+
+      async some(fn) {
+        for await (const chunk of this) {
+          var result = fn(chunk);
+          if (result && typeof result.then === "function") result = await result;
+          if (result) return true;
+        }
+        return false;
+      }
+
+      async every(fn) {
+        for await (const chunk of this) {
+          var result = fn(chunk);
+          if (result && typeof result.then === "function") result = await result;
+          if (!result) return false;
+        }
+        return true;
+      }
+
+      async find(fn) {
+        for await (const chunk of this) {
+          var result = fn(chunk);
+          if (result && typeof result.then === "function") result = await result;
+          if (result) return chunk;
+        }
+        return undefined;
+      }
+
+      flatMap(fn) {
+        const src = this;
+        return new Readable({
+          objectMode: true,
+          async read() {
+            for await (const chunk of src) {
+              var result = fn(chunk);
+              if (result && typeof result.then === "function") result = await result;
+              if (result != null && typeof result[Symbol.asyncIterator] === "function") {
+                for await (const item of result) this.push(item);
+              } else if (result != null && typeof result[Symbol.iterator] === "function" && typeof result !== "string") {
+                for (const item of result) this.push(item);
+              } else {
+                this.push(result);
+              }
+            }
+            this.push(null);
+          },
+        });
+      }
+
+      drop(n) {
+        const src = this;
+        return new Readable({
+          objectMode: true,
+          async read() {
+            var skipped = 0;
+            for await (const chunk of src) {
+              if (skipped < n) { skipped++; continue; }
+              this.push(chunk);
+            }
+            this.push(null);
+          },
+        });
+      }
+
+      take(n) {
+        const src = this;
+        return new Readable({
+          objectMode: true,
+          async read() {
+            var taken = 0;
+            for await (const chunk of src) {
+              this.push(chunk);
+              taken++;
+              if (taken >= n) break;
+            }
+            this.push(null);
+          },
+        });
+      }
+
+            static from(iterable) {
         const iterator =
           iterable[Symbol.asyncIterator]?.() ?? iterable[Symbol.iterator]?.();
         if (!iterator) throw new TypeError("Readable.from requires an iterable");
@@ -5012,6 +5150,13 @@
           _importedKeys.set(kid, { format: "raw", data: raw, algo: algorithm });
           return new CryptoKey(algorithm, "secret", extractable, keyUsages, kid);
         }
+        if (algoName === "AES-GCM" || algoName === "AES-CBC" || algoName === "AES-CTR") {
+          var aesLen = (algorithm.length || 256) / 8;
+          var aesRaw = natives.cryptoRandomFill(aesLen);
+          var aesKid = _keyIdCounter++;
+          _importedKeys.set(aesKid, { format: "raw", data: aesRaw, algo: algorithm });
+          return new CryptoKey(algorithm, "secret", extractable, keyUsages, aesKid);
+        }
         throw new Error("subtle.generateKey: unsupported algorithm " + algoName);
       },
       async deriveBits(algorithm, baseKey, length) {
@@ -5058,6 +5203,89 @@
         }
         var bits = await this.deriveBits(algorithm, baseKey, length);
         return this.importKey("raw", bits, derivedKeyType, extractable, keyUsages);
+      },
+      async encrypt(algorithm, key, data) {
+        var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        var stored = _importedKeys.get(key._id);
+        if (!stored) throw new Error("subtle.encrypt: unknown key");
+        var keyMat = stored.data;
+        var plainArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        if (algoName === "AES-GCM") {
+          var iv = new Uint8Array(algorithm.iv);
+          var cn = keyMat.length === 16 ? "aes-128-gcm" : "aes-256-gcm";
+          var h = natives.cryptoCipherCreate(cn, keyMat, iv, true);
+          if (algorithm.additionalData) natives.cryptoCipherSetAad(h, new Uint8Array(algorithm.additionalData));
+          natives.cryptoCipherUpdate(h, plainArr);
+          var ct = natives.cryptoCipherFinalGcm(h);
+          var tag = natives.cryptoCipherGetAuthTag(h);
+          var out = new Uint8Array(ct.length + tag.length);
+          out.set(ct, 0);
+          out.set(tag, ct.length);
+          return out.buffer;
+        }
+        if (algoName === "AES-CBC") {
+          var iv2 = new Uint8Array(algorithm.iv);
+          var cn2 = keyMat.length === 16 ? "aes-128-cbc" : "aes-256-cbc";
+          var h2 = natives.cryptoCipherCreate(cn2, keyMat, iv2, true);
+          natives.cryptoCipherUpdate(h2, plainArr);
+          var ct2 = natives.cryptoCipherFinal(h2);
+          return ct2.buffer.slice(ct2.byteOffset, ct2.byteOffset + ct2.byteLength);
+        }
+        if (algoName === "AES-CTR") {
+          var ctr = new Uint8Array(algorithm.counter);
+          var cn3 = keyMat.length === 16 ? "aes-128-ctr" : "aes-256-ctr";
+          var h3 = natives.cryptoCipherCreate(cn3, keyMat, ctr, true);
+          natives.cryptoCipherUpdate(h3, plainArr);
+          var ct3 = natives.cryptoCipherFinal(h3);
+          return ct3.buffer.slice(ct3.byteOffset, ct3.byteOffset + ct3.byteLength);
+        }
+        throw new Error("subtle.encrypt: unsupported algorithm " + algoName);
+      },
+      async decrypt(algorithm, key, data) {
+        var algoName = webcryptoAlgoName(algorithm).toUpperCase();
+        var stored = _importedKeys.get(key._id);
+        if (!stored) throw new Error("subtle.decrypt: unknown key");
+        var keyMat = stored.data;
+        var cipherArr = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        if (algoName === "AES-GCM") {
+          var iv = new Uint8Array(algorithm.iv);
+          var tagLen = (algorithm.tagLength || 128) / 8;
+          var cn = keyMat.length === 16 ? "aes-128-gcm" : "aes-256-gcm";
+          var ctPart = cipherArr.slice(0, cipherArr.length - tagLen);
+          var tagPart = cipherArr.slice(cipherArr.length - tagLen);
+          var h = natives.cryptoCipherCreate(cn, keyMat, iv, false);
+          if (algorithm.additionalData) natives.cryptoCipherSetAad(h, new Uint8Array(algorithm.additionalData));
+          natives.cryptoCipherSetAuthTag(h, tagPart);
+          natives.cryptoCipherUpdate(h, ctPart);
+          var pt = natives.cryptoCipherFinalGcm(h);
+          return pt.buffer.slice(pt.byteOffset, pt.byteOffset + pt.byteLength);
+        }
+        if (algoName === "AES-CBC") {
+          var iv2 = new Uint8Array(algorithm.iv);
+          var cn2 = keyMat.length === 16 ? "aes-128-cbc" : "aes-256-cbc";
+          var h2 = natives.cryptoCipherCreate(cn2, keyMat, iv2, false);
+          natives.cryptoCipherUpdate(h2, cipherArr);
+          var pt2 = natives.cryptoCipherFinal(h2);
+          return pt2.buffer.slice(pt2.byteOffset, pt2.byteOffset + pt2.byteLength);
+        }
+        if (algoName === "AES-CTR") {
+          var ctr = new Uint8Array(algorithm.counter);
+          var cn3 = keyMat.length === 16 ? "aes-128-ctr" : "aes-256-ctr";
+          var h3 = natives.cryptoCipherCreate(cn3, keyMat, ctr, false);
+          natives.cryptoCipherUpdate(h3, cipherArr);
+          var pt3 = natives.cryptoCipherFinal(h3);
+          return pt3.buffer.slice(pt3.byteOffset, pt3.byteOffset + pt3.byteLength);
+        }
+        throw new Error("subtle.decrypt: unsupported algorithm " + algoName);
+      },
+      async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+        var exported = await this.exportKey(format, key);
+        var data = exported instanceof ArrayBuffer ? exported : new Uint8Array(exported).buffer;
+        return this.encrypt(wrapAlgorithm, wrappingKey, data);
+      },
+      async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
+        var decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+        return this.importKey(format, decrypted, unwrappedKeyAlgorithm, extractable, keyUsages);
       },
     };
 
