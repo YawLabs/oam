@@ -1743,10 +1743,150 @@
       return true;
     }
 
+    function parseArgs(config) {
+      config = config || {};
+      var argv = config.args || globalThis.process.argv.slice(2);
+      var options = config.options || {};
+      var strict = config.strict !== false;
+      var allowPositionals = config.allowPositionals !== false;
+      var tokens = [];
+      var values = {};
+      var positionals = [];
+
+      for (var name in options) {
+        if (options[name].default !== undefined) {
+          values[name] = options[name].default;
+        }
+      }
+
+      var i = 0;
+      while (i < argv.length) {
+        var arg = argv[i];
+
+        if (arg === "--") {
+          tokens.push({ kind: "option-terminator", index: i });
+          i++;
+          while (i < argv.length) {
+            positionals.push(argv[i]);
+            tokens.push({ kind: "positional", index: i, value: argv[i] });
+            i++;
+          }
+          break;
+        }
+
+        if (arg.startsWith("--")) {
+          var eqIdx = arg.indexOf("=");
+          var longName, longValue;
+          if (eqIdx !== -1) {
+            longName = arg.slice(2, eqIdx);
+            longValue = arg.slice(eqIdx + 1);
+          } else {
+            longName = arg.slice(2);
+            longValue = undefined;
+          }
+          var optDef = options[longName];
+          if (strict && !optDef) {
+            throw new TypeError("Unknown option '--" + longName + "'");
+          }
+          var optType = optDef ? optDef.type : "boolean";
+          if (optType === "string") {
+            if (longValue === undefined) {
+              i++;
+              if (i >= argv.length) {
+                throw new TypeError("Option '--" + longName + "' requires a value");
+              }
+              longValue = argv[i];
+            }
+            if (optDef && optDef.multiple) {
+              if (!Array.isArray(values[longName])) values[longName] = [];
+              values[longName].push(longValue);
+            } else {
+              values[longName] = longValue;
+            }
+          } else {
+            if (longValue !== undefined && strict) {
+              throw new TypeError("Option '--" + longName + "' does not take a value");
+            }
+            if (optDef && optDef.multiple) {
+              if (!Array.isArray(values[longName])) values[longName] = [];
+              values[longName].push(true);
+            } else {
+              values[longName] = true;
+            }
+          }
+          tokens.push({ kind: "option", name: longName, value: values[longName], index: i - (longValue !== undefined && eqIdx === -1 ? 1 : 0) });
+          i++;
+          continue;
+        }
+
+        if (arg.startsWith("-") && arg.length > 1 && arg[1] !== "-") {
+          var shortChars = arg.slice(1);
+          for (var ci = 0; ci < shortChars.length; ci++) {
+            var ch = shortChars[ci];
+            var shortName = null;
+            for (var oName in options) {
+              if (options[oName].short === ch) {
+                shortName = oName;
+                break;
+              }
+            }
+            if (strict && !shortName) {
+              throw new TypeError("Unknown option '-" + ch + "'");
+            }
+            if (!shortName) shortName = ch;
+            var sDef = options[shortName];
+            var sType = sDef ? sDef.type : "boolean";
+            if (sType === "string") {
+              var sVal;
+              if (ci + 1 < shortChars.length) {
+                sVal = shortChars.slice(ci + 1);
+                ci = shortChars.length;
+              } else {
+                i++;
+                if (i >= argv.length) {
+                  throw new TypeError("Option '-" + ch + "' requires a value");
+                }
+                sVal = argv[i];
+              }
+              if (sDef && sDef.multiple) {
+                if (!Array.isArray(values[shortName])) values[shortName] = [];
+                values[shortName].push(sVal);
+              } else {
+                values[shortName] = sVal;
+              }
+              tokens.push({ kind: "option", name: shortName, value: values[shortName], index: i });
+            } else {
+              if (sDef && sDef.multiple) {
+                if (!Array.isArray(values[shortName])) values[shortName] = [];
+                values[shortName].push(true);
+              } else {
+                values[shortName] = true;
+              }
+              tokens.push({ kind: "option", name: shortName, value: true, index: i });
+            }
+          }
+          i++;
+          continue;
+        }
+
+        if (!allowPositionals && strict) {
+          throw new TypeError("Unexpected argument '" + arg + "'");
+        }
+        positionals.push(arg);
+        tokens.push({ kind: "positional", index: i, value: arg });
+        i++;
+      }
+
+      var result = { values: values, positionals: positionals };
+      if (config.tokens) result.tokens = tokens;
+      return result;
+    }
+
     return {
       format,
       formatWithOptions: (_opts, ...args) => format(...args),
       inspect,
+      parseArgs,
       promisify,
       callbackify,
       inherits,
@@ -4958,6 +5098,11 @@
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
     return {
+      hash: (algorithm, data, outputEncoding) => {
+        var h = createHash(algorithm);
+        h.update(data);
+        return outputEncoding ? h.digest(outputEncoding) : h.digest();
+      },
       createHash,
       createHmac,
       randomBytes,

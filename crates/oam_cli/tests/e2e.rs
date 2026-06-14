@@ -6105,3 +6105,177 @@ console.log('onLine=' + (navigator.onLine === true));
         );
     }
 }
+
+#[test]
+fn util_parse_args_full_surface() {
+    let file = write_temp(
+        "util_parse_args.mjs",
+        r#"
+import { parseArgs } from 'node:util';
+
+// basic long options
+const r1 = parseArgs({
+  args: ['--name', 'alice', '--verbose'],
+  options: {
+    name:    { type: 'string' },
+    verbose: { type: 'boolean' },
+  },
+  allowPositionals: false,
+});
+console.log('name=' + r1.values.name);
+console.log('verbose=' + r1.values.verbose);
+console.log('pos0=' + r1.positionals.length);
+
+// short aliases
+const r2 = parseArgs({
+  args: ['-n', 'bob', '-v'],
+  options: {
+    name:    { type: 'string', short: 'n' },
+    verbose: { type: 'boolean', short: 'v' },
+  },
+  allowPositionals: false,
+});
+console.log('short_name=' + r2.values.name);
+console.log('short_verbose=' + r2.values.verbose);
+
+// positionals + option terminator
+const r3 = parseArgs({
+  args: ['--flag', 'pos1', '--', '--not-an-opt'],
+  options: { flag: { type: 'boolean' } },
+  allowPositionals: true,
+});
+console.log('flag=' + r3.values.flag);
+console.log('positionals=' + r3.positionals.join(','));
+
+// multiple values
+const r4 = parseArgs({
+  args: ['--tag', 'a', '--tag', 'b', '--tag', 'c'],
+  options: { tag: { type: 'string', multiple: true } },
+});
+console.log('tags=' + r4.values.tag.join(','));
+
+// default values
+const r5 = parseArgs({
+  args: [],
+  options: { color: { type: 'string', default: 'blue' } },
+});
+console.log('default_color=' + r5.values.color);
+
+// equals syntax
+const r6 = parseArgs({
+  args: ['--output=json'],
+  options: { output: { type: 'string' } },
+});
+console.log('eq_output=' + r6.values.output);
+
+// tokens mode
+const r7 = parseArgs({
+  args: ['--x', 'pos'],
+  options: { x: { type: 'boolean' } },
+  tokens: true,
+  allowPositionals: true,
+});
+console.log('has_tokens=' + Array.isArray(r7.tokens));
+console.log('token_kinds=' + r7.tokens.map(t => t.kind).join(','));
+
+// strict: unknown option throws
+let threw = false;
+try { parseArgs({ args: ['--unknown'], strict: true }); }
+catch (e) { threw = true; }
+console.log('strict_threw=' + threw);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "util.parseArgs test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "name=alice",
+        "verbose=true",
+        "pos0=0",
+        "short_name=bob",
+        "short_verbose=true",
+        "flag=true",
+        "positionals=pos1,--not-an-opt",
+        "tags=a,b,c",
+        "default_color=blue",
+        "eq_output=json",
+        "has_tokens=true",
+        "token_kinds=option,positional",
+        "strict_threw=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn crypto_hash_one_shot() {
+    let file = write_temp(
+        "crypto_hash.mjs",
+        r#"
+import crypto from 'node:crypto';
+
+// basic hex output
+const h1 = crypto.hash('sha256', 'hello', 'hex');
+console.log('sha256_hello=' + h1);
+
+// binary (buffer) output
+const h2 = crypto.hash('sha256', 'hello');
+console.log('is_buffer=' + (h2 instanceof Uint8Array));
+console.log('buf_len=' + h2.length);
+
+// matches createHash
+const h3 = crypto.createHash('sha256').update('hello').digest('hex');
+console.log('matches_createHash=' + (h1 === h3));
+
+// md5
+const h4 = crypto.hash('md5', 'test', 'hex');
+console.log('md5_test=' + h4);
+
+// sha512
+const h5 = crypto.hash('sha512', '', 'hex');
+// SHA-512 of empty string starts with cf83e1357
+console.log('sha512_empty_prefix=' + h5.startsWith('cf83e1357'));
+
+// base64 encoding
+const h6 = crypto.hash('sha256', 'hello', 'base64');
+console.log('base64_len=' + h6.length);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "crypto.hash test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "sha256_hello=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "is_buffer=true",
+        "buf_len=32",
+        "matches_createHash=true",
+        "md5_test=098f6bcd4621d373cade4e832627b4f6",
+        "sha512_empty_prefix=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assert!(
+        stdout.contains("base64_len="),
+        "missing base64 line.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
