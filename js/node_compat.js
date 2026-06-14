@@ -1346,12 +1346,15 @@
       // oam targets x86/arm64 (both LE); hardcoded -- revisit for BE platforms
       endianness: () => "LE",
       availableParallelism: () => natives.cpuCount,
-      cpus: () =>
-        Array.from({ length: natives.cpuCount }, () => ({
-          model: "unknown",
-          speed: 0,
+      cpus: () => {
+        const model = natives.cpuModel();
+        const speed = natives.cpuSpeed();
+        return Array.from({ length: natives.cpuCount }, () => ({
+          model,
+          speed,
           times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
-        })),
+        }));
+      },
       totalmem: () => natives.osTotalMem(),
       freemem: () => natives.osFreeMem(),
       uptime: () => natives.uptimeMs() / 1000,

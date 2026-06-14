@@ -224,6 +224,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // v8 heap / process memory
         ("heapStatistics", op_heap_statistics),
         ("processRss", op_process_rss),
+        // cpu info
+        ("cpuModel", op_cpu_model),
+        ("cpuSpeed", op_cpu_speed),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2565,5 +2568,143 @@ fn process_rss() -> usize {
         .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
         .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
+
+// ============================================================= CPU info
+
+fn op_cpu_model(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let model = cpu_model();
+    let val = v8::String::new(scope, &model).unwrap();
+    rv.set(val.into());
+}
+
+fn op_cpu_speed(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, cpu_speed_mhz() as f64).into());
+}
+
+#[cfg(windows)]
+fn cpu_model() -> String {
+    use std::ptr;
+
+    const KEY_READ: u32 = 0x20019;
+    const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
+
+    unsafe extern "system" {
+        fn RegOpenKeyExW(hKey: isize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut isize) -> i32;
+        fn RegQueryValueExW(hKey: isize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+        fn RegCloseKey(hKey: isize) -> i32;
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let sub_key = to_wide("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
+    let value_name = to_wide("ProcessorNameString");
+    let mut hkey: isize = 0;
+
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+    }
+
+    let mut buf = vec![0u8; 256];
+    let mut buf_len = buf.len() as u32;
+    let mut reg_type: u32 = 0;
+
+    let result = unsafe {
+        RegQueryValueExW(
+            hkey, value_name.as_ptr(), ptr::null_mut(), &mut reg_type,
+            buf.as_mut_ptr(), &mut buf_len,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+
+    if result != 0 || buf_len < 2 {
+        return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+    }
+
+    let wide: Vec<u16> = buf[..buf_len as usize]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&wide).trim().to_string()
+}
+
+#[cfg(windows)]
+fn cpu_speed_mhz() -> u32 {
+    use std::ptr;
+
+    const KEY_READ: u32 = 0x20019;
+    const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
+
+    unsafe extern "system" {
+        fn RegOpenKeyExW(hKey: isize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut isize) -> i32;
+        fn RegQueryValueExW(hKey: isize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+        fn RegCloseKey(hKey: isize) -> i32;
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let sub_key = to_wide("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
+    let value_name = to_wide("~MHz");
+    let mut hkey: isize = 0;
+
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        return 0;
+    }
+
+    let mut val: u32 = 0;
+    let mut val_len = 4u32;
+    let mut reg_type: u32 = 0;
+
+    let result = unsafe {
+        RegQueryValueExW(
+            hkey, value_name.as_ptr(), ptr::null_mut(), &mut reg_type,
+            &mut val as *mut u32 as *mut u8, &mut val_len,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+
+    if result != 0 { 0 } else { val }
+}
+
+#[cfg(not(windows))]
+fn cpu_model() -> String {
+    use std::fs;
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn cpu_speed_mhz() -> u32 {
+    use std::fs;
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("cpu MHz"))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|f| f as u32)
+        })
         .unwrap_or(0)
 }
