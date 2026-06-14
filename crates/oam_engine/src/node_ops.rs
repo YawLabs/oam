@@ -739,11 +739,99 @@ fn op_zlib_stream_close(
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
 
+/// WHATWG blob: origin -- only http/https inner URLs are transparent;
+/// ftp, ws, wss, nested blob:, or unparseable inner URLs yield 'null'.
+fn blob_origin(parsed: &url::Url) -> String {
+    debug_assert_eq!(parsed.scheme(), "blob");
+    let inner = parsed.path();
+    match url::Url::parse(inner) {
+        Ok(inner_url) => match inner_url.scheme() {
+            "http" | "https" => inner_url.origin().ascii_serialization(),
+            _ => "null".to_string(),
+        },
+        Err(_) => "null".to_string(),
+    }
+}
+
 /// Serialize every WHATWG component of a parsed URL in one bundle -- the
 /// JS class stores these and re-requests on mutation.
 fn url_components(parsed: &url::Url) -> serde_json::Value {
+    // --- Post-process href for non-special opaque-path URLs ---
+    // The url crate leaves spaces literal in opaque paths; WHATWG
+    // encodes only the trailing space (immediately before ?, #, or
+    // end-of-path) as %20. All other spaces remain literal.
+    let href = if parsed.cannot_be_a_base() && !is_special_scheme(parsed.scheme()) {
+        let raw = parsed.as_str();
+        let scheme_end = parsed.scheme().len() + 1;
+        let after_scheme = &raw[scheme_end..];
+        let (path_part, rest) = match after_scheme.find('?').or_else(|| after_scheme.find('#')) {
+            Some(pos) => (&after_scheme[..pos], &after_scheme[pos..]),
+            None => (after_scheme, ""),
+        };
+        if let Some(stripped) = path_part.strip_suffix(' ') {
+            format!("{}:{stripped}%20{rest}", parsed.scheme())
+        } else {
+            raw.to_string()
+        }
+    } else {
+        parsed.as_str().to_string()
+    };
+
+    // --- Post-process pathname ---
+    let raw_path = parsed.path();
+    let pathname = if parsed.cannot_be_a_base()
+        && !is_special_scheme(parsed.scheme())
+        && raw_path.ends_with(' ')
+    {
+        let stripped = &raw_path[..raw_path.len() - 1];
+        format!("{stripped}%20")
+    } else {
+        raw_path.to_string()
+    };
+    let pathname = pathname.replace('^', "%5E");
+
+    // --- Post-process href: encode ^ in the path portion only ---
+    let href = if href.contains('^') {
+        // Find path boundaries in the href to limit ^ replacement
+        let scheme_plus_authority = {
+            let s = parsed.scheme().len() + 3; // "scheme://"
+            match parsed.host_str() {
+                Some(_) => {
+                    // Find end of authority: position after host(:port)
+                    // Use the pathname start as the boundary
+                    match href[s..].find('/') {
+                        Some(pos) => s + pos,
+                        None => s,
+                    }
+                }
+                None => parsed.scheme().len() + 1, // "scheme:" for opaque
+            }
+        };
+        let query_start = href.find('?').unwrap_or(href.len());
+        let frag_start = href.find('#').unwrap_or(href.len());
+        let path_end = query_start.min(frag_start);
+        let before_path = &href[..scheme_plus_authority];
+        let path_section = &href[scheme_plus_authority..path_end];
+        let after_path = &href[path_end..];
+        format!(
+            "{}{}{}",
+            before_path,
+            path_section.replace('^', "%5E"),
+            after_path
+        )
+    } else {
+        href
+    };
+
+    // --- origin: blob: gets WHATWG-correct opaque for non-http/https ---
+    let origin = if parsed.scheme() == "blob" {
+        blob_origin(parsed)
+    } else {
+        parsed.origin().ascii_serialization()
+    };
+
     serde_json::json!({
-        "href": parsed.as_str(),
+        "href": href,
         "protocol": format!("{}:", parsed.scheme()),
         "username": parsed.username(),
         "password": parsed.password().unwrap_or(""),
@@ -754,14 +842,14 @@ fn url_components(parsed: &url::Url) -> serde_json::Value {
             (Some(host), None) => host.to_string(),
             _ => String::new(),
         },
-        "pathname": parsed.path(),
+        "pathname": pathname,
         // Spec: the search GETTER is "" for both null and empty query
         // (href keeps a bare '?' for the empty-present case).
         "search": parsed.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
         // Spec: the hash GETTER returns "" when fragment is null or
         // empty; returns "#" + fragment only when fragment is non-empty.
         "hash": parsed.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
-        "origin": parsed.origin().ascii_serialization(),
+        "origin": origin,
     })
 }
 
@@ -771,10 +859,57 @@ fn url_components(parsed: &url::Url) -> serde_json::Value {
 /// (that aborts the process). Err is the user-facing message.
 fn parse_components(input: &str, base: Option<&str>) -> Result<String, String> {
     std::panic::catch_unwind(|| {
+        // --- Pre-process: file:///X| -> file:///X: (WHATWG legacy pipe
+        // as drive-letter delimiter) ---
+        let input_cow: std::borrow::Cow<str> = if input.len() >= 10
+            && input
+                .get(..8)
+                .is_some_and(|s| s.eq_ignore_ascii_case("file:///"))
+            && input
+                .as_bytes()
+                .get(8)
+                .is_some_and(|b| b.is_ascii_alphabetic())
+            && input.as_bytes().get(9) == Some(&b'|')
+            && input
+                .as_bytes()
+                .get(10)
+                .is_none_or(|b| matches!(b, b'/' | b'\\' | b'?' | b'#'))
+        {
+            let mut fixed = input.to_string();
+            // SAFETY: position 9 is a single-byte ASCII '|', replacing
+            // with single-byte ASCII ':'.
+            // Use safe approach via replacement.
+            fixed.replace_range(9..10, ":");
+            std::borrow::Cow::Owned(fixed)
+        } else {
+            std::borrow::Cow::Borrowed(input)
+        };
+
+        // --- Pre-process: for non-file special-scheme bases, collapse
+        // leading slashes/backslashes to "//" (WHATWG scheme-relative-
+        // special-authority-string starts at the third slash). file: is
+        // excluded because ///path in a file: context is an absolute path,
+        // not an authority. ---
+        let input_cow: std::borrow::Cow<str> = match base {
+            Some(b)
+                if input_cow.starts_with("///")
+                    && !b.starts_with("file:")
+                    && (b.starts_with("http:")
+                        || b.starts_with("https:")
+                        || b.starts_with("ws:")
+                        || b.starts_with("wss:")
+                        || b.starts_with("ftp:")) =>
+            {
+                let rest = input_cow.trim_start_matches(['/', '\\']);
+                std::borrow::Cow::Owned(format!("//{rest}"))
+            }
+            _ => input_cow,
+        };
+
         let parsed = match base {
-            None => url::Url::parse(input),
+            None => url::Url::parse(&input_cow),
             Some(base) => match url::Url::parse(base) {
-                Ok(base) => base.join(input),
+                Ok(base) => base.join(&input_cow),
                 Err(_) => return Err(format!("Invalid base URL: {base}")),
             },
         };
