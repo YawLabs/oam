@@ -174,9 +174,9 @@ fn op_fetch(
     };
     // Net permission gate: check the hostname extracted from the URL.
     {
-        let host = url::Url::parse(&request.url)
+        let host = ada_url::Url::parse(&request.url, None)
             .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .map(|u| u.hostname().to_string())
             .unwrap_or_default();
         if let Err(msg) = scope
             .get_slot::<crate::permissions::Permissions>()
@@ -275,9 +275,9 @@ fn op_ws_connect(
         .unwrap_or_default();
 
     {
-        let host = url::Url::parse(&url)
+        let host = ada_url::Url::parse(&url, None)
             .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .map(|u| u.hostname().to_string())
             .unwrap_or_default();
         if let Err(msg) = scope
             .get_slot::<crate::permissions::Permissions>()

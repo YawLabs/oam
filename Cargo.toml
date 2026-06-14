@@ -35,9 +35,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# WHATWG URL parsing (servo's reference implementation, incl. IDNA) — the
-# same engine Deno ships. The JS URL class is a thin wrapper over it.
-url = "2"
+# WHATWG URL parsing — ada is the same C++ parser Node.js ships (3-4x
+# faster than servo url on parse benchmarks). Rust FFI bindings.
+ada-url = "3"
 # node:crypto wave 1: RustCrypto streaming digests + HMAC (pure Rust,
 # builds on every tier-1 target) and OS randomness.
 sha1 = "0.10"

@@ -102,7 +102,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("hostname", op_hostname),
         ("username", op_username),
         ("makeRequire", op_make_require),
-        // WHATWG URL (servo url crate): parse + component mutation.
+        // WHATWG URL (ada parser, same as Node.js): parse + mutation.
         ("urlParse", op_url_parse),
         ("urlUpdate", op_url_update),
         // AsyncLocalStorage substrate: V8's continuation-preserved embedder
@@ -294,21 +294,22 @@ fn return_json(
 fn return_url_obj(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    c: &UrlComponents,
+    parsed: &ada_url::Url,
 ) {
     let obj = v8::Object::new(scope);
+    let origin = parsed.origin();
     let props: [(&str, &str); 11] = [
-        ("href", &c.href),
-        ("protocol", &c.protocol),
-        ("username", &c.username),
-        ("password", &c.password),
-        ("hostname", &c.hostname),
-        ("port", &c.port),
-        ("host", &c.host),
-        ("pathname", &c.pathname),
-        ("search", &c.search),
-        ("hash", &c.hash),
-        ("origin", &c.origin),
+        ("href", parsed.href()),
+        ("protocol", parsed.protocol()),
+        ("username", parsed.username()),
+        ("password", parsed.password()),
+        ("hostname", parsed.hostname()),
+        ("port", parsed.port()),
+        ("host", parsed.host()),
+        ("pathname", parsed.pathname()),
+        ("search", parsed.search()),
+        ("hash", parsed.hash()),
+        ("origin", &origin),
     ];
     for (key, val) in &props {
         if let (Some(k), Some(v)) = (v8::String::new(scope, key), v8::String::new(scope, val)) {
@@ -947,205 +948,6 @@ fn op_zlib_stream_close(
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
 
-/// WHATWG blob: origin -- only http/https inner URLs are transparent;
-/// ftp, ws, wss, nested blob:, or unparseable inner URLs yield 'null'.
-fn blob_origin(parsed: &url::Url) -> String {
-    debug_assert_eq!(parsed.scheme(), "blob");
-    let inner = parsed.path();
-    match url::Url::parse(inner) {
-        Ok(inner_url) => match inner_url.scheme() {
-            "http" | "https" => inner_url.origin().ascii_serialization(),
-            _ => "null".to_string(),
-        },
-        Err(_) => "null".to_string(),
-    }
-}
-
-struct UrlComponents {
-    href: String,
-    protocol: String,
-    username: String,
-    password: String,
-    hostname: String,
-    port: String,
-    host: String,
-    pathname: String,
-    search: String,
-    hash: String,
-    origin: String,
-}
-
-fn url_components(parsed: &url::Url) -> UrlComponents {
-    // --- Post-process href for non-special opaque-path URLs ---
-    // The url crate leaves spaces literal in opaque paths; WHATWG
-    // encodes only the trailing space (immediately before ?, #, or
-    // end-of-path) as %20. All other spaces remain literal.
-    let href = if parsed.cannot_be_a_base() && !is_special_scheme(parsed.scheme()) {
-        let raw = parsed.as_str();
-        let scheme_end = parsed.scheme().len() + 1;
-        let after_scheme = &raw[scheme_end..];
-        let (path_part, rest) = match after_scheme.find('?').or_else(|| after_scheme.find('#')) {
-            Some(pos) => (&after_scheme[..pos], &after_scheme[pos..]),
-            None => (after_scheme, ""),
-        };
-        if let Some(stripped) = path_part.strip_suffix(' ') {
-            format!("{}:{stripped}%20{rest}", parsed.scheme())
-        } else {
-            raw.to_string()
-        }
-    } else {
-        parsed.as_str().to_string()
-    };
-
-    // --- Post-process pathname ---
-    let raw_path = parsed.path();
-    let pathname = if parsed.cannot_be_a_base()
-        && !is_special_scheme(parsed.scheme())
-        && raw_path.ends_with(' ')
-    {
-        let stripped = &raw_path[..raw_path.len() - 1];
-        format!("{stripped}%20")
-    } else {
-        raw_path.to_string()
-    };
-    let pathname = pathname.replace('^', "%5E");
-
-    // --- Post-process href: encode ^ in the path portion only ---
-    let href = if href.contains('^') {
-        // Find path boundaries in the href to limit ^ replacement
-        let scheme_plus_authority = {
-            let s = parsed.scheme().len() + 3; // "scheme://"
-            match parsed.host_str() {
-                Some(_) => {
-                    // Find end of authority: position after host(:port)
-                    // Use the pathname start as the boundary
-                    match href[s..].find('/') {
-                        Some(pos) => s + pos,
-                        None => s,
-                    }
-                }
-                None => parsed.scheme().len() + 1, // "scheme:" for opaque
-            }
-        };
-        let query_start = href.find('?').unwrap_or(href.len());
-        let frag_start = href.find('#').unwrap_or(href.len());
-        let path_end = query_start.min(frag_start);
-        let before_path = &href[..scheme_plus_authority];
-        let path_section = &href[scheme_plus_authority..path_end];
-        let after_path = &href[path_end..];
-        format!(
-            "{}{}{}",
-            before_path,
-            path_section.replace('^', "%5E"),
-            after_path
-        )
-    } else {
-        href
-    };
-
-    // --- origin: blob: gets WHATWG-correct opaque for non-http/https ---
-    let origin = if parsed.scheme() == "blob" {
-        blob_origin(parsed)
-    } else {
-        parsed.origin().ascii_serialization()
-    };
-
-    UrlComponents {
-        href,
-        protocol: format!("{}:", parsed.scheme()),
-        username: parsed.username().to_string(),
-        password: parsed.password().unwrap_or("").to_string(),
-        hostname: parsed.host_str().unwrap_or("").to_string(),
-        port: parsed.port().map(|p| p.to_string()).unwrap_or_default(),
-        host: match (parsed.host_str(), parsed.port()) {
-            (Some(host), Some(port)) => format!("{host}:{port}"),
-            (Some(host), None) => host.to_string(),
-            _ => String::new(),
-        },
-        pathname,
-        search: parsed
-            .query()
-            .filter(|q| !q.is_empty())
-            .map(|q| format!("?{q}"))
-            .unwrap_or_default(),
-        hash: parsed
-            .fragment()
-            .filter(|f| !f.is_empty())
-            .map(|f| format!("#{f}"))
-            .unwrap_or_default(),
-        origin,
-    }
-}
-
-/// Parse with a PANIC boundary: rust-url carries debug assertions that
-/// hostile inputs (the WPT corpus reaches them) can trip; a library panic
-/// must surface as a JS TypeError, never unwind into V8's callback frames
-/// (that aborts the process). Err is the user-facing message.
-fn parse_components(input: &str, base: Option<&str>) -> Result<UrlComponents, String> {
-    std::panic::catch_unwind(|| {
-        // --- Pre-process: file:///X| -> file:///X: (WHATWG legacy pipe
-        // as drive-letter delimiter) ---
-        let input_cow: std::borrow::Cow<str> = if input.len() >= 10
-            && input
-                .get(..8)
-                .is_some_and(|s| s.eq_ignore_ascii_case("file:///"))
-            && input
-                .as_bytes()
-                .get(8)
-                .is_some_and(|b| b.is_ascii_alphabetic())
-            && input.as_bytes().get(9) == Some(&b'|')
-            && input
-                .as_bytes()
-                .get(10)
-                .is_none_or(|b| matches!(b, b'/' | b'\\' | b'?' | b'#'))
-        {
-            let mut fixed = input.to_string();
-            // SAFETY: position 9 is a single-byte ASCII '|', replacing
-            // with single-byte ASCII ':'.
-            // Use safe approach via replacement.
-            fixed.replace_range(9..10, ":");
-            std::borrow::Cow::Owned(fixed)
-        } else {
-            std::borrow::Cow::Borrowed(input)
-        };
-
-        // --- Pre-process: for non-file special-scheme bases, collapse
-        // leading slashes/backslashes to "//" (WHATWG scheme-relative-
-        // special-authority-string starts at the third slash). file: is
-        // excluded because ///path in a file: context is an absolute path,
-        // not an authority. ---
-        let input_cow: std::borrow::Cow<str> = match base {
-            Some(b)
-                if input_cow.starts_with("///")
-                    && !b.starts_with("file:")
-                    && (b.starts_with("http:")
-                        || b.starts_with("https:")
-                        || b.starts_with("ws:")
-                        || b.starts_with("wss:")
-                        || b.starts_with("ftp:")) =>
-            {
-                let rest = input_cow.trim_start_matches(['/', '\\']);
-                std::borrow::Cow::Owned(format!("//{rest}"))
-            }
-            _ => input_cow,
-        };
-
-        let parsed = match base {
-            None => url::Url::parse(&input_cow),
-            Some(base) => match url::Url::parse(base) {
-                Ok(base) => base.join(&input_cow),
-                Err(_) => return Err(format!("Invalid base URL: {base}")),
-            },
-        };
-        match parsed {
-            Ok(parsed) => Ok(url_components(&parsed)),
-            Err(_) => Err(format!("Invalid URL: {input}")),
-        }
-    })
-    .unwrap_or_else(|_| Err(format!("Invalid URL: {input}")))
-}
-
-/// urlParse(input, base?) -> components, or throws TypeError("Invalid URL").
 fn op_url_parse(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1167,15 +969,12 @@ fn op_url_parse(
             }
         }
     };
-    match parse_components(&input, base.as_deref()) {
-        Ok(components) => return_url_obj(scope, &mut rv, &components),
-        Err(message) => throw_type_error(scope, &message),
+    match ada_url::Url::parse(&input, base.as_deref()) {
+        Ok(parsed) => return_url_obj(scope, &mut rv, &parsed),
+        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
     }
 }
 
-/// urlUpdate(href, part, value) -> components after applying a WHATWG
-/// setter. Setter FAILURES are silent keep-old per spec (returns the
-/// unchanged components).
 fn op_url_update(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1189,343 +988,54 @@ fn op_url_update(
         throw_type_error(scope, "urlUpdate requires href, part, value");
         return;
     };
-    // Same panic boundary as parse_components: rust-url setter internals
-    // carry debug assertions hostile values can trip; spec setter
-    // semantics on failure are keep-old, so a panic returns the original.
-    let updated = std::panic::catch_unwind(|| update_components(&href, &part, &value))
-        .unwrap_or_else(|_| update_components(&href, "__noop", ""));
-    match updated {
-        Ok(components) => return_url_obj(scope, &mut rv, &components),
-        Err(message) => throw_type_error(scope, &message),
+    match update_url(&href, &part, &value) {
+        Ok(parsed) => return_url_obj(scope, &mut rv, &parsed),
+        Err(msg) => throw_type_error(scope, &msg),
     }
 }
 
-/// Whether `scheme` is a WHATWG "special" scheme.
-fn is_special_scheme(scheme: &str) -> bool {
-    matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp" | "file")
-}
-
-/// Strip tab / CR / LF from a setter value (WHATWG common pre-processing).
-fn strip_tab_cr_lf(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect()
-}
-
-/// Truncate `value` at the first occurrence of any char in `terminators`,
-/// returning the portion before the terminator (WHATWG host/hostname
-/// setter truncation for `/`, `?`, `#`, `\`).
-fn truncate_at_delimiters<'a>(value: &'a str, terminators: &[char]) -> &'a str {
-    match value.find(terminators.as_ref()) {
-        Some(pos) => &value[..pos],
-        None => value,
-    }
-}
-
-/// Apply one WHATWG setter to `href`, returning the resulting component
-/// bundle. "__noop" re-serializes unchanged (the panic-recovery path).
-fn update_components(href: &str, part: &str, value: &str) -> Result<UrlComponents, String> {
-    let Ok(mut parsed) = url::Url::parse(href) else {
-        return Err(format!("Invalid URL: {href}"));
-    };
+fn update_url(href: &str, part: &str, value: &str) -> Result<ada_url::Url, String> {
+    let mut parsed = ada_url::Url::parse(href, None).map_err(|_| format!("Invalid URL: {href}"))?;
     match part {
         "__noop" => {}
         "protocol" => {
-            // WHATWG: scan to the first ':', treat everything before it
-            // as the scheme candidate, ignore the rest.  The url crate's
-            // set_scheme does the actual validation (alpha-start, valid
-            // chars, special <-> special rules).
-            let candidate = match value.find(':') {
-                Some(pos) => &value[..pos],
-                None => value,
-            };
-            // Pre-strip tab/CR/LF per spec.
-            let cleaned = strip_tab_cr_lf(candidate);
-            let _ = parsed.set_scheme(&cleaned);
+            let _ = parsed.set_protocol(value);
         }
         "username" => {
-            let _ = parsed.set_username(value);
+            let _ = parsed.set_username(Some(value));
         }
         "password" => {
             let _ = parsed.set_password(if value.is_empty() { None } else { Some(value) });
         }
         "host" => {
-            // WHATWG host-state (setter form): strip tab/CR/LF, split
-            // host from port respecting IPv6 brackets, truncate at
-            // delimiters, file: forbids ':' and maps localhost/empty to
-            // the empty host.
-            let cleaned = strip_tab_cr_lf(value);
-            if parsed.scheme() == "file" {
-                // Truncate at '/', '?', '#', '\' for file host.
-                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#', '\\']);
-                if truncated.is_empty() {
-                    let _ = parsed.set_host(None);
-                } else if !truncated.contains(':') {
-                    if is_file_localhost(truncated) {
-                        let _ = parsed.set_host(None);
-                    } else {
-                        let _ = parsed.set_host(Some(truncated));
-                    }
-                }
-            } else if is_special_scheme(parsed.scheme()) {
-                // Special (non-file): truncate at '/', '?', '#', '\'.
-                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#', '\\']);
-                // WHATWG: '@' is a forbidden host code point; if it
-                // appears anywhere in the truncated value, the setter
-                // is a no-op (the entire set fails, not just truncation).
-                if truncated.contains('@') {
-                    // No-op.
-                } else if let Some((host, port_digits)) = split_host_port(truncated)
-                    && !host.is_empty()
-                    && parsed.set_host(Some(host)).is_ok()
-                {
-                    // Host set succeeded; apply port if present.
-                    maybe_apply_port(&mut parsed, port_digits.as_deref());
-                }
-            } else {
-                // Non-special schemes: truncate host part at '/', '?', '#'.
-                let truncated = truncate_at_delimiters(&cleaned, &['/', '?', '#']);
-                if let Some((host, port_digits)) = split_host_port(truncated) {
-                    // Non-special: empty host with credentials or port
-                    // in the value is a no-op.
-                    let has_creds = !parsed.username().is_empty()
-                        || parsed.password().is_some_and(|p| !p.is_empty());
-                    let has_port_in_value = port_digits.as_ref().is_some_and(|d| !d.is_empty());
-                    if host.is_empty() && (has_creds || has_port_in_value) {
-                        // No-op.
-                    } else if parsed.set_host(Some(host)).is_ok() {
-                        maybe_apply_port(&mut parsed, port_digits.as_deref());
-                    }
-                } else if truncated.is_empty() {
-                    if !parsed.username().is_empty()
-                        || parsed.password().is_some_and(|p| !p.is_empty())
-                    {
-                        // No-op: can't clear host when credentials exist.
-                    } else {
-                        let _ = parsed.set_host(Some(""));
-                    }
-                }
-            }
+            let _ = parsed.set_host(Some(value));
         }
         "hostname" => {
-            // The hostname setter FAILS WHOLE on ':' outside brackets.
-            let cleaned = strip_tab_cr_lf(value);
-            // Truncate at '/', '?', '#', '\' (for special schemes) before
-            // the colon check.
-            let delims: &[char] = if is_special_scheme(parsed.scheme()) {
-                &['/', '?', '#', '\\']
-            } else {
-                &['/', '?', '#']
-            };
-            let truncated = truncate_at_delimiters(&cleaned, delims);
-            if truncated.starts_with('[') || !truncated.contains(':') {
-                if parsed.scheme() == "file" {
-                    if truncated.is_empty() || is_file_localhost(truncated) {
-                        let _ = parsed.set_host(None);
-                    } else {
-                        let _ = parsed.set_host(Some(truncated));
-                    }
-                } else if is_special_scheme(parsed.scheme()) {
-                    // Special (non-file): '@' is a forbidden host code
-                    // point; if present, the entire setter is a no-op.
-                    if truncated.contains('@') {
-                        // No-op.
-                    } else if !truncated.is_empty() {
-                        let _ = parsed.set_host(Some(truncated));
-                    }
-                } else {
-                    // Non-special: empty hostname is allowed ONLY if there
-                    // is no username/password. Per WHATWG, setting hostname
-                    // to empty when credentials exist is a no-op.
-                    if truncated.is_empty()
-                        && (!parsed.username().is_empty()
-                            || parsed.password().is_some_and(|p| !p.is_empty()))
-                    {
-                        // No-op: can't clear host when credentials exist.
-                    } else {
-                        let _ = parsed.set_host(Some(truncated));
-                    }
-                }
-            }
+            let _ = parsed.set_hostname(Some(value));
         }
         "port" => {
-            if value.is_empty() {
-                let _ = parsed.set_port(None);
-            } else {
-                // WHATWG: strip tab/CR/LF first, then parse LEADING
-                // digits, ignore the rest; out of range or no digits =
-                // keep old.
-                let cleaned = strip_tab_cr_lf(value);
-                let digits: String = cleaned.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if !digits.is_empty()
-                    && let Ok(port) = digits.parse::<u32>()
-                    && port <= 65535
-                {
-                    apply_port(&mut parsed, port as u16);
-                }
-            }
+            let _ = parsed.set_port(if value.is_empty() { None } else { Some(value) });
         }
         "pathname" => {
-            // Opaque-path URLs (data:, mailto:, ...) ignore the pathname
-            // setter entirely, per spec.
-            if !parsed.cannot_be_a_base() {
-                let scheme = parsed.scheme().to_owned();
-                if scheme == "file" {
-                    // WHATWG: for file URLs, '\' in the path setter is
-                    // treated as '/' (special-scheme path-separator
-                    // equivalence). Pre-convert before handing to the
-                    // url crate.
-                    let converted = value.replace('\\', "/");
-                    parsed.set_path(&converted);
-                } else if !is_special_scheme(&scheme) {
-                    // Non-special: percent-encode '?' and '#' because
-                    // the WHATWG pathname setter uses "path state" which
-                    // does NOT terminate at these delimiters (they are
-                    // literal path characters, not query/fragment markers).
-                    let encoded = value.replace('?', "%3F").replace('#', "%23");
-                    if encoded.is_empty() {
-                        // WHATWG: empty pathname on a non-special URL.
-                        // If the URL has authority (host), empty path is
-                        // valid. If it doesn't, the path must be at least
-                        // "/".
-                        if parsed.host_str().is_some() {
-                            parsed.set_path("");
-                        } else {
-                            parsed.set_path("/");
-                        }
-                    } else {
-                        parsed.set_path(&encoded);
-                    }
-                } else {
-                    parsed.set_path(value);
-                }
-            }
+            let _ = parsed.set_pathname(Some(value));
         }
         "search" => {
-            // Strip exactly ONE leading '?'. An empty VALUE clears the
-            // query; a bare '?' keeps an empty-present query (href ends
-            // with '?', getter reads "").
             if value.is_empty() {
-                parsed.set_query(None);
+                parsed.set_search(None);
             } else {
-                let trimmed = value.strip_prefix('?').unwrap_or(value);
-                parsed.set_query(Some(trimmed));
+                parsed.set_search(Some(value));
             }
         }
         "hash" => {
             if value.is_empty() {
-                // Empty string: clear fragment entirely (null).
-                parsed.set_fragment(None);
+                parsed.set_hash(None);
             } else {
-                let trimmed = value.strip_prefix('#').unwrap_or(value);
-                // Even if trimmed is empty (value was "#"), set
-                // empty-present fragment: href gets trailing '#',
-                // getter returns "".
-                parsed.set_fragment(Some(trimmed));
+                parsed.set_hash(Some(value));
             }
         }
-        other => {
-            return Err(format!("urlUpdate: unknown part '{other}'"));
-        }
+        other => return Err(format!("urlUpdate: unknown part '{other}'")),
     }
-    Ok(url_components(&parsed))
-}
-
-/// Check if a hostname value should be treated as "localhost" for file:
-/// URLs (WHATWG: percent-decode then compare case-insensitively).
-fn is_file_localhost(value: &str) -> bool {
-    // Fast path: exact match without encoding.
-    if value.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // Percent-decode and re-check.
-    let decoded: String = percent_decode_str(value);
-    decoded.eq_ignore_ascii_case("localhost")
-}
-
-/// Simple percent-decode (only for hostname localhost check).
-fn percent_decode_str(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2
-                && let Ok(byte) = u8::from_str_radix(&hex, 16)
-            {
-                result.push(byte as char);
-                continue;
-            }
-            result.push('%');
-            result.push_str(&hex);
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Split a host-setter value into (host, port-digits), respecting IPv6
-/// brackets. None = unparseable shape (setter no-ops). The port side is
-/// the LEADING digits after ':' (WHATWG port-state with state override).
-fn split_host_port(value: &str) -> Option<(&str, Option<String>)> {
-    if let Some(rest) = value.strip_prefix('[') {
-        // Walk char_indices to find ']' so the slice end is guaranteed to
-        // land on a char boundary even if non-ASCII bytes precede the ']'.
-        let close_byte = rest
-            .char_indices()
-            .find(|(_, c)| *c == ']')
-            .map(|(i, _)| i)?;
-        // +1 for the leading '[' we stripped, +']'.len_utf8() (always 1).
-        let end = close_byte + 2;
-        assert!(
-            value.is_char_boundary(end),
-            "split_host_port: end is not a char boundary"
-        );
-        let host = &value[..end];
-        let after = &value[end..];
-        if after.is_empty() {
-            return Some((host, None));
-        }
-        let digits = after.strip_prefix(':')?;
-        let digits: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return Some((host, Some(digits)));
-    }
-    match value.split_once(':') {
-        None => Some((value, None)),
-        Some((host, rest)) => {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            Some((host, Some(digits)))
-        }
-    }
-}
-
-/// Parse and apply port digits if present (convenience for host setter).
-fn maybe_apply_port(parsed: &mut url::Url, digits: Option<&str>) {
-    if let Some(digits) = digits
-        && !digits.is_empty()
-        && let Ok(port) = digits.parse::<u32>()
-        && port <= 65535
-    {
-        apply_port(parsed, port as u16);
-    }
-}
-
-/// Set a port with default-port elision (http/ws 80, https/wss 443,
-/// ftp 21 serialize portless, per spec).
-fn apply_port(parsed: &mut url::Url, port: u16) {
-    let default = match parsed.scheme() {
-        "http" | "ws" => Some(80),
-        "https" | "wss" => Some(443),
-        "ftp" => Some(21),
-        _ => None,
-    };
-    let _ = parsed.set_port(if default == Some(port) {
-        None
-    } else {
-        Some(port)
-    });
+    Ok(parsed)
 }
 
 /// Read the current continuation frame (an immutable Map of

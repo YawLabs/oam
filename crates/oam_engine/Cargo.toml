@@ -16,7 +16,7 @@ oam_loader = { workspace = true }
 serde_json = { workspace = true }
 # WHATWG URL parse/mutate natives for the JS URL class, and permission
 # net-gate host extraction in ops.rs.
-url = { workspace = true }
+ada-url = { workspace = true }
 # node:crypto natives: streaming digests, HMAC, OS randomness.
 sha1 = { workspace = true }
 sha2 = { workspace = true }
