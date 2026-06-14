@@ -215,6 +215,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("spawnWait", op_spawn_wait),
         // dns
         ("dnsLookup", op_dns_lookup),
+        // stdin
+        ("stdinRead", op_stdin_read),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2306,4 +2308,14 @@ fn op_dns_lookup(
         &mut rv,
         oam_core::dns::dns_lookup(hostname, family, all),
     );
+}
+
+// ============================================================== stdin
+
+fn op_stdin_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    crate::ops::spawn_op(scope, &mut rv, oam_core::stdin_read());
 }

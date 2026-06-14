@@ -5207,3 +5207,50 @@ try {
     assert!(lines.iter().any(|l| l == &"resolve4-type: string"), "resolve4 should return strings: {stdout}");
     assert!(lines.iter().any(|l| l == &"bogus-code: ENOTFOUND"), "bogus hostname should ENOTFOUND: {stdout}");
 }
+
+#[test]
+fn process_stdin_is_readable_stream() {
+    use std::io::Write;
+
+    let f = write_temp(
+        "stdin_read.mjs",
+        r#"
+const chunks = [];
+for await (const chunk of process.stdin) {
+  chunks.push(chunk);
+}
+const text = Buffer.concat(chunks).toString();
+console.log('lines:', text.trim().split('\n').length);
+console.log('first:', text.trim().split('\n')[0]);
+console.log('isTTY:', process.stdin.isTTY);
+"#,
+    );
+    let cache = write_temp("oam-cache-stdin/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", f.to_str().unwrap()])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oam");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello world\ngoodbye world\n").unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdin test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("lines: 2"), "should read 2 lines: {stdout}");
+    assert!(stdout.contains("first: hello world"), "first line: {stdout}");
+    assert!(stdout.contains("isTTY: false"), "piped stdin not TTY: {stdout}");
+}

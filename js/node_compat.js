@@ -2340,7 +2340,23 @@
         columns: stderrIsTTY ? 80 : undefined,
         hasColors: () => stderrIsTTY,
       },
-      stdin: { fd: 0, isTTY: natives.isTTY(0) },
+      stdin: Object.assign(
+        new (registry.get("stream").Readable)({
+          read() {
+            natives.stdinRead().then(
+              (chunk) => {
+                if (chunk === undefined || chunk === null || chunk.length === 0) {
+                  this.push(null);
+                } else {
+                  this.push(registry.get("buffer").Buffer.from(chunk));
+                }
+              },
+              () => this.push(null),
+            );
+          },
+        }),
+        { fd: 0, isTTY: natives.isTTY(0) },
+      ),
       emitWarning(warning) {
         if (globalThis.console) {
           globalThis.console.warn(

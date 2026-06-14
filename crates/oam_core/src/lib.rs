@@ -276,6 +276,20 @@ impl Drop for CoreRuntime {
     }
 }
 
+pub async fn stdin_read() -> OpOutcome {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut buf = vec![0u8; 65536];
+    match stdin.read(&mut buf).await {
+        Ok(0) => OpOutcome::Done,
+        Ok(n) => {
+            buf.truncate(n);
+            OpOutcome::Bytes(buf)
+        }
+        Err(e) => OpOutcome::Failed(format!("stdin read: {e}")),
+    }
+}
+
 /// Map an I/O error to the Node errno code ecosystem code branches on.
 /// Shared by the async fs ops below and oam_engine's sync fs natives.
 pub fn node_error_code(error: &std::io::Error) -> &'static str {
