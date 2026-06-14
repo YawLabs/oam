@@ -6966,3 +6966,101 @@ console.log('chain=' + chained.join(','));
         );
     }
 }
+
+// ------------------------------------------------------------------ M3-11
+#[test]
+fn mimetype_crypto_extras_readable_statics() {
+    let file = write_temp(
+        "misc_m3.mjs",
+        r#"
+import util from 'node:util';
+import crypto from 'node:crypto';
+import { Readable } from 'node:stream';
+
+// -- util.MIMEType --
+const mime = new util.MIMEType('text/html; charset=utf-8; boundary="abc"');
+console.log('mime_type=' + mime.type);
+console.log('mime_subtype=' + mime.subtype);
+console.log('mime_essence=' + mime.essence);
+console.log('mime_charset=' + mime.params.get('charset'));
+console.log('mime_boundary=' + mime.params.get('boundary'));
+console.log('mime_str=' + mime.toString());
+
+const json = new util.MIMEType('application/json');
+console.log('json_type=' + json.type);
+console.log('json_subtype=' + json.subtype);
+console.log('json_params_has=' + json.params.has('charset'));
+
+// invalid MIME
+try {
+  new util.MIMEType('invalid');
+  console.log('invalid_mime=no_error');
+} catch (e) {
+  console.log('invalid_mime=error');
+}
+
+// -- crypto.getCurves --
+const curves = crypto.getCurves();
+console.log('curves_includes_p256=' + curves.includes('prime256v1'));
+console.log('curves_includes_ed25519=' + curves.includes('ed25519'));
+
+// -- crypto.generateKeySync --
+const aesKey = crypto.generateKeySync('aes', { length: 128 });
+console.log('genkey_type=' + aesKey.type);
+console.log('genkey_size=' + aesKey.symmetricKeySize);
+
+const hmacKey = crypto.generateKeySync('hmac', { length: 512 });
+console.log('hmackey_type=' + hmacKey.type);
+console.log('hmackey_size=' + hmacKey.symmetricKeySize);
+
+// -- Readable.isDisturbed / isReadable --
+const r = new Readable({ read() {} });
+console.log('is_readable_fresh=' + Readable.isReadable(r));
+console.log('is_disturbed_fresh=' + Readable.isDisturbed(r));
+r.destroy();
+console.log('is_readable_destroyed=' + Readable.isReadable(r));
+console.log('is_disturbed_destroyed=' + Readable.isDisturbed(r));
+
+// -- process.abort exists --
+console.log('process_abort_type=' + typeof process.abort);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3 failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "mime_type=text",
+        "mime_subtype=html",
+        "mime_essence=text/html",
+        "mime_charset=utf-8",
+        "mime_boundary=abc",
+        "mime_str=text/html;charset=utf-8;boundary=abc",
+        "json_type=application",
+        "json_subtype=json",
+        "json_params_has=false",
+        "invalid_mime=error",
+        "curves_includes_p256=true",
+        "curves_includes_ed25519=true",
+        "genkey_type=secret",
+        "genkey_size=16",
+        "hmackey_type=secret",
+        "hmackey_size=64",
+        "is_readable_fresh=true",
+        "is_disturbed_fresh=false",
+        "is_readable_destroyed=false",
+        "is_disturbed_destroyed=true",
+        "process_abort_type=function",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

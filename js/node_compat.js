@@ -1894,6 +1894,38 @@
       formatWithOptions: (_opts, ...args) => format(...args),
       inspect,
       parseArgs,
+      MIMEType: function MIMETypeClass(input) {
+        if (!(this instanceof MIMETypeClass)) throw new TypeError("MIMEType is a constructor, call with new");
+        var str = String(input).trim();
+        var semi = str.indexOf(";");
+        var essence = semi === -1 ? str : str.slice(0, semi).trim();
+        var slash = essence.indexOf("/");
+        if (slash === -1) throw new TypeError("Invalid MIME type: " + input);
+        this.type = essence.slice(0, slash).toLowerCase();
+        this.subtype = essence.slice(slash + 1).toLowerCase();
+        this.essence = this.type + "/" + this.subtype;
+        var params = new Map();
+        if (semi !== -1) {
+          var rest = str.slice(semi + 1);
+          var parts = rest.split(";");
+          for (var i = 0; i < parts.length; i++) {
+            var part = parts[i].trim();
+            if (!part) continue;
+            var eq = part.indexOf("=");
+            if (eq === -1) continue;
+            var k = part.slice(0, eq).trim().toLowerCase();
+            var v = part.slice(eq + 1).trim();
+            if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') v = v.slice(1, -1);
+            params.set(k, v);
+          }
+        }
+        this.params = { get: function(k) { return params.get(k.toLowerCase()); }, set: function(k, v) { params.set(k.toLowerCase(), v); }, has: function(k) { return params.has(k.toLowerCase()); }, delete: function(k) { return params.delete(k.toLowerCase()); }, entries: function() { return params.entries(); }, keys: function() { return params.keys(); }, values: function() { return params.values(); }, forEach: function(fn) { params.forEach(fn); } };
+        this.toString = function() {
+          var s = this.type + "/" + this.subtype;
+          params.forEach(function(v, k) { s += ";" + k + "=" + v; });
+          return s;
+        };
+      },
       promisify,
       callbackify,
       inherits,
@@ -2885,6 +2917,7 @@
         },
         { bigint: () => natives.hrtimeNanos() },
       ),
+      abort: () => { natives.processExit(134); },
       uptime: () => natives.uptimeMs() / 1000,
       memoryUsage: Object.assign(
         () => {
@@ -3714,6 +3747,16 @@
             );
           },
         });
+      }
+
+      static isDisturbed(stream) {
+        if (stream && stream._rState) return stream._rState.reading || stream._rState.ended || stream._rState.destroyed;
+        return false;
+      }
+
+      static isReadable(stream) {
+        if (stream && stream._rState) return !stream._rState.destroyed && !stream._rState.endEmitted;
+        return false;
       }
 
       static toWeb(nodeReadable) {
@@ -5537,6 +5580,37 @@
       randomInt,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
+      getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
+      generateKeySync: (type, options) => {
+        if (type === "aes") {
+          var len = (options && options.length) || 256;
+          return createSecretKey(natives.cryptoRandomFill(len / 8));
+        }
+        if (type === "hmac") {
+          var hLen = (options && options.length) || 256;
+          return createSecretKey(natives.cryptoRandomFill(hLen / 8));
+        }
+        throw new Error("generateKeySync: unsupported type " + type);
+      },
+      generateKey: (type, options, callback) => {
+        try {
+          var result;
+          if (type === "aes") {
+            var len = (options && options.length) || 256;
+            result = createSecretKey(natives.cryptoRandomFill(len / 8));
+          } else if (type === "hmac") {
+            var hLen = (options && options.length) || 256;
+            result = createSecretKey(natives.cryptoRandomFill(hLen / 8));
+          } else {
+            throw new Error("generateKey: unsupported type " + type);
+          }
+          if (callback) queueMicrotask(() => callback(null, result));
+          else return result;
+        } catch (err) {
+          if (callback) queueMicrotask(() => callback(err));
+          else throw err;
+        }
+      },
       getCiphers,
       KeyObject,
       createSecretKey,
