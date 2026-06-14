@@ -5818,3 +5818,81 @@ fn fs_opendir_and_cp() {
         );
     }
 }
+
+#[test]
+fn crypto_generate_keypair_ed25519() {
+    let file = write_temp(
+        "crypto_gkp.mjs",
+        r#"
+import crypto from 'node:crypto';
+
+// 1. generateKeyPairSync returns PEM strings
+const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+console.log('hasPub=' + (publicKey.includes('BEGIN PUBLIC KEY')));
+console.log('hasPriv=' + (privateKey.includes('BEGIN PRIVATE KEY')));
+
+// 2. sign+verify roundtrip with generated keys
+const sign = crypto.createSign('ed25519');
+sign.update('hello world');
+const sig = sign.sign(privateKey);
+console.log('sigLen=' + (sig.length > 0));
+
+const verify = crypto.createVerify('ed25519');
+verify.update('hello world');
+console.log('verified=' + verify.verify(publicKey, sig));
+
+// 3. one-shot sign/verify
+const sig2 = crypto.sign('ed25519', Buffer.from('test'), privateKey);
+const ok2 = crypto.verify('ed25519', Buffer.from('test'), publicKey, sig2);
+console.log('oneshot=' + ok2);
+
+// 4. wrong data fails verification
+const verify2 = crypto.createVerify('ed25519');
+verify2.update('wrong data');
+console.log('wrongData=' + (verify2.verify(publicKey, sig) === false));
+
+// 5. DER format option
+const { publicKey: derPub, privateKey: derPriv } = crypto.generateKeyPairSync('ed25519', {
+  publicKeyEncoding: { type: 'spki', format: 'der' },
+  privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+});
+console.log('derPubBuf=' + Buffer.isBuffer(derPub));
+console.log('derPrivBuf=' + Buffer.isBuffer(derPriv));
+
+// 6. async generateKeyPair
+crypto.generateKeyPair('ed25519', (err, pub2, priv2) => {
+  console.log('asyncErr=' + (err === null));
+  console.log('asyncPub=' + (typeof pub2 === 'string' && pub2.includes('BEGIN PUBLIC KEY')));
+  console.log('asyncPriv=' + (typeof priv2 === 'string' && priv2.includes('BEGIN PRIVATE KEY')));
+});
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "crypto generateKeyPair failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "hasPub=true",
+        "hasPriv=true",
+        "sigLen=true",
+        "verified=true",
+        "oneshot=true",
+        "wrongData=true",
+        "derPubBuf=true",
+        "derPrivBuf=true",
+        "asyncErr=true",
+        "asyncPub=true",
+        "asyncPriv=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

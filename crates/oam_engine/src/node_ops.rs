@@ -13,7 +13,7 @@ use crate::crypto_ops::{
     op_crypto_cipher_set_auto_padding, op_crypto_cipher_update, op_crypto_hash_copy,
     op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update, op_crypto_hkdf_sync,
     op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_random_fill, op_crypto_scrypt_sync,
-    op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify,
+    op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify, op_crypto_generate_keypair,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -213,6 +213,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:crypto wave 3: asymmetric sign/verify (RSA, ECDSA, Ed25519)
         ("cryptoSign", op_crypto_sign),
         ("cryptoVerify", op_crypto_verify),
+        ("cryptoGenerateKeyPair", op_crypto_generate_keypair),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads

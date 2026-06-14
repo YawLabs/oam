@@ -882,6 +882,7 @@ fn gcm_decrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String>
 // Wave 3: RSA (PKCS#1 v1.5, PSS) and ECDSA (P-256, P-384) via ring.
 
 use ring::signature as ring_sig;
+use ring_sig::KeyPair as _;
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
@@ -1087,6 +1088,94 @@ fn crypto_verify_ed25519(
     match pub_key.verify(data, signature) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
+    }
+}
+
+fn crypto_generate_ed25519() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8_doc = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|e| format!("Ed25519 keygen: {e}"))?;
+    let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8_doc.as_ref())
+        .map_err(|e| format!("Ed25519 parse: {e}"))?;
+    let priv_pem = der_to_pem(pkcs8_doc.as_ref(), "PRIVATE KEY");
+    let pub_der = key_pair.public_key().as_ref();
+    let pub_spki = wrap_ed25519_spki(pub_der);
+    let pub_pem = der_to_pem(&pub_spki, "PUBLIC KEY");
+    Ok((priv_pem.into_bytes(), pub_pem.into_bytes()))
+}
+
+fn der_to_pem(der: &[u8], label: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+fn wrap_ed25519_spki(pub_key: &[u8]) -> Vec<u8> {
+    // Ed25519 OID: 1.3.101.112 = 06 03 2b 65 70
+    let algo_id: &[u8] = &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+    let bit_string_len = 1 + pub_key.len(); // 1 byte for unused-bits count
+    let seq_content_len = algo_id.len() + 2 + bit_string_len; // 2 = tag + length of BIT STRING
+    let total_len = 2 + seq_content_len; // 2 = SEQUENCE tag + length
+
+    let mut der = Vec::with_capacity(total_len + 4);
+    der.push(0x30); // SEQUENCE
+    encode_asn1_length(&mut der, seq_content_len);
+    der.extend_from_slice(algo_id);
+    der.push(0x03); // BIT STRING
+    encode_asn1_length(&mut der, bit_string_len);
+    der.push(0x00); // unused bits
+    der.extend_from_slice(pub_key);
+    der
+}
+
+fn encode_asn1_length(buf: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        buf.push(len as u8);
+    } else if len < 0x100 {
+        buf.push(0x81);
+        buf.push(len as u8);
+    } else {
+        buf.push(0x82);
+        buf.push((len >> 8) as u8);
+        buf.push((len & 0xff) as u8);
+    }
+}
+
+pub(crate) fn op_crypto_generate_keypair(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(key_type) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "generateKeyPair: type required");
+        return;
+    };
+    match key_type.as_str() {
+        "ed25519" => match crypto_generate_ed25519() {
+            Ok((priv_pem, pub_pem)) => {
+                let obj = v8::Object::new(scope);
+                if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&priv_pem).unwrap()) {
+                    let key = v8::String::new(scope, "privateKey").unwrap();
+                    obj.set(scope, key.into(), pk.into());
+                }
+                if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&pub_pem).unwrap()) {
+                    let key = v8::String::new(scope, "publicKey").unwrap();
+                    obj.set(scope, key.into(), pk.into());
+                }
+                rv.set(obj.into());
+            }
+            Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+        },
+        _ => {
+            let msg = format!("generateKeyPairSync: unsupported type '{}' (oam supports ed25519)", key_type);
+            crate::node_ops::throw_type_error(scope, &msg);
+        }
     }
 }
 

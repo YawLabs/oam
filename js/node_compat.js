@@ -4202,7 +4202,17 @@
       if (pem.includes("EC PRIVATE") || pem.includes("EC PUBLIC")) return "ec";
       if (pem.includes("ED25519") || pem.includes("ed25519")) return "ed25519";
       if (pem.includes("RSA PRIVATE") || pem.includes("RSA PUBLIC")) return "rsa";
-      if (pem.includes("BEGIN PRIVATE KEY") || pem.includes("BEGIN PUBLIC KEY")) return "rsa";
+      if (pem.includes("BEGIN PRIVATE KEY") || pem.includes("BEGIN PUBLIC KEY")) {
+        var lines = pem.split("\n").filter(function(l) { return l.length > 0 && l.charAt(0) !== "-"; });
+        var b64 = lines.join("");
+        var der = BufferCtor.from(b64, "base64");
+        var hex = "";
+        for (var i = 0; i < der.length && i < 20; i++) hex += ("0" + der[i].toString(16)).slice(-2);
+        if (hex.indexOf("06032b6570") !== -1) return "ed25519";
+        if (hex.indexOf("06032b6571") !== -1) return "ed25519";
+        if (hex.indexOf("2a8648ce3d") !== -1) return "ec";
+        return "rsa";
+      }
       return "rsa";
     }
 
@@ -4328,6 +4338,7 @@
 
     function normalizeAlgo(raw) {
       var s = raw.toUpperCase();
+      if (s === "ED25519") return "ed25519";
       if (s === "RSA-SHA256" || s === "SHA256WITHRSA") return "SHA256";
       if (s === "RSA-SHA384" || s === "SHA384WITHRSA") return "SHA384";
       if (s === "RSA-SHA512" || s === "SHA512WITHRSA") return "SHA512";
@@ -4637,6 +4648,36 @@
       return SUPPORTED_CIPHERS.slice();
     }
 
+    function generateKeyPairSync(type, options) {
+      const result = natives.cryptoGenerateKeyPair(type);
+      const format = (options && options.publicKeyEncoding && options.publicKeyEncoding.format) || 'pem';
+      const privFormat = (options && options.privateKeyEncoding && options.privateKeyEncoding.format) || 'pem';
+      let pubOut = result.publicKey;
+      let privOut = result.privateKey;
+      if (format === 'der') {
+        const lines = pubOut.split('\n').filter(l => !l.startsWith('-----'));
+        pubOut = Buffer.from(lines.join(''), 'base64');
+      }
+      if (privFormat === 'der') {
+        const lines = privOut.split('\n').filter(l => !l.startsWith('-----'));
+        privOut = Buffer.from(lines.join(''), 'base64');
+      }
+      if (format === 'jwk' || privFormat === 'jwk') {
+        throw new Error('JWK format not yet supported in oam');
+      }
+      return { publicKey: pubOut, privateKey: privOut };
+    }
+    function generateKeyPair(type, options, callback) {
+      if (typeof options === 'function') { callback = options; options = {}; }
+      try {
+        const result = generateKeyPairSync(type, options);
+        if (callback) process.nextTick(() => callback(null, result.publicKey, result.privateKey));
+      } catch (err) {
+        if (callback) process.nextTick(() => callback(err));
+        else throw err;
+      }
+    }
+
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
     return {
@@ -4653,12 +4694,31 @@
       createSecretKey,
       createPrivateKey,
       createPublicKey,
+      generateKeyPairSync,
+      generateKeyPair,
       createSign,
       createVerify,
       sign: signOneShot,
       verify: verifyOneShot,
       Sign,
       Verify,
+      constants: {
+        RSA_PKCS1_PADDING: 1,
+        RSA_NO_PADDING: 3,
+        RSA_PKCS1_OAEP_PADDING: 4,
+        RSA_PKCS1_PSS_PADDING: 6,
+        RSA_PKCS1_SHA256_PADDING: 12,
+        POINT_CONVERSION_COMPRESSED: 2,
+        POINT_CONVERSION_UNCOMPRESSED: 4,
+        SSL_OP_ALL: 0x80000bff,
+        SSL_OP_NO_SSLv2: 0x01000000,
+        SSL_OP_NO_SSLv3: 0x02000000,
+        SSL_OP_NO_TLSv1: 0x04000000,
+        SSL_OP_NO_TLSv1_1: 0x10000000,
+        SSL_OP_NO_TLSv1_2: 0x08000000,
+        SSL_OP_NO_TLSv1_3: 0x20000000,
+        defaultCoreCipherList: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+      },
       createCipheriv,
       createDecipheriv,
       pbkdf2Sync,
