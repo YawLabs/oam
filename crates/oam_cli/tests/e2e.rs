@@ -5254,3 +5254,60 @@ console.log('isTTY:', process.stdin.isTTY);
     assert!(stdout.contains("first: hello world"), "first line: {stdout}");
     assert!(stdout.contains("isTTY: false"), "piped stdin not TTY: {stdout}");
 }
+
+#[test]
+fn os_and_process_native_values() {
+    let stdout = run_ok(
+        "os_process_natives.mjs",
+        "import os from 'os';\n\
+         import v8 from 'v8';\n\
+         \n\
+         // os.release returns a non-empty version string\n\
+         const rel = os.release();\n\
+         console.log('release:', rel.length > 0);\n\
+         \n\
+         // os.totalmem/freemem return real values (> 100 MB)\n\
+         console.log('totalmem:', os.totalmem() > 100_000_000);\n\
+         console.log('freemem:', os.freemem() > 0);\n\
+         \n\
+         // os.cpus() returns correct count with real model\n\
+         const cpus = os.cpus();\n\
+         console.log('cpu_count:', cpus.length > 0);\n\
+         console.log('cpu_model:', cpus[0].model.length > 0 && cpus[0].model !== 'unknown');\n\
+         console.log('cpu_speed:', cpus[0].speed > 0);\n\
+         \n\
+         // os.networkInterfaces has loopback\n\
+         const ni = os.networkInterfaces();\n\
+         const hasLoopback = Object.values(ni).some(addrs => addrs.some(a => a.internal && a.address === '127.0.0.1'));\n\
+         console.log('loopback:', hasLoopback);\n\
+         \n\
+         // process.memoryUsage returns real values\n\
+         const m = process.memoryUsage();\n\
+         console.log('rss:', m.rss > 0);\n\
+         console.log('heapUsed:', m.heapUsed > 0);\n\
+         console.log('heapTotal:', m.heapTotal > 0);\n\
+         console.log('rss_fn:', process.memoryUsage.rss() > 0);\n\
+         \n\
+         // v8.getHeapStatistics returns real values\n\
+         const h = v8.getHeapStatistics();\n\
+         console.log('v8_heap:', h.used_heap_size > 0 && h.total_heap_size > 0 && h.heap_size_limit > 0);\n\
+         \n\
+         // process.ppid is a real parent PID (not 0)\n\
+         console.log('ppid:', process.ppid > 0);\n\
+         \n\
+         // os module shape\n\
+         console.log('platform:', os.platform() === process.platform);\n\
+         console.log('arch:', os.arch() === process.arch);\n\
+         console.log('homedir:', os.homedir().length > 0);\n\
+         console.log('tmpdir:', os.tmpdir().length > 0);\n\
+         console.log('hostname:', os.hostname().length > 0);\n\
+         console.log('endianness:', os.endianness() === 'LE');\n\
+         console.log('EOL:', os.EOL === '\\r\\n' || os.EOL === '\\n');",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
