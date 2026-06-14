@@ -2313,8 +2313,17 @@
       ),
       uptime: () => natives.uptimeMs() / 1000,
       memoryUsage: Object.assign(
-        () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
-        { rss: () => 0 },
+        () => {
+          const h = natives.heapStatistics();
+          return {
+            rss: natives.processRss(),
+            heapTotal: h.total_heap_size,
+            heapUsed: h.used_heap_size,
+            external: h.external_memory,
+            arrayBuffers: 0,
+          };
+        },
+        { rss: () => natives.processRss() },
       ),
       stdout: Object.assign(new Writable({
         write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
@@ -5670,7 +5679,7 @@
   // v8 module stub: expose minimal heap / serialization surface. Real V8
   // bindings land with the diagnostics wave; for now, feature-detect callers
   // get safe defaults and serialization uses JSON under a V8 wire header.
-  registry.factories.v8 = () => {
+  registry.factories.v8 = (natives) => {
     // V8 serialization wire format sentinel bytes: 0xff 0x0d (version 13).
     function serialize(value) {
       const json = JSON.stringify(value);
@@ -5709,13 +5718,7 @@
       readValue() { return JSON.parse(this._text); }
     }
     function getHeapStatistics() {
-      return {
-        total_heap_size: 0, total_heap_size_executable: 0, total_physical_size: 0,
-        total_available_size: 0, used_heap_size: 0, heap_size_limit: 0,
-        malloced_memory: 0, peak_malloced_memory: 0, does_zap_garbage: 0,
-        number_of_native_contexts: 0, number_of_detached_contexts: 0,
-        external_memory: 0,
-      };
+      return natives.heapStatistics();
     }
     function getHeapSpaceStatistics() { return []; }
     function getHeapCodeStatistics() {

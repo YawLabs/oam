@@ -221,6 +221,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("osRelease", op_os_release),
         ("osTotalMem", op_os_total_mem),
         ("osFreeMem", op_os_free_mem),
+        // v8 heap / process memory
+        ("heapStatistics", op_heap_statistics),
+        ("processRss", op_process_rss),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2463,5 +2466,104 @@ fn free_mem() -> u64 {
                 .and_then(|n| n.parse::<u64>().ok())
                 .map(|kb| kb * 1024)
         })
+        .unwrap_or(0)
+}
+
+// ======================================================== V8 heap statistics
+
+fn op_heap_statistics(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stats = scope.get_heap_statistics();
+    let obj = v8::Object::new(scope);
+    let pairs: &[(&str, usize)] = &[
+        ("total_heap_size", stats.total_heap_size()),
+        ("total_heap_size_executable", stats.total_heap_size_executable()),
+        ("total_physical_size", stats.total_physical_size()),
+        ("total_available_size", stats.total_available_size()),
+        ("used_heap_size", stats.used_heap_size()),
+        ("heap_size_limit", stats.heap_size_limit()),
+        ("malloced_memory", stats.malloced_memory()),
+        ("peak_malloced_memory", stats.peak_malloced_memory()),
+        ("does_zap_garbage", if stats.does_zap_garbage() { 1 } else { 0 }),
+        ("number_of_native_contexts", stats.number_of_native_contexts()),
+        ("number_of_detached_contexts", stats.number_of_detached_contexts()),
+        ("external_memory", stats.external_memory()),
+    ];
+    for (key, val) in pairs {
+        let k = v8::String::new(scope, key).unwrap();
+        let v = v8::Number::new(scope, *val as f64);
+        obj.set(scope, k.into(), v.into());
+    }
+    rv.set(obj.into());
+}
+
+// ============================================================= process RSS
+
+fn op_process_rss(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, process_rss() as f64).into());
+}
+
+#[cfg(windows)]
+fn process_rss() -> usize {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESS_MEMORY_COUNTERS {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+
+    unsafe extern "system" {
+        fn K32GetProcessMemoryInfo(
+            hProcess: isize,
+            ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+            cb: u32,
+        ) -> i32;
+        fn GetCurrentProcess() -> isize;
+    }
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        PageFaultCount: 0,
+        PeakWorkingSetSize: 0,
+        WorkingSetSize: 0,
+        QuotaPeakPagedPoolUsage: 0,
+        QuotaPagedPoolUsage: 0,
+        QuotaPeakNonPagedPoolUsage: 0,
+        QuotaNonPagedPoolUsage: 0,
+        PagefileUsage: 0,
+        PeakPagefileUsage: 0,
+    };
+    unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            counters.cb,
+        );
+    }
+    counters.WorkingSetSize
+}
+
+#[cfg(not(windows))]
+fn process_rss() -> usize {
+    use std::fs;
+    fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok())
+        .map(|pages| pages * 4096)
         .unwrap_or(0)
 }
