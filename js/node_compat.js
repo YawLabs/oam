@@ -1908,6 +1908,41 @@
         String(str).replace(/\[[0-9;]*[A-Za-z]/g, ""),
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
+      getSystemErrorName: function getSystemErrorName(err) {
+        var map = {
+          [-1]: "EOF", [-2]: "ENOENT", [-3]: "EACCES", [-4]: "EEXIST",
+          [-5]: "ENOTDIR", [-6]: "EISDIR", [-7]: "ENOTEMPTY", [-8]: "EPERM",
+          [-9]: "EBADF", [-10]: "EINVAL", [-11]: "ENOMEM", [-12]: "EBUSY",
+          [-13]: "EAGAIN", [-14]: "ENOSYS", [-15]: "EMFILE", [-16]: "ENFILE",
+          [-17]: "EADDRINUSE", [-18]: "EADDRNOTAVAIL", [-19]: "ECONNREFUSED",
+          [-20]: "ECONNRESET", [-21]: "ECONNABORTED", [-22]: "EPIPE",
+          [-23]: "ETIMEDOUT", [-24]: "ENETUNREACH", [-25]: "EHOSTUNREACH",
+          [-26]: "ELOOP", [-27]: "ENAMETOOLONG", [-28]: "ERANGE",
+        };
+        return map[err] || ("Unknown system error " + err);
+      },
+      getSystemErrorMap: function getSystemErrorMap() {
+        return new Map([
+          [-1, ["EOF", "end of file"]],
+          [-2, ["ENOENT", "no such file or directory"]],
+          [-3, ["EACCES", "permission denied"]],
+          [-4, ["EEXIST", "file already exists"]],
+          [-5, ["ENOTDIR", "not a directory"]],
+          [-6, ["EISDIR", "illegal operation on a directory"]],
+          [-7, ["ENOTEMPTY", "directory not empty"]],
+          [-8, ["EPERM", "operation not permitted"]],
+          [-9, ["EBADF", "bad file descriptor"]],
+          [-10, ["EINVAL", "invalid argument"]],
+          [-11, ["ENOMEM", "not enough memory"]],
+          [-12, ["EBUSY", "resource busy or locked"]],
+          [-13, ["EAGAIN", "resource temporarily unavailable"]],
+          [-17, ["EADDRINUSE", "address already in use"]],
+          [-19, ["ECONNREFUSED", "connection refused"]],
+          [-20, ["ECONNRESET", "connection reset by peer"]],
+          [-22, ["EPIPE", "broken pipe"]],
+          [-23, ["ETIMEDOUT", "connection timed out"]],
+        ]);
+      },
       styleText: function styleText(format, text) {
         var ESC = String.fromCharCode(27);
         var codes = {
@@ -2914,7 +2949,42 @@
       config: { variables: {} },
       features: { inspector: false, ipv6: true, tls: true },
       allowedNodeEnvironmentFlags: new Set(),
-      report: undefined,
+      report: {
+        getReport: () => ({}),
+        writeReport: () => "",
+        directory: "",
+        filename: "",
+        compact: false,
+        signal: "SIGUSR2",
+        reportOnFatalError: false,
+        reportOnSignal: false,
+        reportOnUncaughtException: false,
+      },
+      loadEnvFile: function loadEnvFile(path) {
+        var fs = registry.get("fs");
+        var envPath = path || ".env";
+        var text;
+        try { text = fs.readFileSync(envPath, "utf8"); }
+        catch (e) {
+          var err = new Error("Cannot find env file: " + envPath);
+          err.code = "ERR_ENV_FILE_NOT_FOUND";
+          throw err;
+        }
+        var lines = text.split("\n");
+        for (var li = 0; li < lines.length; li++) {
+          var line = lines[li].trim();
+          if (!line || line[0] === "#") continue;
+          var eqPos = line.indexOf("=");
+          if (eqPos === -1) continue;
+          var key = line.slice(0, eqPos).trim();
+          var val = line.slice(eqPos + 1).trim();
+          if ((val[0] === '"' && val[val.length - 1] === '"') ||
+              (val[0] === "'" && val[val.length - 1] === "'")) {
+            val = val.slice(1, -1);
+          }
+          process.env[key] = val;
+        }
+      },
     });
     return process;
   };

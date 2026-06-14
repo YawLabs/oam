@@ -6421,6 +6421,84 @@ console.log('clone_null=' + (structuredClone(null) === null));
 }
 
 #[test]
+fn process_load_env_file_and_report_stub() {
+    // Create a .env file for loadEnvFile to read
+    let env_file = write_temp(
+        "loadenv/.env",
+        "# comment\nFOO=bar\nBAZ=\"quoted value\"\nNUM=42\n",
+    );
+    let env_dir = env_file.parent().unwrap();
+    let file = write_temp(
+        "loadenv/test.mjs",
+        r#"
+import fs from 'node:fs';
+import util from 'node:util';
+
+// process.loadEnvFile
+process.loadEnvFile();
+console.log('FOO=' + process.env.FOO);
+console.log('BAZ=' + process.env.BAZ);
+console.log('NUM=' + process.env.NUM);
+
+// process.report stub
+console.log('report_type=' + typeof process.report);
+console.log('report_getReport=' + typeof process.report.getReport);
+console.log('report_obj=' + (typeof process.report.getReport() === 'object'));
+
+// Missing .env throws
+let threw = false;
+try { process.loadEnvFile('nonexistent.env'); }
+catch (e) { threw = e.code === 'ERR_ENV_FILE_NOT_FOUND'; }
+console.log('missing_throws=' + threw);
+
+// util.getSystemErrorName
+console.log('enoent=' + util.getSystemErrorName(-2));
+console.log('eacces=' + util.getSystemErrorName(-3));
+console.log('unknown=' + util.getSystemErrorName(-999).startsWith('Unknown'));
+
+// util.getSystemErrorMap
+const map = util.getSystemErrorMap();
+console.log('map_is_map=' + (map instanceof Map));
+console.log('map_enoent=' + map.get(-2)[0]);
+"#,
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", file.to_str().unwrap()])
+        .current_dir(env_dir)
+        .env("OAM_CACHE_DIR", write_temp("oam-cache2/.keep", "").parent().unwrap())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "loadEnvFile test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "FOO=bar",
+        "BAZ=quoted value",
+        "NUM=42",
+        "report_type=object",
+        "report_getReport=function",
+        "report_obj=true",
+        "missing_throws=true",
+        "enoent=ENOENT",
+        "eacces=EACCES",
+        "unknown=true",
+        "map_is_map=true",
+        "map_enoent=ENOENT",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn performance_mark_measure_entries() {
     let file = write_temp(
         "perf_mark.mjs",
