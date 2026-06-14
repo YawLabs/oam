@@ -2282,7 +2282,7 @@
         v8: natives.v8Version,
       },
       pid: natives.pid,
-      ppid: 0,
+      ppid: natives.ppid,
       title: "oam",
       exitCode: undefined,
       exit(code) {

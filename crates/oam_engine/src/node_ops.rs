@@ -45,7 +45,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 5] = [
+    let data: [(&str, v8::Local<v8::Value>); 6] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
         (
@@ -61,6 +61,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "pid",
             v8::Number::new(scope, std::process::id() as f64).into(),
+        ),
+        (
+            "ppid",
+            v8::Number::new(scope, parent_pid() as f64).into(),
         ),
     ];
     for (name, value) in data {
@@ -2770,4 +2774,63 @@ fn network_interfaces() -> serde_json::Value {
     }
 
     Value::Object(result)
+}
+
+// ============================================================= parent PID
+
+#[cfg(windows)]
+fn parent_pid() -> u32 {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESS_BASIC_INFORMATION {
+        ExitStatus: isize,
+        PebBaseAddress: *mut u8,
+        AffinityMask: usize,
+        BasePriority: i32,
+        UniqueProcessId: usize,
+        InheritedFromUniqueProcessId: usize,
+    }
+
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            ProcessHandle: isize,
+            ProcessInformationClass: u32,
+            ProcessInformation: *mut u8,
+            ProcessInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+        fn GetCurrentProcess() -> isize;
+    }
+
+    let mut pbi = PROCESS_BASIC_INFORMATION {
+        ExitStatus: 0,
+        PebBaseAddress: std::ptr::null_mut(),
+        AffinityMask: 0,
+        BasePriority: 0,
+        UniqueProcessId: 0,
+        InheritedFromUniqueProcessId: 0,
+    };
+    let mut ret_len: u32 = 0;
+    unsafe {
+        NtQueryInformationProcess(
+            GetCurrentProcess(),
+            0,
+            &mut pbi as *mut _ as *mut u8,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut ret_len,
+        );
+    }
+    pbi.InheritedFromUniqueProcessId as u32
+}
+
+#[cfg(not(windows))]
+fn parent_pid() -> u32 {
+    use std::fs;
+    fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let after_comm = s.rfind(')')?;
+            s[after_comm + 2..].split_whitespace().nth(1)?.parse().ok()
+        })
+        .unwrap_or(0)
 }
