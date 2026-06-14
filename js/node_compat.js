@@ -1102,6 +1102,15 @@
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
     EventEmitter.listenerCount = (emitter, type) => emitter.listenerCount(type);
+    EventEmitter.addAbortListener = function addAbortListener(signal, listener) {
+      if (signal.aborted) {
+        queueMicrotask(() => listener());
+        return { [Symbol.dispose]() {} };
+      }
+      signal.addEventListener("abort", listener, { once: true });
+      return { [Symbol.dispose]() { signal.removeEventListener("abort", listener); } };
+    };
+    EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
     return EventEmitter;
   };
 
@@ -1459,6 +1468,14 @@
       uptime: () => natives.uptimeMs() / 1000,
       loadavg: () => [0, 0, 0],
       networkInterfaces: () => JSON.parse(natives.networkInterfaces()),
+      machine: () => {
+        var a = natives.arch;
+        if (a === "arm64") return "aarch64";
+        if (a === "x64") return "x86_64";
+        if (a === "ia32") return "i686";
+        if (a === "arm") return "armv7l";
+        return a;
+      },
       userInfo: () => ({
         username: natives.username(),
         homedir: natives.homedir(),
@@ -1894,6 +1911,31 @@
       formatWithOptions: (_opts, ...args) => format(...args),
       inspect,
       parseArgs,
+      aborted: (signal, resource) => {
+        return new Promise((resolve) => {
+          if (signal.aborted) { resolve(signal.reason); return; }
+          signal.addEventListener("abort", () => resolve(signal.reason), { once: true });
+        });
+      },
+      parseEnv: (content) => {
+        var result = Object.create(null);
+        var LF = String.fromCharCode(10);
+        var rawLines = String(content).split(LF);
+        for (var i = 0; i < rawLines.length; i++) {
+          var line = rawLines[i];
+          if (line.length > 0 && line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1);
+          line = line.trim();
+          if (!line || line.charAt(0) === "#") continue;
+          var eq = line.indexOf("=");
+          if (eq === -1) continue;
+          var key = line.slice(0, eq).trim();
+          var val = line.slice(eq + 1).trim();
+          var DQ = String.fromCharCode(34); var SQ = String.fromCharCode(39);
+          if (val.length >= 2 && ((val.charAt(0) === DQ && val.charAt(val.length - 1) === DQ) || (val.charAt(0) === SQ && val.charAt(val.length - 1) === SQ))) val = val.slice(1, -1);
+          result[key] = val;
+        }
+        return result;
+      },
       MIMEType: function MIMETypeClass(input) {
         if (!(this instanceof MIMETypeClass)) throw new TypeError("MIMEType is a constructor, call with new");
         var str = String(input).trim();
@@ -2514,6 +2556,7 @@
         };
         return fh;
       },
+      constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
     };
   };
 
@@ -2917,6 +2960,7 @@
         },
         { bigint: () => natives.hrtimeNanos() },
       ),
+      abort: () => { natives.processExit(134); },
       abort: () => { natives.processExit(134); },
       uptime: () => natives.uptimeMs() / 1000,
       memoryUsage: Object.assign(
@@ -5580,6 +5624,37 @@
       randomInt,
       timingSafeEqual,
       getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
+      getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
+      generateKeySync: (type, options) => {
+        if (type === "aes") {
+          var len = (options && options.length) || 256;
+          return createSecretKey(natives.cryptoRandomFill(len / 8));
+        }
+        if (type === "hmac") {
+          var hLen = (options && options.length) || 256;
+          return createSecretKey(natives.cryptoRandomFill(hLen / 8));
+        }
+        throw new Error("generateKeySync: unsupported type " + type);
+      },
+      generateKey: (type, options, callback) => {
+        try {
+          var result;
+          if (type === "aes") {
+            var len = (options && options.length) || 256;
+            result = createSecretKey(natives.cryptoRandomFill(len / 8));
+          } else if (type === "hmac") {
+            var hLen = (options && options.length) || 256;
+            result = createSecretKey(natives.cryptoRandomFill(hLen / 8));
+          } else {
+            throw new Error("generateKey: unsupported type " + type);
+          }
+          if (callback) queueMicrotask(() => callback(null, result));
+          else return result;
+        } catch (err) {
+          if (callback) queueMicrotask(() => callback(err));
+          else throw err;
+        }
+      },
       getCurves: () => ["prime256v1", "secp256k1", "secp384r1", "secp521r1", "ed25519", "ed448", "x25519", "x448"],
       generateKeySync: (type, options) => {
         if (type === "aes") {

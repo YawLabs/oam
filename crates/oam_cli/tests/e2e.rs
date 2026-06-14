@@ -7064,3 +7064,102 @@ console.log('process_abort_type=' + typeof process.abort);
         );
     }
 }
+
+// ------------------------------------------------------------------ M3-12
+#[test]
+fn os_machine_events_abort_util_parse_env() {
+    let file = write_temp(
+        "misc_m3b.mjs",
+        r#"
+import os from 'node:os';
+import events from 'node:events';
+import util from 'node:util';
+import fs from 'node:fs/promises';
+
+// -- os.machine --
+const m = os.machine();
+console.log('machine_type=' + typeof m);
+console.log('machine_nonempty=' + (m.length > 0));
+
+// -- events.addAbortListener --
+console.log('addAbortListener_type=' + typeof events.addAbortListener);
+const ac = new AbortController();
+let fired = false;
+const disposable = events.addAbortListener(ac.signal, () => { fired = true; });
+console.log('disposable_has_dispose=' + (Symbol.dispose in disposable));
+ac.abort();
+await new Promise(r => setTimeout(r, 10));
+console.log('abort_fired=' + fired);
+
+// addAbortListener on already-aborted signal
+const ac2 = new AbortController();
+ac2.abort();
+let fired2 = false;
+events.addAbortListener(ac2.signal, () => { fired2 = true; });
+await new Promise(r => setTimeout(r, 10));
+console.log('pre_aborted_fired=' + fired2);
+
+// -- util.aborted --
+const ac3 = new AbortController();
+let abortedReason = null;
+const p = util.aborted(ac3.signal).then(r => { abortedReason = r; });
+ac3.abort('test reason');
+await p;
+console.log('aborted_reason=' + abortedReason);
+
+// util.aborted on already-aborted
+const ac4 = new AbortController();
+ac4.abort('already');
+const r4 = await util.aborted(ac4.signal);
+console.log('aborted_already=' + r4);
+
+// -- util.parseEnv --
+const env = util.parseEnv('FOO=bar\nBAZ="hello world"\n# comment\nEMPTY=\nQUOTED=\'single\'');
+console.log('parseEnv_FOO=' + env.FOO);
+console.log('parseEnv_BAZ=' + env.BAZ);
+console.log('parseEnv_EMPTY=' + JSON.stringify(env.EMPTY));
+console.log('parseEnv_QUOTED=' + env.QUOTED);
+console.log('parseEnv_comment=' + (env['# comment'] === undefined));
+
+// -- fs/promises.constants --
+console.log('fsp_F_OK=' + fs.constants.F_OK);
+console.log('fsp_R_OK=' + fs.constants.R_OK);
+
+// -- events.captureRejectionSymbol --
+console.log('captureRejection=' + typeof events.captureRejectionSymbol);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3b failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "machine_type=string",
+        "machine_nonempty=true",
+        "addAbortListener_type=function",
+        "disposable_has_dispose=true",
+        "abort_fired=true",
+        "pre_aborted_fired=true",
+        "aborted_reason=test reason",
+        "aborted_already=already",
+        "parseEnv_FOO=bar",
+        "parseEnv_BAZ=hello world",
+        "parseEnv_EMPTY=\"\"",
+        "parseEnv_QUOTED=single",
+        "parseEnv_comment=true",
+        "fsp_F_OK=0",
+        "fsp_R_OK=4",
+        "captureRejection=symbol",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
