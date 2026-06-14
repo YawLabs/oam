@@ -4917,7 +4917,8 @@
           if (chunk === undefined) {
             this.readable = false;
             this.emit("end");
-            if (!this.writable) this._doClose();
+            if (!this.allowHalfOpen) this.end();
+            else if (!this.writable) this._doClose();
             break;
           }
           this.bytesRead += chunk.length;
