@@ -7462,9 +7462,105 @@
   registry.installRuntimeGlobals = function installRuntimeGlobals() {
     const natives = globalThis.__oam.node;
     globalThis.process = registry.get("process");
+    var _perfEntries = [];
     globalThis.performance = {
       now: () => natives.nowMs(),
       timeOrigin: Date.now() - natives.nowMs(),
+      mark: function mark(name, options) {
+        var entry = {
+          name: name,
+          entryType: "mark",
+          startTime: (options && options.startTime !== undefined) ? options.startTime : natives.nowMs(),
+          duration: 0,
+          detail: (options && options.detail) || null,
+        };
+        _perfEntries.push(entry);
+        return entry;
+      },
+      measure: function measure(name, startOrOptions, endMark) {
+        var startTime = 0;
+        var endTime = natives.nowMs();
+        if (typeof startOrOptions === "string") {
+          for (var i = _perfEntries.length - 1; i >= 0; i--) {
+            if (_perfEntries[i].name === startOrOptions && _perfEntries[i].entryType === "mark") {
+              startTime = _perfEntries[i].startTime;
+              break;
+            }
+          }
+          if (typeof endMark === "string") {
+            for (var j = _perfEntries.length - 1; j >= 0; j--) {
+              if (_perfEntries[j].name === endMark && _perfEntries[j].entryType === "mark") {
+                endTime = _perfEntries[j].startTime;
+                break;
+              }
+            }
+          }
+        } else if (startOrOptions && typeof startOrOptions === "object") {
+          if (startOrOptions.start !== undefined) {
+            if (typeof startOrOptions.start === "string") {
+              for (var k = _perfEntries.length - 1; k >= 0; k--) {
+                if (_perfEntries[k].name === startOrOptions.start && _perfEntries[k].entryType === "mark") {
+                  startTime = _perfEntries[k].startTime;
+                  break;
+                }
+              }
+            } else {
+              startTime = startOrOptions.start;
+            }
+          }
+          if (startOrOptions.end !== undefined) {
+            if (typeof startOrOptions.end === "string") {
+              for (var m = _perfEntries.length - 1; m >= 0; m--) {
+                if (_perfEntries[m].name === startOrOptions.end && _perfEntries[m].entryType === "mark") {
+                  endTime = _perfEntries[m].startTime;
+                  break;
+                }
+              }
+            } else {
+              endTime = startOrOptions.end;
+            }
+          }
+          if (startOrOptions.duration !== undefined) {
+            endTime = startTime + startOrOptions.duration;
+          }
+        }
+        var entry = {
+          name: name,
+          entryType: "measure",
+          startTime: startTime,
+          duration: endTime - startTime,
+          detail: (startOrOptions && typeof startOrOptions === "object" && startOrOptions.detail) || null,
+        };
+        _perfEntries.push(entry);
+        return entry;
+      },
+      getEntries: function getEntries() { return _perfEntries.slice(); },
+      getEntriesByName: function getEntriesByName(name, type) {
+        return _perfEntries.filter(function(e) {
+          return e.name === name && (!type || e.entryType === type);
+        });
+      },
+      getEntriesByType: function getEntriesByType(type) {
+        return _perfEntries.filter(function(e) { return e.entryType === type; });
+      },
+      clearMarks: function clearMarks(name) {
+        if (name === undefined) {
+          _perfEntries = _perfEntries.filter(function(e) { return e.entryType !== "mark"; });
+        } else {
+          _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "mark" && e.name === name); });
+        }
+      },
+      clearMeasures: function clearMeasures(name) {
+        if (name === undefined) {
+          _perfEntries = _perfEntries.filter(function(e) { return e.entryType !== "measure"; });
+        } else {
+          _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "measure" && e.name === name); });
+        }
+      },
+      clearResourceTimings: function clearResourceTimings() {},
+      toJSON: function toJSON() {
+        return { timeOrigin: this.timeOrigin };
+      },
     };
     // Lazy: registry.get('crypto') instantiates the ENTIRE crypto factory
     // (KeyObject, Hash, Hmac, createHash, ...) when only the webcrypto
@@ -7563,10 +7659,50 @@
         writeOut([`${label}: ${next}`]);
       },
       countReset: (label = "default") => counters.delete(label),
+      timeLog: (label = "default", ...extra) => {
+        const start = timers.get(label);
+        if (start === undefined) {
+          writeErr([`Timer '${label}' does not exist`]);
+          return;
+        }
+        const elapsed = `${label}: ${(natives.nowMs() - start).toFixed(3)}ms`;
+        writeOut(extra.length ? [elapsed, ...extra] : [elapsed]);
+      },
       group: (...args) => {
         if (args.length) writeOut(args);
       },
+      groupCollapsed: (...args) => {
+        if (args.length) writeOut(args);
+      },
       groupEnd: () => {},
+      table: (data, columns) => {
+        if (data === null || data === undefined || typeof data !== "object") {
+          writeOut([String(data)]);
+          return;
+        }
+        if (Array.isArray(data)) {
+          if (data.length === 0) { writeOut(["[]"]); return; }
+          if (typeof data[0] === "object" && data[0] !== null) {
+            const cols = columns || Object.keys(data[0]);
+            writeOut(["(index) | " + cols.join(" | ")]);
+            for (let ri = 0; ri < data.length; ri++) {
+              const vals = cols.map(c => String(data[ri][c] === undefined ? "" : data[ri][c]));
+              writeOut([ri + "       | " + vals.join(" | ")]);
+            }
+          } else {
+            writeOut(["(index) | Values"]);
+            for (let vi = 0; vi < data.length; vi++) {
+              writeOut([vi + "       | " + String(data[vi])]);
+            }
+          }
+        } else {
+          const keys = Object.keys(data);
+          if (keys.length === 0) { writeOut(["{}"]); return; }
+          writeOut(["(index) | Values"]);
+          for (const k of keys) writeOut([k + " | " + String(data[k])]);
+        }
+      },
+      clear: () => {},
     };
   };
 })();

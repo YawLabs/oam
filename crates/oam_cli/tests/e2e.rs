@@ -6279,3 +6279,156 @@ console.log('base64_len=' + h6.length);
         "missing base64 line.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+#[test]
+fn console_time_count_group_table() {
+    let file = write_temp(
+        "console_extra.mjs",
+        r#"
+// console.time / timeEnd / timeLog
+console.time('t1');
+console.timeLog('t1', 'checkpoint');
+console.timeEnd('t1');
+
+// console.count / countReset
+console.count('a');
+console.count('a');
+console.count('a');
+console.countReset('a');
+console.count('a');
+
+// console.group / groupEnd
+console.group('grp');
+console.log('inside');
+console.groupEnd();
+
+// console.table (array of objects)
+console.table([{ x: 1, y: 2 }]);
+
+// console.assert
+console.assert(true, 'should not print');
+console.assert(false, 'assertion fired');
+
+// console.dir
+console.dir({ hello: 42 });
+
+// default label
+console.count();
+console.count();
+console.countReset();
+console.count();
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "console extras failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("t1:"), "missing timeLog output:\n{stdout}");
+    assert!(stdout.contains("checkpoint"), "missing timeLog extra args:\n{stdout}");
+    assert!(stdout.contains("a: 1"), "missing count 1:\n{stdout}");
+    assert!(stdout.contains("a: 2"), "missing count 2:\n{stdout}");
+    assert!(stdout.contains("a: 3"), "missing count 3:\n{stdout}");
+    // After countReset, next count should be 1 again
+    let a_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("a: ")).collect();
+    assert_eq!(a_lines.len(), 4, "expected 4 'a:' lines, got {a_lines:?}");
+    assert_eq!(a_lines[3], "a: 1", "countReset did not reset:\n{stdout}");
+    assert!(stdout.contains("inside"), "missing group content:\n{stdout}");
+    assert!(stdout.contains("(index)"), "missing table header:\n{stdout}");
+    assert!(stderr.contains("assertion fired"), "missing assert output:\n{stderr}");
+    assert!(stdout.contains("hello"), "missing dir output:\n{stdout}");
+    // default counters
+    assert!(stdout.contains("default: 1"), "missing default count 1:\n{stdout}");
+    assert!(stdout.contains("default: 2"), "missing default count 2:\n{stdout}");
+}
+
+#[test]
+fn performance_mark_measure_entries() {
+    let file = write_temp(
+        "perf_mark.mjs",
+        r#"
+// performance.now exists
+console.log('now_type=' + typeof performance.now());
+console.log('now_positive=' + (performance.now() > 0));
+
+// performance.mark
+performance.mark('start');
+let sum = 0;
+for (let i = 0; i < 1000; i++) sum += i;
+performance.mark('end');
+
+// performance.measure
+const m = performance.measure('work', 'start', 'end');
+console.log('measure_name=' + m.name);
+console.log('measure_type=' + m.entryType);
+console.log('measure_duration_positive=' + (m.duration >= 0));
+
+// getEntries
+const entries = performance.getEntries();
+console.log('entries_count=' + entries.length);
+
+// getEntriesByName
+const starts = performance.getEntriesByName('start');
+console.log('starts_count=' + starts.length);
+console.log('start_type=' + starts[0].entryType);
+
+// getEntriesByType
+const marks = performance.getEntriesByType('mark');
+console.log('marks_count=' + marks.length);
+const measures = performance.getEntriesByType('measure');
+console.log('measures_count=' + measures.length);
+
+// clearMarks
+performance.clearMarks('start');
+const afterClear = performance.getEntriesByType('mark');
+console.log('marks_after_clear=' + afterClear.length);
+
+// clearMeasures
+performance.clearMeasures();
+const afterClearM = performance.getEntriesByType('measure');
+console.log('measures_after_clear=' + afterClearM.length);
+
+// timeOrigin
+console.log('timeOrigin_positive=' + (performance.timeOrigin > 0));
+
+// measure with options object
+performance.mark('a');
+performance.mark('b');
+const m2 = performance.measure('opt', { start: 'a', end: 'b' });
+console.log('opt_measure=' + m2.name);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "performance test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "now_type=number",
+        "now_positive=true",
+        "measure_name=work",
+        "measure_type=measure",
+        "measure_duration_positive=true",
+        "entries_count=3",
+        "starts_count=1",
+        "start_type=mark",
+        "marks_count=2",
+        "measures_count=1",
+        "marks_after_clear=1",
+        "measures_after_clear=0",
+        "timeOrigin_positive=true",
+        "opt_measure=opt",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
