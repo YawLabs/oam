@@ -2687,6 +2687,13 @@
           );
         },
       }), { fd: 0, isTTY: natives.isTTY(0) }),
+      getBuiltinModule(name) {
+        var bare = String(name).replace(/^node:/, "");
+        if (registry.factories[bare]) {
+          return registry.get(bare);
+        }
+        return undefined;
+      },
       emitWarning(warning) {
         if (globalThis.console) {
           globalThis.console.warn(
@@ -7327,6 +7334,16 @@
       },
       configurable: true,
     });
+
+  // -------------------------------------------------------------- navigator
+  globalThis.navigator = globalThis.navigator || {
+    userAgent: "oam/" + (globalThis.__oam?.version || "0.0.0"),
+    language: "en",
+    languages: ["en"],
+    onLine: true,
+    hardwareConcurrency: 1,
+  };
+
     // oam.serve: defined in bootstrap (snapshot), attached here because
     // the `oam` namespace object is a post-restore native install.
     if (globalThis.oam && globalThis.__oamServe) {

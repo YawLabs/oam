@@ -6059,3 +6059,49 @@ console.log('staticOn=' + (EventEmitter.on === on));
         );
     }
 }
+
+#[test]
+fn process_get_builtin_module_and_navigator() {
+    let file = write_temp(
+        "builtin_nav.mjs",
+        r#"
+// process.getBuiltinModule
+const fs = process.getBuiltinModule('fs');
+console.log('getBuiltin_fs=' + (typeof fs.readFileSync === 'function'));
+
+const crypto = process.getBuiltinModule('node:crypto');
+console.log('getBuiltin_crypto=' + (typeof crypto.createHash === 'function'));
+
+const missing = process.getBuiltinModule('nonexistent');
+console.log('getBuiltin_missing=' + (missing === undefined));
+
+// navigator
+console.log('navigator=' + (typeof navigator === 'object'));
+console.log('userAgent=' + navigator.userAgent.startsWith('oam/'));
+console.log('onLine=' + (navigator.onLine === true));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "builtin/navigator test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "getBuiltin_fs=true",
+        "getBuiltin_crypto=true",
+        "getBuiltin_missing=true",
+        "navigator=true",
+        "userAgent=true",
+        "onLine=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
