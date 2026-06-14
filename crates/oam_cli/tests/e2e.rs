@@ -6345,6 +6345,82 @@ console.count();
 }
 
 #[test]
+fn structured_clone_and_util_style_text() {
+    let file = write_temp(
+        "clone_style.mjs",
+        r#"
+import util from 'node:util';
+
+// structuredClone
+const obj = { a: 1, b: [2, 3], c: { d: 4 } };
+const clone = structuredClone(obj);
+console.log('clone_eq=' + (JSON.stringify(clone) === JSON.stringify(obj)));
+console.log('clone_ref=' + (clone !== obj));
+console.log('clone_deep_ref=' + (clone.c !== obj.c));
+clone.a = 99;
+console.log('original_a=' + obj.a);
+
+// util.styleText single format
+const red = util.styleText('red', 'hello');
+console.log('red_has_escape=' + red.includes('\x1b[31m'));
+console.log('red_has_reset=' + red.includes('\x1b[39m'));
+console.log('red_has_text=' + red.includes('hello'));
+
+// util.styleText array of formats
+const boldRed = util.styleText(['bold', 'red'], 'hi');
+console.log('bold_red_has_bold=' + boldRed.includes('\x1b[1m'));
+console.log('bold_red_has_red=' + boldRed.includes('\x1b[31m'));
+
+// util.styleText with unknown format
+const unknown = util.styleText('nonexistent', 'text');
+console.log('unknown_passthrough=' + unknown);
+
+// structuredClone undefined
+const u = structuredClone(undefined);
+console.log('clone_undef=' + (u === undefined));
+
+// structuredClone primitives
+console.log('clone_num=' + (structuredClone(42) === 42));
+console.log('clone_str=' + (structuredClone('abc') === 'abc'));
+console.log('clone_bool=' + (structuredClone(true) === true));
+console.log('clone_null=' + (structuredClone(null) === null));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "structuredClone/styleText test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "clone_eq=true",
+        "clone_ref=true",
+        "clone_deep_ref=true",
+        "original_a=1",
+        "red_has_escape=true",
+        "red_has_reset=true",
+        "red_has_text=true",
+        "bold_red_has_bold=true",
+        "bold_red_has_red=true",
+        "unknown_passthrough=text",
+        "clone_undef=true",
+        "clone_num=true",
+        "clone_str=true",
+        "clone_bool=true",
+        "clone_null=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn performance_mark_measure_entries() {
     let file = write_temp(
         "perf_mark.mjs",
