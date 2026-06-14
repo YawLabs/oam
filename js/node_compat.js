@@ -1969,6 +1969,23 @@
     }));
   }
 
+  function makeDirent(parentPath, entry) {
+    var name = typeof entry === "string" ? entry : entry.name;
+    var kind = typeof entry === "object" && entry.kind ? entry.kind : "file";
+    return {
+      name: name,
+      parentPath: parentPath,
+      path: parentPath,
+      isFile: function () { return kind === "file"; },
+      isDirectory: function () { return kind === "dir"; },
+      isSymbolicLink: function () { return kind === "symlink"; },
+      isBlockDevice: function () { return false; },
+      isCharacterDevice: function () { return false; },
+      isFIFO: function () { return false; },
+      isSocket: function () { return false; },
+    };
+  }
+
   function readOptions(options) {
     if (typeof options === "string") return { encoding: options };
     return options ?? {};
@@ -2039,6 +2056,48 @@
       link: (existing, newPath) => natives.fsLink(String(existing), String(newPath)),
       chmod: (path, mode) => natives.fsChmod(String(path), mode),
       truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
+      opendir: async function (path) {
+        var dirPath = String(path);
+        var entries = await natives.fsReaddir(dirPath);
+        var idx = 0;
+        var dir = {
+          path: dirPath,
+          read: async function () {
+            if (idx >= entries.length) return null;
+            var entry = entries[idx++];
+            return makeDirent(dirPath, entry);
+          },
+          close: async function () { idx = entries.length; },
+          [Symbol.asyncIterator]: function () {
+            return {
+              next: async function () {
+                var d = await dir.read();
+                if (d === null) return { done: true, value: undefined };
+                return { done: false, value: d };
+              }
+            };
+          }
+        };
+        return dir;
+      },
+      cp: async function cpRecursive(src, dest, options) {
+        var srcStr = String(src);
+        var destStr = String(dest);
+        var opts = options || {};
+        var raw;
+        try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
+        if (raw.kind === "dir") {
+          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
+          try { await natives.fsMkdir(destStr, true); } catch (e) {}
+          var entries = await natives.fsReaddir(srcStr);
+          for (var i = 0; i < entries.length; i++) {
+            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
+            await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+          }
+        } else {
+          await natives.fsCopyFile(srcStr, destStr);
+        }
+      },
       open: async function (path, flags, mode) {
         flags = flags || "r";
         var info = await natives.fsOpen(String(path), String(flags));
@@ -2248,6 +2307,47 @@
       linkSync: (existing, newPath) => natives.fsLinkSync(String(existing), String(newPath)),
       chmodSync: (path, mode) => natives.fsChmodSync(String(path), mode),
       truncateSync: (path, len) => natives.fsTruncateSync(String(path), len ?? 0),
+      opendirSync: function (path) {
+        var dirPath = String(path);
+        var entries = natives.fsReaddirSync(dirPath);
+        var idx = 0;
+        return {
+          path: dirPath,
+          readSync: function () {
+            if (idx >= entries.length) return null;
+            return makeDirent(dirPath, entries[idx++]);
+          },
+          closeSync: function () { idx = entries.length; },
+          [Symbol.iterator]: function () {
+            return {
+              next: function () {
+                var d = this.outer.readSync();
+                if (d === null) return { done: true, value: undefined };
+                return { done: false, value: d };
+              },
+              outer: this
+            };
+          }
+        };
+      },
+      cpSync: function cpSyncRecursive(src, dest, options) {
+        var srcStr = String(src);
+        var destStr = String(dest);
+        var opts = options || {};
+        var raw;
+        try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
+        if (raw.kind === "dir") {
+          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cpSync: -r not specified; omitting directory '" + srcStr + "'");
+          try { natives.fsMkdirSync(destStr, true); } catch (e) {}
+          var entries = natives.fsReaddirSync(srcStr);
+          for (var i = 0; i < entries.length; i++) {
+            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
+            cpSyncRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+          }
+        } else {
+          natives.fsCopyFileSync(srcStr, destStr);
+        }
+      },
 
       readFile: callbackify1(promises.readFile),
       writeFile: callbackify1(promises.writeFile),
@@ -2269,6 +2369,8 @@
       link: callbackify1(promises.link),
       chmod: callbackify1(promises.chmod),
       truncate: callbackify1(promises.truncate),
+      opendir: callbackify1(promises.opendir),
+      cp: callbackify1(promises.cp),
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild.
         cb(natives.fsExistsSync(String(path)));

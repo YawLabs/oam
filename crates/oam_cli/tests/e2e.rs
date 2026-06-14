@@ -5739,3 +5739,82 @@ fn process_cpu_usage_and_kill() {
         }
     }
 }
+
+// ------------------------------------------------------------ fs.opendir + fs.cp
+
+#[test]
+fn fs_opendir_and_cp() {
+    let path = write_temp(
+        "fs_opendir_cp.mjs",
+        "import fs from 'node:fs';\n\
+         import { opendir, cp } from 'node:fs/promises';\n\
+         import { join } from 'node:path';\n\
+         \n\
+         const tmpBase = process.env.TEMP || process.env.TMPDIR || '/tmp';\n\
+         const dir = join(tmpBase, 'oam-opendir-test-' + Date.now());\n\
+         fs.mkdirSync(dir, { recursive: true });\n\
+         fs.writeFileSync(join(dir, 'a.txt'), 'hello');\n\
+         fs.writeFileSync(join(dir, 'b.txt'), 'world');\n\
+         fs.mkdirSync(join(dir, 'sub'));\n\
+         fs.writeFileSync(join(dir, 'sub', 'c.txt'), 'nested');\n\
+         \n\
+         // opendirSync\n\
+         const d = fs.opendirSync(dir);\n\
+         console.log('opendir_path:', d.path === dir);\n\
+         const names = [];\n\
+         let entry;\n\
+         while ((entry = d.readSync()) !== null) {\n\
+           names.push(entry.name);\n\
+           if (entry.name === 'sub') {\n\
+             console.log('sub_isDir:', entry.isDirectory());\n\
+           }\n\
+         }\n\
+         console.log('opendir_count:', names.length === 3);\n\
+         console.log('has_a:', names.includes('a.txt'));\n\
+         console.log('has_b:', names.includes('b.txt'));\n\
+         console.log('has_sub:', names.includes('sub'));\n\
+         \n\
+         // async opendir with for-await\n\
+         const asyncDir = await opendir(dir);\n\
+         const asyncNames = [];\n\
+         for await (const e of asyncDir) {\n\
+           asyncNames.push(e.name);\n\
+         }\n\
+         console.log('async_opendir_count:', asyncNames.length === 3);\n\
+         \n\
+         // cpSync (recursive)\n\
+         const dest = dir + '-copy';\n\
+         fs.cpSync(dir, dest, { recursive: true });\n\
+         console.log('cp_a:', fs.readFileSync(join(dest, 'a.txt'), 'utf8') === 'hello');\n\
+         console.log('cp_b:', fs.readFileSync(join(dest, 'b.txt'), 'utf8') === 'world');\n\
+         console.log('cp_nested:', fs.readFileSync(join(dest, 'sub', 'c.txt'), 'utf8') === 'nested');\n\
+         \n\
+         // async cp\n\
+         const dest2 = dir + '-copy2';\n\
+         await cp(dir, dest2, { recursive: true });\n\
+         console.log('async_cp:', fs.readFileSync(join(dest2, 'a.txt'), 'utf8') === 'hello');\n\
+         \n\
+         // single file cp\n\
+         const singleDest = join(dest2, 'single.txt');\n\
+         fs.cpSync(join(dir, 'a.txt'), singleDest);\n\
+         console.log('single_cp:', fs.readFileSync(singleDest, 'utf8') === 'hello');\n\
+         \n\
+         // cleanup\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n\
+         fs.rmSync(dest, { recursive: true, force: true });\n\
+         fs.rmSync(dest2, { recursive: true, force: true });\n\
+         console.log('done:', true);",
+    );
+    let out = oam(&["run", path.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        panic!("fs opendir/cp failed:\nstdout: {stdout}\nstderr: {stderr}");
+    }
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
