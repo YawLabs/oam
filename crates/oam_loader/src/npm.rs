@@ -109,8 +109,9 @@ const NODE_BUILTINS: [&str; 41] = [
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 49] = [
+const SUPPORTED_BUILTINS: [&str; 50] = [
     "assert",
+    "assert/strict",
     "async_hooks",
     "buffer",
     "child_process",

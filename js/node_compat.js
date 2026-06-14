@@ -1701,6 +1701,8 @@
   // --------------------------------------------------------------- assert
   registry.factories["util/types"] = () => registry.get("util").types;
 
+  registry.factories["assert/strict"] = () => registry.get("assert").strict;
+
     registry.factories.assert = () => {
     const util = registry.get("util");
     const deepEqual = util._deepEqual;
@@ -2453,6 +2455,7 @@
 
     const builtinModules = [
       "assert",
+      "assert/strict",
       "async_hooks",
       "buffer",
       "child_process",
