@@ -4993,11 +4993,110 @@
       }
     }
 
-    const clientGate = () => {
-      throw new Error(
-        "http.request/http.get land with a later wave â€” use fetch() (streaming supported)",
-      );
-    };
+    class ClientRequest extends EventEmitter {
+      constructor(options, callback) {
+        super();
+        if (typeof options === "string") options = new URL(options);
+        if (options instanceof URL) {
+          options = {
+            hostname: options.hostname,
+            port: options.port || (options.protocol === "https:" ? 443 : 80),
+            path: options.pathname + options.search,
+            protocol: options.protocol,
+          };
+        }
+        var opts = options || {};
+        this.method = (opts.method || "GET").toUpperCase();
+        var protocol = opts.protocol || "http:";
+        var host = opts.hostname || opts.host || "localhost";
+        var port = opts.port || (protocol === "https:" ? 443 : 80);
+        var reqPath = opts.path || "/";
+        this._url = protocol + "//" + host + ":" + port + reqPath;
+        this._headers = {};
+        if (opts.headers) {
+          var keys = Object.keys(opts.headers);
+          for (var i = 0; i < keys.length; i++) {
+            this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
+          }
+        }
+        this._body = [];
+        this._ended = false;
+        this._aborted = false;
+        this.socket = { remoteAddress: host };
+        if (callback) this.once("response", callback);
+      }
+      setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
+      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      write(chunk, encoding, callback) {
+        if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        if (typeof chunk !== "string") chunk = new TextDecoder().decode(chunk);
+        this._body.push(chunk);
+        if (callback) queueMicrotask(callback);
+        return true;
+      }
+      end(data, encoding, callback) {
+        if (typeof data === "function") { callback = data; data = undefined; }
+        if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        if (data != null) this.write(data, encoding);
+        this._ended = true;
+        var self = this;
+        var bodyStr = self._body.length > 0 ? self._body.join("") : null;
+        var fetchOpts = {
+          method: self.method,
+          headers: self._headers,
+        };
+        if (bodyStr && self.method !== "GET" && self.method !== "HEAD") {
+          fetchOpts.body = bodyStr;
+        }
+        globalThis.fetch(self._url, fetchOpts).then(function (resp) {
+          if (self._aborted) return;
+          var res = new Readable({ read: function () {} });
+          res.statusCode = resp.status;
+          res.statusMessage = resp.statusText || "";
+          res.httpVersion = "1.1";
+          res.headers = {};
+          res.rawHeaders = [];
+          resp.headers.forEach(function (value, name) {
+            var key = name.toLowerCase();
+            res.headers[key] = key in res.headers ? res.headers[key] + ", " + value : value;
+            res.rawHeaders.push(name, value);
+          });
+          self.emit("response", res);
+          resp.arrayBuffer().then(function (ab) {
+            if (ab.byteLength > 0) res.push(globalThis.Buffer.from(ab));
+            res.push(null);
+          }, function (err) { res.destroy(err); });
+        }, function (err) {
+          self.emit("error", typeof err === "string" ? new Error(err) : err);
+        });
+        if (callback) self.once("response", callback);
+        return this;
+      }
+      abort() {
+        this._aborted = true;
+        this.emit("abort");
+      }
+      destroy(err) {
+        this._aborted = true;
+        if (err) this.emit("error", err);
+        return this;
+      }
+      setTimeout(ms, callback) {
+        if (callback) this.once("timeout", callback);
+        return this;
+      }
+    }
+
+    function request(options, callback) {
+      return new ClientRequest(options, callback);
+    }
+
+    function get(options, callback) {
+      var req = request(options, callback);
+      req.end();
+      return req;
+    }
 
     return {
       createServer: (options, handler) =>
@@ -5005,8 +5104,9 @@
       Server,
       IncomingMessage,
       ServerResponse,
-      request: clientGate,
-      get: clientGate,
+      ClientRequest,
+      request,
+      get,
       METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
       STATUS_CODES: {
         200: "OK",

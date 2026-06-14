@@ -5431,3 +5431,64 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
         );
     }
 }
+
+#[test]
+fn http_request_and_get_client() {
+    let addr = spawn_echo_server();
+    let stdout = run_ok(
+        "http_client.mjs",
+        &format!(
+            "import http from 'node:http';\n\
+             \n\
+             // http.get (auto-ends the request)\n\
+             const getResult = await new Promise((resolve, reject) => {{\n\
+               http.get('http://{addr}/hello', (res) => {{\n\
+                 let body = '';\n\
+                 res.on('data', (chunk) => body += chunk);\n\
+                 res.on('end', () => resolve({{ status: res.statusCode, body }}));\n\
+               }}).on('error', reject);\n\
+             }});\n\
+             console.log('get_status:', getResult.status === 200);\n\
+             const getData = JSON.parse(getResult.body);\n\
+             console.log('get_method:', getData.method === 'GET');\n\
+             console.log('get_path:', getData.path === '/hello');\n\
+             \n\
+             // http.request with POST body\n\
+             const postResult = await new Promise((resolve, reject) => {{\n\
+               const req = http.request({{\n\
+                 hostname: '127.0.0.1',\n\
+                 port: {port},\n\
+                 path: '/submit',\n\
+                 method: 'POST',\n\
+                 headers: {{ 'content-type': 'text/plain' }},\n\
+               }}, (res) => {{\n\
+                 let body = '';\n\
+                 res.on('data', (chunk) => body += chunk);\n\
+                 res.on('end', () => resolve({{ status: res.statusCode, body }}));\n\
+               }});\n\
+               req.on('error', reject);\n\
+               req.write('hello from oam');\n\
+               req.end();\n\
+             }});\n\
+             console.log('post_status:', postResult.status === 200);\n\
+             const postData = JSON.parse(postResult.body);\n\
+             console.log('post_method:', postData.method === 'POST');\n\
+             console.log('post_echo:', postData.echo === 'hello from oam');\n\
+             \n\
+             // setHeader / getHeader / removeHeader\n\
+             const req2 = http.request('http://{addr}/h');\n\
+             req2.setHeader('x-test', 'val');\n\
+             console.log('setHeader:', req2.getHeader('x-test') === 'val');\n\
+             req2.removeHeader('x-test');\n\
+             console.log('removeHeader:', req2.getHeader('x-test') === undefined);\n\
+             req2.destroy();",
+            port = addr.port(),
+        ),
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
