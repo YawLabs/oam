@@ -217,6 +217,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("dnsLookup", op_dns_lookup),
         // stdin
         ("stdinRead", op_stdin_read),
+        // os extended
+        ("osRelease", op_os_release),
+        ("osTotalMem", op_os_total_mem),
+        ("osFreeMem", op_os_free_mem),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2318,4 +2322,146 @@ fn op_stdin_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     crate::ops::spawn_op(scope, &mut rv, oam_core::stdin_read());
+}
+
+// ============================================================== os extended
+
+fn op_os_release(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let release = os_release();
+    let val = v8::String::new(scope, &release).unwrap();
+    rv.set(val.into());
+}
+
+fn op_os_total_mem(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, total_mem() as f64).into());
+}
+
+fn op_os_free_mem(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, free_mem() as f64).into());
+}
+
+#[cfg(windows)]
+fn os_release() -> String {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct OSVERSIONINFOW {
+        dwOSVersionInfoSize: u32,
+        dwMajorVersion: u32,
+        dwMinorVersion: u32,
+        dwBuildNumber: u32,
+        dwPlatformId: u32,
+        szCSDVersion: [u16; 128],
+    }
+
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OSVERSIONINFOW) -> i32;
+    }
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        dwMajorVersion: 0,
+        dwMinorVersion: 0,
+        dwBuildNumber: 0,
+        dwPlatformId: 0,
+        szCSDVersion: [0; 128],
+    };
+    unsafe { RtlGetVersion(&mut info) };
+    format!("{}.{}.{}", info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber)
+}
+
+#[cfg(not(windows))]
+fn os_release() -> String {
+    use std::process::Command;
+    Command::new("uname").arg("-r").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MEMORYSTATUSEX {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+}
+
+#[cfg(windows)]
+fn mem_status() -> MEMORYSTATUSEX {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status) };
+    status
+}
+
+#[cfg(windows)]
+fn total_mem() -> u64 {
+    mem_status().ullTotalPhys
+}
+
+#[cfg(windows)]
+fn free_mem() -> u64 {
+    mem_status().ullAvailPhys
+}
+
+#[cfg(not(windows))]
+fn total_mem() -> u64 {
+    use std::fs;
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn free_mem() -> u64 {
+    use std::fs;
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        })
+        .unwrap_or(0)
 }

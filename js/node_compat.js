@@ -1338,8 +1338,8 @@
           : natives.platform === "darwin"
             ? "Darwin"
             : "Linux",
-      release: () => "",
-      version: () => "",
+      release: () => natives.osRelease(),
+      version: () => natives.osRelease(),
       homedir: () => natives.homedir(),
       tmpdir: () => natives.tmpdir(),
       hostname: () => natives.hostname(),
@@ -1352,9 +1352,8 @@
           speed: 0,
           times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
         })),
-      // Wave-1 stubs (documented): real values need a sysinfo native.
-      totalmem: () => 0,
-      freemem: () => 0,
+      totalmem: () => natives.osTotalMem(),
+      freemem: () => natives.osFreeMem(),
       uptime: () => natives.uptimeMs() / 1000,
       loadavg: () => [0, 0, 0],
       networkInterfaces: () => ({}),
