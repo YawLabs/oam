@@ -1988,14 +1988,6 @@
     return data;
   }
 
-  function streamStub(name) {
-    return () => {
-      throw new Error(
-        `fs.${name} is not implemented yet â€” fs.watch lands with a later compat wave`,
-      );
-    };
-  }
-
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     return {
@@ -2054,6 +2046,77 @@
           (value) => queueMicrotask(() => cb(null, value)),
           (err) => queueMicrotask(() => cb(err)),
         );
+      };
+    }
+
+    function fsWatch(filename, options, listener) {
+      if (typeof options === "function") {
+        listener = options;
+        options = {};
+      }
+      var opts = options || {};
+      var EventEmitter = registry.get("events");
+      var watcher = new EventEmitter();
+      var filePath = String(filename);
+      var prevMtime = 0;
+      var closed = false;
+      try {
+        prevMtime = natives.fsStatSync(filePath, false).mtimeMs;
+      } catch (e) {
+        // file may not exist yet
+      }
+      var pollInterval = opts.interval || 100;
+      var poll = setInterval(function () {
+        if (closed) return;
+        natives.fsStat(filePath, false).then(function (stat) {
+          if (stat.mtimeMs !== prevMtime) {
+            prevMtime = stat.mtimeMs;
+            var parts = filePath.replace(/\\/g, "/").split("/");
+            var base = parts[parts.length - 1] || filePath;
+            watcher.emit("change", "change", base);
+            if (listener) listener("change", base);
+          }
+        }, function (e) {
+          watcher.emit("error", e);
+        });
+      }, pollInterval);
+      watcher.close = function () {
+        closed = true;
+        clearInterval(poll);
+        watcher.emit("close");
+      };
+      watcher.ref = function () { return watcher; };
+      watcher.unref = function () { return watcher; };
+      return watcher;
+    }
+
+    function fsWatchFile(filename, options, listener) {
+      if (typeof options === "function") {
+        listener = options;
+        options = {};
+      }
+      var opts = options || {};
+      var filePath = String(filename);
+      var interval = opts.interval || 5007;
+      var prev;
+      try {
+        prev = wrapStat(natives.fsStatSync(filePath, false));
+      } catch (e) {
+        prev = wrapStat({ kind: "file", size: 0, mtime: 0, atime: 0, mode: 0 });
+      }
+      var poll = setInterval(function () {
+        natives.fsStat(filePath, false).then(function (raw) {
+          var curr = wrapStat(raw);
+          if (curr.mtimeMs !== prev.mtimeMs) {
+            if (listener) listener(curr, prev);
+            prev = curr;
+          }
+        }, function () {});
+      }, interval);
+      return {
+        close: function () { clearInterval(poll); },
+        ref: function () { return this; },
+        unref: function () { return this; },
       };
     }
 
@@ -2212,8 +2275,8 @@
         stream.path = path;
         return stream;
       },
-      watch: streamStub("watch"),
-      watchFile: streamStub("watchFile"),
+      watch: fsWatch,
+      watchFile: fsWatchFile,
     };
     fs.realpathSync.native = fs.realpathSync;
     return fs;

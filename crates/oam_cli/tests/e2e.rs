@@ -5256,6 +5256,33 @@ console.log('isTTY:', process.stdin.isTTY);
 }
 
 #[test]
+fn fs_watch_detects_file_change() {
+    let stdout = run_ok(
+        "fs_watch.mjs",
+        "import fs from 'fs';\n\
+         import path from 'path';\n\
+         const target = path.join(process.cwd(), '_watch_test_' + process.pid + '.tmp');\n\
+         fs.writeFileSync(target, 'initial');\n\
+         let detected = false;\n\
+         const watcher = fs.watch(target, { interval: 30 }, (eventType, filename) => {\n\
+           detected = true;\n\
+           watcher.close();\n\
+           console.log('event:', eventType, 'file:', filename);\n\
+         });\n\
+         setTimeout(() => {\n\
+           fs.writeFileSync(target, 'changed-' + Date.now());\n\
+         }, 100);\n\
+         setTimeout(() => {\n\
+           watcher.close();\n\
+           try { fs.unlinkSync(target); } catch (e) {}\n\
+           console.log('detected:', detected);\n\
+         }, 800);",
+    );
+    assert!(stdout.contains("event: change"), "should detect change event: {stdout}");
+    assert!(stdout.contains("detected: true"), "change should be detected: {stdout}");
+}
+
+#[test]
 fn os_and_process_native_values() {
     let stdout = run_ok(
         "os_process_natives.mjs",
