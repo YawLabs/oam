@@ -35,7 +35,9 @@ pub fn run(release: bool) -> Result<()> {
         .map(|node| capture_version(Path::new(node), &["--version"]))
         .unwrap_or_else(|| "absent".to_string());
 
-    println!("oam {oam_version} vs node {node_version}");
+    // oam_version already carries the "oam " program-name prefix from
+    // `oam --version`; don't prepend another (was "oam oam 0.0.1").
+    println!("{oam_version} vs node {node_version}");
 
     // ------------------------------------------------------------ wpt-url
     println!("suite: wpt-url");
@@ -193,7 +195,7 @@ pub fn run(release: bool) -> Result<()> {
         "Machine-readable twin: [`conformance/scorecard.json`](conformance/scorecard.json).\n\n",
     );
     md.push_str(&format!(
-        "Commit `{commit}` | oam {oam_version} | node {node_version} | host {}-{}\n\n",
+        "Commit `{commit}` | {oam_version} | node {node_version} | host {}-{}\n\n",
         std::env::consts::OS,
         std::env::consts::ARCH
     ));

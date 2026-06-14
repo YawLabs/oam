@@ -1,5 +1,5 @@
 {
-  "commit": "293040f",
+  "commit": "3bfe945",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.0.1",
@@ -76,15 +76,15 @@
         "detail": {
           "AbortController": true,
           "AbortSignal": true,
-          "Blob": false,
-          "BroadcastChannel": false,
+          "Blob": true,
+          "BroadcastChannel": true,
           "Buffer": true,
           "Event": true,
           "EventTarget": true,
-          "FormData": false,
+          "FormData": true,
           "Headers": true,
           "ReadableStream": true,
-          "Request": false,
+          "Request": true,
           "Response": true,
           "TextDecoder": true,
           "TextDecoderStream": true,
@@ -105,9 +105,9 @@
           "setImmediate": true,
           "setInterval": true,
           "setTimeout": true,
-          "structuredClone": false
+          "structuredClone": true
         },
-        "have": 26,
+        "have": 31,
         "total": 32
       },
       "modules": {
@@ -115,107 +115,59 @@
           "assert": true,
           "async_hooks": true,
           "buffer": true,
-          "child_process": false,
-          "cluster": false,
+          "child_process": true,
+          "cluster": true,
           "console": true,
           "crypto": true,
-          "dgram": false,
-          "diagnostics_channel": false,
-          "dns": false,
-          "domain": false,
+          "dgram": true,
+          "diagnostics_channel": true,
+          "dns": true,
+          "domain": true,
           "events": true,
           "fs": true,
           "fs/promises": true,
           "http": true,
-          "http2": false,
-          "https": false,
-          "inspector": false,
+          "http2": true,
+          "https": true,
+          "inspector": true,
           "module": true,
           "net": true,
           "os": true,
           "path": true,
-          "perf_hooks": false,
+          "perf_hooks": true,
           "process": true,
-          "punycode": false,
+          "punycode": true,
           "querystring": true,
-          "readline": false,
-          "repl": false,
+          "readline": true,
+          "repl": true,
           "stream": true,
           "stream/consumers": true,
           "stream/promises": true,
           "stream/web": true,
           "string_decoder": true,
-          "timers": false,
+          "timers": true,
           "timers/promises": true,
-          "tls": false,
-          "trace_events": false,
+          "tls": true,
+          "trace_events": true,
           "tty": true,
           "url": true,
           "util": true,
-          "v8": false,
-          "vm": false,
-          "worker_threads": false,
+          "v8": true,
+          "vm": true,
+          "worker_threads": true,
           "zlib": true
         },
-        "have": 25,
+        "have": 44,
         "total": 44
       }
     },
     "wptUrl": {
       "constructor": {
-        "pass": 827,
+        "pass": 845,
         "total": 888
       },
-      "failureCount": 64,
+      "failureCount": 53,
       "failureSample": [
-        {
-          "base": null,
-          "expected": "file:///w:/m",
-          "field": "href",
-          "got": "file:///w|/m",
-          "input": "file:///w|/m",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "non-special:opaque %20?hi",
-          "field": "href",
-          "got": "non-special:opaque  ?hi",
-          "input": "non-special:opaque  ?hi",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "non-special:opaque %20#hi",
-          "field": "href",
-          "got": "non-special:opaque  #hi",
-          "input": "non-special:opaque  #hi",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "non-special:opaque  %20#hi",
-          "field": "href",
-          "got": "non-special:opaque   #hi",
-          "input": "non-special:opaque \t\t  \t#hi",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "non-special:opaque  %20#hi",
-          "field": "href",
-          "got": "non-special:opaque   #hi",
-          "input": "non-special:opaque \t\t  #hi",
-          "suite": "constructor"
-        },
-        {
-          "base": null,
-          "expected": "non-special:opaque  %20#hi",
-          "field": "href",
-          "got": "non-special:opaque   #hi",
-          "input": "non-special:opaque\t\t  \r #hi",
-          "suite": "constructor"
-        },
         {
           "base": "file://h/C:/a/b",
           "expected": "file://h/C:/",
@@ -367,10 +319,58 @@
           "got": "file:///C:/",
           "input": "C|\n/",
           "suite": "constructor"
+        },
+        {
+          "base": "file://host/dir/file",
+          "expected": "file://host/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "C|\\",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://host/path",
+          "expected": "file://host/c:/foo/bar",
+          "field": "href",
+          "got": "file:///c:/foo/bar",
+          "input": "/c:/foo/bar",
+          "suite": "constructor"
+        },
+        {
+          "base": "abc://x/y/z/C:/",
+          "expected": "abc://x/y/z/",
+          "field": "href",
+          "got": "abc://x/y/z/C:/",
+          "input": "..",
+          "suite": "constructor"
+        },
+        {
+          "base": "file://x/C:/",
+          "expected": "file://x/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "..",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file://example.net/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "file://example.net/C:/",
+          "suite": "constructor"
+        },
+        {
+          "base": null,
+          "expected": "file://1.2.3.4/C:/",
+          "field": "href",
+          "got": "file:///C:/",
+          "input": "file://1.2.3.4/C:/",
+          "suite": "constructor"
         }
       ],
       "setters": {
-        "pass": 275,
+        "pass": 268,
         "total": 278
       },
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
