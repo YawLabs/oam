@@ -21,6 +21,7 @@ pub mod http_server;
 pub mod inspector;
 pub mod tcp;
 pub mod websocket;
+pub mod worker;
 
 pub type OpId = u64;
 
@@ -111,6 +112,7 @@ pub struct CoreRuntime {
     http_state: std::sync::Arc<http_server::HttpState>,
     tcp: tcp::TcpRegistry,
     ws: websocket::WsRegistry,
+    workers: worker::WorkerRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -146,6 +148,7 @@ impl CoreRuntime {
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -190,6 +193,11 @@ impl CoreRuntime {
     /// WebSocket connection registry (Arc clone; dies with the run).
     pub fn ws(&self) -> websocket::WsRegistry {
         self.ws.clone()
+    }
+
+    /// Worker thread registry (Arc clone; parent side).
+    pub fn workers(&self) -> worker::WorkerRegistry {
+        self.workers.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /

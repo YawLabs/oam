@@ -5827,20 +5827,79 @@
         this.port2._twin = this.port1;
       }
     }
+    const natives = globalThis.__oam.node;
+    const pathMod = registry.get("path");
     class Worker extends EventEmitter {
-      constructor() {
+      constructor(filename, opts = {}) {
         super();
-        throw new Error(
-          "Worker threads are not implemented in oam -- multi-thread ops land with a later wave",
-        );
+        if (typeof filename !== "string") throw new TypeError("Worker requires a filename");
+        const resolved = pathMod.resolve(filename);
+        const wd = opts.workerData !== undefined ? JSON.stringify(opts.workerData) : null;
+        const result = natives.workerNew(resolved, wd);
+        this._workerId = result.workerId;
+        this.threadId = result.threadId;
+        this._recvLoop();
       }
+      async _recvLoop() {
+        while (true) {
+          let raw;
+          try { raw = await natives.workerRecvMessage(this._workerId); } catch { break; }
+          if (raw === undefined) { this.emit("exit", 0); break; }
+          if (raw instanceof Uint8Array) {
+            const text = new TextDecoder().decode(raw);
+            try {
+              const data = JSON.parse(text);
+              this.emit("message", data);
+            } catch {
+              this.emit("message", text);
+            }
+          } else if (typeof raw === "object" && raw !== null) {
+            if (raw.type === "error") { this.emit("error", new Error(raw.message)); }
+            if (raw.type === "exit") { this.emit("exit", raw.code); break; }
+          }
+        }
+      }
+      postMessage(data) {
+        natives.workerPostMessage(this._workerId, JSON.stringify(data));
+      }
+      terminate() {
+        natives.workerTerminate(this._workerId);
+        return Promise.resolve(0);
+      }
+      ref() { return this; }
+      unref() { return this; }
     }
+
+    const isMain = natives.workerIsMainThread();
+    const threadId = natives.workerThreadId();
+    const workerData = natives.workerGetData();
+
+    let parentPort = null;
+    if (!isMain) {
+      parentPort = new MessagePort();
+      parentPort.postMessage = function postMessage(data) {
+        natives.parentPortPostMessage(JSON.stringify(data));
+      };
+      (async () => {
+        while (true) {
+          let raw;
+          try { raw = await natives.parentPortRecvMessage(); } catch { break; }
+          if (raw === undefined) break;
+          if (raw instanceof Uint8Array) {
+            const text = new TextDecoder().decode(raw);
+            try { parentPort.emit("message", JSON.parse(text)); }
+            catch { parentPort.emit("message", text); }
+          }
+        }
+      })();
+    }
+
     const _bc = typeof globalThis.BroadcastChannel !== "undefined" ? globalThis.BroadcastChannel : null;
     return {
-      isMainThread: true,
-      parentPort: null,
-      workerData: null,
-      threadId: 0,
+      isMainThread: isMain,
+      parentPort,
+      workerData,
+      threadId,
       resourceLimits: {},
       MessageChannel,
       MessagePort,

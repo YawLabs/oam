@@ -25,6 +25,7 @@ mod node_ops;
 mod ops;
 pub mod permissions;
 mod timers;
+mod worker;
 pub use modules::ModuleHost;
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 

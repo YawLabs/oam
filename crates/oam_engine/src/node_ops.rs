@@ -171,6 +171,16 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoTimingSafeEqual", op_crypto_timing_safe_equal),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
+        // worker_threads
+        ("workerNew", op_worker_new),
+        ("workerPostMessage", op_worker_post_message),
+        ("workerRecvMessage", op_worker_recv_message),
+        ("workerTerminate", op_worker_terminate),
+        ("parentPortPostMessage", op_parent_port_post_message),
+        ("parentPortRecvMessage", op_parent_port_recv_message),
+        ("workerThreadId", op_worker_thread_id),
+        ("workerIsMainThread", op_worker_is_main_thread),
+        ("workerGetData", op_worker_get_data),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -2062,4 +2072,198 @@ fn op_permissions_query(
     let state_val = v8::String::new(scope, state).unwrap();
     result.set(scope, state_key.into(), state_val.into());
     rv.set(result.into());
+}
+
+// -------------------------------------------------------------- worker_threads
+
+fn op_worker_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(script_path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "workerNew requires a script path");
+        return;
+    };
+    let worker_data = if args.get(1).is_null_or_undefined() {
+        None
+    } else {
+        arg_string(scope, &args, 1)
+    };
+
+    let path = PathBuf::from(&script_path);
+    if !path.is_file() {
+        throw_type_error(scope, &format!("worker script not found: {script_path}"));
+        return;
+    }
+
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let workers = core.workers();
+
+    let worker_id = workers.lock().expect("worker registry lock").next_id();
+
+    let (parent_to_worker_tx, parent_to_worker_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (worker_to_parent_tx, worker_to_parent_rx) =
+        std::sync::mpsc::channel::<oam_core::worker::WorkerEvent>();
+
+    let thread = crate::worker::spawn_worker(
+        path,
+        worker_data,
+        worker_id,
+        parent_to_worker_rx,
+        worker_to_parent_tx,
+    );
+
+    {
+        let mut guard = workers.lock().expect("worker registry lock");
+        guard.handles.insert(
+            worker_id,
+            oam_core::worker::WorkerHandle {
+                to_worker: parent_to_worker_tx,
+                thread: Some(thread),
+            },
+        );
+        guard.receivers.insert(worker_id, worker_to_parent_rx);
+    }
+
+    let result = v8::Object::new(scope);
+    let id_key = v8::String::new(scope, "workerId").unwrap();
+    let id_val = v8::Number::new(scope, worker_id as f64);
+    result.set(scope, id_key.into(), id_val.into());
+    let tid_key = v8::String::new(scope, "threadId").unwrap();
+    let tid_val = v8::Number::new(scope, worker_id as f64);
+    result.set(scope, tid_key.into(), tid_val.into());
+    rv.set(result.into());
+}
+
+fn op_worker_post_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(json) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "workerPostMessage requires data");
+        return;
+    };
+    let workers = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .workers();
+    if let Err(msg) = oam_core::worker::parent_post(&workers, worker_id, json.into_bytes()) {
+        let msg_v8 = v8::String::new(scope, &msg).unwrap();
+        let exception = v8::Exception::error(scope, msg_v8);
+        scope.throw_exception(exception);
+    }
+}
+
+fn op_worker_recv_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let workers = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .workers();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::worker::parent_recv(workers, worker_id),
+    );
+}
+
+fn op_worker_terminate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let workers = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .workers();
+    oam_core::worker::parent_terminate(&workers, worker_id);
+}
+
+fn op_parent_port_post_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(json) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "parentPortPostMessage requires data");
+        return;
+    };
+    let ctx = scope.get_slot::<oam_core::worker::WorkerContext>();
+    let Some(ctx) = ctx else {
+        throw_type_error(scope, "not in a worker thread");
+        return;
+    };
+    let outbox = ctx.outbox.clone();
+    if let Err(msg) = oam_core::worker::worker_post(&outbox, json.into_bytes()) {
+        let msg_v8 = v8::String::new(scope, &msg).unwrap();
+        let exception = v8::Exception::error(scope, msg_v8);
+        scope.throw_exception(exception);
+    }
+}
+
+fn op_parent_port_recv_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let ctx = scope.get_slot::<oam_core::worker::WorkerContext>();
+    let Some(ctx) = ctx else {
+        throw_type_error(scope, "not in a worker thread");
+        return;
+    };
+    let inbox = ctx.inbox.clone();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::worker::worker_recv(inbox));
+}
+
+fn op_worker_thread_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let thread_id = scope
+        .get_slot::<oam_core::worker::WorkerContext>()
+        .map(|ctx| ctx.thread_id)
+        .unwrap_or(0);
+    rv.set(v8::Number::new(scope, thread_id as f64).into());
+}
+
+fn op_worker_is_main_thread(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let is_main = scope
+        .get_slot::<oam_core::worker::WorkerContext>()
+        .is_none();
+    rv.set(v8::Boolean::new(scope, is_main).into());
+}
+
+fn op_worker_get_data(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let data = scope
+        .get_slot::<oam_core::worker::WorkerContext>()
+        .and_then(|ctx| ctx.worker_data.clone());
+    match data {
+        Some(json) => {
+            let parsed = v8::String::new(scope, &json).and_then(|s| v8::json::parse(scope, s));
+            match parsed {
+                Some(value) => rv.set(value),
+                None => rv.set(v8::null(scope).into()),
+            }
+        }
+        None => rv.set(v8::null(scope).into()),
+    }
 }

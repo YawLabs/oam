@@ -4510,6 +4510,74 @@ socket.on('close', () => {{
     assert_eq!(lines[1], "closed", "socket closed");
 }
 
+// ------------------------------------------ worker_threads
+
+#[test]
+fn worker_threads_message_round_trip() {
+    let worker_script = write_temp(
+        "echo_worker.cjs",
+        r#"const { parentPort, workerData } = require('worker_threads');
+parentPort.on('message', (msg) => {
+  parentPort.postMessage({ echo: msg, data: workerData });
+});
+"#,
+    );
+
+    let worker_path = worker_script.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        r#"const {{ Worker }} = require('worker_threads');
+const w = new Worker('{worker_path}', {{ workerData: {{ n: 42 }} }});
+w.on('message', (msg) => {{
+  console.log(JSON.stringify(msg));
+  w.terminate();
+}});
+w.on('exit', () => console.log('exited'));
+w.postMessage('ping');
+"#,
+    );
+    let stdout = run_ok("worker_main.cjs", &source);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[0].contains("ping"), "echo: {}", lines[0]);
+    assert!(lines[0].contains("42"), "workerData: {}", lines[0]);
+}
+
+#[test]
+fn worker_threads_is_main_thread_and_thread_id() {
+    let worker_script = write_temp(
+        "id_worker.cjs",
+        r#"const { parentPort, isMainThread, threadId } = require('worker_threads');
+parentPort.postMessage({ isMainThread, threadId });
+"#,
+    );
+
+    let worker_path = worker_script.to_string_lossy().replace('\\', "/");
+    let source = format!(
+        r#"const wt = require('worker_threads');
+console.log('main:isMain=' + wt.isMainThread + ',tid=' + wt.threadId);
+const w = new wt.Worker('{worker_path}');
+w.on('message', (msg) => {{
+  console.log('worker:isMain=' + msg.isMainThread + ',tid=' + msg.threadId);
+  w.terminate();
+}});
+"#,
+    );
+    let stdout = run_ok("worker_id_main.cjs", &source);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "main:isMain=true,tid=0");
+    assert!(
+        lines[1].starts_with("worker:isMain=false,tid="),
+        "worker line: {}",
+        lines[1]
+    );
+    let tid: u64 = lines[1]
+        .split("tid=")
+        .last()
+        .unwrap()
+        .parse()
+        .expect("thread id is a number");
+    assert!(tid > 0, "worker threadId > 0");
+}
+
 // ------------------------------------------ url: portable parity cases
 
 /// Portable (all-platform) subset of `url_parity_fleet_regressions`.
