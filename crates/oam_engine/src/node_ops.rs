@@ -143,6 +143,19 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsUnlink", op_fs_unlink),
         ("fsAccess", op_fs_access),
         ("fsRealpath", op_fs_realpath),
+        ("fsMkdtemp", op_fs_mkdtemp),
+        ("fsSymlink", op_fs_symlink),
+        ("fsReadlink", op_fs_readlink),
+        ("fsLink", op_fs_link),
+        ("fsChmod", op_fs_chmod),
+        ("fsTruncate", op_fs_truncate),
+        // fs sync (new batch)
+        ("fsSymlinkSync", op_fs_symlink_sync),
+        ("fsReadlinkSync", op_fs_readlink_sync),
+        ("fsLinkSync", op_fs_link_sync),
+        ("fsChmodSync", op_fs_chmod_sync),
+        ("fsTruncateSync", op_fs_truncate_sync),
+        ("fsMkdtempSync", op_fs_mkdtemp_sync),
         // fs streams (createReadStream/createWriteStream)
         ("fsOpen", op_fs_open),
         ("fsReadChunk", op_fs_read_chunk),
@@ -1580,6 +1593,230 @@ fn op_fs_realpath(
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_realpath(path));
+}
+
+fn op_fs_mkdtemp(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let prefix = arg_string(scope, &args, 0).unwrap_or_default();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(prefix));
+}
+
+fn op_fs_symlink(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(target) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "symlink requires a target");
+        return;
+    };
+    let Some(path) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "symlink requires a path");
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_symlink(target, path));
+}
+
+fn op_fs_readlink(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "readlink requires a path");
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readlink(path));
+}
+
+fn op_fs_link(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(existing) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "link requires an existing path");
+        return;
+    };
+    let Some(new_path) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "link requires a new path");
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_link(existing, new_path));
+}
+
+fn op_fs_chmod(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "chmod requires a path");
+        return;
+    };
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_chmod(path, mode));
+}
+
+fn op_fs_truncate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "truncate requires a path");
+        return;
+    };
+    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_truncate(path, len));
+}
+
+fn op_fs_symlink_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(target) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "symlinkSync requires a target");
+        return;
+    };
+    let Some(path) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "symlinkSync requires a path");
+        return;
+    };
+    #[cfg(windows)]
+    let result = {
+        let is_dir = std::fs::metadata(&target).map(|m| m.is_dir()).unwrap_or(false);
+        if is_dir {
+            std::os::windows::fs::symlink_dir(&target, &path)
+        } else {
+            std::os::windows::fs::symlink_file(&target, &path)
+        }
+    };
+    #[cfg(not(windows))]
+    let result = std::os::unix::fs::symlink(&target, &path);
+    if let Err(e) = result {
+        throw_node_error(scope, "symlink", &path, &e);
+    }
+}
+
+fn op_fs_readlink_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "readlinkSync requires a path");
+        return;
+    };
+    match std::fs::read_link(&path) {
+        Ok(target) => {
+            let text = oam_core::strip_unc_prefix(&target);
+            if let Some(value) = v8::String::new(scope, &text) {
+                rv.set(value.into());
+            }
+        }
+        Err(e) => throw_node_error(scope, "readlink", &path, &e),
+    }
+}
+
+fn op_fs_link_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(existing) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "linkSync requires an existing path");
+        return;
+    };
+    let Some(new_path) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "linkSync requires a new path");
+        return;
+    };
+    if let Err(e) = std::fs::hard_link(&existing, &new_path) {
+        throw_node_error(scope, "link", &new_path, &e);
+    }
+}
+
+fn op_fs_chmod_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "chmodSync requires a path");
+        return;
+    };
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+            throw_node_error(scope, "chmod", &path, &e);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mut perms = meta.permissions();
+                perms.set_readonly(mode & 0o200 == 0);
+                if let Err(e) = std::fs::set_permissions(&path, perms) {
+                    throw_node_error(scope, "chmod", &path, &e);
+                }
+            }
+            Err(e) => throw_node_error(scope, "chmod", &path, &e),
+        }
+    }
+}
+
+fn op_fs_truncate_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "truncateSync requires a path");
+        return;
+    };
+    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    match std::fs::OpenOptions::new().write(true).open(&path) {
+        Ok(f) => {
+            if let Err(e) = f.set_len(len) {
+                throw_node_error(scope, "truncate", &path, &e);
+            }
+        }
+        Err(e) => throw_node_error(scope, "truncate", &path, &e),
+    }
+}
+
+fn op_fs_mkdtemp_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let prefix = arg_string(scope, &args, 0).unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!(
+        "{}{}",
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {
+            let text = oam_core::strip_unc_prefix(&dir);
+            if let Some(value) = v8::String::new(scope, &text) {
+                rv.set(value.into());
+            }
+        }
+        Err(e) => throw_node_error(scope, "mkdtemp", &prefix, &e),
+    }
 }
 
 // ---------------------------------------------------------- fs stream ops

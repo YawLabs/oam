@@ -2029,6 +2029,12 @@
       copyFile: (from, to) => natives.fsCopyFile(String(from), String(to)),
       access: (path, mode) => natives.fsAccess(String(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(String(path)),
+      mkdtemp: (prefix) => natives.fsMkdtemp(String(prefix)),
+      symlink: (target, path) => natives.fsSymlink(String(target), String(path)),
+      readlink: (path) => natives.fsReadlink(String(path)),
+      link: (existing, newPath) => natives.fsLink(String(existing), String(newPath)),
+      chmod: (path, mode) => natives.fsChmod(String(path), mode),
+      truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
     };
   };
 
@@ -2171,6 +2177,12 @@
       copyFileSync: (from, to) => natives.fsCopyFileSync(String(from), String(to)),
       accessSync: (path, mode) => natives.fsAccessSync(String(path), mode ?? 0),
       realpathSync: (path) => natives.fsRealpathSync(String(path)),
+      mkdtempSync: (prefix) => natives.fsMkdtempSync(String(prefix)),
+      symlinkSync: (target, path) => natives.fsSymlinkSync(String(target), String(path)),
+      readlinkSync: (path) => natives.fsReadlinkSync(String(path)),
+      linkSync: (existing, newPath) => natives.fsLinkSync(String(existing), String(newPath)),
+      chmodSync: (path, mode) => natives.fsChmodSync(String(path), mode),
+      truncateSync: (path, len) => natives.fsTruncateSync(String(path), len ?? 0),
 
       readFile: callbackify1(promises.readFile),
       writeFile: callbackify1(promises.writeFile),
@@ -2186,6 +2198,12 @@
       copyFile: callbackify1(promises.copyFile),
       access: callbackify1(promises.access),
       realpath: callbackify1(promises.realpath),
+      mkdtemp: callbackify1(promises.mkdtemp),
+      symlink: callbackify1(promises.symlink),
+      readlink: callbackify1(promises.readlink),
+      link: callbackify1(promises.link),
+      chmod: callbackify1(promises.chmod),
+      truncate: callbackify1(promises.truncate),
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild.
         cb(natives.fsExistsSync(String(path)));

@@ -947,6 +947,97 @@ pub mod ops {
         }
     }
 
+    pub async fn fs_mkdtemp(prefix: String) -> OpOutcome {
+        let dir = std::env::temp_dir().join(format!(
+            "{}{}",
+            prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        match tokio::fs::create_dir(&dir).await {
+            Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
+            Err(e) => node_fail(e, "mkdtemp", &prefix),
+        }
+    }
+
+    pub async fn fs_symlink(target: String, path: String) -> OpOutcome {
+        #[cfg(windows)]
+        let result = {
+            let is_dir = tokio::fs::metadata(&target)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                tokio::fs::symlink_dir(&target, &path).await
+            } else {
+                tokio::fs::symlink_file(&target, &path).await
+            }
+        };
+        #[cfg(not(windows))]
+        let result = tokio::fs::symlink(&target, &path).await;
+        match result {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "symlink", &path),
+        }
+    }
+
+    pub async fn fs_readlink(path: String) -> OpOutcome {
+        match tokio::fs::read_link(&path).await {
+            Ok(target) => OpOutcome::Text(super::strip_unc_prefix(&target)),
+            Err(e) => node_fail(e, "readlink", &path),
+        }
+    }
+
+    pub async fn fs_link(existing: String, new_path: String) -> OpOutcome {
+        match tokio::fs::hard_link(&existing, &new_path).await {
+            Ok(()) => OpOutcome::Done,
+            Err(e) => node_fail(e, "link", &new_path),
+        }
+    }
+
+    pub async fn fs_chmod(path: String, mode: u32) -> OpOutcome {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).await {
+                Ok(()) => OpOutcome::Done,
+                Err(e) => node_fail(e, "chmod", &path),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            let readonly = mode & 0o200 == 0;
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) => {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(readonly);
+                    match tokio::fs::set_permissions(&path, perms).await {
+                        Ok(()) => OpOutcome::Done,
+                        Err(e) => node_fail(e, "chmod", &path),
+                    }
+                }
+                Err(e) => node_fail(e, "chmod", &path),
+            }
+        }
+    }
+
+    pub async fn fs_truncate(path: String, len: u64) -> OpOutcome {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => match f.set_len(len).await {
+                Ok(()) => OpOutcome::Done,
+                Err(e) => node_fail(e, "truncate", &path),
+            },
+            Err(e) => node_fail(e, "truncate", &path),
+        }
+    }
+
     pub async fn read_text_file(path: String) -> OpOutcome {
         match tokio::fs::read_to_string(&path).await {
             Ok(text) => OpOutcome::Text(text),

@@ -5338,3 +5338,96 @@ fn os_and_process_native_values() {
         );
     }
 }
+
+#[test]
+fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
+    let stdout = run_ok(
+        "fs_new_ops.js",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         import path from 'node:path';\n\
+         import os from 'node:os';\n\
+         \n\
+         // mkdtemp (sync)\n\
+         const dir = fs.mkdtempSync('oam-test-');\n\
+         console.log('mkdtempSync:', dir.includes('oam-test-'));\n\
+         \n\
+         // mkdtemp (async)\n\
+         const dir2 = await fsp.mkdtemp('oam-async-');\n\
+         console.log('mkdtemp:', dir2.includes('oam-async-'));\n\
+         \n\
+         // write a file for testing\n\
+         const testFile = path.join(dir, 'hello.txt');\n\
+         fs.writeFileSync(testFile, 'hello world');\n\
+         \n\
+         // symlink + readlink (sync) -- may fail on Windows without dev mode\n\
+         let symlinkOk = true;\n\
+         try {\n\
+           const linkPath = path.join(dir, 'link.txt');\n\
+           fs.symlinkSync(testFile, linkPath);\n\
+           const target = fs.readlinkSync(linkPath);\n\
+           console.log('symlinkSync:', target.includes('hello.txt'));\n\
+           console.log('readlinkSync:', target === testFile);\n\
+         } catch (e) {\n\
+           if (e.message && e.message.includes('privilege')) {\n\
+             console.log('symlinkSync:', true);\n\
+             console.log('readlinkSync:', true);\n\
+             symlinkOk = false;\n\
+           } else { throw e; }\n\
+         }\n\
+         \n\
+         // symlink + readlink (async)\n\
+         if (symlinkOk) {\n\
+           const linkPath2 = path.join(dir, 'link2.txt');\n\
+           await fsp.symlink(testFile, linkPath2);\n\
+           const target2 = await fsp.readlink(linkPath2);\n\
+           console.log('symlink_async:', target2 === testFile);\n\
+         } else {\n\
+           console.log('symlink_async:', true);\n\
+         }\n\
+         \n\
+         // hard link (sync)\n\
+         const hardPath = path.join(dir, 'hard.txt');\n\
+         fs.linkSync(testFile, hardPath);\n\
+         const hardContent = fs.readFileSync(hardPath, 'utf8');\n\
+         console.log('linkSync:', hardContent === 'hello world');\n\
+         \n\
+         // hard link (async)\n\
+         const hardPath2 = path.join(dir, 'hard2.txt');\n\
+         await fsp.link(testFile, hardPath2);\n\
+         const hardContent2 = await fsp.readFile(hardPath2, 'utf8');\n\
+         console.log('link_async:', hardContent2 === 'hello world');\n\
+         \n\
+         // truncate (sync)\n\
+         const truncFile = path.join(dir, 'trunc.txt');\n\
+         fs.writeFileSync(truncFile, 'abcdefghij');\n\
+         fs.truncateSync(truncFile, 3);\n\
+         console.log('truncateSync:', fs.readFileSync(truncFile, 'utf8') === 'abc');\n\
+         \n\
+         // truncate (async)\n\
+         const truncFile2 = path.join(dir, 'trunc2.txt');\n\
+         fs.writeFileSync(truncFile2, '1234567890');\n\
+         await fsp.truncate(truncFile2, 5);\n\
+         const tr2 = await fsp.readFile(truncFile2, 'utf8');\n\
+         console.log('truncate_async:', tr2 === '12345');\n\
+         \n\
+         // chmod (sync) -- on Windows just tests no throw\n\
+         fs.chmodSync(testFile, 0o644);\n\
+         console.log('chmodSync:', true);\n\
+         \n\
+         // chmod (async)\n\
+         await fsp.chmod(testFile, 0o755);\n\
+         console.log('chmod_async:', true);\n\
+         \n\
+         // cleanup\n\
+         fs.rmSync(dir, { recursive: true, force: true });\n\
+         fs.rmSync(dir2, { recursive: true, force: true });\n\
+         console.log('done:', true);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
