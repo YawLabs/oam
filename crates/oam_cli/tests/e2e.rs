@@ -5073,3 +5073,81 @@ module.exports = function handler(req, res) {
     assert_eq!(body2["body"], r#"{"key":"value"}"#);
     assert!(body2["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
 }
+
+// --------------------------------------------------------- child_process
+
+#[test]
+fn child_process_exec_sync_runs_shell_commands() {
+    let f = write_temp(
+        "cp_exec_sync.mjs",
+        r#"
+import { execSync, spawnSync, execFileSync } from "child_process";
+
+// execSync runs in a shell and returns stdout
+const out = execSync("echo hello from execSync");
+console.log("execSync:", out.toString().trim());
+
+// spawnSync with shell: true
+const r = spawnSync("echo", ["spawn", "sync"], { shell: true });
+console.log("spawnSync:", Buffer.from(r.stdout).toString().trim(), "status:", r.status);
+
+// spawnSync without shell (direct executable)
+const r2 = spawnSync("node", ["-e", "console.log('node-direct')"]);
+console.log("direct:", Buffer.from(r2.stdout).toString().trim(), "status:", r2.status);
+
+// execSync throws on non-zero exit
+try {
+  execSync("exit 42", { encoding: "utf8" });
+  console.log("should have thrown");
+} catch (e) {
+  console.log("threw:", e.status);
+}
+
+// spawnSync with input
+const r3 = spawnSync("node", ["-e", "process.stdin.resume(); process.stdin.on('data', d => { process.stdout.write(d); process.stdin.pause(); });"], { input: "piped-in" });
+console.log("input:", Buffer.from(r3.stdout).toString().trim());
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("execSync: hello from execSync"), "{stdout}");
+    assert!(stdout.contains("spawnSync: spawn sync status: 0"), "{stdout}");
+    assert!(stdout.contains("direct: node-direct status: 0"), "{stdout}");
+    assert!(stdout.contains("threw: 42"), "{stdout}");
+    assert!(stdout.contains("input: piped-in"), "{stdout}");
+}
+
+#[test]
+fn child_process_async_spawn_streams_and_events() {
+    let f = write_temp(
+        "cp_async_spawn.mjs",
+        r#"
+import { spawn, exec } from "child_process";
+
+// Test async spawn with events
+const cp = spawn("echo", ["hello", "async"], { shell: true });
+const chunks = [];
+cp.on("spawn", () => {
+  console.log("spawned pid:", typeof cp.pid);
+  cp.stdout.on("data", (chunk) => chunks.push(chunk));
+});
+cp.on("close", (code) => {
+  console.log("spawn-out:", Buffer.concat(chunks).toString().trim(), "code:", code);
+
+  // Test exec with callback
+  exec("echo exec-cb-test", (err, stdout, stderr) => {
+    console.log("exec:", stdout.trim(), "err:", err);
+    console.log("DONE");
+  });
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("spawned pid: number"), "{stdout}");
+    assert!(stdout.contains("spawn-out: hello async code: 0"), "{stdout}");
+    assert!(stdout.contains("exec: exec-cb-test err: null"), "{stdout}");
+    assert!(stdout.contains("DONE"), "{stdout}");
+}

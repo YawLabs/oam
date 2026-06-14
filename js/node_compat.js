@@ -5849,22 +5849,244 @@
   // ------------------------------------------------------ child_process
   // Stub: throws a clear "not implemented" error. Subprocess ops land with a
   // later wave.
-  registry.factories.child_process = () => {
-    function notImpl(name) {
-      return () => {
-        throw new Error(
-          `child_process.${name} is not implemented in oam -- subprocess ops land with a later wave`,
-        );
+  registry.factories.child_process = (natives) => {
+    const EventEmitter = registry.get("events");
+    const { Readable, Writable } = registry.get("stream");
+    const { Buffer } = registry.get("buffer");
+
+    function normalizeArgs(command, args, options) {
+      if (args != null && typeof args === "object" && !Array.isArray(args)) {
+        options = args;
+        args = [];
+      }
+      return {
+        command: String(command),
+        args: (args || []).map(String),
+        options: options || {},
       };
     }
+
+    function decodeOutput(buf, encoding) {
+      if (!encoding || encoding === "buffer") return Buffer.from(buf);
+      return Buffer.from(buf).toString(encoding);
+    }
+
+    function spawnSync(command, args, options) {
+      const norm = normalizeArgs(command, args, options);
+      const opts = norm.options;
+      const nativeOpts = {
+        cwd: opts.cwd || undefined,
+        env: opts.env || undefined,
+        shell: !!opts.shell,
+        clearEnv: false,
+        timeout: opts.timeout || 0,
+        maxBuffer: opts.maxBuffer || 50 * 1024 * 1024,
+        input: opts.input != null
+          ? (typeof opts.input === "string" ? Buffer.from(opts.input, opts.encoding || "utf8") : opts.input)
+          : undefined,
+      };
+      const result = natives.spawnSync(norm.command, norm.args, nativeOpts);
+      const encoding = opts.encoding || "buffer";
+      return {
+        pid: result.pid,
+        output: [null, decodeOutput(result.stdout, encoding), decodeOutput(result.stderr, encoding)],
+        stdout: decodeOutput(result.stdout, encoding),
+        stderr: decodeOutput(result.stderr, encoding),
+        status: result.status,
+        signal: result.signal,
+        error: result.error
+          ? Object.assign(new Error(result.error.message), { code: result.error.code })
+          : undefined,
+      };
+    }
+
+    function execSync(command, options) {
+      const opts = Object.assign({ shell: true }, options);
+      const result = spawnSync(command, [], opts);
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        const err = new Error(`Command failed: ${command}\n${result.stderr}`);
+        err.status = result.status;
+        err.signal = result.signal;
+        err.stdout = result.stdout;
+        err.stderr = result.stderr;
+        err.pid = result.pid;
+        throw err;
+      }
+      return result.stdout;
+    }
+
+    function execFileSync(file, args, options) {
+      const norm = normalizeArgs(file, args, options);
+      const result = spawnSync(norm.command, norm.args, norm.options);
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        const err = new Error(`Command failed: ${norm.command}`);
+        err.status = result.status;
+        err.signal = result.signal;
+        err.stdout = result.stdout;
+        err.stderr = result.stderr;
+        err.pid = result.pid;
+        throw err;
+      }
+      return result.stdout;
+    }
+
+    class ChildProcess extends EventEmitter {
+      constructor() {
+        super();
+        this.pid = null;
+        this.exitCode = null;
+        this.signalCode = null;
+        this.killed = false;
+        this.connected = false;
+        this.stdin = null;
+        this.stdout = null;
+        this.stderr = null;
+        this._handle = null;
+        this._exited = false;
+      }
+      kill(signal) {
+        if (this._handle != null) {
+          natives.spawnKill(this._handle);
+          this.killed = true;
+        }
+        return true;
+      }
+      ref() { return this; }
+      unref() { return this; }
+    }
+
+    function spawn(command, args, options) {
+      const norm = normalizeArgs(command, args, options);
+      const opts = norm.options;
+      const cp = new ChildProcess();
+
+      const nativeOpts = {
+        cwd: opts.cwd || undefined,
+        env: opts.env || undefined,
+        shell: !!opts.shell,
+        clearEnv: false,
+      };
+
+      const readStdout = async (handle) => {
+        while (true) {
+          const chunk = await natives.spawnReadStdout(handle);
+          if (chunk === undefined || chunk === null || chunk.length === 0) {
+            cp.stdout.push(null);
+            break;
+          }
+          cp.stdout.push(Buffer.from(chunk));
+        }
+      };
+      const readStderr = async (handle) => {
+        while (true) {
+          const chunk = await natives.spawnReadStderr(handle);
+          if (chunk === undefined || chunk === null || chunk.length === 0) {
+            cp.stderr.push(null);
+            break;
+          }
+          cp.stderr.push(Buffer.from(chunk));
+        }
+      };
+
+      natives.spawnAsync(norm.command, norm.args, nativeOpts).then((info) => {
+        cp._handle = info.handle;
+        cp.pid = info.pid;
+
+        cp.stdout = new Readable({ read() {} });
+        cp.stderr = new Readable({ read() {} });
+        cp.stdin = new Writable({
+          write(chunk, encoding, callback) {
+            natives.spawnWrite(info.handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
+              .then(() => callback(), (err) => callback(err));
+          },
+        });
+
+        cp.emit("spawn");
+
+        readStdout(info.handle);
+        readStderr(info.handle);
+
+        natives.spawnWait(info.handle).then((result) => {
+          cp._exited = true;
+          cp.exitCode = result.code;
+          cp.signalCode = result.signal;
+          cp.emit("exit", result.code, result.signal);
+          queueMicrotask(() => cp.emit("close", result.code, result.signal));
+        });
+      }).catch((err) => {
+        queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+      });
+
+      return cp;
+    }
+
+    function exec(command, options, callback) {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      const opts = Object.assign({ shell: true }, options);
+      const cp = spawn(command, [], opts);
+      const stdout = [];
+      const stderr = [];
+      const maxBuffer = opts.maxBuffer || 50 * 1024 * 1024;
+
+      cp.on("spawn", () => {
+        cp.stdout.on("data", (chunk) => {
+          stdout.push(chunk);
+          if (Buffer.concat(stdout).length > maxBuffer) {
+            cp.kill();
+          }
+        });
+        cp.stderr.on("data", (chunk) => {
+          stderr.push(chunk);
+        });
+      });
+      cp.on("close", (code, signal) => {
+        const stdoutBuf = Buffer.concat(stdout);
+        const stderrBuf = Buffer.concat(stderr);
+        const enc = opts.encoding || "utf8";
+        const out = enc === "buffer" ? stdoutBuf : stdoutBuf.toString(enc);
+        const errOut = enc === "buffer" ? stderrBuf : stderrBuf.toString(enc);
+        if (code !== 0 && callback) {
+          const err = new Error(`Command failed: ${command}\n${errOut}`);
+          err.code = code;
+          err.signal = signal;
+          callback(err, out, errOut);
+        } else if (callback) {
+          callback(null, out, errOut);
+        }
+      });
+      cp.on("error", (err) => {
+        if (callback) callback(err, "", "");
+      });
+      return cp;
+    }
+
+    function execFile(file, args, options, callback) {
+      if (typeof args === "function") {
+        callback = args;
+        args = [];
+        options = {};
+      } else if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      const norm = normalizeArgs(file, args, options);
+      return exec(norm.command + " " + norm.args.join(" "), norm.options, callback);
+    }
+
     return {
-      exec: notImpl("exec"),
-      execFile: notImpl("execFile"),
-      spawn: notImpl("spawn"),
-      spawnSync: notImpl("spawnSync"),
-      execSync: notImpl("execSync"),
-      execFileSync: notImpl("execFileSync"),
-      fork: notImpl("fork"),
+      spawn,
+      spawnSync,
+      exec,
+      execSync,
+      execFile,
+      execFileSync,
+      fork: () => { throw new Error("child_process.fork is not implemented in oam yet"); },
+      ChildProcess,
     };
   };
 

@@ -205,6 +205,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("workerThreadId", op_worker_thread_id),
         ("workerIsMainThread", op_worker_is_main_thread),
         ("workerGetData", op_worker_get_data),
+        // child_process
+        ("spawnSync", op_spawn_sync),
+        ("spawnAsync", op_spawn_async),
+        ("spawnKill", op_spawn_kill),
+        ("spawnReadStdout", op_spawn_read_stdout),
+        ("spawnReadStderr", op_spawn_read_stderr),
+        ("spawnWrite", op_spawn_write),
+        ("spawnWait", op_spawn_wait),
     );
 
     let node_key = v8::String::new(scope, "node").unwrap();
@@ -1921,4 +1929,356 @@ fn op_worker_get_data(
         }
         None => rv.set(v8::null(scope).into()),
     }
+}
+
+// -------------------------------------------------------- child_process ops
+
+fn op_spawn_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(command) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "spawnSync: command required");
+        return;
+    };
+
+    let args_val = args.get(1);
+    let mut child_args: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
+        for i in 0..arr.length() {
+            if let Some(v) = arr.get_index(scope, i) {
+                if let Some(s) = v.to_string(scope) {
+                    child_args.push(s.to_rust_string_lossy(scope));
+                }
+            }
+        }
+    }
+
+    let opts_val = args.get(2);
+    let opts = if opts_val.is_null_or_undefined() {
+        None
+    } else {
+        v8::Local::<v8::Object>::try_from(opts_val).ok()
+    };
+
+    let cwd = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "cwd")?;
+            let val = o.get(scope, key.into())?;
+            if val.is_null_or_undefined() {
+                return None;
+            }
+            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+        });
+    let shell = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "shell")?;
+            o.get(scope, key.into())
+        })
+        .is_some_and(|v| v.is_true());
+    let clear_env = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "clearEnv")?;
+            o.get(scope, key.into())
+        })
+        .is_some_and(|v| v.is_true());
+    let timeout_ms = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "timeout")?;
+            let val = o.get(scope, key.into())?;
+            val.number_value(scope)
+        })
+        .unwrap_or(0.0) as u64;
+    let max_buffer = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "maxBuffer")?;
+            let val = o.get(scope, key.into())?;
+            val.number_value(scope)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(50 * 1024 * 1024);
+
+    let input = opts.and_then(|o| {
+        let key = v8::String::new(scope, "input")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(val) {
+            let mut bytes = vec![0u8; view.byte_length()];
+            let copied = view.copy_contents(&mut bytes);
+            bytes.truncate(copied);
+            return Some(bytes);
+        }
+        let text = val.to_string(scope)?.to_rust_string_lossy(scope);
+        Some(text.into_bytes())
+    });
+
+    let env_pairs = opts.and_then(|o| {
+        let key = v8::String::new(scope, "env")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+        let names = env_obj.get_own_property_names(scope, Default::default())?;
+        let mut pairs = Vec::new();
+        for i in 0..names.length() {
+            if let Some(name) = names.get_index(scope, i) {
+                if let Some(val) = env_obj.get(scope, name) {
+                    if let (Some(k), Some(v)) = (
+                        name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    ) {
+                        pairs.push((k, v));
+                    }
+                }
+            }
+        }
+        Some(pairs)
+    });
+
+    let result = oam_core::child::spawn_sync(
+        &command,
+        &child_args,
+        cwd.as_deref(),
+        env_pairs.as_deref(),
+        input.as_deref(),
+        shell,
+        clear_env,
+        timeout_ms,
+        max_buffer,
+    );
+
+    let obj = v8::Object::new(scope);
+    if let Some(stdout) = bytes_to_uint8array(scope, result.stdout) {
+        let key = v8::String::new(scope, "stdout").unwrap();
+        obj.set(scope, key.into(), stdout);
+    }
+    if let Some(stderr) = bytes_to_uint8array(scope, result.stderr) {
+        let key = v8::String::new(scope, "stderr").unwrap();
+        obj.set(scope, key.into(), stderr);
+    }
+    let key = v8::String::new(scope, "pid").unwrap();
+    let val = v8::Number::new(scope, result.pid as f64);
+    obj.set(scope, key.into(), val.into());
+
+    let key = v8::String::new(scope, "status").unwrap();
+    match result.status {
+        Some(code) => {
+            let val = v8::Number::new(scope, code as f64);
+            obj.set(scope, key.into(), val.into());
+        }
+        None => {
+            obj.set(scope, key.into(), v8::null(scope).into());
+        }
+    }
+
+    let key = v8::String::new(scope, "signal").unwrap();
+    match &result.signal {
+        Some(sig) => {
+            let val = v8::String::new(scope, sig).unwrap();
+            obj.set(scope, key.into(), val.into());
+        }
+        None => {
+            obj.set(scope, key.into(), v8::null(scope).into());
+        }
+    }
+
+    if let Some(error) = &result.error {
+        let err_obj = v8::Object::new(scope);
+        let k = v8::String::new(scope, "code").unwrap();
+        let v = v8::String::new(scope, &error.code).unwrap();
+        err_obj.set(scope, k.into(), v.into());
+        let k = v8::String::new(scope, "message").unwrap();
+        let v = v8::String::new(scope, &error.message).unwrap();
+        err_obj.set(scope, k.into(), v.into());
+        let key = v8::String::new(scope, "error").unwrap();
+        obj.set(scope, key.into(), err_obj.into());
+    }
+
+    rv.set(obj.into());
+}
+
+fn op_spawn_async(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(command) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "spawn: command required");
+        return;
+    };
+
+    let args_val = args.get(1);
+    let mut child_args: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
+        for i in 0..arr.length() {
+            if let Some(v) = arr.get_index(scope, i) {
+                if let Some(s) = v.to_string(scope) {
+                    child_args.push(s.to_rust_string_lossy(scope));
+                }
+            }
+        }
+    }
+
+    let opts_val = args.get(2);
+    let opts = if opts_val.is_null_or_undefined() {
+        None
+    } else {
+        v8::Local::<v8::Object>::try_from(opts_val).ok()
+    };
+
+    let cwd = opts.and_then(|o| {
+        let key = v8::String::new(scope, "cwd")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() { return None; }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
+    let shell = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "shell")?;
+            o.get(scope, key.into())
+        })
+        .is_some_and(|v| v.is_true());
+    let clear_env = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "clearEnv")?;
+            o.get(scope, key.into())
+        })
+        .is_some_and(|v| v.is_true());
+
+    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
+        let key = v8::String::new(scope, "env")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() { return None; }
+        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+        let names = env_obj.get_own_property_names(scope, Default::default())?;
+        let mut pairs = Vec::new();
+        for i in 0..names.length() {
+            if let Some(name) = names.get_index(scope, i) {
+                if let Some(val) = env_obj.get(scope, name) {
+                    if let (Some(k), Some(v)) = (
+                        name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    ) {
+                        pairs.push((k, v));
+                    }
+                }
+            }
+        }
+        Some(pairs)
+    });
+
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    let ids = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .body_ids();
+
+    let children2 = children.clone();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        match oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env).await {
+            Ok((child, pid)) => {
+                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut guard = children2.lock().expect("child registry lock");
+                guard.insert(handle, oam_core::child::ChildProcess { child, pid });
+                let json = serde_json::json!({ "handle": handle, "pid": pid });
+                oam_core::OpOutcome::Json(json.to_string())
+            }
+            Err(msg) => oam_core::OpOutcome::Failed(msg),
+        }
+    });
+}
+
+fn op_spawn_kill(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    let mut guard = children.lock().expect("child registry lock");
+    if let Some(cp) = guard.get_mut(&handle) {
+        let _ = cp.child.start_kill();
+    }
+}
+
+fn op_spawn_read_stdout(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child::child_read_stdout(children, handle),
+    );
+}
+
+fn op_spawn_read_stderr(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child::child_read_stderr(children, handle),
+    );
+}
+
+fn op_spawn_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "spawnWrite: data required");
+        return;
+    };
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child::child_write_stdin(children, handle, data),
+    );
+}
+
+fn op_spawn_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child::child_wait(children, handle),
+    );
 }

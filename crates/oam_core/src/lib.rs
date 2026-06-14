@@ -17,6 +17,7 @@ use std::time::Instant;
 
 pub use oam_diagnostics as diagnostics;
 
+pub mod child;
 pub mod http_server;
 pub mod inspector;
 pub mod tcp;
@@ -113,6 +114,7 @@ pub struct CoreRuntime {
     tcp: tcp::TcpRegistry,
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
+    children: child::ChildRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -149,6 +151,7 @@ impl CoreRuntime {
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
+            children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -198,6 +201,11 @@ impl CoreRuntime {
     /// Worker thread registry (Arc clone; parent side).
     pub fn workers(&self) -> worker::WorkerRegistry {
         self.workers.clone()
+    }
+
+    /// Child process registry (Arc clone; dies with the run).
+    pub fn children(&self) -> child::ChildRegistry {
+        self.children.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /
