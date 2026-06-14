@@ -1424,8 +1424,14 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          try { drained = await inflight; } catch (e) { drained = 'FAILED:' + e.constructor.name; }\n\
          console.log(drained);\n\
          // Body budget: a flood of large unread uploads must reject some\n\
-         // (503) rather than retain unbounded memory.\n\
-         const server2 = http.createServer((req, res) => res.end('ok'));\n\
+         // (503) rather than retain unbounded memory. The handler holds\n\
+         // each request ~400ms before responding so the 8MB bodies stay\n\
+         // reserved against the 512MB GLOBAL_BODY_BUDGET long enough to\n\
+         // accumulate past it. With an instant res.end the RequestGuard\n\
+         // refunds each reservation before 64 (512MB) pile up on a fast\n\
+         // runner, so the budget never trips and load-shedding looks broken\n\
+         // (flaky 'true false true' seen on the Windows x64 CI runner).\n\
+         const server2 = http.createServer((req, res) => setTimeout(() => res.end('ok'), 400));\n\
          await new Promise((r) => server2.listen(0, r));\n\
          const base2 = `http://127.0.0.1:${server2.address().port}`;\n\
          const big = 'x'.repeat(8 * 1024 * 1024);\n\
