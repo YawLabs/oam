@@ -2220,6 +2220,8 @@
   // -------------------------------------------------------------- process
   registry.factories.process = (natives) => {
     const EventEmitter = registry.get("events");
+    const { Readable, Writable } = registry.get("stream");
+    const { Buffer } = registry.get("buffer");
     const process = new EventEmitter();
 
     // Lazy env: natives.env() crosses the FFI boundary and copies every
@@ -2315,48 +2317,25 @@
         () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
         { rss: () => 0 },
       ),
-      // Binary chunks (Buffers/views) pass through to the native as RAW
-      // bytes â€” a UTF-8 round-trip corrupts piped binary output (images,
-      // gzip). Strings encode as UTF-8 on the Rust side.
-      stdout: {
-        fd: 1,
-        isTTY: stdoutIsTTY,
-        write(chunk, cb) {
-          natives.stdoutWrite(chunk);
-          if (typeof cb === "function") queueMicrotask(cb);
-          return true;
+      stdout: Object.assign(new Writable({
+        write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
+        decodeStrings: false,
+      }), { fd: 1, isTTY: stdoutIsTTY, columns: stdoutIsTTY ? 80 : undefined, hasColors: () => stdoutIsTTY }),
+      stderr: Object.assign(new Writable({
+        write(chunk, _enc, cb) { natives.stderrWrite(chunk); cb(); },
+        decodeStrings: false,
+      }), { fd: 2, isTTY: stderrIsTTY, columns: stderrIsTTY ? 80 : undefined, hasColors: () => stderrIsTTY }),
+      stdin: Object.assign(new Readable({
+        read() {
+          natives.stdinRead().then(
+            (chunk) => {
+              if (chunk === undefined || chunk === null || chunk.length === 0) this.push(null);
+              else this.push(Buffer.from(chunk));
+            },
+            () => this.push(null),
+          );
         },
-        columns: stdoutIsTTY ? 80 : undefined,
-        hasColors: () => stdoutIsTTY,
-      },
-      stderr: {
-        fd: 2,
-        isTTY: stderrIsTTY,
-        write(chunk, cb) {
-          natives.stderrWrite(chunk);
-          if (typeof cb === "function") queueMicrotask(cb);
-          return true;
-        },
-        columns: stderrIsTTY ? 80 : undefined,
-        hasColors: () => stderrIsTTY,
-      },
-      stdin: Object.assign(
-        new (registry.get("stream").Readable)({
-          read() {
-            natives.stdinRead().then(
-              (chunk) => {
-                if (chunk === undefined || chunk === null || chunk.length === 0) {
-                  this.push(null);
-                } else {
-                  this.push(registry.get("buffer").Buffer.from(chunk));
-                }
-              },
-              () => this.push(null),
-            );
-          },
-        }),
-        { fd: 0, isTTY: natives.isTTY(0) },
-      ),
+      }), { fd: 0, isTTY: natives.isTTY(0) }),
       emitWarning(warning) {
         if (globalThis.console) {
           globalThis.console.warn(
