@@ -7965,3 +7965,80 @@ console.log('isGeneratorObject=' + util.types.isGeneratorObject((function*(){})(
         );
     }
 }
+
+#[test]
+fn crypto_rsa_public_encrypt_private_decrypt() {
+    let file = write_temp(
+        "rsa_encrypt.mjs",
+        r#"
+import crypto from 'node:crypto';
+
+// Generate RSA 2048-bit key pair
+const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+});
+console.log('keygen_ok=' + (publicKey.startsWith('-----BEGIN PUBLIC KEY-----')));
+console.log('privkey_ok=' + (privateKey.startsWith('-----BEGIN PRIVATE KEY-----')));
+
+// Test 1: OAEP (default padding) round-trip
+const plaintext = Buffer.from('Hello RSA-OAEP!');
+const encrypted = crypto.publicEncrypt(publicKey, plaintext);
+console.log('encrypted_length=' + encrypted.length);
+console.log('encrypted_is_buffer=' + Buffer.isBuffer(encrypted));
+const decrypted = crypto.privateDecrypt(privateKey, encrypted);
+console.log('oaep_roundtrip=' + (decrypted.toString() === 'Hello RSA-OAEP!'));
+
+// Test 2: OAEP with explicit sha256
+const enc2 = crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, plaintext);
+const dec2 = crypto.privateDecrypt({ key: privateKey, oaepHash: 'sha256' }, enc2);
+console.log('oaep_sha256_roundtrip=' + (dec2.toString() === 'Hello RSA-OAEP!'));
+
+// Test 3: PKCS1v15 padding
+const enc3 = crypto.publicEncrypt(
+  { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+  Buffer.from('PKCS1 test')
+);
+const dec3 = crypto.privateDecrypt(
+  { key: privateKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+  enc3
+);
+console.log('pkcs1_roundtrip=' + (dec3.toString() === 'PKCS1 test'));
+
+// Test 4: Encrypt with private key PEM also accepted (extracts public key)
+const enc4 = crypto.publicEncrypt(privateKey, Buffer.from('privkey-as-pubkey'));
+const dec4 = crypto.privateDecrypt(privateKey, enc4);
+console.log('privkey_as_pubkey=' + (dec4.toString() === 'privkey-as-pubkey'));
+
+// Test 5: Constants exist
+console.log('RSA_PKCS1_PADDING=' + crypto.constants.RSA_PKCS1_PADDING);
+console.log('RSA_PKCS1_OAEP_PADDING=' + crypto.constants.RSA_PKCS1_OAEP_PADDING);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "RSA encrypt/decrypt failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "keygen_ok=true",
+        "privkey_ok=true",
+        "encrypted_length=256",
+        "encrypted_is_buffer=true",
+        "oaep_roundtrip=true",
+        "oaep_sha256_roundtrip=true",
+        "pkcs1_roundtrip=true",
+        "privkey_as_pubkey=true",
+        "RSA_PKCS1_PADDING=1",
+        "RSA_PKCS1_OAEP_PADDING=4",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

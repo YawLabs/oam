@@ -5953,7 +5953,7 @@
     }
 
     function generateKeyPairSync(type, options) {
-      const result = natives.cryptoGenerateKeyPair(type);
+      const result = natives.cryptoGenerateKeyPair(type, (options && options.modulusLength) || 0);
       const format = (options && options.publicKeyEncoding && options.publicKeyEncoding.format) || 'pem';
       const privFormat = (options && options.privateKeyEncoding && options.privateKeyEncoding.format) || 'pem';
       let pubOut = result.publicKey;
@@ -5980,6 +5980,43 @@
         if (callback) process.nextTick(() => callback(err));
         else throw err;
       }
+    }
+
+
+    function publicEncrypt(keyOrOpts, buffer) {
+      var key, padding = 4, oaepHash = "sha1";
+      if (typeof keyOrOpts === "string") {
+        key = keyOrOpts;
+      } else if (ArrayBuffer.isView(keyOrOpts)) {
+        key = new TextDecoder().decode(keyOrOpts);
+      } else if (keyOrOpts && typeof keyOrOpts === "object") {
+        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
+        if (keyOrOpts.padding !== undefined) padding = keyOrOpts.padding;
+        if (keyOrOpts.oaepHash) oaepHash = keyOrOpts.oaepHash;
+      } else {
+        throw new TypeError("publicEncrypt: key must be a string, Buffer, or object");
+      }
+      var paddingName = padding === 1 ? "pkcs1" : "oaep";
+      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
+      return BufferCtor.from(natives.cryptoPublicEncrypt(new Uint8Array(data), key, paddingName, oaepHash));
+    }
+
+    function privateDecrypt(keyOrOpts, buffer) {
+      var key, padding = 4, oaepHash = "sha1";
+      if (typeof keyOrOpts === "string") {
+        key = keyOrOpts;
+      } else if (ArrayBuffer.isView(keyOrOpts)) {
+        key = new TextDecoder().decode(keyOrOpts);
+      } else if (keyOrOpts && typeof keyOrOpts === "object") {
+        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
+        if (keyOrOpts.padding !== undefined) padding = keyOrOpts.padding;
+        if (keyOrOpts.oaepHash) oaepHash = keyOrOpts.oaepHash;
+      } else {
+        throw new TypeError("privateDecrypt: key must be a string, Buffer, or object");
+      }
+      var paddingName = padding === 1 ? "pkcs1" : "oaep";
+      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
+      return BufferCtor.from(natives.cryptoPrivateDecrypt(new Uint8Array(data), key, paddingName, oaepHash));
     }
 
     const webcrypto = { subtle, getRandomValues, randomUUID };
@@ -6082,6 +6119,8 @@
       createPublicKey,
       generateKeyPairSync,
       generateKeyPair,
+      publicEncrypt,
+      privateDecrypt,
       createSign,
       createVerify,
       sign: signOneShot,

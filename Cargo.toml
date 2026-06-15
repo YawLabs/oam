@@ -60,6 +60,11 @@ hkdf = "0.12"
 # to a direct dep adds zero new compilation units.
 ring = "0.17"
 base64 = "0.22"
+# node:crypto wave 4: RSA encrypt/decrypt (publicEncrypt, privateDecrypt).
+# ring deliberately omits RSA encryption; the rsa crate (pure Rust) fills
+# the gap. rand_core provides OsRng for the encrypt padding randomness.
+rsa = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

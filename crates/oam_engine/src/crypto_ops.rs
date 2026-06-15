@@ -884,6 +884,12 @@ fn gcm_decrypt(c: &CipherInstance) -> Result<(Vec<u8>, Option<Vec<u8>>), String>
 use ring::signature as ring_sig;
 use ring_sig::KeyPair as _;
 
+// Wave 4: RSA encrypt/decrypt via the `rsa` crate (ring doesn't do encryption).
+use rsa::{Oaep, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPublicKey};
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
+use rand_core::OsRng;
+
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     let body: String = pem
@@ -1156,26 +1162,42 @@ pub(crate) fn op_crypto_generate_keypair(
         crate::node_ops::throw_type_error(scope, "generateKeyPair: type required");
         return;
     };
-    match key_type.as_str() {
-        "ed25519" => match crypto_generate_ed25519() {
-            Ok((priv_pem, pub_pem)) => {
-                let obj = v8::Object::new(scope);
-                if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&priv_pem).unwrap()) {
-                    let key = v8::String::new(scope, "privateKey").unwrap();
-                    obj.set(scope, key.into(), pk.into());
-                }
-                if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&pub_pem).unwrap()) {
-                    let key = v8::String::new(scope, "publicKey").unwrap();
-                    obj.set(scope, key.into(), pk.into());
-                }
-                rv.set(obj.into());
+    let result = match key_type.as_str() {
+        "ed25519" => crypto_generate_ed25519(),
+        "rsa" => {
+            let bits = args.get(1).number_value(scope).unwrap_or(2048.0) as usize;
+            if bits < 512 || bits > 16384 {
+                crate::node_ops::throw_type_error(
+                    scope,
+                    "generateKeyPairSync: modulusLength must be between 512 and 16384",
+                );
+                return;
             }
-            Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
-        },
-        _ => {
-            let msg = format!("generateKeyPairSync: unsupported type '{}' (oam supports ed25519)", key_type);
-            crate::node_ops::throw_type_error(scope, &msg);
+            crypto_generate_rsa(bits)
         }
+        _ => {
+            let msg = format!(
+                "generateKeyPairSync: unsupported type '{}' (oam supports rsa, ed25519)",
+                key_type
+            );
+            crate::node_ops::throw_type_error(scope, &msg);
+            return;
+        }
+    };
+    match result {
+        Ok((priv_pem, pub_pem)) => {
+            let obj = v8::Object::new(scope);
+            if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&priv_pem).unwrap()) {
+                let key = v8::String::new(scope, "privateKey").unwrap();
+                obj.set(scope, key.into(), pk.into());
+            }
+            if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&pub_pem).unwrap()) {
+                let key = v8::String::new(scope, "publicKey").unwrap();
+                obj.set(scope, key.into(), pk.into());
+            }
+            rv.set(obj.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
     }
 }
 
@@ -1252,5 +1274,208 @@ pub(crate) fn op_crypto_verify(
     match result {
         Ok(valid) => rv.set_bool(valid),
         Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+// ===================================================== RSA encrypt/decrypt
+// Wave 4: publicEncrypt / privateDecrypt via the `rsa` crate.
+
+fn parse_rsa_public_key(der: &[u8], label: &str) -> Result<RsaPublicKey, String> {
+    match label {
+        "PUBLIC KEY" => {
+            let pkcs1_bytes = extract_spki_pubkey(der)?;
+            RsaPublicKey::from_pkcs1_der(&pkcs1_bytes)
+                .map_err(|e| format!("RSA public key parse: {e}"))
+        }
+        "RSA PUBLIC KEY" => RsaPublicKey::from_pkcs1_der(der)
+            .map_err(|e| format!("RSA public key parse: {e}")),
+        "PRIVATE KEY" => {
+            let priv_key = RsaPrivateKey::from_pkcs8_der(der)
+                .map_err(|e| format!("RSA key parse: {e}"))?;
+            Ok(RsaPublicKey::from(&priv_key))
+        }
+        "RSA PRIVATE KEY" => {
+            let priv_key = RsaPrivateKey::from_pkcs1_der(der)
+                .map_err(|e| format!("RSA key parse: {e}"))?;
+            Ok(RsaPublicKey::from(&priv_key))
+        }
+        _ => Err(format!("unsupported PEM label for RSA public key: '{label}'")),
+    }
+}
+
+fn parse_rsa_private_key(der: &[u8], label: &str) -> Result<RsaPrivateKey, String> {
+    match label {
+        "PRIVATE KEY" => RsaPrivateKey::from_pkcs8_der(der)
+            .map_err(|e| format!("RSA private key parse: {e}")),
+        "RSA PRIVATE KEY" => RsaPrivateKey::from_pkcs1_der(der)
+            .map_err(|e| format!("RSA private key parse: {e}")),
+        _ => Err(format!("unsupported PEM label for RSA private key: '{label}'")),
+    }
+}
+
+fn crypto_public_encrypt(
+    data: &[u8],
+    key_pem: &str,
+    padding_type: &str,
+    oaep_hash: &str,
+) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let pub_key = parse_rsa_public_key(&der, label)?;
+    let mut rng = OsRng;
+
+    match padding_type {
+        "oaep" => {
+            let padding = match oaep_hash {
+                "sha1" => Oaep::new::<sha1::Sha1>(),
+                "sha256" => Oaep::new::<sha2::Sha256>(),
+                "sha384" => Oaep::new::<sha2::Sha384>(),
+                "sha512" => Oaep::new::<sha2::Sha512>(),
+                _ => return Err(format!("unsupported OAEP hash: '{oaep_hash}'")),
+            };
+            pub_key
+                .encrypt(&mut rng, padding, data)
+                .map_err(|e| format!("RSA OAEP encrypt: {e}"))
+        }
+        "pkcs1" => pub_key
+            .encrypt(&mut rng, Pkcs1v15Encrypt, data)
+            .map_err(|e| format!("RSA PKCS1v15 encrypt: {e}")),
+        _ => Err(format!("unsupported RSA padding: '{padding_type}'")),
+    }
+}
+
+fn crypto_private_decrypt(
+    data: &[u8],
+    key_pem: &str,
+    padding_type: &str,
+    oaep_hash: &str,
+) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let priv_key = parse_rsa_private_key(&der, label)?;
+
+    match padding_type {
+        "oaep" => {
+            let padding = match oaep_hash {
+                "sha1" => Oaep::new::<sha1::Sha1>(),
+                "sha256" => Oaep::new::<sha2::Sha256>(),
+                "sha384" => Oaep::new::<sha2::Sha384>(),
+                "sha512" => Oaep::new::<sha2::Sha512>(),
+                _ => return Err(format!("unsupported OAEP hash: '{oaep_hash}'")),
+            };
+            priv_key
+                .decrypt(padding, data)
+                .map_err(|e| format!("RSA OAEP decrypt: {e}"))
+        }
+        "pkcs1" => priv_key
+            .decrypt(Pkcs1v15Encrypt, data)
+            .map_err(|e| format!("RSA PKCS1v15 decrypt: {e}")),
+        _ => Err(format!("unsupported RSA padding: '{padding_type}'")),
+    }
+}
+
+pub(crate) fn op_crypto_public_encrypt(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "publicEncrypt: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "publicEncrypt: key required");
+        return;
+    };
+    let padding = crate::node_ops::arg_string(scope, &args, 2)
+        .unwrap_or_else(|| "oaep".to_string());
+    let oaep_hash = crate::node_ops::arg_string(scope, &args, 3)
+        .unwrap_or_else(|| "sha1".to_string());
+
+    match crypto_public_encrypt(&data, &key_pem, &padding, &oaep_hash) {
+        Ok(ct) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, ct) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_private_decrypt(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "privateDecrypt: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "privateDecrypt: key required");
+        return;
+    };
+    let padding = crate::node_ops::arg_string(scope, &args, 2)
+        .unwrap_or_else(|| "oaep".to_string());
+    let oaep_hash = crate::node_ops::arg_string(scope, &args, 3)
+        .unwrap_or_else(|| "sha1".to_string());
+
+    match crypto_private_decrypt(&data, &key_pem, &padding, &oaep_hash) {
+        Ok(pt) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, pt) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+fn crypto_generate_rsa(bits: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut rng = OsRng;
+    let priv_key = RsaPrivateKey::new(&mut rng, bits)
+        .map_err(|e| format!("RSA keygen: {e}"))?;
+    let pub_key = RsaPublicKey::from(&priv_key);
+
+    let priv_doc = priv_key
+        .to_pkcs8_der()
+        .map_err(|e| format!("RSA private key encode: {e}"))?;
+    let pub_pkcs1 = pub_key
+        .to_pkcs1_der()
+        .map_err(|e| format!("RSA public key encode: {e}"))?;
+    let pub_spki = wrap_rsa_spki(pub_pkcs1.as_ref());
+
+    let priv_pem = der_to_pem(priv_doc.as_bytes(), "PRIVATE KEY");
+    let pub_pem = der_to_pem(&pub_spki, "PUBLIC KEY");
+
+    Ok((priv_pem.into_bytes(), pub_pem.into_bytes()))
+}
+
+fn wrap_rsa_spki(pkcs1_pub: &[u8]) -> Vec<u8> {
+    // RSA OID: 1.2.840.113549.1.1.1 + NULL params
+    let algo_id: &[u8] = &[
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05,
+        0x00,
+    ];
+    let bit_string_len = 1 + pkcs1_pub.len();
+    let seq_content_len = algo_id.len() + 1 + asn1_length_size(bit_string_len) + bit_string_len;
+
+    let mut der = Vec::with_capacity(1 + asn1_length_size(seq_content_len) + seq_content_len);
+    der.push(0x30); // SEQUENCE
+    encode_asn1_length(&mut der, seq_content_len);
+    der.extend_from_slice(algo_id);
+    der.push(0x03); // BIT STRING
+    encode_asn1_length(&mut der, bit_string_len);
+    der.push(0x00); // unused bits
+    der.extend_from_slice(pkcs1_pub);
+    der
+}
+
+fn asn1_length_size(len: usize) -> usize {
+    if len < 0x80 {
+        1
+    } else if len < 0x100 {
+        2
+    } else {
+        3
     }
 }
