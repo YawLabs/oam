@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use oam_diagnostics::{Diagnostic, Origin, Position, Severity, Span};
 use oxc_allocator::Allocator;
 
+pub mod install;
 mod npm;
 mod tsconfig;
 pub use npm::{ModuleKind, module_kind, resolve_require};

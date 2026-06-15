@@ -11,14 +11,15 @@ use crate::crypto_ops::{
     op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
     op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
     op_crypto_cipher_set_auth_tag, op_crypto_cipher_set_auto_padding, op_crypto_cipher_update,
-    op_crypto_dh_compute_secret, op_crypto_dh_generate_keys, op_crypto_ecdh_compute_secret,
-    op_crypto_ecdh_generate_keys, op_crypto_ecdh_get_public_key, op_crypto_extract_public_pem,
-    op_crypto_generate_keypair, op_crypto_generate_prime, op_crypto_hash_copy,
-    op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update, op_crypto_hkdf_sync,
-    op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_private_decrypt,
-    op_crypto_private_encrypt, op_crypto_public_decrypt, op_crypto_public_encrypt,
-    op_crypto_random_fill, op_crypto_rsa_jwk_components, op_crypto_scrypt_sync, op_crypto_sign,
-    op_crypto_timing_safe_equal, op_crypto_verify, op_crypto_x509_parse,
+    op_crypto_dh_compute_secret, op_crypto_dh_generate_keys, op_crypto_ec_jwk_export,
+    op_crypto_ec_jwk_import, op_crypto_ecdh_compute_secret, op_crypto_ecdh_generate_keys,
+    op_crypto_ecdh_get_public_key, op_crypto_extract_public_pem, op_crypto_generate_keypair,
+    op_crypto_generate_prime, op_crypto_hash_copy, op_crypto_hash_create, op_crypto_hash_digest,
+    op_crypto_hash_update, op_crypto_hkdf_sync, op_crypto_hmac_create, op_crypto_pbkdf2_sync,
+    op_crypto_private_decrypt, op_crypto_private_encrypt, op_crypto_public_decrypt,
+    op_crypto_public_encrypt, op_crypto_random_fill, op_crypto_rsa_jwk_components,
+    op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
+    op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -225,6 +226,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoPublicDecrypt", op_crypto_public_decrypt),
         ("cryptoExtractPublicPem", op_crypto_extract_public_pem),
         ("cryptoRsaJwkComponents", op_crypto_rsa_jwk_components),
+        // node:crypto wave 9: EC JWK import/export + RSA-PSS
+        ("cryptoEcJwkImport", op_crypto_ec_jwk_import),
+        ("cryptoEcJwkExport", op_crypto_ec_jwk_export),
+        ("cryptoSignPss", op_crypto_sign_pss),
+        ("cryptoVerifyPss", op_crypto_verify_pss),
         // node:crypto wave 5: ECDH key agreement
         ("cryptoEcdhGenerateKeys", op_crypto_ecdh_generate_keys),
         ("cryptoEcdhComputeSecret", op_crypto_ecdh_compute_secret),
@@ -337,6 +343,9 @@ pub(crate) fn arg_bytes(
     index: i32,
 ) -> Option<Vec<u8>> {
     let value = args.get(index);
+    if value.is_undefined() || value.is_null() {
+        return None;
+    }
     if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
         let mut bytes = vec![0u8; view.byte_length()];
         let copied = view.copy_contents(&mut bytes);

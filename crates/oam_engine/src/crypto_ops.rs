@@ -10,6 +10,7 @@
 use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit};
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
 use hmac::Mac;
+use rsa::signature::SignatureEncoding;
 use sha2::Digest;
 use std::collections::HashMap;
 
@@ -1761,6 +1762,376 @@ macro_rules! impl_ec_keygen {
 
 impl_ec_keygen!(p256, crypto_generate_ec_p256);
 impl_ec_keygen!(p384, crypto_generate_ec_p384);
+
+// ===================================================== EC JWK import/export
+// Wave 9: import EC private/public keys from JWK components (crv, x, y, d)
+// and export EC keys to JWK components.
+
+/// Import an EC private key from JWK components and return a PKCS#8 PEM.
+fn ec_jwk_to_pkcs8_pem(crv: &str, x: &[u8], y: &[u8], d: &[u8]) -> Result<String, String> {
+    match crv {
+        "P-256" => {
+            use p256::elliptic_curve::pkcs8::EncodePrivateKey;
+            let sk = p256::SecretKey::from_slice(d)
+                .map_err(|e| format!("EC P-256 JWK import private: {e}"))?;
+            {
+                use p256::elliptic_curve::sec1::ToEncodedPoint;
+                let pk = sk.public_key();
+                let pt = pk.to_encoded_point(false);
+                if pt.x().map(|v| v.as_slice()) != Some(x)
+                    || pt.y().map(|v| v.as_slice()) != Some(y)
+                {
+                    return Err("EC P-256 JWK: x/y do not match private key d".into());
+                }
+            }
+            let doc = sk
+                .to_pkcs8_der()
+                .map_err(|e| format!("EC P-256 PKCS#8 encode: {e}"))?;
+            Ok(der_to_pem(doc.as_bytes(), "PRIVATE KEY"))
+        }
+        "P-384" => {
+            use p384::elliptic_curve::pkcs8::EncodePrivateKey;
+            let sk = p384::SecretKey::from_slice(d)
+                .map_err(|e| format!("EC P-384 JWK import private: {e}"))?;
+            {
+                use p384::elliptic_curve::sec1::ToEncodedPoint;
+                let pk = sk.public_key();
+                let pt = pk.to_encoded_point(false);
+                if pt.x().map(|v| v.as_slice()) != Some(x)
+                    || pt.y().map(|v| v.as_slice()) != Some(y)
+                {
+                    return Err("EC P-384 JWK: x/y do not match private key d".into());
+                }
+            }
+            let doc = sk
+                .to_pkcs8_der()
+                .map_err(|e| format!("EC P-384 PKCS#8 encode: {e}"))?;
+            Ok(der_to_pem(doc.as_bytes(), "PRIVATE KEY"))
+        }
+        _ => Err(format!("unsupported EC curve for JWK import: '{crv}'")),
+    }
+}
+
+/// Import an EC public key from JWK components and return an SPKI PEM.
+fn ec_jwk_to_spki_pem(crv: &str, x: &[u8], y: &[u8]) -> Result<String, String> {
+    match crv {
+        "P-256" => {
+            use p256::elliptic_curve::pkcs8::spki::EncodePublicKey;
+            let mut uncompressed = Vec::with_capacity(1 + x.len() + y.len());
+            uncompressed.push(0x04);
+            uncompressed.extend_from_slice(x);
+            uncompressed.extend_from_slice(y);
+            let pk = p256::PublicKey::from_sec1_bytes(&uncompressed)
+                .map_err(|e| format!("EC P-256 JWK import public: {e}"))?;
+            let doc = pk
+                .to_public_key_der()
+                .map_err(|e| format!("EC P-256 SPKI encode: {e}"))?;
+            Ok(der_to_pem(doc.as_ref(), "PUBLIC KEY"))
+        }
+        "P-384" => {
+            use p384::elliptic_curve::pkcs8::spki::EncodePublicKey;
+            let mut uncompressed = Vec::with_capacity(1 + x.len() + y.len());
+            uncompressed.push(0x04);
+            uncompressed.extend_from_slice(x);
+            uncompressed.extend_from_slice(y);
+            let pk = p384::PublicKey::from_sec1_bytes(&uncompressed)
+                .map_err(|e| format!("EC P-384 JWK import public: {e}"))?;
+            let doc = pk
+                .to_public_key_der()
+                .map_err(|e| format!("EC P-384 SPKI encode: {e}"))?;
+            Ok(der_to_pem(doc.as_ref(), "PUBLIC KEY"))
+        }
+        _ => Err(format!("unsupported EC curve for JWK import: '{crv}'")),
+    }
+}
+
+struct EcJwkComponents {
+    crv: String,
+    x: Vec<u8>,
+    y: Vec<u8>,
+    d: Option<Vec<u8>>,
+}
+
+/// Export EC key PEM to JWK components {crv, x, y, d?}.
+fn ec_pem_to_jwk_components(pem: &str, is_private: bool) -> Result<EcJwkComponents, String> {
+    let der = pem_to_der(pem)?;
+    let label = pem_label(pem);
+
+    if is_private {
+        if let Ok(sk) = p256::SecretKey::from_pkcs8_der(&der) {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let pk = sk.public_key();
+            let pt = pk.to_encoded_point(false);
+            return Ok(EcJwkComponents {
+                crv: "P-256".into(),
+                x: pt.x().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                y: pt.y().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                d: Some(sk.to_bytes().to_vec()),
+            });
+        }
+        if let Ok(sk) = p384::SecretKey::from_pkcs8_der(&der) {
+            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            let pk = sk.public_key();
+            let pt = pk.to_encoded_point(false);
+            return Ok(EcJwkComponents {
+                crv: "P-384".into(),
+                x: pt.x().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                y: pt.y().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                d: Some(sk.to_bytes().to_vec()),
+            });
+        }
+        Err(format!(
+            "EC private key parse failed (tried P-256, P-384), label='{label}'"
+        ))
+    } else {
+        let spki_pub = extract_spki_pubkey(&der)?;
+        if let Ok(pk) = p256::PublicKey::from_sec1_bytes(&spki_pub) {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            let pt = pk.to_encoded_point(false);
+            return Ok(EcJwkComponents {
+                crv: "P-256".into(),
+                x: pt.x().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                y: pt.y().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                d: None,
+            });
+        }
+        if let Ok(pk) = p384::PublicKey::from_sec1_bytes(&spki_pub) {
+            use p384::elliptic_curve::sec1::ToEncodedPoint;
+            let pt = pk.to_encoded_point(false);
+            return Ok(EcJwkComponents {
+                crv: "P-384".into(),
+                x: pt.x().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                y: pt.y().map(|v| v.as_slice().to_vec()).unwrap_or_default(),
+                d: None,
+            });
+        }
+        Err(format!(
+            "EC public key parse failed (tried P-256, P-384), label='{label}'"
+        ))
+    }
+}
+
+pub(crate) fn op_crypto_ec_jwk_import(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(crv) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "ecJwkImport: crv required");
+        return;
+    };
+    let Some(x) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "ecJwkImport: x required");
+        return;
+    };
+    let Some(y) = crate::node_ops::arg_bytes(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "ecJwkImport: y required");
+        return;
+    };
+    let d = crate::node_ops::arg_bytes(scope, &args, 3);
+    let is_private = d.is_some();
+
+    let result = if is_private {
+        ec_jwk_to_pkcs8_pem(&crv, &x, &y, d.as_ref().unwrap())
+    } else {
+        ec_jwk_to_spki_pem(&crv, &x, &y)
+    };
+
+    match result {
+        Ok(pem) => {
+            let val = v8::String::new(scope, &pem).unwrap();
+            rv.set(val.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_ec_jwk_export(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "ecJwkExport: key required");
+        return;
+    };
+    let is_private = args.get(1).boolean_value(scope);
+
+    match ec_pem_to_jwk_components(&key_pem, is_private) {
+        Ok(comps) => {
+            let obj = v8::Object::new(scope);
+            macro_rules! set_str {
+                ($name:expr, $val:expr) => {{
+                    let k = v8::String::new(scope, $name).unwrap();
+                    let v = v8::String::new(scope, $val).unwrap();
+                    obj.set(scope, k.into(), v.into());
+                }};
+            }
+            macro_rules! set_bytes {
+                ($name:expr, $val:expr) => {{
+                    let k = v8::String::new(scope, $name).unwrap();
+                    if let Some(arr) = crate::node_ops::bytes_to_uint8array(scope, $val) {
+                        obj.set(scope, k.into(), arr);
+                    }
+                }};
+            }
+            set_str!("crv", &comps.crv);
+            set_bytes!("x", comps.x);
+            set_bytes!("y", comps.y);
+            if let Some(d) = comps.d {
+                set_bytes!("d", d);
+            }
+            rv.set(obj.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+// ===================================================== RSA-PSS sign/verify
+// Wave 9: RSA-PSS via the `rsa` crate (ring doesn't support custom salt lengths).
+
+fn crypto_sign_rsa_pss(
+    algo: &str,
+    data: &[u8],
+    key_pem: &str,
+    salt_length: usize,
+) -> Result<Vec<u8>, String> {
+    use rsa::pss::BlindedSigningKey;
+    use rsa::signature::RandomizedSigner;
+
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let priv_key = parse_rsa_private_key(&der, label)?;
+    let mut rng = OsRng;
+
+    match algo {
+        "sha256" => {
+            let signing_key =
+                BlindedSigningKey::<sha2::Sha256>::new_with_salt_len(priv_key, salt_length);
+            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+        }
+        "sha384" => {
+            let signing_key =
+                BlindedSigningKey::<sha2::Sha384>::new_with_salt_len(priv_key, salt_length);
+            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+        }
+        "sha512" => {
+            let signing_key =
+                BlindedSigningKey::<sha2::Sha512>::new_with_salt_len(priv_key, salt_length);
+            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+        }
+        "sha1" => {
+            let signing_key =
+                BlindedSigningKey::<sha1::Sha1>::new_with_salt_len(priv_key, salt_length);
+            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+        }
+        _ => Err(format!("unsupported RSA-PSS hash: '{algo}'")),
+    }
+}
+
+fn crypto_verify_rsa_pss(
+    algo: &str,
+    data: &[u8],
+    key_pem: &str,
+    signature: &[u8],
+    salt_length: usize,
+) -> Result<bool, String> {
+    use rsa::pss::VerifyingKey;
+    use rsa::signature::Verifier;
+
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+
+    let pub_key = if label == "PRIVATE KEY" || label == "RSA PRIVATE KEY" {
+        let priv_key = parse_rsa_private_key(&der, label)?;
+        RsaPublicKey::from(&priv_key)
+    } else {
+        parse_rsa_public_key(&der, label)?
+    };
+
+    let sig = rsa::pss::Signature::try_from(signature)
+        .map_err(|e| format!("RSA-PSS signature parse: {e}"))?;
+
+    match algo {
+        "sha256" => {
+            let vk = VerifyingKey::<sha2::Sha256>::new_with_salt_len(pub_key, salt_length);
+            Ok(vk.verify(data, &sig).is_ok())
+        }
+        "sha384" => {
+            let vk = VerifyingKey::<sha2::Sha384>::new_with_salt_len(pub_key, salt_length);
+            Ok(vk.verify(data, &sig).is_ok())
+        }
+        "sha512" => {
+            let vk = VerifyingKey::<sha2::Sha512>::new_with_salt_len(pub_key, salt_length);
+            Ok(vk.verify(data, &sig).is_ok())
+        }
+        "sha1" => {
+            let vk = VerifyingKey::<sha1::Sha1>::new_with_salt_len(pub_key, salt_length);
+            Ok(vk.verify(data, &sig).is_ok())
+        }
+        _ => Err(format!("unsupported RSA-PSS verify hash: '{algo}'")),
+    }
+}
+
+pub(crate) fn op_crypto_sign_pss(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(algo) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "signPss: algorithm required");
+        return;
+    };
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "signPss: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "signPss: key required");
+        return;
+    };
+    let salt_length = args.get(3).number_value(scope).unwrap_or(32.0) as usize;
+    let normalized = normalize_algorithm(&algo);
+
+    match crypto_sign_rsa_pss(&normalized, &data, &key_pem, salt_length) {
+        Ok(sig) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, sig) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_verify_pss(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(algo) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "verifyPss: algorithm required");
+        return;
+    };
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "verifyPss: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "verifyPss: key required");
+        return;
+    };
+    let Some(signature) = crate::node_ops::arg_bytes(scope, &args, 3) else {
+        crate::node_ops::throw_type_error(scope, "verifyPss: signature required");
+        return;
+    };
+    let salt_length = args.get(4).number_value(scope).unwrap_or(32.0) as usize;
+    let normalized = normalize_algorithm(&algo);
+
+    match crypto_verify_rsa_pss(&normalized, &data, &key_pem, &signature, salt_length) {
+        Ok(valid) => rv.set_bool(valid),
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
 
 fn normalize_curve(name: &str) -> &str {
     match name {

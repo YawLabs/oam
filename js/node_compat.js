@@ -5221,6 +5221,12 @@
         var jwk = input.key;
         if (jwk.kty === "RSA") {
           pem = derToPem(rsaJwkToPkcs8(jwk), "PRIVATE KEY");
+        } else if (jwk.kty === "EC") {
+          var crv = jwk.crv;
+          var xBytes = new Uint8Array(base64urlDecode(jwk.x));
+          var yBytes = new Uint8Array(base64urlDecode(jwk.y));
+          var dBytes = jwk.d ? new Uint8Array(base64urlDecode(jwk.d)) : undefined;
+          pem = natives.cryptoEcJwkImport(crv, xBytes, yBytes, dBytes);
         } else {
           throw new Error("createPrivateKey: unsupported JWK kty: " + jwk.kty);
         }
@@ -5241,6 +5247,17 @@
       ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
+        if (options && options.format === "jwk") {
+          if (ko._keyType === "ec") {
+            var comps = natives.cryptoEcJwkExport(pem, true);
+            return { kty: "EC", crv: comps.crv, x: base64urlEncode(comps.x), y: base64urlEncode(comps.y), d: base64urlEncode(comps.d) };
+          }
+          if (ko._keyType === "rsa") {
+            var rcomps = natives.cryptoRsaJwkComponents(pem, true);
+            return { kty: "RSA", n: base64urlEncode(rcomps.n), e: base64urlEncode(rcomps.e), d: base64urlEncode(rcomps.d), p: base64urlEncode(rcomps.p), q: base64urlEncode(rcomps.q), dp: base64urlEncode(rcomps.dp), dq: base64urlEncode(rcomps.dq), qi: base64urlEncode(rcomps.qi) };
+          }
+          throw new Error("JWK export not supported for key type: " + ko._keyType);
+        }
         if (!options || options.type === "pkcs8" || options.format === "pem") return pem;
         return BufferCtor.from(pem);
       };
@@ -5253,6 +5270,11 @@
         var jwk = input.key;
         if (jwk.kty === "RSA") {
           pem = derToPem(rsaJwkToSpki(jwk), "PUBLIC KEY");
+        } else if (jwk.kty === "EC") {
+          var crv = jwk.crv;
+          var xBytes = new Uint8Array(base64urlDecode(jwk.x));
+          var yBytes = new Uint8Array(base64urlDecode(jwk.y));
+          pem = natives.cryptoEcJwkImport(crv, xBytes, yBytes);
         } else {
           throw new Error("createPublicKey: unsupported JWK kty: " + jwk.kty);
         }
@@ -5275,6 +5297,17 @@
       ko.asymmetricKeyType = ko._keyType === "rsa" ? "rsa" : ko._keyType === "ec" ? "ec" : "ed25519";
       ko.asymmetricKeySize = undefined;
       ko.export = function(options) {
+        if (options && options.format === "jwk") {
+          if (ko._keyType === "ec") {
+            var comps = natives.cryptoEcJwkExport(pem, false);
+            return { kty: "EC", crv: comps.crv, x: base64urlEncode(comps.x), y: base64urlEncode(comps.y) };
+          }
+          if (ko._keyType === "rsa") {
+            var rcomps = natives.cryptoRsaJwkComponents(pem, false);
+            return { kty: "RSA", n: base64urlEncode(rcomps.n), e: base64urlEncode(rcomps.e) };
+          }
+          throw new Error("JWK export not supported for key type: " + ko._keyType);
+        }
         if (!options || options.type === "spki" || options.format === "pem") return pem;
         return BufferCtor.from(pem);
       };
@@ -5307,7 +5340,20 @@
         var merged = new Uint8Array(total);
         var off = 0;
         for (var i = 0; i < this._data.length; i++) { merged.set(this._data[i], off); off += this._data[i].length; }
-        var sig = asBuffer(natives.cryptoSign(this._algorithm, merged, pem, keyType));
+        var padding = 1;
+        var saltLength = 32;
+        if (key instanceof KeyObject) {
+          // KeyObject does not carry padding; default PKCS1
+        } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
+          if (key.padding !== undefined) padding = key.padding;
+          if (key.saltLength !== undefined) saltLength = key.saltLength;
+        }
+        var sig;
+        if (padding === 6 && keyType === "rsa") {
+          sig = asBuffer(natives.cryptoSignPss(this._algorithm, merged, pem, saltLength));
+        } else {
+          sig = asBuffer(natives.cryptoSign(this._algorithm, merged, pem, keyType));
+        }
         return outputEncoding ? sig.toString(outputEncoding) : sig;
       }
     }
@@ -5341,6 +5387,17 @@
         var sigBuf = typeof signature === "string"
           ? BufferCtor.from(signature, signatureEncoding || "base64")
           : toBytes(signature);
+        var padding = 1;
+        var saltLength = 32;
+        if (key instanceof KeyObject) {
+          // KeyObject does not carry padding; default PKCS1
+        } else if (typeof key === "object" && key !== null && !(key instanceof Uint8Array)) {
+          if (key.padding !== undefined) padding = key.padding;
+          if (key.saltLength !== undefined) saltLength = key.saltLength;
+        }
+        if (padding === 6 && keyType === "rsa") {
+          return natives.cryptoVerifyPss(this._algorithm, merged, pem, sigBuf, saltLength);
+        }
         return natives.cryptoVerify(this._algorithm, merged, pem, sigBuf, keyType);
       }
     }
@@ -5530,6 +5587,20 @@
               _importedKeys.set(id, { format: "spki", pem: pem, algo: algoObj });
               keyType = "public";
             }
+          } else if (kty === "EC") {
+            var ecCrv = keyData.crv;
+            var ecX = new Uint8Array(base64urlDecode(keyData.x));
+            var ecY = new Uint8Array(base64urlDecode(keyData.y));
+            if (keyData.d) {
+              var ecD = new Uint8Array(base64urlDecode(keyData.d));
+              pem = natives.cryptoEcJwkImport(ecCrv, ecX, ecY, ecD);
+              _importedKeys.set(id, { format: "pkcs8", pem: pem, algo: algoObj });
+              keyType = "private";
+            } else {
+              pem = natives.cryptoEcJwkImport(ecCrv, ecX, ecY);
+              _importedKeys.set(id, { format: "spki", pem: pem, algo: algoObj });
+              keyType = "public";
+            }
           } else {
             throw new Error("subtle.importKey: unsupported JWK kty: " + kty);
           }
@@ -5587,6 +5658,13 @@
           return sigBytes3.buffer.slice(sigBytes3.byteOffset, sigBytes3.byteOffset + sigBytes3.length);
         }
 
+        if (algoName === "RSA-PSS" || algoName === "RSASSA-PSS") {
+          var pssHash = webcryptoHashName(stored.algo);
+          var pssSaltLen = (algorithm && algorithm.saltLength !== undefined) ? algorithm.saltLength : 32;
+          var pssSig = natives.cryptoSignPss(pssHash, toBytes(data), stored.pem, pssSaltLen);
+          return pssSig.buffer.slice(pssSig.byteOffset, pssSig.byteOffset + pssSig.length);
+        }
+
         throw new Error("subtle.sign: unsupported algorithm " + algoName);
       },
 
@@ -5620,6 +5698,13 @@
           var hashN2 = webcryptoHashName(algorithm);
           var sigBuf3 = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
           return natives.cryptoVerify(hashN2, toBytes(data), stored.pem, sigBuf3, "ec");
+        }
+
+        if (algoName === "RSA-PSS" || algoName === "RSASSA-PSS") {
+          var pssHash2 = webcryptoHashName(stored.algo);
+          var pssSaltLen2 = (algorithm && algorithm.saltLength !== undefined) ? algorithm.saltLength : 32;
+          var pssSigBuf = signature instanceof ArrayBuffer ? new Uint8Array(signature) : new Uint8Array(signature.buffer, signature.byteOffset, signature.byteLength);
+          return natives.cryptoVerifyPss(pssHash2, toBytes(data), stored.pem, pssSigBuf, pssSaltLen2);
         }
 
         throw new Error("subtle.verify: unsupported algorithm " + algoName);
@@ -6001,22 +6086,32 @@
         privOut = Buffer.from(lines.join(''), 'base64');
       }
       if (format === 'jwk') {
-        var pubComps = natives.cryptoRsaJwkComponents(result.publicKey, false);
-        pubOut = { kty: 'RSA', n: base64urlEncode(pubComps.n), e: base64urlEncode(pubComps.e) };
+        if (type === 'ec') {
+          var pubEcComps = natives.cryptoEcJwkExport(result.publicKey, false);
+          pubOut = { kty: 'EC', crv: pubEcComps.crv, x: base64urlEncode(pubEcComps.x), y: base64urlEncode(pubEcComps.y) };
+        } else {
+          var pubComps = natives.cryptoRsaJwkComponents(result.publicKey, false);
+          pubOut = { kty: 'RSA', n: base64urlEncode(pubComps.n), e: base64urlEncode(pubComps.e) };
+        }
       }
       if (privFormat === 'jwk') {
-        var privComps = natives.cryptoRsaJwkComponents(result.privateKey, true);
-        privOut = {
-          kty: 'RSA',
-          n: base64urlEncode(privComps.n),
-          e: base64urlEncode(privComps.e),
-          d: base64urlEncode(privComps.d),
-          p: base64urlEncode(privComps.p),
-          q: base64urlEncode(privComps.q),
-          dp: base64urlEncode(privComps.dp),
-          dq: base64urlEncode(privComps.dq),
-          qi: base64urlEncode(privComps.qi),
-        };
+        if (type === 'ec') {
+          var privEcComps = natives.cryptoEcJwkExport(result.privateKey, true);
+          privOut = { kty: 'EC', crv: privEcComps.crv, x: base64urlEncode(privEcComps.x), y: base64urlEncode(privEcComps.y), d: base64urlEncode(privEcComps.d) };
+        } else {
+          var privComps = natives.cryptoRsaJwkComponents(result.privateKey, true);
+          privOut = {
+            kty: 'RSA',
+            n: base64urlEncode(privComps.n),
+            e: base64urlEncode(privComps.e),
+            d: base64urlEncode(privComps.d),
+            p: base64urlEncode(privComps.p),
+            q: base64urlEncode(privComps.q),
+            dp: base64urlEncode(privComps.dp),
+            dq: base64urlEncode(privComps.dq),
+            qi: base64urlEncode(privComps.qi),
+          };
+        }
       }
       return { publicKey: pubOut, privateKey: privOut };
     }

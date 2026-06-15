@@ -81,6 +81,8 @@ x509-parser = "0.16"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"
+# npm tarball extraction.
+tar = "0.4"
 # node:zlib brotli backend -- pure-Rust, default features only (std + alloc-stdlib).
 # No native deps, no ffi-api, no simd -- builds on every tier-1 target.
 brotli = { version = "8", default-features = false, features = ["std"] }

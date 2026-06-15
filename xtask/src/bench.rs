@@ -110,19 +110,28 @@ struct CaseResult {
     median: f64,
     min: f64,
     max: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
     unit: String,
     iterations: usize,
+    warmup_iterations: usize,
     samples: Vec<f64>,
 }
 
-fn stats(samples: &[f64]) -> (f64, f64, f64) {
+/// Returns (p50, min, max, p95, p99) from sorted samples.
+fn stats(samples: &[f64]) -> (f64, f64, f64, f64, f64) {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    (
-        sorted[sorted.len() / 2],
-        sorted[0],
-        sorted[sorted.len() - 1],
-    )
+    let n = sorted.len();
+    let p50 = if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+    let p95 = sorted[((95.0 / 100.0 * n as f64).round() as usize).clamp(1, n) - 1];
+    let p99 = sorted[((99.0 / 100.0 * n as f64).round() as usize).clamp(1, n) - 1];
+    (p50, sorted[0], sorted[n - 1], p95, p99)
 }
 
 fn run_timed_case(
@@ -160,15 +169,19 @@ fn run_timed_case(
     }
     println!(" done");
 
-    let (median, min, max) = stats(&samples);
+    let (p50, min, max, p95, p99) = stats(&samples);
     Ok(CaseResult {
         runtime: rt.name.clone(),
         name: case_name.to_string(),
-        median,
+        median: p50,
         min,
         max,
+        p50,
+        p95,
+        p99,
         unit: "ms".to_string(),
         iterations: iters,
+        warmup_iterations: 0,
         samples,
     })
 }
@@ -191,15 +204,19 @@ fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
     }
     println!(" done");
 
-    let (median, min, max) = stats(&samples);
+    let (p50, min, max, p95, p99) = stats(&samples);
     Ok(CaseResult {
         runtime: rt.name.clone(),
         name: "cold-start".to_string(),
-        median,
+        median: p50,
         min,
         max,
+        p50,
+        p95,
+        p99,
         unit: "ms".to_string(),
         iterations: COLD_START_ITERS,
+        warmup_iterations: 0,
         samples,
     })
 }
@@ -502,21 +519,30 @@ fn build_json(
             serde_json::json!({
                 "runtime": r.runtime,
                 "case": r.name,
-                "median": r.median,
-                "min": r.min,
-                "max": r.max,
                 "unit": r.unit,
                 "iterations": r.iterations,
+                "warmup_iterations": r.warmup_iterations,
                 "samples": r.samples,
+                "p50": r.p50,
+                "p95": r.p95,
+                "p99": r.p99,
+                "min": r.min,
+                "max": r.max,
             })
         })
         .collect();
 
+    let timestamp = chrono_utc_now();
+
     serde_json::json!({
-        "schema": "oam-bench/2",
+        "schema": "oam-bench/3",
+        "timestamp": timestamp,
         "commit": commit,
-        "profile": profile,
+        "ci_run_id": std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
         "host": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "hardware_class": std::env::var("BENCH_HARDWARE_CLASS").unwrap_or_else(|_| "unknown".to_string()),
+        "profile": profile,
+        "warmup_iterations": 0,
         "runtimes": rt_info,
         "results": cases,
     })
@@ -659,6 +685,17 @@ fn capture_version(exe: &Path, args: &[&str]) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// ISO 8601 UTC timestamp via shell `date`, no chrono dependency.
+fn chrono_utc_now() -> String {
+    Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 fn git_short_commit(repo: &Path) -> String {

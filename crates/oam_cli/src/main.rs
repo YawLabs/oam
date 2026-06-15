@@ -9,6 +9,7 @@
 use clap::{Parser, Subcommand};
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use oam_loader::SourceKind;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -114,6 +115,24 @@ enum Command {
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect_brk: Option<String>,
     },
+    /// Install packages from the lockfile (npm ci equivalent).
+    Install {
+        /// Refuse to modify the lockfile (default and only mode for MVP).
+        #[arg(long, default_value = "true")]
+        frozen_lockfile: bool,
+    },
+    /// Compile a pre-bundled JS file into a standalone executable.
+    /// The user bundles externally (esbuild/rollup); this embeds the result.
+    Compile {
+        /// Pre-bundled JS/CJS entry file.
+        entry: PathBuf,
+        /// Output binary path.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Reserved for future use (minify the embedded source).
+        #[arg(long)]
+        minify: bool,
+    },
     /// Internal: type-check daemon server process. Not for direct use.
     #[command(name = "__oamd-ts", hide = true)]
     DaemonServe { tsconfig: PathBuf },
@@ -134,6 +153,10 @@ enum DaemonAction {
 }
 
 fn main() -> ExitCode {
+    if let Some(source) = extract_embedded_js() {
+        return run_embedded(&source, std::env::args().collect());
+    }
+
     let cli = Cli::parse();
     let Some(command) = &cli.command else {
         return repl_command();
@@ -210,6 +233,14 @@ fn main() -> ExitCode {
                 run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
             }
         }
+        Command::Install { frozen_lockfile } => {
+            install_command(*frozen_lockfile, cli.json)
+        }
+        Command::Compile {
+            entry,
+            output,
+            minify: _,
+        } => compile_command(entry, output),
         Command::DaemonServe { tsconfig } => match oam_ts::daemon::serve(tsconfig) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -746,6 +777,56 @@ fn render(d: &Diagnostic, json: bool) {
     }
 }
 
+/// `oam install`: frozen-lockfile package install from package-lock.json v3.
+fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
+    // Walk upward from cwd to find the directory containing package-lock.json.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
+
+    match oam_loader::install::install(&project_dir, frozen_lockfile) {
+        Ok(summary) => {
+            if json {
+                let d = Diagnostic::new(
+                    "OAM-PKG0000",
+                    Severity::Info,
+                    Origin::Install,
+                    format!(
+                        "installed {} package(s) in {:.1}s",
+                        summary.packages_installed,
+                        summary.elapsed.as_secs_f64()
+                    ),
+                );
+                render(&d, true);
+            } else {
+                eprintln!(
+                    "oam install: {} package(s) in {:.1}s",
+                    summary.packages_installed,
+                    summary.elapsed.as_secs_f64()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(diagnostics) => {
+            for d in &diagnostics {
+                render(d, json);
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Walk upward from `start` looking for a directory that contains `target`.
+fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
+    let mut dir = Some(start.to_path_buf());
+    while let Some(current) = dir {
+        if current.join(target).is_file() {
+            return Some(current);
+        }
+        dir = current.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
 /// The CLI's module host: filesystem loading + oxc transpilation, with the
 /// resolution rules from oam_loader. Everything `oam run` executes goes
 /// through this — entry file included — as an ES module (ESM-first per plan).
@@ -1132,6 +1213,212 @@ fn run_file(
     result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
 }
 
+
+// -- oam compile: embed a pre-bundled JS file into a standalone binary --
+
+/// 8-byte magic trailer written after the JS payload + length.
+/// Format: [JS bytes][u64 LE length][b"OAMEXEC\0"]
+const COMPILE_MAGIC: &[u8; 8] = b"OAMEXEC\0";
+
+/// Read the last 16 bytes of the current executable to check for an
+/// embedded JS payload. Returns `Some(source)` if the magic marker and
+/// length are valid, `None` otherwise (normal CLI binary).
+fn extract_embedded_js() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut f = std::fs::File::open(&exe).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    // Trailer is 16 bytes: 8 (length) + 8 (magic).
+    if file_len < 16 {
+        return None;
+    }
+    let mut trailer = [0u8; 16];
+    f.seek(SeekFrom::End(-16)).ok()?;
+    f.read_exact(&mut trailer).ok()?;
+    // Check magic marker (last 8 bytes of trailer).
+    if &trailer[8..16] != COMPILE_MAGIC {
+        return None;
+    }
+    let js_len = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    // Sanity: JS payload + 16-byte trailer must fit in the file.
+    if js_len > file_len - 16 {
+        return None;
+    }
+    let offset = file_len - 16 - js_len;
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; js_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Execute embedded JS source as a CJS script (the typical output of
+/// esbuild/rollup --format=cjs). Supports `--inspect` / `--inspect-brk`
+/// flags for debugging the compiled binary.
+fn run_embedded(source: &str, args: Vec<String>) -> ExitCode {
+    // Parse --inspect / --inspect-brk from raw args (we bypass clap for
+    // embedded binaries so the user's positional args pass through).
+    let mut inspect: Option<(std::net::SocketAddr, bool)> = None;
+    let mut script_args: Vec<String> = Vec::new();
+    let mut iter = args.iter().skip(1); // skip argv[0]
+    #[allow(clippy::while_let_on_iterator)] // need iter.cloned() inside the loop body
+    while let Some(arg) = iter.next() {
+        if arg == "--inspect-brk" || arg.starts_with("--inspect-brk=") {
+            let value = if let Some(v) = arg.strip_prefix("--inspect-brk=") {
+                v.to_string()
+            } else {
+                "127.0.0.1:9229".to_string()
+            };
+            match resolve_inspect(None, Some(&value)) {
+                Ok(v) => inspect = v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if arg == "--inspect" || arg.starts_with("--inspect=") {
+            let value = if let Some(v) = arg.strip_prefix("--inspect=") {
+                v.to_string()
+            } else {
+                "127.0.0.1:9229".to_string()
+            };
+            match resolve_inspect(Some(&value), None) {
+                Ok(v) => inspect = v,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if arg == "--" {
+            script_args.extend(iter.cloned());
+            break;
+        } else {
+            script_args.push(arg.clone());
+        }
+    }
+
+    let mut rt = oam_engine::JsRuntime::new();
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "oam-compiled".to_string());
+    let mut argv = vec![exe];
+    argv.extend(script_args);
+    rt.set_process_argv(argv);
+
+    if let Some((addr, brk)) = inspect {
+        match rt.attach_inspector(addr, brk) {
+            Ok(url) => {
+                eprintln!("Debugger listening on {url}");
+                eprintln!("For help, see: https://oam.sh/docs/inspector");
+            }
+            Err(e) => {
+                eprintln!("could not start inspector: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // Write the embedded source to a temp file so the CJS loader has a
+    // real path for __filename / __dirname / require() resolution.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp_dir = std::env::temp_dir().join(format!("oam-embed-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for embedded source");
+    let tmp_file = tmp_dir.join("__oam_embedded.js");
+    std::fs::write(&tmp_file, source).expect("write embedded source to temp");
+
+    let result = rt.execute_cjs(&tmp_file);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    match result {
+        Ok(()) => ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8),
+        Err(diagnostics) => {
+            for d in &diagnostics {
+                render(d, false);
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `oam compile <entry> --output <path>`: read the JS source, copy the
+/// current oam binary, and append the JS payload with a magic trailer.
+fn compile_command(entry: &Path, output: &Path) -> ExitCode {
+    // 1. Read the entry JS file.
+    let source = match std::fs::read(entry) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("oam compile: could not read {}: {e}", entry.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Validate it's UTF-8 (JS source must be).
+    if std::str::from_utf8(&source).is_err() {
+        eprintln!(
+            "oam compile: {} is not valid UTF-8 (expected a JS source file)",
+            entry.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 2. Copy the current oam binary to the output path.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("oam compile: could not locate own executable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "oam compile: could not create output directory {}: {e}",
+                    parent.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Err(e) = std::fs::copy(&exe, output) {
+        eprintln!(
+            "oam compile: could not copy binary to {}: {e}",
+            output.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // 3. Append: [JS source bytes][u64 LE length][magic "OAMEXEC\0"]
+    let mut out_file = match std::fs::OpenOptions::new().append(true).open(output) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("oam compile: could not open {} for append: {e}", output.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    use std::io::Write;
+    let js_len = source.len() as u64;
+    if let Err(e) = out_file
+        .write_all(&source)
+        .and_then(|()| out_file.write_all(&js_len.to_le_bytes()))
+        .and_then(|()| out_file.write_all(COMPILE_MAGIC))
+    {
+        eprintln!("oam compile: write failed: {e}");
+        let _ = std::fs::remove_file(output);
+        return ExitCode::FAILURE;
+    }
+
+    let out_abs = std::path::absolute(output)
+        .unwrap_or_else(|_| output.to_path_buf());
+    eprintln!(
+        "oam compile: {} ({} bytes JS) -> {}",
+        entry.display(),
+        source.len(),
+        out_abs.display()
+    );
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_inspect;
@@ -1181,5 +1468,11 @@ mod tests {
     #[test]
     fn inspect_neither_flag_returns_none() {
         assert!(resolve_inspect(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn compile_magic_is_8_bytes() {
+        assert_eq!(super::COMPILE_MAGIC.len(), 8);
+        assert_eq!(super::COMPILE_MAGIC, b"OAMEXEC\0");
     }
 }
