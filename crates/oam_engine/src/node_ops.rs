@@ -16,6 +16,7 @@ use crate::crypto_ops::{
     op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify, op_crypto_generate_keypair,
     op_crypto_public_encrypt, op_crypto_private_decrypt,
     op_crypto_private_encrypt, op_crypto_public_decrypt,
+    op_crypto_extract_public_pem, op_crypto_rsa_jwk_components,
     op_crypto_ecdh_generate_keys, op_crypto_ecdh_compute_secret, op_crypto_ecdh_get_public_key,
     op_crypto_dh_generate_keys, op_crypto_dh_compute_secret,
     op_crypto_x509_parse,
@@ -225,6 +226,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoPrivateDecrypt", op_crypto_private_decrypt),
         ("cryptoPrivateEncrypt", op_crypto_private_encrypt),
         ("cryptoPublicDecrypt", op_crypto_public_decrypt),
+        ("cryptoExtractPublicPem", op_crypto_extract_public_pem),
+        ("cryptoRsaJwkComponents", op_crypto_rsa_jwk_components),
         // node:crypto wave 5: ECDH key agreement
         ("cryptoEcdhGenerateKeys", op_crypto_ecdh_generate_keys),
         ("cryptoEcdhComputeSecret", op_crypto_ecdh_compute_secret),

@@ -5260,9 +5260,8 @@
         pem = input;
       } else if (input && typeof input === "object") {
         if (input instanceof KeyObject && input.type === "private") {
-          throw new TypeError("createPublicKey from private KeyObject not yet supported -- pass PEM string");
-        }
-        if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
+          pem = natives.cryptoExtractPublicPem(input._pem);
+        } else if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
           pem = new TextDecoder().decode(input.key);
         } else {
           pem = String(input.key);
@@ -6001,8 +6000,23 @@
         const lines = privOut.split('\n').filter(l => !l.startsWith('-----'));
         privOut = Buffer.from(lines.join(''), 'base64');
       }
-      if (format === 'jwk' || privFormat === 'jwk') {
-        throw new Error('JWK format not yet supported in oam');
+      if (format === 'jwk') {
+        var pubComps = natives.cryptoRsaJwkComponents(result.publicKey, false);
+        pubOut = { kty: 'RSA', n: base64urlEncode(pubComps.n), e: base64urlEncode(pubComps.e) };
+      }
+      if (privFormat === 'jwk') {
+        var privComps = natives.cryptoRsaJwkComponents(result.privateKey, true);
+        privOut = {
+          kty: 'RSA',
+          n: base64urlEncode(privComps.n),
+          e: base64urlEncode(privComps.e),
+          d: base64urlEncode(privComps.d),
+          p: base64urlEncode(privComps.p),
+          q: base64urlEncode(privComps.q),
+          dp: base64urlEncode(privComps.dp),
+          dq: base64urlEncode(privComps.dq),
+          qi: base64urlEncode(privComps.qi),
+        };
       }
       return { publicKey: pubOut, privateKey: privOut };
     }

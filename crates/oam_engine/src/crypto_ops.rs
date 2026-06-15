@@ -1559,6 +1559,96 @@ pub(crate) fn op_crypto_public_decrypt(
     }
 }
 
+pub(crate) fn op_crypto_extract_public_pem(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "extractPublicPem: key required");
+        return;
+    };
+    let der = match pem_to_der(&key_pem) {
+        Ok(d) => d,
+        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+    };
+    let label = pem_label(&key_pem);
+    let priv_key = match parse_rsa_private_key(&der, label) {
+        Ok(k) => k,
+        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+    };
+    let pub_key = RsaPublicKey::from(&priv_key);
+    let pub_pkcs1 = match pub_key.to_pkcs1_der() {
+        Ok(d) => d,
+        Err(e) => { crate::node_ops::throw_type_error(scope, &format!("RSA pub encode: {e}")); return; }
+    };
+    let pub_spki = wrap_rsa_spki(pub_pkcs1.as_ref());
+    let pem_str = der_to_pem(&pub_spki, "PUBLIC KEY");
+    let val = v8::String::new(scope, &pem_str).unwrap();
+    rv.set(val.into());
+}
+
+pub(crate) fn op_crypto_rsa_jwk_components(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "rsaJwkComponents: key required");
+        return;
+    };
+    let is_private = args.get(1).boolean_value(scope);
+    let der = match pem_to_der(&key_pem) {
+        Ok(d) => d,
+        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+    };
+    let label = pem_label(&key_pem);
+    let obj = v8::Object::new(scope);
+
+    macro_rules! set_bytes_prop {
+        ($name:expr, $bytes:expr) => {{
+            let k = v8::String::new(scope, $name).unwrap();
+            if let Some(val) = crate::node_ops::bytes_to_uint8array(scope, $bytes) {
+                obj.set(scope, k.into(), val);
+            }
+        }};
+    }
+
+    if is_private {
+        let priv_key = match parse_rsa_private_key(&der, label) {
+            Ok(k) => k,
+            Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+        };
+        set_bytes_prop!("n", priv_key.n().to_bytes_be());
+        set_bytes_prop!("e", priv_key.e().to_bytes_be());
+        set_bytes_prop!("d", priv_key.d().to_bytes_be());
+        let primes = priv_key.primes();
+        if primes.len() >= 2 {
+            set_bytes_prop!("p", primes[0].to_bytes_be());
+            set_bytes_prop!("q", primes[1].to_bytes_be());
+            let one = BigUint::from(1u32);
+            let dp = priv_key.d() % (&primes[0] - &one);
+            let dq = priv_key.d() % (&primes[1] - &one);
+            set_bytes_prop!("dp", dp.to_bytes_be());
+            set_bytes_prop!("dq", dq.to_bytes_be());
+            let qi = primes[1].modpow(
+                &(&primes[0] - BigUint::from(2u32)),
+                &primes[0],
+            );
+            set_bytes_prop!("qi", qi.to_bytes_be());
+        }
+    } else {
+        let pub_key = match parse_rsa_public_key(&der, label) {
+            Ok(k) => k,
+            Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+        };
+        set_bytes_prop!("n", pub_key.n().to_bytes_be());
+        set_bytes_prop!("e", pub_key.e().to_bytes_be());
+    }
+
+    rv.set(obj.into());
+}
+
 fn crypto_generate_rsa(bits: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut rng = OsRng;
     let priv_key = RsaPrivateKey::new(&mut rng, bits)

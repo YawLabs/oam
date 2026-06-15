@@ -8681,3 +8681,111 @@ crypto.generatePrime(64, (err, p) => {
     assert!(stdout.contains("async_is_buffer=true"), "stdout: {stdout}");
     assert!(stdout.contains("async_is_prime=true"), "stdout: {stdout}");
 }
+
+// ── createPublicKey from private KeyObject ──────────────────────────
+
+#[test]
+fn crypto_create_public_key_from_private() {
+    let file = write_temp(
+        "crypto_pubkey_from_priv.mjs",
+        r#"
+import crypto from "node:crypto";
+
+const { publicKey: pubPem, privateKey: privPem } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+});
+
+const privKeyObj = crypto.createPrivateKey(privPem);
+console.log("priv_type=" + privKeyObj.type);
+
+const pubKeyObj = crypto.createPublicKey(privKeyObj);
+console.log("pub_type=" + pubKeyObj.type);
+
+// Verify the extracted public key works for encryption
+const msg = Buffer.from("round trip test");
+const encrypted = crypto.publicEncrypt(pubKeyObj.export(), msg);
+const decrypted = crypto.privateDecrypt(privPem, encrypted);
+console.log("round_trip=" + decrypted.toString());
+
+// Verify it matches the original public key
+const origPubObj = crypto.createPublicKey(pubPem);
+console.log("pem_match=" + (pubKeyObj.export() === origPubObj.export()));
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("priv_type=private"), "stdout: {stdout}");
+    assert!(stdout.contains("pub_type=public"), "stdout: {stdout}");
+    assert!(stdout.contains("round_trip=round trip test"), "stdout: {stdout}");
+    assert!(stdout.contains("pem_match=true"), "stdout: {stdout}");
+}
+
+// ── generateKeyPairSync JWK output format ───────────────────────────
+
+#[test]
+fn crypto_generate_keypair_jwk() {
+    let file = write_temp(
+        "crypto_keypair_jwk.mjs",
+        r#"
+import crypto from "node:crypto";
+
+// Generate RSA key pair with JWK output
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "jwk" },
+  privateKeyEncoding: { type: "pkcs8", format: "jwk" },
+});
+
+console.log("pub_kty=" + publicKey.kty);
+console.log("pub_has_n=" + (typeof publicKey.n === "string" && publicKey.n.length > 0));
+console.log("pub_has_e=" + (typeof publicKey.e === "string" && publicKey.e.length > 0));
+console.log("pub_no_d=" + (publicKey.d === undefined));
+
+console.log("priv_kty=" + privateKey.kty);
+console.log("priv_has_n=" + (typeof privateKey.n === "string" && privateKey.n.length > 0));
+console.log("priv_has_e=" + (typeof privateKey.e === "string" && privateKey.e.length > 0));
+console.log("priv_has_d=" + (typeof privateKey.d === "string" && privateKey.d.length > 0));
+console.log("priv_has_p=" + (typeof privateKey.p === "string" && privateKey.p.length > 0));
+console.log("priv_has_q=" + (typeof privateKey.q === "string" && privateKey.q.length > 0));
+console.log("priv_has_dp=" + (typeof privateKey.dp === "string" && privateKey.dp.length > 0));
+console.log("priv_has_dq=" + (typeof privateKey.dq === "string" && privateKey.dq.length > 0));
+console.log("priv_has_qi=" + (typeof privateKey.qi === "string" && privateKey.qi.length > 0));
+
+// Round-trip: import JWK back and use for sign/verify
+const privKeyObj = crypto.createPrivateKey({ format: "jwk", key: privateKey });
+const pubKeyObj = crypto.createPublicKey({ format: "jwk", key: publicKey });
+
+const signer = crypto.createSign("SHA256");
+signer.update("jwk round trip");
+const sig = signer.sign(privKeyObj.export());
+
+const verifier = crypto.createVerify("SHA256");
+verifier.update("jwk round trip");
+const valid = verifier.verify(pubKeyObj.export(), sig);
+console.log("jwk_round_trip_verify=" + valid);
+
+// n values should match between public and private
+console.log("n_match=" + (publicKey.n === privateKey.n));
+console.log("e_match=" + (publicKey.e === privateKey.e));
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("pub_kty=RSA"), "stdout: {stdout}");
+    assert!(stdout.contains("pub_has_n=true"), "stdout: {stdout}");
+    assert!(stdout.contains("pub_has_e=true"), "stdout: {stdout}");
+    assert!(stdout.contains("pub_no_d=true"), "stdout: {stdout}");
+    assert!(stdout.contains("priv_kty=RSA"), "stdout: {stdout}");
+    assert!(stdout.contains("priv_has_d=true"), "stdout: {stdout}");
+    assert!(stdout.contains("priv_has_p=true"), "stdout: {stdout}");
+    assert!(stdout.contains("priv_has_qi=true"), "stdout: {stdout}");
+    assert!(stdout.contains("jwk_round_trip_verify=true"), "stdout: {stdout}");
+    assert!(stdout.contains("n_match=true"), "stdout: {stdout}");
+    assert!(stdout.contains("e_match=true"), "stdout: {stdout}");
+}
