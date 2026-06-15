@@ -7163,3 +7163,104 @@ console.log('captureRejection=' + typeof events.captureRejectionSymbol);
         );
     }
 }
+
+#[test]
+fn assert_iferror_events_getmax_util_tousvstring_process_extras() {
+    let file = write_temp(
+        "misc_m3c.mjs",
+        r#"
+import assert from 'node:assert';
+import events from 'node:events';
+import util from 'node:util';
+import process from 'node:process';
+import crypto from 'node:crypto';
+import stream from 'node:stream';
+import buffer from 'node:buffer';
+
+// -- assert.ifError --
+assert.ifError(null);
+assert.ifError(undefined);
+try { assert.ifError(new Error('boom')); console.log('FAIL'); } catch(e) {
+  console.log('ifError_err=' + e.message);
+}
+try { assert.ifError('oops'); console.log('FAIL'); } catch(e) {
+  console.log('ifError_str=' + e.message.includes('oops'));
+  console.log('ifError_op=' + e.operator);
+}
+
+// -- events.getMaxListeners --
+const ee = new events.EventEmitter();
+ee.setMaxListeners(42);
+console.log('getMax_ee=' + events.getMaxListeners(ee));
+console.log('getMax_default=' + events.getMaxListeners(new events.EventEmitter()));
+
+// -- util.toUSVString --
+console.log('toUSV_basic=' + (util.toUSVString('hello') === 'hello'));
+console.log('toUSV_num=' + util.toUSVString(123));
+console.log('toUSV_type=' + typeof util.toUSVString);
+
+// -- process.debugPort, connected, constrainedMemory, availableMemory --
+console.log('debugPort=' + process.debugPort);
+console.log('connected=' + process.connected);
+console.log('constrainedMemory=' + process.constrainedMemory());
+console.log('availableMemory=' + process.availableMemory());
+
+// -- crypto.getFips, secureHeapUsed --
+console.log('getFips=' + crypto.getFips());
+const sh = crypto.secureHeapUsed();
+console.log('secureHeap_total=' + sh.total);
+console.log('secureHeap_used=' + sh.used);
+try { crypto.setFips(1); } catch(e) { console.log('setFips_err=true'); }
+
+// -- stream.getDefaultHighWaterMark / setDefaultHighWaterMark --
+console.log('hwm_obj=' + stream.getDefaultHighWaterMark(true));
+console.log('hwm_buf=' + stream.getDefaultHighWaterMark(false));
+try { stream.setDefaultHighWaterMark(false, -1); } catch(e) { console.log('hwm_invalid=true'); }
+
+// -- buffer.kStringMaxLength, SlowBuffer --
+console.log('kStringMaxLength=' + buffer.kStringMaxLength);
+console.log('SlowBuffer_type=' + typeof buffer.SlowBuffer);
+const sb = new buffer.SlowBuffer(8);
+console.log('sb_len=' + sb.length);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3c failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "ifError_err=boom",
+        "ifError_str=true",
+        "ifError_op=ifError",
+        "getMax_ee=42",
+        "getMax_default=10",
+        "toUSV_basic=true",
+        "toUSV_num=123",
+        "toUSV_type=function",
+        "debugPort=9229",
+        "connected=false",
+        "constrainedMemory=0",
+        "availableMemory=0",
+        "getFips=0",
+        "secureHeap_total=0",
+        "secureHeap_used=0",
+        "setFips_err=true",
+        "hwm_obj=16",
+        "hwm_buf=16384",
+        "hwm_invalid=true",
+        "kStringMaxLength=536870888",
+        "SlowBuffer_type=function",
+        "sb_len=8",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

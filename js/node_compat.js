@@ -1102,6 +1102,10 @@
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
     EventEmitter.listenerCount = (emitter, type) => emitter.listenerCount(type);
+    EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
+      if (typeof emitterOrTarget.getMaxListeners === "function") return emitterOrTarget.getMaxListeners();
+      return EventEmitter.defaultMaxListeners;
+    };
     EventEmitter.addAbortListener = function addAbortListener(signal, listener) {
       if (signal.aborted) {
         queueMicrotask(() => listener());
@@ -1976,6 +1980,11 @@
       debug: debuglog,
       isArray: Array.isArray,
       isDeepStrictEqual: (a, b) => deepEqualImpl(a, b, true),
+      toUSVString: (val) => {
+        var s = String(val);
+        if (typeof s.toWellFormed === "function") return s.toWellFormed();
+        return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
+      },
       _deepEqual: deepEqualImpl,
       stripVTControlCharacters: (str) =>
         // eslint-disable-next-line no-control-regex
@@ -2309,6 +2318,16 @@
       match: (string, regexp, message) => {
         if (!regexp.test(string)) {
           innerFail(string, regexp, message ?? `The input did not match the regular expression`, "match");
+        }
+      },
+      ifError: (value) => {
+        if (value !== null && value !== undefined) {
+          if (value instanceof Error) throw value;
+          var e = new Error("ifError got unwanted exception: " + value);
+          e.actual = value;
+          e.expected = null;
+          e.operator = "ifError";
+          throw e;
         }
       },
       doesNotMatch: (string, regexp, message) => {
@@ -2963,6 +2982,10 @@
       abort: () => { natives.processExit(134); },
       abort: () => { natives.processExit(134); },
       uptime: () => natives.uptimeMs() / 1000,
+      debugPort: 9229,
+      connected: false,
+      constrainedMemory: () => 0,
+      availableMemory: () => 0,
       memoryUsage: Object.assign(
         () => {
           const h = natives.heapStatistics();
@@ -4247,6 +4270,12 @@
       },
       isErrored: (s) => Boolean(s._rState?.errored),
       isReadable: (s) => Boolean(s._rState && !s._rState.destroyed && !s._rState.endEmitted),
+      getDefaultHighWaterMark: (objectMode) => objectMode ? 16 : 16384,
+      setDefaultHighWaterMark: (objectMode, value) => {
+        if (typeof value !== "number" || value < 0 || Number.isNaN(value)) {
+          throw new TypeError("The value of highWaterMark is invalid: " + value);
+        }
+      },
       addAbortSignal: (signal, stream) => {
         if (signal.aborted) {
           stream.destroy(signal.reason ?? new Error("This operation was aborted"));
@@ -5687,6 +5716,9 @@
         }
       },
       getCiphers,
+      getFips: () => 0,
+      setFips: () => { throw new Error("Cannot set FIPS mode in this environment"); },
+      secureHeapUsed: () => ({ total: 0, min: 0, used: 0 }),
       KeyObject,
       createSecretKey,
       createPrivateKey,
@@ -6853,6 +6885,8 @@
     btoa: globalThis.btoa,
     constants: { MAX_LENGTH: 4294967295, MAX_STRING_LENGTH: 536870888 },
     kMaxLength: 4294967295,
+    kStringMaxLength: 536870888,
+    SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafe(size); },
     isUtf8: (input) => {
       try {
         new TextDecoder("utf-8", { fatal: true }).decode(input);
