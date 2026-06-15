@@ -8042,3 +8042,104 @@ console.log('RSA_PKCS1_OAEP_PADDING=' + crypto.constants.RSA_PKCS1_OAEP_PADDING)
         );
     }
 }
+
+#[test]
+fn crypto_ecdh_key_agreement() {
+    let file = write_temp(
+        "ecdh_test.mjs",
+        r#"
+import crypto from 'node:crypto';
+
+// Test 1: createECDH exists
+console.log('createECDH_type=' + typeof crypto.createECDH);
+
+// Test 2: P-256 key exchange between two parties
+const alice = crypto.createECDH('prime256v1');
+const bob = crypto.createECDH('prime256v1');
+
+alice.generateKeys();
+bob.generateKeys();
+
+const alicePub = alice.getPublicKey();
+const bobPub = bob.getPublicKey();
+
+// P-256 uncompressed point: 0x04 || x(32) || y(32) = 65 bytes
+console.log('alice_pub_len=' + alicePub.length);
+console.log('bob_pub_len=' + bobPub.length);
+console.log('alice_pub_is_buffer=' + Buffer.isBuffer(alicePub));
+
+// Private key: 32-byte scalar
+const alicePriv = alice.getPrivateKey();
+console.log('alice_priv_len=' + alicePriv.length);
+
+// Shared secrets must match
+const aliceSecret = alice.computeSecret(bobPub);
+const bobSecret = bob.computeSecret(alicePub);
+console.log('shared_secret_len=' + aliceSecret.length);
+console.log('secrets_match=' + aliceSecret.equals(bobSecret));
+
+// Test 3: P-384 key exchange
+const c384 = crypto.createECDH('secp384r1');
+const d384 = crypto.createECDH('secp384r1');
+c384.generateKeys();
+d384.generateKeys();
+
+// P-384 uncompressed point: 0x04 || x(48) || y(48) = 97 bytes
+console.log('p384_pub_len=' + c384.getPublicKey().length);
+console.log('p384_priv_len=' + c384.getPrivateKey().length);
+
+const s1 = c384.computeSecret(d384.getPublicKey());
+const s2 = d384.computeSecret(c384.getPublicKey());
+console.log('p384_secret_len=' + s1.length);
+console.log('p384_secrets_match=' + s1.equals(s2));
+
+// Test 4: encoding support
+const hexPub = alice.getPublicKey('hex');
+console.log('hex_pub_starts_04=' + hexPub.startsWith('04'));
+const b64Secret = alice.computeSecret(bobPub, null, 'base64');
+console.log('b64_secret_is_string=' + (typeof b64Secret === 'string'));
+
+// Test 5: setPrivateKey derives public key
+const clone = crypto.createECDH('prime256v1');
+clone.setPrivateKey(alicePriv);
+const clonePub = clone.getPublicKey();
+console.log('set_priv_derives_pub=' + alicePub.equals(clonePub));
+
+// Test 6: computeSecret still works after setPrivateKey
+const cloneSecret = clone.computeSecret(bobPub);
+console.log('clone_secret_matches=' + cloneSecret.equals(aliceSecret));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ECDH key agreement failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "createECDH_type=function",
+        "alice_pub_len=65",
+        "bob_pub_len=65",
+        "alice_pub_is_buffer=true",
+        "alice_priv_len=32",
+        "shared_secret_len=32",
+        "secrets_match=true",
+        "p384_pub_len=97",
+        "p384_priv_len=48",
+        "p384_secret_len=48",
+        "p384_secrets_match=true",
+        "hex_pub_starts_04=true",
+        "b64_secret_is_string=true",
+        "set_priv_derives_pub=true",
+        "clone_secret_matches=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

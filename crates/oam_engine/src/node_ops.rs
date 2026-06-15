@@ -15,6 +15,7 @@ use crate::crypto_ops::{
     op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_random_fill, op_crypto_scrypt_sync,
     op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify, op_crypto_generate_keypair,
     op_crypto_public_encrypt, op_crypto_private_decrypt,
+    op_crypto_ecdh_generate_keys, op_crypto_ecdh_compute_secret, op_crypto_ecdh_get_public_key,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -218,6 +219,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node:crypto wave 4: RSA encrypt/decrypt
         ("cryptoPublicEncrypt", op_crypto_public_encrypt),
         ("cryptoPrivateDecrypt", op_crypto_private_decrypt),
+        // node:crypto wave 5: ECDH key agreement
+        ("cryptoEcdhGenerateKeys", op_crypto_ecdh_generate_keys),
+        ("cryptoEcdhComputeSecret", op_crypto_ecdh_compute_secret),
+        ("cryptoEcdhGetPublicKey", op_crypto_ecdh_get_public_key),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads

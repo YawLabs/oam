@@ -1479,3 +1479,147 @@ fn asn1_length_size(len: usize) -> usize {
         3
     }
 }
+
+// ===================================================== ECDH key agreement
+// Wave 5: createECDH — P-256, P-384 via the p256/p384 RustCrypto crates.
+
+macro_rules! impl_ecdh {
+    ($mod:ident, $gen:ident, $compute:ident, $pub_from_priv:ident) => {
+        fn $gen() -> Result<(Vec<u8>, Vec<u8>), String> {
+            use $mod::elliptic_curve::sec1::ToEncodedPoint;
+            let sk = $mod::SecretKey::random(&mut OsRng);
+            let pk = sk.public_key();
+            let priv_bytes = sk.to_bytes().to_vec();
+            let pub_bytes = pk.to_encoded_point(false).as_bytes().to_vec();
+            Ok((pub_bytes, priv_bytes))
+        }
+
+        fn $compute(my_private: &[u8], their_public: &[u8]) -> Result<Vec<u8>, String> {
+            let sk = $mod::SecretKey::from_slice(my_private)
+                .map_err(|e| format!("ECDH private key: {e}"))?;
+            let pk = $mod::PublicKey::from_sec1_bytes(their_public)
+                .map_err(|e| format!("ECDH public key: {e}"))?;
+            let shared = $mod::ecdh::diffie_hellman(
+                sk.to_nonzero_scalar(),
+                pk.as_affine(),
+            );
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+
+        fn $pub_from_priv(my_private: &[u8]) -> Result<Vec<u8>, String> {
+            use $mod::elliptic_curve::sec1::ToEncodedPoint;
+            let sk = $mod::SecretKey::from_slice(my_private)
+                .map_err(|e| format!("ECDH private key: {e}"))?;
+            let pk = sk.public_key();
+            Ok(pk.to_encoded_point(false).as_bytes().to_vec())
+        }
+    };
+}
+
+impl_ecdh!(p256, ecdh_gen_p256, ecdh_compute_p256, ecdh_pub_p256);
+impl_ecdh!(p384, ecdh_gen_p384, ecdh_compute_p384, ecdh_pub_p384);
+
+fn normalize_curve(name: &str) -> &str {
+    match name {
+        "prime256v1" | "secp256r1" | "P-256" | "p256" => "p256",
+        "secp384r1" | "P-384" | "p384" => "p384",
+        _ => name,
+    }
+}
+
+pub(crate) fn op_crypto_ecdh_generate_keys(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(curve) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "ECDH generateKeys: curve required");
+        return;
+    };
+    let result = match normalize_curve(&curve) {
+        "p256" => ecdh_gen_p256(),
+        "p384" => ecdh_gen_p384(),
+        _ => {
+            crate::node_ops::throw_type_error(
+                scope,
+                &format!("ECDH: unsupported curve '{curve}' (oam supports prime256v1, secp384r1)"),
+            );
+            return;
+        }
+    };
+    match result {
+        Ok((pub_bytes, priv_bytes)) => {
+            let obj = v8::Object::new(scope);
+            if let Some(pub_arr) = crate::node_ops::bytes_to_uint8array(scope, pub_bytes) {
+                let key = v8::String::new(scope, "publicKey").unwrap();
+                obj.set(scope, key.into(), pub_arr);
+            }
+            if let Some(priv_arr) = crate::node_ops::bytes_to_uint8array(scope, priv_bytes) {
+                let key = v8::String::new(scope, "privateKey").unwrap();
+                obj.set(scope, key.into(), priv_arr);
+            }
+            rv.set(obj.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_ecdh_compute_secret(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(curve) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "ECDH computeSecret: curve required");
+        return;
+    };
+    let Some(my_private) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "ECDH computeSecret: private key required");
+        return;
+    };
+    let Some(their_public) = crate::node_ops::arg_bytes(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "ECDH computeSecret: other public key required");
+        return;
+    };
+    let result = match normalize_curve(&curve) {
+        "p256" => ecdh_compute_p256(&my_private, &their_public),
+        "p384" => ecdh_compute_p384(&my_private, &their_public),
+        _ => Err(format!("ECDH: unsupported curve '{curve}'")),
+    };
+    match result {
+        Ok(secret) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, secret) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_ecdh_get_public_key(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(curve) = crate::node_ops::arg_string(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "ECDH getPublicKey: curve required");
+        return;
+    };
+    let Some(my_private) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "ECDH getPublicKey: private key required");
+        return;
+    };
+    let result = match normalize_curve(&curve) {
+        "p256" => ecdh_pub_p256(&my_private),
+        "p384" => ecdh_pub_p384(&my_private),
+        _ => Err(format!("ECDH: unsupported curve '{curve}'")),
+    };
+    match result {
+        Ok(pub_bytes) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, pub_bytes) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}

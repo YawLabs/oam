@@ -5983,6 +5983,64 @@
     }
 
 
+
+    class ECDH {
+      constructor(curve) {
+        this._curve = curve;
+        this._publicKey = null;
+        this._privateKey = null;
+      }
+      generateKeys(encoding, format) {
+        var result = natives.cryptoEcdhGenerateKeys(this._curve);
+        this._publicKey = result.publicKey;
+        this._privateKey = result.privateKey;
+        return this.getPublicKey(encoding, format);
+      }
+      computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
+        if (!this._privateKey) throw new Error("ECDH: keys have not been generated");
+        var otherKey = typeof otherPublicKey === "string"
+          ? BufferCtor.from(otherPublicKey, inputEncoding || "utf8")
+          : otherPublicKey;
+        var secret = natives.cryptoEcdhComputeSecret(this._curve, new Uint8Array(this._privateKey), new Uint8Array(otherKey));
+        var buf = BufferCtor.from(secret);
+        return outputEncoding ? buf.toString(outputEncoding) : buf;
+      }
+      getPublicKey(encoding, format) {
+        if (!this._publicKey) throw new Error("ECDH: keys have not been generated");
+        var buf = BufferCtor.from(this._publicKey);
+        if (format === "compressed") {
+          var len = (buf.length - 1) / 2;
+          var x = buf.subarray(1, 1 + len);
+          var prefix = (buf[buf.length - 1] & 1) ? 0x03 : 0x02;
+          var out = BufferCtor.alloc(1 + len);
+          out[0] = prefix;
+          x.copy(out, 1);
+          buf = out;
+        }
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      getPrivateKey(encoding) {
+        if (!this._privateKey) throw new Error("ECDH: keys have not been generated");
+        var buf = BufferCtor.from(this._privateKey);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      setPrivateKey(key, encoding) {
+        this._privateKey = typeof key === "string"
+          ? new Uint8Array(BufferCtor.from(key, encoding || "utf8"))
+          : new Uint8Array(key);
+        this._publicKey = natives.cryptoEcdhGetPublicKey(this._curve, this._privateKey);
+      }
+      setPublicKey(key, encoding) {
+        this._publicKey = typeof key === "string"
+          ? new Uint8Array(BufferCtor.from(key, encoding || "utf8"))
+          : new Uint8Array(key);
+      }
+    }
+
+    function createECDH(curveName) {
+      return new ECDH(curveName);
+    }
+
     function publicEncrypt(keyOrOpts, buffer) {
       var key, padding = 4, oaepHash = "sha1";
       if (typeof keyOrOpts === "string") {
@@ -6119,6 +6177,8 @@
       createPublicKey,
       generateKeyPairSync,
       generateKeyPair,
+      createECDH,
+      ECDH,
       publicEncrypt,
       privateDecrypt,
       createSign,

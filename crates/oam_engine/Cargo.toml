@@ -38,6 +38,9 @@ base64 = { workspace = true }
 # node:crypto wave 4: RSA encrypt/decrypt.
 rsa = { workspace = true }
 rand_core = { workspace = true }
+# node:crypto wave 5: ECDH key agreement.
+p256 = { workspace = true }
+p384 = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.
