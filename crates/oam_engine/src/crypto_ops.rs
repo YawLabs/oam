@@ -885,11 +885,11 @@ use ring::signature as ring_sig;
 use ring_sig::KeyPair as _;
 
 // Wave 4: RSA encrypt/decrypt via the `rsa` crate (ring doesn't do encryption).
-use rsa::{Oaep, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
-use rsa::traits::{PublicKeyParts, PrivateKeyParts};
+use rand_core::OsRng;
 use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
-use rand_core::OsRng;
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+use rsa::{Oaep, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
@@ -914,9 +914,7 @@ fn pem_label(pem: &str) -> &str {
     ""
 }
 
-fn resolve_sign_algorithm(
-    algo: &str,
-) -> Result<&'static dyn ring_sig::RsaEncoding, String> {
+fn resolve_sign_algorithm(algo: &str) -> Result<&'static dyn ring_sig::RsaEncoding, String> {
     match algo {
         "sha256" | "rsasha256" => Ok(&ring_sig::RSA_PKCS1_SHA256),
         "sha384" | "rsasha384" => Ok(&ring_sig::RSA_PKCS1_SHA384),
@@ -1023,12 +1021,8 @@ fn crypto_sign_ec(algo: &str, data: &[u8], key_pem: &str) -> Result<Vec<u8>, Str
         return Err(format!("unsupported EC PEM label: '{label}'"));
     }
     let signing_alg: &ring_sig::EcdsaSigningAlgorithm = match algo {
-        "sha256" | "ecdsasha256" | "p256" => {
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING
-        }
-        "sha384" | "ecdsasha384" | "p384" => {
-            &ring_sig::ECDSA_P384_SHA384_FIXED_SIGNING
-        }
+        "sha256" | "ecdsasha256" | "p256" => &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+        "sha384" | "ecdsasha384" | "p384" => &ring_sig::ECDSA_P384_SHA384_FIXED_SIGNING,
         _ => return Err(format!("unsupported ECDSA algorithm: '{algo}'")),
     };
     let rng = ring::rand::SystemRandom::new();
@@ -1053,12 +1047,8 @@ fn crypto_verify_ec(
     let der = pem_to_der(key_pem)?;
     let label = pem_label(key_pem);
     let verify_alg: &ring_sig::EcdsaVerificationAlgorithm = match algo {
-        "sha256" | "ecdsasha256" | "p256" => {
-            &ring_sig::ECDSA_P256_SHA256_FIXED
-        }
-        "sha384" | "ecdsasha384" | "p384" => {
-            &ring_sig::ECDSA_P384_SHA384_FIXED
-        }
+        "sha256" | "ecdsasha256" | "p256" => &ring_sig::ECDSA_P256_SHA256_FIXED,
+        "sha384" | "ecdsasha384" | "p384" => &ring_sig::ECDSA_P384_SHA384_FIXED,
         _ => return Err(format!("unsupported ECDSA verify algorithm: '{algo}'")),
     };
     if label != "PUBLIC KEY" {
@@ -1079,19 +1069,14 @@ fn crypto_sign_ed25519(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
     Ok(key_pair.sign(data).as_ref().to_vec())
 }
 
-fn crypto_verify_ed25519(
-    data: &[u8],
-    key_pem: &str,
-    signature: &[u8],
-) -> Result<bool, String> {
+fn crypto_verify_ed25519(data: &[u8], key_pem: &str, signature: &[u8]) -> Result<bool, String> {
     let der = pem_to_der(key_pem)?;
     let label = pem_label(key_pem);
     if label != "PUBLIC KEY" {
         return Err(format!("unsupported Ed25519 public key PEM: '{label}'"));
     }
     let pub_bytes = extract_spki_pubkey(&der)?;
-    let pub_key =
-        ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, &pub_bytes);
+    let pub_key = ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, &pub_bytes);
     match pub_key.verify(data, signature) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
@@ -1177,8 +1162,7 @@ pub(crate) fn op_crypto_generate_keypair(
             crypto_generate_rsa(bits)
         }
         "ec" => {
-            let curve_raw = crate::node_ops::arg_string(scope, &args, 2)
-                .filter(|s| !s.is_empty());
+            let curve_raw = crate::node_ops::arg_string(scope, &args, 2).filter(|s| !s.is_empty());
             let Some(curve_raw) = curve_raw else {
                 crate::node_ops::throw_type_error(
                     scope,
@@ -1311,29 +1295,36 @@ fn parse_rsa_public_key(der: &[u8], label: &str) -> Result<RsaPublicKey, String>
             RsaPublicKey::from_pkcs1_der(&pkcs1_bytes)
                 .map_err(|e| format!("RSA public key parse: {e}"))
         }
-        "RSA PUBLIC KEY" => RsaPublicKey::from_pkcs1_der(der)
-            .map_err(|e| format!("RSA public key parse: {e}")),
+        "RSA PUBLIC KEY" => {
+            RsaPublicKey::from_pkcs1_der(der).map_err(|e| format!("RSA public key parse: {e}"))
+        }
         "PRIVATE KEY" => {
-            let priv_key = RsaPrivateKey::from_pkcs8_der(der)
-                .map_err(|e| format!("RSA key parse: {e}"))?;
+            let priv_key =
+                RsaPrivateKey::from_pkcs8_der(der).map_err(|e| format!("RSA key parse: {e}"))?;
             Ok(RsaPublicKey::from(&priv_key))
         }
         "RSA PRIVATE KEY" => {
-            let priv_key = RsaPrivateKey::from_pkcs1_der(der)
-                .map_err(|e| format!("RSA key parse: {e}"))?;
+            let priv_key =
+                RsaPrivateKey::from_pkcs1_der(der).map_err(|e| format!("RSA key parse: {e}"))?;
             Ok(RsaPublicKey::from(&priv_key))
         }
-        _ => Err(format!("unsupported PEM label for RSA public key: '{label}'")),
+        _ => Err(format!(
+            "unsupported PEM label for RSA public key: '{label}'"
+        )),
     }
 }
 
 fn parse_rsa_private_key(der: &[u8], label: &str) -> Result<RsaPrivateKey, String> {
     match label {
-        "PRIVATE KEY" => RsaPrivateKey::from_pkcs8_der(der)
-            .map_err(|e| format!("RSA private key parse: {e}")),
-        "RSA PRIVATE KEY" => RsaPrivateKey::from_pkcs1_der(der)
-            .map_err(|e| format!("RSA private key parse: {e}")),
-        _ => Err(format!("unsupported PEM label for RSA private key: '{label}'")),
+        "PRIVATE KEY" => {
+            RsaPrivateKey::from_pkcs8_der(der).map_err(|e| format!("RSA private key parse: {e}"))
+        }
+        "RSA PRIVATE KEY" => {
+            RsaPrivateKey::from_pkcs1_der(der).map_err(|e| format!("RSA private key parse: {e}"))
+        }
+        _ => Err(format!(
+            "unsupported PEM label for RSA private key: '{label}'"
+        )),
     }
 }
 
@@ -1470,10 +1461,10 @@ pub(crate) fn op_crypto_public_encrypt(
         crate::node_ops::throw_type_error(scope, "publicEncrypt: key required");
         return;
     };
-    let padding = crate::node_ops::arg_string(scope, &args, 2)
-        .unwrap_or_else(|| "oaep".to_string());
-    let oaep_hash = crate::node_ops::arg_string(scope, &args, 3)
-        .unwrap_or_else(|| "sha1".to_string());
+    let padding =
+        crate::node_ops::arg_string(scope, &args, 2).unwrap_or_else(|| "oaep".to_string());
+    let oaep_hash =
+        crate::node_ops::arg_string(scope, &args, 3).unwrap_or_else(|| "sha1".to_string());
 
     match crypto_public_encrypt(&data, &key_pem, &padding, &oaep_hash) {
         Ok(ct) => {
@@ -1498,10 +1489,10 @@ pub(crate) fn op_crypto_private_decrypt(
         crate::node_ops::throw_type_error(scope, "privateDecrypt: key required");
         return;
     };
-    let padding = crate::node_ops::arg_string(scope, &args, 2)
-        .unwrap_or_else(|| "oaep".to_string());
-    let oaep_hash = crate::node_ops::arg_string(scope, &args, 3)
-        .unwrap_or_else(|| "sha1".to_string());
+    let padding =
+        crate::node_ops::arg_string(scope, &args, 2).unwrap_or_else(|| "oaep".to_string());
+    let oaep_hash =
+        crate::node_ops::arg_string(scope, &args, 3).unwrap_or_else(|| "sha1".to_string());
 
     match crypto_private_decrypt(&data, &key_pem, &padding, &oaep_hash) {
         Ok(pt) => {
@@ -1570,17 +1561,26 @@ pub(crate) fn op_crypto_extract_public_pem(
     };
     let der = match pem_to_der(&key_pem) {
         Ok(d) => d,
-        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+        Err(e) => {
+            crate::node_ops::throw_type_error(scope, &e);
+            return;
+        }
     };
     let label = pem_label(&key_pem);
     let priv_key = match parse_rsa_private_key(&der, label) {
         Ok(k) => k,
-        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+        Err(e) => {
+            crate::node_ops::throw_type_error(scope, &e);
+            return;
+        }
     };
     let pub_key = RsaPublicKey::from(&priv_key);
     let pub_pkcs1 = match pub_key.to_pkcs1_der() {
         Ok(d) => d,
-        Err(e) => { crate::node_ops::throw_type_error(scope, &format!("RSA pub encode: {e}")); return; }
+        Err(e) => {
+            crate::node_ops::throw_type_error(scope, &format!("RSA pub encode: {e}"));
+            return;
+        }
     };
     let pub_spki = wrap_rsa_spki(pub_pkcs1.as_ref());
     let pem_str = der_to_pem(&pub_spki, "PUBLIC KEY");
@@ -1600,7 +1600,10 @@ pub(crate) fn op_crypto_rsa_jwk_components(
     let is_private = args.get(1).boolean_value(scope);
     let der = match pem_to_der(&key_pem) {
         Ok(d) => d,
-        Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+        Err(e) => {
+            crate::node_ops::throw_type_error(scope, &e);
+            return;
+        }
     };
     let label = pem_label(&key_pem);
     let obj = v8::Object::new(scope);
@@ -1617,7 +1620,10 @@ pub(crate) fn op_crypto_rsa_jwk_components(
     if is_private {
         let priv_key = match parse_rsa_private_key(&der, label) {
             Ok(k) => k,
-            Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+            Err(e) => {
+                crate::node_ops::throw_type_error(scope, &e);
+                return;
+            }
         };
         set_bytes_prop!("n", priv_key.n().to_bytes_be());
         set_bytes_prop!("e", priv_key.e().to_bytes_be());
@@ -1631,16 +1637,16 @@ pub(crate) fn op_crypto_rsa_jwk_components(
             let dq = priv_key.d() % (&primes[1] - &one);
             set_bytes_prop!("dp", dp.to_bytes_be());
             set_bytes_prop!("dq", dq.to_bytes_be());
-            let qi = primes[1].modpow(
-                &(&primes[0] - BigUint::from(2u32)),
-                &primes[0],
-            );
+            let qi = primes[1].modpow(&(&primes[0] - BigUint::from(2u32)), &primes[0]);
             set_bytes_prop!("qi", qi.to_bytes_be());
         }
     } else {
         let pub_key = match parse_rsa_public_key(&der, label) {
             Ok(k) => k,
-            Err(e) => { crate::node_ops::throw_type_error(scope, &e); return; }
+            Err(e) => {
+                crate::node_ops::throw_type_error(scope, &e);
+                return;
+            }
         };
         set_bytes_prop!("n", pub_key.n().to_bytes_be());
         set_bytes_prop!("e", pub_key.e().to_bytes_be());
@@ -1651,8 +1657,7 @@ pub(crate) fn op_crypto_rsa_jwk_components(
 
 fn crypto_generate_rsa(bits: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut rng = OsRng;
-    let priv_key = RsaPrivateKey::new(&mut rng, bits)
-        .map_err(|e| format!("RSA keygen: {e}"))?;
+    let priv_key = RsaPrivateKey::new(&mut rng, bits).map_err(|e| format!("RSA keygen: {e}"))?;
     let pub_key = RsaPublicKey::from(&priv_key);
 
     let priv_doc = priv_key
@@ -1672,8 +1677,7 @@ fn crypto_generate_rsa(bits: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
 fn wrap_rsa_spki(pkcs1_pub: &[u8]) -> Vec<u8> {
     // RSA OID: 1.2.840.113549.1.1.1 + NULL params
     let algo_id: &[u8] = &[
-        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05,
-        0x00,
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
     ];
     let bit_string_len = 1 + pkcs1_pub.len();
     let seq_content_len = algo_id.len() + 1 + asn1_length_size(bit_string_len) + bit_string_len;
@@ -1718,10 +1722,7 @@ macro_rules! impl_ecdh {
                 .map_err(|e| format!("ECDH private key: {e}"))?;
             let pk = $mod::PublicKey::from_sec1_bytes(their_public)
                 .map_err(|e| format!("ECDH public key: {e}"))?;
-            let shared = $mod::ecdh::diffie_hellman(
-                sk.to_nonzero_scalar(),
-                pk.as_affine(),
-            );
+            let shared = $mod::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
             Ok(shared.raw_secret_bytes().to_vec())
         }
 
@@ -1879,10 +1880,7 @@ fn pad_be(bytes: Vec<u8>, target_len: usize) -> Vec<u8> {
     padded
 }
 
-fn crypto_dh_generate_keys(
-    prime: &[u8],
-    generator: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn crypto_dh_generate_keys(prime: &[u8], generator: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     use rand_core::RngCore;
     let p = BigUint::from_bytes_be(prime);
     let g = BigUint::from_bytes_be(generator);
@@ -2019,10 +2017,7 @@ pub(crate) fn op_crypto_x509_parse(
         match x509_parser::pem::parse_x509_pem(&input) {
             Ok((_, pem)) => pem.contents,
             Err(e) => {
-                crate::node_ops::throw_type_error(
-                    scope,
-                    &format!("X509 PEM parse error: {e}"),
-                );
+                crate::node_ops::throw_type_error(scope, &format!("X509 PEM parse error: {e}"));
                 return;
             }
         }
@@ -2060,7 +2055,11 @@ pub(crate) fn op_crypto_x509_parse(
         .map(|b| format!("{b:02X}"))
         .collect::<String>();
     let serial_hex = serial_hex.trim_start_matches('0');
-    let serial_hex = if serial_hex.is_empty() { "0" } else { serial_hex };
+    let serial_hex = if serial_hex.is_empty() {
+        "0"
+    } else {
+        serial_hex
+    };
     set_str!("serialNumber", serial_hex);
 
     set_str!("validFrom", &cert.validity().not_before.to_string());
@@ -2104,13 +2103,27 @@ pub(crate) fn op_crypto_x509_parse(
                 san_formatted = Some(names.join(", "));
             }
             x509_parser::extensions::ParsedExtension::KeyUsage(ku) => {
-                if ku.digital_signature() { ku_list.push("digitalSignature"); }
-                if ku.non_repudiation() { ku_list.push("nonRepudiation"); }
-                if ku.key_encipherment() { ku_list.push("keyEncipherment"); }
-                if ku.data_encipherment() { ku_list.push("dataEncipherment"); }
-                if ku.key_agreement() { ku_list.push("keyAgreement"); }
-                if ku.key_cert_sign() { ku_list.push("keyCertSign"); }
-                if ku.crl_sign() { ku_list.push("cRLSign"); }
+                if ku.digital_signature() {
+                    ku_list.push("digitalSignature");
+                }
+                if ku.non_repudiation() {
+                    ku_list.push("nonRepudiation");
+                }
+                if ku.key_encipherment() {
+                    ku_list.push("keyEncipherment");
+                }
+                if ku.data_encipherment() {
+                    ku_list.push("dataEncipherment");
+                }
+                if ku.key_agreement() {
+                    ku_list.push("keyAgreement");
+                }
+                if ku.key_cert_sign() {
+                    ku_list.push("keyCertSign");
+                }
+                if ku.crl_sign() {
+                    ku_list.push("cRLSign");
+                }
             }
             _ => {}
         }

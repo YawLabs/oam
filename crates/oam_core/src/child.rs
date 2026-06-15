@@ -63,7 +63,10 @@ pub async fn spawn_child(
 
     let child = cmd.spawn().map_err(|e| {
         let code = super::node_error_code(&e);
-        format!("{{\"code\":\"{code}\",\"message\":\"{}\"}}", e.to_string().replace('"', "\\\""))
+        format!(
+            "{{\"code\":\"{code}\",\"message\":\"{}\"}}",
+            e.to_string().replace('"', "\\\"")
+        )
     })?;
     let pid = child.id().unwrap_or(0);
     Ok((child, pid))

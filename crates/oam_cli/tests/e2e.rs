@@ -7908,7 +7908,7 @@ console.log('ru_maxRSS=' + ru.maxRSS);
         "PerformanceEntry=function",
         "pe_name=test",
         "pe_type=measure",
-        r#"pe_json={"name":"test","entryType":"measure","startTime":100,"duration":50}"#,
+        r#"pe_json={"name":"test","entryType":"measure","startTime":100,"duration":50,"detail":null}"#,
         "PerformanceObserverEntryList=function",
         "poel_getEntries=true",
         "PerformanceNodeTiming=function",
@@ -9260,4 +9260,897 @@ child.on('close', () => {{
         stdout.contains("captured=child-output-line"),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn readline_line_events_and_close() {
+    let stdout = run_ok(
+        "readline_line_events.cjs",
+        r#"
+        const { Readable } = require('stream');
+        const readline = require('readline');
+
+        const input = new Readable({ read() {} });
+        const rl = readline.createInterface({ input });
+
+        const lines = [];
+        rl.on('line', (line) => lines.push(line));
+        rl.on('close', () => {
+            console.log('lines=' + JSON.stringify(lines));
+            console.log('closed=true');
+        });
+
+        input.push('hello\nworld\nlast');
+        input.push(null);
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"lines=["hello","world","last"]"#),
+        "line events: {stdout}"
+    );
+    assert!(stdout.contains("closed=true"), "close event: {stdout}");
+}
+
+#[test]
+fn readline_clearline_ansi() {
+    let stdout = run_ok(
+        "readline_clearline.cjs",
+        r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // dir = -1 => ESC[1K (erase left)
+        const r1 = readline.clearLine(out, -1);
+        const after1 = buf;
+        buf = '';
+
+        // dir = 1 => ESC[0K (erase right)
+        readline.clearLine(out, 1);
+        const after2 = buf;
+        buf = '';
+
+        // dir = 0 => ESC[2K (erase whole line)
+        readline.clearLine(out, 0);
+        const after3 = buf;
+        buf = '';
+
+        // no stream => returns false
+        const r2 = readline.clearLine(null, 0);
+
+        console.log('cl_left=' + JSON.stringify(after1));
+        console.log('cl_right=' + JSON.stringify(after2));
+        console.log('cl_whole=' + JSON.stringify(after3));
+        console.log('ret_stream=' + r1);
+        console.log('ret_null=' + r2);
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"cl_left="\u001b[1K""#),
+        "clearLine left: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"cl_right="\u001b[0K""#),
+        "clearLine right: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"cl_whole="\u001b[2K""#),
+        "clearLine whole: {stdout}"
+    );
+    assert!(
+        stdout.contains("ret_stream=true"),
+        "clearLine return with stream: {stdout}"
+    );
+    assert!(
+        stdout.contains("ret_null=false"),
+        "clearLine return without stream: {stdout}"
+    );
+}
+
+#[test]
+fn readline_cursorto_ansi() {
+    let stdout = run_ok(
+        "readline_cursorto.cjs",
+        r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // column only: ESC[(x+1)G
+        readline.cursorTo(out, 5);
+        const col_only = buf;
+        buf = '';
+
+        // row + column: ESC[(y+1);(x+1)H
+        readline.cursorTo(out, 3, 7);
+        const row_col = buf;
+
+        console.log('col_only=' + JSON.stringify(col_only));
+        console.log('row_col=' + JSON.stringify(row_col));
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"col_only="\u001b[6G""#),
+        "cursorTo column: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"row_col="\u001b[8;4H""#),
+        "cursorTo row+col: {stdout}"
+    );
+}
+
+#[test]
+fn readline_movecursor_ansi() {
+    let stdout = run_ok(
+        "readline_movecursor.cjs",
+        r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // dx=3 => ESC[3C, dy=-2 => ESC[2A
+        readline.moveCursor(out, 3, -2);
+        const move1 = buf;
+        buf = '';
+
+        // dx=-4 => ESC[4D, dy=1 => ESC[1B
+        readline.moveCursor(out, -4, 1);
+        const move2 = buf;
+
+        console.log('move1=' + JSON.stringify(move1));
+        console.log('move2=' + JSON.stringify(move2));
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"move1="\u001b[3C\u001b[2A""#),
+        "moveCursor right+up: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"move2="\u001b[4D\u001b[1B""#),
+        "moveCursor left+down: {stdout}"
+    );
+}
+
+#[test]
+fn readline_prompt_write_pause_resume() {
+    let stdout = run_ok(
+        "readline_prompt_write.cjs",
+        r#"
+        const { Readable, Writable } = require('stream');
+        const readline = require('readline');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+        const input = new Readable({ read() {} });
+        const rl = readline.createInterface({ input, output: out, prompt: '$ ' });
+
+        // setPrompt + prompt
+        rl.setPrompt('>> ');
+        rl.prompt();
+        const prompted = buf;
+        buf = '';
+
+        // write
+        rl.write('typed text');
+        const written = buf;
+        buf = '';
+
+        // pause / resume emit events
+        const events = [];
+        rl.on('pause', () => events.push('pause'));
+        rl.on('resume', () => events.push('resume'));
+        rl.pause();
+        rl.resume();
+        // double pause should not double-emit
+        rl.pause();
+        rl.pause();
+
+        console.log('prompted=' + JSON.stringify(prompted));
+        console.log('written=' + JSON.stringify(written));
+        console.log('events=' + JSON.stringify(events));
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"prompted=">> ""#),
+        "prompt output: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"written="typed text""#),
+        "write output: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#"events=["pause","resume","pause"]"#),
+        "pause/resume events: {stdout}"
+    );
+}
+
+#[test]
+fn readline_crlfdelay_option() {
+    let stdout = run_ok(
+        "readline_crlfdelay.cjs",
+        r#"
+        const readline = require('readline');
+        const { Readable } = require('stream');
+
+        const input1 = new Readable({ read() {} });
+        const rl1 = readline.createInterface({ input: input1, crlfDelay: Infinity });
+        console.log('delay=' + rl1.crlfDelay);
+
+        // default crlfDelay
+        const input2 = new Readable({ read() {} });
+        const rl2 = readline.createInterface({ input: input2 });
+        console.log('default_delay=' + rl2.crlfDelay);
+    "#,
+    );
+    assert!(
+        stdout.contains("delay=Infinity"),
+        "crlfDelay Infinity: {stdout}"
+    );
+    assert!(
+        stdout.contains("default_delay=100"),
+        "crlfDelay default: {stdout}"
+    );
+}
+
+#[test]
+fn vm_run_in_new_context_sandbox() {
+    let stdout = run_ok(
+        "vm_run_in_new_context.cjs",
+        r#"
+        const vm = require('vm');
+        const sandbox = { x: 10, y: 20 };
+        const result = vm.runInNewContext('x + y', sandbox);
+        console.log('sum=' + result);
+        const result2 = vm.runInNewContext('x * y', sandbox);
+        console.log('product=' + result2);
+    "#,
+    );
+    assert!(stdout.contains("sum=30"), "{stdout}");
+    assert!(stdout.contains("product=200"), "{stdout}");
+}
+
+#[test]
+fn vm_create_context_is_context() {
+    let stdout = run_ok(
+        "vm_create_context.cjs",
+        r#"
+        const vm = require('vm');
+        const ctx = vm.createContext({ a: 1 });
+        console.log('isCtx=' + vm.isContext(ctx));
+        console.log('plainObj=' + vm.isContext({ b: 2 }));
+        console.log('nullCheck=' + vm.isContext(null));
+        console.log('tag=' + Object.prototype.toString.call(ctx));
+    "#,
+    );
+    assert!(stdout.contains("isCtx=true"), "{stdout}");
+    assert!(stdout.contains("plainObj=false"), "{stdout}");
+    assert!(stdout.contains("nullCheck=false"), "{stdout}");
+    assert!(stdout.contains("tag=[object Context]"), "{stdout}");
+}
+
+#[test]
+fn vm_script_class() {
+    let stdout = run_ok(
+        "vm_script_class.cjs",
+        r#"
+        const vm = require('vm');
+        const script = new vm.Script('40 + 2');
+        const result = script.runInThisContext();
+        console.log('expr=' + result);
+        const s2 = new vm.Script('this.z = 99;');
+        const ctx = vm.createContext({});
+        s2.runInContext(ctx);
+        console.log('z=' + ctx.z);
+    "#,
+    );
+    assert!(stdout.contains("expr=42"), "{stdout}");
+    assert!(stdout.contains("z=99"), "{stdout}");
+}
+
+#[test]
+fn vm_compile_function() {
+    let stdout = run_ok(
+        "vm_compile_fn.cjs",
+        r#"
+        const vm = require('vm');
+        const fn = vm.compileFunction('return a + b', ['a', 'b']);
+        console.log('result=' + fn(3, 7));
+    "#,
+    );
+    assert!(stdout.contains("result=10"), "{stdout}");
+}
+
+#[test]
+fn vm_create_script_alias() {
+    let stdout = run_ok(
+        "vm_create_script.cjs",
+        r#"
+        const vm = require('vm');
+        const script = vm.createScript('x * 2');
+        const ctx = vm.createContext({ x: 21 });
+        const result = script.runInContext(ctx);
+        console.log('val=' + result);
+    "#,
+    );
+    assert!(stdout.contains("val=42"), "{stdout}");
+}
+
+#[test]
+fn vm_script_filename_option() {
+    let stdout = run_ok(
+        "vm_script_filename.cjs",
+        r#"
+        const vm = require('vm');
+        const s = new vm.Script('1+1', { filename: 'test.js', lineOffset: 5 });
+        console.log('fname=' + s._filename);
+        console.log('line=' + s._lineOffset);
+        const s2 = new vm.Script('2+2', 'legacy.js');
+        console.log('legacy=' + s2._filename);
+    "#,
+    );
+    assert!(stdout.contains("fname=test.js"), "{stdout}");
+    assert!(stdout.contains("line=5"), "{stdout}");
+    assert!(stdout.contains("legacy=legacy.js"), "{stdout}");
+}
+
+#[test]
+fn vm_context_preserves_existing_tag() {
+    let stdout = run_ok(
+        "vm_ctx_tag.cjs",
+        r#"
+        const vm = require('vm');
+        const obj = {};
+        Object.defineProperty(obj, Symbol.toStringTag, { value: 'Custom' });
+        const ctx = vm.createContext(obj);
+        console.log('tag=' + Object.prototype.toString.call(ctx));
+        console.log('same=' + (ctx === obj));
+    "#,
+    );
+    assert!(stdout.contains("tag=[object Custom]"), "{stdout}");
+    assert!(stdout.contains("same=true"), "{stdout}");
+}
+
+#[test]
+fn vm_statement_fallback() {
+    let stdout = run_ok(
+        "vm_stmt_fallback.cjs",
+        r#"
+        const vm = require('vm');
+        const ctx = vm.createContext({ items: [] });
+        vm.runInContext('items.push(1); items.push(2);', ctx);
+        console.log('len=' + ctx.items.length);
+        console.log('items=' + ctx.items.join(','));
+    "#,
+    );
+    assert!(stdout.contains("len=2"), "{stdout}");
+    assert!(stdout.contains("items=1,2"), "{stdout}");
+}
+
+#[test]
+fn punycode_encode_decode() {
+    let stdout = run_ok(
+        "punycode_test.cjs",
+        r#"
+        const punycode = require('punycode');
+
+        // 1. encode('mañana') -> 'maana-pta'
+        const enc1 = punycode.encode('mañana');
+        console.log('enc1=' + enc1);
+
+        // 2. decode('maana-pta') -> 'mañana'
+        const dec1 = punycode.decode('maana-pta');
+        console.log('dec1=' + dec1);
+
+        // 3. toASCII('mañana.com') -> 'xn--maana-pta.com'
+        const ascii1 = punycode.toASCII('mañana.com');
+        console.log('ascii1=' + ascii1);
+
+        // 4. toUnicode('xn--maana-pta.com') -> 'mañana.com'
+        const uni1 = punycode.toUnicode('xn--maana-pta.com');
+        console.log('uni1=' + uni1);
+
+        // 5. ucs2.decode('abc') -> [97, 98, 99]
+        const ucs2d = punycode.ucs2.decode('abc');
+        console.log('ucs2d=' + JSON.stringify(ucs2d));
+
+        // 6. ucs2.encode([97, 98, 99]) -> 'abc'
+        const ucs2e = punycode.ucs2.encode([97, 98, 99]);
+        console.log('ucs2e=' + ucs2e);
+
+        // 7. Pure ASCII encode/decode round-trip: 'abc' -> 'abc-'
+        const encAscii = punycode.encode('abc');
+        console.log('encAscii=' + encAscii);
+        const decAscii = punycode.decode('abc-');
+        console.log('decAscii=' + decAscii);
+
+        // 8. Emoji round-trip: encode then decode U+1F37A (beer mug)
+        const emoji = String.fromCodePoint(0x1F37A);
+        const encEmoji = punycode.encode(emoji);
+        console.log('encEmoji=' + encEmoji);
+        const decEmoji = punycode.decode(encEmoji);
+        console.log('emojiRt=' + (decEmoji === emoji));
+
+        // Bonus: ucs2 handles surrogate pairs (emoji is above U+FFFF)
+        const emojiCps = punycode.ucs2.decode(emoji);
+        console.log('emojiCp=' + emojiCps[0]);
+        const emojiBack = punycode.ucs2.encode(emojiCps);
+        console.log('emojiUcs2Rt=' + (emojiBack === emoji));
+    "#,
+    );
+    assert!(stdout.contains("enc1=maana-pta"), "encode mañana: {stdout}");
+    assert!(stdout.contains("dec1=mañana"), "decode maana-pta: {stdout}");
+    assert!(
+        stdout.contains("ascii1=xn--maana-pta.com"),
+        "toASCII: {stdout}"
+    );
+    assert!(stdout.contains("uni1=mañana.com"), "toUnicode: {stdout}");
+    assert!(stdout.contains("ucs2d=[97,98,99]"), "ucs2.decode: {stdout}");
+    assert!(stdout.contains("ucs2e=abc"), "ucs2.encode: {stdout}");
+    assert!(
+        stdout.contains("encAscii=abc-"),
+        "pure ASCII encode: {stdout}"
+    );
+    assert!(
+        stdout.contains("decAscii=abc"),
+        "pure ASCII decode: {stdout}"
+    );
+    assert!(
+        stdout.contains("encEmoji="),
+        "emoji encode produced output: {stdout}"
+    );
+    assert!(
+        stdout.contains("emojiRt=true"),
+        "emoji round-trip: {stdout}"
+    );
+    assert!(
+        stdout.contains("emojiCp=127866"),
+        "ucs2.decode emoji codepoint: {stdout}"
+    );
+    assert!(
+        stdout.contains("emojiUcs2Rt=true"),
+        "ucs2.encode emoji round-trip: {stdout}"
+    );
+}
+
+#[test]
+fn perf_hooks_mark_measure_entries() {
+    let stdout = run_ok(
+        "perf_hooks_mark_measure.cjs",
+        r#"
+        const { performance, PerformanceObserver, PerformanceEntry } = require('perf_hooks');
+
+        // mark() creates entries with correct entryType
+        performance.mark('start');
+        performance.mark('middle');
+        performance.mark('end');
+
+        const marks = performance.getEntriesByType('mark');
+        console.log('marks_count=' + marks.length);
+        console.log('mark0_name=' + marks[0].name);
+        console.log('mark0_type=' + marks[0].entryType);
+        console.log('mark0_dur=' + marks[0].duration);
+
+        // mark startTime is a positive number
+        console.log('mark_time_positive=' + (marks[0].startTime > 0));
+
+        // measure() between two marks
+        performance.measure('start-to-end', 'start', 'end');
+        const measures = performance.getEntriesByType('measure');
+        console.log('measures_count=' + measures.length);
+        console.log('measure0_name=' + measures[0].name);
+        console.log('measure0_type=' + measures[0].entryType);
+        console.log('measure_dur_gte0=' + (measures[0].duration >= 0));
+
+        // getEntries returns both marks and measures
+        const all = performance.getEntries();
+        console.log('all_count=' + all.length);
+
+        // getEntriesByName
+        const byName = performance.getEntriesByName('start');
+        console.log('byname_start=' + byName.length);
+        const byNameType = performance.getEntriesByName('start', 'mark');
+        console.log('byname_type=' + byNameType.length);
+
+        // PerformanceEntry is a constructor
+        console.log('entry_class=' + (typeof PerformanceEntry === 'function'));
+    "#,
+    );
+    assert!(stdout.contains("marks_count=3"), "{stdout}");
+    assert!(stdout.contains("mark0_name=start"), "{stdout}");
+    assert!(stdout.contains("mark0_type=mark"), "{stdout}");
+    assert!(stdout.contains("mark0_dur=0"), "{stdout}");
+    assert!(stdout.contains("mark_time_positive=true"), "{stdout}");
+    assert!(stdout.contains("measures_count=1"), "{stdout}");
+    assert!(stdout.contains("measure0_name=start-to-end"), "{stdout}");
+    assert!(stdout.contains("measure0_type=measure"), "{stdout}");
+    assert!(stdout.contains("measure_dur_gte0=true"), "{stdout}");
+    assert!(stdout.contains("all_count=4"), "{stdout}");
+    assert!(stdout.contains("byname_start=1"), "{stdout}");
+    assert!(stdout.contains("byname_type=1"), "{stdout}");
+    assert!(stdout.contains("entry_class=true"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_clear_marks_measures() {
+    let stdout = run_ok(
+        "perf_hooks_clear.cjs",
+        r#"
+        const { performance } = require('perf_hooks');
+
+        performance.mark('a');
+        performance.mark('b');
+        performance.mark('a');
+        console.log('before_clear=' + performance.getEntriesByType('mark').length);
+
+        // clearMarks with name removes only matching
+        performance.clearMarks('a');
+        const afterA = performance.getEntriesByType('mark');
+        console.log('after_clear_a=' + afterA.length);
+        console.log('remaining=' + afterA[0].name);
+
+        // clearMarks without name clears all
+        performance.mark('c');
+        performance.clearMarks();
+        console.log('after_clear_all=' + performance.getEntriesByType('mark').length);
+
+        // clearMeasures
+        performance.mark('x');
+        performance.mark('y');
+        performance.measure('m1', 'x', 'y');
+        performance.measure('m2', 'x', 'y');
+        console.log('measures_before=' + performance.getEntriesByType('measure').length);
+        performance.clearMeasures('m1');
+        console.log('measures_after=' + performance.getEntriesByType('measure').length);
+        performance.clearMeasures();
+        console.log('measures_cleared=' + performance.getEntriesByType('measure').length);
+    "#,
+    );
+    assert!(stdout.contains("before_clear=3"), "{stdout}");
+    assert!(stdout.contains("after_clear_a=1"), "{stdout}");
+    assert!(stdout.contains("remaining=b"), "{stdout}");
+    assert!(stdout.contains("after_clear_all=0"), "{stdout}");
+    assert!(stdout.contains("measures_before=2"), "{stdout}");
+    assert!(stdout.contains("measures_after=1"), "{stdout}");
+    assert!(stdout.contains("measures_cleared=0"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_observer() {
+    let stdout = run_ok(
+        "perf_hooks_observer.cjs",
+        r#"
+        const { performance, PerformanceObserver } = require('perf_hooks');
+
+        // Observer fires on mark
+        const observed = [];
+        const obs = new PerformanceObserver((list, observer) => {
+            const entries = list.getEntries();
+            for (const e of entries) {
+                observed.push(e.entryType + ':' + e.name);
+            }
+        });
+        obs.observe({ entryTypes: ['mark', 'measure'] });
+
+        performance.mark('obs_mark1');
+        performance.mark('obs_mark2');
+        performance.measure('obs_measure', 'obs_mark1', 'obs_mark2');
+
+        console.log('observed_count=' + observed.length);
+        console.log('observed_0=' + observed[0]);
+        console.log('observed_1=' + observed[1]);
+        console.log('observed_2=' + observed[2]);
+
+        // disconnect stops notifications
+        obs.disconnect();
+        performance.mark('after_disconnect');
+        console.log('observed_after_disconnect=' + observed.length);
+
+        // supportedEntryTypes
+        console.log('supported=' + PerformanceObserver.supportedEntryTypes.join(','));
+    "#,
+    );
+    assert!(stdout.contains("observed_count=3"), "{stdout}");
+    assert!(stdout.contains("observed_0=mark:obs_mark1"), "{stdout}");
+    assert!(stdout.contains("observed_1=mark:obs_mark2"), "{stdout}");
+    assert!(
+        stdout.contains("observed_2=measure:obs_measure"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("observed_after_disconnect=3"), "{stdout}");
+    assert!(stdout.contains("supported=mark,measure"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_observer_buffered() {
+    let stdout = run_ok(
+        "perf_hooks_observer_buffered.cjs",
+        r#"
+        const { performance, PerformanceObserver } = require('perf_hooks');
+
+        // Create marks before observer
+        performance.mark('pre1');
+        performance.mark('pre2');
+
+        const buffered = [];
+        const obs = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+                buffered.push(e.name);
+            }
+        });
+        // observe with buffered:true delivers existing entries
+        obs.observe({ type: 'mark', buffered: true });
+        console.log('buffered_count=' + buffered.length);
+        console.log('buffered_0=' + buffered[0]);
+        console.log('buffered_1=' + buffered[1]);
+
+        obs.disconnect();
+    "#,
+    );
+    assert!(stdout.contains("buffered_count=2"), "{stdout}");
+    assert!(stdout.contains("buffered_0=pre1"), "{stdout}");
+    assert!(stdout.contains("buffered_1=pre2"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_now_and_time_origin() {
+    let stdout = run_ok(
+        "perf_hooks_now.cjs",
+        r#"
+        const { performance } = require('perf_hooks');
+
+        // .now() returns a positive number
+        const t = performance.now();
+        console.log('now_positive=' + (t > 0));
+        console.log('now_is_number=' + (typeof t === 'number'));
+
+        // .timeOrigin is a positive number
+        console.log('origin_positive=' + (performance.timeOrigin > 0));
+
+        // toJSON returns expected shape
+        const j = performance.toJSON();
+        console.log('json_has_origin=' + ('timeOrigin' in j));
+        console.log('json_has_timing=' + ('nodeTiming' in j));
+
+        // eventLoopUtilization exists
+        const elu = performance.eventLoopUtilization();
+        console.log('elu_has_idle=' + ('idle' in elu));
+    "#,
+    );
+    assert!(stdout.contains("now_positive=true"), "{stdout}");
+    assert!(stdout.contains("now_is_number=true"), "{stdout}");
+    assert!(stdout.contains("origin_positive=true"), "{stdout}");
+    assert!(stdout.contains("json_has_origin=true"), "{stdout}");
+    assert!(stdout.contains("json_has_timing=true"), "{stdout}");
+    assert!(stdout.contains("elu_has_idle=true"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_measure_with_options_object() {
+    let stdout = run_ok(
+        "perf_hooks_measure_opts.cjs",
+        r#"
+        const { performance } = require('perf_hooks');
+
+        // measure with options object {start, end, detail}
+        performance.mark('s');
+        performance.mark('e');
+        performance.measure('opts_measure', { start: 's', end: 'e', detail: { key: 'val' } });
+
+        const m = performance.getEntriesByName('opts_measure')[0];
+        console.log('opts_name=' + m.name);
+        console.log('opts_type=' + m.entryType);
+        console.log('opts_dur_gte0=' + (m.duration >= 0));
+        console.log('opts_detail_key=' + m.detail.key);
+
+        // measure with numeric start/end
+        performance.measure('numeric', { start: 10, end: 50 });
+        const n = performance.getEntriesByName('numeric')[0];
+        console.log('numeric_start=' + n.startTime);
+        console.log('numeric_dur=' + n.duration);
+
+        // measure with explicit duration
+        performance.measure('explicit', { start: 5, duration: 100 });
+        const ex = performance.getEntriesByName('explicit')[0];
+        console.log('explicit_dur=' + ex.duration);
+    "#,
+    );
+    assert!(stdout.contains("opts_name=opts_measure"), "{stdout}");
+    assert!(stdout.contains("opts_type=measure"), "{stdout}");
+    assert!(stdout.contains("opts_dur_gte0=true"), "{stdout}");
+    assert!(stdout.contains("opts_detail_key=val"), "{stdout}");
+    assert!(stdout.contains("numeric_start=10"), "{stdout}");
+    assert!(stdout.contains("numeric_dur=40"), "{stdout}");
+    assert!(stdout.contains("explicit_dur=100"), "{stdout}");
+}
+
+#[test]
+fn worker_threads_share_env_symbol() {
+    let stdout = run_ok(
+        "worker_threads_share_env.cjs",
+        r#"
+        const wt = require('worker_threads');
+        console.log('type=' + typeof wt.SHARE_ENV);
+        console.log('is_symbol=' + (typeof wt.SHARE_ENV === 'symbol'));
+        console.log('desc=' + wt.SHARE_ENV.description);
+        // SHARE_ENV should not equal any other symbol
+        console.log('unique=' + (wt.SHARE_ENV !== Symbol('nodejs.worker_threads.SHARE_ENV')));
+    "#,
+    );
+    assert!(stdout.contains("type=symbol"), "{stdout}");
+    assert!(stdout.contains("is_symbol=true"), "{stdout}");
+    assert!(
+        stdout.contains("desc=nodejs.worker_threads.SHARE_ENV"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("unique=true"), "{stdout}");
+}
+
+#[test]
+fn worker_threads_env_data_round_trip() {
+    let stdout = run_ok(
+        "worker_threads_envdata.cjs",
+        r#"
+        const wt = require('worker_threads');
+
+        // Initially undefined
+        console.log('before=' + wt.getEnvironmentData('mykey'));
+
+        // Set a string
+        wt.setEnvironmentData('mykey', 'hello');
+        console.log('str=' + wt.getEnvironmentData('mykey'));
+
+        // Set an object -- should be cloned (not same reference)
+        const obj = { a: 1, b: [2, 3] };
+        wt.setEnvironmentData('objkey', obj);
+        const got = wt.getEnvironmentData('objkey');
+        console.log('obj_a=' + got.a);
+        console.log('obj_b=' + JSON.stringify(got.b));
+        console.log('cloned=' + (got !== obj));
+
+        // Mutating the returned clone does not affect stored value
+        got.a = 999;
+        const got2 = wt.getEnvironmentData('objkey');
+        console.log('immutable=' + (got2.a === 1));
+
+        // Delete by setting undefined
+        wt.setEnvironmentData('mykey', undefined);
+        console.log('deleted=' + (wt.getEnvironmentData('mykey') === undefined));
+
+        // Number key
+        wt.setEnvironmentData(42, 'numkey');
+        console.log('numkey=' + wt.getEnvironmentData(42));
+    "#,
+    );
+    assert!(stdout.contains("before=undefined"), "{stdout}");
+    assert!(stdout.contains("str=hello"), "{stdout}");
+    assert!(stdout.contains("obj_a=1"), "{stdout}");
+    assert!(stdout.contains("obj_b=[2,3]"), "{stdout}");
+    assert!(stdout.contains("cloned=true"), "{stdout}");
+    assert!(stdout.contains("immutable=true"), "{stdout}");
+    assert!(stdout.contains("deleted=true"), "{stdout}");
+    assert!(stdout.contains("numkey=numkey"), "{stdout}");
+}
+
+#[test]
+fn worker_threads_mark_as_untransferable() {
+    let stdout = run_ok(
+        "worker_threads_untransfer.cjs",
+        r#"
+        const wt = require('worker_threads');
+
+        // Should be a function
+        console.log('type=' + typeof wt.markAsUntransferable);
+
+        // Should accept objects without throwing
+        const buf = new ArrayBuffer(8);
+        wt.markAsUntransferable(buf);
+        console.log('marked_ok=true');
+
+        // Should throw on non-objects
+        let threw = false;
+        try { wt.markAsUntransferable(42); } catch(e) { threw = true; }
+        console.log('threw_on_number=' + threw);
+
+        threw = false;
+        try { wt.markAsUntransferable(null); } catch(e) { threw = true; }
+        console.log('threw_on_null=' + threw);
+
+        threw = false;
+        try { wt.markAsUntransferable('str'); } catch(e) { threw = true; }
+        console.log('threw_on_string=' + threw);
+    "#,
+    );
+    assert!(stdout.contains("type=function"), "{stdout}");
+    assert!(stdout.contains("marked_ok=true"), "{stdout}");
+    assert!(stdout.contains("threw_on_number=true"), "{stdout}");
+    assert!(stdout.contains("threw_on_null=true"), "{stdout}");
+    assert!(stdout.contains("threw_on_string=true"), "{stdout}");
+}
+
+#[test]
+fn worker_threads_exports_surface() {
+    let stdout = run_ok(
+        "worker_threads_surface.cjs",
+        r#"
+        const wt = require('worker_threads');
+
+        // Check all expected exports exist
+        console.log('isMainThread=' + wt.isMainThread);
+        console.log('has_threadId=' + (typeof wt.threadId === 'number'));
+        console.log('has_MessageChannel=' + (typeof wt.MessageChannel === 'function'));
+        console.log('has_MessagePort=' + (typeof wt.MessagePort === 'function'));
+        console.log('has_Worker=' + (typeof wt.Worker === 'function'));
+        console.log('has_SHARE_ENV=' + (typeof wt.SHARE_ENV === 'symbol'));
+        console.log('has_getEnvData=' + (typeof wt.getEnvironmentData === 'function'));
+        console.log('has_setEnvData=' + (typeof wt.setEnvironmentData === 'function'));
+        console.log('has_markUntransfer=' + (typeof wt.markAsUntransferable === 'function'));
+        console.log('has_receiveOnPort=' + (typeof wt.receiveMessageOnPort === 'function'));
+        console.log('has_resourceLimits=' + (typeof wt.resourceLimits === 'object'));
+    "#,
+    );
+    assert!(stdout.contains("isMainThread=true"), "{stdout}");
+    assert!(stdout.contains("has_threadId=true"), "{stdout}");
+    assert!(stdout.contains("has_MessageChannel=true"), "{stdout}");
+    assert!(stdout.contains("has_MessagePort=true"), "{stdout}");
+    assert!(stdout.contains("has_Worker=true"), "{stdout}");
+    assert!(stdout.contains("has_SHARE_ENV=true"), "{stdout}");
+    assert!(stdout.contains("has_getEnvData=true"), "{stdout}");
+    assert!(stdout.contains("has_setEnvData=true"), "{stdout}");
+    assert!(stdout.contains("has_markUntransfer=true"), "{stdout}");
+    assert!(stdout.contains("has_receiveOnPort=true"), "{stdout}");
+    assert!(stdout.contains("has_resourceLimits=true"), "{stdout}");
+}
+
+#[test]
+fn worker_threads_message_channel() {
+    let stdout = run_ok(
+        "worker_threads_msgchan.cjs",
+        r#"
+        const wt = require('worker_threads');
+        const { MessageChannel } = wt;
+        const ch = new MessageChannel();
+
+        let received = null;
+        ch.port2.on('message', (msg) => {
+            received = msg;
+            console.log('received=' + JSON.stringify(msg));
+        });
+        ch.port1.postMessage({ hello: 'world' });
+
+        // Message is delivered via queueMicrotask, so wait a tick
+        queueMicrotask(() => {
+            console.log('got_msg=' + (received !== null));
+            ch.port1.close();
+            ch.port2.close();
+        });
+    "#,
+    );
+    assert!(stdout.contains(r#"received={"hello":"world"}"#), "{stdout}");
+    assert!(stdout.contains("got_msg=true"), "{stdout}");
 }

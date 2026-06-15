@@ -7986,29 +7986,80 @@
   // lookup to call time so requiring perf_hooks before installRuntimeGlobals
   // still works (performance will be live when methods are invoked).
   registry.factories.perf_hooks = () => {
-    class PerformanceObserver {
-      constructor(cb) { this._cb = cb; this._types = []; }
-      observe(options) { this._types = (options && options.entryTypes) || []; }
-      disconnect() { this._types = []; }
-    }
-    PerformanceObserver.supportedEntryTypes = Object.freeze(["measure", "mark"]);
+    const _marks = [];
+    const _measures = [];
+    const _observers = [];
+
     class PerformanceEntry {
-      constructor(name, entryType, startTime, duration) {
+      constructor(name, entryType, startTime, duration, detail) {
         this.name = name || "";
         this.entryType = entryType || "";
         this.startTime = startTime || 0;
         this.duration = duration || 0;
+        this.detail = detail !== undefined ? detail : null;
       }
       toJSON() {
-        return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+        return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration, detail: this.detail };
       }
     }
+
     class PerformanceObserverEntryList {
-      constructor() { this._entries = []; }
+      constructor(entries) { this._entries = entries || []; }
       getEntries() { return this._entries.slice(); }
-      getEntriesByName(name) { return this._entries.filter(function(e) { return e.name === name; }); }
+      getEntriesByName(name, type) {
+        return this._entries.filter(function(e) {
+          return e.name === name && (type === undefined || e.entryType === type);
+        });
+      }
       getEntriesByType(type) { return this._entries.filter(function(e) { return e.entryType === type; }); }
     }
+
+    function _notifyObservers(entry) {
+      for (var i = 0; i < _observers.length; i++) {
+        var obs = _observers[i];
+        if (obs._types && obs._types.indexOf(entry.entryType) !== -1) {
+          try {
+            obs._cb(new PerformanceObserverEntryList([entry]), obs);
+          } catch (e) { /* observer callback errors are swallowed per spec */ }
+        }
+      }
+    }
+
+    class PerformanceObserver {
+      constructor(cb) { this._cb = cb; this._types = []; }
+      observe(options) {
+        if (options && options.entryTypes) {
+          this._types = options.entryTypes.slice();
+        } else if (options && options.type) {
+          if (this._types.indexOf(options.type) === -1) {
+            this._types.push(options.type);
+          }
+          if (options.buffered) {
+            var existing = [];
+            var t = options.type;
+            if (t === "mark") {
+              for (var i = 0; i < _marks.length; i++) existing.push(_marks[i]);
+            } else if (t === "measure") {
+              for (var i = 0; i < _measures.length; i++) existing.push(_measures[i]);
+            }
+            if (existing.length > 0) {
+              var self = this;
+              try { self._cb(new PerformanceObserverEntryList(existing), self); } catch (e) {}
+            }
+          }
+        }
+        if (_observers.indexOf(this) === -1) {
+          _observers.push(this);
+        }
+      }
+      disconnect() {
+        this._types = [];
+        var idx = _observers.indexOf(this);
+        if (idx !== -1) _observers.splice(idx, 1);
+      }
+    }
+    PerformanceObserver.supportedEntryTypes = Object.freeze(["mark", "measure"]);
+
     class PerformanceNodeTiming extends PerformanceEntry {
       constructor() {
         super("node", "node", 0, 0);
@@ -8022,13 +8073,123 @@
       }
     }
 
+    function _findMark(name) {
+      for (var i = _marks.length - 1; i >= 0; i--) {
+        if (_marks[i].name === name) return _marks[i];
+      }
+      return null;
+    }
+
+    var _nodeTiming = new PerformanceNodeTiming();
+
+    var perf = {
+      now: function() { return globalThis.performance.now(); },
+      get timeOrigin() { return globalThis.performance.timeOrigin; },
+
+      mark: function(name, options) {
+        var startTime = (options && options.startTime !== undefined) ? options.startTime : globalThis.performance.now();
+        var detail = (options && options.detail !== undefined) ? options.detail : null;
+        var entry = new PerformanceEntry(name, "mark", startTime, 0, detail);
+        _marks.push(entry);
+        _notifyObservers(entry);
+        return entry;
+      },
+
+      measure: function(name, startMarkOrOptions, endMark) {
+        var startTime = 0;
+        var endTime = globalThis.performance.now();
+        var detail = null;
+        var duration;
+
+        if (typeof startMarkOrOptions === "string") {
+          var sm = _findMark(startMarkOrOptions);
+          if (sm) startTime = sm.startTime;
+          if (typeof endMark === "string") {
+            var em = _findMark(endMark);
+            if (em) endTime = em.startTime;
+          }
+          duration = endTime - startTime;
+        } else if (startMarkOrOptions && typeof startMarkOrOptions === "object") {
+          var opts = startMarkOrOptions;
+          detail = opts.detail !== undefined ? opts.detail : null;
+          if (opts.start !== undefined) {
+            if (typeof opts.start === "string") {
+              var smk = _findMark(opts.start);
+              startTime = smk ? smk.startTime : 0;
+            } else {
+              startTime = opts.start;
+            }
+          }
+          if (opts.end !== undefined) {
+            if (typeof opts.end === "string") {
+              var emk = _findMark(opts.end);
+              endTime = emk ? emk.startTime : globalThis.performance.now();
+            } else {
+              endTime = opts.end;
+            }
+          }
+          if (opts.duration !== undefined) {
+            duration = opts.duration;
+          } else {
+            duration = endTime - startTime;
+          }
+        } else {
+          duration = endTime - startTime;
+        }
+
+        var entry = new PerformanceEntry(name, "measure", startTime, duration, detail);
+        _measures.push(entry);
+        _notifyObservers(entry);
+        return entry;
+      },
+
+      getEntries: function() { return _marks.concat(_measures); },
+      getEntriesByName: function(name, type) {
+        return _marks.concat(_measures).filter(function(e) {
+          return e.name === name && (type === undefined || e.entryType === type);
+        });
+      },
+      getEntriesByType: function(type) {
+        if (type === "mark") return _marks.slice();
+        if (type === "measure") return _measures.slice();
+        return [];
+      },
+
+      clearMarks: function(name) {
+        if (name !== undefined) {
+          for (var i = _marks.length - 1; i >= 0; i--) {
+            if (_marks[i].name === name) _marks.splice(i, 1);
+          }
+        } else {
+          _marks.length = 0;
+        }
+      },
+      clearMeasures: function(name) {
+        if (name !== undefined) {
+          for (var i = _measures.length - 1; i >= 0; i--) {
+            if (_measures[i].name === name) _measures.splice(i, 1);
+          }
+        } else {
+          _measures.length = 0;
+        }
+      },
+
+      toJSON: function() {
+        return { timeOrigin: globalThis.performance.timeOrigin, nodeTiming: {} };
+      },
+
+      eventLoopUtilization: function() {
+        return { idle: 0, active: 0, utilization: 0 };
+      }
+    };
+
     return {
-      get performance() { return globalThis.performance; },
+      performance: perf,
       PerformanceObserver,
       PerformanceEntry,
       PerformanceObserverEntryList,
       PerformanceNodeTiming,
-      nodeTiming: new PerformanceNodeTiming(),
+      nodeTiming: _nodeTiming,
       createHistogram: () => ({
         record: () => {},
         percentile: () => 0,
@@ -8121,21 +8282,34 @@
     class Interface extends EventEmitter {
       constructor(options) {
         super();
-        this.input = (options && options.input) || null;
-        this.output = (options && options.output) || null;
-        this.terminal = options && options.terminal === true;
+        const opts = options || {};
+        this.input = opts.input || null;
+        this.output = opts.output || null;
+        this.terminal = opts.terminal === true;
         this._closed = false;
+        this._paused = false;
+        this._prompt = typeof opts.prompt === "string" ? opts.prompt : "> ";
+        this.crlfDelay = typeof opts.crlfDelay === "number" ? opts.crlfDelay : 100;
+        this.line = "";
         if (this.input && typeof this.input.on === "function") {
           const dec = new TextDecoder();
           let buf = "";
           this.input.on("data", (chunk) => {
+            if (this._closed) return;
             buf += typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true });
             const parts = buf.split(/\r?\n/);
             buf = parts.pop() || "";
-            for (const line of parts) this.emit("line", line);
+            for (const line of parts) {
+              this.line = line;
+              this.emit("line", line);
+            }
           });
           this.input.on("end", () => {
-            if (buf.length) { this.emit("line", buf); buf = ""; }
+            if (buf.length) {
+              this.line = buf;
+              this.emit("line", buf);
+              buf = "";
+            }
             this.close();
           });
         }
@@ -8143,6 +8317,9 @@
       close() {
         if (this._closed) return;
         this._closed = true;
+        if (this.input && typeof this.input.pause === "function") {
+          try { this.input.pause(); } catch (_e) { /* ignore */ }
+        }
         this.emit("close");
       }
       question(prompt, cb) {
@@ -8150,11 +8327,39 @@
         const onLine = (line) => { this.removeListener("line", onLine); cb(line); };
         this.once("line", onLine);
       }
-      setPrompt() {}
-      prompt() {}
-      write() {}
-      pause() { return this; }
-      resume() { return this; }
+      setPrompt(prompt) {
+        this._prompt = typeof prompt === "string" ? prompt : "> ";
+      }
+      prompt(preserveCursor) {
+        if (this.output && typeof this.output.write === "function") {
+          this.output.write(this._prompt);
+        }
+      }
+      write(data, key) {
+        if (this.output && typeof this.output.write === "function" && data != null) {
+          this.output.write(typeof data === "string" ? data : String(data));
+        }
+      }
+      pause() {
+        if (!this._paused) {
+          this._paused = true;
+          if (this.input && typeof this.input.pause === "function") {
+            this.input.pause();
+          }
+          this.emit("pause");
+        }
+        return this;
+      }
+      resume() {
+        if (this._paused) {
+          this._paused = false;
+          if (this.input && typeof this.input.resume === "function") {
+            this.input.resume();
+          }
+          this.emit("resume");
+        }
+        return this;
+      }
       [Symbol.asyncIterator]() {
         const self = this;
         const queue = [];
@@ -8183,13 +8388,55 @@
       }
       return new Interface(options || {});
     }
-    function clearLine(stream, dir, cb) { if (typeof cb === "function") queueMicrotask(cb); }
-    function clearScreenDown(stream, cb) { if (typeof cb === "function") queueMicrotask(cb); }
-    function cursorTo(stream, x, y, cb) {
-      if (typeof y === "function") { cb = y; }
+    function clearLine(stream, dir, cb) {
+      if (!stream || typeof stream.write !== "function") {
+        if (typeof cb === "function") queueMicrotask(cb);
+        return false;
+      }
+      if (dir === -1) {
+        stream.write("\x1b[1K");
+      } else if (dir === 1) {
+        stream.write("\x1b[0K");
+      } else {
+        stream.write("\x1b[2K");
+      }
+      if (typeof cb === "function") queueMicrotask(cb);
+      return true;
+    }
+    function clearScreenDown(stream, cb) {
+      if (stream && typeof stream.write === "function") {
+        stream.write("\x1b[0J");
+      }
       if (typeof cb === "function") queueMicrotask(cb);
     }
-    function moveCursor(stream, dx, dy, cb) { if (typeof cb === "function") queueMicrotask(cb); }
+    function cursorTo(stream, x, y, cb) {
+      if (typeof y === "function") { cb = y; y = undefined; }
+      if (stream && typeof stream.write === "function") {
+        if (typeof x === "number") {
+          if (typeof y === "number") {
+            stream.write("\x1b[" + (y + 1) + ";" + (x + 1) + "H");
+          } else {
+            stream.write("\x1b[" + (x + 1) + "G");
+          }
+        }
+      }
+      if (typeof cb === "function") queueMicrotask(cb);
+      return true;
+    }
+    function moveCursor(stream, dx, dy, cb) {
+      if (stream && typeof stream.write === "function") {
+        if (dx !== 0 && typeof dx === "number") {
+          if (dx > 0) stream.write("\x1b[" + dx + "C");
+          else stream.write("\x1b[" + (-dx) + "D");
+        }
+        if (dy !== 0 && typeof dy === "number") {
+          if (dy > 0) stream.write("\x1b[" + dy + "B");
+          else stream.write("\x1b[" + (-dy) + "A");
+        }
+      }
+      if (typeof cb === "function") queueMicrotask(cb);
+      return true;
+    }
     function emitKeypressEvents() {}
     return {
       Interface, createInterface,
@@ -8239,18 +8486,38 @@
   };
 
   // ----------------------------------------------------------------------- vm
-  // vm module stub: Script.runInThisContext / runInNewContext cover the
-  // most-used APIs (module bundlers, Jest, etc.).
+  // vm module: Script.runInThisContext / runInNewContext / runInContext,
+  // createContext with WeakSet tracking, expression-first compilation.
+  // NOTE: this uses the with(this){...} pattern for sandboxing, which is
+  // NOT true V8 context isolation -- it shares the same global heap.
+  // Sufficient for template engines, config eval, and most bundler use.
   registry.factories.vm = () => {
+    const _vmContexts = new WeakSet();
+
     class Script {
-      constructor(code, _options) {
+      constructor(code, options) {
         this._code = String(code);
+        const opts = options != null && typeof options === "object" ? options : {};
+        if (typeof options === "string") {
+          this._filename = options;
+        } else {
+          this._filename = opts.filename || "evalmachine.<anonymous>";
+        }
+        this._lineOffset = Number(opts.lineOffset) || 0;
+        this._columnOffset = Number(opts.columnOffset) || 0;
         this._fn = null;
       }
       _compile() {
-        if (!this._fn) {
+        if (this._fn) return this._fn;
+        const code = this._code;
+        // Try expression form first so that 'x + 1' works without explicit
+        // return.  Fall back to statement form on SyntaxError.
+        try {
           // eslint-disable-next-line no-new-func
-          this._fn = new Function(`with(this){${this._code}}`);
+          this._fn = new Function(`with(this){return(${code})}`);
+        } catch (_e) {
+          // eslint-disable-next-line no-new-func
+          this._fn = new Function(`with(this){${code}}`);
         }
         return this._fn;
       }
@@ -8261,35 +8528,62 @@
         return this._compile().call(ctx != null ? ctx : globalThis);
       }
       runInNewContext(sandbox, _options) {
-        const ctx = Object.assign(Object.create(null), sandbox);
+        const ctx = createContext(sandbox || {});
         return this._compile().call(ctx);
       }
       createCachedData() { return new Uint8Array(0); }
     }
+
     function createContext(sandbox, _options) {
-      return Object.assign(Object.create(null), sandbox || {});
+      const obj = sandbox != null && typeof sandbox === "object"
+        ? sandbox
+        : Object.create(null);
+      if (!_vmContexts.has(obj)) {
+        _vmContexts.add(obj);
+        // Tag the context unless the caller already set Symbol.toStringTag.
+        const desc = Object.getOwnPropertyDescriptor(obj, Symbol.toStringTag);
+        if (!desc) {
+          Object.defineProperty(obj, Symbol.toStringTag, {
+            value: "Context",
+            writable: false,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+      }
+      return obj;
     }
+
     function isContext(value) {
-      return value !== null && typeof value === "object";
+      return value !== null && typeof value === "object" && _vmContexts.has(value);
     }
+
     function runInThisContext(code, _options) {
-      return new Script(code).runInThisContext();
+      return new Script(code, _options).runInThisContext();
     }
     function runInNewContext(code, sandbox, _options) {
-      return new Script(code).runInNewContext(sandbox);
+      return new Script(code, _options).runInNewContext(sandbox);
     }
     function runInContext(code, ctx, _options) {
-      return new Script(code).runInContext(ctx);
+      return new Script(code, _options).runInContext(ctx);
     }
-    function compileFunction(code, params, _options) {
+    function compileFunction(code, params, options) {
+      const p = params || [];
+      const opts = options != null && typeof options === "object" ? options : {};
       // eslint-disable-next-line no-new-func
-      return new Function(...(params || []), code);
+      const fn = new Function(...p, code);
+      if (opts.filename) fn._filename = opts.filename;
+      return fn;
     }
     function measureMemory() {
       return Promise.resolve({ total: { jsMemoryEstimate: 0 } });
     }
+    function createScript(code, options) {
+      return new Script(code, options);
+    }
+
     return {
-      Script, createContext, isContext,
+      Script, createContext, isContext, createScript,
       runInThisContext, runInNewContext, runInContext,
       compileFunction, measureMemory,
     };
@@ -9442,9 +9736,22 @@
 
   // --------------------------------------------------------- worker_threads
   // MessageChannel / MessagePort are fully functional (in-process). Worker
-  // class throws on construction (thread spawn needs native ops).
+  // class has native-backed thread spawning via workerNew/workerRecvMessage/
+  // workerPostMessage/workerTerminate ops.
   registry.factories.worker_threads = () => {
     const EventEmitter = registry.get("events");
+
+    // SHARE_ENV sentinel -- when passed as opts.env, workers share the
+    // process environment (which they do by default in oam anyway).
+    const SHARE_ENV = Symbol("nodejs.worker_threads.SHARE_ENV");
+
+    // Module-level environment data store shared across threads in-process.
+    const _envData = new Map();
+
+    // WeakSet for markAsUntransferable -- marks objects so transfer attempts
+    // can check (actual enforcement is future; the mark is the contract).
+    const _untransferableSet = new WeakSet();
+
     class MessagePort extends EventEmitter {
       constructor() { super(); this._twin = null; this._active = true; }
       postMessage(data) {
@@ -9474,10 +9781,24 @@
         if (typeof filename !== "string") throw new TypeError("Worker requires a filename");
         const resolved = pathMod.resolve(filename);
         const wd = opts.workerData !== undefined ? JSON.stringify(opts.workerData) : null;
+
+        // Store worker name (Node >=12.11 option)
+        this.name = opts.name || "";
+
+        // Note SHARE_ENV usage (workers share process env by default in oam)
+        this._shareEnv = opts.env === SHARE_ENV;
+
         const result = natives.workerNew(resolved, wd);
         this._workerId = result.workerId;
         this.threadId = result.threadId;
+
+        // Expose performance reference (mirrors Node behavior)
+        this.performance = globalThis.performance;
+
         this._recvLoop();
+
+        // Emit 'online' asynchronously after construction, matching Node
+        queueMicrotask(() => this.emit("online"));
       }
       async _recvLoop() {
         while (true) {
@@ -9507,6 +9828,34 @@
       }
       ref() { return this; }
       unref() { return this; }
+      getHeapSnapshot() { return Promise.resolve(new Uint8Array(0)); }
+    }
+
+    // Symbol.dispose support for the 'using' keyword
+    if (typeof Symbol.dispose !== "undefined") {
+      Worker.prototype[Symbol.dispose] = function() { this.terminate(); };
+    }
+
+    function getEnvironmentData(key) {
+      const val = _envData.get(key);
+      if (val === undefined) return undefined;
+      // Return a clone via JSON round-trip
+      return JSON.parse(JSON.stringify(val));
+    }
+
+    function setEnvironmentData(key, value) {
+      if (value === undefined) {
+        _envData.delete(key);
+      } else {
+        _envData.set(key, value);
+      }
+    }
+
+    function markAsUntransferable(obj) {
+      if (typeof obj !== "object" || obj === null) {
+        throw new TypeError("markAsUntransferable expects an object");
+      }
+      _untransferableSet.add(obj);
     }
 
     const isMain = natives.workerIsMainThread();
@@ -9540,15 +9889,16 @@
       workerData,
       threadId,
       resourceLimits: {},
+      SHARE_ENV,
       MessageChannel,
       MessagePort,
       Worker,
       BroadcastChannel: _bc || class BroadcastChannel { constructor() { throw new Error("BroadcastChannel not available"); } },
       receiveMessageOnPort: () => undefined,
-      markAsUntransferable: () => {},
+      markAsUntransferable,
       moveMessagePortToContext: () => { throw new Error("moveMessagePortToContext is not supported in oam"); },
-      getEnvironmentData: () => undefined,
-      setEnvironmentData: () => {},
+      getEnvironmentData,
+      setEnvironmentData,
     };
   };
 
