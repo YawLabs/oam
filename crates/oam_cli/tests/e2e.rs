@@ -7264,3 +7264,105 @@ console.log('sb_len=' + sb.length);
         );
     }
 }
+
+#[test]
+fn util_is_family_stream_isdisturbed_http_globalagent() {
+    let file = write_temp(
+        "misc_m3d.mjs",
+        r#"
+import util from 'node:util';
+import stream from 'node:stream';
+import http from 'node:http';
+
+// -- util.is* deprecated family --
+console.log('isRegExp=' + util.isRegExp(/test/));
+console.log('isRegExp_f=' + util.isRegExp('nope'));
+console.log('isDate=' + util.isDate(new Date()));
+console.log('isDate_f=' + util.isDate(42));
+console.log('isError=' + util.isError(new TypeError('x')));
+console.log('isError_f=' + util.isError('x'));
+console.log('isPrim_null=' + util.isPrimitive(null));
+console.log('isPrim_str=' + util.isPrimitive('x'));
+console.log('isPrim_num=' + util.isPrimitive(0));
+console.log('isPrim_obj=' + util.isPrimitive({}));
+console.log('isBuffer=' + util.isBuffer(Buffer.from('x')));
+console.log('isBuffer_f=' + util.isBuffer(new Uint8Array(1)));
+console.log('isFunction=' + util.isFunction(() => {}));
+console.log('isFunction_f=' + util.isFunction(42));
+console.log('isObject=' + util.isObject({}));
+console.log('isObject_null=' + util.isObject(null));
+console.log('isNullOrUndef_n=' + util.isNullOrUndefined(null));
+console.log('isNullOrUndef_u=' + util.isNullOrUndefined(undefined));
+console.log('isNullOrUndef_f=' + util.isNullOrUndefined(0));
+console.log('isString=' + util.isString('hello'));
+console.log('isNumber=' + util.isNumber(3.14));
+console.log('isBoolean=' + util.isBoolean(false));
+console.log('isNull=' + util.isNull(null));
+console.log('isNull_undef=' + util.isNull(undefined));
+console.log('isUndefined=' + util.isUndefined(undefined));
+console.log('isSymbol=' + util.isSymbol(Symbol('x')));
+
+// -- util.log --
+console.log('log_type=' + typeof util.log);
+
+// -- stream.isDisturbed --
+console.log('isDisturbed_type=' + typeof stream.isDisturbed);
+const r = new stream.Readable({ read() {} });
+console.log('isDisturbed_fresh=' + stream.isDisturbed(r));
+
+// -- http.globalAgent --
+console.log('globalAgent_type=' + typeof http.globalAgent);
+console.log('maxSockets=' + http.globalAgent.maxSockets);
+console.log('keepAlive=' + http.globalAgent.keepAlive);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3d failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "isRegExp=true",
+        "isRegExp_f=false",
+        "isDate=true",
+        "isDate_f=false",
+        "isError=true",
+        "isError_f=false",
+        "isPrim_null=true",
+        "isPrim_str=true",
+        "isPrim_num=true",
+        "isPrim_obj=false",
+        "isBuffer=true",
+        "isBuffer_f=false",
+        "isFunction=true",
+        "isFunction_f=false",
+        "isObject=true",
+        "isObject_null=false",
+        "isNullOrUndef_n=true",
+        "isNullOrUndef_u=true",
+        "isNullOrUndef_f=false",
+        "isString=true",
+        "isNumber=true",
+        "isBoolean=true",
+        "isNull=true",
+        "isNull_undef=false",
+        "isUndefined=true",
+        "isSymbol=true",
+        "log_type=function",
+        "isDisturbed_type=function",
+        "isDisturbed_fresh=false",
+        "globalAgent_type=object",
+        "maxSockets=Infinity",
+        "keepAlive=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

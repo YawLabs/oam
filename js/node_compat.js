@@ -2075,6 +2075,25 @@
         if (!pair) return String(text);
         return ESC + "[" + pair[0] + "m" + String(text) + ESC + "[" + pair[1] + "m";
       },
+      log: function utilLog() {
+        var d = new Date();
+        var ts = d.getUTCDate() + " " + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()] + " " + ("0" + d.getUTCHours()).slice(-2) + ":" + ("0" + d.getUTCMinutes()).slice(-2) + ":" + ("0" + d.getUTCSeconds()).slice(-2);
+        console.log(ts + " - " + Array.prototype.join.call(arguments, " "));
+      },
+      isRegExp: (v) => v instanceof RegExp,
+      isDate: (v) => v instanceof Date,
+      isError: (v) => v instanceof Error,
+      isPrimitive: (v) => v === null || (typeof v !== "object" && typeof v !== "function"),
+      isBuffer: (v) => globalThis.Buffer.isBuffer(v),
+      isFunction: (v) => typeof v === "function",
+      isObject: (v) => typeof v === "object" && v !== null,
+      isNullOrUndefined: (v) => v === null || v === undefined,
+      isString: (v) => typeof v === "string",
+      isNumber: (v) => typeof v === "number",
+      isBoolean: (v) => typeof v === "boolean",
+      isNull: (v) => v === null,
+      isUndefined: (v) => v === undefined,
+      isSymbol: (v) => typeof v === "symbol",
       types: {
         isDate: (v) => v instanceof Date,
         isRegExp: (v) => v instanceof RegExp,
@@ -4270,6 +4289,7 @@
       },
       isErrored: (s) => Boolean(s._rState?.errored),
       isReadable: (s) => Boolean(s._rState && !s._rState.destroyed && !s._rState.endEmitted),
+      isDisturbed: (s) => Boolean(s._rState?.reading || s._rState?.ended || s._rState?.endEmitted),
       getDefaultHighWaterMark: (objectMode) => objectMode ? 16 : 16384,
       setDefaultHighWaterMark: (objectMode, value) => {
         if (typeof value !== "number" || value < 0 || Number.isNaN(value)) {
@@ -6523,6 +6543,7 @@
       ClientRequest,
       request,
       get,
+      globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
       METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
       STATUS_CODES: {
         200: "OK",
