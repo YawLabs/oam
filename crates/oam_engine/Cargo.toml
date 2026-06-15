@@ -41,6 +41,8 @@ rand_core = { workspace = true }
 # node:crypto wave 5: ECDH key agreement.
 p256 = { workspace = true }
 p384 = { workspace = true }
+# node:crypto wave 6: classic Diffie-Hellman.
+num-bigint-dig = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.

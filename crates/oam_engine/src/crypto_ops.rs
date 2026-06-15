@@ -1669,3 +1669,110 @@ pub(crate) fn op_crypto_ecdh_get_public_key(
         Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
     }
 }
+
+// ── Wave 6: classic Diffie-Hellman ──────────────────────────────────
+
+use num_bigint_dig::BigUint;
+
+fn pad_be(bytes: Vec<u8>, target_len: usize) -> Vec<u8> {
+    if bytes.len() >= target_len {
+        return bytes;
+    }
+    let mut padded = vec![0u8; target_len - bytes.len()];
+    padded.extend_from_slice(&bytes);
+    padded
+}
+
+fn crypto_dh_generate_keys(
+    prime: &[u8],
+    generator: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use rand_core::RngCore;
+    let p = BigUint::from_bytes_be(prime);
+    let g = BigUint::from_bytes_be(generator);
+    if p <= BigUint::from(2u32) {
+        return Err("DH prime too small".into());
+    }
+    let p_minus_2 = &p - BigUint::from(2u32);
+    let mut rand_bytes = vec![0u8; prime.len()];
+    OsRng.fill_bytes(&mut rand_bytes);
+    let priv_val = BigUint::from_bytes_be(&rand_bytes) % &p_minus_2 + BigUint::from(2u32);
+    let pub_val = g.modpow(&priv_val, &p);
+    let p_len = prime.len();
+    Ok((
+        pad_be(pub_val.to_bytes_be(), p_len),
+        pad_be(priv_val.to_bytes_be(), p_len),
+    ))
+}
+
+fn crypto_dh_compute_secret(
+    prime: &[u8],
+    private_key: &[u8],
+    other_public_key: &[u8],
+) -> Result<Vec<u8>, String> {
+    let p = BigUint::from_bytes_be(prime);
+    let priv_val = BigUint::from_bytes_be(private_key);
+    let other_pub = BigUint::from_bytes_be(other_public_key);
+    if other_pub >= p || other_pub <= BigUint::from(1u32) {
+        return Err("DH: invalid peer public key".into());
+    }
+    let secret = other_pub.modpow(&priv_val, &p);
+    Ok(pad_be(secret.to_bytes_be(), prime.len()))
+}
+
+pub(crate) fn op_crypto_dh_generate_keys(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(prime) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "DH generateKeys: prime required");
+        return;
+    };
+    let Some(generator) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "DH generateKeys: generator required");
+        return;
+    };
+    match crypto_dh_generate_keys(&prime, &generator) {
+        Ok((pub_bytes, priv_bytes)) => {
+            let obj = v8::Object::new(scope);
+            if let Some(pub_arr) = crate::node_ops::bytes_to_uint8array(scope, pub_bytes) {
+                let key = v8::String::new(scope, "publicKey").unwrap();
+                obj.set(scope, key.into(), pub_arr);
+            }
+            if let Some(priv_arr) = crate::node_ops::bytes_to_uint8array(scope, priv_bytes) {
+                let key = v8::String::new(scope, "privateKey").unwrap();
+                obj.set(scope, key.into(), priv_arr);
+            }
+            rv.set(obj.into());
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_dh_compute_secret(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(prime) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "DH computeSecret: prime required");
+        return;
+    };
+    let Some(private_key) = crate::node_ops::arg_bytes(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "DH computeSecret: private key required");
+        return;
+    };
+    let Some(other_pub) = crate::node_ops::arg_bytes(scope, &args, 2) else {
+        crate::node_ops::throw_type_error(scope, "DH computeSecret: peer public key required");
+        return;
+    };
+    match crypto_dh_compute_secret(&prime, &private_key, &other_pub) {
+        Ok(secret) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, secret) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}

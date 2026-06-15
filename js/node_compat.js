@@ -6077,6 +6077,107 @@
       return BufferCtor.from(natives.cryptoPrivateDecrypt(new Uint8Array(data), key, paddingName, oaepHash));
     }
 
+
+    // ---- Diffie-Hellman (classic, non-EC) ----
+    var DH_GROUPS = {
+      modp1: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6BFFFFFFFFFFFFFFFF",
+      modp2: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF",
+      modp5: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
+      modp14: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF",
+    };
+
+    class DiffieHellman {
+      constructor(prime, generator) {
+        if (typeof prime === "number") {
+          throw new Error("DH prime generation by bit length not yet supported in oam");
+        }
+        this._prime = BufferCtor.isBuffer(prime) ? prime : BufferCtor.from(prime);
+        if (!generator) generator = BufferCtor.from([2]);
+        else if (typeof generator === "number") generator = BufferCtor.from([generator]);
+        else if (!BufferCtor.isBuffer(generator)) generator = BufferCtor.from(generator);
+        this._generator = generator;
+        this._publicKey = null;
+        this._privateKey = null;
+      }
+      generateKeys(encoding) {
+        var result = natives.cryptoDhGenerateKeys(
+          new Uint8Array(this._prime),
+          new Uint8Array(this._generator)
+        );
+        this._publicKey = BufferCtor.from(result.publicKey);
+        this._privateKey = BufferCtor.from(result.privateKey);
+        return this.getPublicKey(encoding);
+      }
+      computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
+        if (!this._privateKey) throw new Error("DH: keys have not been generated");
+        var otherKey = typeof otherPublicKey === "string"
+          ? BufferCtor.from(otherPublicKey, inputEncoding || "hex")
+          : BufferCtor.from(otherPublicKey);
+        var secret = natives.cryptoDhComputeSecret(
+          new Uint8Array(this._prime),
+          new Uint8Array(this._privateKey),
+          new Uint8Array(otherKey)
+        );
+        var buf = BufferCtor.from(secret);
+        return outputEncoding ? buf.toString(outputEncoding) : buf;
+      }
+      getPrime(encoding) {
+        var buf = BufferCtor.from(this._prime);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      getGenerator(encoding) {
+        var buf = BufferCtor.from(this._generator);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      getPublicKey(encoding) {
+        if (!this._publicKey) throw new Error("DH: keys have not been generated");
+        var buf = BufferCtor.from(this._publicKey);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      getPrivateKey(encoding) {
+        if (!this._privateKey) throw new Error("DH: keys have not been generated");
+        var buf = BufferCtor.from(this._privateKey);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+      setPublicKey(key, encoding) {
+        this._publicKey = typeof key === "string"
+          ? BufferCtor.from(key, encoding || "hex")
+          : BufferCtor.from(key);
+      }
+      setPrivateKey(key, encoding) {
+        this._privateKey = typeof key === "string"
+          ? BufferCtor.from(key, encoding || "hex")
+          : BufferCtor.from(key);
+      }
+      get verifyError() { return 0; }
+    }
+
+    function createDiffieHellman(primeOrLen, primeEncoding, generator, generatorEncoding) {
+      if (typeof primeOrLen === "number") {
+        throw new Error("DH prime generation by bit length not yet supported in oam");
+      }
+      var prime = typeof primeOrLen === "string"
+        ? BufferCtor.from(primeOrLen, primeEncoding || "hex")
+        : BufferCtor.from(primeOrLen);
+      var gen;
+      if (generator === undefined || generator === null) {
+        gen = BufferCtor.from([2]);
+      } else if (typeof generator === "number") {
+        gen = BufferCtor.from([generator]);
+      } else if (typeof generator === "string") {
+        gen = BufferCtor.from(generator, generatorEncoding || "hex");
+      } else {
+        gen = BufferCtor.from(generator);
+      }
+      return new DiffieHellman(prime, gen);
+    }
+
+    function getDiffieHellman(groupName) {
+      var hex = DH_GROUPS[groupName.toLowerCase()];
+      if (!hex) throw new Error("Unknown DH group: " + groupName);
+      return new DiffieHellman(BufferCtor.from(hex, "hex"), BufferCtor.from([2]));
+    }
+
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
     class Certificate {
@@ -6181,6 +6282,9 @@
       ECDH,
       publicEncrypt,
       privateDecrypt,
+      createDiffieHellman,
+      getDiffieHellman,
+      DiffieHellman,
       createSign,
       createVerify,
       sign: signOneShot,

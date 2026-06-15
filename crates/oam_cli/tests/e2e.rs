@@ -8231,3 +8231,92 @@ console.log("der_is_buffer=" + Buffer.isBuffer(pubDer));
         );
     }
 }
+
+#[test]
+fn crypto_diffie_hellman_key_exchange() {
+    let file = write_temp(
+        "test_crypto_dh.mjs",
+        r#"
+import crypto from "crypto";
+
+// Test 1: getDiffieHellman with modp14 (2048-bit, most common)
+const alice = crypto.getDiffieHellman("modp14");
+const bob = crypto.getDiffieHellman("modp14");
+
+alice.generateKeys();
+bob.generateKeys();
+
+const alicePrime = alice.getPrime("hex");
+const bobPrime = bob.getPrime("hex");
+console.log("primes_match=" + (alicePrime === bobPrime));
+console.log("prime_len=" + alicePrime.length);
+
+const alicePub = alice.getPublicKey();
+const bobPub = bob.getPublicKey();
+console.log("alice_pub_len=" + alicePub.length);
+console.log("bob_pub_len=" + bobPub.length);
+
+const aliceSecret = alice.computeSecret(bobPub);
+const bobSecret = bob.computeSecret(alicePub);
+console.log("secret_len=" + aliceSecret.length);
+console.log("secrets_match=" + (aliceSecret.toString("hex") === bobSecret.toString("hex")));
+
+// Test 2: getDiffieHellman with modp1 (768-bit)
+const dh1 = crypto.getDiffieHellman("modp1");
+dh1.generateKeys();
+console.log("modp1_prime_hex_len=" + dh1.getPrime("hex").length);
+
+// Test 3: createDiffieHellman with explicit prime
+const prime = alice.getPrime();
+const gen = alice.getGenerator();
+const charlie = crypto.createDiffieHellman(prime, gen);
+charlie.generateKeys();
+const charlieSecret = charlie.computeSecret(alicePub);
+const aliceCharlie = alice.computeSecret(charlie.getPublicKey());
+console.log("explicit_prime_match=" + (charlieSecret.toString("hex") === aliceCharlie.toString("hex")));
+
+// Test 4: hex encoding for computeSecret
+const hexSecret = alice.computeSecret(bobPub, null, "hex");
+console.log("hex_encoding=" + (typeof hexSecret === "string"));
+console.log("hex_matches=" + (hexSecret === aliceSecret.toString("hex")));
+
+// Test 5: getGenerator returns a Buffer
+const genBuf = alice.getGenerator();
+console.log("gen_is_buffer=" + Buffer.isBuffer(genBuf));
+console.log("gen_value=" + genBuf[0]);
+
+// Test 6: verifyError property
+console.log("verify_error=" + alice.verifyError);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "DH key exchange failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "primes_match=true",
+        "prime_len=512",
+        "alice_pub_len=256",
+        "bob_pub_len=256",
+        "secret_len=256",
+        "secrets_match=true",
+        "modp1_prime_hex_len=192",
+        "explicit_prime_match=true",
+        "hex_encoding=true",
+        "hex_matches=true",
+        "gen_is_buffer=true",
+        "gen_value=2",
+        "verify_error=0",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
