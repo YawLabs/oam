@@ -7458,3 +7458,89 @@ console.log('report_actual=' + report[0].actual);
         );
     }
 }
+
+#[test]
+fn fs_dirent_class_expanded_constants() {
+    let file = write_temp(
+        "misc_m3f.mjs",
+        r#"
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+
+// -- fs.Dirent class exists --
+console.log('Dirent_type=' + typeof fs.Dirent);
+
+// -- readdirSync withFileTypes returns Dirent instances --
+const entries = fs.readdirSync('.', { withFileTypes: true });
+const first = entries[0];
+console.log('instanceof=' + (first instanceof fs.Dirent));
+console.log('has_isFile=' + typeof first.isFile);
+console.log('has_isDir=' + typeof first.isDirectory);
+console.log('has_isSymlink=' + typeof first.isSymbolicLink);
+console.log('has_name=' + (typeof first.name === 'string'));
+console.log('has_parentPath=' + (typeof first.parentPath === 'string'));
+console.log('has_path=' + (typeof first.path === 'string'));
+
+// -- async readdir withFileTypes --
+const asyncEntries = await fsp.readdir('.', { withFileTypes: true });
+const asyncFirst = asyncEntries[0];
+console.log('async_instanceof=' + (asyncFirst instanceof fs.Dirent));
+
+// -- expanded fs.constants --
+console.log('F_OK=' + fs.constants.F_OK);
+console.log('O_RDONLY=' + fs.constants.O_RDONLY);
+console.log('O_WRONLY=' + fs.constants.O_WRONLY);
+console.log('O_RDWR=' + fs.constants.O_RDWR);
+console.log('O_CREAT=' + fs.constants.O_CREAT);
+console.log('S_IFMT=' + fs.constants.S_IFMT);
+console.log('S_IFREG=' + fs.constants.S_IFREG);
+console.log('S_IFDIR=' + fs.constants.S_IFDIR);
+console.log('S_IRUSR=' + fs.constants.S_IRUSR);
+console.log('COPYFILE_EXCL=' + fs.constants.COPYFILE_EXCL);
+
+// -- fs/promises also exports Dirent and expanded constants --
+console.log('fsp_Dirent=' + typeof fsp.Dirent);
+console.log('fsp_O_RDONLY=' + fsp.constants.O_RDONLY);
+console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3f failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "Dirent_type=function",
+        "instanceof=true",
+        "has_isFile=function",
+        "has_isDir=function",
+        "has_isSymlink=function",
+        "has_name=true",
+        "has_parentPath=true",
+        "has_path=true",
+        "async_instanceof=true",
+        "F_OK=0",
+        "O_RDONLY=0",
+        "O_WRONLY=1",
+        "O_RDWR=2",
+        "O_CREAT=64",
+        "S_IFMT=61440",
+        "S_IFREG=32768",
+        "S_IFDIR=16384",
+        "S_IRUSR=256",
+        "COPYFILE_EXCL=1",
+        "fsp_Dirent=function",
+        "fsp_O_RDONLY=0",
+        "fsp_S_IFMT=61440",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

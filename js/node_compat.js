@@ -2447,37 +2447,31 @@
     };
   }
 
+  class Dirent {
+    constructor(name, parentPath, kind) {
+      this.name = name;
+      this.parentPath = parentPath;
+      this.path = parentPath;
+      this._kind = kind;
+    }
+    isFile() { return this._kind === "file"; }
+    isDirectory() { return this._kind === "dir"; }
+    isSymbolicLink() { return this._kind === "symlink"; }
+    isBlockDevice() { return false; }
+    isCharacterDevice() { return false; }
+    isFIFO() { return false; }
+    isSocket() { return false; }
+  }
+
   function wrapDirents(parent, entries, withFileTypes) {
     if (!withFileTypes) return entries.map((e) => e.name);
-    return entries.map((e) => ({
-      name: e.name,
-      parentPath: parent,
-      path: parent,
-      isFile: () => e.kind === "file",
-      isDirectory: () => e.kind === "dir",
-      isSymbolicLink: () => e.kind === "symlink",
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
-    }));
+    return entries.map((e) => new Dirent(e.name, parent, e.kind));
   }
 
   function makeDirent(parentPath, entry) {
     var name = typeof entry === "string" ? entry : entry.name;
     var kind = typeof entry === "object" && entry.kind ? entry.kind : "file";
-    return {
-      name: name,
-      parentPath: parentPath,
-      path: parentPath,
-      isFile: function () { return kind === "file"; },
-      isDirectory: function () { return kind === "dir"; },
-      isSymbolicLink: function () { return kind === "symlink"; },
-      isBlockDevice: function () { return false; },
-      isCharacterDevice: function () { return false; },
-      isFIFO: function () { return false; },
-      isSocket: function () { return false; },
-    };
+    return new Dirent(name, parentPath, kind);
   }
 
   function readOptions(options) {
@@ -2653,7 +2647,20 @@
         };
         return fh;
       },
-      constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
+      constants: {
+        F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+        O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+        O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_SYNC: 1052672,
+        O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
+        S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
+        S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
+        S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64,
+        S_IRGRP: 32, S_IWGRP: 16, S_IXGRP: 8,
+        S_IROTH: 4, S_IWOTH: 2, S_IXOTH: 1,
+        COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
+        UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
+      },
+      Dirent,
     };
   };
 
@@ -2747,7 +2754,19 @@
 
     const fs = {
       promises,
-      constants: { F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4 },
+      constants: {
+        F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+        O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+        O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_SYNC: 1052672,
+        O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
+        S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
+        S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
+        S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64,
+        S_IRGRP: 32, S_IWGRP: 16, S_IXGRP: 8,
+        S_IROTH: 4, S_IWOTH: 2, S_IXOTH: 1,
+        COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
+        UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
+      },
 
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
@@ -2959,6 +2978,7 @@
       watchFile: fsWatchFile,
     };
     fs.realpathSync.native = fs.realpathSync;
+    fs.Dirent = Dirent;
     return fs;
   };
 
