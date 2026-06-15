@@ -7755,3 +7755,113 @@ console.log('setuid_setgid=ok');
         );
     }
 }
+
+#[test]
+fn duplex_statics_http2_consts_dns_codes_perf_entry_resource_usage() {
+    let file = write_temp(
+        "misc_m3i.mjs",
+        r#"
+import stream from 'node:stream';
+import http2 from 'node:http2';
+import dns from 'node:dns';
+import { performance, PerformanceObserver, PerformanceEntry, PerformanceObserverEntryList, PerformanceNodeTiming, nodeTiming } from 'node:perf_hooks';
+import process from 'node:process';
+
+// -- Duplex statics --
+console.log('Duplex.from=' + typeof stream.Duplex.from);
+console.log('Duplex.fromWeb=' + typeof stream.Duplex.fromWeb);
+console.log('Duplex.toWeb=' + typeof stream.Duplex.toWeb);
+
+// Duplex.from with a passthrough-like Duplex
+const src = new stream.PassThrough();
+const dup = stream.Duplex.from(src);
+console.log('dupFrom_ok=' + (typeof dup.write === 'function'));
+
+// -- http2.constants --
+console.log('h2_NO_ERROR=' + http2.constants.NGHTTP2_NO_ERROR);
+console.log('h2_PROTOCOL_ERROR=' + http2.constants.NGHTTP2_PROTOCOL_ERROR);
+console.log('h2_CANCEL=' + http2.constants.NGHTTP2_CANCEL);
+console.log('h2_STATUS=' + http2.constants.HTTP2_HEADER_STATUS);
+console.log('h2_METHOD=' + http2.constants.HTTP2_HEADER_METHOD);
+console.log('h2_OK=' + http2.constants.HTTP_STATUS_OK);
+console.log('h2_WEIGHT=' + http2.constants.NGHTTP2_DEFAULT_WEIGHT);
+
+// -- dns error codes --
+console.log('dns_NODATA=' + dns.NODATA);
+console.log('dns_NOTFOUND=' + dns.NOTFOUND);
+console.log('dns_SERVFAIL=' + dns.SERVFAIL);
+console.log('dns_CONNREFUSED=' + dns.CONNREFUSED);
+console.log('dns_TIMEOUT=' + dns.TIMEOUT);
+console.log('dns_CANCELLED=' + dns.CANCELLED);
+
+// -- perf_hooks --
+console.log('PerformanceEntry=' + typeof PerformanceEntry);
+const pe = new PerformanceEntry('test', 'measure', 100, 50);
+console.log('pe_name=' + pe.name);
+console.log('pe_type=' + pe.entryType);
+console.log('pe_json=' + JSON.stringify(pe.toJSON()));
+
+console.log('PerformanceObserverEntryList=' + typeof PerformanceObserverEntryList);
+const poel = new PerformanceObserverEntryList();
+console.log('poel_getEntries=' + Array.isArray(poel.getEntries()));
+
+console.log('PerformanceNodeTiming=' + typeof PerformanceNodeTiming);
+console.log('nodeTiming_name=' + nodeTiming.name);
+console.log('nodeTiming_type=' + nodeTiming.entryType);
+console.log('nodeTiming_idleTime=' + nodeTiming.idleTime);
+
+// -- process.resourceUsage --
+const ru = process.resourceUsage();
+console.log('ru_type=' + typeof ru);
+console.log('ru_userCPU=' + ru.userCPUTime);
+console.log('ru_maxRSS=' + ru.maxRSS);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3i failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "Duplex.from=function",
+        "Duplex.fromWeb=function",
+        "Duplex.toWeb=function",
+        "dupFrom_ok=true",
+        "h2_NO_ERROR=0",
+        "h2_PROTOCOL_ERROR=1",
+        "h2_CANCEL=8",
+        "h2_STATUS=:status",
+        "h2_METHOD=:method",
+        "h2_OK=200",
+        "h2_WEIGHT=16",
+        "dns_NODATA=NODATA",
+        "dns_NOTFOUND=NOTFOUND",
+        "dns_SERVFAIL=SERVFAIL",
+        "dns_CONNREFUSED=CONNREFUSED",
+        "dns_TIMEOUT=TIMEOUT",
+        "dns_CANCELLED=CANCELLED",
+        "PerformanceEntry=function",
+        "pe_name=test",
+        "pe_type=measure",
+        r#"pe_json={"name":"test","entryType":"measure","startTime":100,"duration":50}"#,
+        "PerformanceObserverEntryList=function",
+        "poel_getEntries=true",
+        "PerformanceNodeTiming=function",
+        "nodeTiming_name=node",
+        "nodeTiming_type=node",
+        "nodeTiming_idleTime=0",
+        "ru_type=object",
+        "ru_userCPU=0",
+        "ru_maxRSS=0",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

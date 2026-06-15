@@ -3169,6 +3169,13 @@
       getgroups: () => [0],
       setgroups: () => {},
       initgroups: () => {},
+      resourceUsage: () => ({
+        userCPUTime: 0, systemCPUTime: 0, maxRSS: 0,
+        sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0,
+        minorPageFault: 0, majorPageFault: 0, swappedOut: 0,
+        fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
+        signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
+      }),
       release: { name: "node" },
       config: { variables: {} },
       features: { inspector: false, ipv6: true, tls: true },
@@ -4250,6 +4257,54 @@
     });
 
     // ----------------------------------------------------------- Transform
+    Duplex.from = function duplexFrom(source) {
+      if (source && typeof source.pipe === "function" && typeof source.write === "function") return source;
+      if (source && typeof source[Symbol.asyncIterator] === "function") {
+        return new Duplex({
+          objectMode: true,
+          write(chunk, enc, cb) { cb(); },
+          async read() {
+            for await (var v of source) { if (!this.push(v)) break; }
+            this.push(null);
+          },
+        });
+      }
+      if (source && typeof source.readable === "object" && typeof source.writable === "object") {
+        var d = new Duplex({
+          write(chunk, enc, cb) { source.writable.write(chunk); cb(); },
+          read() {},
+        });
+        if (source.readable && typeof source.readable.on === "function") {
+          source.readable.on("data", function(ch) { d.push(ch); });
+          source.readable.on("end", function() { d.push(null); });
+        }
+        return d;
+      }
+      throw new TypeError("Duplex.from: unsupported source");
+    };
+    Duplex.fromWeb = function duplexFromWeb(pair) {
+      var readable = pair.readable;
+      var writable = pair.writable;
+      var reader = readable.getReader();
+      var writer = writable.getWriter();
+      return new Duplex({
+        async read() {
+          try {
+            var r = await reader.read();
+            if (r.done) this.push(null); else this.push(r.value);
+          } catch(e) { this.destroy(e); }
+        },
+        write(chunk, enc, cb) { writer.write(chunk).then(function() { cb(); }, cb); },
+        final(cb) { writer.close().then(function() { cb(); }, cb); },
+      });
+    };
+    Duplex.toWeb = function duplexToWeb(duplex) {
+      return {
+        readable: Readable.toWeb(duplex),
+        writable: Writable.toWeb(duplex),
+      };
+    };
+
     class Transform extends Duplex {
       constructor(options = {}) {
         super(options);
@@ -7298,9 +7353,43 @@
       disconnect() { this._types = []; }
     }
     PerformanceObserver.supportedEntryTypes = Object.freeze(["measure", "mark"]);
+    class PerformanceEntry {
+      constructor(name, entryType, startTime, duration) {
+        this.name = name || "";
+        this.entryType = entryType || "";
+        this.startTime = startTime || 0;
+        this.duration = duration || 0;
+      }
+      toJSON() {
+        return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+      }
+    }
+    class PerformanceObserverEntryList {
+      constructor() { this._entries = []; }
+      getEntries() { return this._entries.slice(); }
+      getEntriesByName(name) { return this._entries.filter(function(e) { return e.name === name; }); }
+      getEntriesByType(type) { return this._entries.filter(function(e) { return e.entryType === type; }); }
+    }
+    class PerformanceNodeTiming extends PerformanceEntry {
+      constructor() {
+        super("node", "node", 0, 0);
+        this.nodeStart = 0;
+        this.v8Start = 0;
+        this.bootstrapComplete = 0;
+        this.environment = 0;
+        this.loopStart = 0;
+        this.loopExit = 0;
+        this.idleTime = 0;
+      }
+    }
+
     return {
       get performance() { return globalThis.performance; },
       PerformanceObserver,
+      PerformanceEntry,
+      PerformanceObserverEntryList,
+      PerformanceNodeTiming,
+      nodeTiming: new PerformanceNodeTiming(),
       createHistogram: () => ({
         record: () => {},
         percentile: () => 0,
@@ -8176,6 +8265,30 @@
       ADDRCONFIG,
       V4MAPPED,
       ALL,
+      NODATA: "NODATA",
+      FORMERR: "FORMERR",
+      SERVFAIL: "SERVFAIL",
+      NOTFOUND: "NOTFOUND",
+      NOTIMP: "NOTIMP",
+      REFUSED: "REFUSED",
+      BADQUERY: "BADQUERY",
+      BADNAME: "BADNAME",
+      BADFAMILY: "BADFAMILY",
+      BADRESP: "BADRESP",
+      CONNREFUSED: "CONNREFUSED",
+      TIMEOUT: "TIMEOUT",
+      EOF: "EOF",
+      FILE: "FILE",
+      NOMEM: "NOMEM",
+      DESTRUCTION: "DESTRUCTION",
+      BADSTR: "BADSTR",
+      BADFLAGS: "BADFLAGS",
+      NONAME: "NONAME",
+      BADHINTS: "BADHINTS",
+      NOTINITIALIZED: "NOTINITIALIZED",
+      LOADIPHLPAPI: "LOADIPHLPAPI",
+      ADDRGETNETWORKPARAMS: "ADDRGETNETWORKPARAMS",
+      CANCELLED: "CANCELLED",
     };
   };
 
@@ -8194,7 +8307,45 @@
       createServer: notImpl("createServer"),
       createSecureServer: notImpl("createSecureServer"),
       connect: notImpl("connect"),
-      constants: {},
+      constants: {
+        NGHTTP2_SESSION_SERVER: 0,
+        NGHTTP2_SESSION_CLIENT: 1,
+        NGHTTP2_STREAM_STATE_IDLE: 1,
+        NGHTTP2_STREAM_STATE_OPEN: 2,
+        NGHTTP2_STREAM_STATE_RESERVED_LOCAL: 3,
+        NGHTTP2_STREAM_STATE_RESERVED_REMOTE: 4,
+        NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL: 5,
+        NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE: 6,
+        NGHTTP2_STREAM_STATE_CLOSED: 7,
+        NGHTTP2_NO_ERROR: 0,
+        NGHTTP2_PROTOCOL_ERROR: 1,
+        NGHTTP2_INTERNAL_ERROR: 2,
+        NGHTTP2_FLOW_CONTROL_ERROR: 3,
+        NGHTTP2_SETTINGS_TIMEOUT: 4,
+        NGHTTP2_STREAM_CLOSED: 5,
+        NGHTTP2_FRAME_SIZE_ERROR: 6,
+        NGHTTP2_REFUSED_STREAM: 7,
+        NGHTTP2_CANCEL: 8,
+        NGHTTP2_COMPRESSION_ERROR: 9,
+        NGHTTP2_CONNECT_ERROR: 10,
+        NGHTTP2_ENHANCE_YOUR_CALM: 11,
+        NGHTTP2_INADEQUATE_SECURITY: 12,
+        NGHTTP2_HTTP_1_1_REQUIRED: 13,
+        NGHTTP2_DEFAULT_WEIGHT: 16,
+        HTTP2_HEADER_STATUS: ":status",
+        HTTP2_HEADER_METHOD: ":method",
+        HTTP2_HEADER_AUTHORITY: ":authority",
+        HTTP2_HEADER_SCHEME: ":scheme",
+        HTTP2_HEADER_PATH: ":path",
+        HTTP2_HEADER_CONTENT_TYPE: "content-type",
+        HTTP2_HEADER_CONTENT_LENGTH: "content-length",
+        HTTP2_HEADER_ACCEPT_ENCODING: "accept-encoding",
+        HTTP2_METHOD_GET: "GET",
+        HTTP2_METHOD_POST: "POST",
+        HTTP_STATUS_OK: 200,
+        HTTP_STATUS_NOT_FOUND: 404,
+        HTTP_STATUS_INTERNAL_SERVER_ERROR: 500,
+      },
       sensitiveHeaders: Symbol.for("nodejs.http2.sensitiveHeaders"),
     };
   };
