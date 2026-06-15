@@ -5953,7 +5953,7 @@
     }
 
     function generateKeyPairSync(type, options) {
-      const result = natives.cryptoGenerateKeyPair(type, (options && options.modulusLength) || 0);
+      const result = natives.cryptoGenerateKeyPair(type, (options && options.modulusLength) || 0, (options && options.namedCurve) || "");
       const format = (options && options.publicKeyEncoding && options.publicKeyEncoding.format) || 'pem';
       const privFormat = (options && options.privateKeyEncoding && options.privateKeyEncoding.format) || 'pem';
       let pubOut = result.publicKey;

@@ -8143,3 +8143,91 @@ console.log('clone_secret_matches=' + cloneSecret.equals(aliceSecret));
         );
     }
 }
+
+#[test]
+fn crypto_ec_keygen_sign_verify() {
+    let file = write_temp(
+        "test_crypto_ec_keygen.mjs",
+        r#"
+import crypto from "crypto";
+
+// P-256 keygen
+const { publicKey: pub256, privateKey: priv256 } = crypto.generateKeyPairSync("ec", {
+  namedCurve: "P-256",
+});
+console.log("pub256_type=" + typeof pub256);
+console.log("pub256_pem=" + pub256.startsWith("-----BEGIN PUBLIC KEY-----"));
+console.log("priv256_pem=" + priv256.startsWith("-----BEGIN PRIVATE KEY-----"));
+
+// Sign/verify round-trip proves keys are valid ECDSA pairs
+const sign = crypto.createSign("SHA256");
+sign.update("hello from oam");
+const sig = sign.sign(priv256);
+console.log("sig256_len=" + sig.length);
+
+const verify = crypto.createVerify("SHA256");
+verify.update("hello from oam");
+console.log("verify256=" + verify.verify(pub256, sig));
+
+// P-384 keygen
+const { publicKey: pub384, privateKey: priv384 } = crypto.generateKeyPairSync("ec", {
+  namedCurve: "P-384",
+});
+console.log("pub384_pem=" + pub384.startsWith("-----BEGIN PUBLIC KEY-----"));
+console.log("priv384_pem=" + priv384.startsWith("-----BEGIN PRIVATE KEY-----"));
+console.log("pub384_longer=" + (pub384.length > pub256.length));
+
+// Sign/verify P-384
+const sign384 = crypto.createSign("SHA384");
+sign384.update("hello from oam");
+const sig384 = sign384.sign(priv384);
+console.log("sig384_len=" + sig384.length);
+
+const verify384 = crypto.createVerify("SHA384");
+verify384.update("hello from oam");
+console.log("verify384=" + verify384.verify(pub384, sig384));
+
+// Curve alias works (prime256v1 = P-256)
+const { publicKey: pubAlias } = crypto.generateKeyPairSync("ec", {
+  namedCurve: "prime256v1",
+});
+console.log("alias_works=" + pubAlias.startsWith("-----BEGIN PUBLIC KEY-----"));
+
+// DER output format
+const { publicKey: pubDer } = crypto.generateKeyPairSync("ec", {
+  namedCurve: "P-256",
+  publicKeyEncoding: { type: "spki", format: "der" },
+});
+console.log("der_is_buffer=" + Buffer.isBuffer(pubDer));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "EC keygen failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "pub256_type=string",
+        "pub256_pem=true",
+        "priv256_pem=true",
+        "sig256_len=64",
+        "verify256=true",
+        "pub384_pem=true",
+        "priv384_pem=true",
+        "pub384_longer=true",
+        "sig384_len=96",
+        "verify384=true",
+        "alias_works=true",
+        "der_is_buffer=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

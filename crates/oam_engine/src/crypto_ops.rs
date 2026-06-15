@@ -1175,9 +1175,32 @@ pub(crate) fn op_crypto_generate_keypair(
             }
             crypto_generate_rsa(bits)
         }
+        "ec" => {
+            let curve_raw = crate::node_ops::arg_string(scope, &args, 2)
+                .filter(|s| !s.is_empty());
+            let Some(curve_raw) = curve_raw else {
+                crate::node_ops::throw_type_error(
+                    scope,
+                    "generateKeyPairSync: namedCurve required for EC keys",
+                );
+                return;
+            };
+            match normalize_curve(&curve_raw) {
+                "p256" => crypto_generate_ec_p256(),
+                "p384" => crypto_generate_ec_p384(),
+                _ => {
+                    let msg = format!(
+                        "generateKeyPairSync: unsupported EC curve '{}' (oam supports P-256, P-384)",
+                        curve_raw
+                    );
+                    crate::node_ops::throw_type_error(scope, &msg);
+                    return;
+                }
+            }
+        }
         _ => {
             let msg = format!(
-                "generateKeyPairSync: unsupported type '{}' (oam supports rsa, ed25519)",
+                "generateKeyPairSync: unsupported type '{}' (oam supports rsa, ec, ed25519)",
                 key_type
             );
             crate::node_ops::throw_type_error(scope, &msg);
@@ -1518,6 +1541,29 @@ macro_rules! impl_ecdh {
 
 impl_ecdh!(p256, ecdh_gen_p256, ecdh_compute_p256, ecdh_pub_p256);
 impl_ecdh!(p384, ecdh_gen_p384, ecdh_compute_p384, ecdh_pub_p384);
+
+macro_rules! impl_ec_keygen {
+    ($mod:ident, $fn_name:ident) => {
+        fn $fn_name() -> Result<(Vec<u8>, Vec<u8>), String> {
+            use $mod::elliptic_curve::pkcs8::EncodePrivateKey;
+            use $mod::elliptic_curve::pkcs8::spki::EncodePublicKey;
+            let sk = $mod::SecretKey::random(&mut OsRng);
+            let pk = sk.public_key();
+            let priv_doc = sk
+                .to_pkcs8_der()
+                .map_err(|e| format!("EC keygen private: {e}"))?;
+            let priv_pem = der_to_pem(priv_doc.as_bytes(), "PRIVATE KEY");
+            let pub_doc = pk
+                .to_public_key_der()
+                .map_err(|e| format!("EC keygen public: {e}"))?;
+            let pub_pem = der_to_pem(pub_doc.as_ref(), "PUBLIC KEY");
+            Ok((priv_pem.into_bytes(), pub_pem.into_bytes()))
+        }
+    };
+}
+
+impl_ec_keygen!(p256, crypto_generate_ec_p256);
+impl_ec_keygen!(p384, crypto_generate_ec_p384);
 
 fn normalize_curve(name: &str) -> &str {
     match name {
