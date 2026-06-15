@@ -7366,3 +7366,95 @@ console.log('keepAlive=' + http.globalAgent.keepAlive);
         );
     }
 }
+
+#[test]
+fn os_constants_tracing_channel_call_tracker() {
+    let file = write_temp(
+        "misc_m3e.mjs",
+        r#"
+import os from 'node:os';
+import diag from 'node:diagnostics_channel';
+import assert from 'node:assert';
+
+// -- os.constants.signals --
+console.log('SIGTERM=' + os.constants.signals.SIGTERM);
+console.log('SIGKILL=' + os.constants.signals.SIGKILL);
+console.log('SIGINT=' + os.constants.signals.SIGINT);
+console.log('SIGHUP=' + os.constants.signals.SIGHUP);
+
+// -- os.constants.errno --
+console.log('ENOENT=' + os.constants.errno.ENOENT);
+console.log('EACCES=' + os.constants.errno.EACCES);
+console.log('EEXIST=' + os.constants.errno.EEXIST);
+console.log('EPERM=' + os.constants.errno.EPERM);
+
+// -- os.constants.priority --
+console.log('PRIORITY_NORMAL=' + os.constants.priority.PRIORITY_NORMAL);
+
+// -- diagnostics_channel.tracingChannel --
+const tc = diag.tracingChannel('test.op');
+console.log('tc_start_type=' + typeof tc.start.subscribe);
+console.log('tc_end_type=' + typeof tc.end.subscribe);
+console.log('tc_error_type=' + typeof tc.error.subscribe);
+console.log('tc_asyncStart_type=' + typeof tc.asyncStart.subscribe);
+
+let startMsg = null;
+tc.subscribe({ start: (msg) => { startMsg = msg; } });
+tc.start.publish({ op: 'hello' });
+console.log('tc_start_msg=' + startMsg.op);
+
+// -- assert.CallTracker --
+const tracker = new assert.CallTracker();
+const fn1 = tracker.calls(() => 42, 2);
+console.log('fn1_call1=' + fn1());
+console.log('fn1_call2=' + fn1());
+tracker.verify();
+console.log('tracker_ok=true');
+
+const tracker2 = new assert.CallTracker();
+const fn2 = tracker2.calls(() => {}, 3);
+fn2(); fn2();
+const report = tracker2.report();
+console.log('report_len=' + report.length);
+console.log('report_expected=' + report[0].expected);
+console.log('report_actual=' + report[0].actual);
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3e failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "SIGTERM=15",
+        "SIGKILL=9",
+        "SIGINT=2",
+        "SIGHUP=1",
+        "ENOENT=-2",
+        "EACCES=-13",
+        "EEXIST=-17",
+        "EPERM=-1",
+        "PRIORITY_NORMAL=0",
+        "tc_start_type=function",
+        "tc_end_type=function",
+        "tc_error_type=function",
+        "tc_asyncStart_type=function",
+        "tc_start_msg=hello",
+        "fn1_call1=42",
+        "fn1_call2=42",
+        "tracker_ok=true",
+        "report_len=1",
+        "report_expected=3",
+        "report_actual=2",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

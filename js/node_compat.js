@@ -1487,6 +1487,43 @@
         uid: -1,
         gid: -1,
       }),
+      constants: {
+        signals: {
+          SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5,
+          SIGABRT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10,
+          SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
+          SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21,
+          SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
+          SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
+        },
+        errno: {
+          E2BIG: -7, EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99,
+          EAFNOSUPPORT: -97, EAGAIN: -11, EALREADY: -114, EBADF: -9,
+          EBADMSG: -74, EBUSY: -16, ECANCELED: -125, ECHILD: -10,
+          ECONNABORTED: -103, ECONNREFUSED: -111, ECONNRESET: -104,
+          EDEADLK: -35, EDESTADDRREQ: -89, EDOM: -33, EDQUOT: -122,
+          EEXIST: -17, EFAULT: -14, EFBIG: -27, EHOSTUNREACH: -113,
+          EIDRM: -43, EILSEQ: -84, EINPROGRESS: -115, EINTR: -4,
+          EINVAL: -22, EIO: -5, EISCONN: -106, EISDIR: -21,
+          ELOOP: -40, EMFILE: -24, EMLINK: -31, EMSGSIZE: -90,
+          EMULTIHOP: -72, ENAMETOOLONG: -36, ENETDOWN: -100,
+          ENETRESET: -102, ENETUNREACH: -101, ENFILE: -23, ENOBUFS: -105,
+          ENODATA: -61, ENODEV: -19, ENOENT: -2, ENOEXEC: -8,
+          ENOLCK: -37, ENOLINK: -67, ENOMEM: -12, ENOMSG: -42,
+          ENOPROTOOPT: -92, ENOSPC: -28, ENOSR: -63, ENOSTR: -60,
+          ENOSYS: -38, ENOTCONN: -107, ENOTDIR: -20, ENOTEMPTY: -39,
+          ENOTSOCK: -88, ENOTSUP: -95, ENOTTY: -25, ENXIO: -6,
+          EOPNOTSUPP: -95, EOVERFLOW: -75, EPERM: -1, EPIPE: -32,
+          EPROTO: -71, EPROTONOSUPPORT: -93, EPROTOTYPE: -91,
+          ERANGE: -34, EROFS: -30, ESPIPE: -29, ESRCH: -3,
+          ESTALE: -116, ETIME: -62, ETIMEDOUT: -110, ETXTBSY: -26,
+          EWOULDBLOCK: -11, EXDEV: -18,
+        },
+        priority: {
+          PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
+          PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
+        },
+      },
     };
   };
 
@@ -2356,6 +2393,28 @@
       },
     });
     // assert.strict: equal family promoted to strict semantics.
+    assert.CallTracker = class CallTracker {
+      constructor() { this._calls = []; }
+      calls(fn, exact) {
+        var expected = typeof exact === "number" ? exact : 1;
+        var count = 0;
+        var entry = { expected, actual: 0 };
+        this._calls.push(entry);
+        return function tracked() { entry.actual++; count++; return fn ? fn.apply(this, arguments) : undefined; };
+      }
+      getCalls(fn) { return this._calls; }
+      report() {
+        return this._calls.filter(c => c.actual !== c.expected).map(c => ({
+          message: "Expected " + c.expected + " calls but got " + c.actual,
+          actual: c.actual, expected: c.expected,
+        }));
+      }
+      verify() {
+        var errs = this.report();
+        if (errs.length > 0) throw new Error(errs[0].message);
+      }
+      reset(fn) { this._calls = []; }
+    };
     assert.strict = Object.assign(
       (value, message) => ok(value, message),
       assert,
@@ -7136,7 +7195,32 @@
     }
     function subscribe(name, fn) { channel(name).subscribe(fn); }
     function unsubscribe(name, fn) { return channel(name).unsubscribe(fn); }
-    return { channel, hasSubscribers, subscribe, unsubscribe, Channel };
+    function tracingChannel(nameOrChannel) {
+      var name = typeof nameOrChannel === "string" ? nameOrChannel : nameOrChannel.name;
+      var ch = (suffix) => channel(name + ":" + suffix);
+      return {
+        start: ch("start"),
+        end: ch("end"),
+        asyncStart: ch("asyncStart"),
+        asyncEnd: ch("asyncEnd"),
+        error: ch("error"),
+        subscribe: (handlers) => {
+          if (handlers.start) ch("start").subscribe(handlers.start);
+          if (handlers.end) ch("end").subscribe(handlers.end);
+          if (handlers.asyncStart) ch("asyncStart").subscribe(handlers.asyncStart);
+          if (handlers.asyncEnd) ch("asyncEnd").subscribe(handlers.asyncEnd);
+          if (handlers.error) ch("error").subscribe(handlers.error);
+        },
+        unsubscribe: (handlers) => {
+          if (handlers.start) ch("start").unsubscribe(handlers.start);
+          if (handlers.end) ch("end").unsubscribe(handlers.end);
+          if (handlers.asyncStart) ch("asyncStart").unsubscribe(handlers.asyncStart);
+          if (handlers.asyncEnd) ch("asyncEnd").unsubscribe(handlers.asyncEnd);
+          if (handlers.error) ch("error").unsubscribe(handlers.error);
+        },
+      };
+    }
+    return { channel, hasSubscribers, subscribe, unsubscribe, Channel, tracingChannel };
   };
 
   // -------------------------------------------------------------- readline
