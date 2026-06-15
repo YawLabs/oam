@@ -1115,6 +1115,16 @@
       return { [Symbol.dispose]() { signal.removeEventListener("abort", listener); } };
     };
     EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
+    class EventEmitterAsyncResource extends EventEmitter {
+      constructor(options) {
+        super(options);
+        this.asyncResource = { type: (options && options.name) || "EventEmitterAsyncResource" };
+      }
+      get asyncId() { return 0; }
+      get triggerAsyncId() { return 0; }
+      emitDestroy() { return this; }
+    }
+    EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
     return EventEmitter;
   };
 
@@ -2979,6 +2989,11 @@
     };
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
+    fs.Stats = function Stats() {};
+    fs.ReadStream = fs.createReadStream;
+    fs.WriteStream = fs.createWriteStream;
+    fs.FileReadStream = fs.createReadStream;
+    fs.FileWriteStream = fs.createWriteStream;
     return fs;
   };
 
@@ -5747,6 +5762,9 @@
       createHash,
       createHmac,
       randomBytes,
+      pseudoRandomBytes: randomBytes,
+      rng: randomBytes,
+      prng: randomBytes,
       randomFillSync,
       randomUUID,
       randomInt,
@@ -6613,6 +6631,34 @@
       return req;
     }
 
+    class Agent {
+      constructor(options) {
+        this.options = options || {};
+        this.maxSockets = this.options.maxSockets || Infinity;
+        this.maxFreeSockets = this.options.maxFreeSockets || 256;
+        this.keepAlive = this.options.keepAlive || false;
+        this.keepAliveMsecs = this.options.keepAliveMsecs || 1000;
+        this.sockets = {};
+        this.freeSockets = {};
+        this.requests = {};
+      }
+      destroy() { this.sockets = {}; this.freeSockets = {}; this.requests = {}; }
+      getName(options) {
+        var name = (options.host || "localhost") + ":" + (options.port || 80);
+        if (options.localAddress) name += ":" + options.localAddress;
+        return name;
+      }
+    }
+
+    var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
+    function validateHeaderName(name) {
+      if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
+      if (INVALID_HEADER_CHAR.test(name)) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
+    }
+    function validateHeaderValue(name, value) {
+      if (value === undefined) throw new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
+    }
+
     return {
       createServer: (options, handler) =>
         new Server(typeof options === "function" ? options : handler),
@@ -6623,6 +6669,10 @@
       request,
       get,
       globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
+      Agent,
+      maxHeaderSize: 16384,
+      validateHeaderName,
+      validateHeaderValue,
       METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
       STATUS_CODES: {
         200: "OK",

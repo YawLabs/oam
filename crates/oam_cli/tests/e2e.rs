@@ -7544,3 +7544,90 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
         );
     }
 }
+
+#[test]
+fn crypto_aliases_http_agent_fs_exports_eear() {
+    let file = write_temp(
+        "misc_m3g.mjs",
+        r#"
+import crypto from 'node:crypto';
+import http from 'node:http';
+import fs from 'node:fs';
+import events from 'node:events';
+
+// -- crypto aliases --
+console.log('pseudoRandomBytes=' + typeof crypto.pseudoRandomBytes);
+console.log('rng=' + typeof crypto.rng);
+console.log('prng=' + typeof crypto.prng);
+const b = crypto.pseudoRandomBytes(8);
+console.log('prb_len=' + b.length);
+
+// -- http.Agent --
+console.log('Agent=' + typeof http.Agent);
+const agent = new http.Agent({ keepAlive: true });
+console.log('agent_keepAlive=' + agent.keepAlive);
+console.log('agent_maxSockets=' + agent.maxSockets);
+console.log('agent_getName=' + agent.getName({ host: 'x.com', port: 443 }));
+agent.destroy();
+
+// -- http.maxHeaderSize --
+console.log('maxHeaderSize=' + http.maxHeaderSize);
+
+// -- http.validateHeaderName / validateHeaderValue --
+http.validateHeaderName('Content-Type');
+console.log('validateName=ok');
+http.validateHeaderValue('X-Test', 'val');
+console.log('validateValue=ok');
+try { http.validateHeaderValue('X-Test', undefined); } catch(e) { console.log('validateValue_undef=caught'); }
+
+// -- fs exports --
+console.log('Stats=' + typeof fs.Stats);
+console.log('ReadStream=' + typeof fs.ReadStream);
+console.log('WriteStream=' + typeof fs.WriteStream);
+console.log('FileReadStream=' + typeof fs.FileReadStream);
+
+// -- events.EventEmitterAsyncResource --
+console.log('EEAR=' + typeof events.EventEmitterAsyncResource);
+const ear = new events.EventEmitterAsyncResource({ name: 'test' });
+console.log('ear_asyncId=' + ear.asyncId);
+ear.on('test', () => {});
+console.log('ear_listeners=' + ear.listenerCount('test'));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3g failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "pseudoRandomBytes=function",
+        "rng=function",
+        "prng=function",
+        "prb_len=8",
+        "Agent=function",
+        "agent_keepAlive=true",
+        "agent_maxSockets=Infinity",
+        "agent_getName=x.com:443",
+        "maxHeaderSize=16384",
+        "validateName=ok",
+        "validateValue=ok",
+        "validateValue_undef=caught",
+        "Stats=function",
+        "ReadStream=function",
+        "WriteStream=function",
+        "FileReadStream=function",
+        "EEAR=function",
+        "ear_asyncId=0",
+        "ear_listeners=1",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
