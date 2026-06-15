@@ -886,6 +886,7 @@ use ring_sig::KeyPair as _;
 
 // Wave 4: RSA encrypt/decrypt via the `rsa` crate (ring doesn't do encryption).
 use rsa::{Oaep, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use rsa::traits::{PublicKeyParts, PrivateKeyParts};
 use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rand_core::OsRng;
@@ -1397,6 +1398,65 @@ fn crypto_private_decrypt(
     }
 }
 
+fn crypto_private_encrypt(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let priv_key = parse_rsa_private_key(&der, label)?;
+    let n = priv_key.n();
+    let d = priv_key.d();
+    let key_len = (n.bits() as usize + 7) / 8;
+    if data.len() + 11 > key_len {
+        return Err("privateEncrypt: data too large for key size".into());
+    }
+    let ps_len = key_len - data.len() - 3;
+    let mut em = vec![0u8; key_len];
+    em[1] = 0x01;
+    for i in 0..ps_len {
+        em[2 + i] = 0xFF;
+    }
+    em[2 + ps_len] = 0x00;
+    em[3 + ps_len..].copy_from_slice(data);
+    let m = BigUint::from_bytes_be(&em);
+    let c = m.modpow(d, n);
+    Ok(pad_be(c.to_bytes_be(), key_len))
+}
+
+fn crypto_public_decrypt(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    let der = pem_to_der(key_pem)?;
+    let label = pem_label(key_pem);
+    let (n, e) = if label == "PUBLIC KEY" || label == "RSA PUBLIC KEY" {
+        let pk = parse_rsa_public_key(&der, label)?;
+        (pk.n().clone(), pk.e().clone())
+    } else {
+        let sk = parse_rsa_private_key(&der, label)?;
+        (sk.n().clone(), sk.e().clone())
+    };
+    let key_len = (n.bits() as usize + 7) / 8;
+    if data.len() != key_len {
+        return Err(format!("publicDecrypt: input must be {} bytes", key_len));
+    }
+    let c = BigUint::from_bytes_be(data);
+    let m = c.modpow(&e, &n);
+    let em = pad_be(m.to_bytes_be(), key_len);
+    if em.len() < 11 || em[0] != 0x00 || em[1] != 0x01 {
+        return Err("publicDecrypt: invalid PKCS#1 v1.5 padding".into());
+    }
+    let mut sep = None;
+    for i in 2..em.len() {
+        if em[i] == 0x00 {
+            sep = Some(i);
+            break;
+        }
+        if em[i] != 0xFF {
+            return Err("publicDecrypt: invalid PKCS#1 v1.5 padding".into());
+        }
+    }
+    match sep {
+        Some(idx) if idx >= 10 => Ok(em[idx + 1..].to_vec()),
+        _ => Err("publicDecrypt: invalid PKCS#1 v1.5 padding".into()),
+    }
+}
+
 pub(crate) fn op_crypto_public_encrypt(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -1444,6 +1504,52 @@ pub(crate) fn op_crypto_private_decrypt(
         .unwrap_or_else(|| "sha1".to_string());
 
     match crypto_private_decrypt(&data, &key_pem, &padding, &oaep_hash) {
+        Ok(pt) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, pt) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_private_encrypt(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "privateEncrypt: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "privateEncrypt: key required");
+        return;
+    };
+    match crypto_private_encrypt(&data, &key_pem) {
+        Ok(ct) => {
+            if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, ct) {
+                rv.set(value);
+            }
+        }
+        Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
+    }
+}
+
+pub(crate) fn op_crypto_public_decrypt(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "publicDecrypt: data required");
+        return;
+    };
+    let Some(key_pem) = crate::node_ops::arg_string(scope, &args, 1) else {
+        crate::node_ops::throw_type_error(scope, "publicDecrypt: key required");
+        return;
+    };
+    match crypto_public_decrypt(&data, &key_pem) {
         Ok(pt) => {
             if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, pt) {
                 rv.set(value);
@@ -1775,4 +1881,207 @@ pub(crate) fn op_crypto_dh_compute_secret(
         }
         Err(msg) => crate::node_ops::throw_type_error(scope, &msg),
     }
+}
+
+// ===================================================== X.509 certificate parsing
+
+fn format_colon_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn format_x509_name(name: &x509_parser::x509::X509Name<'_>) -> String {
+    let mut parts = Vec::new();
+    for rdn in name.iter() {
+        for attr in rdn.iter() {
+            let oid = attr.attr_type().to_id_string();
+            let label = match oid.as_str() {
+                "2.5.4.3" => "CN",
+                "2.5.4.6" => "C",
+                "2.5.4.7" => "L",
+                "2.5.4.8" => "ST",
+                "2.5.4.10" => "O",
+                "2.5.4.11" => "OU",
+                "1.2.840.113549.1.9.1" => "emailAddress",
+                _ => &oid,
+            };
+            let value = attr.as_str().unwrap_or("(invalid)");
+            parts.push(format!("{label}={value}"));
+        }
+    }
+    parts.join("\n")
+}
+
+pub(crate) fn op_crypto_x509_parse(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(input) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "X509Certificate: certificate data required");
+        return;
+    };
+
+    let der_bytes: Vec<u8> = if input.starts_with(b"-----BEGIN") {
+        match x509_parser::pem::parse_x509_pem(&input) {
+            Ok((_, pem)) => pem.contents,
+            Err(e) => {
+                crate::node_ops::throw_type_error(
+                    scope,
+                    &format!("X509 PEM parse error: {e}"),
+                );
+                return;
+            }
+        }
+    } else {
+        input
+    };
+
+    let der_for_raw = der_bytes.clone();
+
+    let cert = match x509_parser::parse_x509_certificate(&der_bytes) {
+        Ok((_, cert)) => cert,
+        Err(e) => {
+            crate::node_ops::throw_type_error(scope, &format!("X509 parse error: {e}"));
+            return;
+        }
+    };
+
+    let obj = v8::Object::new(scope);
+
+    macro_rules! set_str {
+        ($name:expr, $val:expr) => {{
+            let k = v8::String::new(scope, $name).unwrap();
+            let v = v8::String::new(scope, $val).unwrap();
+            obj.set(scope, k.into(), v.into());
+        }};
+    }
+
+    set_str!("subject", &format_x509_name(cert.subject()));
+    set_str!("issuer", &format_x509_name(cert.issuer()));
+
+    let serial_hex = cert
+        .tbs_certificate
+        .raw_serial()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<String>();
+    let serial_hex = serial_hex.trim_start_matches('0');
+    let serial_hex = if serial_hex.is_empty() { "0" } else { serial_hex };
+    set_str!("serialNumber", serial_hex);
+
+    set_str!("validFrom", &cert.validity().not_before.to_string());
+    set_str!("validTo", &cert.validity().not_after.to_string());
+
+    {
+        let hash = <sha1::Sha1 as Digest>::digest(&der_bytes);
+        set_str!("fingerprint", &format_colon_hex(&hash));
+    }
+    {
+        let hash = <sha2::Sha256 as Digest>::digest(&der_bytes);
+        set_str!("fingerprint256", &format_colon_hex(&hash));
+    }
+
+    let mut ca = false;
+    let mut san_formatted: Option<String> = None;
+    let mut ku_list: Vec<&str> = Vec::new();
+
+    for ext in cert.extensions() {
+        match ext.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::BasicConstraints(bc) => {
+                ca = bc.ca;
+            }
+            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
+                let names: Vec<String> = san
+                    .general_names
+                    .iter()
+                    .map(|gn| {
+                        use x509_parser::extensions::GeneralName;
+                        match gn {
+                            GeneralName::DNSName(s) => format!("DNS:{s}"),
+                            GeneralName::IPAddress(b) if b.len() == 4 => {
+                                format!("IP Address:{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+                            }
+                            GeneralName::RFC822Name(s) => format!("email:{s}"),
+                            GeneralName::URI(s) => format!("URI:{s}"),
+                            other => format!("{other:?}"),
+                        }
+                    })
+                    .collect();
+                san_formatted = Some(names.join(", "));
+            }
+            x509_parser::extensions::ParsedExtension::KeyUsage(ku) => {
+                if ku.digital_signature() { ku_list.push("digitalSignature"); }
+                if ku.non_repudiation() { ku_list.push("nonRepudiation"); }
+                if ku.key_encipherment() { ku_list.push("keyEncipherment"); }
+                if ku.data_encipherment() { ku_list.push("dataEncipherment"); }
+                if ku.key_agreement() { ku_list.push("keyAgreement"); }
+                if ku.key_cert_sign() { ku_list.push("keyCertSign"); }
+                if ku.crl_sign() { ku_list.push("cRLSign"); }
+            }
+            _ => {}
+        }
+    }
+
+    {
+        let k = v8::String::new(scope, "ca").unwrap();
+        obj.set(scope, k.into(), v8::Boolean::new(scope, ca).into());
+    }
+    if let Some(ref san) = san_formatted {
+        set_str!("subjectAltName", san);
+    }
+    if !ku_list.is_empty() {
+        let arr = v8::Array::new(scope, ku_list.len() as i32);
+        for (i, s) in ku_list.iter().enumerate() {
+            let val = v8::String::new(scope, s).unwrap();
+            arr.set_index(scope, i as u32, val.into());
+        }
+        let k = v8::String::new(scope, "keyUsage").unwrap();
+        obj.set(scope, k.into(), arr.into());
+    }
+
+    if let Some(raw) = crate::node_ops::bytes_to_uint8array(scope, der_for_raw) {
+        let k = v8::String::new(scope, "raw").unwrap();
+        obj.set(scope, k.into(), raw);
+    }
+
+    rv.set(obj.into());
+}
+
+// ── Wave 8: prime generation & testing ────────────────────────────────
+
+pub(crate) fn op_crypto_generate_prime(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    use num_bigint_dig::RandPrime;
+    let bits = args.get(0).int32_value(scope).unwrap_or(0) as usize;
+    if bits < 2 {
+        crate::node_ops::throw_type_error(scope, "generatePrime: bits must be >= 2");
+        return;
+    }
+    let prime = OsRng.gen_prime(bits);
+    let bytes = prime.to_bytes_be();
+    if let Some(value) = crate::node_ops::bytes_to_uint8array(scope, bytes) {
+        rv.set(value);
+    }
+}
+
+pub(crate) fn op_crypto_check_prime(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    use num_bigint_dig::prime::probably_prime;
+    let Some(data) = crate::node_ops::arg_bytes(scope, &args, 0) else {
+        crate::node_ops::throw_type_error(scope, "checkPrime: data required");
+        return;
+    };
+    let n = BigUint::from_bytes_be(&data);
+    let is_prime = probably_prime(&n, 25);
+    rv.set(v8::Boolean::new(scope, is_prime).into());
 }

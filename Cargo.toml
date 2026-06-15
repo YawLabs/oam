@@ -74,6 +74,10 @@ p384 = { version = "0.13", features = ["ecdh"] }
 # getDiffieHellman).  Already in-tree transitively via rsa -> num-bigint-dig;
 # promoting to direct dep adds zero new compilation units.
 num-bigint-dig = { version = "0.8", features = ["prime"] }
+# node:crypto wave 7: X.509 certificate inspection (X509Certificate class).
+# nom is already in-tree transitively; x509-parser adds only the ASN.1
+# layer (der-parser, asn1-rs, oid-registry) — no C deps.
+x509-parser = "0.16"
 # node:zlib: gzip/deflate via the same backend everything else in the
 # Rust ecosystem uses (already in-tree transitively through oxc).
 flate2 = "1"

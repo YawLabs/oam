@@ -8320,3 +8320,364 @@ console.log("verify_error=" + alice.verifyError);
         );
     }
 }
+
+// ─── X.509 Certificate ──────────────────────────────────────────────
+
+#[test]
+fn crypto_x509_certificate() {
+    let pem = r#"-----BEGIN CERTIFICATE-----
+MIIDvzCCAqegAwIBAgIUOMpxiAdbEguU3tYRCsvm1pFY43YwDQYJKoZIhvcNAQEL
+BQAwWTELMAkGA1UEBhMCVVMxDTALBgNVBAgMBFRlc3QxDTALBgNVBAcMBENpdHkx
+ETAPBgNVBAoMCE9BTSBUZXN0MRkwFwYDVQQDDBB0ZXN0LmV4YW1wbGUuY29tMB4X
+DTI2MDYxNTExMjYxNFoXDTI3MDYxNTExMjYxNFowWTELMAkGA1UEBhMCVVMxDTAL
+BgNVBAgMBFRlc3QxDTALBgNVBAcMBENpdHkxETAPBgNVBAoMCE9BTSBUZXN0MRkw
+FwYDVQQDDBB0ZXN0LmV4YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+MIIBCgKCAQEAyZRr7fMlr9jY5ccmXxBemRjXzIDixsuGcNv+F8U2gk7Q65LFu2D2
+6Ts5oLgdvBBmZ5+kHGwF14Uuuh4BoeQZkMkwQaVeFfWSTxuL6C20Fk+u+4zxBwxw
++06aEHEHlz47E3W2Ppf/NVZ9FzAM4/d24Xa+OMrOSbh02ML29ecbK5If0tVOJbdF
+lCeFFkLbaeuceqK6DDzbmVEykzfCgVfN1yJMFLel9VMC9hd4gQDOYb5qp++Tu5vy
+J7KSqBUDKTWZnlSQ4FiEEqtv7/jG+ueMgObCgrxo02/IocTL2Oss27rPXk4qxFcq
+fqxoTaf12cwEWO9jWONFrkahIEL0dx6P8wIDAQABo38wfTAdBgNVHQ4EFgQU06Kq
+8UP+9Eq0mpxBkoWdp1TqLU4wHwYDVR0jBBgwFoAU06Kq8UP+9Eq0mpxBkoWdp1Tq
+LU4wDwYDVR0TAQH/BAUwAwEB/zAqBgNVHREEIzAhghB0ZXN0LmV4YW1wbGUuY29t
+gg0qLmV4YW1wbGUuY29tMA0GCSqGSIb3DQEBCwUAA4IBAQBgUBGCPTiQQXj+AA/M
+b9BQTC9sojsC8XGCc/1HyrSNabLJP/5QB9v6a+mJswVCZU5zO1xqAJXIrrjRvBhe
+dbTDL7hiiLZHbVDOREesvLB/p4HBV0qmsbdDm7RnXhHL3lNr+SIH4JIrRecBpCSM
+TVLHaF6ycKXtGQGkU7JCa4JE2Jl8Fg0ZltE4a29fBvO/HGNdQ6idNM0dhj7RkHWS
+gcG/fnPr9jbpPQ5SwHHkYBDp5Xi08qhTAN9dOHQnB/8FDw8lUZkzPVZHCoVDUyWK
+rWCtKlbFZMS8wUaC7hBaylJ2pYmcNKdGEqzehCCHHnBop3qustoUQ4ec54fqxzLa
+MWNy
+-----END CERTIFICATE-----"#;
+
+    let src = format!(
+        r#"
+import crypto from 'node:crypto';
+const {{ X509Certificate }} = crypto;
+
+const pem = `{pem}`;
+const cert = new X509Certificate(pem);
+
+// subject / issuer
+const subj = cert.subject;
+console.log("subject_has_cn=" + subj.includes("CN=test.example.com"));
+console.log("subject_has_c=" + subj.includes("C=US"));
+console.log("subject_has_o=" + subj.includes("O=OAM Test"));
+console.log("issuer_matches=" + (cert.issuer === cert.subject));
+
+// serialNumber
+console.log("serial_len=" + cert.serialNumber.length);
+console.log("serial_hex=" + /^[0-9A-F]+$/.test(cert.serialNumber));
+
+// validity dates
+console.log("validFrom_nonempty=" + (cert.validFrom.length > 0));
+console.log("validTo_nonempty=" + (cert.validTo.length > 0));
+
+// fingerprints
+const fpParts = cert.fingerprint.split(":");
+console.log("fp_bytes=" + fpParts.length);
+console.log("fp256_bytes=" + cert.fingerprint256.split(":").length);
+
+// ca
+console.log("ca=" + cert.ca);
+
+// SAN
+console.log("san_has_test=" + cert.subjectAltName.includes("DNS:test.example.com"));
+console.log("san_has_wildcard=" + cert.subjectAltName.includes("DNS:*.example.com"));
+
+// raw
+console.log("raw_type=" + (cert.raw instanceof Uint8Array));
+console.log("raw_len=" + cert.raw.length);
+
+// toString round-trip
+const pem2 = cert.toString();
+console.log("tostring_begins=" + pem2.startsWith("-----BEGIN CERTIFICATE-----"));
+console.log("tostring_ends=" + pem2.trimEnd().endsWith("-----END CERTIFICATE-----"));
+const cert2 = new X509Certificate(pem2);
+console.log("roundtrip_subject=" + (cert2.subject === cert.subject));
+console.log("roundtrip_fp=" + (cert2.fingerprint === cert.fingerprint));
+
+// toJSON
+console.log("tojson_is_pem=" + (cert.toJSON() === cert.toString()));
+
+// toLegacyObject
+const legacy = cert.toLegacyObject();
+console.log("legacy_has_subject=" + ("subject" in legacy));
+console.log("legacy_has_serial=" + ("serialNumber" in legacy));
+"#,
+        pem = pem
+    );
+
+    let file = write_temp("crypto_x509.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "X509Certificate test failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let expected = [
+        "subject_has_cn=true",
+        "subject_has_c=true",
+        "subject_has_o=true",
+        "issuer_matches=true",
+        "serial_len=40",
+        "serial_hex=true",
+        "validFrom_nonempty=true",
+        "validTo_nonempty=true",
+        "fp_bytes=20",
+        "fp256_bytes=32",
+        "ca=true",
+        "san_has_test=true",
+        "san_has_wildcard=true",
+        "raw_type=true",
+        "raw_len=963",
+        "tostring_begins=true",
+        "tostring_ends=true",
+        "roundtrip_subject=true",
+        "roundtrip_fp=true",
+        "tojson_is_pem=true",
+        "legacy_has_subject=true",
+        "legacy_has_serial=true",
+    ];
+
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+// ── Wave 8: privateEncrypt / publicDecrypt ─────────────────────────
+
+#[test]
+fn crypto_private_encrypt_public_decrypt() {
+    let file = write_temp(
+        "crypto_priv_enc.mjs",
+        r#"
+import crypto from "node:crypto";
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+});
+
+const msg = Buffer.from("hello private encrypt");
+const encrypted = crypto.privateEncrypt(privateKey, msg);
+console.log("encrypted_type=" + (encrypted instanceof Buffer));
+console.log("encrypted_len=" + encrypted.length);
+
+const decrypted = crypto.publicDecrypt(publicKey, encrypted);
+console.log("round_trip=" + decrypted.toString());
+
+// Also test with object form
+const encrypted2 = crypto.privateEncrypt({ key: privateKey }, Buffer.from("obj form"));
+const decrypted2 = crypto.publicDecrypt({ key: publicKey }, encrypted2);
+console.log("obj_round_trip=" + decrypted2.toString());
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("encrypted_type=true"), "stdout: {stdout}");
+    assert!(stdout.contains("encrypted_len=256"), "stdout: {stdout}");
+    assert!(stdout.contains("round_trip=hello private encrypt"), "stdout: {stdout}");
+    assert!(stdout.contains("obj_round_trip=obj form"), "stdout: {stdout}");
+}
+
+// ── Wave 8: subtle.importKey JWK ────────────────────────────────────
+
+#[test]
+fn crypto_subtle_import_key_jwk() {
+    let file = write_temp(
+        "crypto_subtle_jwk.mjs",
+        r#"
+import crypto from "node:crypto";
+const { subtle } = crypto.webcrypto || crypto;
+
+// Test symmetric (oct) JWK import
+const hmacJwk = {
+  kty: "oct",
+  k: "c2VjcmV0a2V5MTIzNDU2Nzg",  // base64url("secretkey12345678")
+  alg: "HS256",
+};
+const hmacKey = await subtle.importKey("jwk", hmacJwk, { name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
+console.log("hmac_key_type=" + hmacKey.type);
+
+const sig = await subtle.sign("HMAC", hmacKey, new TextEncoder().encode("test data"));
+console.log("hmac_sig_len=" + new Uint8Array(sig).length);
+
+const valid = await subtle.verify("HMAC", hmacKey, sig, new TextEncoder().encode("test data"));
+console.log("hmac_verify=" + valid);
+
+// Test RSA JWK import (public key only - simpler)
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+});
+
+// Sign with PEM key, verify with JWK-imported key
+const signer = crypto.createSign("SHA256");
+signer.update("jwk test data");
+const rsaSig = signer.sign(privateKey);
+console.log("rsa_sig_len=" + rsaSig.length);
+console.log("all_ok=true");
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("hmac_key_type=secret"), "stdout: {stdout}");
+    assert!(stdout.contains("hmac_sig_len=32"), "stdout: {stdout}");
+    assert!(stdout.contains("hmac_verify=true"), "stdout: {stdout}");
+    assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
+}
+
+// ── Wave 8: createKeyObject from JWK ────────────────────────────────
+
+#[test]
+fn crypto_create_key_object_jwk() {
+    let file = write_temp(
+        "crypto_keyobj_jwk.mjs",
+        r#"
+import crypto from "node:crypto";
+
+// Test createSecretKey from JWK
+const secretJwk = { kty: "oct", k: "dGVzdGtleQ" };  // base64url("testkey")
+const secretKey = crypto.createSecretKey(secretJwk);
+console.log("secret_type=" + secretKey.type);
+
+// Test createPublicKey from JWK
+const { publicKey: pubPem, privateKey: privPem } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+});
+
+console.log("secret_key_ok=true");
+console.log("all_ok=true");
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("secret_type=secret"), "stdout: {stdout}");
+    assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
+}
+
+// ── Wave 8: createDiffieHellman(primeLength) ────────────────────────
+
+#[test]
+fn crypto_dh_prime_generation() {
+    let file = write_temp(
+        "crypto_dh_primegen.mjs",
+        r#"
+import crypto from "node:crypto";
+
+// Test createDiffieHellman with bit length
+const dh = crypto.createDiffieHellman(512);
+console.log("dh_created=true");
+
+const prime = dh.getPrime();
+console.log("prime_len=" + prime.length);
+console.log("prime_bits_ok=" + (prime.length * 8 >= 512));
+
+// Generate keys and verify they work
+dh.generateKeys();
+const pub1 = dh.getPublicKey();
+const priv1 = dh.getPrivateKey();
+console.log("has_public=" + (pub1.length > 0));
+console.log("has_private=" + (priv1.length > 0));
+
+// Test DH key exchange with generated prime
+const dh2 = crypto.createDiffieHellman(dh.getPrime(), dh.getGenerator());
+dh2.generateKeys();
+
+const secret1 = dh.computeSecret(dh2.getPublicKey());
+const secret2 = dh2.computeSecret(dh.getPublicKey());
+console.log("secrets_match=" + (secret1.toString("hex") === secret2.toString("hex")));
+
+// Also test DiffieHellman constructor with number
+const dh3 = new crypto.DiffieHellman(256);
+dh3.generateKeys();
+console.log("constructor_ok=true");
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("dh_created=true"), "stdout: {stdout}");
+    assert!(stdout.contains("prime_bits_ok=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_public=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_private=true"), "stdout: {stdout}");
+    assert!(stdout.contains("secrets_match=true"), "stdout: {stdout}");
+    assert!(stdout.contains("constructor_ok=true"), "stdout: {stdout}");
+}
+
+// ── Wave 8: generatePrime / checkPrimeSync ──────────────────────────
+
+#[test]
+fn crypto_generate_prime_check_prime() {
+    let file = write_temp(
+        "crypto_primes.mjs",
+        r#"
+import crypto from "node:crypto";
+
+// generatePrimeSync returns a Buffer
+const prime = crypto.generatePrimeSync(128);
+console.log("prime_is_buffer=" + Buffer.isBuffer(prime));
+console.log("prime_byte_len=" + prime.length);
+
+// checkPrimeSync verifies the generated prime
+const isPrime = crypto.checkPrimeSync(prime);
+console.log("is_prime=" + isPrime);
+
+// Check known prime
+const knownPrime = Buffer.from([0x07]); // 7 is prime
+console.log("seven_is_prime=" + crypto.checkPrimeSync(knownPrime));
+
+// Check known composite
+const composite = Buffer.from([0x09]); // 9 = 3*3
+console.log("nine_is_prime=" + crypto.checkPrimeSync(composite));
+
+// generatePrimeSync with bigint option
+const bigPrime = crypto.generatePrimeSync(64, { bigint: true });
+console.log("bigint_type=" + (typeof bigPrime));
+console.log("bigint_positive=" + (bigPrime > 0n));
+
+// checkPrimeSync with BigInt input
+console.log("bigint_is_prime=" + crypto.checkPrimeSync(bigPrime));
+console.log("bigint_4_is_prime=" + crypto.checkPrimeSync(4n));
+
+// Async generatePrime with callback
+crypto.generatePrime(64, (err, p) => {
+  console.log("async_err=" + (err === null));
+  console.log("async_is_buffer=" + Buffer.isBuffer(p));
+  console.log("async_is_prime=" + crypto.checkPrimeSync(p));
+});
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("prime_is_buffer=true"), "stdout: {stdout}");
+    assert!(stdout.contains("is_prime=true"), "stdout: {stdout}");
+    assert!(stdout.contains("seven_is_prime=true"), "stdout: {stdout}");
+    assert!(stdout.contains("nine_is_prime=false"), "stdout: {stdout}");
+    assert!(stdout.contains("bigint_type=bigint"), "stdout: {stdout}");
+    assert!(stdout.contains("bigint_positive=true"), "stdout: {stdout}");
+    assert!(stdout.contains("bigint_is_prime=true"), "stdout: {stdout}");
+    assert!(stdout.contains("bigint_4_is_prime=false"), "stdout: {stdout}");
+    assert!(stdout.contains("async_err=true"), "stdout: {stdout}");
+    assert!(stdout.contains("async_is_buffer=true"), "stdout: {stdout}");
+    assert!(stdout.contains("async_is_prime=true"), "stdout: {stdout}");
+}

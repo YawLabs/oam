@@ -43,6 +43,8 @@ p256 = { workspace = true }
 p384 = { workspace = true }
 # node:crypto wave 6: classic Diffie-Hellman.
 num-bigint-dig = { workspace = true }
+# node:crypto wave 7: X.509 certificate inspection.
+x509-parser = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.

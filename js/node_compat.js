@@ -5188,6 +5188,10 @@
       // buffer (standard key-hygiene) would silently corrupt the key.
       // NOTE: Buffer#slice is a VIEW here (Node semantics) — use a real
       // Uint8Array copy.
+      if (typeof key === "object" && key !== null && key.kty === "oct") {
+        var raw = new Uint8Array(base64urlDecode(key.k));
+        return new KeyObject("secret", raw);
+      }
       const material = toBytes(key, encoding);
       return new KeyObject("secret", new Uint8Array(material));
     }
@@ -5213,7 +5217,14 @@
 
     function createPrivateKey(input) {
       var pem;
-      if (typeof input === "string") {
+      if (typeof input === "object" && input !== null && input.format === "jwk" && input.key) {
+        var jwk = input.key;
+        if (jwk.kty === "RSA") {
+          pem = derToPem(rsaJwkToPkcs8(jwk), "PRIVATE KEY");
+        } else {
+          throw new Error("createPrivateKey: unsupported JWK kty: " + jwk.kty);
+        }
+      } else if (typeof input === "string") {
         pem = input;
       } else if (input && typeof input === "object") {
         if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
@@ -5238,7 +5249,14 @@
 
     function createPublicKey(input) {
       var pem;
-      if (typeof input === "string") {
+      if (typeof input === "object" && input !== null && input.format === "jwk" && input.key) {
+        var jwk = input.key;
+        if (jwk.kty === "RSA") {
+          pem = derToPem(rsaJwkToSpki(jwk), "PUBLIC KEY");
+        } else {
+          throw new Error("createPublicKey: unsupported JWK kty: " + jwk.kty);
+        }
+      } else if (typeof input === "string") {
         pem = input;
       } else if (input && typeof input === "object") {
         if (input instanceof KeyObject && input.type === "private") {
@@ -5498,7 +5516,24 @@
           _importedKeys.set(id, { format: "spki", pem: pem, algo: algoObj });
           keyType = "public";
         } else if (format === "jwk") {
-          throw new Error("subtle.importKey: JWK format not yet supported in oam");
+          var kty = keyData.kty;
+          if (kty === "oct") {
+            var raw = new Uint8Array(base64urlDecode(keyData.k));
+            _importedKeys.set(id, { format: "raw", data: raw, algo: algoObj });
+            keyType = "secret";
+          } else if (kty === "RSA") {
+            if (keyData.d) {
+              pem = derToPem(rsaJwkToPkcs8(keyData), "PRIVATE KEY");
+              _importedKeys.set(id, { format: "pkcs8", pem: pem, algo: algoObj });
+              keyType = "private";
+            } else {
+              pem = derToPem(rsaJwkToSpki(keyData), "PUBLIC KEY");
+              _importedKeys.set(id, { format: "spki", pem: pem, algo: algoObj });
+              keyType = "public";
+            }
+          } else {
+            throw new Error("subtle.importKey: unsupported JWK kty: " + kty);
+          }
         } else {
           throw new Error("subtle.importKey: unsupported format " + format);
         }
@@ -6041,6 +6076,92 @@
       return new ECDH(curveName);
     }
 
+    // ---- ASN.1 / JWK helpers ----
+    function base64urlDecode(str) {
+      str = str.replace(/-/g, '+').replace(/_/g, '/');
+      while (str.length % 4 !== 0) str += '=';
+      return BufferCtor.from(str, 'base64');
+    }
+    function base64urlEncode(buf) {
+      return BufferCtor.from(buf).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    function asn1Length(len) {
+      if (len < 128) return [len];
+      var bytes = [];
+      var tmp = len;
+      while (tmp > 0) { bytes.unshift(tmp & 0xFF); tmp >>= 8; }
+      bytes.unshift(0x80 | bytes.length);
+      return bytes;
+    }
+    function asn1Wrap(tag, content) {
+      var len = asn1Length(content.length);
+      var out = new Uint8Array(1 + len.length + content.length);
+      out[0] = tag;
+      out.set(len, 1);
+      out.set(content, 1 + len.length);
+      return out;
+    }
+    function asn1Int(bytes) {
+      if (bytes[0] >= 0x80) {
+        var padded = new Uint8Array(bytes.length + 1);
+        padded.set(bytes, 1);
+        bytes = padded;
+      }
+      return asn1Wrap(0x02, bytes);
+    }
+    function asn1Seq(parts) {
+      var totalLen = 0;
+      for (var i = 0; i < parts.length; i++) totalLen += parts[i].length;
+      var content = new Uint8Array(totalLen);
+      var off = 0;
+      for (var i = 0; i < parts.length; i++) {
+        content.set(parts[i], off);
+        off += parts[i].length;
+      }
+      return asn1Wrap(0x30, content);
+    }
+    var RSA_OID_BYTES = new Uint8Array([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00]);
+
+    function rsaJwkToSpki(jwk) {
+      var n = new Uint8Array(base64urlDecode(jwk.n));
+      var e = new Uint8Array(base64urlDecode(jwk.e));
+      var pubKeySeq = asn1Seq([asn1Int(n), asn1Int(e)]);
+      var bitStr = asn1Wrap(0x03, (function() {
+        var bs = new Uint8Array(1 + pubKeySeq.length);
+        bs[0] = 0x00;
+        bs.set(pubKeySeq, 1);
+        return bs;
+      })());
+      var totalLen = RSA_OID_BYTES.length + bitStr.length;
+      var content = new Uint8Array(totalLen);
+      content.set(RSA_OID_BYTES, 0);
+      content.set(bitStr, RSA_OID_BYTES.length);
+      return asn1Wrap(0x30, content);
+    }
+
+    function rsaJwkToPkcs8(jwk) {
+      var n = new Uint8Array(base64urlDecode(jwk.n));
+      var e = new Uint8Array(base64urlDecode(jwk.e));
+      var d = new Uint8Array(base64urlDecode(jwk.d));
+      var p = new Uint8Array(base64urlDecode(jwk.p));
+      var q = new Uint8Array(base64urlDecode(jwk.q));
+      var dp = new Uint8Array(base64urlDecode(jwk.dp));
+      var dq = new Uint8Array(base64urlDecode(jwk.dq));
+      var qi = new Uint8Array(base64urlDecode(jwk.qi));
+      var version = asn1Int(new Uint8Array([0]));
+      var rsaPriv = asn1Seq([version, asn1Int(n), asn1Int(e), asn1Int(d), asn1Int(p), asn1Int(q), asn1Int(dp), asn1Int(dq), asn1Int(qi)]);
+      var octetStr = asn1Wrap(0x04, rsaPriv);
+      var pkcs8Version = asn1Int(new Uint8Array([0]));
+      return asn1Seq([pkcs8Version, RSA_OID_BYTES, octetStr]);
+    }
+
+    function rsaJwkToPkcs1(jwk) {
+      var n = new Uint8Array(base64urlDecode(jwk.n));
+      var e = new Uint8Array(base64urlDecode(jwk.e));
+      return asn1Seq([asn1Int(n), asn1Int(e)]);
+    }
+
     function publicEncrypt(keyOrOpts, buffer) {
       var key, padding = 4, oaepHash = "sha1";
       if (typeof keyOrOpts === "string") {
@@ -6077,6 +6198,36 @@
       return BufferCtor.from(natives.cryptoPrivateDecrypt(new Uint8Array(data), key, paddingName, oaepHash));
     }
 
+    function privateEncrypt(keyOrOpts, buffer) {
+      var key;
+      if (typeof keyOrOpts === "string") {
+        key = keyOrOpts;
+      } else if (ArrayBuffer.isView(keyOrOpts)) {
+        key = new TextDecoder().decode(keyOrOpts);
+      } else if (keyOrOpts && typeof keyOrOpts === "object") {
+        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
+      } else {
+        throw new TypeError("privateEncrypt: key must be a string, Buffer, or object");
+      }
+      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
+      return BufferCtor.from(natives.cryptoPrivateEncrypt(new Uint8Array(data), key));
+    }
+
+    function publicDecrypt(keyOrOpts, buffer) {
+      var key;
+      if (typeof keyOrOpts === "string") {
+        key = keyOrOpts;
+      } else if (ArrayBuffer.isView(keyOrOpts)) {
+        key = new TextDecoder().decode(keyOrOpts);
+      } else if (keyOrOpts && typeof keyOrOpts === "object") {
+        key = typeof keyOrOpts.key === "string" ? keyOrOpts.key : new TextDecoder().decode(keyOrOpts.key);
+      } else {
+        throw new TypeError("publicDecrypt: key must be a string, Buffer, or object");
+      }
+      var data = typeof buffer === "string" ? BufferCtor.from(buffer) : buffer;
+      return BufferCtor.from(natives.cryptoPublicDecrypt(new Uint8Array(data), key));
+    }
+
 
     // ---- Diffie-Hellman (classic, non-EC) ----
     var DH_GROUPS = {
@@ -6089,7 +6240,8 @@
     class DiffieHellman {
       constructor(prime, generator) {
         if (typeof prime === "number") {
-          throw new Error("DH prime generation by bit length not yet supported in oam");
+          var primeBytes = BufferCtor.from(natives.cryptoGeneratePrime(prime));
+          prime = primeBytes;
         }
         this._prime = BufferCtor.isBuffer(prime) ? prime : BufferCtor.from(prime);
         if (!generator) generator = BufferCtor.from([2]);
@@ -6154,7 +6306,8 @@
 
     function createDiffieHellman(primeOrLen, primeEncoding, generator, generatorEncoding) {
       if (typeof primeOrLen === "number") {
-        throw new Error("DH prime generation by bit length not yet supported in oam");
+        var primeBytes = BufferCtor.from(natives.cryptoGeneratePrime(primeOrLen));
+        return new DiffieHellman(primeBytes, BufferCtor.from([2]));
       }
       var prime = typeof primeOrLen === "string"
         ? BufferCtor.from(primeOrLen, primeEncoding || "hex")
@@ -6178,6 +6331,56 @@
       return new DiffieHellman(BufferCtor.from(hex, "hex"), BufferCtor.from([2]));
     }
 
+
+    // ---- X.509 Certificate ----
+    class X509Certificate {
+      constructor(buf) {
+        if (typeof buf === "string") buf = BufferCtor.from(buf);
+        else if (!BufferCtor.isBuffer(buf)) buf = BufferCtor.from(buf);
+        var parsed = natives.cryptoX509Parse(new Uint8Array(buf));
+        this._subject = parsed.subject;
+        this._issuer = parsed.issuer;
+        this._serialNumber = parsed.serialNumber;
+        this._validFrom = parsed.validFrom;
+        this._validTo = parsed.validTo;
+        this._fingerprint = parsed.fingerprint;
+        this._fingerprint256 = parsed.fingerprint256;
+        this._ca = parsed.ca;
+        this._subjectAltName = parsed.subjectAltName || "";
+        this._keyUsage = parsed.keyUsage || [];
+        this._raw = BufferCtor.from(parsed.raw);
+      }
+      get subject() { return this._subject; }
+      get issuer() { return this._issuer; }
+      get serialNumber() { return this._serialNumber; }
+      get validFrom() { return this._validFrom; }
+      get validTo() { return this._validTo; }
+      get fingerprint() { return this._fingerprint; }
+      get fingerprint256() { return this._fingerprint256; }
+      get ca() { return this._ca; }
+      get subjectAltName() { return this._subjectAltName; }
+      get keyUsage() { return this._keyUsage; }
+      get raw() { return this._raw; }
+      toString() {
+        var b64 = this._raw.toString("base64");
+        var out = [];
+        for (var i = 0; i < b64.length; i += 64) out.push(b64.slice(i, i + 64));
+        return "-----BEGIN CERTIFICATE-----\n" + out.join("\n") + "\n-----END CERTIFICATE-----\n";
+      }
+      toJSON() { return this.toString(); }
+      toLegacyObject() {
+        return {
+          subject: this._subject,
+          issuer: this._issuer,
+          serialNumber: this._serialNumber,
+          valid_from: this._validFrom,
+          valid_to: this._validTo,
+          fingerprint: this._fingerprint,
+          fingerprint256: this._fingerprint256,
+        };
+      }
+    }
+
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
     class Certificate {
@@ -6187,6 +6390,53 @@
       exportChallenge() { return Certificate.exportChallenge.apply(null, arguments); }
       exportPublicKey() { return Certificate.exportPublicKey.apply(null, arguments); }
       verifySpkac() { return Certificate.verifySpkac.apply(null, arguments); }
+    }
+
+    function generatePrimeSync(size, options) {
+      var bigint = options && options.bigint;
+      var bytes = natives.cryptoGeneratePrime(size);
+      if (bigint) {
+        var hex = "";
+        for (var i = 0; i < bytes.length; i++) hex += ("0" + bytes[i].toString(16)).slice(-2);
+        return BigInt("0x" + hex);
+      }
+      return BufferCtor.from(bytes);
+    }
+
+    function generatePrime(size, options, callback) {
+      if (typeof options === "function") { callback = options; options = {}; }
+      try {
+        var result = generatePrimeSync(size, options);
+        if (callback) queueMicrotask(function() { callback(null, result); });
+        else return result;
+      } catch (err) {
+        if (callback) queueMicrotask(function() { callback(err); });
+        else throw err;
+      }
+    }
+
+    function checkPrimeSync(candidate, options) {
+      var buf;
+      if (typeof candidate === "bigint") {
+        var hex = candidate.toString(16);
+        if (hex.length % 2 !== 0) hex = "0" + hex;
+        buf = BufferCtor.from(hex, 'hex');
+      } else {
+        buf = BufferCtor.from(candidate);
+      }
+      return natives.cryptoCheckPrime(new Uint8Array(buf));
+    }
+
+    function checkPrime(candidate, options, callback) {
+      if (typeof options === "function") { callback = options; options = {}; }
+      try {
+        var result = checkPrimeSync(candidate, options);
+        if (callback) queueMicrotask(function() { callback(null, result); });
+        else return result;
+      } catch (err) {
+        if (callback) queueMicrotask(function() { callback(err); });
+        else throw err;
+      }
     }
 
     return {
@@ -6281,10 +6531,17 @@
       createECDH,
       ECDH,
       publicEncrypt,
+      privateEncrypt,
       privateDecrypt,
+      publicDecrypt,
       createDiffieHellman,
       getDiffieHellman,
       DiffieHellman,
+      X509Certificate,
+      generatePrime,
+      generatePrimeSync,
+      checkPrime,
+      checkPrimeSync,
       createSign,
       createVerify,
       sign: signOneShot,
