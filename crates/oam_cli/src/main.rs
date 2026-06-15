@@ -1299,9 +1299,6 @@ fn run_embedded(source: &str, args: Vec<String>) -> ExitCode {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam-compiled".to_string());
-    let mut argv = vec![exe];
-    argv.extend(script_args);
-    rt.set_process_argv(argv);
 
     if let Some((addr, brk)) = inspect {
         match rt.attach_inspector(addr, brk) {
@@ -1326,6 +1323,13 @@ fn run_embedded(source: &str, args: Vec<String>) -> ExitCode {
     std::fs::create_dir_all(&tmp_dir).expect("create temp dir for embedded source");
     let tmp_file = tmp_dir.join("__oam_embedded.js");
     std::fs::write(&tmp_file, source).expect("write embedded source to temp");
+
+    // Node convention: argv[0]=binary, argv[1]=script path. Set argv[1] to
+    // the temp file so isEntryPoint checks (import.meta.url vs
+    // pathToFileURL(argv[1])) pass -- __filename is this same temp path.
+    let mut argv = vec![exe, tmp_file.to_string_lossy().into_owned()];
+    argv.extend(script_args);
+    rt.set_process_argv(argv);
 
     let result = rt.execute_cjs(&tmp_file);
     let _ = std::fs::remove_dir_all(&tmp_dir);

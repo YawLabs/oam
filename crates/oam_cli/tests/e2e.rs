@@ -10549,7 +10549,7 @@ fn compile_produces_standalone_binary_that_runs() {
 fn compile_binary_passes_script_args() {
     let entry = write_temp(
         "compile_args.js",
-        "console.log('args=' + process.argv.slice(1).join(','));",
+        "console.log('args=' + process.argv.slice(2).join(','));",
     );
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let nanos = std::time::SystemTime::now()
