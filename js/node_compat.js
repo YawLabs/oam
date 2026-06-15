@@ -8034,18 +8034,21 @@
           if (this._types.indexOf(options.type) === -1) {
             this._types.push(options.type);
           }
-          if (options.buffered) {
-            var existing = [];
-            var t = options.type;
+        }
+        if (options && options.buffered) {
+          var existing = [];
+          var types = this._types;
+          for (var ti = 0; ti < types.length; ti++) {
+            var t = types[ti];
             if (t === "mark") {
               for (var i = 0; i < _marks.length; i++) existing.push(_marks[i]);
             } else if (t === "measure") {
               for (var i = 0; i < _measures.length; i++) existing.push(_measures[i]);
             }
-            if (existing.length > 0) {
-              var self = this;
-              try { self._cb(new PerformanceObserverEntryList(existing), self); } catch (e) {}
-            }
+          }
+          if (existing.length > 0) {
+            var self = this;
+            try { self._cb(new PerformanceObserverEntryList(existing), self); } catch (e) {}
           }
         }
         if (_observers.indexOf(this) === -1) {
@@ -8103,10 +8106,12 @@
 
         if (typeof startMarkOrOptions === "string") {
           var sm = _findMark(startMarkOrOptions);
-          if (sm) startTime = sm.startTime;
+          if (!sm) throw new Error("Failed to execute 'measure': The mark '" + startMarkOrOptions + "' does not exist.");
+          startTime = sm.startTime;
           if (typeof endMark === "string") {
             var em = _findMark(endMark);
-            if (em) endTime = em.startTime;
+            if (!em) throw new Error("Failed to execute 'measure': The mark '" + endMark + "' does not exist.");
+            endTime = em.startTime;
           }
           duration = endTime - startTime;
         } else if (startMarkOrOptions && typeof startMarkOrOptions === "object") {
@@ -8115,7 +8120,8 @@
           if (opts.start !== undefined) {
             if (typeof opts.start === "string") {
               var smk = _findMark(opts.start);
-              startTime = smk ? smk.startTime : 0;
+              if (!smk) throw new Error("Failed to execute 'measure': The mark '" + opts.start + "' does not exist.");
+              startTime = smk.startTime;
             } else {
               startTime = opts.start;
             }
@@ -8123,7 +8129,8 @@
           if (opts.end !== undefined) {
             if (typeof opts.end === "string") {
               var emk = _findMark(opts.end);
-              endTime = emk ? emk.startTime : globalThis.performance.now();
+              if (!emk) throw new Error("Failed to execute 'measure': The mark '" + opts.end + "' does not exist.");
+              endTime = emk.startTime;
             } else {
               endTime = opts.end;
             }
@@ -8143,9 +8150,9 @@
         return entry;
       },
 
-      getEntries: function() { return _marks.concat(_measures); },
+      getEntries: function() { return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}); },
       getEntriesByName: function(name, type) {
-        return _marks.concat(_measures).filter(function(e) {
+        return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}).filter(function(e) {
           return e.name === name && (type === undefined || e.entryType === type);
         });
       },
@@ -8285,7 +8292,7 @@
         const opts = options || {};
         this.input = opts.input || null;
         this.output = opts.output || null;
-        this.terminal = opts.terminal === true;
+        this.terminal = opts.terminal != null ? opts.terminal === true : !!(opts.output && opts.output.isTTY);
         this._closed = false;
         this._paused = false;
         this._prompt = typeof opts.prompt === "string" ? opts.prompt : "> ";
@@ -8324,8 +8331,10 @@
       }
       question(prompt, cb) {
         if (this.output && typeof this.output.write === "function") this.output.write(prompt);
-        const onLine = (line) => { this.removeListener("line", onLine); cb(line); };
+        const cleanup = () => { this.removeListener("line", onLine); };
+        const onLine = (line) => { this.removeListener("close", cleanup); cb(line); };
         this.once("line", onLine);
+        this.once("close", cleanup);
       }
       setPrompt(prompt) {
         this._prompt = typeof prompt === "string" ? prompt : "> ";
@@ -8447,9 +8456,19 @@
   registry.factories["readline/promises"] = () => {
     var rl = registry.get("readline");
     class Interface extends rl.Interface {
-      question(prompt) {
-        return new Promise(function (resolve) {
-          rl.Interface.prototype.question.call(this, prompt, resolve);
+      question(prompt, options) {
+        var signal = options && options.signal ? options.signal : null;
+        return new Promise(function (resolve, reject) {
+          if (signal && signal.aborted) { reject(new DOMException("The operation was aborted", "AbortError")); return; }
+          var onAbort;
+          rl.Interface.prototype.question.call(this, prompt, function(answer) {
+            if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+            resolve(answer);
+          });
+          if (signal) {
+            onAbort = function() { reject(new DOMException("The operation was aborted", "AbortError")); };
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
         }.bind(this));
       }
     }
@@ -8535,9 +8554,10 @@
     }
 
     function createContext(sandbox, _options) {
-      const obj = sandbox != null && typeof sandbox === "object"
-        ? sandbox
-        : Object.create(null);
+      if (sandbox !== undefined && (sandbox === null || typeof sandbox !== "object")) {
+        throw new TypeError("The 'sandbox' argument must be of type object. Received " + typeof sandbox);
+      }
+      const obj = sandbox != null ? sandbox : Object.create(null);
       if (!_vmContexts.has(obj)) {
         _vmContexts.add(obj);
         // Tag the context unless the caller already set Symbol.toStringTag.
@@ -9756,7 +9776,10 @@
       constructor() { super(); this._twin = null; this._active = true; }
       postMessage(data) {
         const twin = this._twin;
-        if (twin && twin._active) queueMicrotask(() => twin.emit("message", data));
+        if (twin && twin._active) {
+          const cloned = (typeof data === "object" && data !== null) ? structuredClone(data) : data;
+          queueMicrotask(() => twin.emit("message", cloned));
+        }
       }
       start() { return this; }
       close() { this._active = false; this.emit("close"); }
@@ -9839,15 +9862,15 @@
     function getEnvironmentData(key) {
       const val = _envData.get(key);
       if (val === undefined) return undefined;
-      // Return a clone via JSON round-trip
-      return JSON.parse(JSON.stringify(val));
+      if (val === null || typeof val !== "object") return val;
+      return structuredClone(val);
     }
 
     function setEnvironmentData(key, value) {
       if (value === undefined) {
         _envData.delete(key);
       } else {
-        _envData.set(key, value);
+        _envData.set(key, (typeof value === "object" && value !== null) ? structuredClone(value) : value);
       }
     }
 
