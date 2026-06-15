@@ -18,6 +18,7 @@ pub struct TcpState {
     writers: HashMap<u64, OwnedWriteHalf>,
     listeners: HashMap<u64, tokio::net::TcpListener>,
     closed: HashSet<u64>,
+    cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
 }
 
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;
@@ -228,46 +229,62 @@ pub async fn tcp_accept(
     server_id: u64,
     stream_ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> OpOutcome {
-    let listener = registry
-        .lock()
-        .expect("tcp registry lock")
-        .listeners
-        .remove(&server_id);
+    let (listener, notify) = {
+        let mut guard = registry.lock().expect("tcp registry lock");
+        let listener = guard.listeners.remove(&server_id);
+        let notify = guard
+            .cancel
+            .entry(server_id)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        (listener, notify)
+    };
     let Some(listener) = listener else {
         return OpOutcome::Done;
     };
 
-    match listener.accept().await {
-        Ok((stream, peer_addr)) => {
-            reinsert_listener(&registry, server_id, listener);
+    tokio::select! {
+        result = listener.accept() => {
+            match result {
+                Ok((stream, peer_addr)) => {
+                    reinsert_listener(&registry, server_id, listener);
 
-            let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
-            let (reader, writer) = stream.into_split();
-            {
-                let mut guard = registry.lock().expect("tcp registry lock");
-                guard.readers.insert(handle, reader);
-                guard.writers.insert(handle, writer);
+                    let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
+                    let (reader, writer) = stream.into_split();
+                    {
+                        let mut guard = registry.lock().expect("tcp registry lock");
+                        guard.readers.insert(handle, reader);
+                        guard.writers.insert(handle, writer);
+                    }
+
+                    OpOutcome::Json(
+                        serde_json::json!({
+                            "handle": handle,
+                            "remoteAddr": addr_to_json(peer_addr),
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => {
+                    reinsert_listener(&registry, server_id, listener);
+                    tcp_fail(e, "accept", &server_id.to_string())
+                }
             }
-
-            OpOutcome::Json(
-                serde_json::json!({
-                    "handle": handle,
-                    "remoteAddr": addr_to_json(peer_addr),
-                })
-                .to_string(),
-            )
         }
-        Err(e) => {
-            reinsert_listener(&registry, server_id, listener);
-            tcp_fail(e, "accept", &server_id.to_string())
+        _ = notify.notified() => {
+            drop(listener);
+            OpOutcome::Done
         }
     }
 }
 
 /// Close a TCP server. Remove the listener AND add to closed set so any
-/// in-flight accept does not resurrect it.
+/// in-flight accept does not resurrect it. Notifies any blocked accept.
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().expect("tcp registry lock");
     guard.listeners.remove(&server_id);
     guard.closed.insert(server_id);
+    if let Some(notify) = guard.cancel.remove(&server_id) {
+        notify.notify_one();
+    }
 }

@@ -97,6 +97,10 @@ bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false }
 webpki-roots = "0.26"
 rustls-pemfile = "2"
+# DNS record-type resolution (MX, TXT, CNAME, NS, SRV, SOA, PTR, etc.)
+# and reverse lookups. tokio-runtime for async; system-config reads
+# the OS resolver settings.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 # V8 Inspector (CDP) transport: WebSocket framing for the debugger socket.
 # default-features=false drops the TLS backends — the inspector is
 # plaintext localhost only.

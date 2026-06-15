@@ -5112,7 +5112,10 @@ console.log("input:", Buffer.from(r3.stdout).toString().trim());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {}: {stdout}", out.status);
     assert!(stdout.contains("execSync: hello from execSync"), "{stdout}");
-    assert!(stdout.contains("spawnSync: spawn sync status: 0"), "{stdout}");
+    assert!(
+        stdout.contains("spawnSync: spawn sync status: 0"),
+        "{stdout}"
+    );
     assert!(stdout.contains("direct: node-direct status: 0"), "{stdout}");
     assert!(stdout.contains("threw: 42"), "{stdout}");
     assert!(stdout.contains("input: piped-in"), "{stdout}");
@@ -5147,7 +5150,10 @@ cp.on("close", (code) => {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {}: {stdout}", out.status);
     assert!(stdout.contains("spawned pid: number"), "{stdout}");
-    assert!(stdout.contains("spawn-out: hello async code: 0"), "{stdout}");
+    assert!(
+        stdout.contains("spawn-out: hello async code: 0"),
+        "{stdout}"
+    );
     assert!(stdout.contains("exec: exec-cb-test err: null"), "{stdout}");
     assert!(stdout.contains("DONE"), "{stdout}");
 }
@@ -5199,13 +5205,34 @@ try {
         "dns test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert!(lines.iter().any(|l| l.starts_with("cb-err: null")), "callback error should be null: {stdout}");
-    assert!(lines.iter().any(|l| l.starts_with("cb-addr: ")), "callback should return address: {stdout}");
-    assert!(lines.iter().any(|l| l.starts_with("p-addr: ")), "promise should return address: {stdout}");
-    assert!(lines.iter().any(|l| l == &"all-len: true"), "all:true should return results: {stdout}");
-    assert!(lines.iter().any(|l| l == &"resolve4-len: true"), "resolve4 should return results: {stdout}");
-    assert!(lines.iter().any(|l| l == &"resolve4-type: string"), "resolve4 should return strings: {stdout}");
-    assert!(lines.iter().any(|l| l == &"bogus-code: ENOTFOUND"), "bogus hostname should ENOTFOUND: {stdout}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("cb-err: null")),
+        "callback error should be null: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("cb-addr: ")),
+        "callback should return address: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("p-addr: ")),
+        "promise should return address: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l == &"all-len: true"),
+        "all:true should return results: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l == &"resolve4-len: true"),
+        "resolve4 should return results: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l == &"resolve4-type: string"),
+        "resolve4 should return strings: {stdout}"
+    );
+    assert!(
+        lines.iter().any(|l| l == &"bogus-code: ENOTFOUND"),
+        "bogus hostname should ENOTFOUND: {stdout}"
+    );
 }
 
 #[test]
@@ -5251,8 +5278,14 @@ console.log('isTTY:', process.stdin.isTTY);
         "stdin test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(stdout.contains("lines: 2"), "should read 2 lines: {stdout}");
-    assert!(stdout.contains("first: hello world"), "first line: {stdout}");
-    assert!(stdout.contains("isTTY: false"), "piped stdin not TTY: {stdout}");
+    assert!(
+        stdout.contains("first: hello world"),
+        "first line: {stdout}"
+    );
+    assert!(
+        stdout.contains("isTTY: false"),
+        "piped stdin not TTY: {stdout}"
+    );
 }
 
 #[test]
@@ -5278,8 +5311,14 @@ fn fs_watch_detects_file_change() {
            console.log('detected:', detected);\n\
          }, 800);",
     );
-    assert!(stdout.contains("event: change"), "should detect change event: {stdout}");
-    assert!(stdout.contains("detected: true"), "change should be detected: {stdout}");
+    assert!(
+        stdout.contains("event: change"),
+        "should detect change event: {stdout}"
+    );
+    assert!(
+        stdout.contains("detected: true"),
+        "change should be detected: {stdout}"
+    );
 }
 
 #[test]
@@ -6327,7 +6366,10 @@ console.count();
         "console extras failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(stdout.contains("t1:"), "missing timeLog output:\n{stdout}");
-    assert!(stdout.contains("checkpoint"), "missing timeLog extra args:\n{stdout}");
+    assert!(
+        stdout.contains("checkpoint"),
+        "missing timeLog extra args:\n{stdout}"
+    );
     assert!(stdout.contains("a: 1"), "missing count 1:\n{stdout}");
     assert!(stdout.contains("a: 2"), "missing count 2:\n{stdout}");
     assert!(stdout.contains("a: 3"), "missing count 3:\n{stdout}");
@@ -6335,13 +6377,28 @@ console.count();
     let a_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("a: ")).collect();
     assert_eq!(a_lines.len(), 4, "expected 4 'a:' lines, got {a_lines:?}");
     assert_eq!(a_lines[3], "a: 1", "countReset did not reset:\n{stdout}");
-    assert!(stdout.contains("inside"), "missing group content:\n{stdout}");
-    assert!(stdout.contains("(index)"), "missing table header:\n{stdout}");
-    assert!(stderr.contains("assertion fired"), "missing assert output:\n{stderr}");
+    assert!(
+        stdout.contains("inside"),
+        "missing group content:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(index)"),
+        "missing table header:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("assertion fired"),
+        "missing assert output:\n{stderr}"
+    );
     assert!(stdout.contains("hello"), "missing dir output:\n{stdout}");
     // default counters
-    assert!(stdout.contains("default: 1"), "missing default count 1:\n{stdout}");
-    assert!(stdout.contains("default: 2"), "missing default count 2:\n{stdout}");
+    assert!(
+        stdout.contains("default: 1"),
+        "missing default count 1:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("default: 2"),
+        "missing default count 2:\n{stdout}"
+    );
 }
 
 #[test]
@@ -6465,7 +6522,10 @@ console.log('map_enoent=' + map.get(-2)[0]);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(["run", file.to_str().unwrap()])
         .current_dir(env_dir)
-        .env("OAM_CACHE_DIR", write_temp("oam-cache2/.keep", "").parent().unwrap())
+        .env(
+            "OAM_CACHE_DIR",
+            write_temp("oam-cache2/.keep", "").parent().unwrap(),
+        )
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -6666,7 +6726,10 @@ console.log('blob_text=' + text);
             "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
         );
     }
-    assert!(stdout.contains("blob_text=hello"), "missing blob_text.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("blob_text=hello"),
+        "missing blob_text.\nstdout: {stdout}\nstderr: {stderr}"
+    );
 }
 
 #[test]
@@ -8482,11 +8545,20 @@ console.log("obj_round_trip=" + decrypted2.toString());
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("encrypted_type=true"), "stdout: {stdout}");
     assert!(stdout.contains("encrypted_len=256"), "stdout: {stdout}");
-    assert!(stdout.contains("round_trip=hello private encrypt"), "stdout: {stdout}");
-    assert!(stdout.contains("obj_round_trip=obj form"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("round_trip=hello private encrypt"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("obj_round_trip=obj form"),
+        "stdout: {stdout}"
+    );
 }
 
 // ── Wave 8: subtle.importKey JWK ────────────────────────────────────
@@ -8532,7 +8604,10 @@ console.log("all_ok=true");
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("hmac_key_type=secret"), "stdout: {stdout}");
     assert!(stdout.contains("hmac_sig_len=32"), "stdout: {stdout}");
     assert!(stdout.contains("hmac_verify=true"), "stdout: {stdout}");
@@ -8567,7 +8642,10 @@ console.log("all_ok=true");
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("secret_type=secret"), "stdout: {stdout}");
     assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
 }
@@ -8613,7 +8691,10 @@ console.log("constructor_ok=true");
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("dh_created=true"), "stdout: {stdout}");
     assert!(stdout.contains("prime_bits_ok=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_public=true"), "stdout: {stdout}");
@@ -8668,7 +8749,10 @@ crypto.generatePrime(64, (err, p) => {
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("prime_is_buffer=true"), "stdout: {stdout}");
     assert!(stdout.contains("is_prime=true"), "stdout: {stdout}");
     assert!(stdout.contains("seven_is_prime=true"), "stdout: {stdout}");
@@ -8676,7 +8760,10 @@ crypto.generatePrime(64, (err, p) => {
     assert!(stdout.contains("bigint_type=bigint"), "stdout: {stdout}");
     assert!(stdout.contains("bigint_positive=true"), "stdout: {stdout}");
     assert!(stdout.contains("bigint_is_prime=true"), "stdout: {stdout}");
-    assert!(stdout.contains("bigint_4_is_prime=false"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("bigint_4_is_prime=false"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("async_err=true"), "stdout: {stdout}");
     assert!(stdout.contains("async_is_buffer=true"), "stdout: {stdout}");
     assert!(stdout.contains("async_is_prime=true"), "stdout: {stdout}");
@@ -8717,10 +8804,16 @@ console.log("pem_match=" + (pubKeyObj.export() === origPubObj.export()));
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("priv_type=private"), "stdout: {stdout}");
     assert!(stdout.contains("pub_type=public"), "stdout: {stdout}");
-    assert!(stdout.contains("round_trip=round trip test"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("round_trip=round trip test"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("pem_match=true"), "stdout: {stdout}");
 }
 
@@ -8776,7 +8869,10 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
     let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "test failed.\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("pub_kty=RSA"), "stdout: {stdout}");
     assert!(stdout.contains("pub_has_n=true"), "stdout: {stdout}");
     assert!(stdout.contains("pub_has_e=true"), "stdout: {stdout}");
@@ -8785,7 +8881,10 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
     assert!(stdout.contains("priv_has_d=true"), "stdout: {stdout}");
     assert!(stdout.contains("priv_has_p=true"), "stdout: {stdout}");
     assert!(stdout.contains("priv_has_qi=true"), "stdout: {stdout}");
-    assert!(stdout.contains("jwk_round_trip_verify=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("jwk_round_trip_verify=true"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("n_match=true"), "stdout: {stdout}");
     assert!(stdout.contains("e_match=true"), "stdout: {stdout}");
 }
@@ -8975,8 +9074,190 @@ server.close();
     assert!(stdout.contains("remote_port=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_200=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_echo=true"), "stdout: {stdout}");
-    assert!(stdout.contains("has_DEFAULT_ECDH_CURVE=true"), "stdout: {stdout}");
-    assert!(stdout.contains("has_DEFAULT_MAX_VERSION=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("has_DEFAULT_ECDH_CURVE=true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("has_DEFAULT_MAX_VERSION=true"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("has_getCiphers=true"), "stdout: {stdout}");
-    assert!(stdout.contains("has_createSecureContext=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("has_createSecureContext=true"),
+        "stdout: {stdout}"
+    );
+}
+
+// ======================================= dns.resolve + dns.reverse
+
+#[test]
+fn dns_resolve_a_record() {
+    let stdout = run_ok(
+        "dns_resolve_a.mjs",
+        r#"
+import dns from 'node:dns';
+dns.resolve('google.com', 'A', (err, addrs) => {
+  if (err) { console.log('ERR:' + err.code); process.exit(1); }
+  console.log('count=' + addrs.length);
+  console.log('is_ipv4=' + /^\d+\.\d+\.\d+\.\d+$/.test(addrs[0]));
+});
+"#,
+    );
+    assert!(stdout.contains("count="), "stdout: {stdout}");
+    let count: usize = stdout
+        .lines()
+        .find(|l| l.starts_with("count="))
+        .unwrap()
+        .strip_prefix("count=")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(count >= 1, "expected at least 1 A record, got {count}");
+    assert!(stdout.contains("is_ipv4=true"), "stdout: {stdout}");
+}
+
+#[test]
+fn dns_resolve_mx_record() {
+    let stdout = run_ok(
+        "dns_resolve_mx.mjs",
+        r#"
+import dns from 'node:dns';
+dns.resolveMx('google.com', (err, records) => {
+  if (err) { console.log('ERR:' + err.code); process.exit(1); }
+  console.log('count=' + records.length);
+  const r = records[0];
+  console.log('has_priority=' + (typeof r.priority === 'number'));
+  console.log('has_exchange=' + (typeof r.exchange === 'string'));
+});
+"#,
+    );
+    assert!(stdout.contains("count="), "stdout: {stdout}");
+    assert!(stdout.contains("has_priority=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_exchange=true"), "stdout: {stdout}");
+}
+
+#[test]
+fn dns_resolve_txt_record() {
+    let stdout = run_ok(
+        "dns_resolve_txt.mjs",
+        r#"
+import dns from 'node:dns';
+dns.resolveTxt('google.com', (err, records) => {
+  if (err) { console.log('ERR:' + err.code); process.exit(1); }
+  console.log('count=' + records.length);
+  console.log('is_array_of_arrays=' + (Array.isArray(records) && Array.isArray(records[0])));
+});
+"#,
+    );
+    assert!(stdout.contains("count="), "stdout: {stdout}");
+    assert!(
+        stdout.contains("is_array_of_arrays=true"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn dns_reverse_lookup() {
+    let stdout = run_ok(
+        "dns_reverse.mjs",
+        r#"
+import dns from 'node:dns';
+dns.reverse('8.8.8.8', (err, hostnames) => {
+  if (err) { console.log('ERR:' + err.code); process.exit(1); }
+  console.log('count=' + hostnames.length);
+  console.log('has_dns=' + hostnames.some(h => h.includes('dns')));
+});
+"#,
+    );
+    assert!(stdout.contains("count="), "stdout: {stdout}");
+    assert!(stdout.contains("has_dns=true"), "stdout: {stdout}");
+}
+
+#[test]
+fn dns_promises_resolve() {
+    let stdout = run_ok(
+        "dns_promises_resolve.mjs",
+        r#"
+import dns from 'node:dns';
+const addrs = await dns.promises.resolve('google.com', 'A');
+console.log('count=' + addrs.length);
+console.log('is_ipv4=' + /^\d+\.\d+\.\d+\.\d+$/.test(addrs[0]));
+const hostnames = await dns.promises.reverse('8.8.8.8');
+console.log('rev_count=' + hostnames.length);
+"#,
+    );
+    assert!(stdout.contains("count="), "stdout: {stdout}");
+    assert!(stdout.contains("is_ipv4=true"), "stdout: {stdout}");
+    assert!(stdout.contains("rev_count="), "stdout: {stdout}");
+}
+
+// ======================================= child_process.fork
+
+#[test]
+fn fork_ipc_round_trip() {
+    // Child script: receives a message, sends it back with a suffix, then exits
+    let child_path = write_temp(
+        "fork_child.mjs",
+        r#"
+process.on('message', (msg) => {
+  process.send({ echo: msg.data, from: 'child' });
+  process.disconnect();
+});
+"#,
+    );
+
+    // Parent script: forks the child, sends a message, waits for response
+    let child_str = child_path.to_str().unwrap().replace('\\', "/");
+    let parent_src = format!(
+        r#"
+import {{ fork }} from 'node:child_process';
+const child = fork('{}');
+child.on('message', (msg) => {{
+  console.log('echo=' + msg.echo);
+  console.log('from=' + msg.from);
+}});
+child.on('exit', (code) => {{
+  console.log('exit=' + code);
+}});
+child.send({{ data: 'hello-from-parent' }});
+"#,
+        child_str
+    );
+    let stdout = run_ok("fork_parent.mjs", &parent_src);
+    assert!(
+        stdout.contains("echo=hello-from-parent"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("from=child"), "stdout: {stdout}");
+    assert!(stdout.contains("exit=0"), "stdout: {stdout}");
+}
+
+#[test]
+fn fork_child_stdout_captured() {
+    let child_path = write_temp(
+        "fork_stdout_child.mjs",
+        r#"
+console.log('child-output-line');
+"#,
+    );
+
+    let child_str = child_path.to_str().unwrap().replace('\\', "/");
+    let parent_src = format!(
+        r#"
+import {{ fork }} from 'node:child_process';
+const child = fork('{}', [], {{ silent: true }});
+let out = '';
+child.stdout.on('data', (chunk) => {{ out += chunk; }});
+child.on('close', () => {{
+  console.log('captured=' + out.trim());
+}});
+"#,
+        child_str
+    );
+    let stdout = run_ok("fork_stdout_parent.mjs", &parent_src);
+    assert!(
+        stdout.contains("captured=child-output-line"),
+        "stdout: {stdout}"
+    );
 }

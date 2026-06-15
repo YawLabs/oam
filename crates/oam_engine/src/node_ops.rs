@@ -8,19 +8,17 @@
 //! the ecosystem branches on codes, not messages.
 
 use crate::crypto_ops::{
-    op_crypto_cipher_create, op_crypto_cipher_final, op_crypto_cipher_final_gcm,
-    op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad, op_crypto_cipher_set_auth_tag,
-    op_crypto_cipher_set_auto_padding, op_crypto_cipher_update, op_crypto_hash_copy,
+    op_crypto_check_prime, op_crypto_cipher_create, op_crypto_cipher_final,
+    op_crypto_cipher_final_gcm, op_crypto_cipher_get_auth_tag, op_crypto_cipher_set_aad,
+    op_crypto_cipher_set_auth_tag, op_crypto_cipher_set_auto_padding, op_crypto_cipher_update,
+    op_crypto_dh_compute_secret, op_crypto_dh_generate_keys, op_crypto_ecdh_compute_secret,
+    op_crypto_ecdh_generate_keys, op_crypto_ecdh_get_public_key, op_crypto_extract_public_pem,
+    op_crypto_generate_keypair, op_crypto_generate_prime, op_crypto_hash_copy,
     op_crypto_hash_create, op_crypto_hash_digest, op_crypto_hash_update, op_crypto_hkdf_sync,
-    op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_random_fill, op_crypto_scrypt_sync,
-    op_crypto_timing_safe_equal, op_crypto_sign, op_crypto_verify, op_crypto_generate_keypair,
-    op_crypto_public_encrypt, op_crypto_private_decrypt,
-    op_crypto_private_encrypt, op_crypto_public_decrypt,
-    op_crypto_extract_public_pem, op_crypto_rsa_jwk_components,
-    op_crypto_ecdh_generate_keys, op_crypto_ecdh_compute_secret, op_crypto_ecdh_get_public_key,
-    op_crypto_dh_generate_keys, op_crypto_dh_compute_secret,
-    op_crypto_x509_parse,
-    op_crypto_generate_prime, op_crypto_check_prime,
+    op_crypto_hmac_create, op_crypto_pbkdf2_sync, op_crypto_private_decrypt,
+    op_crypto_private_encrypt, op_crypto_public_decrypt, op_crypto_public_encrypt,
+    op_crypto_random_fill, op_crypto_rsa_jwk_components, op_crypto_scrypt_sync, op_crypto_sign,
+    op_crypto_timing_safe_equal, op_crypto_verify, op_crypto_x509_parse,
 };
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
@@ -69,10 +67,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             "pid",
             v8::Number::new(scope, std::process::id() as f64).into(),
         ),
-        (
-            "ppid",
-            v8::Number::new(scope, parent_pid() as f64).into(),
-        ),
+        ("ppid", v8::Number::new(scope, parent_pid() as f64).into()),
     ];
     for (name, value) in data {
         let key = v8::String::new(scope, name).unwrap();
@@ -267,6 +262,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("spawnWait", op_spawn_wait),
         // dns
         ("dnsLookup", op_dns_lookup),
+        ("dnsResolve", op_dns_resolve),
+        ("dnsReverse", op_dns_reverse),
         // stdin
         ("stdinRead", op_stdin_read),
         // os extended
@@ -942,8 +939,15 @@ fn op_tls_connect(
         scope,
         &mut rv,
         oam_core::tls::tls_connect(
-            tls, ids, host, port, server_name, ca_pem, reject_unauthorized,
-            client_cert_pem, client_key_pem,
+            tls,
+            ids,
+            host,
+            port,
+            server_name,
+            ca_pem,
+            reject_unauthorized,
+            client_cert_pem,
+            client_key_pem,
         ),
     );
 }
@@ -1849,7 +1853,9 @@ fn op_fs_symlink_sync(
     };
     #[cfg(windows)]
     let result = {
-        let is_dir = std::fs::metadata(&target).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = std::fs::metadata(&target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         if is_dir {
             std::os::windows::fs::symlink_dir(&target, &path)
         } else {
@@ -2379,15 +2385,14 @@ fn op_spawn_sync(
         v8::Local::<v8::Object>::try_from(opts_val).ok()
     };
 
-    let cwd = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "cwd")?;
-            let val = o.get(scope, key.into())?;
-            if val.is_null_or_undefined() {
-                return None;
-            }
-            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
-        });
+    let cwd = opts.and_then(|o| {
+        let key = v8::String::new(scope, "cwd")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
     let shell = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "shell")?;
@@ -2550,7 +2555,9 @@ fn op_spawn_async(
     let cwd = opts.and_then(|o| {
         let key = v8::String::new(scope, "cwd")?;
         let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() { return None; }
+        if val.is_null_or_undefined() {
+            return None;
+        }
         val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
     });
     let shell = opts
@@ -2569,7 +2576,9 @@ fn op_spawn_async(
     let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
         let key = v8::String::new(scope, "env")?;
         let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() { return None; }
+        if val.is_null_or_undefined() {
+            return None;
+        }
         let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
         let names = env_obj.get_own_property_names(scope, Default::default())?;
         let mut pairs = Vec::new();
@@ -2599,7 +2608,9 @@ fn op_spawn_async(
 
     let children2 = children.clone();
     crate::ops::spawn_op(scope, &mut rv, async move {
-        match oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env).await {
+        match oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env)
+            .await
+        {
             Ok((child, pid)) => {
                 let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut guard = children2.lock().expect("child registry lock");
@@ -2723,6 +2734,25 @@ fn op_dns_lookup(
     );
 }
 
+fn op_dns_resolve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let hostname: String = args.get(0).to_rust_string_lossy(scope);
+    let rrtype: String = args.get(1).to_rust_string_lossy(scope);
+    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_resolve(hostname, rrtype));
+}
+
+fn op_dns_reverse(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let ip: String = args.get(0).to_rust_string_lossy(scope);
+    crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip));
+}
+
 // ============================================================== stdin
 
 fn op_stdin_read(
@@ -2787,13 +2817,18 @@ fn os_release() -> String {
         szCSDVersion: [0; 128],
     };
     unsafe { RtlGetVersion(&mut info) };
-    format!("{}.{}.{}", info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber)
+    format!(
+        "{}.{}.{}",
+        info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+    )
 }
 
 #[cfg(not(windows))]
 fn os_release() -> String {
     use std::process::Command;
-    Command::new("uname").arg("-r").output()
+    Command::new("uname")
+        .arg("-r")
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
 }
@@ -2886,16 +2921,28 @@ fn op_heap_statistics(
     let obj = v8::Object::new(scope);
     let pairs: &[(&str, usize)] = &[
         ("total_heap_size", stats.total_heap_size()),
-        ("total_heap_size_executable", stats.total_heap_size_executable()),
+        (
+            "total_heap_size_executable",
+            stats.total_heap_size_executable(),
+        ),
         ("total_physical_size", stats.total_physical_size()),
         ("total_available_size", stats.total_available_size()),
         ("used_heap_size", stats.used_heap_size()),
         ("heap_size_limit", stats.heap_size_limit()),
         ("malloced_memory", stats.malloced_memory()),
         ("peak_malloced_memory", stats.peak_malloced_memory()),
-        ("does_zap_garbage", if stats.does_zap_garbage() { 1 } else { 0 }),
-        ("number_of_native_contexts", stats.number_of_native_contexts()),
-        ("number_of_detached_contexts", stats.number_of_detached_contexts()),
+        (
+            "does_zap_garbage",
+            if stats.does_zap_garbage() { 1 } else { 0 },
+        ),
+        (
+            "number_of_native_contexts",
+            stats.number_of_native_contexts(),
+        ),
+        (
+            "number_of_detached_contexts",
+            stats.number_of_detached_contexts(),
+        ),
         ("external_memory", stats.external_memory()),
     ];
     for (key, val) in pairs {
@@ -2955,11 +3002,7 @@ fn process_rss() -> usize {
         PeakPagefileUsage: 0,
     };
     unsafe {
-        K32GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            &mut counters,
-            counters.cb,
-        );
+        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb);
     }
     counters.WorkingSetSize
 }
@@ -3002,8 +3045,21 @@ fn cpu_model() -> String {
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
     unsafe extern "system" {
-        fn RegOpenKeyExW(hKey: isize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut isize) -> i32;
-        fn RegQueryValueExW(hKey: isize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+        fn RegOpenKeyExW(
+            hKey: isize,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: isize,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
         fn RegCloseKey(hKey: isize) -> i32;
     }
 
@@ -3025,8 +3081,12 @@ fn cpu_model() -> String {
 
     let result = unsafe {
         RegQueryValueExW(
-            hkey, value_name.as_ptr(), ptr::null_mut(), &mut reg_type,
-            buf.as_mut_ptr(), &mut buf_len,
+            hkey,
+            value_name.as_ptr(),
+            ptr::null_mut(),
+            &mut reg_type,
+            buf.as_mut_ptr(),
+            &mut buf_len,
         )
     };
     unsafe { RegCloseKey(hkey) };
@@ -3051,8 +3111,21 @@ fn cpu_speed_mhz() -> u32 {
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
     unsafe extern "system" {
-        fn RegOpenKeyExW(hKey: isize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut isize) -> i32;
-        fn RegQueryValueExW(hKey: isize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+        fn RegOpenKeyExW(
+            hKey: isize,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: isize,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
         fn RegCloseKey(hKey: isize) -> i32;
     }
 
@@ -3074,8 +3147,12 @@ fn cpu_speed_mhz() -> u32 {
 
     let result = unsafe {
         RegQueryValueExW(
-            hkey, value_name.as_ptr(), ptr::null_mut(), &mut reg_type,
-            &mut val as *mut u32 as *mut u8, &mut val_len,
+            hkey,
+            value_name.as_ptr(),
+            ptr::null_mut(),
+            &mut reg_type,
+            &mut val as *mut u32 as *mut u8,
+            &mut val_len,
         )
     };
     unsafe { RegCloseKey(hkey) };
@@ -3125,47 +3202,57 @@ fn op_network_interfaces(
 }
 
 fn network_interfaces() -> serde_json::Value {
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::net::UdpSocket;
 
     let mut result = Map::new();
 
-    let lo_name = if cfg!(windows) { "Loopback Pseudo-Interface 1" } else { "lo" };
-    result.insert(lo_name.to_string(), json!([
-        {
-            "address": "127.0.0.1",
-            "netmask": "255.0.0.0",
-            "family": "IPv4",
-            "mac": "00:00:00:00:00:00",
-            "internal": true,
-            "cidr": "127.0.0.1/8"
-        },
-        {
-            "address": "::1",
-            "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-            "family": "IPv6",
-            "mac": "00:00:00:00:00:00",
-            "internal": true,
-            "cidr": "::1/128",
-            "scopeid": 0
-        }
-    ]));
+    let lo_name = if cfg!(windows) {
+        "Loopback Pseudo-Interface 1"
+    } else {
+        "lo"
+    };
+    result.insert(
+        lo_name.to_string(),
+        json!([
+            {
+                "address": "127.0.0.1",
+                "netmask": "255.0.0.0",
+                "family": "IPv4",
+                "mac": "00:00:00:00:00:00",
+                "internal": true,
+                "cidr": "127.0.0.1/8"
+            },
+            {
+                "address": "::1",
+                "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "family": "IPv6",
+                "mac": "00:00:00:00:00:00",
+                "internal": true,
+                "cidr": "::1/128",
+                "scopeid": 0
+            }
+        ]),
+    );
 
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
             if let Ok(addr) = socket.local_addr() {
                 let ip = addr.ip().to_string();
                 let iface_name = if cfg!(windows) { "Ethernet" } else { "eth0" };
-                result.insert(iface_name.to_string(), json!([
-                    {
-                        "address": ip,
-                        "netmask": "255.255.255.0",
-                        "family": "IPv4",
-                        "mac": "00:00:00:00:00:00",
-                        "internal": false,
-                        "cidr": format!("{}/24", ip)
-                    }
-                ]));
+                result.insert(
+                    iface_name.to_string(),
+                    json!([
+                        {
+                            "address": ip,
+                            "netmask": "255.255.255.0",
+                            "family": "IPv4",
+                            "mac": "00:00:00:00:00:00",
+                            "internal": false,
+                            "cidr": format!("{}/24", ip)
+                        }
+                    ]),
+                );
             }
         }
     }
@@ -3302,8 +3389,14 @@ fn cpu_usage_us() -> (u64, u64) {
         fn getrusage(who: i32, usage: *mut rusage) -> i32;
     }
     let mut usage = rusage {
-        ru_utime: timeval { tv_sec: 0, tv_usec: 0 },
-        ru_stime: timeval { tv_sec: 0, tv_usec: 0 },
+        ru_utime: timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        ru_stime: timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
         _pad: [0; 112],
     };
     unsafe { getrusage(0, &mut usage) };

@@ -8800,6 +8800,171 @@
       return exec(norm.command + " " + norm.args.join(" "), norm.options, callback);
     }
 
+    function fork(modulePath, args, options) {
+      if (typeof args === "object" && !Array.isArray(args)) {
+        options = args;
+        args = [];
+      }
+      args = (args || []).map(String);
+      const opts = Object.assign({}, options);
+      const execPath = opts.execPath || globalThis.process.execPath;
+      const execArgv = opts.execArgv || globalThis.process.execArgv || [];
+      const silent = !!opts.silent;
+
+      const cp = new ChildProcess();
+      cp.connected = true;
+
+      cp.stdout = silent ? new Readable({ read() {} }) : null;
+      cp.stderr = silent ? new Readable({ read() {} }) : null;
+      cp.stdin = null;
+
+      let ipcSocket = null;
+      const pendingSends = [];
+
+      cp.send = function send(message, _sendHandle, _options, callback) {
+        if (typeof _sendHandle === "function") { callback = _sendHandle; }
+        else if (typeof _options === "function") { callback = _options; }
+        if (!cp.connected) {
+          const err = new Error("channel closed");
+          err.code = "ERR_IPC_CHANNEL_CLOSED";
+          if (callback) callback(err);
+          return false;
+        }
+        const line = JSON.stringify(message) + "\n";
+        if (ipcSocket) {
+          ipcSocket.write(line, "utf8", callback);
+        } else {
+          pendingSends.push({ line, callback });
+        }
+        return true;
+      };
+
+      cp.disconnect = function disconnect() {
+        cp.connected = false;
+        if (ipcSocket) {
+          var sock = ipcSocket;
+          ipcSocket = null;
+          sock._chain.then(function() {
+            sock.destroy();
+            cp.emit("disconnect");
+          });
+        } else {
+          cp.emit("disconnect");
+        }
+      };
+
+      const net = registry.get("net");
+      const ipcServer = net.createServer();
+
+      ipcServer.listen(0, "127.0.0.1", () => {
+        const ipcPort = ipcServer.address().port;
+
+        const childEnv = Object.assign({},
+          opts.env || globalThis.process.env,
+          { OAM_FORK_IPC_PORT: String(ipcPort) },
+        );
+
+        const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
+        const nativeOpts = {
+          cwd: opts.cwd || undefined,
+          env: childEnv,
+          shell: false,
+          clearEnv: false,
+        };
+
+        ipcServer.on("connection", (socket) => {
+          ipcSocket = socket;
+          ipcServer.close();
+
+          for (const p of pendingSends) {
+            socket.write(p.line, "utf8", p.callback);
+          }
+          pendingSends.length = 0;
+
+          let buf = "";
+          socket.setEncoding("utf8");
+          socket.on("data", (chunk) => {
+            buf += chunk;
+            let nl;
+            while ((nl = buf.indexOf("\n")) !== -1) {
+              const line = buf.slice(0, nl);
+              buf = buf.slice(nl + 1);
+              try {
+                const msg = JSON.parse(line);
+                cp.emit("message", msg);
+              } catch (_) { /* ignore malformed */ }
+            }
+          });
+          socket.on("end", () => {
+            cp.connected = false;
+            cp.emit("disconnect");
+          });
+          socket.on("error", () => {
+            cp.connected = false;
+          });
+        });
+
+        natives.spawnAsync(execPath, spawnArgs, nativeOpts).then((info) => {
+          cp._handle = info.handle;
+          cp.pid = info.pid;
+
+          if (silent) {
+            cp.stdin = new Writable({
+              write(chunk, encoding, callback) {
+                natives.spawnWrite(info.handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
+                  .then(() => callback(), (err) => callback(err));
+              },
+            });
+          }
+
+          cp.emit("spawn");
+
+          const readStdout = async (handle) => {
+            while (true) {
+              const chunk = await natives.spawnReadStdout(handle);
+              if (chunk === undefined || chunk === null || chunk.length === 0) {
+                if (cp.stdout) cp.stdout.push(null);
+                break;
+              }
+              if (cp.stdout) cp.stdout.push(Buffer.from(chunk));
+            }
+          };
+          const readStderr = async (handle) => {
+            while (true) {
+              const chunk = await natives.spawnReadStderr(handle);
+              if (chunk === undefined || chunk === null || chunk.length === 0) {
+                if (cp.stderr) cp.stderr.push(null);
+                break;
+              }
+              if (cp.stderr) cp.stderr.push(Buffer.from(chunk));
+            }
+          };
+          readStdout(info.handle);
+          readStderr(info.handle);
+
+          natives.spawnWait(info.handle).then((result) => {
+            cp._exited = true;
+            cp.exitCode = result.code;
+            cp.signalCode = result.signal;
+            ipcServer.close();
+            if (ipcSocket) {
+              var sock = ipcSocket;
+              ipcSocket = null;
+              sock._chain.then(function() { sock.end(); });
+            }
+            cp.connected = false;
+            cp.emit("exit", result.code, result.signal);
+            queueMicrotask(() => cp.emit("close", result.code, result.signal));
+          });
+        }).catch((err) => {
+          ipcServer.close();
+          queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+        });
+      });
+
+      return cp;
+    }
+
     return {
       spawn,
       spawnSync,
@@ -8807,7 +8972,7 @@
       execSync,
       execFile,
       execFileSync,
-      fork: () => { throw new Error("child_process.fork is not implemented in oam yet"); },
+      fork: fork,
       ChildProcess,
     };
   };
@@ -8849,26 +9014,6 @@
 
   // -------------------------------------------------------------------- dns
   registry.factories.dns = (natives) => {
-    function notImpl(name) {
-      return (...args) => {
-        const cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
-        const err = Object.assign(
-          new Error(`dns.${name} is not implemented in oam -- DNS record-type queries land with a later wave`),
-          { code: "ENOSYS" },
-        );
-        if (cb) queueMicrotask(() => cb(err));
-        else throw err;
-      };
-    }
-    function notImplPromise(name) {
-      return () => Promise.reject(
-        Object.assign(
-          new Error(`dns.promises.${name} is not implemented in oam -- DNS record-type queries land with a later wave`),
-          { code: "ENOSYS" },
-        ),
-      );
-    }
-
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
@@ -8887,9 +9032,14 @@
             callback(null, result.address, result.family);
           }
         },
-        (err) => {
-          callback(err);
-        },
+        (err) => callback(err),
+      );
+    }
+
+    function _resolveNative(hostname, rrtype, callback) {
+      natives.dnsResolve(String(hostname), rrtype).then(
+        (result) => callback(null, result),
+        (err) => callback(err),
       );
     }
 
@@ -8899,29 +9049,17 @@
         rrtype = "A";
       }
       rrtype = (rrtype || "A").toUpperCase();
-      if (rrtype === "A") {
-        natives.dnsLookup(String(hostname), 4, true).then(
-          (results) => callback(null, results.map((r) => r.address)),
-          (err) => callback(err),
-        );
-      } else if (rrtype === "AAAA") {
-        natives.dnsLookup(String(hostname), 6, true).then(
-          (results) => callback(null, results.map((r) => r.address)),
-          (err) => callback(err),
-        );
-      } else {
-        notImpl(`resolve(${rrtype})`)(hostname, callback);
-      }
+      _resolveNative(hostname, rrtype, callback);
     }
 
     function resolve4(hostname, options, callback) {
       if (typeof options === "function") { callback = options; options = {}; }
-      natives.dnsLookup(String(hostname), 4, true).then(
+      natives.dnsResolve(String(hostname), "A").then(
         (results) => {
           if (options && options.ttl) {
-            callback(null, results.map((r) => ({ address: r.address, ttl: 0 })));
+            callback(null, results.map((r) => ({ address: r, ttl: 0 })));
           } else {
-            callback(null, results.map((r) => r.address));
+            callback(null, results);
           }
         },
         (err) => callback(err),
@@ -8930,19 +9068,69 @@
 
     function resolve6(hostname, options, callback) {
       if (typeof options === "function") { callback = options; options = {}; }
-      natives.dnsLookup(String(hostname), 6, true).then(
+      natives.dnsResolve(String(hostname), "AAAA").then(
         (results) => {
           if (options && options.ttl) {
-            callback(null, results.map((r) => ({ address: r.address, ttl: 0 })));
+            callback(null, results.map((r) => ({ address: r, ttl: 0 })));
           } else {
-            callback(null, results.map((r) => r.address));
+            callback(null, results);
           }
         },
         (err) => callback(err),
       );
     }
 
-    const RRTYPE_OK = new Set(["A", "AAAA"]);
+    function resolveCname(hostname, callback) {
+      _resolveNative(hostname, "CNAME", callback);
+    }
+
+    function resolveMx(hostname, callback) {
+      _resolveNative(hostname, "MX", callback);
+    }
+
+    function resolveTxt(hostname, callback) {
+      _resolveNative(hostname, "TXT", callback);
+    }
+
+    function resolveNs(hostname, callback) {
+      _resolveNative(hostname, "NS", callback);
+    }
+
+    function resolveSrv(hostname, callback) {
+      _resolveNative(hostname, "SRV", callback);
+    }
+
+    function resolveSoa(hostname, callback) {
+      _resolveNative(hostname, "SOA", callback);
+    }
+
+    function resolvePtr(hostname, callback) {
+      _resolveNative(hostname, "PTR", callback);
+    }
+
+    function resolveCaa(hostname, callback) {
+      _resolveNative(hostname, "CAA", callback);
+    }
+
+    function resolveNaptr(hostname, callback) {
+      _resolveNative(hostname, "NAPTR", callback);
+    }
+
+    function resolveAny(hostname, callback) {
+      const err = Object.assign(
+        new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
+        { code: "ENOSYS" },
+      );
+      if (typeof callback === "function") queueMicrotask(() => callback(err));
+      else throw err;
+    }
+
+    function reverse(ip, callback) {
+      natives.dnsReverse(String(ip)).then(
+        (result) => callback(null, result),
+        (err) => callback(err),
+      );
+    }
 
     const promises = {
       lookup(hostname, options) {
@@ -8953,30 +9141,36 @@
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
-        if (rrtype === "A") {
-          return natives.dnsLookup(String(hostname), 4, true).then((r) => r.map((x) => x.address));
-        }
-        if (rrtype === "AAAA") {
-          return natives.dnsLookup(String(hostname), 6, true).then((r) => r.map((x) => x.address));
-        }
-        return notImplPromise(`resolve(${rrtype})`)();
+        return natives.dnsResolve(String(hostname), rrtype);
       },
       resolve4(hostname, options) {
-        return natives.dnsLookup(String(hostname), 4, true).then((r) => {
-          if (options && options.ttl) return r.map((x) => ({ address: x.address, ttl: 0 }));
-          return r.map((x) => x.address);
+        return natives.dnsResolve(String(hostname), "A").then((r) => {
+          if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
+          return r;
         });
       },
       resolve6(hostname, options) {
-        return natives.dnsLookup(String(hostname), 6, true).then((r) => {
-          if (options && options.ttl) return r.map((x) => ({ address: x.address, ttl: 0 }));
-          return r.map((x) => x.address);
+        return natives.dnsResolve(String(hostname), "AAAA").then((r) => {
+          if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
+          return r;
         });
       },
-      resolveAny: notImplPromise("resolveAny"),
-      resolveCname: notImplPromise("resolveCname"),
-      resolveMx: notImplPromise("resolveMx"),
-      resolveTxt: notImplPromise("resolveTxt"),
+      resolveCname(hostname) { return natives.dnsResolve(String(hostname), "CNAME"); },
+      resolveMx(hostname) { return natives.dnsResolve(String(hostname), "MX"); },
+      resolveTxt(hostname) { return natives.dnsResolve(String(hostname), "TXT"); },
+      resolveNs(hostname) { return natives.dnsResolve(String(hostname), "NS"); },
+      resolveSrv(hostname) { return natives.dnsResolve(String(hostname), "SRV"); },
+      resolveSoa(hostname) { return natives.dnsResolve(String(hostname), "SOA"); },
+      resolvePtr(hostname) { return natives.dnsResolve(String(hostname), "PTR"); },
+      resolveCaa(hostname) { return natives.dnsResolve(String(hostname), "CAA"); },
+      resolveNaptr(hostname) { return natives.dnsResolve(String(hostname), "NAPTR"); },
+      resolveAny() {
+        return Promise.reject(Object.assign(
+          new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
+          { code: "ENOSYS" },
+        ));
+      },
+      reverse(ip) { return natives.dnsReverse(String(ip)); },
     };
 
     class Resolver {
@@ -8987,6 +9181,16 @@
       }
       resolve4(hostname, opts, cb) { resolve4(hostname, opts, cb); }
       resolve6(hostname, opts, cb) { resolve6(hostname, opts, cb); }
+      resolveCname(hostname, cb) { resolveCname(hostname, cb); }
+      resolveMx(hostname, cb) { resolveMx(hostname, cb); }
+      resolveTxt(hostname, cb) { resolveTxt(hostname, cb); }
+      resolveNs(hostname, cb) { resolveNs(hostname, cb); }
+      resolveSrv(hostname, cb) { resolveSrv(hostname, cb); }
+      resolveSoa(hostname, cb) { resolveSoa(hostname, cb); }
+      resolvePtr(hostname, cb) { resolvePtr(hostname, cb); }
+      resolveCaa(hostname, cb) { resolveCaa(hostname, cb); }
+      resolveNaptr(hostname, cb) { resolveNaptr(hostname, cb); }
+      reverse(ip, cb) { reverse(ip, cb); }
       cancel() {}
       getServers() { return this._servers.slice(); }
       setServers(servers) { this._servers = (servers || []).slice(); }
@@ -9001,6 +9205,17 @@
       resolve,
       resolve4,
       resolve6,
+      resolveCname,
+      resolveMx,
+      resolveTxt,
+      resolveNs,
+      resolveSrv,
+      resolveSoa,
+      resolvePtr,
+      resolveCaa,
+      resolveNaptr,
+      resolveAny,
+      reverse,
       Resolver,
       promises,
       setDefaultResultOrder() {},
@@ -9345,6 +9560,97 @@
   registry.installRuntimeGlobals = function installRuntimeGlobals() {
     const natives = globalThis.__oam.node;
     globalThis.process = registry.get("process");
+
+    // Fork IPC child side: store port for lazy connect.
+    // Cannot connect during installRuntimeGlobals because CoreRuntime
+    // (tokio, TCP ops) is not installed until execute_module/reset_run_slots.
+    // Instead, store the port and connect lazily on first process.on('message').
+    const _ipcPort = globalThis.process.env.OAM_FORK_IPC_PORT;
+    if (_ipcPort) {
+      globalThis.process.connected = true;
+      let _ipcSock = null;
+      let _ipcReady = false;
+      const _ipcPending = [];
+      let _ipcConnecting = false;
+
+      function _ipcEnsureConnect() {
+        if (_ipcConnecting || _ipcReady) return;
+        _ipcConnecting = true;
+        const _net = registry.get("net");
+        _ipcSock = new _net.Socket();
+        let _ipcBuf = "";
+
+        _ipcSock.connect(parseInt(_ipcPort, 10), "127.0.0.1", () => {
+          _ipcReady = true;
+          _ipcSock.setEncoding("utf8");
+
+          for (const p of _ipcPending) {
+            _ipcSock.write(p.line, "utf8", p.callback);
+          }
+          _ipcPending.length = 0;
+
+          _ipcSock.on("data", (chunk) => {
+            _ipcBuf += chunk;
+            let nl;
+            while ((nl = _ipcBuf.indexOf("\n")) !== -1) {
+              const line = _ipcBuf.slice(0, nl);
+              _ipcBuf = _ipcBuf.slice(nl + 1);
+              try {
+                const msg = JSON.parse(line);
+                globalThis.process.emit("message", msg);
+              } catch (_) { /* ignore malformed */ }
+            }
+          });
+          _ipcSock.on("end", () => {
+            globalThis.process.connected = false;
+            globalThis.process.emit("disconnect");
+          });
+          _ipcSock.on("error", () => {
+            globalThis.process.connected = false;
+          });
+        });
+      }
+
+      const _origOn = globalThis.process.on.bind(globalThis.process);
+      globalThis.process.on = function on(event, listener) {
+        if (event === "message") _ipcEnsureConnect();
+        return _origOn(event, listener);
+      };
+
+      globalThis.process.send = function send(message, _sendHandle, _options, callback) {
+        if (typeof _sendHandle === "function") { callback = _sendHandle; }
+        else if (typeof _options === "function") { callback = _options; }
+        if (!globalThis.process.connected) {
+          const err = new Error("channel closed");
+          err.code = "ERR_IPC_CHANNEL_CLOSED";
+          if (callback) callback(err);
+          return false;
+        }
+        _ipcEnsureConnect();
+        const line = JSON.stringify(message) + "\n";
+        if (_ipcReady && _ipcSock) {
+          _ipcSock.write(line, "utf8", callback);
+        } else {
+          _ipcPending.push({ line, callback });
+        }
+        return true;
+      };
+
+      globalThis.process.disconnect = function disconnect() {
+        globalThis.process.connected = false;
+        if (_ipcSock) {
+          var sock = _ipcSock;
+          _ipcSock = null;
+          _ipcReady = false;
+          sock._chain.then(function() {
+            sock.destroy();
+            globalThis.process.emit("disconnect");
+          });
+        } else {
+          globalThis.process.emit("disconnect");
+        }
+      };
+    }
     var _perfEntries = [];
     globalThis.performance = {
       now: () => natives.nowMs(),
