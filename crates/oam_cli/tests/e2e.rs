@@ -8789,3 +8789,194 @@ console.log("e_match=" + (publicKey.e === privateKey.e));
     assert!(stdout.contains("n_match=true"), "stdout: {stdout}");
     assert!(stdout.contains("e_match=true"), "stdout: {stdout}");
 }
+
+// ─── TLS / HTTPS ────────────────────────────────────────────────────
+
+const TLS_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDCTCCAfGgAwIBAgIUJscRiMbEzxV45KtAxD+Lly4dJrQwDQYJKoZIhvcNAQEL\n\
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYxNTEyMzAwN1oXDTI3MDYx\n\
+NTEyMzAwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n\
+AAOCAQ8AMIIBCgKCAQEAoQ5a/fh4J3VW0MPpngEpN+yRUdJtlmY6aBhV/984yEIm\n\
+ng9/MGoK0ZRdB8YYGqx4awK1z82ECwtmmdVO/77WA4q6N0CJRzmAF6BN9RgzoyKV\n\
+2w1ltowPFyB6SrVqcW1MHqA/9NX/gw/ckvcjcuazYeI857joWulUmR/iWIpSNuBJ\n\
+c6odEIkfXG9W6/GyZwlutQXnKaa8eClLqCm+hDnkPBHx+doGWxezFVeOfFAdQM8w\n\
+NXT7mj4QN3fiHFDQHI6UkSnVttu7lAAEHY978gjnVyixAPX2dY9mB/Ed4R5eSOpJ\n\
+eTR7bXH6+QmUcDJSaDblM5vB3fb3zhitEGLo/APdQQIDAQABo1MwUTAdBgNVHQ4E\n\
+FgQUPffw9cdyC1LQ2PLrzN7IZjkpKmMwHwYDVR0jBBgwFoAUPffw9cdyC1LQ2PLr\n\
+zN7IZjkpKmMwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAWtdW\n\
+V/jSdVB5cN4GOwYXTHhh3dkYDtAPvFPCXbYacelaQe8mlRWv2BBHAhOZdmoJ3ai/\n\
+kNRw0D6pKqjcF4p17of9S07ZFCRaQGBAsDEd9jNY156AlEXu4Z8yp/kXE3fvznib\n\
+WHrQjdlDcmC2H/Ao+S7f4BkmbvsabyDbUoo+0Drk4MDvqga2azrFDdljqXQxzrEH\n\
+/mEwoi9pfukgFnFnhDE+WEqNsZQF9Yxa5QEX6d5tgbOcxS2NpKDug4xSgkpAQ0l6\n\
+XKpI59mdGTahOy9zGuNfTqVTHvrFoSXudnNHUjkfHK7Mh/VrNz9ZGpwDt5fGFD4x\n\
+E13+0jp6In545LYu+A==\n\
+-----END CERTIFICATE-----";
+
+const TLS_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQChDlr9+HgndVbQ\n\
+w+meASk37JFR0m2WZjpoGFX/3zjIQiaeD38wagrRlF0HxhgarHhrArXPzYQLC2aZ\n\
+1U7/vtYDiro3QIlHOYAXoE31GDOjIpXbDWW2jA8XIHpKtWpxbUweoD/01f+DD9yS\n\
+9yNy5rNh4jznuOha6VSZH+JYilI24Elzqh0QiR9cb1br8bJnCW61Becpprx4KUuo\n\
+Kb6EOeQ8EfH52gZbF7MVV458UB1AzzA1dPuaPhA3d+IcUNAcjpSRKdW227uUAAQd\n\
+j3vyCOdXKLEA9fZ1j2YH8R3hHl5I6kl5NHttcfr5CZRwMlJoNuUzm8Hd9vfOGK0Q\n\
+Yuj8A91BAgMBAAECgf9+I0AgqPlx7fSQjN/rX/1oT1+BNc2efXJBFM5GGA3gye50\n\
+3K5AvMy8V/aEoCFAwtOM/BJpLgy8mbFByk6U/mGfZIdzvpfFsMMhvetQiiPnIK89\n\
+YMDIt+kZs9YTrQIw0+lKEzgECZaUj1exwt2AoC7d+tK4qZlRmm0ngFFGBw9c6g4E\n\
+bKpZPPb62HjVAPcPPNJzj0ULTCkFQ7CPhgyz7q6UQUQJ0kM/8DWbnI9qbOWkv0qN\n\
+TafdX50piyHstcXGNFelOXmUMw1qQvbPo28qpzkxH7bDU8pShzsnySJL2HL5Wxbr\n\
+PbzZ94WOOLXfD3OmT5oW9kHDpH/zUd8pKlbYkNkCgYEA1ygCE4ZSNm0B7U8iwgBK\n\
+0Aszxpnf9f4aKKfb9CsmLaf4rxmAAqRaxT4Eki2yebqRX15Ctzlf1ryddKxNAAdh\n\
+gCcc+KAdwoJOO3pkwac+r/jsmvWqXHHi/Jn9Bhj886n5NkDGfKiCBL3rUHonwOjN\n\
+7y61ExJIy46kOM81Pm88B90CgYEAv6E6owvvAjFs1eoWD5oyUnO1HeAhKvBClDjZ\n\
+dcoY965ak5RFM4Da/HcnXAho4+pJY+4O48PIi8nQeZugm8DvpOKfivxYTI3ISDmz\n\
+CG0m7N9jJiYOPyt8dpn7Yl7R8OqFvfZAd/KkJ1wBMpsKy1MGU1pdny9mVaAVjxei\n\
+fnxNprUCgYEAn2onT6wgUe8mlFwkFrX8uHT0Ydw1EqC5ZRIqaJln6kAghCxSqqJ4\n\
+FtjCrkRpjsPrXkwLBpLeLc8GoyHe03ykgz13u8d3BV1i9bLT4KA4VE4NkSsglOpV\n\
+EnBOByyQj0GLQuVvq4F3BGhrZ+96cPaNTwC+bWkIwrnnd6gffSkRw4kCgYEAsAEE\n\
+mzZdunTs0nii9IeaipJNmnf93rM3Y23nhUEut2ZDOOLowEosV8+UrfnnZNYNvCOt\n\
+N1LeAk5FFTx0QjntoVKoWH43F3DtsDCWmDmwk8UFCsfPNAPb2A7LjekrCAxO9E+V\n\
+nNWWIbRmQTWXr3G9EJeh/5AIfMKAqqF5lJTUuTUCgYEAtzMfzgUekShhJoGov7uH\n\
+MyykhATJv+3ZlR0BCuEjgb7Lu6tu/pbgD1SkhpQ3QbM+XF5DgNJWxQATcgPWP6wy\n\
+C7rRXUYQtUTmtwTetACx3EEz7k2ixAxxdDCUPJIxGcVIPVKt6sTovr3yGLMuc4f7\n\
+I5PYIZ3kyY8EsQqX4JpTtbY=\n\
+-----END PRIVATE KEY-----";
+
+#[test]
+fn https_create_server_serves_tls() {
+    let src = format!(
+        r#"
+import https from 'node:https';
+import tls from 'node:tls';
+
+const cert = `{cert}`;
+const key = `{key}`;
+
+const server = https.createServer({{ cert, key }}, (req, res) => {{
+  res.writeHead(200, {{ 'content-type': 'text/plain' }});
+  res.end('hello-tls ' + req.url);
+}});
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+console.log('listening=' + port);
+
+const sock = tls.connect({{ port, host: '127.0.0.1', rejectUnauthorized: false }});
+await new Promise((resolve) => sock.on('secureConnect', resolve));
+console.log('encrypted=' + sock.encrypted);
+console.log('authorized=' + (typeof sock.authorized === 'boolean'));
+
+sock.write('GET /test-path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+
+const chunks = [];
+sock.on('data', (c) => chunks.push(c.toString()));
+await new Promise((resolve) => sock.on('end', resolve));
+
+const response = chunks.join('');
+console.log('has_200=' + response.includes('200'));
+console.log('has_body=' + response.includes('hello-tls /test-path'));
+
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("https_server.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("encrypted=true"), "stdout: {stdout}");
+    assert!(stdout.contains("authorized="), "stdout: {stdout}");
+    assert!(stdout.contains("has_200=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_body=true"), "stdout: {stdout}");
+}
+
+#[test]
+fn tls_connect_reads_and_writes() {
+    let src = format!(
+        r#"
+import https from 'node:https';
+import tls from 'node:tls';
+
+const cert = `{cert}`;
+const key = `{key}`;
+
+// Start an HTTPS server to connect to
+const server = https.createServer({{ cert, key }}, (req, res) => {{
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {{
+    const body = Buffer.concat(chunks).toString();
+    res.writeHead(200, {{ 'content-type': 'text/plain', 'connection': 'close' }});
+    res.end('echo:' + body);
+  }});
+}});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+
+// Connect with tls.connect
+const socket = tls.connect({{ host: '127.0.0.1', port, rejectUnauthorized: false }});
+await new Promise((resolve) => socket.on('secureConnect', resolve));
+
+console.log('encrypted=' + socket.encrypted);
+console.log('has_protocol=' + (socket.getProtocol() !== null));
+console.log('has_cipher=' + (socket.getCipher() !== null));
+console.log('remote_addr=' + (socket.remoteAddress === '127.0.0.1'));
+console.log('remote_port=' + (socket.remotePort === port));
+
+// Send an HTTP request over the TLS socket
+const body = 'tls-payload-42';
+const req = [
+  'POST /echo HTTP/1.1',
+  'Host: localhost',
+  'Content-Length: ' + body.length,
+  'Connection: close',
+  '',
+  body,
+].join('\r\n');
+socket.write(req);
+
+const chunks = [];
+socket.on('data', (c) => chunks.push(c.toString()));
+await new Promise((resolve) => socket.on('end', resolve));
+
+const response = chunks.join('');
+console.log('has_200=' + response.includes('200'));
+console.log('has_echo=' + response.includes('echo:tls-payload-42'));
+
+// tls module exports
+console.log('has_DEFAULT_ECDH_CURVE=' + (tls.DEFAULT_ECDH_CURVE === 'auto'));
+console.log('has_DEFAULT_MAX_VERSION=' + (tls.DEFAULT_MAX_VERSION === 'TLSv1.3'));
+console.log('has_getCiphers=' + (typeof tls.getCiphers === 'function'));
+console.log('has_createSecureContext=' + (typeof tls.createSecureContext === 'function'));
+
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_connect.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("encrypted=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_protocol=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_cipher=true"), "stdout: {stdout}");
+    assert!(stdout.contains("remote_addr=true"), "stdout: {stdout}");
+    assert!(stdout.contains("remote_port=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_200=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_echo=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_DEFAULT_ECDH_CURVE=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_DEFAULT_MAX_VERSION=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_getCiphers=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_createSecureContext=true"), "stdout: {stdout}");
+}

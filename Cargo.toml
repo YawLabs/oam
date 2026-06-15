@@ -90,6 +90,13 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
+# bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
+# All three are already compiled transitively via tokio-tungstenite --
+# promoting to direct deps adds zero new compilation units.
+tokio-rustls = { version = "0.26", default-features = false }
+webpki-roots = "0.26"
+rustls-pemfile = "2"
 # V8 Inspector (CDP) transport: WebSocket framing for the debugger socket.
 # default-features=false drops the TLS backends — the inspector is
 # plaintext localhost only.

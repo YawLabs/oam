@@ -25,3 +25,7 @@ futures-util = { workspace = true }
 sha1 = { workspace = true }
 # node:zlib brotli backend (pure-Rust; default features only).
 brotli = { workspace = true }
+# TLS client/server for node:tls and node:https.
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pemfile = { workspace = true }

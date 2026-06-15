@@ -484,6 +484,91 @@ async fn handle_request(
     }
 }
 
+/// Bind a TLS-wrapped HTTP server. Same as http_serve but each accepted
+/// connection goes through a TLS handshake before reaching hyper. The
+/// request/response lifecycle is identical (shared HttpState, same ops).
+pub async fn https_serve(
+    state: Arc<HttpState>,
+    host: String,
+    port: u16,
+    cert_pem: String,
+    key_pem: String,
+) -> super::OpOutcome {
+    let tls_config = match crate::tls::build_server_config(&cert_pem, &key_pem) {
+        Ok(c) => c,
+        Err(e) => return super::OpOutcome::Failed(format!("https tls config: {e}")),
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+
+    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    };
+    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    state.servers.lock().expect("http servers lock").insert(
+        server_id,
+        ServerEntry {
+            queue: Some(queue_rx),
+            shutdown: Some(shutdown_tx),
+        },
+    );
+
+    let accept_state = state.clone();
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let conn_acceptor = acceptor.clone();
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let mut conn_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let tls_stream = match conn_acceptor.accept(stream).await {
+                            Ok(s) => s,
+                            Err(_) => return, // handshake failed, drop connection
+                        };
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let service = hyper::service::service_fn(move |req| {
+                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                        });
+                        let conn = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service);
+                        let mut conn = std::pin::pin!(conn);
+                        let mut shutting_down = false;
+                        loop {
+                            tokio::select! {
+                                result = conn.as_mut() => {
+                                    let _ = result;
+                                    break;
+                                }
+                                _ = conn_shutdown.changed(), if !shutting_down => {
+                                    shutting_down = true;
+                                    conn.as_mut().graceful_shutdown();
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    super::OpOutcome::Json(
+        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+    )
+}
+
 /// Long-poll the next request. Json metadata, or Done when the server
 /// closed (queue drained + senders dropped).
 pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutcome {

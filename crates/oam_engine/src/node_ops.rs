@@ -185,6 +185,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBodyPush", op_http_body_push),
         ("httpBodyEnd", op_http_body_end),
         ("httpClose", op_http_close),
+        // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
+        ("httpsServe", op_https_serve),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
         ("tcpRead", op_tcp_read),
@@ -237,6 +239,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoX509Parse", op_crypto_x509_parse),
         ("cryptoGeneratePrime", op_crypto_generate_prime),
         ("cryptoCheckPrime", op_crypto_check_prime),
+        // TLS sockets (node:tls)
+        ("tlsConnect", op_tls_connect),
+        ("tlsRead", op_tls_read),
+        ("tlsWrite", op_tls_write),
+        ("tlsClose", op_tls_close),
+        ("tlsShutdown", op_tls_shutdown),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -733,6 +741,35 @@ fn op_http_close(
     http_state(scope).close_server(server_id);
 }
 
+// ----------------------------------------------------------------- HTTPS
+
+fn op_https_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(cert_pem) = arg_string(scope, &args, 2) else {
+        throw_type_error(scope, "httpsServe requires cert PEM");
+        return;
+    };
+    let Some(key_pem) = arg_string(scope, &args, 3) else {
+        throw_type_error(scope, "httpsServe requires key PEM");
+        return;
+    };
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let state = http_state(scope);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::https_serve(state, host, port, cert_pem, key_pem),
+    );
+}
+
 // ------------------------------------------------------------------- TCP
 
 fn op_tcp_connect(
@@ -873,6 +910,99 @@ fn op_tcp_server_close(
         .expect("core runtime installed")
         .tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
+}
+
+// ------------------------------------------------------------------- TLS
+
+fn op_tls_connect(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "tlsConnect requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let server_name = arg_string(scope, &args, 2);
+    let ca_pem = arg_string(scope, &args, 3);
+    let reject_unauthorized = args.get(4).boolean_value(scope);
+    let client_cert_pem = arg_string(scope, &args, 5);
+    let client_key_pem = arg_string(scope, &args, 6);
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let tls = core.tls();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tls::tls_connect(
+            tls, ids, host, port, server_name, ca_pem, reject_unauthorized,
+            client_cert_pem, client_key_pem,
+        ),
+    );
+}
+
+fn op_tls_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let tls = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tls();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_read(tls, handle, len));
+}
+
+fn op_tls_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "tlsWrite requires data");
+        return;
+    };
+    let tls = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tls();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_write(tls, handle, data));
+}
+
+fn op_tls_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tls = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tls();
+    oam_core::tls::tls_close(&tls, handle);
+}
+
+fn op_tls_shutdown(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let tls = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .tls();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

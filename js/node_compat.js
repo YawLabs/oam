@@ -8367,12 +8367,117 @@
   };
 
   // -------------------------------------------------------------- https
-  // Node's `https` module: re-exports the http module. oam has no TLS
-  // handshake client yet; most callers either use fetch() (which supports
-  // https) or just need the module to resolve. Documented divergence: no
-  // client-cert or CA-bundle options; TLS termination is handled by the
-  // upstream or by oam's fetch op.
-  registry.factories.https = () => registry.get("http");
+  // HTTPS server (TLS-wrapped HTTP) and client. The server uses
+  // httpsServe (Rust TLS termination) but shares the same accept/respond
+  // ops as plain HTTP. Client request/get delegate to fetch (which
+  // supports HTTPS natively via reqwest+rustls).
+  registry.factories.https = (natives) => {
+    const http = registry.get("http");
+    const EventEmitter = registry.get("events");
+
+    class Server extends EventEmitter {
+      constructor(options, handler) {
+        super();
+        if (typeof options === "function") {
+          handler = options;
+          options = {};
+        }
+        this._options = options || {};
+        if (handler) this.on("request", handler);
+        this._serverId = null;
+        this._port = null;
+        this._host = null;
+        this.listening = false;
+      }
+      listen(port, host, callback) {
+        if (typeof port === "object" && port !== null) {
+          callback = host;
+          host = port.host;
+          port = port.port;
+        }
+        if (typeof host === "function") {
+          callback = host;
+          host = undefined;
+        }
+        if (typeof callback === "function") this.once("listening", callback);
+        var hostname = host || "127.0.0.1";
+        var certPem = typeof this._options.cert === "object" && this._options.cert instanceof Uint8Array
+          ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
+        var keyPem = typeof this._options.key === "object" && this._options.key instanceof Uint8Array
+          ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
+        natives.httpsServe(hostname, port || 0, certPem, keyPem).then(
+          (bound) => {
+            this._serverId = bound.serverId;
+            this._port = bound.port;
+            this._host = hostname;
+            this.listening = true;
+            this.emit("listening");
+            (async () => {
+              for (;;) {
+                const meta = await natives.httpAccept(bound.serverId);
+                if (meta === undefined) break;
+                const req = new http.IncomingMessage(meta);
+                req.socket = { remoteAddress: "127.0.0.1", encrypted: true };
+                const res = new http.ServerResponse(meta.requestId);
+                this.emit("request", req, res);
+              }
+              this.emit("close");
+            })();
+          },
+          (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
+        );
+        return this;
+      }
+      address() {
+        return this.listening
+          ? { port: this._port, address: this._host, family: "IPv4" }
+          : null;
+      }
+      close(callback) {
+        if (this._serverId !== null) {
+          natives.httpClose(this._serverId);
+          this.listening = false;
+        }
+        if (callback) this.once("close", callback);
+        return this;
+      }
+    }
+
+    function createServer(options, handler) {
+      return new Server(options, handler);
+    }
+
+    function request(options, callback) {
+      if (typeof options === "string") options = new URL(options);
+      if (options instanceof URL) {
+        options = {
+          hostname: options.hostname,
+          port: options.port || 443,
+          path: options.pathname + options.search,
+          protocol: "https:",
+        };
+      } else if (typeof options === "object") {
+        if (!options.protocol) options.protocol = "https:";
+        if (!options.port) options.port = 443;
+      }
+      return http.request(options, callback);
+    }
+
+    function get(options, callback) {
+      var req = request(options, callback);
+      req.end();
+      return req;
+    }
+
+    var merged = {};
+    var httpKeys = Object.keys(http);
+    for (var i = 0; i < httpKeys.length; i++) merged[httpKeys[i]] = http[httpKeys[i]];
+    merged.createServer = createServer;
+    merged.Server = Server;
+    merged.request = request;
+    merged.get = get;
+    return merged;
+  };
 
   // --------------------------------------------------------------- domain
   // Node's `domain` module (deprecated since Node 4, still pulled in by
@@ -8993,24 +9098,129 @@
   };
 
   // ------------------------------------------------------------------- tls
-  registry.factories.tls = () => {
-    function notImpl(name) {
-      return () => {
-        throw new Error(
-          `tls.${name} is not implemented in oam -- TLS client sockets land with a later wave`,
+  registry.factories.tls = (natives) => {
+    const EventEmitter = registry.get("events");
+    const { Duplex } = registry.get("stream");
+
+    class TLSSocket extends Duplex {
+      constructor(socket, options) {
+        super();
+        this.encrypted = true;
+        this.authorized = false;
+        this.authorizationError = null;
+        this.alpnProtocol = false;
+        this._handle = null;
+        this._reading = false;
+        this._protocol = null;
+        this._cipher = null;
+      }
+      _read(size) {
+        if (this._handle === null || this._reading) return;
+        this._reading = true;
+        natives.tlsRead(this._handle, size || 65536).then(
+          (data) => {
+            this._reading = false;
+            if (data === undefined) {
+              this.push(null);
+            } else {
+              this.push(new globalThis.Buffer(data.buffer, data.byteOffset, data.length));
+            }
+          },
+          (err) => {
+            this._reading = false;
+            this.destroy(typeof err === "string" ? new Error(err) : err);
+          },
         );
-      };
+      }
+      _write(chunk, encoding, callback) {
+        if (this._handle === null) {
+          callback(new Error("TLSSocket: not connected"));
+          return;
+        }
+        var data = typeof chunk === "string"
+          ? globalThis.Buffer.from(chunk, encoding) : chunk;
+        natives.tlsWrite(this._handle, data).then(
+          () => callback(),
+          (err) => callback(typeof err === "string" ? new Error(err) : err),
+        );
+      }
+      _destroy(err, callback) {
+        if (this._handle !== null) {
+          natives.tlsClose(this._handle);
+          this._handle = null;
+        }
+        callback(err);
+      }
+      getPeerCertificate() { return {}; }
+      getProtocol() { return this._protocol || null; }
+      getCipher() {
+        return this._cipher ? { name: this._cipher, standardName: this._cipher, version: this._protocol } : null;
+      }
+      setMaxSendFragment() { return true; }
+      enableTrace() {}
+      get remoteAddress() { return this._remoteAddress || undefined; }
+      get remotePort() { return this._remotePort || undefined; }
     }
+
+    function connect(optionsOrPort, hostOrCb, cb) {
+      var options, callback;
+      if (typeof optionsOrPort === "number") {
+        options = { port: optionsOrPort, host: typeof hostOrCb === "string" ? hostOrCb : "localhost" };
+        callback = typeof hostOrCb === "function" ? hostOrCb : cb;
+      } else {
+        options = optionsOrPort || {};
+        callback = typeof hostOrCb === "function" ? hostOrCb : undefined;
+      }
+      var host = options.host || options.hostname || "localhost";
+      var port = options.port || 443;
+      var serverName = options.servername || host;
+      var ca = options.ca != null ? String(options.ca) : undefined;
+      var cert = options.cert != null ? String(options.cert) : undefined;
+      var key = options.key != null ? String(options.key) : undefined;
+      var rejectUnauthorized = options.rejectUnauthorized !== false;
+
+      var socket = new TLSSocket(null, options);
+      socket._remoteAddress = host;
+      socket._remotePort = port;
+      if (callback) socket.once("secureConnect", callback);
+
+      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key).then(
+        (info) => {
+          socket._handle = info.handle;
+          socket.authorized = info.authorized;
+          socket._protocol = info.protocol;
+          socket._cipher = info.cipher;
+          socket.alpnProtocol = info.alpnProtocol || false;
+          socket.emit("secureConnect");
+        },
+        (err) => {
+          socket.destroy(typeof err === "string" ? new Error(err) : err);
+        },
+      );
+
+      return socket;
+    }
+
+    function createSecureContext(options) {
+      return Object.assign({}, options);
+    }
+
+    function createServer() {
+      throw new Error(
+        "tls.createServer is not yet implemented in oam -- use https.createServer for HTTPS servers",
+      );
+    }
+
     return {
-      connect: notImpl("connect"),
-      createServer: notImpl("createServer"),
-      createSecureContext: notImpl("createSecureContext"),
-      TLSSocket: class TLSSocket { constructor() { notImpl("TLSSocket")(); } },
+      connect,
+      createServer,
+      createSecureContext,
+      TLSSocket,
       DEFAULT_ECDH_CURVE: "auto",
       DEFAULT_MAX_VERSION: "TLSv1.3",
       DEFAULT_MIN_VERSION: "TLSv1.2",
       rootCertificates: [],
-      getCiphers: () => [],
+      getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
       checkServerIdentity: () => undefined,
     };
   };
