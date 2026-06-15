@@ -3158,6 +3158,17 @@
         return true;
       },
       umask: () => 0,
+      getuid: () => 0,
+      getgid: () => 0,
+      geteuid: () => 0,
+      getegid: () => 0,
+      setuid: () => {},
+      setgid: () => {},
+      seteuid: () => {},
+      setegid: () => {},
+      getgroups: () => [0],
+      setgroups: () => {},
+      initgroups: () => {},
       release: { name: "node" },
       config: { variables: {} },
       features: { inspector: false, ipv6: true, tls: true },
@@ -5753,6 +5764,15 @@
 
     const webcrypto = { subtle, getRandomValues, randomUUID };
 
+    class Certificate {
+      static exportChallenge() { return globalThis.Buffer.alloc(0); }
+      static exportPublicKey() { return globalThis.Buffer.alloc(0); }
+      static verifySpkac() { return false; }
+      exportChallenge() { return Certificate.exportChallenge.apply(null, arguments); }
+      exportPublicKey() { return Certificate.exportPublicKey.apply(null, arguments); }
+      verifySpkac() { return Certificate.verifySpkac.apply(null, arguments); }
+    }
+
     return {
       hash: (algorithm, data, outputEncoding) => {
         var h = createHash(algorithm);
@@ -5848,6 +5868,7 @@
       verify: verifyOneShot,
       Sign,
       Verify,
+      Certificate,
       constants: {
         RSA_PKCS1_PADDING: 1,
         RSA_NO_PADDING: 3,
@@ -6659,6 +6680,34 @@
       if (value === undefined) throw new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
     }
 
+    class OutgoingMessage extends EventEmitter {
+      constructor() {
+        super();
+        this.headersSent = false;
+        this.sendDate = true;
+        this.finished = false;
+        this.writableEnded = false;
+        this.writableFinished = false;
+        this._headers = {};
+      }
+      setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
+      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      getHeaderNames() { return Object.keys(this._headers); }
+      getHeaders() { return Object.assign({}, this._headers); }
+      hasHeader(name) { return name.toLowerCase() in this._headers; }
+      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      flushHeaders() {}
+      appendHeader(name, value) {
+        var existing = this._headers[name.toLowerCase()];
+        if (existing !== undefined) {
+          this._headers[name.toLowerCase()] = Array.isArray(existing) ? existing.concat(value) : [existing, value];
+        } else {
+          this._headers[name.toLowerCase()] = value;
+        }
+      }
+    }
+    Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
+
     return {
       createServer: (options, handler) =>
         new Server(typeof options === "function" ? options : handler),
@@ -6666,6 +6715,7 @@
       IncomingMessage,
       ServerResponse,
       ClientRequest,
+      OutgoingMessage,
       request,
       get,
       globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
@@ -6675,19 +6725,27 @@
       validateHeaderValue,
       METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
       STATUS_CODES: {
-        200: "OK",
-        201: "Created",
-        204: "No Content",
-        301: "Moved Permanently",
-        302: "Found",
-        304: "Not Modified",
-        400: "Bad Request",
-        401: "Unauthorized",
-        403: "Forbidden",
-        404: "Not Found",
-        413: "Payload Too Large",
-        500: "Internal Server Error",
-        503: "Service Unavailable",
+        100: "Continue", 101: "Switching Protocols", 102: "Processing", 103: "Early Hints",
+        200: "OK", 201: "Created", 202: "Accepted", 203: "Non-Authoritative Information",
+        204: "No Content", 205: "Reset Content", 206: "Partial Content", 207: "Multi-Status",
+        208: "Already Reported", 226: "IM Used",
+        300: "Multiple Choices", 301: "Moved Permanently", 302: "Found", 303: "See Other",
+        304: "Not Modified", 305: "Use Proxy", 307: "Temporary Redirect", 308: "Permanent Redirect",
+        400: "Bad Request", 401: "Unauthorized", 402: "Payment Required", 403: "Forbidden",
+        404: "Not Found", 405: "Method Not Allowed", 406: "Not Acceptable",
+        407: "Proxy Authentication Required", 408: "Request Timeout", 409: "Conflict",
+        410: "Gone", 411: "Length Required", 412: "Precondition Failed",
+        413: "Payload Too Large", 414: "URI Too Long", 415: "Unsupported Media Type",
+        416: "Range Not Satisfiable", 417: "Expectation Failed", 418: "I'm a Teapot",
+        421: "Misdirected Request", 422: "Unprocessable Entity", 423: "Locked",
+        424: "Failed Dependency", 425: "Too Early", 426: "Upgrade Required",
+        428: "Precondition Required", 429: "Too Many Requests",
+        431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
+        500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
+        503: "Service Unavailable", 504: "Gateway Timeout",
+        505: "HTTP Version Not Supported", 506: "Variant Also Negotiates",
+        507: "Insufficient Storage", 508: "Loop Detected",
+        510: "Not Extended", 511: "Network Authentication Required",
       },
     };
   };
@@ -7010,9 +7068,43 @@
       return new Server(options, connectionListener);
     }
 
+    class SocketAddress {
+      constructor(options) {
+        options = options || {};
+        this.address = options.address || "127.0.0.1";
+        this.port = options.port || 0;
+        this.family = options.family || "ipv4";
+        this.flowlabel = options.flowlabel || 0;
+      }
+    }
+
+    class BlockList {
+      constructor() { this._rules = []; }
+      addAddress(address, family) {
+        this._rules.push({ type: "address", address: address, family: family || "ipv4" });
+      }
+      addRange(start, end, family) {
+        this._rules.push({ type: "range", start: start, end: end, family: family || "ipv4" });
+      }
+      addSubnet(network, prefix, family) {
+        this._rules.push({ type: "subnet", network: network, prefix: prefix, family: family || "ipv4" });
+      }
+      check(address, family) {
+        var fam = (family || "ipv4").toLowerCase();
+        for (var ri = 0; ri < this._rules.length; ri++) {
+          var rule = this._rules[ri];
+          if (rule.family !== fam) continue;
+          if (rule.type === "address" && rule.address === address) return true;
+        }
+        return false;
+      }
+      get rules() { return this._rules.slice(); }
+    }
+
     return {
       isIPv4, isIPv6, isIP,
       Socket, Server,
+      SocketAddress, BlockList,
       createConnection, connect: createConnection, createServer,
     };
   };

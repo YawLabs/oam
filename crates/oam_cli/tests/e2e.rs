@@ -7631,3 +7631,127 @@ console.log('ear_listeners=' + ear.listenerCount('test'));
         );
     }
 }
+
+#[test]
+fn http_outgoing_msg_full_status_codes_net_blocklist_crypto_cert_process_uid() {
+    let file = write_temp(
+        "misc_m3h.mjs",
+        r#"
+import http from 'node:http';
+import net from 'node:net';
+import crypto from 'node:crypto';
+import process from 'node:process';
+
+// -- http.OutgoingMessage --
+console.log('OutgoingMessage=' + typeof http.OutgoingMessage);
+const om = new http.OutgoingMessage();
+console.log('om_headersSent=' + om.headersSent);
+om.setHeader('X-Test', 'hello');
+console.log('om_getHeader=' + om.getHeader('x-test'));
+console.log('om_hasHeader=' + om.hasHeader('X-Test'));
+console.log('om_getHeaderNames=' + om.getHeaderNames().join(','));
+om.appendHeader('X-Multi', 'a');
+om.appendHeader('X-Multi', 'b');
+console.log('om_appendHeader=' + JSON.stringify(om.getHeader('x-multi')));
+om.removeHeader('X-Test');
+console.log('om_removed=' + om.hasHeader('X-Test'));
+
+// ServerResponse instanceof OutgoingMessage
+console.log('SR_proto=' + (http.ServerResponse.prototype instanceof http.OutgoingMessage));
+
+// -- full STATUS_CODES --
+console.log('sc_100=' + http.STATUS_CODES[100]);
+console.log('sc_418=' + http.STATUS_CODES[418]);
+console.log('sc_429=' + http.STATUS_CODES[429]);
+console.log('sc_451=' + http.STATUS_CODES[451]);
+console.log('sc_502=' + http.STATUS_CODES[502]);
+console.log('sc_511=' + http.STATUS_CODES[511]);
+const codeCount = Object.keys(http.STATUS_CODES).length;
+console.log('sc_count_gte_40=' + (codeCount >= 40));
+
+// -- net.SocketAddress --
+console.log('SocketAddress=' + typeof net.SocketAddress);
+const sa = new net.SocketAddress({ address: '10.0.0.1', port: 8080 });
+console.log('sa_addr=' + sa.address);
+console.log('sa_port=' + sa.port);
+console.log('sa_family=' + sa.family);
+
+// -- net.BlockList --
+console.log('BlockList=' + typeof net.BlockList);
+const bl = new net.BlockList();
+bl.addAddress('1.2.3.4');
+bl.addRange('10.0.0.0', '10.0.0.255');
+bl.addSubnet('192.168.1.0', 24);
+console.log('bl_check_hit=' + bl.check('1.2.3.4'));
+console.log('bl_check_miss=' + bl.check('5.6.7.8'));
+console.log('bl_rules=' + bl.rules.length);
+
+// -- crypto.Certificate --
+console.log('Certificate=' + typeof crypto.Certificate);
+const cert = new crypto.Certificate();
+console.log('cert_verifySpkac=' + cert.verifySpkac());
+console.log('cert_static_verify=' + crypto.Certificate.verifySpkac());
+console.log('cert_exportChallenge_len=' + crypto.Certificate.exportChallenge().length);
+
+// -- process.getuid/getgid --
+console.log('getuid=' + process.getuid());
+console.log('getgid=' + process.getgid());
+console.log('geteuid=' + process.geteuid());
+console.log('getegid=' + process.getegid());
+console.log('getgroups=' + JSON.stringify(process.getgroups()));
+process.setuid(0);
+process.setgid(0);
+console.log('setuid_setgid=ok');
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3h failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "OutgoingMessage=function",
+        "om_headersSent=false",
+        "om_getHeader=hello",
+        "om_hasHeader=true",
+        "om_getHeaderNames=x-test",
+        r#"om_appendHeader=["a","b"]"#,
+        "om_removed=false",
+        "SR_proto=true",
+        "sc_100=Continue",
+        "sc_418=I'm a Teapot",
+        "sc_429=Too Many Requests",
+        "sc_451=Unavailable For Legal Reasons",
+        "sc_502=Bad Gateway",
+        "sc_511=Network Authentication Required",
+        "sc_count_gte_40=true",
+        "SocketAddress=function",
+        "sa_addr=10.0.0.1",
+        "sa_port=8080",
+        "sa_family=ipv4",
+        "BlockList=function",
+        "bl_check_hit=true",
+        "bl_check_miss=false",
+        "bl_rules=3",
+        "Certificate=function",
+        "cert_verifySpkac=false",
+        "cert_static_verify=false",
+        "cert_exportChallenge_len=0",
+        "getuid=0",
+        "getgid=0",
+        "geteuid=0",
+        "getegid=0",
+        "getgroups=[0]",
+        "setuid_setgid=ok",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
