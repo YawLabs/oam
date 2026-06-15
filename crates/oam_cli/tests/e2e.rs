@@ -7865,3 +7865,103 @@ console.log('ru_maxRSS=' + ru.maxRSS);
         );
     }
 }
+
+#[test]
+fn error_codes_util_types_internal_errors() {
+    let file = write_temp(
+        "misc_m3j.mjs",
+        r#"
+import util from 'node:util';
+import { codes } from 'node:internal/errors';
+console.log('codes_type=' + typeof codes);
+
+// ERR_INVALID_ARG_TYPE
+const e1 = codes.ERR_INVALID_ARG_TYPE('path', 'string', 42);
+console.log('e1_instanceof=' + (e1 instanceof TypeError));
+console.log('e1_code=' + e1.code);
+console.log('e1_msg_has_path=' + e1.message.includes('"path"'));
+
+// ERR_OUT_OF_RANGE
+const e2 = codes.ERR_OUT_OF_RANGE('port', '>= 0 and < 65536', -1);
+console.log('e2_instanceof=' + (e2 instanceof RangeError));
+console.log('e2_code=' + e2.code);
+
+// ERR_STREAM_DESTROYED
+const e3 = codes.ERR_STREAM_DESTROYED('write');
+console.log('e3_instanceof=' + (e3 instanceof Error));
+console.log('e3_code=' + e3.code);
+console.log('e3_msg=' + e3.message);
+
+// ERR_MISSING_ARGS
+const e4 = codes.ERR_MISSING_ARGS('path', 'options');
+console.log('e4_code=' + e4.code);
+console.log('e4_msg_has_both=' + (e4.message.includes('"path"') && e4.message.includes('"options"')));
+
+// ERR_STREAM_PREMATURE_CLOSE
+const e5 = codes.ERR_STREAM_PREMATURE_CLOSE();
+console.log('e5_code=' + e5.code);
+console.log('e5_msg=' + e5.message);
+
+// ERR_MODULE_NOT_FOUND
+const e6 = codes.ERR_MODULE_NOT_FOUND('foo', '/bar');
+console.log('e6_code=' + e6.code);
+console.log('e6_msg_has_foo=' + e6.message.includes('"foo"'));
+
+// -- util.types expansions --
+console.log('isArrayBufferView=' + util.types.isArrayBufferView(new Uint8Array(1)));
+console.log('isArrayBufferView_false=' + util.types.isArrayBufferView({}));
+console.log('isUint16Array=' + util.types.isUint16Array(new Uint16Array(1)));
+console.log('isFloat64Array=' + util.types.isFloat64Array(new Float64Array(1)));
+console.log('isInt32Array=' + util.types.isInt32Array(new Int32Array(1)));
+console.log('isArgumentsObject=' + util.types.isArgumentsObject((function() { return arguments; })()));
+console.log('isBooleanObject=' + util.types.isBooleanObject(new Boolean(true)));
+console.log('isNumberObject=' + util.types.isNumberObject(new Number(1)));
+console.log('isStringObject=' + util.types.isStringObject(new String('x')));
+console.log('isWeakRef=' + util.types.isWeakRef(new WeakRef({})));
+console.log('isGeneratorObject=' + util.types.isGeneratorObject((function*(){})()));
+"#,
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "misc m3j failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let expected = [
+        "codes_type=object",
+        "e1_instanceof=true",
+        "e1_code=ERR_INVALID_ARG_TYPE",
+        "e1_msg_has_path=true",
+        "e2_instanceof=true",
+        "e2_code=ERR_OUT_OF_RANGE",
+        "e3_instanceof=true",
+        "e3_code=ERR_STREAM_DESTROYED",
+        "e3_msg=Cannot call write after a stream was destroyed",
+        "e4_code=ERR_MISSING_ARGS",
+        "e4_msg_has_both=true",
+        "e5_code=ERR_STREAM_PREMATURE_CLOSE",
+        "e5_msg=Premature close",
+        "e6_code=ERR_MODULE_NOT_FOUND",
+        "e6_msg_has_foo=true",
+        "isArrayBufferView=true",
+        "isArrayBufferView_false=false",
+        "isUint16Array=true",
+        "isFloat64Array=true",
+        "isInt32Array=true",
+        "isArgumentsObject=true",
+        "isBooleanObject=true",
+        "isNumberObject=true",
+        "isStringObject=true",
+        "isWeakRef=true",
+        "isGeneratorObject=true",
+    ];
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            lines.get(i).unwrap_or(&"MISSING"),
+            exp,
+            "line {i} mismatch.\nfull stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}

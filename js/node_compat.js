@@ -273,11 +273,151 @@
     return out.subarray(0, o);
   }
 
+  // Node-shaped error codes: each entry creates a typed error with .code
   function makeNodeError(code, message) {
-    const err = new Error(message);
+    var err = new Error(message);
     err.code = code;
     return err;
   }
+
+  function E(code, Base, msgFn) {
+    function NodeError() {
+      var args = Array.prototype.slice.call(arguments);
+      var msg = typeof msgFn === "function" ? msgFn.apply(null, args) : msgFn;
+      var inst = new Base(msg);
+      inst.code = code;
+      inst.name = Base.name + " [" + code + "]";
+      return inst;
+    }
+    return NodeError;
+  }
+
+  var codes = {};
+  // ---- TypeError family ----
+  codes.ERR_INVALID_ARG_TYPE = E("ERR_INVALID_ARG_TYPE", TypeError, function(name, expected, actual) {
+    return 'The "' + name + '" argument must be of type ' + expected + '. Received ' + typeof actual;
+  });
+  codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, function(name, value, reason) {
+    return 'The argument "' + name + '" is invalid. Received ' + String(value) + (reason ? ". " + reason : "");
+  });
+  codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
+    return 'Callback must be a function. Received ' + String(name);
+  });
+  codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
+    return 'Value of "this" must be of type ' + expected;
+  });
+  codes.ERR_INVALID_RETURN_VALUE = E("ERR_INVALID_RETURN_VALUE", TypeError, function(input, name, value) {
+    return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' + typeof value + ".";
+  });
+  codes.ERR_MISSING_ARGS = E("ERR_MISSING_ARGS", TypeError, function() {
+    var args = Array.prototype.slice.call(arguments);
+    return 'The ' + args.map(function(a) { return '"' + a + '"'; }).join(", ") + ' argument' + (args.length > 1 ? 's' : '') + ' must be specified';
+  });
+  codes.ERR_UNKNOWN_ENCODING = E("ERR_UNKNOWN_ENCODING", TypeError, function(enc) {
+    return 'Unknown encoding: ' + enc;
+  });
+  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input) {
+    return 'Invalid URL: ' + input;
+  });
+  codes.ERR_INVALID_URL_SCHEME = E("ERR_INVALID_URL_SCHEME", TypeError, function(expected) {
+    return 'The URL must be of scheme ' + expected;
+  });
+  codes.ERR_INVALID_PROTOCOL = E("ERR_INVALID_PROTOCOL", TypeError, function(protocol, expected) {
+    return 'Protocol "' + protocol + '" not supported. Expected "' + expected + '"';
+  });
+  codes.ERR_METHOD_NOT_IMPLEMENTED = E("ERR_METHOD_NOT_IMPLEMENTED", TypeError, function(name) {
+    return 'The ' + name + ' method is not implemented';
+  });
+  codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
+    return 'Bad socket type specified. Valid types are: udp4, udp6';
+  });
+  codes.ERR_UNKNOWN_SIGNAL = E("ERR_UNKNOWN_SIGNAL", TypeError, function(signal) {
+    return 'Unknown signal: ' + signal;
+  });
+  codes.ERR_UNESCAPED_CHARACTERS = E("ERR_UNESCAPED_CHARACTERS", TypeError, function(name) {
+    return name + ' contains unescaped characters';
+  });
+  // ---- RangeError family ----
+  codes.ERR_OUT_OF_RANGE = E("ERR_OUT_OF_RANGE", RangeError, function(name, range, received) {
+    return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + received;
+  });
+  codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
+    return name ? '"' + name + '" is outside the bounds of the buffer' : 'Attempt to access memory outside buffer bounds';
+  });
+  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
+    return 'Child closed before reply';
+  });
+  codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
+    return '"' + name + '" option should be >= ' + (allowZero ? '0' : '1') + ' and < 65536. Received ' + port;
+  });
+  // ---- Error family ----
+  codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
+    return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
+  });
+  codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
+    return 'Premature close';
+  });
+  codes.ERR_STREAM_NULL_VALUES = E("ERR_STREAM_NULL_VALUES", TypeError, function() {
+    return 'May not write null values to stream';
+  });
+  codes.ERR_STREAM_WRITE_AFTER_END = E("ERR_STREAM_WRITE_AFTER_END", Error, function() {
+    return 'write after end';
+  });
+  codes.ERR_STREAM_ALREADY_FINISHED = E("ERR_STREAM_ALREADY_FINISHED", Error, function(name) {
+    return 'Cannot call ' + (name || 'write') + ' after a stream was finished';
+  });
+  codes.ERR_STREAM_PUSH_AFTER_EOF = E("ERR_STREAM_PUSH_AFTER_EOF", Error, function() {
+    return 'stream.push() after EOF';
+  });
+  codes.ERR_STREAM_UNSHIFT_AFTER_END_EVENT = E("ERR_STREAM_UNSHIFT_AFTER_END_EVENT", Error, function() {
+    return 'stream.unshift() after end event';
+  });
+  codes.ERR_MULTIPLE_CALLBACK = E("ERR_MULTIPLE_CALLBACK", Error, function() {
+    return 'Callback called multiple times';
+  });
+  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", Error, function(msg) {
+    return 'File URL path ' + msg;
+  });
+  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", Error, function(host) {
+    return 'File URL host must be "localhost" or empty on ' + host;
+  });
+  codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
+    return msg;
+  });
+  codes.ERR_FS_EISDIR = E("ERR_FS_EISDIR", Error, function(msg) {
+    return msg || 'Path is a directory';
+  });
+  codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
+    return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
+  });
+  codes.ERR_PACKAGE_PATH_NOT_EXPORTED = E("ERR_PACKAGE_PATH_NOT_EXPORTED", Error, function(pkgPath, subpath) {
+    return 'Package subpath "' + subpath + '" is not defined by "exports" in ' + pkgPath;
+  });
+  codes.ERR_PACKAGE_IMPORT_NOT_DEFINED = E("ERR_PACKAGE_IMPORT_NOT_DEFINED", TypeError, function(specifier, pkgPath) {
+    return 'Package import specifier "' + specifier + '" is not defined in ' + pkgPath;
+  });
+  codes.ERR_UNSUPPORTED_DIR_IMPORT = E("ERR_UNSUPPORTED_DIR_IMPORT", Error, function(path) {
+    return 'Directory import "' + path + '" is not supported';
+  });
+  codes.ERR_UNSUPPORTED_ESM_URL_SCHEME = E("ERR_UNSUPPORTED_ESM_URL_SCHEME", Error, function(url) {
+    return 'Only URLs with a scheme in: file and data are supported by the default ESM loader. Received protocol "' + url + '"';
+  });
+  codes.ERR_ASSERTION = E("ERR_ASSERTION", Error, function(msg) {
+    return msg || 'assertion error';
+  });
+  codes.ERR_CRYPTO_FIPS_FORCED = E("ERR_CRYPTO_FIPS_FORCED", Error, function() {
+    return 'Cannot set FIPS mode, it was forced with --force-fips at startup.';
+  });
+  codes.ERR_WORKER_NOT_SUPPORTED = E("ERR_WORKER_NOT_SUPPORTED", Error, function() {
+    return 'Worker threads are not supported in this environment';
+  });
+  codes.ERR_ENV_FILE_NOT_FOUND = E("ERR_ENV_FILE_NOT_FOUND", Error, function(path) {
+    return 'Cannot find env file: ' + path;
+  });
+  codes.ERR_INVALID_BUFFER_SIZE = E("ERR_INVALID_BUFFER_SIZE", RangeError, function() {
+    return 'Buffer size must be a multiple of 8';
+  });
+
 
   function bytesFromString(str, enc) {
     const encoding = normalizeEncoding(enc);
@@ -2164,6 +2304,30 @@
         isGeneratorFunction: (v) =>
           typeof v === "function" && v.constructor?.name === "GeneratorFunction",
         isProxy: () => false,
+        isArrayBufferView: (v) => ArrayBuffer.isView(v),
+        isUint8ClampedArray: (v) => v instanceof Uint8ClampedArray,
+        isUint16Array: (v) => v instanceof Uint16Array,
+        isUint32Array: (v) => v instanceof Uint32Array,
+        isInt8Array: (v) => v instanceof Int8Array,
+        isInt16Array: (v) => v instanceof Int16Array,
+        isInt32Array: (v) => v instanceof Int32Array,
+        isFloat32Array: (v) => v instanceof Float32Array,
+        isFloat64Array: (v) => v instanceof Float64Array,
+        isBigInt64Array: (v) => typeof BigInt64Array !== "undefined" && v instanceof BigInt64Array,
+        isBigUint64Array: (v) => typeof BigUint64Array !== "undefined" && v instanceof BigUint64Array,
+        isMapIterator: (v) => { try { Map.prototype.has.call(v); return false; } catch { return String(v) === "[object Map Iterator]"; } },
+        isSetIterator: (v) => { try { Set.prototype.has.call(v); return false; } catch { return String(v) === "[object Set Iterator]"; } },
+        isGeneratorObject: (v) => v != null && typeof v.next === "function" && typeof v.throw === "function" && typeof v[Symbol.iterator] === "function",
+        isWeakRef: (v) => v instanceof WeakRef,
+        isModuleNamespaceObject: () => false,
+        isExternal: () => false,
+        isArgumentsObject: (v) => Object.prototype.toString.call(v) === "[object Arguments]",
+        isBooleanObject: (v) => v instanceof Boolean,
+        isNumberObject: (v) => v instanceof Number,
+        isStringObject: (v) => v instanceof String,
+        isSymbolObject: (v) => Object.prototype.toString.call(v) === "[object Symbol]" && typeof v === "object",
+        isCryptoKey: (v) => typeof CryptoKey !== "undefined" && v instanceof CryptoKey,
+        isKeyObject: () => false,
         isBoxedPrimitive: (v) =>
           v instanceof Number || v instanceof String || v instanceof Boolean,
       },
@@ -3237,6 +3401,7 @@
       "diagnostics_channel",
       "dns",
       "dns/promises",
+      "internal/errors",
       "domain",
       "events",
       "fs",
@@ -8293,6 +8458,9 @@
   };
 
   registry.factories["dns/promises"] = () => registry.get("dns").promises;
+
+  // internal/errors -- some packages (readable-stream, undici) import this
+  registry.factories["internal/errors"] = () => ({ codes });
 
   // ------------------------------------------------------------------ http2
   registry.factories.http2 = () => {
