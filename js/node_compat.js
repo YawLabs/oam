@@ -3068,7 +3068,11 @@
         const { Readable } = registry.get("stream");
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
+        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
+        const startByte = typeof opts.start === "number" ? opts.start : 0;
+        const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
         let handle = null;
+        let totalRead = 0;
         const stream = new Readable({
           highWaterMark,
           encoding: opts.encoding ?? null,
@@ -3079,15 +3083,26 @@
                 stream.emit("open", handle);
                 stream.emit("ready");
               }
-              const chunk = await natives.fsReadChunk(handle, size || highWaterMark);
+              const remaining = maxBytes - totalRead;
+              if (remaining <= 0) {
+                await Promise.resolve(natives.fsClose(handle)).catch(() => {});
+                handle = null;
+                this.push(null);
+                process.nextTick(() => stream.emit("close"));
+                return;
+              }
+              const want = Math.min(size || highWaterMark, remaining);
+              const chunk = await natives.fsReadChunk(handle, want);
               if (chunk === undefined) {
                 await Promise.resolve(natives.fsClose(handle)).catch(() => {});
                 handle = null;
                 this.push(null);
+                process.nextTick(() => stream.emit("close"));
               } else {
-                this.push(
-                  new globalThis.Buffer(chunk.buffer, chunk.byteOffset, chunk.length),
-                );
+                const buf = new globalThis.Buffer(chunk.buffer, chunk.byteOffset, chunk.length);
+                totalRead += buf.length;
+                stream.bytesRead = totalRead;
+                this.push(buf);
               }
             } catch (e) {
               this.destroy(e);
@@ -3102,6 +3117,7 @@
           },
         });
         stream.path = path;
+        stream.bytesRead = 0;
         return stream;
       },
       createWriteStream: (path, options) => {
@@ -3109,6 +3125,7 @@
         const opts = readOptions(options);
         const flags = opts.flags === "a" ? "a" : "w";
         let handle = null;
+        let totalWritten = 0;
         const stream = new Writable({
           highWaterMark: opts.highWaterMark ?? 65536,
           async write(chunk, _encoding, cb) {
@@ -3119,6 +3136,8 @@
                 stream.emit("ready");
               }
               await natives.fsWriteChunk(handle, chunk);
+              totalWritten += chunk.length;
+              stream.bytesWritten = totalWritten;
               cb();
             } catch (e) {
               cb(e);
@@ -3133,6 +3152,7 @@
               natives.fsClose(handle);
               handle = null;
               cb();
+              stream.emit("close");
             } catch (e) {
               cb(e);
             }
@@ -3146,6 +3166,7 @@
           },
         });
         stream.path = path;
+        stream.bytesWritten = 0;
         return stream;
       },
       watch: fsWatch,
@@ -7560,6 +7581,17 @@
           }
           bodyData = merged;
         }
+        var connHdr = (self._headers["connection"] || "").toLowerCase();
+        if (connHdr.indexOf("upgrade") !== -1) {
+          self._doUpgradeRequest(bodyData);
+        } else {
+          self._doFetchRequest(bodyData);
+        }
+        if (callback) self.once("response", callback);
+        return this;
+      }
+      _doFetchRequest(bodyData) {
+        var self = this;
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
@@ -7589,8 +7621,95 @@
         }, function (err) {
           self.emit("error", typeof err === "string" ? new Error(err) : err);
         });
-        if (callback) self.once("response", callback);
-        return this;
+      }
+      _doUpgradeRequest(bodyData) {
+        var self = this;
+        var parsed = new URL(self._url);
+        var host = parsed.hostname;
+        var port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
+        var reqPath = parsed.pathname + parsed.search;
+        natives.tcpConnect(host, port).then(function (result) {
+          var handle = result.handle;
+          if (!self._headers["host"]) {
+            self._headers["host"] = port === 80 ? host : host + ":" + port;
+          }
+          var reqLine = self.method + " " + reqPath + " HTTP/1.1\r\n";
+          var headerStr = "";
+          var hkeys = Object.keys(self._headers);
+          for (var hi = 0; hi < hkeys.length; hi++) {
+            headerStr += hkeys[hi] + ": " + self._headers[hkeys[hi]] + "\r\n";
+          }
+          var reqBytes = globalThis.Buffer.from(reqLine + headerStr + "\r\n");
+          natives.tcpWrite(handle, reqBytes).then(function () {
+            var responseBuf = globalThis.Buffer.alloc(0);
+            function readMore() {
+              natives.tcpRead(handle, 4096).then(function (chunk) {
+                if (chunk === undefined) {
+                  self.emit("error", new Error("connection closed before upgrade response"));
+                  return;
+                }
+                responseBuf = globalThis.Buffer.concat([responseBuf, globalThis.Buffer.from(chunk)]);
+                var headerEnd = -1;
+                for (var si = 0; si < responseBuf.length - 3; si++) {
+                  if (responseBuf[si] === 13 && responseBuf[si+1] === 10 && responseBuf[si+2] === 13 && responseBuf[si+3] === 10) {
+                    headerEnd = si;
+                    break;
+                  }
+                }
+                if (headerEnd === -1) { readMore(); return; }
+                var headStr = responseBuf.slice(0, headerEnd).toString();
+                var headBytes = headerEnd + 4;
+                var remaining = responseBuf.slice(headBytes);
+                var lines = headStr.split("\r\n");
+                var statusLine = lines[0] || "";
+                var statusMatch = statusLine.match(/HTTP\/\d\.\d (\d+)/);
+                var statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+                var resHeaders = {};
+                var rawHeaders = [];
+                for (var li = 1; li < lines.length; li++) {
+                  var colonIdx = lines[li].indexOf(":");
+                  if (colonIdx !== -1) {
+                    var hname = lines[li].slice(0, colonIdx);
+                    var hval = lines[li].slice(colonIdx + 1).trim();
+                    var lname = hname.toLowerCase();
+                    resHeaders[lname] = lname in resHeaders ? resHeaders[lname] + ", " + hval : hval;
+                    rawHeaders.push(hname, hval);
+                  }
+                }
+                if (statusCode === 101) {
+                  var NetSocket = registry.get("net").Socket;
+                  var socket = new NetSocket({
+                    _handle: handle,
+                    _remoteAddr: result.remoteAddr,
+                  });
+                  socket._readLoop();
+                  var res = new Readable({ read: function () {} });
+                  res.statusCode = statusCode;
+                  res.statusMessage = statusLine.slice(statusLine.indexOf(" " + statusCode) + String(statusCode).length + 2) || "";
+                  res.httpVersion = "1.1";
+                  res.headers = resHeaders;
+                  res.rawHeaders = rawHeaders;
+                  self.emit("upgrade", res, socket, remaining);
+                } else {
+                  var res = new Readable({ read: function () {} });
+                  res.statusCode = statusCode;
+                  res.statusMessage = "";
+                  res.httpVersion = "1.1";
+                  res.headers = resHeaders;
+                  res.rawHeaders = rawHeaders;
+                  self.emit("response", res);
+                  if (remaining.length > 0) res.push(remaining);
+                  natives.tcpRead(handle, 65536).then(function readRest(chunk) {
+                    if (chunk === undefined) { res.push(null); return; }
+                    res.push(globalThis.Buffer.from(chunk));
+                    natives.tcpRead(handle, 65536).then(readRest);
+                  });
+                }
+              }, function (err) { self.emit("error", err); });
+            }
+            readMore();
+          }, function (err) { self.emit("error", err); });
+        }, function (err) { self.emit("error", err); });
       }
       abort() {
         this._aborted = true;
@@ -9648,42 +9767,183 @@
   };
 
   // ------------------------------------------------------------------ dgram
-  registry.factories.dgram = () => {
+  registry.factories.dgram = (natives) => {
     const EventEmitter = registry.get("events");
-    function createSocket(_type, _callback) {
-      const socket = new EventEmitter();
-      socket.bind = function () {
-        process.nextTick(() =>
-          socket.emit("error", new Error("dgram is not implemented in oam")),
-        );
-        return socket;
-      };
-      socket.send = function () {
-        const cb = arguments[arguments.length - 1];
-        if (typeof cb === "function")
-          cb(new Error("dgram.send is not implemented in oam"));
-      };
-      socket.close = function (cb) {
-        if (typeof cb === "function") cb();
-      };
-      socket.address = function () {
-        return { address: "0.0.0.0", family: "IPv4", port: 0 };
-      };
-      socket.addMembership = function () {};
-      socket.dropMembership = function () {};
-      socket.setBroadcast = function () {};
-      socket.setMulticastLoopback = function () {};
-      socket.setMulticastTTL = function () {};
-      socket.setTTL = function () {};
-      socket.ref = function () {
-        return socket;
-      };
-      socket.unref = function () {
-        return socket;
-      };
-      return socket;
+
+    // base64 decode helper (browser-compat atob is available in the snapshot)
+    function b64ToBuffer(b64) {
+      const raw = atob(b64);
+      const buf = globalThis.Buffer.alloc(raw.length);
+      for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+      return buf;
     }
-    return { createSocket };
+
+    class Socket extends EventEmitter {
+      constructor(type, listener) {
+        super();
+        this._type = type || "udp4";
+        this._handle = null;
+        this._bound = false;
+        this._closed = false;
+        this._recvLoop = false;
+        this._address = { address: "0.0.0.0", family: "IPv4", port: 0 };
+        if (typeof listener === "function") this.on("message", listener);
+      }
+
+      bind(...args) {
+        let port = 0, address = "0.0.0.0", cb;
+        if (typeof args[0] === "number") {
+          port = args[0];
+          if (typeof args[1] === "string") address = args[1];
+          if (typeof args[args.length - 1] === "function") cb = args[args.length - 1];
+        } else if (typeof args[0] === "object" && args[0] !== null) {
+          const opts = args[0];
+          port = opts.port || 0;
+          address = opts.address || "0.0.0.0";
+          if (typeof args[1] === "function") cb = args[1];
+        } else if (typeof args[0] === "function") {
+          cb = args[0];
+        }
+
+        if (cb) this.once("listening", cb);
+
+        natives.udpBind(address, port).then((result) => {
+          if (this._closed) return;
+          this._handle = result.handle;
+          this._bound = true;
+          this._address = {
+            address: result.address,
+            port: result.port,
+            family: result.family,
+          };
+          this.emit("listening");
+          this._startRecv();
+        }).catch((err) => {
+          this.emit("error", err);
+        });
+
+        return this;
+      }
+
+      _startRecv() {
+        if (this._recvLoop || this._closed) return;
+        this._recvLoop = true;
+        const loop = async () => {
+          while (!this._closed && this._handle !== null) {
+            try {
+              const result = await natives.udpRecv(this._handle, 65536);
+              if (result === undefined || this._closed) break;
+              const msg = b64ToBuffer(result.data);
+              this.emit("message", msg, result.rinfo);
+            } catch (err) {
+              if (!this._closed) this.emit("error", err);
+              break;
+            }
+          }
+          this._recvLoop = false;
+        };
+        loop();
+      }
+
+      send(msg, ...args) {
+        // Signatures:
+        //   send(msg, offset, length, port, address, callback)
+        //   send(msg, port, address, callback)
+        let offset, length, port, address, cb;
+
+        if (typeof args[0] === "number" && typeof args[1] === "number" &&
+            typeof args[2] === "number") {
+          // send(msg, offset, length, port, address, callback)
+          offset = args[0];
+          length = args[1];
+          port = args[2];
+          address = typeof args[3] === "string" ? args[3] : "127.0.0.1";
+          cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+        } else {
+          // send(msg, port, address, callback)
+          port = args[0];
+          address = typeof args[1] === "string" ? args[1] : "127.0.0.1";
+          cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+          offset = 0;
+          length = undefined;
+        }
+
+        let data;
+        if (typeof msg === "string") {
+          data = globalThis.Buffer.from(msg, "utf8");
+        } else if (msg instanceof Uint8Array) {
+          data = msg;
+        } else if (Array.isArray(msg)) {
+          data = globalThis.Buffer.concat(msg.map((m) =>
+            typeof m === "string" ? globalThis.Buffer.from(m, "utf8") : m
+          ));
+        } else {
+          data = globalThis.Buffer.from(String(msg));
+        }
+
+        if (offset !== undefined && offset !== 0 || length !== undefined) {
+          data = data.slice(offset || 0, length !== undefined ? (offset || 0) + length : undefined);
+        }
+
+        const doSend = () => {
+          natives.udpSend(this._handle, data, String(address), port).then((result) => {
+            if (cb) cb(null, result.bytesSent);
+          }).catch((err) => {
+            if (cb) cb(err);
+            else this.emit("error", err);
+          });
+        };
+
+        if (!this._bound) {
+          // Auto-bind like Node does when sending without bind
+          this.bind(0, () => doSend());
+        } else {
+          doSend();
+        }
+      }
+
+      close(cb) {
+        if (this._closed) return this;
+        this._closed = true;
+        if (this._handle !== null) {
+          natives.udpClose(this._handle);
+          this._handle = null;
+        }
+        this._bound = false;
+        if (typeof cb === "function") this.once("close", cb);
+        process.nextTick(() => this.emit("close"));
+        return this;
+      }
+
+      address() {
+        return Object.assign({}, this._address);
+      }
+
+      // Stubs for multicast/TTL options -- no-ops but don't throw
+      addMembership() {}
+      dropMembership() {}
+      setBroadcast() {}
+      setMulticastLoopback() {}
+      setMulticastTTL() {}
+      setTTL() {}
+      setRecvBufferSize() {}
+      setSendBufferSize() {}
+      getRecvBufferSize() { return 65536; }
+      getSendBufferSize() { return 65536; }
+
+      ref() { return this; }
+      unref() { return this; }
+    }
+
+    function createSocket(type, listener) {
+      if (typeof type === "object") {
+        listener = type.listener || listener;
+        type = type.type;
+      }
+      return new Socket(type, listener);
+    }
+
+    return { createSocket, Socket };
   };
 
   // -------------------------------------------------------------------- dns
@@ -9931,42 +10191,334 @@
   registry.factories["internal/errors"] = () => ({ codes });
 
   // ------------------------------------------------------------------ http2
-  registry.factories.http2 = () => {
+  registry.factories.http2 = (natives) => {
     const EventEmitter = registry.get("events");
-    function createServer(_options, _handler) {
-      const server = new EventEmitter();
-      server.listen = function () {
-        process.nextTick(() =>
-          server.emit(
-            "error",
-            new Error("http2.createServer is not implemented in oam"),
-          ),
+    const { Duplex } = registry.get("stream");
+
+    class ServerHttp2Stream extends Duplex {
+      constructor(requestId, inHeaders) {
+        super({ allowHalfOpen: true });
+        this._requestId = requestId;
+        this._streamId = null;
+        this._ended = false;
+        this._responded = false;
+        this._chain = Promise.resolve();
+        this.sentHeaders = null;
+        this._inHeaders = inHeaders;
+        this.id = requestId;
+      }
+      respond(headers, options) {
+        if (this._responded) return;
+        this._responded = true;
+        var status = 200;
+        var outPairs = [];
+        if (headers) {
+          var keys = Object.keys(headers);
+          for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            if (k === ":status") {
+              status = Number(headers[k]);
+            } else if (k.charAt(0) !== ":") {
+              outPairs.push([k.toLowerCase(), String(headers[k])]);
+            }
+          }
+        }
+        this.sentHeaders = headers || {};
+        var endStream = options && options.endStream;
+        if (endStream) {
+          this._ended = true;
+          natives.httpRespond(
+            this._requestId,
+            status,
+            JSON.stringify(outPairs),
+            new Uint8Array(0),
+          );
+          var self = this;
+          queueMicrotask(function() { self.emit("finish"); self.push(null); });
+        } else {
+          this._streamId = natives.httpRespondStream(
+            this._requestId,
+            status,
+            JSON.stringify(outPairs),
+          );
+        }
+      }
+      additionalHeaders() {}
+      _write(chunk, encoding, callback) {
+        if (this._ended) { callback(); return; }
+        if (!this._responded) {
+          this.respond({ ":status": 200 });
+        }
+        var bytes;
+        if (typeof chunk === "string") {
+          bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
+        } else {
+          bytes = chunk;
+        }
+        if (this._streamId === null) { callback(); return; }
+        var streamId = this._streamId;
+        this._chain = this._chain
+          .then(function() { return natives.httpBodyPush(streamId, bytes); })
+          .then(function() { callback(); }, function(err) { callback(err); });
+      }
+      _final(callback) {
+        if (this._ended) { callback(); return; }
+        this._ended = true;
+        if (!this._responded) {
+          this.respond({ ":status": 200 });
+        }
+        if (this._streamId !== null) {
+          var streamId = this._streamId;
+          var self = this;
+          this._chain = this._chain.then(function() {
+            natives.httpBodyEnd(streamId);
+            self.emit("finish");
+            callback();
+          });
+        } else {
+          callback();
+        }
+      }
+      _read() {
+        if (!this._bodyPushed) {
+          this._bodyPushed = true;
+          var body = natives.httpRequestBody(this._requestId);
+          if (body && body.length > 0) {
+            this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
+          }
+          this.push(null);
+        }
+      }
+      close(code, callback) {
+        if (typeof code === "function") { callback = code; code = 0; }
+        this.end();
+        if (callback) this.once("close", callback);
+      }
+    }
+
+    class Http2Server extends EventEmitter {
+      constructor(options, handler) {
+        super();
+        if (typeof options === "function") {
+          handler = options;
+          options = {};
+        }
+        this._options = options || {};
+        if (handler) this.on("stream", handler);
+        this._serverId = null;
+        this._port = null;
+        this._host = null;
+        this.listening = false;
+      }
+      listen(port, host, callback) {
+        if (typeof port === "object" && port !== null) {
+          callback = host;
+          host = port.host;
+          port = port.port;
+        }
+        if (typeof host === "function") {
+          callback = host;
+          host = undefined;
+        }
+        if (typeof callback === "function") this.once("listening", callback);
+        var hostname = host || "127.0.0.1";
+        var self = this;
+        natives.http2Serve(hostname, port || 0).then(
+          function(bound) {
+            self._serverId = bound.serverId;
+            self._port = bound.port;
+            self._host = hostname;
+            self.listening = true;
+            self.emit("listening");
+            (async function() {
+              for (;;) {
+                var meta = await natives.httpAccept(bound.serverId);
+                if (meta === undefined) break;
+                var hdrs = {};
+                for (var i = 0; i < meta.headers.length; i++) {
+                  var key = meta.headers[i][0].toLowerCase();
+                  hdrs[key] = meta.headers[i][1];
+                }
+                hdrs[":method"] = meta.method;
+                hdrs[":path"] = meta.uri;
+                hdrs[":scheme"] = "http";
+                var stream = new ServerHttp2Stream(meta.requestId, hdrs);
+                self.emit("stream", stream, hdrs);
+              }
+              self.emit("close");
+            })();
+          },
+          function(err) { self.emit("error", err); },
         );
-        return server;
-      };
-      server.close = function (cb) {
-        if (typeof cb === "function") cb();
-        return server;
-      };
-      return server;
+        return this;
+      }
+      address() {
+        return this.listening
+          ? { port: this._port, address: this._host, family: "IPv4" }
+          : null;
+      }
+      close(callback) {
+        if (this._serverId !== null) {
+          natives.httpClose(this._serverId);
+          this.listening = false;
+        }
+        if (callback) this.once("close", callback);
+        return this;
+      }
+      setTimeout() { return this; }
     }
-    function createSecureServer(_options, _handler) {
-      return createServer(_options, _handler);
+
+    function createServer(options, handler) {
+      return new Http2Server(options, handler);
     }
-    function connect(_authority, _options) {
-      const session = new EventEmitter();
-      session.close = function () {};
-      session.destroy = function () {};
-      session.ref = function () { return session; };
-      session.unref = function () { return session; };
-      process.nextTick(() =>
-        session.emit(
-          "error",
-          new Error("http2.connect is not implemented in oam"),
-        ),
-      );
-      return session;
+
+    function createSecureServer(options, handler) {
+      return createServer(options, handler);
     }
+
+    class ClientHttp2Stream extends Duplex {
+      constructor(session, headers) {
+        super({ allowHalfOpen: true });
+        this._session = session;
+        this._reqHeaders = headers;
+        this._bodyChunks = [];
+        this._ended = false;
+        this.sentHeaders = headers;
+        this.id = 1;
+        this._responseEmitted = false;
+      }
+      _write(chunk, encoding, callback) {
+        if (typeof chunk === "string") {
+          this._bodyChunks.push(globalThis.Buffer.from(chunk, encoding || "utf8"));
+        } else {
+          this._bodyChunks.push(chunk);
+        }
+        callback();
+      }
+      _final(callback) {
+        this._ended = true;
+        this._doFetch(callback);
+      }
+      _read() {}
+      _doFetch(callback) {
+        var self = this;
+        var method = this._reqHeaders[":method"] || "GET";
+        var path = this._reqHeaders[":path"] || "/";
+        var scheme = this._reqHeaders[":scheme"] || "http";
+        var authority = this._reqHeaders[":authority"] || this._session._authority;
+        var url = scheme + "://" + authority + path;
+        var fetchHeaders = {};
+        var keys = Object.keys(this._reqHeaders);
+        for (var i = 0; i < keys.length; i++) {
+          if (keys[i].charAt(0) !== ":") {
+            fetchHeaders[keys[i]] = this._reqHeaders[keys[i]];
+          }
+        }
+        var bodyData = null;
+        if (this._bodyChunks.length > 0) {
+          var totalLen = 0;
+          for (var bi = 0; bi < this._bodyChunks.length; bi++) totalLen += this._bodyChunks[bi].length;
+          var merged = new Uint8Array(totalLen);
+          var boff = 0;
+          for (var bi = 0; bi < this._bodyChunks.length; bi++) {
+            merged.set(this._bodyChunks[bi], boff);
+            boff += this._bodyChunks[bi].length;
+          }
+          bodyData = merged;
+        }
+        var fetchOpts = { method: method, headers: fetchHeaders };
+        if (bodyData && method !== "GET" && method !== "HEAD") {
+          fetchOpts.body = bodyData;
+        }
+        globalThis.fetch(url, fetchOpts).then(
+          function(resp) {
+            var respHeaders = { ":status": resp.status };
+            resp.headers.forEach(function(value, name) {
+              respHeaders[name.toLowerCase()] = value;
+            });
+            self.emit("response", respHeaders, 0);
+            resp.arrayBuffer().then(function(ab) {
+              if (ab.byteLength > 0) {
+                self.push(globalThis.Buffer.from(ab));
+              }
+              self.push(null);
+              callback();
+            }, function(err) {
+              self.destroy(err);
+              callback(err);
+            });
+          },
+          function(err) {
+            self.emit("error", typeof err === "string" ? new Error(err) : err);
+            callback(err);
+          },
+        );
+      }
+      close(code, callback) {
+        if (typeof code === "function") { callback = code; code = 0; }
+        this.end();
+        if (callback) this.once("close", callback);
+      }
+    }
+
+    class ClientHttp2Session extends EventEmitter {
+      constructor(authority) {
+        super();
+        this._authority = authority.replace(/^https?:\/\//, "");
+        this._scheme = authority.startsWith("https") ? "https" : "http";
+        this._closed = false;
+        this._destroyed = false;
+        this.socket = {};
+        this.alpnProtocol = "h2c";
+        var self = this;
+        process.nextTick(function() { self.emit("connect", self); });
+      }
+      request(headers) {
+        if (this._closed || this._destroyed) {
+          throw new Error("Session is closed");
+        }
+        var merged = {};
+        merged[":method"] = "GET";
+        merged[":path"] = "/";
+        merged[":scheme"] = this._scheme;
+        merged[":authority"] = this._authority;
+        if (headers) {
+          var keys = Object.keys(headers);
+          for (var i = 0; i < keys.length; i++) {
+            merged[keys[i]] = headers[keys[i]];
+          }
+        }
+        var stream = new ClientHttp2Stream(this, merged);
+        return stream;
+      }
+      close(callback) {
+        this._closed = true;
+        if (callback) this.once("close", callback);
+        var self = this;
+        process.nextTick(function() { self.emit("close"); });
+      }
+      destroy(err) {
+        this._destroyed = true;
+        this._closed = true;
+        if (err) this.emit("error", err);
+        var self = this;
+        process.nextTick(function() { self.emit("close"); });
+      }
+      ref() { return this; }
+      unref() { return this; }
+      ping(payload, callback) {
+        if (typeof payload === "function") { callback = payload; payload = undefined; }
+        if (callback) process.nextTick(function() { callback(null, 0, globalThis.Buffer.alloc(8)); });
+      }
+      get closed() { return this._closed; }
+      get destroyed() { return this._destroyed; }
+    }
+
+    function connect(authority, options) {
+      if (typeof options === "function") options = {};
+      return new ClientHttp2Session(authority);
+    }
+
     return {
       createServer,
       createSecureServer,

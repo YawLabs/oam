@@ -727,6 +727,140 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
     }
 }
 
+/// HTTP/2 connection preface: `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` (24 bytes).
+/// If the first bytes on the wire match this, the connection is h2c
+/// (prior-knowledge HTTP/2). Otherwise, treat it as HTTP/1.1 — exactly
+/// what Node's `http2.createServer()` does: accept both protocols.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Bind + spawn an HTTP/2 cleartext (h2c) accept loop. Same request/response
+/// lifecycle as http_serve — shared HttpState, same accept/respond ops.
+///
+/// Each connection auto-detects the protocol: if the client sends the HTTP/2
+/// connection preface it runs through hyper's http2 builder, otherwise it
+/// falls back to the http1 builder. This matches Node's `http2.createServer()`
+/// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
+pub async fn http2_serve(
+    state: Arc<HttpState>,
+    host: String,
+    port: u16,
+) -> super::OpOutcome {
+    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
+        Ok(listener) => listener,
+        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    };
+    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let server_id = state.next_id();
+    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+            },
+        );
+
+    let accept_state = state.clone();
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let conn_state = accept_state.clone();
+                    let conn_queue = queue_tx.clone();
+                    let mut conn_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // Peek the first bytes to detect HTTP/2 prior-knowledge.
+                        // The preface is 24 bytes; TCP segmentation may deliver
+                        // fewer on the first peek. Retry a few times with a
+                        // short wait before falling back to HTTP/1.1.
+                        let mut peek_buf = [0u8; 24];
+                        let mut is_h2 = false;
+                        for _ in 0..3u8 {
+                            match stream.peek(&mut peek_buf).await {
+                                Ok(n) if n >= H2_PREFACE.len() => {
+                                    is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
+                                    break;
+                                }
+                                Ok(n) if n > 0 && n < H2_PREFACE.len() => {
+                                    // Partial read: if the first few bytes match
+                                    // the preface prefix, wait for more data.
+                                    if peek_buf[..n] == H2_PREFACE[..n] {
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                        continue;
+                                    }
+                                    // Definitely not h2.
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let service = hyper::service::service_fn(move |req| {
+                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                        });
+
+                        if is_h2 {
+                            let conn = hyper::server::conn::http2::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(io, service);
+                            let mut conn = std::pin::pin!(conn);
+                            let mut shutting_down = false;
+                            loop {
+                                tokio::select! {
+                                    result = conn.as_mut() => {
+                                        let _ = result;
+                                        break;
+                                    }
+                                    _ = conn_shutdown.changed(), if !shutting_down => {
+                                        shutting_down = true;
+                                        conn.as_mut().graceful_shutdown();
+                                    }
+                                }
+                            }
+                        } else {
+                            let conn = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service);
+                            let mut conn = std::pin::pin!(conn);
+                            let mut shutting_down = false;
+                            loop {
+                                tokio::select! {
+                                    result = conn.as_mut() => {
+                                        let _ = result;
+                                        break;
+                                    }
+                                    _ = conn_shutdown.changed(), if !shutting_down => {
+                                        shutting_down = true;
+                                        conn.as_mut().graceful_shutdown();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    super::OpOutcome::Json(
+        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+    )
+}
+
 /// Backpressured chunk push for streaming responses. A bounded timeout is
 /// the half-open backstop: when a client stops reading (or vanishes
 /// without a reset the OS has noticed yet), hyper stops draining the body,

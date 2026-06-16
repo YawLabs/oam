@@ -88,7 +88,7 @@ tar = "0.4"
 brotli = { version = "8", default-features = false, features = ["std"] }
 # HTTP server: hyper + adapters (already in-tree transitively through
 # reqwest — declaring them adds no new compilation units).
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"

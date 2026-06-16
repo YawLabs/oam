@@ -25,6 +25,7 @@ pub mod http_server;
 pub mod inspector;
 pub mod tcp;
 pub mod tls;
+pub mod udp;
 pub mod websocket;
 pub mod worker;
 
@@ -119,6 +120,7 @@ pub struct CoreRuntime {
     http_state: std::sync::Arc<http_server::HttpState>,
     tcp: tcp::TcpRegistry,
     tls: tls::TlsRegistry,
+    udp: udp::UdpRegistry,
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
     children: child::ChildRegistry,
@@ -157,6 +159,7 @@ impl CoreRuntime {
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
             tls: std::sync::Arc::new(std::sync::Mutex::new(tls::TlsState::default())),
+            udp: std::sync::Arc::new(std::sync::Mutex::new(udp::UdpState::default())),
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -204,6 +207,11 @@ impl CoreRuntime {
     /// TLS socket registry (Arc clone; dies with the run).
     pub fn tls(&self) -> tls::TlsRegistry {
         self.tls.clone()
+    }
+
+    /// UDP socket registry (Arc clone; dies with the run).
+    pub fn udp(&self) -> udp::UdpRegistry {
+        self.udp.clone()
     }
 
     /// WebSocket connection registry (Arc clone; dies with the run).

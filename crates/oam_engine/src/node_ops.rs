@@ -184,6 +184,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBodyPush", op_http_body_push),
         ("httpBodyEnd", op_http_body_end),
         ("httpClose", op_http_close),
+        // HTTP/2 cleartext server (h2c — same accept/respond ops)
+        ("http2Serve", op_http2_serve),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
         ("httpsServe", op_https_serve),
         // TCP sockets (node:net)
@@ -195,6 +197,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
         ("tcpServerClose", op_tcp_server_close),
+        // UDP sockets (node:dgram)
+        ("udpBind", op_udp_bind),
+        ("udpSend", op_udp_send),
+        ("udpRecv", op_udp_recv),
+        ("udpClose", op_udp_close),
         // node:crypto (crypto_ops.rs)
         ("cryptoHashCreate", op_crypto_hash_create),
         ("cryptoHmacCreate", op_crypto_hmac_create),
@@ -787,6 +794,27 @@ fn op_http_close(
     core_runtime!(scope).http().close_server(server_id);
 }
 
+// ----------------------------------------------------------------- HTTP/2
+
+fn op_http2_serve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let state = core_runtime!(scope).http();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http2_serve(state, host, port),
+    );
+}
+
 // ----------------------------------------------------------------- HTTPS
 
 fn op_https_serve(
@@ -940,6 +968,76 @@ fn op_tcp_server_close(
     let tcp = core_runtime!(scope)
         .tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
+}
+
+// ------------------------------------------------------------------- UDP
+
+fn op_udp_bind(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "udpBind requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
+    let core = core_runtime!(scope);
+    let udp = core.udp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::udp::udp_bind(udp, ids, host, port),
+    );
+}
+
+fn op_udp_send(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(data) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "udpSend requires data");
+        return;
+    };
+    let Some(host) = arg_string(scope, &args, 2) else {
+        throw_type_error(scope, "udpSend requires a target host");
+        return;
+    };
+    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let udp = core_runtime!(scope).udp();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::udp::udp_send(udp, handle, data, host, port),
+    );
+}
+
+fn op_udp_recv(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    let udp = core_runtime!(scope).udp();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::udp::udp_recv(udp, handle, len));
+}
+
+fn op_udp_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let udp = core_runtime!(scope).udp();
+    oam_core::udp::udp_close(&udp, handle);
 }
 
 // ------------------------------------------------------------------- TLS

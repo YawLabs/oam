@@ -10888,33 +10888,68 @@ console.log("all_ok=true");
     assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
 }
 
+// ------------------------------------------ dgram: UDP round-trip
+
 #[test]
-fn graceful_stub_dgram() {
-    let stdout = run_ok(
-        "stub_dgram.mjs",
-        "import dgram from 'node:dgram';\n\
-         const socket = dgram.createSocket('udp4');\n\
-         console.log('createSocket:', typeof socket === 'object');\n\
-         let errEmitted = false;\n\
-         socket.bind(0);\n\
-         socket.on('error', (e) => {\n\
-           errEmitted = true;\n\
-           console.log('error_emitted:', true);\n\
-           console.log('error_message:', e.message.includes('not implemented'));\n\
-         });\n\
-         await new Promise(r => setTimeout(r, 50));\n\
-         console.log('no_throw:', !errEmitted || true);",
-    );
-    for line in stdout.lines() {
-        assert!(
-            line.ends_with("true"),
-            "assertion failed: {line}\nfull output: {stdout}"
-        );
-    }
+fn dgram_udp_round_trip() {
+    let source = r#"
+import dgram from 'node:dgram';
+
+const server = dgram.createSocket('udp4');
+const client = dgram.createSocket('udp4');
+
+server.bind(0, '127.0.0.1', () => {
+  const addr = server.address();
+  console.log('bound:true');
+  console.log('family:' + addr.family);
+
+  server.on('message', (msg, rinfo) => {
+    console.log('recv:' + msg.toString());
+    console.log('rinfo_addr:' + rinfo.address);
+    console.log('rinfo_size:' + rinfo.size);
+    // Echo back
+    server.send(msg, rinfo.port, rinfo.address, () => {
+      server.close();
+    });
+  });
+
+  client.bind(0, '127.0.0.1', () => {
+    client.on('message', (msg, rinfo) => {
+      console.log('echo:' + msg.toString());
+      client.close(() => {
+        console.log('closed:true');
+      });
+    });
+
+    client.send('hello udp', 0, 9, addr.port, '127.0.0.1', (err, bytes) => {
+      console.log('sent_err:' + (err === null ? 'null' : err));
+      console.log('sent_bytes:' + bytes);
+    });
+  });
+});
+"#;
+    let stdout = run_ok("dgram_udp_roundtrip.mjs", source);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let kv: std::collections::HashMap<&str, &str> = lines
+        .iter()
+        .filter_map(|l| l.split_once(':'))
+        .collect();
+
+    assert_eq!(kv.get("bound"), Some(&"true"), "server bound");
+    assert_eq!(kv.get("family"), Some(&"IPv4"), "family is IPv4");
+    assert_eq!(kv.get("recv"), Some(&"hello udp"), "server received message");
+    assert_eq!(kv.get("rinfo_addr"), Some(&"127.0.0.1"), "rinfo address");
+    assert_eq!(kv.get("rinfo_size"), Some(&"9"), "rinfo size");
+    assert_eq!(kv.get("sent_err"), Some(&"null"), "send had no error");
+    assert_eq!(kv.get("sent_bytes"), Some(&"9"), "sent 9 bytes");
+    assert_eq!(kv.get("echo"), Some(&"hello udp"), "client got echo");
+    assert_eq!(kv.get("closed"), Some(&"true"), "client closed");
 }
 
 #[test]
-fn graceful_stub_http2() {
+fn http2_module_shape_and_server_listens() {
+    // Replaced the old "graceful stub" test: http2 is now implemented.
+    // Server.listen() succeeds (port 0); connect() emits 'connect'.
     let stdout = run_ok(
         "stub_http2.mjs",
         "import http2 from 'node:http2';\n\
@@ -10923,16 +10958,15 @@ fn graceful_stub_http2() {
          console.log('connect_fn:', typeof http2.connect === 'function');\n\
          const server = http2.createServer();\n\
          console.log('server_created:', typeof server === 'object');\n\
-         let serverErr = false;\n\
-         server.on('error', () => { serverErr = true; });\n\
-         server.listen();\n\
-         await new Promise(r => setTimeout(r, 50));\n\
-         console.log('server_error:', serverErr);\n\
-         let connectErr = false;\n\
-         const session = http2.connect('http://localhost:1');\n\
-         session.on('error', () => { connectErr = true; });\n\
-         await new Promise(r => setTimeout(r, 50));\n\
-         console.log('connect_error:', connectErr);",
+         let serverListening = false;\n\
+         await new Promise(r => server.listen(0, '127.0.0.1', () => { serverListening = true; r(); }));\n\
+         console.log('server_listening:', serverListening);\n\
+         let connected = false;\n\
+         const session = http2.connect('http://127.0.0.1:' + server.address().port);\n\
+         await new Promise(r => session.on('connect', () => { connected = true; r(); }));\n\
+         console.log('client_connected:', connected);\n\
+         session.close();\n\
+         server.close();",
     );
     for line in stdout.lines() {
         assert!(
@@ -11047,5 +11081,357 @@ fn http_upgrade_event_fires_with_socket() {
     assert!(
         stdout.contains("got_body: true"),
         "stdout: {stdout}"
+    );
+}
+
+// ------------------------------------------------- fs stream e2e tests
+
+#[test]
+fn test_fs_stream_pipe() {
+    // The JS script creates a 256KB source file, pipes it through
+    // createReadStream -> createWriteStream, then verifies the copy.
+    // Paths are passed via process.argv so the Rust side controls temp layout.
+    let src = write_temp("fspipe/source.bin", "");
+    let dest_path = src.parent().unwrap().join("dest.bin");
+    // Touch dest so the parent dir exists.
+    std::fs::write(&dest_path, "").unwrap();
+
+    let script = write_temp(
+        "fspipe/pipe.cjs",
+        r#"const fs = require('fs');
+const src = process.argv[2];
+const dest = process.argv[3];
+
+// Build 256KB of patterned data and write the source file.
+const size = 256 * 1024;
+const buf = Buffer.alloc(size);
+for (let i = 0; i < size; i++) buf[i] = i % 251;
+fs.writeFileSync(src, buf);
+
+const rs = fs.createReadStream(src);
+const ws = fs.createWriteStream(dest);
+rs.pipe(ws);
+ws.on('close', () => {
+  try {
+    const original = fs.readFileSync(src);
+    const copied = fs.readFileSync(dest);
+    if (!original.equals(copied)) {
+      console.log('FAIL: copied data does not match original');
+      process.exit(1);
+    }
+    if (rs.path !== src) {
+      console.log('FAIL: readStream.path mismatch: ' + rs.path);
+      process.exit(1);
+    }
+    if (ws.path !== dest) {
+      console.log('FAIL: writeStream.path mismatch: ' + ws.path);
+      process.exit(1);
+    }
+    if (rs.bytesRead !== size) {
+      console.log('FAIL: bytesRead=' + rs.bytesRead + ' expected=' + size);
+      process.exit(1);
+    }
+    if (ws.bytesWritten !== size) {
+      console.log('FAIL: bytesWritten=' + ws.bytesWritten + ' expected=' + size);
+      process.exit(1);
+    }
+    console.log('PASS bytesRead=' + rs.bytesRead + ' bytesWritten=' + ws.bytesWritten);
+  } catch (e) {
+    console.log('FAIL: ' + e.message);
+    process.exit(1);
+  }
+});"#,
+    );
+
+    let out = oam(&[
+        "run",
+        script.to_str().unwrap(),
+        "--",
+        src.to_str().unwrap(),
+        dest_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("PASS"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_fs_stream_end_option() {
+    // createReadStream with { end: 4 } should read bytes 0 through 4 inclusive
+    // (5 bytes: "ABCDE") from a 10-byte file.
+    let src = write_temp("fsend/source.txt", "ABCDEFGHIJ");
+
+    let script = write_temp(
+        "fsend/end_opt.cjs",
+        r#"const fs = require('fs');
+const src = process.argv[2];
+
+const rs = fs.createReadStream(src, { end: 4 });
+const chunks = [];
+rs.on('data', (chunk) => chunks.push(chunk));
+rs.on('end', () => {
+  const result = Buffer.concat(chunks).toString();
+  if (result === 'ABCDE') {
+    console.log('PASS');
+  } else {
+    console.log('FAIL: got "' + result + '" expected "ABCDE"');
+    process.exit(1);
+  }
+});
+rs.on('error', (err) => {
+  console.log('FAIL: ' + err.message);
+  process.exit(1);
+});"#,
+    );
+
+    let out = oam(&[
+        "run",
+        script.to_str().unwrap(),
+        "--",
+        src.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("PASS"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_fs_stream_events() {
+    // Verify that createReadStream fires events in the expected order:
+    // open -> ready -> data (1+) -> end -> close
+    let src = write_temp("fsevents/source.txt", "hello stream events");
+
+    let script = write_temp(
+        "fsevents/events.cjs",
+        r#"const fs = require('fs');
+const src = process.argv[2];
+
+const events = [];
+const rs = fs.createReadStream(src);
+rs.on('open', () => events.push('open'));
+rs.on('ready', () => events.push('ready'));
+rs.on('data', () => {
+  if (!events.includes('data')) events.push('data');
+});
+rs.on('end', () => events.push('end'));
+rs.on('close', () => {
+  events.push('close');
+  const expected = ['open', 'ready', 'data', 'end', 'close'];
+  const ok = expected.every((e, i) => events[i] === e) && events.length === expected.length;
+  if (ok) {
+    console.log('PASS');
+  } else {
+    console.log('FAIL: events=' + JSON.stringify(events) + ' expected=' + JSON.stringify(expected));
+    process.exit(1);
+  }
+});
+rs.on('error', (err) => {
+  console.log('FAIL: ' + err.message);
+  process.exit(1);
+});"#,
+    );
+
+    let out = oam(&[
+        "run",
+        script.to_str().unwrap(),
+        "--",
+        src.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("PASS"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn http_client_upgrade_event() {
+    let stdout = run_ok(
+        "http_client_upgrade.mjs",
+        r#"import http from 'node:http';
+import net from 'node:net';
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+const server = http.createServer((req, res) => res.end('normal'));
+server.on('upgrade', (req, socket, head) => {
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n\r\n'
+  );
+  socket.write('upgraded-payload');
+  socket.end();
+});
+await new Promise(r => server.listen(0, r));
+const port = server.address().port;
+let gotUpgrade = false;
+let upgradeData = '';
+const req = http.request({
+  hostname: '127.0.0.1',
+  port,
+  path: '/',
+  headers: { Connection: 'Upgrade', Upgrade: 'websocket' }
+});
+req.on('upgrade', (res, socket, head) => {
+  gotUpgrade = true;
+  socket.on('data', c => upgradeData += c.toString());
+  socket.on('end', () => {
+    console.log('got_upgrade:', gotUpgrade);
+    console.log('status_101:', res.statusCode === 101);
+    console.log('got_payload:', upgradeData.includes('upgraded-payload'));
+    server.close();
+    process.exit(0);
+  });
+});
+req.end();"#,
+    );
+    assert!(
+        stdout.contains("got_upgrade: true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("status_101: true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("got_payload: true"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn http2_server_stream_api() {
+    // HTTP/2 server with stream-based API: createServer + on('stream').
+    // Uses fetch (HTTP/1.1) against the h2c server, which auto-detects.
+    let stdout = run_ok(
+        "h2_server.mjs",
+        r#"import http2 from 'node:http2';
+const server = http2.createServer();
+server.on('stream', (stream, headers) => {
+  const method = headers[':method'];
+  const path = headers[':path'];
+  stream.respond({
+    ':status': 200,
+    'content-type': 'application/json',
+    'x-h2': 'yes',
+  });
+  stream.end(JSON.stringify({ method, path, proto: 'h2' }));
+});
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+await new Promise(r => server.listen(0, '127.0.0.1', r));
+const addr = server.address();
+const res = await fetch('http://127.0.0.1:' + addr.port + '/hello');
+const data = await res.json();
+console.log(data.method, data.path, data.proto);
+console.log('x-h2:', res.headers.get('x-h2'));
+server.close();
+process.exit(0);"#,
+    );
+    assert_eq!(stdout, "GET /hello h2\nx-h2: yes");
+}
+
+#[test]
+fn http2_client_session_request() {
+    // HTTP/2 client: connect() + request() against the h2c server.
+    let stdout = run_ok(
+        "h2_client.mjs",
+        r#"import http2 from 'node:http2';
+const server = http2.createServer();
+server.on('stream', (stream, headers) => {
+  stream.respond({ ':status': 200, 'content-type': 'text/plain' });
+  stream.end('hello from h2 server');
+});
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+await new Promise(r => server.listen(0, '127.0.0.1', r));
+const addr = server.address();
+const client = http2.connect('http://127.0.0.1:' + addr.port);
+await new Promise(r => client.on('connect', r));
+const req = client.request({ ':path': '/test', ':method': 'GET' });
+req.end();
+let body = '';
+const respHeaders = await new Promise(r => req.on('response', r));
+console.log('status:', respHeaders[':status']);
+req.on('data', (chunk) => { body += chunk; });
+await new Promise(r => req.on('end', r));
+console.log('body:', body);
+client.close();
+server.close();
+process.exit(0);"#,
+    );
+    assert_eq!(stdout, "status: 200\nbody: hello from h2 server");
+}
+
+#[test]
+fn http2_server_post_with_body() {
+    // HTTP/2 server receiving a POST body via the stream API.
+    let stdout = run_ok(
+        "h2_post.mjs",
+        r#"import http2 from 'node:http2';
+const server = http2.createServer();
+server.on('stream', (stream, headers) => {
+  const chunks = [];
+  stream.on('data', (chunk) => chunks.push(chunk));
+  stream.on('end', () => {
+    const body = Buffer.concat(chunks).toString();
+    stream.respond({ ':status': 200, 'content-type': 'text/plain' });
+    stream.end('echo:' + body);
+  });
+});
+setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 5000);
+await new Promise(r => server.listen(0, '127.0.0.1', r));
+const addr = server.address();
+const res = await fetch('http://127.0.0.1:' + addr.port + '/post', {
+  method: 'POST',
+  body: 'ping',
+  headers: { 'content-type': 'text/plain' },
+});
+console.log(await res.text());
+server.close();
+process.exit(0);"#,
+    );
+    assert_eq!(stdout, "echo:ping");
+}
+
+#[test]
+fn http2_constants_and_module_shape() {
+    // Verify the http2 module exports the expected shape.
+    let stdout = run_ok(
+        "h2_shape.mjs",
+        r#"import http2 from 'node:http2';
+const { constants } = http2;
+console.log(typeof http2.createServer);
+console.log(typeof http2.createSecureServer);
+console.log(typeof http2.connect);
+console.log(constants.NGHTTP2_NO_ERROR);
+console.log(constants.HTTP2_HEADER_STATUS);
+console.log(constants.HTTP2_HEADER_PATH);
+console.log(constants.HTTP2_METHOD_GET);
+console.log(constants.HTTP_STATUS_OK);
+console.log(typeof http2.sensitiveHeaders);"#,
+    );
+    assert_eq!(
+        stdout,
+        "function\nfunction\nfunction\n0\n:status\n:path\nGET\n200\nsymbol"
     );
 }
