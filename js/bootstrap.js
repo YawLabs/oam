@@ -347,6 +347,27 @@
     globalThis.Blob = Blob;
   }
 
+  // -------------------------------------------------------------------- File
+  if (typeof globalThis.File !== "function") {
+    class File extends globalThis.Blob {
+      constructor(parts, name, options) {
+        super(parts, options);
+        this._name = String(name);
+        this._lastModified = (options && typeof options.lastModified === "number")
+          ? options.lastModified : Date.now();
+      }
+      get name() { return this._name; }
+      get lastModified() { return this._lastModified; }
+      toString() { return "[object File]"; }
+      get [Symbol.toStringTag]() { return "File"; }
+    }
+    globalThis.File = File;
+  }
+
+  if (typeof globalThis.MessagePort === "undefined") {
+    globalThis.MessagePort = class MessagePort {};
+  }
+
   // ----------------------------------------------------------------- FormData
   // WHATWG FormData: a multipart/form-data key-value store. Supports multiple
   // values per key. File / Blob entries are included as-is; streaming encoding

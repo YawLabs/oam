@@ -6709,6 +6709,46 @@
     const asBuffer = (bytes) => new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.length);
     const levelOf = (options) => options?.level ?? -1;
 
+    const Z_NO_FLUSH = 0;
+    const Z_PARTIAL_FLUSH = 1;
+    const Z_SYNC_FLUSH = 2;
+    const Z_FULL_FLUSH = 3;
+    const Z_FINISH = 4;
+    const DEFLATE = 1;
+    const INFLATE = 2;
+    const DEFLATERAW = 5;
+    const INFLATERAW = 6;
+
+    class ZlibHandle {
+      constructor(mode) {
+        this._mode = mode;
+        this._nativeHandle = null;
+        this.onerror = null;
+        this._owner = null;
+      }
+      init(windowBits, level, memLevel, strategy, writeState, processCallback, dictionary) {
+        this._writeState = writeState;
+        this._processCallback = processCallback;
+        const effectiveLevel = (this._mode === DEFLATE || this._mode === DEFLATERAW) ? (level != null ? level : -1) : -1;
+        this._nativeHandle = natives.zlibHandleCreate(this._mode, effectiveLevel);
+      }
+      writeSync(flush, chunk, inOff, inLen, buffer, outOff, outLen) {
+        const input = (chunk && inLen > 0) ? chunk.subarray(inOff, inOff + inLen) : new Uint8Array(0);
+        const result = natives.zlibHandleWriteSync(
+          this._nativeHandle, flush, input, buffer, outOff, outLen
+        );
+        this._writeState[0] = result[0];
+        this._writeState[1] = result[1];
+      }
+      close() {
+        if (this._nativeHandle !== null) {
+          natives.zlibStreamClose(this._nativeHandle);
+          this._nativeHandle = null;
+        }
+      }
+    }
+
+
     const sync = (format, compress) => (data, options) =>
       asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress));
     const callbackForm = (format, compress) => (data, options, callback) => {
@@ -6745,6 +6785,7 @@
           // Promise serializing back-to-back _transform calls so we
           // never have two concurrent zlibStreamWrite ops for the same handle.
           this._zlibQueue = Promise.resolve();
+          this._handle = Object.create(ZlibHandle.prototype);
         }
 
         // Lazily allocate the Rust-side stream on first use.
@@ -6907,6 +6948,20 @@
         Z_OK: 0,
         Z_STREAM_END: 1,
         Z_DATA_ERROR: -3,
+        Z_NO_FLUSH: 0,
+        Z_PARTIAL_FLUSH: 1,
+        Z_SYNC_FLUSH: 2,
+        Z_FULL_FLUSH: 3,
+        Z_FINISH: 4,
+        Z_DEFAULT_WINDOWBITS: 15,
+        Z_DEFAULT_MEMLEVEL: 8,
+        Z_DEFAULT_STRATEGY: 0,
+        DEFLATE: 1,
+        INFLATE: 2,
+        GZIP: 3,
+        GUNZIP: 4,
+        DEFLATERAW: 5,
+        INFLATERAW: 6,
         BROTLI_OPERATION_PROCESS: 0,
         BROTLI_OPERATION_FLUSH: 1,
         BROTLI_OPERATION_FINISH: 2,

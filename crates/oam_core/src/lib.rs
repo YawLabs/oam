@@ -95,6 +95,8 @@ pub enum ZlibStream {
     // is paid once per brotli stream, never on the per-chunk write path.
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
+    HandleCompress(flate2::Compress),
+    HandleDecompress(flate2::Decompress),
 }
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
@@ -1200,6 +1202,9 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
                     .map_err(|e| format!("brotli stream write: {e}")),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err("zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into())
+                }
             }
         })
         .await;
@@ -1236,6 +1241,9 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .finish()
                     .map_err(|e| format!("brotli stream flush: {e}")),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err("zlib handle: use close(), not zlibStreamFlush".into())
+                }
             }
         })
         .await;
@@ -1254,6 +1262,88 @@ pub mod ops {
             .lock()
             .expect("zlib stream registry lock")
             .remove(&handle);
+    }
+
+    /// zlibHandleCreate: allocate a low-level flate2 Compress or Decompress
+    /// handle for Node's zlib binding interface (used by ssh2 etc.).
+    /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW.
+    pub fn zlib_handle_create(
+        streams: &super::ZlibRegistry,
+        ids: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+        mode: i32,
+        level: i32,
+    ) -> Result<u64, String> {
+        let zlib_header = mode == 1 || mode == 2;
+        let stream = match mode {
+            1 | 5 => {
+                let lvl = if (0..=9).contains(&level) {
+                    flate2::Compression::new(level as u32)
+                } else {
+                    flate2::Compression::default()
+                };
+                super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
+            }
+            2 | 6 => {
+                super::ZlibStream::HandleDecompress(flate2::Decompress::new(zlib_header))
+            }
+            _ => return Err(format!("zlib handle: unknown mode {mode}")),
+        };
+        let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        streams
+            .lock()
+            .expect("zlib registry lock")
+            .insert(handle, stream);
+        Ok(handle)
+    }
+
+    /// zlibHandleWriteSync: synchronous incremental compress/decompress.
+    /// Returns (availOutAfter, availInAfter). The caller provides a mutable
+    /// output slice; compressed/decompressed bytes are written into it.
+    pub fn zlib_handle_write_sync(
+        streams: &super::ZlibRegistry,
+        handle: u64,
+        flush: i32,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(usize, usize), String> {
+        let mut guard = streams.lock().expect("zlib registry lock");
+        let stream = guard
+            .get_mut(&handle)
+            .ok_or_else(|| format!("zlib handle {handle} not found"))?;
+        match stream {
+            super::ZlibStream::HandleCompress(c) => {
+                let before_in = c.total_in();
+                let before_out = c.total_out();
+                let fl = match flush {
+                    0 => flate2::FlushCompress::None,
+                    1 => flate2::FlushCompress::Partial,
+                    2 => flate2::FlushCompress::Sync,
+                    3 => flate2::FlushCompress::Full,
+                    4 => flate2::FlushCompress::Finish,
+                    _ => flate2::FlushCompress::None,
+                };
+                c.compress(input, output, fl)
+                    .map_err(|e| format!("zlib handle compress: {e}"))?;
+                let consumed = (c.total_in() - before_in) as usize;
+                let produced = (c.total_out() - before_out) as usize;
+                Ok((output.len() - produced, input.len() - consumed))
+            }
+            super::ZlibStream::HandleDecompress(d) => {
+                let before_in = d.total_in();
+                let before_out = d.total_out();
+                let fl = match flush {
+                    2 => flate2::FlushDecompress::Sync,
+                    4 => flate2::FlushDecompress::Finish,
+                    _ => flate2::FlushDecompress::None,
+                };
+                d.decompress(input, output, fl)
+                    .map_err(|e| format!("zlib handle decompress: {e}"))?;
+                let consumed = (d.total_in() - before_in) as usize;
+                let produced = (d.total_out() - before_out) as usize;
+                Ok((output.len() - produced, input.len() - consumed))
+            }
+            _ => Err(format!("zlib handle {handle} is not a handle variant")),
+        }
     }
 
     /// Async zlib: CPU-bound, so spawn_blocking off the op channel

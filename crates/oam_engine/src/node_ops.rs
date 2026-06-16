@@ -172,6 +172,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("zlibStreamWrite", op_zlib_stream_write),
         ("zlibStreamFlush", op_zlib_stream_flush),
         ("zlibStreamClose", op_zlib_stream_close),
+        // node:zlib handle (sync incremental, for ssh2/native binding compat)
+        ("zlibHandleCreate", op_zlib_handle_create),
+        ("zlibHandleWriteSync", op_zlib_handle_write_sync),
         // HTTP server
         ("httpServe", op_http_serve),
         ("httpAccept", op_http_accept),
@@ -1164,6 +1167,94 @@ fn op_zlib_stream_close(
         .expect("core runtime installed")
         .zlib_streams();
     oam_core::ops::zlib_stream_close(&streams, handle);
+}
+
+/// zlibHandleCreate(mode, level) -> handle (number).
+/// Allocates a low-level flate2 Compress/Decompress for Node's internal
+/// zlib binding interface (ssh2's ZlibHandle pattern).
+fn op_zlib_handle_create(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mode = args.get(0).int32_value(scope).unwrap_or(0);
+    let level = args.get(1).int32_value(scope).unwrap_or(-1);
+    let core = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed");
+    let streams = core.zlib_streams();
+    let ids = core.body_ids();
+    match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level) {
+        Ok(handle) => {
+            let val = v8::Number::new(scope, handle as f64);
+            rv.set(val.into());
+        }
+        Err(e) => {
+            throw_type_error(scope, &e);
+        }
+    }
+}
+
+/// zlibHandleWriteSync(handle, flush, input, outBuf, outOff, outLen)
+///   -> [availOutAfter, availInAfter].
+/// Synchronous incremental compress/decompress. Writes output directly
+/// into outBuf's backing store at outOff.
+fn op_zlib_handle_write_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let flush = args.get(1).int32_value(scope).unwrap_or(0);
+    let input = arg_bytes(scope, &args, 2).unwrap_or_default();
+    let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
+    let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
+
+    let streams = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .zlib_streams();
+
+    let mut output = vec![0u8; out_len];
+    let result = oam_core::ops::zlib_handle_write_sync(&streams, handle, flush, &input, &mut output);
+
+    match result {
+        Ok((avail_out, avail_in)) => {
+            let produced = out_len - avail_out;
+            if produced > 0 {
+                let out_buf_value = args.get(3);
+                if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(out_buf_value) {
+                    if let Some(buf) = view.buffer(scope) {
+                        let store = buf.get_backing_store();
+                        if let Some(data) = store.data() {
+                            let byte_offset = view.byte_offset() + out_off;
+                            if byte_offset + produced <= store.byte_length() {
+                                unsafe {
+                                    let dest = (data.as_ptr() as *mut u8).add(byte_offset);
+                                    std::ptr::copy_nonoverlapping(
+                                        output.as_ptr(),
+                                        dest,
+                                        produced,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let ao = v8::Number::new(scope, avail_out as f64);
+            let ai = v8::Number::new(scope, avail_in as f64);
+            let arr = v8::Array::new(scope, 2);
+            arr.set_index(scope, 0, ao.into());
+            arr.set_index(scope, 1, ai.into());
+            rv.set(arr.into());
+        }
+        Err(e) => {
+            let message = v8::String::new(scope, &e).unwrap();
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+    }
 }
 
 fn op_url_parse_href(
