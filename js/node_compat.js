@@ -7759,7 +7759,10 @@
         this.localPort = undefined;
         this.bytesRead = 0;
         this.bytesWritten = 0;
+        this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        this._paused = false;
+        this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
         if (options && options._handle !== undefined) {
@@ -7869,6 +7872,7 @@
 
       async _readLoop() {
         while (!this.destroyed) {
+          if (this._paused) return;
           let chunk;
           try {
             chunk = await natives.tcpRead(this._handle, 65536);
@@ -7938,13 +7942,30 @@
         if (this.writable) return "writeOnly";
         return "closed";
       }
+      get pending() { return this.connecting; }
       pipe(dest) {
-        this.on("data", (chunk) => dest.write(chunk));
+        this._pipeHandler = (chunk) => dest.write(chunk);
+        this.on("data", this._pipeHandler);
         this.on("end", () => { if (typeof dest.end === "function") dest.end(); });
         return dest;
       }
-      pause() { return this; }
-      resume() { return this; }
+      unpipe(dest) {
+        if (this._pipeHandler) {
+          this.removeListener("data", this._pipeHandler);
+          this._pipeHandler = null;
+        }
+        return this;
+      }
+      pause() { this._paused = true; return this; }
+      resume() {
+        if (this._paused) {
+          this._paused = false;
+          this._readLoop();
+        }
+        return this;
+      }
+      cork() { return this; }
+      uncork() { return this; }
     }
 
     class Server extends EventEmitter {
@@ -9165,8 +9186,6 @@
   };
 
   // ------------------------------------------------------ child_process
-  // Stub: throws a clear "not implemented" error. Subprocess ops land with a
-  // later wave.
   registry.factories.child_process = (natives) => {
     const EventEmitter = registry.get("events");
     const { Readable, Writable } = registry.get("stream");
