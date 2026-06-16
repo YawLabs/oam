@@ -256,6 +256,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsWrite", op_tls_write),
         ("tlsClose", op_tls_close),
         ("tlsShutdown", op_tls_shutdown),
+        ("tlsAcceptWrap", op_tls_accept_wrap),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -275,7 +276,13 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("spawnReadStdout", op_spawn_read_stdout),
         ("spawnReadStderr", op_spawn_read_stderr),
         ("spawnWrite", op_spawn_write),
+        ("spawnCloseStdin", op_spawn_close_stdin),
         ("spawnWait", op_spawn_wait),
+        // cluster
+        ("clusterFork", op_cluster_fork),
+        ("clusterWorkerWait", op_cluster_worker_wait),
+        ("clusterWorkerKill", op_cluster_worker_kill),
+        ("clusterIsWorker", op_cluster_is_worker),
         // dns
         ("dnsLookup", op_dns_lookup),
         ("dnsResolve", op_dns_resolve),
@@ -1128,6 +1135,31 @@ fn op_tls_shutdown(
     let tls = core_runtime!(scope)
         .tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
+}
+
+fn op_tls_accept_wrap(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let tcp_handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(cert_pem) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "tlsAcceptWrap requires cert PEM");
+        return;
+    };
+    let Some(key_pem) = arg_string(scope, &args, 2) else {
+        throw_type_error(scope, "tlsAcceptWrap requires key PEM");
+        return;
+    };
+    let core = core_runtime!(scope);
+    let tls = core.tls();
+    let tcp = core.tcp();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tls::tls_accept_wrap(tls, tcp, ids, tcp_handle, cert_pem, key_pem),
+    );
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the
@@ -2869,6 +2901,16 @@ fn op_spawn_write(
     );
 }
 
+fn op_spawn_close_stdin(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = core_runtime!(scope).children();
+    oam_core::child::child_close_stdin(&children, handle);
+}
+
 fn op_spawn_wait(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2882,6 +2924,89 @@ fn op_spawn_wait(
         &mut rv,
         oam_core::child::child_wait(children, handle),
     );
+}
+
+// ================================================================ cluster
+
+fn op_cluster_fork(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(script_path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "clusterFork: script path required");
+        return;
+    };
+    let Some(worker_id) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "clusterFork: worker id required");
+        return;
+    };
+    let env_pairs: Vec<(String, String)> = {
+        let val = args.get(2);
+        if val.is_null_or_undefined() {
+            Vec::new()
+        } else if let Ok(obj) = v8::Local::<v8::Object>::try_from(val) {
+            let mut pairs = Vec::new();
+            if let Some(names) = obj.get_own_property_names(scope, Default::default()) {
+                for i in 0..names.length() {
+                    if let Some(name) = names.get_index(scope, i) {
+                        if let Some(val) = obj.get(scope, name) {
+                            if let (Some(k), Some(v)) = (
+                                name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                                val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                            ) {
+                                pairs.push((k, v));
+                            }
+                        }
+                    }
+                }
+            }
+            pairs
+        } else {
+            Vec::new()
+        }
+    };
+    let rt = core_runtime!(scope);
+    let children = rt.children();
+    let ids = rt.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::cluster::cluster_fork(children, ids, script_path, worker_id, env_pairs),
+    );
+}
+
+fn op_cluster_worker_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = core_runtime!(scope).children();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::cluster::cluster_worker_wait(children, handle),
+    );
+}
+
+fn op_cluster_worker_kill(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let children = core_runtime!(scope).children();
+    oam_core::cluster::cluster_worker_kill(&children, handle);
+}
+
+fn op_cluster_is_worker(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let val = v8::Boolean::new(scope, oam_core::cluster::cluster_is_worker());
+    rv.set(val.into());
 }
 
 // ================================================================ dns

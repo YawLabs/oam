@@ -20,6 +20,7 @@ use futures_util::FutureExt;
 pub use oam_diagnostics as diagnostics;
 
 pub mod child;
+pub mod cluster;
 pub mod dns;
 pub mod http_server;
 pub mod inspector;

@@ -287,6 +287,13 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
     }
 }
 
+pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
+    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cp) = guard.get_mut(&handle) {
+        drop(cp.child.stdin.take());
+    }
+}
+
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());

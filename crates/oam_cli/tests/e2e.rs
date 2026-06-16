@@ -5159,6 +5159,110 @@ cp.on("close", (code) => {
 }
 
 #[test]
+fn child_process_spawn_stdin_piped() {
+    let f = write_temp(
+        "cp_stdin.mjs",
+        r#"
+import { spawn } from "child_process";
+const cp = spawn("cmd", ["/c", "findstr", ".*"], { shell: false });
+const chunks = [];
+cp.stdout.on("data", (chunk) => chunks.push(chunk));
+cp.on("spawn", () => {
+  cp.stdin.write("hello-from-stdin\r\n");
+  cp.stdin.end();
+});
+cp.on("close", (code) => {
+  const out = Buffer.concat(chunks).toString().trim();
+  console.log("stdin-result:", out.includes("hello-from-stdin") ? "ok" : "fail:" + out);
+  console.log("stdin-code:", code);
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("stdin-result: ok"), "{stdout}");
+    assert!(stdout.contains("stdin-code: 0"), "{stdout}");
+}
+
+#[test]
+fn child_process_kill_terminates_child() {
+    let f = write_temp(
+        "cp_kill.mjs",
+        r#"
+import { spawn } from "child_process";
+const cp = spawn("node", ["-e", "setTimeout(() => {}, 60000);"]);
+cp.on("spawn", () => {
+  console.log("kill-pid-type:", typeof cp.pid);
+  setTimeout(() => {
+    cp.kill();
+    console.log("killed:", cp.killed);
+  }, 200);
+});
+cp.on("exit", (code, signal) => {
+  console.log("kill-exit-fired: yes");
+});
+cp.on("close", () => {
+  console.log("kill-closed: yes");
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("kill-pid-type: number"), "{stdout}");
+    assert!(stdout.contains("killed: true"), "{stdout}");
+    assert!(stdout.contains("kill-exit-fired: yes"), "{stdout}");
+    assert!(stdout.contains("kill-closed: yes"), "{stdout}");
+}
+
+#[test]
+fn child_process_spawn_echo() {
+    let f = write_temp(
+        "cp_echo.mjs",
+        r#"
+import { spawn } from "child_process";
+const cp = spawn("cmd", ["/c", "echo", "hello"], { shell: false });
+const chunks = [];
+cp.on("spawn", () => {
+  cp.stdout.on("data", (chunk) => chunks.push(chunk));
+});
+cp.on("close", (code) => {
+  const out = Buffer.concat(chunks).toString().trim();
+  console.log("echo-result:", out.includes("hello") ? "ok" : "fail:" + out);
+  console.log("echo-code:", code);
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("echo-result: ok"), "{stdout}");
+    assert!(stdout.contains("echo-code: 0"), "{stdout}");
+}
+
+#[test]
+fn child_process_exec_callback() {
+    let f = write_temp(
+        "cp_exec_cb.mjs",
+        r#"
+import { exec } from "child_process";
+exec("echo hello-exec-cb", (err, stdout, stderr) => {
+  console.log("exec-err:", err);
+  console.log("exec-stdout:", stdout.trim());
+  console.log("exec-stderr-type:", typeof stderr);
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("exec-err: null"), "{stdout}");
+    assert!(stdout.contains("exec-stdout: hello-exec-cb"), "{stdout}");
+    assert!(stdout.contains("exec-stderr-type: string"), "{stdout}");
+}
+
+#[test]
 fn dns_lookup_resolves_localhost() {
     let f = write_temp(
         "dns_lookup.mjs",
@@ -9138,6 +9242,141 @@ server.close();
     );
 }
 
+#[test]
+fn tls_create_server_echo() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+
+const cert = `{cert}`;
+const key = `{key}`;
+
+const server = tls.createServer({{ cert, key }}, (socket) => {{
+  console.log('server_encrypted=' + socket.encrypted);
+  socket.on('data', (chunk) => {{
+    socket.write('echo:' + chunk.toString());
+  }});
+  socket.on('end', () => socket.end());
+}});
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const addr = server.address();
+console.log('listening=' + addr.port);
+console.log('has_address=' + (addr.address !== null));
+
+const client = tls.connect({{ host: '127.0.0.1', port: addr.port, rejectUnauthorized: false }});
+await new Promise((resolve) => client.on('secureConnect', resolve));
+console.log('client_encrypted=' + client.encrypted);
+
+client.write('hello-tls-server');
+
+const chunks = [];
+client.on('data', (c) => chunks.push(c.toString()));
+await new Promise((resolve) => setTimeout(resolve, 200));
+
+const received = chunks.join('');
+console.log('has_echo=' + received.includes('echo:hello-tls-server'));
+console.log('has_Server=' + (typeof tls.Server === 'function'));
+console.log('has_createServer=' + (typeof tls.createServer === 'function'));
+
+client.end();
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_server_echo.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("server_encrypted=true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("client_encrypted=true"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("has_echo=true"), "stdout: {stdout}");
+    assert!(stdout.contains("has_Server=true"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("has_createServer=true"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn https_request_get() {
+    let src = format!(
+        r#"
+import https from 'node:https';
+
+const cert = `{cert}`;
+const key = `{key}`;
+
+const server = https.createServer({{ cert, key }}, (req, res) => {{
+  res.writeHead(200, {{ 'content-type': 'application/json' }});
+  res.end(JSON.stringify({{ method: req.method, url: req.url }}));
+}});
+
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+
+const body = await new Promise((resolve, reject) => {{
+  https.get(`https://127.0.0.1:${{port}}/hello?q=1`, {{ rejectUnauthorized: false }}, (res) => {{
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+  }}).on('error', reject);
+}});
+
+const parsed = JSON.parse(body);
+console.log('method=' + parsed.method);
+console.log('url=' + parsed.url);
+
+const body2 = await new Promise((resolve, reject) => {{
+  const req = https.request(
+    `https://127.0.0.1:${{port}}/post-path`,
+    {{ method: 'POST', rejectUnauthorized: false }},
+    (res) => {{
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    }}
+  );
+  req.on('error', reject);
+  req.end();
+}});
+
+const parsed2 = JSON.parse(body2);
+console.log('method2=' + parsed2.method);
+console.log('url2=' + parsed2.url);
+
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("https_request_get.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("method=GET"), "stdout: {stdout}");
+    assert!(stdout.contains("url=/hello?q=1"), "stdout: {stdout}");
+    assert!(stdout.contains("method2=POST"), "stdout: {stdout}");
+    assert!(stdout.contains("url2=/post-path"), "stdout: {stdout}");
+}
+
 // ======================================= dns.resolve + dns.reverse
 
 #[test]
@@ -10977,19 +11216,15 @@ fn http2_module_shape_and_server_listens() {
 }
 
 #[test]
-fn graceful_stub_cluster_fork() {
+fn cluster_basic_api() {
     let stdout = run_ok(
-        "stub_cluster.mjs",
+        "cluster_basic.mjs",
         "import cluster from 'node:cluster';\n\
          console.log('is_primary:', cluster.isPrimary);\n\
          console.log('is_worker:', cluster.isWorker === false);\n\
-         const worker = cluster.fork();\n\
-         console.log('worker_created:', typeof worker === 'object');\n\
-         console.log('worker_id:', worker.id > 0);\n\
-         let forkErr = false;\n\
-         worker.on('error', () => { forkErr = true; });\n\
-         await new Promise(r => setTimeout(r, 50));\n\
-         console.log('fork_error:', forkErr);",
+         console.log('has_fork:', typeof cluster.fork === 'function');\n\
+         console.log('has_workers:', typeof cluster.workers === 'object');\n\
+         console.log('sched_rr:', cluster.SCHED_RR === 2);",
     );
     for line in stdout.lines() {
         assert!(
@@ -11000,19 +11235,63 @@ fn graceful_stub_cluster_fork() {
 }
 
 #[test]
-fn graceful_stub_tls_create_server() {
+fn cluster_is_primary_and_fork() {
     let stdout = run_ok(
-        "stub_tls_server.mjs",
+        "cluster_fork.mjs",
+        "import cluster from 'node:cluster';\n\
+         if (cluster.isPrimary) {\n\
+           const worker = cluster.fork();\n\
+           worker.on('exit', (code) => {\n\
+             console.log('worker_exited:', true);\n\
+             console.log('exit_code_zero:', code === 0);\n\
+             process.exit(0);\n\
+           });\n\
+         } else {\n\
+           console.log('worker_running:', true);\n\
+           process.exit(0);\n\
+         }",
+    );
+    assert!(stdout.contains("worker_running: true"), "worker should run: {stdout}");
+    assert!(stdout.contains("worker_exited: true"), "worker should exit: {stdout}");
+}
+
+#[test]
+fn cluster_worker_exit_event() {
+    let stdout = run_ok(
+        "cluster_exit.mjs",
+        "import cluster from 'node:cluster';\n\
+         if (cluster.isPrimary) {\n\
+           const worker = cluster.fork();\n\
+           cluster.on('exit', (w, code) => {\n\
+             console.log('cluster_exit_event:', true);\n\
+             console.log('worker_match:', w === worker);\n\
+             process.exit(0);\n\
+           });\n\
+         } else {\n\
+           process.exit(0);\n\
+         }",
+    );
+    assert!(stdout.contains("cluster_exit_event: true"), "cluster exit event: {stdout}");
+    assert!(stdout.contains("worker_match: true"), "worker match: {stdout}");
+}
+
+#[test]
+fn tls_create_server_basics() {
+    let stdout = run_ok(
+        "tls_server_basics.mjs",
         "import tls from 'node:tls';\n\
          console.log('import_ok:', typeof tls.connect === 'function');\n\
          console.log('create_server_fn:', typeof tls.createServer === 'function');\n\
+         console.log('server_class:', typeof tls.Server === 'function');\n\
          const server = tls.createServer();\n\
          console.log('server_created:', typeof server === 'object');\n\
-         let serverErr = false;\n\
-         server.on('error', () => { serverErr = true; });\n\
-         server.listen();\n\
-         await new Promise(r => setTimeout(r, 50));\n\
-         console.log('server_error:', serverErr);",
+         let listening = false;\n\
+         server.on('listening', () => { listening = true; });\n\
+         server.listen(0, '127.0.0.1');\n\
+         await new Promise(r => setTimeout(r, 100));\n\
+         console.log('server_listening:', listening);\n\
+         console.log('has_address:', server.address() !== null);\n\
+         server.close();",
     );
     for line in stdout.lines() {
         assert!(

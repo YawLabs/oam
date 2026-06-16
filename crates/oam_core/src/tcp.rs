@@ -26,6 +26,13 @@ impl TcpState {
         self.readers.insert(handle, reader);
         self.writers.insert(handle, writer);
     }
+
+    pub fn take_halves(&mut self, handle: u64) -> Option<(OwnedReadHalf, OwnedWriteHalf)> {
+        let reader = self.readers.remove(&handle)?;
+        let writer = self.writers.remove(&handle)?;
+        self.closed.insert(handle);
+        Some((reader, writer))
+    }
 }
 
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;

@@ -17,17 +17,28 @@ use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 
 type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+enum TlsReader {
+    Client(ReadHalf<ClientStream>),
+    Server(ReadHalf<ServerStream>),
+}
+
+enum TlsWriter {
+    Client(WriteHalf<ClientStream>),
+    Server(WriteHalf<ServerStream>),
+}
 
 #[derive(Default)]
 pub struct TlsState {
-    readers: HashMap<u64, ReadHalf<ClientStream>>,
-    writers: HashMap<u64, WriteHalf<ClientStream>>,
+    readers: HashMap<u64, TlsReader>,
+    writers: HashMap<u64, TlsWriter>,
     closed: HashSet<u64>,
 }
 
 pub type TlsRegistry = Arc<std::sync::Mutex<TlsState>>;
 
-fn reinsert_reader(registry: &TlsRegistry, handle: u64, reader: ReadHalf<ClientStream>) -> bool {
+fn reinsert_reader(registry: &TlsRegistry, handle: u64, reader: TlsReader) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(reader);
@@ -38,7 +49,7 @@ fn reinsert_reader(registry: &TlsRegistry, handle: u64, reader: ReadHalf<ClientS
     }
 }
 
-fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: WriteHalf<ClientStream>) -> bool {
+fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: TlsWriter) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(writer);
@@ -164,8 +175,8 @@ pub async fn tls_connect(
     let (reader, writer) = tokio::io::split(tls_stream);
     {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.readers.insert(handle, reader);
-        guard.writers.insert(handle, writer);
+        guard.readers.insert(handle, TlsReader::Client(reader));
+        guard.writers.insert(handle, TlsWriter::Client(writer));
     }
 
     OpOutcome::Json(
@@ -186,22 +197,36 @@ pub async fn tls_read(registry: TlsRegistry, handle: u64, len: usize) -> OpOutco
         .expect("tls registry lock")
         .readers
         .remove(&handle);
-    let Some(mut reader) = reader else {
+    let Some(reader) = reader else {
         return OpOutcome::Failed(format!("tls: read handle {handle} is gone"));
     };
 
     let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
-    match reader.read(&mut buf).await {
-        Ok(0) => {
-            reinsert_reader(&registry, handle, reader);
-            OpOutcome::Done
-        }
-        Ok(n) => {
-            reinsert_reader(&registry, handle, reader);
-            buf.truncate(n);
-            OpOutcome::Bytes(buf)
-        }
-        Err(e) => tls_fail(e, "read", &handle.to_string()),
+    match reader {
+        TlsReader::Client(mut r) => match r.read(&mut buf).await {
+            Ok(0) => {
+                reinsert_reader(&registry, handle, TlsReader::Client(r));
+                OpOutcome::Done
+            }
+            Ok(n) => {
+                reinsert_reader(&registry, handle, TlsReader::Client(r));
+                buf.truncate(n);
+                OpOutcome::Bytes(buf)
+            }
+            Err(e) => tls_fail(e, "read", &handle.to_string()),
+        },
+        TlsReader::Server(mut r) => match r.read(&mut buf).await {
+            Ok(0) => {
+                reinsert_reader(&registry, handle, TlsReader::Server(r));
+                OpOutcome::Done
+            }
+            Ok(n) => {
+                reinsert_reader(&registry, handle, TlsReader::Server(r));
+                buf.truncate(n);
+                OpOutcome::Bytes(buf)
+            }
+            Err(e) => tls_fail(e, "read", &handle.to_string()),
+        },
     }
 }
 
@@ -211,16 +236,25 @@ pub async fn tls_write(registry: TlsRegistry, handle: u64, data: Vec<u8>) -> OpO
         .expect("tls registry lock")
         .writers
         .remove(&handle);
-    let Some(mut writer) = writer else {
+    let Some(writer) = writer else {
         return OpOutcome::Failed(format!("tls: write handle {handle} is gone"));
     };
 
-    match writer.write_all(&data).await {
-        Ok(()) => {
-            reinsert_writer(&registry, handle, writer);
-            OpOutcome::Done
-        }
-        Err(e) => tls_fail(e, "write", &handle.to_string()),
+    match writer {
+        TlsWriter::Client(mut w) => match w.write_all(&data).await {
+            Ok(()) => {
+                reinsert_writer(&registry, handle, TlsWriter::Client(w));
+                OpOutcome::Done
+            }
+            Err(e) => tls_fail(e, "write", &handle.to_string()),
+        },
+        TlsWriter::Server(mut w) => match w.write_all(&data).await {
+            Ok(()) => {
+                reinsert_writer(&registry, handle, TlsWriter::Server(w));
+                OpOutcome::Done
+            }
+            Err(e) => tls_fail(e, "write", &handle.to_string()),
+        },
     }
 }
 
@@ -230,11 +264,17 @@ pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
         .expect("tls registry lock")
         .writers
         .remove(&handle);
-    let Some(mut writer) = writer else {
+    let Some(writer) = writer else {
         return OpOutcome::Done;
     };
-    let _ = writer.shutdown().await;
-    drop(writer);
+    match writer {
+        TlsWriter::Client(mut w) => {
+            let _ = w.shutdown().await;
+        }
+        TlsWriter::Server(mut w) => {
+            let _ = w.shutdown().await;
+        }
+    }
     OpOutcome::Done
 }
 
@@ -245,8 +285,72 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     guard.closed.insert(handle);
 }
 
+pub async fn tls_accept_wrap(
+    tls_registry: TlsRegistry,
+    tcp_registry: crate::tcp::TcpRegistry,
+    ids: Arc<std::sync::atomic::AtomicU64>,
+    tcp_handle: u64,
+    cert_pem: String,
+    key_pem: String,
+) -> OpOutcome {
+    let Some((reader, writer)) = tcp_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_halves(tcp_handle)
+    else {
+        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
+    };
+
+    let tcp_stream = match reader.reunite(writer) {
+        Ok(s) => s,
+        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
+    };
+
+    let tls_config = match build_server_config(&cert_pem, &key_pem) {
+        Ok(c) => c,
+        Err(e) => return OpOutcome::Failed(format!("tls accept config: {e}")),
+    };
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let tls_stream = match acceptor.accept(tcp_stream).await {
+        Ok(s) => s,
+        Err(e) => return tls_fail(e, "accept", &tcp_handle.to_string()),
+    };
+
+    let (_, server_conn) = tls_stream.get_ref();
+    let protocol = server_conn
+        .protocol_version()
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
+    let cipher = server_conn
+        .negotiated_cipher_suite()
+        .map(|c| format!("{:?}", c.suite()))
+        .unwrap_or_default();
+    let alpn = server_conn
+        .alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .unwrap_or_default();
+
+    let handle = ids.fetch_add(1, Ordering::Relaxed);
+    let (reader, writer) = tokio::io::split(tls_stream);
+    {
+        let mut guard = tls_registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.readers.insert(handle, TlsReader::Server(reader));
+        guard.writers.insert(handle, TlsWriter::Server(writer));
+    }
+
+    OpOutcome::Json(
+        serde_json::json!({
+            "handle": handle,
+            "protocol": protocol,
+            "cipher": cipher,
+            "alpnProtocol": alpn,
+        })
+        .to_string(),
+    )
+}
+
 /// Build a TLS server config from PEM-encoded cert chain + private key.
-/// Used by https_serve in http_server.rs.
 pub fn build_server_config(
     cert_pem: &str,
     key_pem: &str,
