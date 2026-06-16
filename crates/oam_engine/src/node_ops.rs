@@ -684,11 +684,14 @@ fn op_http_serve(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let state = core_runtime!(scope).http();
+    let rt = core_runtime!(scope);
+    let state = rt.http();
+    let tcp = rt.tcp();
+    let tcp_ids = rt.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http_serve(state, host, port),
+        oam_core::http_server::http_serve(state, tcp, tcp_ids, host, port),
     );
 }
 

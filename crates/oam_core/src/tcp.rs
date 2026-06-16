@@ -21,6 +21,13 @@ pub struct TcpState {
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
 }
 
+impl TcpState {
+    pub fn register_stream(&mut self, handle: u64, reader: OwnedReadHalf, writer: OwnedWriteHalf) {
+        self.readers.insert(handle, reader);
+        self.writers.insert(handle, writer);
+    }
+}
+
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;
 
 fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -> bool {

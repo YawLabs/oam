@@ -10987,3 +10987,65 @@ fn graceful_stub_tls_create_server() {
         );
     }
 }
+
+#[test]
+fn http_upgrade_event_fires_with_socket() {
+    let stdout = run_ok(
+        "http_upgrade.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const server = http.createServer((req, res) => res.end('normal'));\n\
+         server.on('upgrade', (req, socket, head) => {\n\
+           console.log('upgrade_url:', req.url);\n\
+           console.log('upgrade_hdr:', req.headers['upgrade']);\n\
+           console.log('has_socket:', socket instanceof net.Socket);\n\
+           socket.write(\n\
+             'HTTP/1.1 101 Switching Protocols\\r\\n' +\n\
+             'Upgrade: websocket\\r\\n' +\n\
+             'Connection: Upgrade\\r\\n\\r\\n'\n\
+           );\n\
+           socket.write('hello from upgrade');\n\
+           socket.end();\n\
+         });\n\
+         await new Promise(r => server.listen(0, r));\n\
+         const port = server.address().port;\n\
+         const client = new net.Socket();\n\
+         let data = '';\n\
+         await new Promise((resolve, reject) => {\n\
+           client.connect(port, '127.0.0.1', () => {\n\
+             client.write(\n\
+               'GET /ws-test HTTP/1.1\\r\\n' +\n\
+               'Host: 127.0.0.1\\r\\n' +\n\
+               'Upgrade: websocket\\r\\n' +\n\
+               'Connection: Upgrade\\r\\n\\r\\n'\n\
+             );\n\
+           });\n\
+           client.on('data', chunk => data += chunk.toString());\n\
+           client.on('end', resolve);\n\
+           client.on('error', reject);\n\
+         });\n\
+         console.log('got_101:', data.includes('101'));\n\
+         console.log('got_body:', data.includes('hello from upgrade'));\n\
+         server.close();",
+    );
+    assert!(
+        stdout.contains("upgrade_url: /ws-test"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("upgrade_hdr: websocket"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("has_socket: true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("got_101: true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("got_body: true"),
+        "stdout: {stdout}"
+    );
+}

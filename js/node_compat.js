@@ -7434,9 +7434,24 @@
               for (;;) {
                 const meta = await natives.httpAccept(bound.serverId);
                 if (meta === undefined) break;
-                const req = new IncomingMessage(meta);
-                const res = new ServerResponse(meta.requestId);
-                this.emit("request", req, res);
+                if (meta.isUpgrade && meta.socketHandle !== undefined) {
+                  const NetSocket = registry.get("net").Socket;
+                  const socket = new NetSocket({
+                    _handle: meta.socketHandle,
+                    _remoteAddr: {
+                      address: meta.remoteAddress || "127.0.0.1",
+                      port: meta.remotePort || 0,
+                      family: "IPv4",
+                    },
+                  });
+                  socket._readLoop();
+                  const req = new IncomingMessage(meta);
+                  this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0));
+                } else {
+                  const req = new IncomingMessage(meta);
+                  const res = new ServerResponse(meta.requestId);
+                  this.emit("request", req, res);
+                }
               }
               this.emit("close");
             })();

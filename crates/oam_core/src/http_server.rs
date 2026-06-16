@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 /// Per-request body cap (wave-1 buffered bodies).
@@ -61,6 +62,10 @@ pub struct IncomingRequest {
     pub uri: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub is_upgrade: bool,
+    pub socket_handle: Option<u64>,
+    pub remote_addr: Option<String>,
+    pub remote_port: Option<u16>,
 }
 
 pub enum ResponseBody {
@@ -228,8 +233,56 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     })
 }
 
+// ---- HTTP upgrade detection (raw-TCP peek, bypasses hyper) ----
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn is_connection_upgrade(buf: &[u8]) -> bool {
+    let text = match std::str::from_utf8(buf) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    for line in text.split("\r\n") {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("connection:") && lower.contains("upgrade") {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_upgrade_headers(buf: &[u8]) -> Option<(String, String, Vec<(String, String)>)> {
+    let text = std::str::from_utf8(buf).ok()?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let uri = parts.next()?.to_string();
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.find(':') {
+            let name = line[..colon].to_string();
+            let value = line[colon + 1..].trim().to_string();
+            headers.push((name, value));
+        }
+    }
+    Some((method, uri, headers))
+}
+
 /// Bind + spawn the accept loop. Resolves Json {serverId, port}.
-pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super::OpOutcome {
+pub async fn http_serve(
+    state: Arc<HttpState>,
+    tcp: super::tcp::TcpRegistry,
+    tcp_ids: Arc<std::sync::atomic::AtomicU64>,
+    host: String,
+    port: u16,
+) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
@@ -247,26 +300,78 @@ pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super
     );
 
     let accept_state = state.clone();
+    let accept_tcp = tcp;
+    let accept_tcp_ids = tcp_ids;
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
-                    // Connection cap: refuse (drop) past the ceiling rather
-                    // than queue — a flood can't spawn unbounded tasks or
-                    // buffer unbounded bodies. The permit lives in the conn
-                    // task and frees when the connection ends.
+                    let Ok((mut stream, peer)) = accepted else { continue };
                     let Ok(permit) = connections.clone().try_acquire_owned() else {
                         drop(stream);
                         continue;
                     };
+
+                    // Peek for Connection: Upgrade before hyper takes ownership.
+                    let mut peek_buf = [0u8; 8192];
+                    let is_upgrade = match stream.peek(&mut peek_buf).await {
+                        Ok(n) if n > 16 => {
+                            find_header_end(&peek_buf[..n]).is_some()
+                                && is_connection_upgrade(&peek_buf[..n])
+                        }
+                        _ => false,
+                    };
+
+                    if is_upgrade {
+                        let n = match stream.peek(&mut peek_buf).await {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+                        let Some(hdr_end) = find_header_end(&peek_buf[..n]) else {
+                            continue;
+                        };
+                        let consume = hdr_end + 4;
+                        let mut discard = vec![0u8; consume];
+                        if stream.read_exact(&mut discard).await.is_err() {
+                            continue;
+                        }
+                        if let Some((method, uri, headers)) =
+                            parse_upgrade_headers(&discard[..hdr_end])
+                        {
+                            let id = accept_state.next_id();
+                            let handle =
+                                accept_tcp_ids.fetch_add(1, Ordering::Relaxed);
+                            let (reader, writer) = stream.into_split();
+                            accept_tcp
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .register_stream(handle, reader, writer);
+                            let _ = queue_tx
+                                .send(IncomingRequest {
+                                    id,
+                                    method,
+                                    uri,
+                                    headers,
+                                    body: Vec::new(),
+                                    is_upgrade: true,
+                                    socket_handle: Some(handle),
+                                    remote_addr: Some(peer.ip().to_string()),
+                                    remote_port: Some(peer.port()),
+                                })
+                                .await;
+                        }
+                        drop(permit);
+                        continue;
+                    }
+
+                    // Normal HTTP: hand to hyper.
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        let _permit = permit; // released when the task ends
+                        let _permit = permit;
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
                             handle_request(conn_state.clone(), conn_queue.clone(), req)
@@ -463,6 +568,10 @@ async fn handle_request(
             uri,
             headers,
             body: Vec::new(), // delivered via take_request_body
+            is_upgrade: false,
+            socket_handle: None,
+            remote_addr: None,
+            remote_port: None,
         })
         .await;
     if sent.is_err() {
@@ -595,15 +704,25 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         entry.queue = Some(queue);
     }
     match next {
-        Some(request) => super::OpOutcome::Json(
-            serde_json::json!({
+        Some(request) => {
+            let mut meta = serde_json::json!({
                 "requestId": request.id,
                 "method": request.method,
                 "uri": request.uri,
                 "headers": request.headers,
-            })
-            .to_string(),
-        ),
+            });
+            if request.is_upgrade {
+                meta["isUpgrade"] = serde_json::json!(true);
+                meta["socketHandle"] = serde_json::json!(request.socket_handle);
+                if let Some(addr) = &request.remote_addr {
+                    meta["remoteAddress"] = serde_json::json!(addr);
+                }
+                if let Some(port) = request.remote_port {
+                    meta["remotePort"] = serde_json::json!(port);
+                }
+            }
+            super::OpOutcome::Json(meta.to_string())
+        }
         None => super::OpOutcome::Done,
     }
 }
