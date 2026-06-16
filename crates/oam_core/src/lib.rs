@@ -15,6 +15,8 @@ use std::future::Future;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use futures_util::FutureExt;
+
 pub use oam_diagnostics as diagnostics;
 
 pub mod child;
@@ -233,8 +235,20 @@ impl CoreRuntime {
             .as_ref()
             .expect("runtime alive")
             .spawn(async move {
-                let outcome = op.await;
-                // Receiver dropped means the runtime is shutting down: fine.
+                let outcome =
+                    match std::panic::AssertUnwindSafe(op).catch_unwind().await {
+                        Ok(outcome) => outcome,
+                        Err(payload) => {
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .or_else(|| {
+                                    payload.downcast_ref::<String>().map(|s| s.as_str())
+                                })
+                                .unwrap_or("internal panic in async op");
+                            OpOutcome::Failed(format!("panic: {msg}"))
+                        }
+                    };
                 let _ = tx.send(OpCompletion { id, outcome });
             });
         id
@@ -1185,7 +1199,7 @@ pub mod ops {
         chunk: Vec<u8>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
-            let mut guard = streams.lock().expect("zlib stream registry lock");
+            let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
             let Some(stream) = guard.get_mut(&handle) else {
                 return Err(format!("zlib stream: handle {handle} not found"));
             };
@@ -1306,7 +1320,7 @@ pub mod ops {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(usize, usize), String> {
-        let mut guard = streams.lock().expect("zlib registry lock");
+        let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
         let stream = guard
             .get_mut(&handle)
             .ok_or_else(|| format!("zlib handle {handle} not found"))?;
@@ -1414,7 +1428,7 @@ pub mod ops {
     /// whether it was kept (false = the handle was retired by fsClose
     /// during the IO await, so the File is dropped here, closing the fd).
     fn reinsert_file(files: &super::FileRegistry, handle: u64, file: tokio::fs::File) -> bool {
-        let mut guard = files.lock().expect("file registry lock");
+        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
         if guard.closed.remove(&handle) {
             drop(file); // closed during the await: do not resurrect
             false
@@ -1480,7 +1494,7 @@ pub mod ops {
     /// (handle dropped). Remove-await-reinsert keeps the lock short; the
     /// JS ReadableStream lock guarantees a single reader per handle.
     pub async fn fetch_body_read(bodies: super::BodyRegistry, handle: u64) -> OpOutcome {
-        let response = bodies.lock().expect("body registry lock").remove(&handle);
+        let response = bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
         let Some(mut response) = response else {
             return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
         };

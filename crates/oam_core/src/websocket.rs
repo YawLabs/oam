@@ -107,7 +107,7 @@ pub async fn ws_connect(
     tokio::spawn(bridge(ws_stream, outbound_rx, inbound_tx));
 
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    registry.lock().expect("ws registry lock").insert(
+    registry.lock().unwrap_or_else(|e| e.into_inner()).insert(
         handle,
         WsConnection {
             outbound: outbound_tx,
@@ -127,7 +127,7 @@ pub async fn ws_connect(
 
 pub fn ws_send_sync(registry: &WsRegistry, handle: u64, message: Message) -> Result<(), String> {
     let sender = {
-        let guard = registry.lock().expect("ws registry lock");
+        let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&handle) {
             Some(conn) => conn.outbound.clone(),
             None => return Err(format!("WebSocket: handle {handle} not found")),
@@ -151,7 +151,7 @@ pub async fn ws_recv(registry: WsRegistry, handle: u64) -> OpOutcome {
 
     let frame = rx.recv().await;
 
-    if let Some(conn) = registry.lock().expect("ws registry lock").get_mut(&handle) {
+    if let Some(conn) = registry.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&handle) {
         conn.inbound = Some(rx);
     }
 
@@ -169,7 +169,7 @@ pub async fn ws_recv(registry: WsRegistry, handle: u64) -> OpOutcome {
 
 pub async fn ws_close(registry: WsRegistry, handle: u64, code: u16, reason: String) -> OpOutcome {
     let sender = {
-        let guard = registry.lock().expect("ws registry lock");
+        let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get(&handle) {
             Some(conn) => conn.outbound.clone(),
             None => return OpOutcome::Done,
@@ -184,5 +184,5 @@ pub async fn ws_close(registry: WsRegistry, handle: u64, code: u16, reason: Stri
 }
 
 pub fn ws_drop(registry: &WsRegistry, handle: u64) {
-    registry.lock().expect("ws registry lock").remove(&handle);
+    registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
 }

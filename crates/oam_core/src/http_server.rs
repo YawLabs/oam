@@ -107,7 +107,7 @@ impl HttpState {
 
     /// Sync (isolate-thread) helpers consumed by the engine natives.
     pub fn take_request_body(&self, id: u64) -> Option<Vec<u8>> {
-        self.bodies.lock().expect("http bodies lock").remove(&id)
+        self.bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
     }
 
     pub fn respond_full(
@@ -117,7 +117,7 @@ impl HttpState {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> bool {
-        let Some(responder) = self.pending.lock().expect("http pending lock").remove(&id) else {
+        let Some(responder) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else {
             return false;
         };
         responder
@@ -238,7 +238,7 @@ pub async fn http_serve(state: Arc<HttpState>, host: String, port: u16) -> super
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    state.servers.lock().expect("http servers lock").insert(
+    state.servers.lock().unwrap_or_else(|e| e.into_inner()).insert(
         server_id,
         ServerEntry {
             queue: Some(queue_rx),
@@ -508,7 +508,7 @@ pub async fn https_serve(
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    state.servers.lock().expect("http servers lock").insert(
+    state.servers.lock().unwrap_or_else(|e| e.into_inner()).insert(
         server_id,
         ServerEntry {
             queue: Some(queue_rx),

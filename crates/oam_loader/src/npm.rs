@@ -186,11 +186,38 @@ fn diag(code: &str, message: String) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Resolve, message)
 }
 
+/// Cache of package.json path -> parsed JSON value. Avoids re-reading and
+/// re-parsing the same package.json on every resolve/module_kind call.
+fn cached_manifest(path: &Path) -> Option<serde_json::Value> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<serde_json::Value>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = map.get(path) {
+        return cached.clone();
+    }
+    let result = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok());
+    map.insert(path.to_path_buf(), result.clone());
+    result
+}
+
 /// Exact-name builtin check (Node semantics): 'fs' and 'fs/promises' are
 /// builtins; 'fs/foo' and 'process/browser' are NOT.
 pub(crate) fn is_node_builtin(specifier: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static BUILTINS: OnceLock<HashSet<&str>> = OnceLock::new();
+    let set = BUILTINS.get_or_init(|| {
+        let mut s = HashSet::with_capacity(NODE_BUILTINS.len() + SUBPATH_BUILTINS.len());
+        s.extend(NODE_BUILTINS.iter().copied());
+        s.extend(SUBPATH_BUILTINS.iter().copied());
+        s
+    });
     let name = specifier.strip_prefix("node:").unwrap_or(specifier);
-    NODE_BUILTINS.contains(&name) || SUBPATH_BUILTINS.contains(&name)
+    set.contains(name)
 }
 
 /// Resolve a bare specifier from `referrer` against node_modules.
@@ -357,10 +384,7 @@ fn resolve_in_package(
     mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
     let manifest_path = package_dir.join("package.json");
-    let manifest: Value = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or(Value::Null);
+    let manifest: Value = cached_manifest(&manifest_path).unwrap_or(Value::Null);
 
     let resolved = if let Some(exports) = manifest.get("exports") {
         let target =
@@ -464,17 +488,12 @@ fn probe_require(raw: &Path) -> Option<PathBuf> {
         return Some(found);
     }
     if raw.is_dir() {
-        let main = std::fs::read_to_string(raw.join("package.json"))
-            .ok()
-            .and_then(|text| {
-                serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
-            })
-            .and_then(|manifest| {
-                manifest
-                    .get("main")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
+        let main = cached_manifest(&raw.join("package.json")).and_then(|manifest| {
+            manifest
+                .get("main")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
         if let Some(main) = main {
             let target = raw.join(main);
             if let Some(found) = as_file(&target).or_else(|| as_index(&target)) {
@@ -517,17 +536,12 @@ pub fn module_kind(path: &Path) -> ModuleKind {
     while let Some(current) = dir {
         let manifest_path = current.join("package.json");
         if manifest_path.is_file() {
-            let declared = std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|text| {
-                    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
-                })
-                .and_then(|manifest| {
-                    manifest
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+            let declared = cached_manifest(&manifest_path).and_then(|manifest| {
+                manifest
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
             return match declared.as_deref() {
                 Some("module") => ModuleKind::Esm,
                 Some(_) => ModuleKind::Cjs,

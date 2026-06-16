@@ -24,7 +24,7 @@ pub struct TcpState {
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;
 
 fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -> bool {
-    let mut guard = registry.lock().expect("tcp registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(reader);
         false
@@ -35,7 +35,7 @@ fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -
 }
 
 fn reinsert_writer(registry: &TcpRegistry, handle: u64, writer: OwnedWriteHalf) -> bool {
-    let mut guard = registry.lock().expect("tcp registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(writer);
         false
@@ -51,7 +51,7 @@ fn reinsert_listener(
     server_id: u64,
     listener: tokio::net::TcpListener,
 ) -> bool {
-    let mut guard = registry.lock().expect("tcp registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.remove(&server_id) {
         drop(listener);
         false
@@ -98,7 +98,7 @@ pub async fn tcp_connect(
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = stream.into_split();
     {
-        let mut guard = registry.lock().expect("tcp registry lock");
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         guard.readers.insert(handle, reader);
         guard.writers.insert(handle, writer);
     }
@@ -180,7 +180,7 @@ pub async fn tcp_shutdown(registry: TcpRegistry, handle: u64) -> OpOutcome {
 /// Close a TCP stream. Remove both halves and mark the handle closed so
 /// any in-flight read/write does not resurrect it.
 pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
-    let mut guard = registry.lock().expect("tcp registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
     guard.closed.insert(handle);
@@ -230,7 +230,7 @@ pub async fn tcp_accept(
     stream_ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> OpOutcome {
     let (listener, notify) = {
-        let mut guard = registry.lock().expect("tcp registry lock");
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         let listener = guard.listeners.remove(&server_id);
         let notify = guard
             .cancel
@@ -252,7 +252,7 @@ pub async fn tcp_accept(
                     let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
                     let (reader, writer) = stream.into_split();
                     {
-                        let mut guard = registry.lock().expect("tcp registry lock");
+                        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
                         guard.readers.insert(handle, reader);
                         guard.writers.insert(handle, writer);
                     }
@@ -281,7 +281,7 @@ pub async fn tcp_accept(
 /// Close a TCP server. Remove the listener AND add to closed set so any
 /// in-flight accept does not resurrect it. Notifies any blocked accept.
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
-    let mut guard = registry.lock().expect("tcp registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.listeners.remove(&server_id);
     guard.closed.insert(server_id);
     if let Some(notify) = guard.cancel.remove(&server_id) {

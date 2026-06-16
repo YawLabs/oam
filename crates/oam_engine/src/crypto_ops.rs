@@ -1196,11 +1196,13 @@ pub(crate) fn op_crypto_generate_keypair(
     match result {
         Ok((priv_pem, pub_pem)) => {
             let obj = v8::Object::new(scope);
-            if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&priv_pem).unwrap()) {
+            let priv_str = String::from_utf8_lossy(&priv_pem);
+            if let Some(pk) = v8::String::new(scope, &priv_str) {
                 let key = v8::String::new(scope, "privateKey").unwrap();
                 obj.set(scope, key.into(), pk.into());
             }
-            if let Some(pk) = v8::String::new(scope, std::str::from_utf8(&pub_pem).unwrap()) {
+            let pub_str = String::from_utf8_lossy(&pub_pem);
+            if let Some(pk) = v8::String::new(scope, &pub_str) {
                 let key = v8::String::new(scope, "publicKey").unwrap();
                 obj.set(scope, key.into(), pk.into());
             }

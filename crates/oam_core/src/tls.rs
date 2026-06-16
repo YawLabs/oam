@@ -28,7 +28,7 @@ pub struct TlsState {
 pub type TlsRegistry = Arc<std::sync::Mutex<TlsState>>;
 
 fn reinsert_reader(registry: &TlsRegistry, handle: u64, reader: ReadHalf<ClientStream>) -> bool {
-    let mut guard = registry.lock().expect("tls registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(reader);
         false
@@ -39,7 +39,7 @@ fn reinsert_reader(registry: &TlsRegistry, handle: u64, reader: ReadHalf<ClientS
 }
 
 fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: WriteHalf<ClientStream>) -> bool {
-    let mut guard = registry.lock().expect("tls registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         drop(writer);
         false
@@ -163,7 +163,7 @@ pub async fn tls_connect(
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = tokio::io::split(tls_stream);
     {
-        let mut guard = registry.lock().expect("tls registry lock");
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         guard.readers.insert(handle, reader);
         guard.writers.insert(handle, writer);
     }
@@ -239,7 +239,7 @@ pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
 }
 
 pub fn tls_close(registry: &TlsRegistry, handle: u64) {
-    let mut guard = registry.lock().expect("tls registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
     guard.closed.insert(handle);

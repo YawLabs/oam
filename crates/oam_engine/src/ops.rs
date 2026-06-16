@@ -239,7 +239,7 @@ fn op_fetch_body_cancel(
         .get_slot::<CoreRuntime>()
         .expect("core runtime installed")
         .bodies();
-    bodies.lock().expect("body registry lock").remove(&handle);
+    bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
 }
 
 fn op_ws_connect(

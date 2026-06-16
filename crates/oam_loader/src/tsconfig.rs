@@ -15,7 +15,7 @@
 //! before serde sees it.
 
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -28,7 +28,7 @@ fn warned_bare_extends() -> &'static Mutex<HashSet<PathBuf>> {
     SET.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PathsConfig {
     /// The declaring tsconfig's directory; substitutions resolve here.
     pub base_dir: PathBuf,
@@ -55,6 +55,13 @@ struct RawCompilerOptions {
     paths: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Cache of tsconfig.json path -> parsed PathsConfig (or None if no paths).
+/// Avoids re-reading and re-parsing tsconfig.json on every resolve call.
+fn tsconfig_cache() -> &'static Mutex<HashMap<PathBuf, Option<PathsConfig>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<PathsConfig>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Walk up from `referrer` to the nearest tsconfig.json and load its
 /// effective paths. None = no tsconfig or no paths configured.
 pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
@@ -66,7 +73,15 @@ pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
     loop {
         let candidate = dir.join("tsconfig.json");
         if candidate.is_file() {
-            return load_chain(&candidate, 0);
+            let mut cache = tsconfig_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.get(&candidate) {
+                return cached.clone();
+            }
+            let result = load_chain(&candidate, 0);
+            cache.insert(candidate, result.clone());
+            return result;
         }
         if !dir.pop() {
             return None;

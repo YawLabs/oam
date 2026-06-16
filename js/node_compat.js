@@ -4162,8 +4162,10 @@
         destroyed: false,
         needDrain: false,
         endCallbacks: [],
+        corked: 0,
       };
       if (options.write) self._write = options.write;
+      if (options.writev) self._writev = options.writev;
       if (options.final) self._final = options.final;
       if (options.destroy) self._destroy = options.destroy;
     }
@@ -4206,7 +4208,51 @@
 
       _processWrites() {
         const s = this._wState;
-        if (s.writing || s.destroyed) return;
+        if (s.writing || s.destroyed || s.corked > 0) return;
+        if (s.queue.length === 0) {
+          this._maybeFinish();
+          return;
+        }
+        // If _writev is available and multiple chunks are queued, batch them
+        if (this._writev && s.queue.length > 1) {
+          const batch = s.queue.splice(0);
+          s.writing = true;
+          let called = false;
+          let batchLen = 0;
+          for (let i = 0; i < batch.length; i++) {
+            batchLen += s.objectMode ? 1 : (batch[i].chunk.length ?? 1);
+          }
+          const done = (err) => {
+            if (called) return;
+            called = true;
+            s.writing = false;
+            s.length -= batchLen;
+            if (err) {
+              for (let i = 0; i < batch.length; i++) {
+                if (batch[i].cb) batch[i].cb(err);
+              }
+              this.destroy(err);
+              return;
+            }
+            for (let i = 0; i < batch.length; i++) {
+              if (batch[i].cb) batch[i].cb();
+            }
+            if (s.queue.length === 0 && s.needDrain && !s.ending) {
+              s.needDrain = false;
+              this.emit("drain");
+            }
+            this._processWrites();
+          };
+          try {
+            const result = this._writev(batch, done);
+            if (result && typeof result.then === "function") {
+              result.catch(done);
+            }
+          } catch (e) {
+            done(e);
+          }
+          return;
+        }
         const next = s.queue.shift();
         if (next === undefined) {
           this._maybeFinish();
@@ -4292,8 +4338,14 @@
         return this;
       },
 
-      cork() {},
-      uncork() {},
+      cork() {
+        this._wState.corked++;
+      },
+      uncork() {
+        const s = this._wState;
+        if (s.corked > 0) s.corked--;
+        if (s.corked === 0) this._processWrites();
+      },
       setDefaultEncoding() {
         return this;
       },
@@ -5146,6 +5198,7 @@
   // Asymmetric keys / sign-verify / ciphers land with a later wave.
   registry.factories.crypto = (natives) => {
     const BufferCtor = globalThis.Buffer;
+    const stream = registry.get("stream");
 
     const toBytes = (data, encoding) => {
       if (typeof data === "string") return BufferCtor.from(data, encoding ?? "utf8");
@@ -5314,8 +5367,9 @@
       return ko;
     }
 
-    class Sign {
+    class Sign extends stream.Transform {
       constructor(algorithm) {
+        super();
         this._algorithm = algorithm;
         this._data = [];
       }
@@ -5356,10 +5410,15 @@
         }
         return outputEncoding ? sig.toString(outputEncoding) : sig;
       }
+      _transform(chunk, encoding, callback) {
+        this.update(chunk, encoding);
+        callback();
+      }
     }
 
-    class Verify {
+    class Verify extends stream.Transform {
       constructor(algorithm) {
+        super();
         this._algorithm = algorithm;
         this._data = [];
       }
@@ -5399,6 +5458,10 @@
           return natives.cryptoVerifyPss(this._algorithm, merged, pem, sigBuf, saltLength);
         }
         return natives.cryptoVerify(this._algorithm, merged, pem, sigBuf, keyType);
+      }
+      _transform(chunk, encoding, callback) {
+        this.update(chunk, encoding);
+        callback();
       }
     }
 
@@ -7428,8 +7491,13 @@
       removeHeader(name) { delete this._headers[name.toLowerCase()]; }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
-        if (typeof chunk !== "string") chunk = new TextDecoder().decode(chunk);
-        this._body.push(chunk);
+        if (typeof chunk === "string") {
+          this._body.push(globalThis.Buffer.from(chunk, encoding || "utf8"));
+        } else if (chunk instanceof Uint8Array) {
+          this._body.push(chunk);
+        } else {
+          this._body.push(globalThis.Buffer.from(chunk));
+        }
         if (callback) queueMicrotask(callback);
         return true;
       }
@@ -7439,13 +7507,24 @@
         if (data != null) this.write(data, encoding);
         this._ended = true;
         var self = this;
-        var bodyStr = self._body.length > 0 ? self._body.join("") : null;
+        var bodyData = null;
+        if (self._body.length > 0) {
+          var totalLen = 0;
+          for (var bi = 0; bi < self._body.length; bi++) totalLen += self._body[bi].length;
+          var merged = new Uint8Array(totalLen);
+          var boff = 0;
+          for (var bi = 0; bi < self._body.length; bi++) {
+            merged.set(self._body[bi], boff);
+            boff += self._body[bi].length;
+          }
+          bodyData = merged;
+        }
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
         };
-        if (bodyStr && self.method !== "GET" && self.method !== "HEAD") {
-          fetchOpts.body = bodyStr;
+        if (bodyData && self.method !== "GET" && self.method !== "HEAD") {
+          fetchOpts.body = bodyData;
         }
         globalThis.fetch(self._url, fetchOpts).then(function (resp) {
           if (self._aborted) return;
@@ -7654,6 +7733,8 @@
         this.bytesRead = 0;
         this.bytesWritten = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        this._timeoutMs = 0;
+        this._timeoutId = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -7712,6 +7793,7 @@
           else this.emit("error", err);
           return false;
         }
+        if (this._timeoutMs > 0) this._resetTimeout();
         const bytes = toBytes(data, encoding);
         this.bytesWritten += bytes.length;
         this._chain = this._chain.then(() => {
@@ -7745,6 +7827,10 @@
         this.readable = false;
         this.writable = false;
         this.connecting = false;
+        if (this._timeoutId !== null) {
+          globalThis.clearTimeout(this._timeoutId);
+          this._timeoutId = null;
+        }
         if (this._handle !== null) {
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
@@ -7771,6 +7857,7 @@
             break;
           }
           this.bytesRead += chunk.length;
+          if (this._timeoutMs > 0) this._resetTimeout();
           if (this._encoding) {
             this.emit("data", new TextDecoder(this._encoding).decode(chunk));
           } else {
@@ -7791,7 +7878,25 @@
       }
 
       setEncoding(encoding) { this._encoding = encoding; return this; }
-      setTimeout(ms, cb) { if (cb) this.once("timeout", cb); return this; }
+      setTimeout(ms, cb) {
+        if (this._timeoutId !== null) {
+          globalThis.clearTimeout(this._timeoutId);
+          this._timeoutId = null;
+        }
+        if (cb) this.once("timeout", cb);
+        this._timeoutMs = ms || 0;
+        if (this._timeoutMs > 0) this._resetTimeout();
+        return this;
+      }
+      _resetTimeout() {
+        if (this._timeoutId !== null) globalThis.clearTimeout(this._timeoutId);
+        if (this._timeoutMs > 0 && !this.destroyed) {
+          this._timeoutId = globalThis.setTimeout(() => {
+            this._timeoutId = null;
+            this.emit("timeout");
+          }, this._timeoutMs);
+        }
+      }
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
       ref() { return this; }

@@ -221,6 +221,44 @@ pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagn
     })
 }
 
+/// Negative probe cache: remembers paths confirmed to NOT exist so repeated
+/// resolves of the same specifier skip redundant `is_file()` stat calls.
+fn negative_probe_cache() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Check if a candidate path is a file, consulting the negative cache first.
+/// On miss from `is_file()`, insert into the negative set. On hit, remove
+/// from the negative set (in case a file was created since last check).
+fn is_file_cached(path: &Path) -> bool {
+    {
+        let neg = negative_probe_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if neg.contains(path) {
+            return false;
+        }
+    }
+    if path.is_file() {
+        // File exists -- remove from negative cache if present (file may
+        // have been created since last check).
+        let mut neg = negative_probe_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        neg.remove(path);
+        true
+    } else {
+        let mut neg = negative_probe_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        neg.insert(path.to_path_buf());
+        false
+    }
+}
+
 /// Probe a raw path for the actual module file. Candidate order: exact,
 /// TS-source fallback for JS extensions, then APPENDED extensions +
 /// directory index. Appending (not with_extension) keeps dotted basenames
@@ -254,7 +292,7 @@ fn probe_candidates(raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
 
     let found = candidates
         .iter()
-        .find(|c| c.is_file())
+        .find(|c| is_file_cached(c))
         .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()));
     (found, candidates)
 }

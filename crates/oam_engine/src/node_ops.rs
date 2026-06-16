@@ -506,8 +506,11 @@ fn op_stdout_write(
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        let _ = lock.write_all(&bytes);
-        let _ = lock.flush();
+        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush()) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+        }
     }
 }
 
@@ -520,8 +523,11 @@ fn op_stderr_write(
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        let _ = lock.write_all(&bytes);
-        let _ = lock.flush();
+        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush()) {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                std::process::exit(0);
+            }
+        }
     }
 }
 
@@ -1237,6 +1243,14 @@ fn op_zlib_handle_write_sync(
                                         produced,
                                     );
                                 }
+                            } else {
+                                let message = v8::String::new(
+                                    scope,
+                                    "zlib: output buffer overflow (offset + produced exceeds buffer length)",
+                                ).unwrap();
+                                let exception = v8::Exception::range_error(scope, message);
+                                scope.throw_exception(exception);
+                                return;
                             }
                         }
                     }
@@ -2168,7 +2182,7 @@ fn op_fs_close(
         .get_slot::<oam_core::CoreRuntime>()
         .expect("core runtime installed")
         .files();
-    let mut guard = files.lock().expect("file registry lock");
+    let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
     // If the File is in flight (removed by a chunk op for its IO await),
     // it is absent here -- record the close so the op's reinsert drops it
     // instead of resurrecting a leaked fd (destroy()-during-read race).
@@ -2288,7 +2302,7 @@ fn op_worker_new(
         .expect("core runtime installed");
     let workers = core.workers();
 
-    let worker_id = workers.lock().expect("worker registry lock").next_id();
+    let worker_id = workers.lock().unwrap_or_else(|e| e.into_inner()).next_id();
 
     let (parent_to_worker_tx, parent_to_worker_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (worker_to_parent_tx, worker_to_parent_rx) =
@@ -2303,7 +2317,7 @@ fn op_worker_new(
     );
 
     {
-        let mut guard = workers.lock().expect("worker registry lock");
+        let mut guard = workers.lock().unwrap_or_else(|e| e.into_inner());
         guard.handles.insert(
             worker_id,
             oam_core::worker::WorkerHandle {
@@ -2713,7 +2727,7 @@ fn op_spawn_async(
         {
             Ok((child, pid)) => {
                 let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut guard = children2.lock().expect("child registry lock");
+                let mut guard = children2.lock().unwrap_or_else(|e| e.into_inner());
                 guard.insert(handle, oam_core::child::ChildProcess { child, pid });
                 let json = serde_json::json!({ "handle": handle, "pid": pid });
                 oam_core::OpOutcome::Json(json.to_string())
@@ -2733,7 +2747,7 @@ fn op_spawn_kill(
         .get_slot::<oam_core::CoreRuntime>()
         .expect("core runtime installed")
         .children();
-    let mut guard = children.lock().expect("child registry lock");
+    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cp) = guard.get_mut(&handle) {
         let _ = cp.child.start_kill();
     }
@@ -2813,12 +2827,26 @@ fn op_spawn_wait(
 
 // ================================================================ dns
 
+fn validate_hostname(hostname: &str) -> Result<(), &'static str> {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err("hostname must be between 1 and 253 characters");
+    }
+    if hostname.contains('\0') {
+        return Err("hostname must not contain null bytes");
+    }
+    Ok(())
+}
+
 fn op_dns_lookup(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let hostname: String = args.get(0).to_rust_string_lossy(scope);
+    if let Err(msg) = validate_hostname(&hostname) {
+        throw_type_error(scope, msg);
+        return;
+    }
 
     let family = if args.get(1).is_number() {
         args.get(1).number_value(scope).unwrap_or(0.0) as i32
@@ -2840,6 +2868,10 @@ fn op_dns_resolve(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let hostname: String = args.get(0).to_rust_string_lossy(scope);
+    if let Err(msg) = validate_hostname(&hostname) {
+        throw_type_error(scope, msg);
+        return;
+    }
     let rrtype: String = args.get(1).to_rust_string_lossy(scope);
     crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_resolve(hostname, rrtype));
 }
@@ -3514,6 +3546,26 @@ fn op_process_kill(
 ) {
     let pid = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let signal = args.get(1).number_value(scope).unwrap_or(15.0) as i32;
+
+    // Only child processes of this runtime should be killable.
+    let children = scope
+        .get_slot::<oam_core::CoreRuntime>()
+        .expect("core runtime installed")
+        .children();
+    let is_own_child = children
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|child| child.pid == pid);
+    let is_self = pid == std::process::id();
+    if !is_own_child && !is_self {
+        throw_type_error(
+            scope,
+            &format!("process.kill: permission denied for pid {pid} (not a child process)"),
+        );
+        return;
+    }
+
     if let Err(msg) = kill_process(pid, signal) {
         throw_type_error(scope, &msg);
     }

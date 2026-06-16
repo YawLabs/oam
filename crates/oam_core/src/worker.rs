@@ -66,7 +66,7 @@ fn reinsert_receiver(
     worker_id: u64,
     rx: mpsc::Receiver<WorkerEvent>,
 ) -> bool {
-    let mut guard = registry.lock().expect("worker registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&worker_id) {
         false
     } else {
@@ -113,7 +113,7 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
 
 /// Send a message to a worker (parent -> worker). Synchronous.
 pub fn parent_post(registry: &WorkerRegistry, worker_id: u64, data: Vec<u8>) -> Result<(), String> {
-    let guard = registry.lock().expect("worker registry lock");
+    let guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     let Some(handle) = guard.handles.get(&worker_id) else {
         return Err(format!("worker {worker_id} not found"));
     };
@@ -125,7 +125,7 @@ pub fn parent_post(registry: &WorkerRegistry, worker_id: u64, data: Vec<u8>) -> 
 
 /// Terminate a worker. Removes all state.
 pub fn parent_terminate(registry: &WorkerRegistry, worker_id: u64) {
-    let mut guard = registry.lock().expect("worker registry lock");
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.handles.remove(&worker_id);
     guard.receivers.remove(&worker_id);
     guard.closed.insert(worker_id);
@@ -136,7 +136,7 @@ pub fn parent_terminate(registry: &WorkerRegistry, worker_id: u64) {
 pub async fn worker_recv(
     inbox: std::sync::Arc<std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>>,
 ) -> OpOutcome {
-    let rx = inbox.lock().expect("worker inbox lock").take();
+    let rx = inbox.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some(rx) = rx else {
         return OpOutcome::Done;
     };
@@ -149,7 +149,7 @@ pub async fn worker_recv(
 
     match result {
         Ok((rx, Ok(data))) => {
-            *inbox.lock().expect("worker inbox lock") = Some(rx);
+            *inbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
             OpOutcome::Bytes(data)
         }
         Ok((_, Err(_))) => OpOutcome::Done,

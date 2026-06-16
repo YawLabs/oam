@@ -237,7 +237,7 @@ pub struct SpawnSyncError {
 
 pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
     let child = {
-        let mut guard = children.lock().expect("child registry lock");
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         guard.get_mut(&handle).and_then(|c| c.child.stdout.take())
     };
     match child {
@@ -248,7 +248,7 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(0) => OpOutcome::Done,
                 Ok(n) => {
                     buf.truncate(n);
-                    let mut guard = children.lock().expect("child registry lock");
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = guard.get_mut(&handle) {
                         c.child.stdout = Some(stdout);
                     }
@@ -263,7 +263,7 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
 
 pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcome {
     let child = {
-        let mut guard = children.lock().expect("child registry lock");
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         guard.get_mut(&handle).and_then(|c| c.child.stderr.take())
     };
     match child {
@@ -274,7 +274,7 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(0) => OpOutcome::Done,
                 Ok(n) => {
                     buf.truncate(n);
-                    let mut guard = children.lock().expect("child registry lock");
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = guard.get_mut(&handle) {
                         c.child.stderr = Some(stderr);
                     }
@@ -289,7 +289,7 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
 
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
-        let mut guard = children.lock().expect("child registry lock");
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         guard.get_mut(&handle).and_then(|c| c.child.stdin.take())
     };
     match stdin {
@@ -297,7 +297,7 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
             use tokio::io::AsyncWriteExt;
             match stdin.write_all(&data).await {
                 Ok(()) => {
-                    let mut guard = children.lock().expect("child registry lock");
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = guard.get_mut(&handle) {
                         c.child.stdin = Some(stdin);
                     }
@@ -312,7 +312,7 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
 
 pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
     let child = {
-        let mut guard = children.lock().expect("child registry lock");
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         guard.remove(&handle)
     };
     match child {
