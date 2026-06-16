@@ -1838,6 +1838,7 @@ dependencies = [
 name = "oam_core"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "brotli",
  "bytes",
  "flate2",

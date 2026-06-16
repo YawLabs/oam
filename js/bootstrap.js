@@ -635,12 +635,19 @@
       url: wellFormed(input),
       method: init.method ? String(init.method).toUpperCase() : "GET",
       headers,
-      body: init.body == null
-        ? null
-        : init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
-          ? new TextDecoder().decode(init.body)
-          : wellFormed(init.body),
     };
+    if (init.body != null) {
+      if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
+        const bytes = init.body instanceof ArrayBuffer
+          ? new Uint8Array(init.body)
+          : new Uint8Array(init.body.buffer, init.body.byteOffset, init.body.byteLength);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        request.body_base64 = btoa(binary);
+      } else {
+        request.body = wellFormed(init.body);
+      }
+    }
     const op = globalThis.__oam
       .fetch(JSON.stringify(request))
       .then(makeResponse, (e) => {

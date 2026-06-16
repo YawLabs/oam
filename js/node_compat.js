@@ -7489,12 +7489,31 @@
         this._body = [];
         this._ended = false;
         this._aborted = false;
-        this.socket = { remoteAddress: host };
+        this.headersSent = false;
+        var self = this;
+        this.socket = {
+          remoteAddress: host,
+          remotePort: Number(port),
+          localAddress: "127.0.0.1",
+          localPort: 0,
+          setTimeout: function(ms, cb) { if (cb) self.once("timeout", cb); return this; },
+          setNoDelay: function() { return this; },
+          setKeepAlive: function() { return this; },
+          ref: function() { return this; },
+          unref: function() { return this; },
+          destroy: function() { self.destroy(); },
+        };
         if (callback) this.once("response", callback);
+        process.nextTick(function() {
+          self.emit("socket", self.socket);
+        });
       }
       setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
       getHeader(name) { return this._headers[name.toLowerCase()]; }
       removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      getHeaders() { return Object.assign({}, this._headers); }
+      hasHeader(name) { return name.toLowerCase() in this._headers; }
+      flushHeaders() { /* fetch sends headers with the body */ }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         if (typeof chunk === "string") {
@@ -7512,6 +7531,7 @@
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         if (data != null) this.write(data, encoding);
         this._ended = true;
+        this.headersSent = true;
         var self = this;
         var bodyData = null;
         if (self._body.length > 0) {
@@ -7549,6 +7569,7 @@
           resp.arrayBuffer().then(function (ab) {
             if (ab.byteLength > 0) res.push(globalThis.Buffer.from(ab));
             res.push(null);
+            process.nextTick(function() { self.emit("close"); });
           }, function (err) { res.destroy(err); });
         }, function (err) {
           self.emit("error", typeof err === "string" ? new Error(err) : err);

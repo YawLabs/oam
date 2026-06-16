@@ -1081,6 +1081,8 @@ pub mod ops {
         pub headers: Vec<(String, String)>,
         #[serde(default)]
         pub body: Option<String>,
+        #[serde(default)]
+        pub body_base64: Option<String>,
     }
 
     /// Streaming fetch: resolves at HEADERS time with the response shape
@@ -1104,6 +1106,14 @@ pub mod ops {
         }
         if let Some(body) = req.body {
             builder = builder.body(body);
+        } else if let Some(b64) = req.body_base64 {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                Ok(bytes) => {
+                    builder = builder.body(bytes);
+                }
+                Err(_) => return OpOutcome::Failed("fetch: malformed base64 body".into()),
+            }
         }
         let response = match builder.send().await {
             Ok(r) => r,

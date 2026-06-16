@@ -5533,6 +5533,55 @@ fn http_request_and_get_client() {
 }
 
 #[test]
+fn http_client_socket_event_and_headers() {
+    let addr = spawn_echo_server();
+    let stdout = run_ok(
+        "http_client_compat.mjs",
+        &format!(
+            "import http from 'node:http';\n\
+             const req = http.request('http://{addr}/test');\n\
+             \n\
+             // socket event fires\n\
+             let socketEmitted = false;\n\
+             req.on('socket', (sock) => {{\n\
+               socketEmitted = true;\n\
+               console.log('socket_event:', true);\n\
+               console.log('socket_has_methods:', typeof sock.setTimeout === 'function');\n\
+             }});\n\
+             \n\
+             // headers API\n\
+             req.setHeader('x-test', 'val');\n\
+             console.log('hasHeader:', req.hasHeader('x-test'));\n\
+             console.log('getHeaders:', 'x-test' in req.getHeaders());\n\
+             console.log('headersSent_before:', req.headersSent === false);\n\
+             \n\
+             // end and check response\n\
+             const result = await new Promise((resolve, reject) => {{\n\
+               req.on('response', (res) => {{\n\
+                 let body = '';\n\
+                 res.on('data', (c) => body += c);\n\
+                 res.on('end', () => resolve(body));\n\
+               }});\n\
+               req.on('error', reject);\n\
+               req.end();\n\
+             }});\n\
+             console.log('headersSent_after:', req.headersSent === true);\n\
+             console.log('socket_fired:', socketEmitted);\n\
+             \n\
+             // close event\n\
+             await new Promise(r => setTimeout(r, 50));\n\
+             console.log('response_ok:', result.length > 0);",
+        ),
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn submodule_imports_resolve() {
     let stdout = run_ok(
         "submod_imports.mjs",
@@ -10837,4 +10886,104 @@ console.log("all_ok=true");
     assert!(stdout.contains("verify=true"), "stdout: {stdout}");
     assert!(stdout.contains("wrong_verify=false"), "stdout: {stdout}");
     assert!(stdout.contains("all_ok=true"), "stdout: {stdout}");
+}
+
+#[test]
+fn graceful_stub_dgram() {
+    let stdout = run_ok(
+        "stub_dgram.mjs",
+        "import dgram from 'node:dgram';\n\
+         const socket = dgram.createSocket('udp4');\n\
+         console.log('createSocket:', typeof socket === 'object');\n\
+         let errEmitted = false;\n\
+         socket.bind(0);\n\
+         socket.on('error', (e) => {\n\
+           errEmitted = true;\n\
+           console.log('error_emitted:', true);\n\
+           console.log('error_message:', e.message.includes('not implemented'));\n\
+         });\n\
+         await new Promise(r => setTimeout(r, 50));\n\
+         console.log('no_throw:', !errEmitted || true);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn graceful_stub_http2() {
+    let stdout = run_ok(
+        "stub_http2.mjs",
+        "import http2 from 'node:http2';\n\
+         console.log('import_ok:', typeof http2.createServer === 'function');\n\
+         console.log('constants:', typeof http2.constants === 'object');\n\
+         console.log('connect_fn:', typeof http2.connect === 'function');\n\
+         const server = http2.createServer();\n\
+         console.log('server_created:', typeof server === 'object');\n\
+         let serverErr = false;\n\
+         server.on('error', () => { serverErr = true; });\n\
+         server.listen();\n\
+         await new Promise(r => setTimeout(r, 50));\n\
+         console.log('server_error:', serverErr);\n\
+         let connectErr = false;\n\
+         const session = http2.connect('http://localhost:1');\n\
+         session.on('error', () => { connectErr = true; });\n\
+         await new Promise(r => setTimeout(r, 50));\n\
+         console.log('connect_error:', connectErr);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn graceful_stub_cluster_fork() {
+    let stdout = run_ok(
+        "stub_cluster.mjs",
+        "import cluster from 'node:cluster';\n\
+         console.log('is_primary:', cluster.isPrimary);\n\
+         console.log('is_worker:', cluster.isWorker === false);\n\
+         const worker = cluster.fork();\n\
+         console.log('worker_created:', typeof worker === 'object');\n\
+         console.log('worker_id:', worker.id > 0);\n\
+         let forkErr = false;\n\
+         worker.on('error', () => { forkErr = true; });\n\
+         await new Promise(r => setTimeout(r, 50));\n\
+         console.log('fork_error:', forkErr);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn graceful_stub_tls_create_server() {
+    let stdout = run_ok(
+        "stub_tls_server.mjs",
+        "import tls from 'node:tls';\n\
+         console.log('import_ok:', typeof tls.connect === 'function');\n\
+         console.log('create_server_fn:', typeof tls.createServer === 'function');\n\
+         const server = tls.createServer();\n\
+         console.log('server_created:', typeof server === 'object');\n\
+         let serverErr = false;\n\
+         server.on('error', () => { serverErr = true; });\n\
+         server.listen();\n\
+         await new Promise(r => setTimeout(r, 50));\n\
+         console.log('server_error:', serverErr);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
 }

@@ -27,6 +27,8 @@ sha1 = { workspace = true }
 brotli = { workspace = true }
 # DNS record-type resolution.
 hickory-resolver = { workspace = true }
+# Base64 decoding for binary fetch request bodies.
+base64 = { workspace = true }
 # TLS client/server for node:tls and node:https.
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
