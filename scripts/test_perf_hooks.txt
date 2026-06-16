@@ -1,0 +1,229 @@
+#[test]
+fn perf_hooks_mark_measure_entries() {
+    let stdout = run_ok("perf_hooks_mark_measure.mjs", r#"
+        const { performance, PerformanceObserver, PerformanceEntry } = require('perf_hooks');
+
+        // mark() creates entries with correct entryType
+        performance.mark('start');
+        performance.mark('middle');
+        performance.mark('end');
+
+        const marks = performance.getEntriesByType('mark');
+        console.log('marks_count=' + marks.length);
+        console.log('mark0_name=' + marks[0].name);
+        console.log('mark0_type=' + marks[0].entryType);
+        console.log('mark0_dur=' + marks[0].duration);
+
+        // mark startTime is a positive number
+        console.log('mark_time_positive=' + (marks[0].startTime > 0));
+
+        // measure() between two marks
+        performance.measure('start-to-end', 'start', 'end');
+        const measures = performance.getEntriesByType('measure');
+        console.log('measures_count=' + measures.length);
+        console.log('measure0_name=' + measures[0].name);
+        console.log('measure0_type=' + measures[0].entryType);
+        console.log('measure_dur_gte0=' + (measures[0].duration >= 0));
+
+        // getEntries returns both marks and measures
+        const all = performance.getEntries();
+        console.log('all_count=' + all.length);
+
+        // getEntriesByName
+        const byName = performance.getEntriesByName('start');
+        console.log('byname_start=' + byName.length);
+        const byNameType = performance.getEntriesByName('start', 'mark');
+        console.log('byname_type=' + byNameType.length);
+
+        // PerformanceEntry is a constructor
+        console.log('entry_class=' + (typeof PerformanceEntry === 'function'));
+    "#);
+    assert!(stdout.contains("marks_count=3"), "{stdout}");
+    assert!(stdout.contains("mark0_name=start"), "{stdout}");
+    assert!(stdout.contains("mark0_type=mark"), "{stdout}");
+    assert!(stdout.contains("mark0_dur=0"), "{stdout}");
+    assert!(stdout.contains("mark_time_positive=true"), "{stdout}");
+    assert!(stdout.contains("measures_count=1"), "{stdout}");
+    assert!(stdout.contains("measure0_name=start-to-end"), "{stdout}");
+    assert!(stdout.contains("measure0_type=measure"), "{stdout}");
+    assert!(stdout.contains("measure_dur_gte0=true"), "{stdout}");
+    assert!(stdout.contains("all_count=4"), "{stdout}");
+    assert!(stdout.contains("byname_start=1"), "{stdout}");
+    assert!(stdout.contains("byname_type=1"), "{stdout}");
+    assert!(stdout.contains("entry_class=true"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_clear_marks_measures() {
+    let stdout = run_ok("perf_hooks_clear.mjs", r#"
+        const { performance } = require('perf_hooks');
+
+        performance.mark('a');
+        performance.mark('b');
+        performance.mark('a');
+        console.log('before_clear=' + performance.getEntriesByType('mark').length);
+
+        // clearMarks with name removes only matching
+        performance.clearMarks('a');
+        const afterA = performance.getEntriesByType('mark');
+        console.log('after_clear_a=' + afterA.length);
+        console.log('remaining=' + afterA[0].name);
+
+        // clearMarks without name clears all
+        performance.mark('c');
+        performance.clearMarks();
+        console.log('after_clear_all=' + performance.getEntriesByType('mark').length);
+
+        // clearMeasures
+        performance.mark('x');
+        performance.mark('y');
+        performance.measure('m1', 'x', 'y');
+        performance.measure('m2', 'x', 'y');
+        console.log('measures_before=' + performance.getEntriesByType('measure').length);
+        performance.clearMeasures('m1');
+        console.log('measures_after=' + performance.getEntriesByType('measure').length);
+        performance.clearMeasures();
+        console.log('measures_cleared=' + performance.getEntriesByType('measure').length);
+    "#);
+    assert!(stdout.contains("before_clear=3"), "{stdout}");
+    assert!(stdout.contains("after_clear_a=1"), "{stdout}");
+    assert!(stdout.contains("remaining=b"), "{stdout}");
+    assert!(stdout.contains("after_clear_all=0"), "{stdout}");
+    assert!(stdout.contains("measures_before=2"), "{stdout}");
+    assert!(stdout.contains("measures_after=1"), "{stdout}");
+    assert!(stdout.contains("measures_cleared=0"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_observer() {
+    let stdout = run_ok("perf_hooks_observer.mjs", r#"
+        const { performance, PerformanceObserver } = require('perf_hooks');
+
+        // Observer fires on mark
+        const observed = [];
+        const obs = new PerformanceObserver((list, observer) => {
+            const entries = list.getEntries();
+            for (const e of entries) {
+                observed.push(e.entryType + ':' + e.name);
+            }
+        });
+        obs.observe({ entryTypes: ['mark', 'measure'] });
+
+        performance.mark('obs_mark1');
+        performance.mark('obs_mark2');
+        performance.measure('obs_measure', 'obs_mark1', 'obs_mark2');
+
+        console.log('observed_count=' + observed.length);
+        console.log('observed_0=' + observed[0]);
+        console.log('observed_1=' + observed[1]);
+        console.log('observed_2=' + observed[2]);
+
+        // disconnect stops notifications
+        obs.disconnect();
+        performance.mark('after_disconnect');
+        console.log('observed_after_disconnect=' + observed.length);
+
+        // supportedEntryTypes
+        console.log('supported=' + PerformanceObserver.supportedEntryTypes.join(','));
+    "#);
+    assert!(stdout.contains("observed_count=3"), "{stdout}");
+    assert!(stdout.contains("observed_0=mark:obs_mark1"), "{stdout}");
+    assert!(stdout.contains("observed_1=mark:obs_mark2"), "{stdout}");
+    assert!(stdout.contains("observed_2=measure:obs_measure"), "{stdout}");
+    assert!(stdout.contains("observed_after_disconnect=3"), "{stdout}");
+    assert!(stdout.contains("supported=mark,measure"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_observer_buffered() {
+    let stdout = run_ok("perf_hooks_observer_buffered.mjs", r#"
+        const { performance, PerformanceObserver } = require('perf_hooks');
+
+        // Create marks before observer
+        performance.mark('pre1');
+        performance.mark('pre2');
+
+        const buffered = [];
+        const obs = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+                buffered.push(e.name);
+            }
+        });
+        // observe with buffered:true delivers existing entries
+        obs.observe({ type: 'mark', buffered: true });
+        console.log('buffered_count=' + buffered.length);
+        console.log('buffered_0=' + buffered[0]);
+        console.log('buffered_1=' + buffered[1]);
+
+        obs.disconnect();
+    "#);
+    assert!(stdout.contains("buffered_count=2"), "{stdout}");
+    assert!(stdout.contains("buffered_0=pre1"), "{stdout}");
+    assert!(stdout.contains("buffered_1=pre2"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_now_and_time_origin() {
+    let stdout = run_ok("perf_hooks_now.mjs", r#"
+        const { performance } = require('perf_hooks');
+
+        // .now() returns a positive number
+        const t = performance.now();
+        console.log('now_positive=' + (t > 0));
+        console.log('now_is_number=' + (typeof t === 'number'));
+
+        // .timeOrigin is a positive number
+        console.log('origin_positive=' + (performance.timeOrigin > 0));
+
+        // toJSON returns expected shape
+        const j = performance.toJSON();
+        console.log('json_has_origin=' + ('timeOrigin' in j));
+        console.log('json_has_timing=' + ('nodeTiming' in j));
+
+        // eventLoopUtilization exists
+        const elu = performance.eventLoopUtilization();
+        console.log('elu_has_idle=' + ('idle' in elu));
+    "#);
+    assert!(stdout.contains("now_positive=true"), "{stdout}");
+    assert!(stdout.contains("now_is_number=true"), "{stdout}");
+    assert!(stdout.contains("origin_positive=true"), "{stdout}");
+    assert!(stdout.contains("json_has_origin=true"), "{stdout}");
+    assert!(stdout.contains("json_has_timing=true"), "{stdout}");
+    assert!(stdout.contains("elu_has_idle=true"), "{stdout}");
+}
+
+#[test]
+fn perf_hooks_measure_with_options_object() {
+    let stdout = run_ok("perf_hooks_measure_opts.mjs", r#"
+        const { performance } = require('perf_hooks');
+
+        // measure with options object {start, end, detail}
+        performance.mark('s');
+        performance.mark('e');
+        performance.measure('opts_measure', { start: 's', end: 'e', detail: { key: 'val' } });
+
+        const m = performance.getEntriesByName('opts_measure')[0];
+        console.log('opts_name=' + m.name);
+        console.log('opts_type=' + m.entryType);
+        console.log('opts_dur_gte0=' + (m.duration >= 0));
+        console.log('opts_detail_key=' + m.detail.key);
+
+        // measure with numeric start/end
+        performance.measure('numeric', { start: 10, end: 50 });
+        const n = performance.getEntriesByName('numeric')[0];
+        console.log('numeric_start=' + n.startTime);
+        console.log('numeric_dur=' + n.duration);
+
+        // measure with explicit duration
+        performance.measure('explicit', { start: 5, duration: 100 });
+        const ex = performance.getEntriesByName('explicit')[0];
+        console.log('explicit_dur=' + ex.duration);
+    "#);
+    assert!(stdout.contains("opts_name=opts_measure"), "{stdout}");
+    assert!(stdout.contains("opts_type=measure"), "{stdout}");
+    assert!(stdout.contains("opts_dur_gte0=true"), "{stdout}");
+    assert!(stdout.contains("opts_detail_key=val"), "{stdout}");
+    assert!(stdout.contains("numeric_start=10"), "{stdout}");
+    assert!(stdout.contains("numeric_dur=40"), "{stdout}");
+    assert!(stdout.contains("explicit_dur=100"), "{stdout}");
+}

@@ -1,0 +1,192 @@
+#[test]
+fn readline_line_events_and_close() {
+    let stdout = run_ok("readline_line_events.mjs", r#"
+        const { Readable } = require('stream');
+        const readline = require('readline');
+
+        const input = new Readable({ read() {} });
+        const rl = readline.createInterface({ input });
+
+        const lines = [];
+        rl.on('line', (line) => lines.push(line));
+        rl.on('close', () => {
+            console.log('lines=' + JSON.stringify(lines));
+            console.log('closed=true');
+        });
+
+        input.push('hello\nworld\nlast');
+        input.push(null);
+    "#);
+    assert!(stdout.contains(r#"lines=["hello","world","last"]"#), "line events: {stdout}");
+    assert!(stdout.contains("closed=true"), "close event: {stdout}");
+}
+
+#[test]
+fn readline_clearline_ansi() {
+    let stdout = run_ok("readline_clearline.mjs", r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // dir = -1 => ESC[1K (erase left)
+        const r1 = readline.clearLine(out, -1);
+        const after1 = buf;
+        buf = '';
+
+        // dir = 1 => ESC[0K (erase right)
+        readline.clearLine(out, 1);
+        const after2 = buf;
+        buf = '';
+
+        // dir = 0 => ESC[2K (erase whole line)
+        readline.clearLine(out, 0);
+        const after3 = buf;
+        buf = '';
+
+        // no stream => returns false
+        const r2 = readline.clearLine(null, 0);
+
+        console.log('cl_left=' + JSON.stringify(after1));
+        console.log('cl_right=' + JSON.stringify(after2));
+        console.log('cl_whole=' + JSON.stringify(after3));
+        console.log('ret_stream=' + r1);
+        console.log('ret_null=' + r2);
+    "#);
+    assert!(stdout.contains(r#"cl_left="[1K""#), "clearLine left: {stdout}");
+    assert!(stdout.contains(r#"cl_right="[0K""#), "clearLine right: {stdout}");
+    assert!(stdout.contains(r#"cl_whole="[2K""#), "clearLine whole: {stdout}");
+    assert!(stdout.contains("ret_stream=true"), "clearLine return with stream: {stdout}");
+    assert!(stdout.contains("ret_null=false"), "clearLine return without stream: {stdout}");
+}
+
+#[test]
+fn readline_cursorto_ansi() {
+    let stdout = run_ok("readline_cursorto.mjs", r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // column only: ESC[(x+1)G
+        readline.cursorTo(out, 5);
+        const col_only = buf;
+        buf = '';
+
+        // row + column: ESC[(y+1);(x+1)H
+        readline.cursorTo(out, 3, 7);
+        const row_col = buf;
+
+        console.log('col_only=' + JSON.stringify(col_only));
+        console.log('row_col=' + JSON.stringify(row_col));
+    "#);
+    assert!(stdout.contains(r#"col_only="[6G""#), "cursorTo column: {stdout}");
+    assert!(stdout.contains(r#"row_col="[8;4H""#), "cursorTo row+col: {stdout}");
+}
+
+#[test]
+fn readline_movecursor_ansi() {
+    let stdout = run_ok("readline_movecursor.mjs", r#"
+        const readline = require('readline');
+        const { Writable } = require('stream');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+
+        // dx=3 => ESC[3C, dy=-2 => ESC[2A
+        readline.moveCursor(out, 3, -2);
+        const move1 = buf;
+        buf = '';
+
+        // dx=-4 => ESC[4D, dy=1 => ESC[1B
+        readline.moveCursor(out, -4, 1);
+        const move2 = buf;
+
+        console.log('move1=' + JSON.stringify(move1));
+        console.log('move2=' + JSON.stringify(move2));
+    "#);
+    assert!(stdout.contains(r#"move1="[3C[2A""#), "moveCursor right+up: {stdout}");
+    assert!(stdout.contains(r#"move2="[4D[1B""#), "moveCursor left+down: {stdout}");
+}
+
+#[test]
+fn readline_prompt_write_pause_resume() {
+    let stdout = run_ok("readline_prompt_write.mjs", r#"
+        const { Readable, Writable } = require('stream');
+        const readline = require('readline');
+
+        let buf = '';
+        const out = new Writable({
+            write(chunk, _enc, cb) {
+                buf += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+                cb();
+            }
+        });
+        const input = new Readable({ read() {} });
+        const rl = readline.createInterface({ input, output: out, prompt: '$ ' });
+
+        // setPrompt + prompt
+        rl.setPrompt('>> ');
+        rl.prompt();
+        const prompted = buf;
+        buf = '';
+
+        // write
+        rl.write('typed text');
+        const written = buf;
+        buf = '';
+
+        // pause / resume emit events
+        const events = [];
+        rl.on('pause', () => events.push('pause'));
+        rl.on('resume', () => events.push('resume'));
+        rl.pause();
+        rl.resume();
+        // double pause should not double-emit
+        rl.pause();
+        rl.pause();
+
+        console.log('prompted=' + JSON.stringify(prompted));
+        console.log('written=' + JSON.stringify(written));
+        console.log('events=' + JSON.stringify(events));
+    "#);
+    assert!(stdout.contains(r#"prompted=">> ""#), "prompt output: {stdout}");
+    assert!(stdout.contains(r#"written="typed text""#), "write output: {stdout}");
+    assert!(stdout.contains(r#"events=["pause","resume","pause"]"#), "pause/resume events: {stdout}");
+}
+
+#[test]
+fn readline_crlfdelay_option() {
+    let stdout = run_ok("readline_crlfdelay.mjs", r#"
+        const readline = require('readline');
+        const { Readable } = require('stream');
+
+        const input1 = new Readable({ read() {} });
+        const rl1 = readline.createInterface({ input: input1, crlfDelay: Infinity });
+        console.log('delay=' + rl1.crlfDelay);
+
+        // default crlfDelay
+        const input2 = new Readable({ read() {} });
+        const rl2 = readline.createInterface({ input: input2 });
+        console.log('default_delay=' + rl2.crlfDelay);
+    "#);
+    assert!(stdout.contains("delay=Infinity"), "crlfDelay Infinity: {stdout}");
+    assert!(stdout.contains("default_delay=100"), "crlfDelay default: {stdout}");
+}
