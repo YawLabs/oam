@@ -21,6 +21,49 @@ impl PendingOps {
     }
 }
 
+macro_rules! core_runtime {
+    ($scope:expr) => {
+        match $scope.get_slot::<CoreRuntime>() {
+            Some(rt) => rt,
+            None => {
+                let msg = v8::String::new($scope, "internal: runtime not initialized").unwrap();
+                let exc = v8::Exception::error($scope, msg);
+                $scope.throw_exception(exc);
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! core_runtime_mut {
+    ($scope:expr) => {
+        match $scope.get_slot_mut::<CoreRuntime>() {
+            Some(rt) => rt,
+            None => {
+                let msg = v8::String::new($scope, "internal: runtime not initialized").unwrap();
+                let exc = v8::Exception::error($scope, msg);
+                $scope.throw_exception(exc);
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! pending_ops_mut {
+    ($scope:expr) => {
+        match $scope.get_slot_mut::<PendingOps>() {
+            Some(ops) => ops,
+            None => {
+                let msg = v8::String::new($scope, "internal: pending ops not initialized").unwrap();
+                let exc = v8::Exception::error($scope, msg);
+                $scope.throw_exception(exc);
+                return;
+            }
+        }
+    };
+}
+
+
 /// Install the `oam` namespace object onto the global.
 pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
     let global = context.global(scope);
@@ -91,13 +134,9 @@ pub(crate) fn spawn_op(
     let promise = resolver.get_promise(scope);
     let resolver = v8::Global::new(scope, resolver);
 
-    let id = scope
-        .get_slot_mut::<CoreRuntime>()
-        .expect("core runtime installed")
+    let id = core_runtime_mut!(scope)
         .spawn_op(op);
-    scope
-        .get_slot_mut::<PendingOps>()
-        .expect("pending ops installed")
+    pending_ops_mut!(scope)
         .park(id, resolver);
 
     rv.set(promise.into());
@@ -131,7 +170,7 @@ fn op_read_text_file(
     let path = path.to_rust_string_lossy(scope);
     // Permission gate: read access for this path.
     if let Err(msg) = scope
-        .get_slot::<crate::permissions::Permissions>()
+        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
         .unwrap_or_default()
         .check_read(&path)
@@ -179,7 +218,7 @@ fn op_fetch(
             .map(|u| u.hostname().to_string())
             .unwrap_or_default();
         if let Err(msg) = scope
-            .get_slot::<crate::permissions::Permissions>()
+            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
             .cloned()
             .unwrap_or_default()
             .check_net(&host)
@@ -197,9 +236,7 @@ fn op_fetch(
             return;
         }
     }
-    let core = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let client = core.http_client();
     let bodies = core.bodies();
     let ids = core.body_ids();
@@ -216,9 +253,7 @@ fn op_fetch_body_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bodies = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let bodies = core_runtime!(scope)
         .bodies();
     spawn_op(
         scope,
@@ -235,9 +270,7 @@ fn op_fetch_body_cancel(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bodies = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let bodies = core_runtime!(scope)
         .bodies();
     bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
 }
@@ -280,7 +313,7 @@ fn op_ws_connect(
             .map(|u| u.hostname().to_string())
             .unwrap_or_default();
         if let Err(msg) = scope
-            .get_slot::<crate::permissions::Permissions>()
+            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
             .cloned()
             .unwrap_or_default()
             .check_net(&host)
@@ -298,9 +331,7 @@ fn op_ws_connect(
             return;
         }
     }
-    let core = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let registry = core.ws();
     let ids = core.body_ids();
     spawn_op(
@@ -339,9 +370,7 @@ fn op_ws_send(
             .unwrap_or_default();
         tokio_tungstenite::tungstenite::Message::Text(text)
     };
-    let registry = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let registry = core_runtime!(scope)
         .ws();
     if let Err(msg) = oam_core::websocket::ws_send_sync(&registry, handle, message) {
         let msg_v8 = v8::String::new(scope, &msg).unwrap();
@@ -356,9 +385,7 @@ fn op_ws_recv(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let registry = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let registry = core_runtime!(scope)
         .ws();
     spawn_op(
         scope,
@@ -379,9 +406,7 @@ fn op_ws_close(
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
-    let registry = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let registry = core_runtime!(scope)
         .ws();
     spawn_op(
         scope,
@@ -396,9 +421,7 @@ fn op_ws_drop(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let registry = scope
-        .get_slot::<CoreRuntime>()
-        .expect("core runtime installed")
+    let registry = core_runtime!(scope)
         .ws();
     oam_core::websocket::ws_drop(&registry, handle);
 }

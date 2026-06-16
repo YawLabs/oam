@@ -89,7 +89,7 @@ impl JsRuntime {
         isolate.set_slot(napi::AddonRegistry::new());
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
-        isolate.set_slot(permissions::Permissions::from_opts(opts));
+        isolate.set_slot(std::sync::Arc::new(permissions::Permissions::from_opts(opts)));
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's default context: bootstrap.js is

@@ -304,6 +304,43 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     scope.throw_exception(exception);
 }
 
+/// Safely create a V8 string from a dynamic (possibly very large) Rust
+/// string. V8 rejects strings longer than ~1 GB; the fallback avoids a
+/// panic on the FFI boundary.
+#[allow(dead_code)]
+fn v8_string_or_fallback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    s: &str,
+) -> v8::Local<'s, v8::String> {
+    v8::String::new(scope, s)
+        .unwrap_or_else(|| v8::String::new(scope, "internal error").unwrap())
+}
+
+macro_rules! core_runtime {
+    ($scope:expr) => {
+        match $scope.get_slot::<oam_core::CoreRuntime>() {
+            Some(rt) => rt,
+            None => {
+                throw_type_error($scope, "internal: runtime not initialized");
+                return;
+            }
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! core_runtime_mut {
+    ($scope:expr) => {
+        match $scope.get_slot_mut::<oam_core::CoreRuntime>() {
+            Some(rt) => rt,
+            None => {
+                throw_type_error($scope, "internal: runtime not initialized");
+                return;
+            }
+        }
+    };
+}
+
 /// Throw an Error with Node's `.code` / `.syscall` / `.path` properties.
 fn throw_node_error(
     scope: &mut v8::PinScope<'_, '_>,
@@ -630,15 +667,6 @@ fn op_username(
 
 // ------------------------------------------------------------ http server
 
-fn http_state(
-    scope: &mut v8::PinScope<'_, '_>,
-) -> std::sync::Arc<oam_core::http_server::HttpState> {
-    scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
-        .http()
-}
-
 /// Headers travel as a JSON [[name, value], ...] string both directions.
 fn parse_headers_json(json: &str) -> Vec<(String, String)> {
     serde_json::from_str::<Vec<(String, String)>>(json).unwrap_or_default()
@@ -656,7 +684,7 @@ fn op_http_serve(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let state = http_state(scope);
+    let state = core_runtime!(scope).http();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -670,7 +698,7 @@ fn op_http_accept(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let state = http_state(scope);
+    let state = core_runtime!(scope).http();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -684,7 +712,7 @@ fn op_http_request_body(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bytes = http_state(scope).take_request_body(id).unwrap_or_default();
+    let bytes = core_runtime!(scope).http().take_request_body(id).unwrap_or_default();
     if let Some(value) = bytes_to_uint8array(scope, bytes) {
         rv.set(value);
     }
@@ -701,7 +729,7 @@ fn op_http_respond(
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
-    rv.set_bool(http_state(scope).respond_full(id, status, headers, body));
+    rv.set_bool(core_runtime!(scope).http().respond_full(id, status, headers, body));
 }
 
 fn op_http_respond_stream(
@@ -714,7 +742,7 @@ fn op_http_respond_stream(
     let headers = arg_string(scope, &args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
-    match http_state(scope).respond_stream(id, status, headers) {
+    match core_runtime!(scope).http().respond_stream(id, status, headers) {
         Some(stream_id) => rv.set_double(stream_id as f64),
         None => throw_type_error(scope, "request already responded or connection gone"),
     }
@@ -730,7 +758,7 @@ fn op_http_body_push(
         throw_type_error(scope, "httpBodyPush requires data");
         return;
     };
-    let state = http_state(scope);
+    let state = core_runtime!(scope).http();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -744,7 +772,7 @@ fn op_http_body_end(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    http_state(scope).end_stream(stream_id);
+    core_runtime!(scope).http().end_stream(stream_id);
 }
 
 fn op_http_close(
@@ -753,7 +781,7 @@ fn op_http_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    http_state(scope).close_server(server_id);
+    core_runtime!(scope).http().close_server(server_id);
 }
 
 // ----------------------------------------------------------------- HTTPS
@@ -777,7 +805,7 @@ fn op_https_serve(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let state = http_state(scope);
+    let state = core_runtime!(scope).http();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -801,9 +829,7 @@ fn op_tcp_connect(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -820,9 +846,7 @@ fn op_tcp_read(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let tcp = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tcp = core_runtime!(scope)
         .tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_read(tcp, handle, len));
 }
@@ -837,9 +861,7 @@ fn op_tcp_write(
         throw_type_error(scope, "tcpWrite requires data");
         return;
     };
-    let tcp = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tcp = core_runtime!(scope)
         .tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
 }
@@ -850,9 +872,7 @@ fn op_tcp_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tcp = core_runtime!(scope)
         .tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
 }
@@ -863,9 +883,7 @@ fn op_tcp_shutdown(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tcp = core_runtime!(scope)
         .tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
 }
@@ -884,9 +902,7 @@ fn op_tcp_listen(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -902,9 +918,7 @@ fn op_tcp_accept(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -920,9 +934,7 @@ fn op_tcp_server_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tcp = core_runtime!(scope)
         .tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
 }
@@ -948,9 +960,7 @@ fn op_tls_connect(
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let tls = core.tls();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -977,9 +987,7 @@ fn op_tls_read(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let tls = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tls = core_runtime!(scope)
         .tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_read(tls, handle, len));
 }
@@ -994,9 +1002,7 @@ fn op_tls_write(
         throw_type_error(scope, "tlsWrite requires data");
         return;
     };
-    let tls = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tls = core_runtime!(scope)
         .tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_write(tls, handle, data));
 }
@@ -1007,9 +1013,7 @@ fn op_tls_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tls = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tls = core_runtime!(scope)
         .tls();
     oam_core::tls::tls_close(&tls, handle);
 }
@@ -1020,9 +1024,7 @@ fn op_tls_shutdown(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tls = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let tls = core_runtime!(scope)
         .tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
 }
@@ -1103,9 +1105,7 @@ fn op_zlib_stream_create(
     let format = arg_string(scope, &args, 0).unwrap_or_default();
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
     let compress = args.get(2).is_true();
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -1128,9 +1128,7 @@ fn op_zlib_stream_write(
         throw_type_error(scope, "zlibStreamWrite requires data");
         return;
     };
-    let streams = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let streams = core_runtime!(scope)
         .zlib_streams();
     crate::ops::spawn_op(
         scope,
@@ -1148,9 +1146,7 @@ fn op_zlib_stream_flush(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let streams = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let streams = core_runtime!(scope)
         .zlib_streams();
     crate::ops::spawn_op(
         scope,
@@ -1168,9 +1164,7 @@ fn op_zlib_stream_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let streams = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let streams = core_runtime!(scope)
         .zlib_streams();
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
@@ -1185,9 +1179,7 @@ fn op_zlib_handle_create(
 ) {
     let mode = args.get(0).int32_value(scope).unwrap_or(0);
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
     match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level) {
@@ -1216,9 +1208,7 @@ fn op_zlib_handle_write_sync(
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
     let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
 
-    let streams = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let streams = core_runtime!(scope)
         .zlib_streams();
 
     let mut output = vec![0u8; out_len];
@@ -2120,9 +2110,7 @@ fn op_fs_open(
     } else if !check_read_perm(scope, &path) {
         return;
     }
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let files = core.files();
     let ids = core.body_ids();
     crate::ops::spawn_op(
@@ -2139,9 +2127,7 @@ fn op_fs_read_chunk(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let files = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let files = core_runtime!(scope)
         .files();
     crate::ops::spawn_op(
         scope,
@@ -2160,9 +2146,7 @@ fn op_fs_write_chunk(
         throw_type_error(scope, "fsWriteChunk requires data");
         return;
     };
-    let files = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let files = core_runtime!(scope)
         .files();
     crate::ops::spawn_op(
         scope,
@@ -2178,9 +2162,7 @@ fn op_fs_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let files = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let files = core_runtime!(scope)
         .files();
     let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
     // If the File is in flight (removed by a chunk op for its IO await),
@@ -2208,11 +2190,9 @@ fn throw_permission_denied(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     scope.throw_exception(exception);
 }
 
-/// Get a clone of the current `Permissions` slot, or an all-granted default.
-/// Clone is cheap (three enum variants, no heap except for List paths).
-fn get_permissions(scope: &v8::PinScope<'_, '_>) -> crate::permissions::Permissions {
+fn get_permissions(scope: &v8::PinScope<'_, '_>) -> std::sync::Arc<crate::permissions::Permissions> {
     scope
-        .get_slot::<crate::permissions::Permissions>()
+        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
         .unwrap_or_default()
 }
@@ -2297,9 +2277,7 @@ fn op_worker_new(
         return;
     }
 
-    let core = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed");
+    let core = core_runtime!(scope);
     let workers = core.workers();
 
     let worker_id = workers.lock().unwrap_or_else(|e| e.into_inner()).next_id();
@@ -2348,9 +2326,7 @@ fn op_worker_post_message(
         throw_type_error(scope, "workerPostMessage requires data");
         return;
     };
-    let workers = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let workers = core_runtime!(scope)
         .workers();
     if let Err(msg) = oam_core::worker::parent_post(&workers, worker_id, json.into_bytes()) {
         let msg_v8 = v8::String::new(scope, &msg).unwrap();
@@ -2365,9 +2341,7 @@ fn op_worker_recv_message(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let workers = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let workers = core_runtime!(scope)
         .workers();
     crate::ops::spawn_op(
         scope,
@@ -2382,9 +2356,7 @@ fn op_worker_terminate(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let workers = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let workers = core_runtime!(scope)
         .workers();
     oam_core::worker::parent_terminate(&workers, worker_id);
 }
@@ -2711,13 +2683,9 @@ fn op_spawn_async(
         Some(pairs)
     });
 
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
-    let ids = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let ids = core_runtime!(scope)
         .body_ids();
 
     let children2 = children.clone();
@@ -2743,9 +2711,7 @@ fn op_spawn_kill(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cp) = guard.get_mut(&handle) {
@@ -2759,9 +2725,7 @@ fn op_spawn_read_stdout(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     crate::ops::spawn_op(
         scope,
@@ -2776,9 +2740,7 @@ fn op_spawn_read_stderr(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     crate::ops::spawn_op(
         scope,
@@ -2797,9 +2759,7 @@ fn op_spawn_write(
         throw_type_error(scope, "spawnWrite: data required");
         return;
     };
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     crate::ops::spawn_op(
         scope,
@@ -2814,9 +2774,7 @@ fn op_spawn_wait(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     crate::ops::spawn_op(
         scope,
@@ -3548,9 +3506,7 @@ fn op_process_kill(
     let signal = args.get(1).number_value(scope).unwrap_or(15.0) as i32;
 
     // Only child processes of this runtime should be killable.
-    let children = scope
-        .get_slot::<oam_core::CoreRuntime>()
-        .expect("core runtime installed")
+    let children = core_runtime!(scope)
         .children();
     let is_own_child = children
         .lock()

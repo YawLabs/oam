@@ -7248,13 +7248,19 @@
           this.rawHeaders.push(name, value);
         }
         this.socket = { remoteAddress: "127.0.0.1", encrypted: false };
-        const body = natives.httpRequestBody(meta.requestId);
-        if (body.length > 0) {
-          this.push(new globalThis.Buffer(body.buffer, body.byteOffset, body.length));
-        }
-        this.push(null);
+        this._requestId = meta.requestId;
+        this._bodyPushed = false;
       }
-      _read() {}
+      _read() {
+        if (!this._bodyPushed) {
+          this._bodyPushed = true;
+          const body = natives.httpRequestBody(this._requestId);
+          if (body.length > 0) {
+            this.push(new globalThis.Buffer(body.buffer, body.byteOffset, body.length));
+          }
+          this.push(null);
+        }
+      }
     }
 
     class ServerResponse extends EventEmitter {
@@ -9561,7 +9567,24 @@
         this.SCHED_RR = 2;
         this.schedulingPolicy = this.SCHED_RR;
       }
-      fork() { throw new Error("cluster.fork is not implemented in oam"); }
+      fork(_env) {
+        const worker = new EventEmitter();
+        worker.id = Object.keys(this.workers).length + 1;
+        worker.process = { pid: 0, kill() {} };
+        worker.isDead = () => true;
+        worker.isConnected = () => false;
+        worker.send = function () { return false; };
+        worker.kill = function () {};
+        worker.disconnect = function () {};
+        this.workers[worker.id] = worker;
+        process.nextTick(() =>
+          worker.emit(
+            "error",
+            new Error("cluster.fork is not implemented in oam"),
+          ),
+        );
+        return worker;
+      }
       setupMaster() {}
       setupPrimary() {}
       disconnect(cb) { if (typeof cb === "function") queueMicrotask(cb); }
@@ -9571,14 +9594,41 @@
 
   // ------------------------------------------------------------------ dgram
   registry.factories.dgram = () => {
-    function notImpl(name) {
-      return () => {
-        throw new Error(
-          `dgram.${name} is not implemented in oam -- UDP sockets land with a later wave`,
+    const EventEmitter = registry.get("events");
+    function createSocket(_type, _callback) {
+      const socket = new EventEmitter();
+      socket.bind = function () {
+        process.nextTick(() =>
+          socket.emit("error", new Error("dgram is not implemented in oam")),
         );
+        return socket;
       };
+      socket.send = function () {
+        const cb = arguments[arguments.length - 1];
+        if (typeof cb === "function")
+          cb(new Error("dgram.send is not implemented in oam"));
+      };
+      socket.close = function (cb) {
+        if (typeof cb === "function") cb();
+      };
+      socket.address = function () {
+        return { address: "0.0.0.0", family: "IPv4", port: 0 };
+      };
+      socket.addMembership = function () {};
+      socket.dropMembership = function () {};
+      socket.setBroadcast = function () {};
+      socket.setMulticastLoopback = function () {};
+      socket.setMulticastTTL = function () {};
+      socket.setTTL = function () {};
+      socket.ref = function () {
+        return socket;
+      };
+      socket.unref = function () {
+        return socket;
+      };
+      return socket;
     }
-    return { createSocket: notImpl("createSocket") };
+    return { createSocket };
   };
 
   // -------------------------------------------------------------------- dns
@@ -9827,17 +9877,45 @@
 
   // ------------------------------------------------------------------ http2
   registry.factories.http2 = () => {
-    function notImpl(name) {
-      return () => {
-        throw new Error(
-          `http2.${name} is not implemented in oam -- HTTP/2 lands with a later wave`,
+    const EventEmitter = registry.get("events");
+    function createServer(_options, _handler) {
+      const server = new EventEmitter();
+      server.listen = function () {
+        process.nextTick(() =>
+          server.emit(
+            "error",
+            new Error("http2.createServer is not implemented in oam"),
+          ),
         );
+        return server;
       };
+      server.close = function (cb) {
+        if (typeof cb === "function") cb();
+        return server;
+      };
+      return server;
+    }
+    function createSecureServer(_options, _handler) {
+      return createServer(_options, _handler);
+    }
+    function connect(_authority, _options) {
+      const session = new EventEmitter();
+      session.close = function () {};
+      session.destroy = function () {};
+      session.ref = function () { return session; };
+      session.unref = function () { return session; };
+      process.nextTick(() =>
+        session.emit(
+          "error",
+          new Error("http2.connect is not implemented in oam"),
+        ),
+      );
+      return session;
     }
     return {
-      createServer: notImpl("createServer"),
-      createSecureServer: notImpl("createSecureServer"),
-      connect: notImpl("connect"),
+      createServer,
+      createSecureServer,
+      connect,
       constants: {
         NGHTTP2_SESSION_SERVER: 0,
         NGHTTP2_SESSION_CLIENT: 1,
@@ -9989,10 +10067,25 @@
       return Object.assign({}, options);
     }
 
-    function createServer() {
-      throw new Error(
-        "tls.createServer is not yet implemented in oam -- use https.createServer for HTTPS servers",
-      );
+    function createServer(_options, _requestListener) {
+      const server = new EventEmitter();
+      server.listen = function () {
+        process.nextTick(() =>
+          server.emit(
+            "error",
+            new Error("tls.createServer is not yet implemented in oam -- use https.createServer"),
+          ),
+        );
+        return server;
+      };
+      server.close = function (cb) {
+        if (typeof cb === "function") cb();
+        return server;
+      };
+      server.address = function () {
+        return null;
+      };
+      return server;
     }
 
     return {

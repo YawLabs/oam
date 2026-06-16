@@ -635,7 +635,11 @@
       url: wellFormed(input),
       method: init.method ? String(init.method).toUpperCase() : "GET",
       headers,
-      body: init.body == null ? null : wellFormed(init.body),
+      body: init.body == null
+        ? null
+        : init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)
+          ? new TextDecoder().decode(init.body)
+          : wellFormed(init.body),
     };
     const op = globalThis.__oam
       .fetch(JSON.stringify(request))
