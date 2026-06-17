@@ -63,7 +63,6 @@ macro_rules! pending_ops_mut {
     };
 }
 
-
 /// Install the `oam` namespace object onto the global.
 pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) {
     let global = context.global(scope);
@@ -134,10 +133,8 @@ pub(crate) fn spawn_op(
     let promise = resolver.get_promise(scope);
     let resolver = v8::Global::new(scope, resolver);
 
-    let id = core_runtime_mut!(scope)
-        .spawn_op(op);
-    pending_ops_mut!(scope)
-        .park(id, resolver);
+    let id = core_runtime_mut!(scope).spawn_op(op);
+    pending_ops_mut!(scope).park(id, resolver);
 
     rv.set(promise.into());
 }
@@ -253,8 +250,7 @@ fn op_fetch_body_read(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bodies = core_runtime!(scope)
-        .bodies();
+    let bodies = core_runtime!(scope).bodies();
     spawn_op(
         scope,
         &mut rv,
@@ -270,9 +266,11 @@ fn op_fetch_body_cancel(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bodies = core_runtime!(scope)
-        .bodies();
-    bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
+    let bodies = core_runtime!(scope).bodies();
+    bodies
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
 }
 
 fn op_ws_connect(
@@ -370,8 +368,7 @@ fn op_ws_send(
             .unwrap_or_default();
         tokio_tungstenite::tungstenite::Message::Text(text)
     };
-    let registry = core_runtime!(scope)
-        .ws();
+    let registry = core_runtime!(scope).ws();
     if let Err(msg) = oam_core::websocket::ws_send_sync(&registry, handle, message) {
         let msg_v8 = v8::String::new(scope, &msg).unwrap();
         let exception = v8::Exception::error(scope, msg_v8);
@@ -385,8 +382,7 @@ fn op_ws_recv(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let registry = core_runtime!(scope)
-        .ws();
+    let registry = core_runtime!(scope).ws();
     spawn_op(
         scope,
         &mut rv,
@@ -406,8 +402,7 @@ fn op_ws_close(
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
-    let registry = core_runtime!(scope)
-        .ws();
+    let registry = core_runtime!(scope).ws();
     spawn_op(
         scope,
         &mut rv,
@@ -421,8 +416,7 @@ fn op_ws_drop(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let registry = core_runtime!(scope)
-        .ws();
+    let registry = core_runtime!(scope).ws();
     oam_core::websocket::ws_drop(&registry, handle);
 }
 

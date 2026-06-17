@@ -151,7 +151,11 @@ pub async fn ws_recv(registry: WsRegistry, handle: u64) -> OpOutcome {
 
     let frame = rx.recv().await;
 
-    if let Some(conn) = registry.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&handle) {
+    if let Some(conn) = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&handle)
+    {
         conn.inbound = Some(rx);
     }
 
@@ -184,5 +188,8 @@ pub async fn ws_close(registry: WsRegistry, handle: u64, code: u16, reason: Stri
 }
 
 pub fn ws_drop(registry: &WsRegistry, handle: u64) {
-    registry.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
 }

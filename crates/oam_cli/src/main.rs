@@ -233,9 +233,7 @@ fn main() -> ExitCode {
                 run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
             }
         }
-        Command::Install { frozen_lockfile } => {
-            install_command(*frozen_lockfile, cli.json)
-        }
+        Command::Install { frozen_lockfile } => install_command(*frozen_lockfile, cli.json),
         Command::Compile {
             entry,
             output,
@@ -1240,7 +1238,6 @@ fn run_file(
     result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
 }
 
-
 // -- oam compile: embed a pre-bundled JS file into a standalone binary --
 
 /// 8-byte magic trailer written after the JS payload + length.
@@ -1423,7 +1420,10 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
     let mut out_file = match std::fs::OpenOptions::new().append(true).open(output) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("oam compile: could not open {} for append: {e}", output.display());
+            eprintln!(
+                "oam compile: could not open {} for append: {e}",
+                output.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -1439,8 +1439,7 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let out_abs = std::path::absolute(output)
-        .unwrap_or_else(|_| output.to_path_buf());
+    let out_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
     eprintln!(
         "oam compile: {} ({} bytes JS) -> {}",
         entry.display(),

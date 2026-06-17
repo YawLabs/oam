@@ -244,20 +244,17 @@ impl CoreRuntime {
             .as_ref()
             .expect("runtime alive")
             .spawn(async move {
-                let outcome =
-                    match std::panic::AssertUnwindSafe(op).catch_unwind().await {
-                        Ok(outcome) => outcome,
-                        Err(payload) => {
-                            let msg = payload
-                                .downcast_ref::<&str>()
-                                .copied()
-                                .or_else(|| {
-                                    payload.downcast_ref::<String>().map(|s| s.as_str())
-                                })
-                                .unwrap_or("internal panic in async op");
-                            OpOutcome::Failed(format!("panic: {msg}"))
-                        }
-                    };
+                let outcome = match std::panic::AssertUnwindSafe(op).catch_unwind().await {
+                    Ok(outcome) => outcome,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                            .unwrap_or("internal panic in async op");
+                        OpOutcome::Failed(format!("panic: {msg}"))
+                    }
+                };
                 let _ = tx.send(OpCompletion { id, outcome });
             });
         id
@@ -1360,9 +1357,7 @@ pub mod ops {
                 };
                 super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
             }
-            2 | 6 => {
-                super::ZlibStream::HandleDecompress(flate2::Decompress::new(zlib_header))
-            }
+            2 | 6 => super::ZlibStream::HandleDecompress(flate2::Decompress::new(zlib_header)),
             _ => return Err(format!("zlib handle: unknown mode {mode}")),
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1557,7 +1552,10 @@ pub mod ops {
     /// (handle dropped). Remove-await-reinsert keeps the lock short; the
     /// JS ReadableStream lock guarantees a single reader per handle.
     pub async fn fetch_body_read(bodies: super::BodyRegistry, handle: u64) -> OpOutcome {
-        let response = bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle);
+        let response = bodies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle);
         let Some(mut response) = response else {
             return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
         };

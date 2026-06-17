@@ -264,8 +264,8 @@ fn resolve_subpath_import(
             ),
         ));
     };
-    let target = exports_resolve(imports, specifier, mode.conditions()).map_err(
-        |reason| match reason {
+    let target =
+        exports_resolve(imports, specifier, mode.conditions()).map_err(|reason| match reason {
             ExportsError::NotExported => diag(
                 "OAM-MOD0007",
                 format!(
@@ -280,8 +280,7 @@ fn resolve_subpath_import(
                     pkg_dir.display()
                 ),
             ),
-        },
-    )?;
+        })?;
     // Per spec: a target starting with './' is package-relative; anything else
     // is a bare specifier resolved as a regular import from the package root.
     if let Some(rel) = target.strip_prefix("./") {
@@ -750,11 +749,7 @@ fn exports_resolve(
     // shapes route through this same function; the subpath shape (specifier
     // vs '.') matches the key shape.
     let as_map = match exports {
-        Value::Object(map)
-            if map
-                .keys()
-                .any(|k| k.starts_with('.') || k.starts_with('#')) =>
-        {
+        Value::Object(map) if map.keys().any(|k| k.starts_with('.') || k.starts_with('#')) => {
             Some(map)
         }
         _ => None,
@@ -900,12 +895,16 @@ mod tests {
         });
         // Exact key.
         assert_eq!(
-            exports_resolve(&imports, "#ansi-styles", IMPORT).ok().unwrap(),
+            exports_resolve(&imports, "#ansi-styles", IMPORT)
+                .ok()
+                .unwrap(),
             "./source/vendor/ansi-styles/index.js"
         );
         // Wildcard subpath.
         assert_eq!(
-            exports_resolve(&imports, "#deep/feature", IMPORT).ok().unwrap(),
+            exports_resolve(&imports, "#deep/feature", IMPORT)
+                .ok()
+                .unwrap(),
             "./src/deep/feature.js"
         );
         // Conditions branch (import vs require).
@@ -970,7 +969,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CNT: AtomicU64 = AtomicU64::new(0);
         let id = CNT.fetch_add(1, Ordering::Relaxed);
-        let pkg = std::env::temp_dir().join(format!("oam-subpath-noimp-{}-{}", std::process::id(), id));
+        let pkg =
+            std::env::temp_dir().join(format!("oam-subpath-noimp-{}-{}", std::process::id(), id));
         let _ = std::fs::remove_dir_all(&pkg);
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(

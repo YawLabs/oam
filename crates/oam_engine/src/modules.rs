@@ -1144,9 +1144,7 @@ fn dyn_import_load(
     }
 
     let module = {
-        let map = tc
-            .get_slot::<ModuleMap>()
-            .expect("module map installed");
+        let map = tc.get_slot::<ModuleMap>().expect("module map installed");
         match map.by_path.get(&resolved) {
             Some(global) => v8::Local::new(tc, global),
             None => {
@@ -1165,7 +1163,9 @@ fn dyn_import_load(
     {
         return match dyn_caught_value(tc) {
             Some(v) => DynResult::Rejected(v),
-            None => DynResult::Error(format!("oam: dynamic import('{spec}'): instantiation failed")),
+            None => DynResult::Error(format!(
+                "oam: dynamic import('{spec}'): instantiation failed"
+            )),
         };
     }
     if module.get_status() == v8::ModuleStatus::Errored {
@@ -1290,7 +1290,11 @@ pub(crate) fn dynamic_import_callback<'s>(
                 .first()
                 .map(|d| format!("{}: {}", d.code, d.message))
                 .unwrap_or_else(|| format!("cannot resolve '{spec}'"));
-            reject_with_message(scope, &resolver, &format!("oam: dynamic import('{spec}'): {msg}"));
+            reject_with_message(
+                scope,
+                &resolver,
+                &format!("oam: dynamic import('{spec}'): {msg}"),
+            );
             return Some(promise);
         }
     };

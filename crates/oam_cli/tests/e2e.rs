@@ -2604,7 +2604,11 @@ fn dynamic_import_loads_modules_and_rejects_missing() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("builtin true"), "{stdout}");
     assert!(stdout.contains("named true default true"), "{stdout}");
     assert!(stdout.contains("missing true"), "{stdout}");
@@ -2630,7 +2634,11 @@ fn dynamic_import_cjs_facade_and_cache_identity() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("answer true"), "{stdout}");
     assert!(stdout.contains("name true"), "{stdout}");
     assert!(stdout.contains("identity true"), "{stdout}");
@@ -2653,7 +2661,11 @@ fn dynamic_import_propagates_top_level_throw() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("caught true"), "{stdout}");
 }
 
@@ -2681,7 +2693,11 @@ fn dynamic_import_works_from_timer_callback() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("result from-timer"), "{stdout}");
 }
 
@@ -2690,10 +2706,7 @@ fn dynamic_import_works_from_timer_callback() {
 // unsupported type value (other than "json") errors before resolve runs.
 #[test]
 fn dynamic_import_attributes_match_static_path() {
-    write_temp(
-        "dynimp_attrs/notjson.mjs",
-        "export const x = 1;\n",
-    );
+    write_temp("dynimp_attrs/notjson.mjs", "export const x = 1;\n");
     let main = write_temp(
         "dynimp_attrs/main.mjs",
         "let badType = 'NO-THROW';\n\
@@ -2708,7 +2721,11 @@ fn dynamic_import_attributes_match_static_path() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("type_other rejected"), "{stdout}");
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
@@ -2747,7 +2764,11 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("a_fromA true"), "{stdout}");
     assert!(stdout.contains("a_after true"), "{stdout}");
     assert!(stdout.contains("b_sawFromA true"), "{stdout}");
@@ -2790,13 +2811,18 @@ fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
     // test body throws if the rejection message regresses, so exit success
     // already implies the host slot was cleared. The stdout console.log is a
     // direct visibility check.
-    assert!(out.status.success(), "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>",
+        out.status
+    );
     assert!(
         stdout.contains("not wired up on this entry path"),
         "expected the test body to log the new rejection message: stdout=<<{stdout}>>"
     );
     assert!(
-        stderr.contains("1 passed") || stderr.contains("ok") && stderr.contains("cleared host slot"),
+        stderr.contains("1 passed")
+            || stderr.contains("ok") && stderr.contains("cleared host slot"),
         "expected the test runner to record 1 passed: stderr=<<{stderr}>>"
     );
 }
@@ -2842,7 +2868,11 @@ fn undici_shim_request_stream_fetch_over_http() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("get true"), "{stdout}");
     assert!(stdout.contains("post true"), "{stdout}");
     assert!(stdout.contains("stream true"), "{stdout}");
@@ -2879,7 +2909,11 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     // Pin honored: connected to 127.0.0.1 with Host: example.invalid preserved.
     assert!(
         stdout.contains("pin=200:pinned:example.invalid:"),
@@ -9584,20 +9618,11 @@ server.close();
         output.status.success(),
         "test failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(
-        stdout.contains("server_encrypted=true"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("client_encrypted=true"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("server_encrypted=true"), "stdout: {stdout}");
+    assert!(stdout.contains("client_encrypted=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_echo=true"), "stdout: {stdout}");
     assert!(stdout.contains("has_Server=true"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("has_createServer=true"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("has_createServer=true"), "stdout: {stdout}");
 }
 
 #[test]
@@ -9694,7 +9719,11 @@ if (cluster.isPrimary) {
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("worker_exited=true"), "{stdout}");
     assert!(stdout.contains("is_dead=true"), "{stdout}");
     assert!(stdout.contains("exit_signal=SIGTERM"), "{stdout}");
@@ -9717,7 +9746,11 @@ if (cluster.isPrimary) {
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("exit_code=3"), "{stdout}");
 }
 
@@ -9738,7 +9771,11 @@ setTimeout(() => { console.log('done'); process.exit(0); }, 1500);
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("cp_error=true"), "{stdout}");
     assert!(stdout.contains("stdin_settled=true"), "{stdout}");
 }
@@ -9763,7 +9800,11 @@ cp.on('close', (code) => {
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("deferred-stdin"), "{stdout}");
     assert!(stdout.contains("code=0"), "{stdout}");
 }
@@ -9815,7 +9856,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("body=hello world"), "{stdout}");
     assert!(stdout.contains("cookies_is_array=true"), "{stdout}");
     assert!(stdout.contains("cookie_count=2"), "{stdout}");
@@ -9878,7 +9923,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("echoed_body=payload-123"), "{stdout}");
     assert!(stdout.contains("host_count=1"), "{stdout}");
 }
@@ -9912,7 +9961,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("errored=true"), "{stdout}");
 }
 
@@ -9952,7 +10005,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("a_ok=true"), "{stdout}");
     assert!(stdout.contains("b_ok=true"), "{stdout}");
     assert!(stdout.contains("d_ok=true"), "{stdout}");
@@ -9981,7 +10038,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("client_error_fired=true"), "{stdout}");
     assert!(stdout.contains("still_listening=true"), "{stdout}");
 }
@@ -10022,9 +10083,19 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
-    assert!(stdout.contains("result=error:"), "expected an error, got: {stdout}");
-    assert!(stdout.contains(expect_code), "expected code {expect_code}, got: {stdout}");
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("result=error:"),
+        "expected an error, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(expect_code),
+        "expected code {expect_code}, got: {stdout}"
+    );
 }
 
 // bug-fix coverage: a Content-Length body the peer truncates must error, not
@@ -10075,7 +10146,11 @@ setTimeout(() => { console.log('timeout'); process.exit(1); }, 5000);
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("exit_signal=SIGTERM"), "{stdout}");
 }
 
@@ -10110,7 +10185,11 @@ server.close();
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("piped=echo:piped-hello"), "{stdout}");
 }
 
@@ -10133,7 +10212,11 @@ if (cluster.isPrimary) {
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("killed_via_pending=true"), "{stdout}");
 }
 
@@ -10169,7 +10252,11 @@ process.exit(0);
     let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("ended=true"), "{stdout}");
 }
 
@@ -11588,7 +11675,10 @@ fn install_parses_empty_lockfile_v3() {
 
 #[test]
 fn compile_produces_standalone_binary_that_runs() {
-    let entry = write_temp("compile_hello.js", "console.log('hello from compiled oam');");
+    let entry = write_temp(
+        "compile_hello.js",
+        "console.log('hello from compiled oam');",
+    );
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11666,7 +11756,12 @@ fn compile_binary_passes_script_args() {
 #[test]
 fn compile_missing_entry_fails() {
     let output = std::env::temp_dir().join("oam-compile-missing-output.exe");
-    let out = oam(&["compile", "/nonexistent/file.js", "--output", output.to_str().unwrap()]);
+    let out = oam(&[
+        "compile",
+        "/nonexistent/file.js",
+        "--output",
+        output.to_str().unwrap(),
+    ]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -11965,14 +12060,16 @@ server.bind(0, '127.0.0.1', () => {
 "#;
     let stdout = run_ok("dgram_udp_roundtrip.mjs", source);
     let lines: Vec<&str> = stdout.lines().collect();
-    let kv: std::collections::HashMap<&str, &str> = lines
-        .iter()
-        .filter_map(|l| l.split_once(':'))
-        .collect();
+    let kv: std::collections::HashMap<&str, &str> =
+        lines.iter().filter_map(|l| l.split_once(':')).collect();
 
     assert_eq!(kv.get("bound"), Some(&"true"), "server bound");
     assert_eq!(kv.get("family"), Some(&"IPv4"), "family is IPv4");
-    assert_eq!(kv.get("recv"), Some(&"hello udp"), "server received message");
+    assert_eq!(
+        kv.get("recv"),
+        Some(&"hello udp"),
+        "server received message"
+    );
     assert_eq!(kv.get("rinfo_addr"), Some(&"127.0.0.1"), "rinfo address");
     assert_eq!(kv.get("rinfo_size"), Some(&"9"), "rinfo size");
     assert_eq!(kv.get("sent_err"), Some(&"null"), "send had no error");
@@ -12047,8 +12144,14 @@ fn cluster_is_primary_and_fork() {
            process.exit(0);\n\
          }",
     );
-    assert!(stdout.contains("worker_running: true"), "worker should run: {stdout}");
-    assert!(stdout.contains("worker_exited: true"), "worker should exit: {stdout}");
+    assert!(
+        stdout.contains("worker_running: true"),
+        "worker should run: {stdout}"
+    );
+    assert!(
+        stdout.contains("worker_exited: true"),
+        "worker should exit: {stdout}"
+    );
 }
 
 #[test]
@@ -12067,8 +12170,14 @@ fn cluster_worker_exit_event() {
            process.exit(0);\n\
          }",
     );
-    assert!(stdout.contains("cluster_exit_event: true"), "cluster exit event: {stdout}");
-    assert!(stdout.contains("worker_match: true"), "worker match: {stdout}");
+    assert!(
+        stdout.contains("cluster_exit_event: true"),
+        "cluster exit event: {stdout}"
+    );
+    assert!(
+        stdout.contains("worker_match: true"),
+        "worker match: {stdout}"
+    );
 }
 
 #[test]
@@ -12137,26 +12246,14 @@ fn http_upgrade_event_fires_with_socket() {
          console.log('got_body:', data.includes('hello from upgrade'));\n\
          server.close();",
     );
-    assert!(
-        stdout.contains("upgrade_url: /ws-test"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("upgrade_url: /ws-test"), "stdout: {stdout}");
     assert!(
         stdout.contains("upgrade_hdr: websocket"),
         "stdout: {stdout}"
     );
-    assert!(
-        stdout.contains("has_socket: true"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("got_101: true"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("got_body: true"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("has_socket: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_101: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_body: true"), "stdout: {stdout}");
 }
 
 // ------------------------------------------------- fs stream e2e tests
@@ -12267,12 +12364,7 @@ rs.on('error', (err) => {
 });"#,
     );
 
-    let out = oam(&[
-        "run",
-        script.to_str().unwrap(),
-        "--",
-        src.to_str().unwrap(),
-    ]);
+    let out = oam(&["run", script.to_str().unwrap(), "--", src.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -12322,12 +12414,7 @@ rs.on('error', (err) => {
 });"#,
     );
 
-    let out = oam(&[
-        "run",
-        script.to_str().unwrap(),
-        "--",
-        src.to_str().unwrap(),
-    ]);
+    let out = oam(&["run", script.to_str().unwrap(), "--", src.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -12381,18 +12468,9 @@ req.on('upgrade', (res, socket, head) => {
 });
 req.end();"#,
     );
-    assert!(
-        stdout.contains("got_upgrade: true"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("status_101: true"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("got_payload: true"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("got_upgrade: true"), "stdout: {stdout}");
+    assert!(stdout.contains("status_101: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_payload: true"), "stdout: {stdout}");
 }
 
 #[test]

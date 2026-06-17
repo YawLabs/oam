@@ -2010,22 +2010,34 @@ fn crypto_sign_rsa_pss(
         "sha256" => {
             let signing_key =
                 BlindedSigningKey::<sha2::Sha256>::new_with_salt_len(priv_key, salt_length);
-            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+            Ok(signing_key
+                .sign_with_rng(&mut rng, data)
+                .to_bytes()
+                .to_vec())
         }
         "sha384" => {
             let signing_key =
                 BlindedSigningKey::<sha2::Sha384>::new_with_salt_len(priv_key, salt_length);
-            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+            Ok(signing_key
+                .sign_with_rng(&mut rng, data)
+                .to_bytes()
+                .to_vec())
         }
         "sha512" => {
             let signing_key =
                 BlindedSigningKey::<sha2::Sha512>::new_with_salt_len(priv_key, salt_length);
-            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+            Ok(signing_key
+                .sign_with_rng(&mut rng, data)
+                .to_bytes()
+                .to_vec())
         }
         "sha1" => {
             let signing_key =
                 BlindedSigningKey::<sha1::Sha1>::new_with_salt_len(priv_key, salt_length);
-            Ok(signing_key.sign_with_rng(&mut rng, data).to_bytes().to_vec())
+            Ok(signing_key
+                .sign_with_rng(&mut rng, data)
+                .to_bytes()
+                .to_vec())
         }
         _ => Err(format!("unsupported RSA-PSS hash: '{algo}'")),
     }

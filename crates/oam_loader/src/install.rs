@@ -378,12 +378,13 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
     // the next install run will retry from scratch instead of seeing a
     // half-written package whose package.json exists (the idempotency
     // shortcut in install() trusts package.json presence).
-    let parent = dest.parent().ok_or_else(|| {
-        format!("extract destination has no parent dir: {}", dest.display())
-    })?;
-    let base = dest.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        format!("extract destination has no file name: {}", dest.display())
-    })?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("extract destination has no parent dir: {}", dest.display()))?;
+    let base = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("extract destination has no file name: {}", dest.display()))?;
     // Per-process unique tempdir suffix. We can't randomize across processes
     // without a syscall, but combining pid + a monotonic counter is enough to
     // avoid collisions WITHIN this process. A racing sibling process picks a
@@ -401,9 +402,8 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
     // would be unusual but possible; clean it first so create_dir_all below
     // works on a fresh tree.
     let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| {
-        format!("create extract tempdir {}: {e}", tmp.display())
-    })?;
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| format!("create extract tempdir {}: {e}", tmp.display()))?;
 
     let result = extract_into(data, &tmp);
     match result {
@@ -435,7 +435,11 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
                     if dest.join("package.json").is_file() {
                         Ok(())
                     } else {
-                        Err(format!("rename {} -> {}: {e}", tmp.display(), dest.display()))
+                        Err(format!(
+                            "rename {} -> {}: {e}",
+                            tmp.display(),
+                            dest.display()
+                        ))
                     }
                 }
             }

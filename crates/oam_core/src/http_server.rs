@@ -112,7 +112,10 @@ impl HttpState {
 
     /// Sync (isolate-thread) helpers consumed by the engine natives.
     pub fn take_request_body(&self, id: u64) -> Option<Vec<u8>> {
-        self.bodies.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+        self.bodies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
     }
 
     pub fn respond_full(
@@ -122,7 +125,12 @@ impl HttpState {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> bool {
-        let Some(responder) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else {
+        let Some(responder) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        else {
             return false;
         };
         responder
@@ -291,13 +299,17 @@ pub async fn http_serve(
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    state.servers.lock().unwrap_or_else(|e| e.into_inner()).insert(
-        server_id,
-        ServerEntry {
-            queue: Some(queue_rx),
-            shutdown: Some(shutdown_tx),
-        },
-    );
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+            },
+        );
 
     let accept_state = state.clone();
     let accept_tcp = tcp;
@@ -617,13 +629,17 @@ pub async fn https_serve(
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    state.servers.lock().unwrap_or_else(|e| e.into_inner()).insert(
-        server_id,
-        ServerEntry {
-            queue: Some(queue_rx),
-            shutdown: Some(shutdown_tx),
-        },
-    );
+    state
+        .servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            server_id,
+            ServerEntry {
+                queue: Some(queue_rx),
+                shutdown: Some(shutdown_tx),
+            },
+        );
 
     let accept_state = state.clone();
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -740,11 +756,7 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// connection preface it runs through hyper's http2 builder, otherwise it
 /// falls back to the http1 builder. This matches Node's `http2.createServer()`
 /// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
-pub async fn http2_serve(
-    state: Arc<HttpState>,
-    host: String,
-    port: u16,
-) -> super::OpOutcome {
+pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
