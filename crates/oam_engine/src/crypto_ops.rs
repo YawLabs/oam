@@ -906,10 +906,10 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
 
 fn pem_label(pem: &str) -> &str {
     for line in pem.lines() {
-        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
-            if let Some(label) = rest.strip_suffix("-----") {
-                return label.trim();
-            }
+        if let Some(rest) = line.strip_prefix("-----BEGIN ")
+            && let Some(label) = rest.strip_suffix("-----")
+        {
+            return label.trim();
         }
     }
     ""
@@ -1153,7 +1153,7 @@ pub(crate) fn op_crypto_generate_keypair(
         "ed25519" => crypto_generate_ed25519(),
         "rsa" => {
             let bits = args.get(1).number_value(scope).unwrap_or(2048.0) as usize;
-            if bits < 512 || bits > 16384 {
+            if !(512..=16384).contains(&bits) {
                 crate::node_ops::throw_type_error(
                     scope,
                     "generateKeyPairSync: modulusLength must be between 512 and 16384",
@@ -1398,7 +1398,7 @@ fn crypto_private_encrypt(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String>
     let priv_key = parse_rsa_private_key(&der, label)?;
     let n = priv_key.n();
     let d = priv_key.d();
-    let key_len = (n.bits() as usize + 7) / 8;
+    let key_len = n.bits().div_ceil(8);
     if data.len() + 11 > key_len {
         return Err("privateEncrypt: data too large for key size".into());
     }
@@ -1425,7 +1425,7 @@ fn crypto_public_decrypt(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> 
         let sk = parse_rsa_private_key(&der, label)?;
         (sk.n().clone(), sk.e().clone())
     };
-    let key_len = (n.bits() as usize + 7) / 8;
+    let key_len = n.bits().div_ceil(8);
     if data.len() != key_len {
         return Err(format!("publicDecrypt: input must be {} bytes", key_len));
     }
@@ -1436,12 +1436,12 @@ fn crypto_public_decrypt(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> 
         return Err("publicDecrypt: invalid PKCS#1 v1.5 padding".into());
     }
     let mut sep = None;
-    for i in 2..em.len() {
-        if em[i] == 0x00 {
+    for (i, &byte) in em.iter().enumerate().skip(2) {
+        if byte == 0x00 {
             sep = Some(i);
             break;
         }
-        if em[i] != 0xFF {
+        if byte != 0xFF {
             return Err("publicDecrypt: invalid PKCS#1 v1.5 padding".into());
         }
     }

@@ -261,7 +261,9 @@ fn is_connection_upgrade(buf: &[u8]) -> bool {
     false
 }
 
-fn parse_upgrade_headers(buf: &[u8]) -> Option<(String, String, Vec<(String, String)>)> {
+type UpgradeHeaders = (String, String, Vec<(String, String)>);
+
+fn parse_upgrade_headers(buf: &[u8]) -> Option<UpgradeHeaders> {
     let text = std::str::from_utf8(buf).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;

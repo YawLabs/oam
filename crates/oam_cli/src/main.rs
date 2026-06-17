@@ -1397,16 +1397,15 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "oam compile: could not create output directory {}: {e}",
-                    parent.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "oam compile: could not create output directory {}: {e}",
+            parent.display()
+        );
+        return ExitCode::FAILURE;
     }
     if let Err(e) = std::fs::copy(&exe, output) {
         eprintln!(

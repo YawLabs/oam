@@ -92,6 +92,7 @@ pub async fn spawn_child(
     Ok((child, pid))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sync(
     command: &str,
     args: &[String],
@@ -170,11 +171,11 @@ pub fn spawn_sync(
 
     let pid = child.id();
 
-    if let Some(input) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(input);
-        }
+    if let Some(input) = input
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        use std::io::Write;
+        let _ = stdin.write_all(input);
     }
     drop(child.stdin.take());
 

@@ -556,10 +556,10 @@ fn op_stdout_write(
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
-        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush()) {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                std::process::exit(0);
-            }
+        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            std::process::exit(0);
         }
     }
 }
@@ -573,10 +573,10 @@ fn op_stderr_write(
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush()) {
-            if e.kind() == std::io::ErrorKind::BrokenPipe {
-                std::process::exit(0);
-            }
+        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            std::process::exit(0);
         }
     }
 }
@@ -1349,25 +1349,25 @@ fn op_zlib_handle_write_sync(
             let produced = out_len - avail_out;
             if produced > 0 {
                 let out_buf_value = args.get(3);
-                if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(out_buf_value) {
-                    if let Some(buf) = view.buffer(scope) {
-                        let store = buf.get_backing_store();
-                        if let Some(data) = store.data() {
-                            let byte_offset = view.byte_offset() + out_off;
-                            if byte_offset + produced <= store.byte_length() {
-                                unsafe {
-                                    let dest = (data.as_ptr() as *mut u8).add(byte_offset);
-                                    std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
-                                }
-                            } else {
-                                let message = v8::String::new(
+                if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(out_buf_value)
+                    && let Some(buf) = view.buffer(scope)
+                {
+                    let store = buf.get_backing_store();
+                    if let Some(data) = store.data() {
+                        let byte_offset = view.byte_offset() + out_off;
+                        if byte_offset + produced <= store.byte_length() {
+                            unsafe {
+                                let dest = (data.as_ptr() as *mut u8).add(byte_offset);
+                                std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
+                            }
+                        } else {
+                            let message = v8::String::new(
                                     scope,
                                     "zlib: output buffer overflow (offset + produced exceeds buffer length)",
                                 ).unwrap();
-                                let exception = v8::Exception::range_error(scope, message);
-                                scope.throw_exception(exception);
-                                return;
-                            }
+                            let exception = v8::Exception::range_error(scope, message);
+                            scope.throw_exception(exception);
+                            return;
                         }
                     }
                 }
@@ -2578,10 +2578,10 @@ fn op_spawn_sync(
     let mut child_args: Vec<String> = Vec::new();
     if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
         for i in 0..arr.length() {
-            if let Some(v) = arr.get_index(scope, i) {
-                if let Some(s) = v.to_string(scope) {
-                    child_args.push(s.to_rust_string_lossy(scope));
-                }
+            if let Some(v) = arr.get_index(scope, i)
+                && let Some(s) = v.to_string(scope)
+            {
+                child_args.push(s.to_rust_string_lossy(scope));
             }
         }
     }
@@ -2655,15 +2655,14 @@ fn op_spawn_sync(
         let names = env_obj.get_own_property_names(scope, Default::default())?;
         let mut pairs = Vec::new();
         for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i) {
-                if let Some(val) = env_obj.get(scope, name) {
-                    if let (Some(k), Some(v)) = (
-                        name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    ) {
-                        pairs.push((k, v));
-                    }
-                }
+            if let Some(name) = names.get_index(scope, i)
+                && let Some(val) = env_obj.get(scope, name)
+                && let (Some(k), Some(v)) = (
+                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                )
+            {
+                pairs.push((k, v));
             }
         }
         Some(pairs)
@@ -2745,10 +2744,10 @@ fn op_spawn_async(
     let mut child_args: Vec<String> = Vec::new();
     if let Ok(arr) = v8::Local::<v8::Array>::try_from(args_val) {
         for i in 0..arr.length() {
-            if let Some(v) = arr.get_index(scope, i) {
-                if let Some(s) = v.to_string(scope) {
-                    child_args.push(s.to_rust_string_lossy(scope));
-                }
+            if let Some(v) = arr.get_index(scope, i)
+                && let Some(s) = v.to_string(scope)
+            {
+                child_args.push(s.to_rust_string_lossy(scope));
             }
         }
     }
@@ -2791,15 +2790,14 @@ fn op_spawn_async(
         let names = env_obj.get_own_property_names(scope, Default::default())?;
         let mut pairs = Vec::new();
         for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i) {
-                if let Some(val) = env_obj.get(scope, name) {
-                    if let (Some(k), Some(v)) = (
-                        name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    ) {
-                        pairs.push((k, v));
-                    }
-                }
+            if let Some(name) = names.get_index(scope, i)
+                && let Some(val) = env_obj.get(scope, name)
+                && let (Some(k), Some(v)) = (
+                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                )
+            {
+                pairs.push((k, v));
             }
         }
         Some(pairs)
@@ -2943,15 +2941,14 @@ fn op_cluster_fork(
             let mut pairs = Vec::new();
             if let Some(names) = obj.get_own_property_names(scope, Default::default()) {
                 for i in 0..names.length() {
-                    if let Some(name) = names.get_index(scope, i) {
-                        if let Some(val) = obj.get(scope, name) {
-                            if let (Some(k), Some(v)) = (
-                                name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                                val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                            ) {
-                                pairs.push((k, v));
-                            }
-                        }
+                    if let Some(name) = names.get_index(scope, i)
+                        && let Some(val) = obj.get(scope, name)
+                        && let (Some(k), Some(v)) = (
+                            name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                            val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                        )
+                    {
+                        pairs.push((k, v));
                     }
                 }
             }
@@ -3546,26 +3543,25 @@ fn network_interfaces() -> serde_json::Value {
         ]),
     );
 
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip().to_string();
-                let iface_name = if cfg!(windows) { "Ethernet" } else { "eth0" };
-                result.insert(
-                    iface_name.to_string(),
-                    json!([
-                        {
-                            "address": ip,
-                            "netmask": "255.255.255.0",
-                            "family": "IPv4",
-                            "mac": "00:00:00:00:00:00",
-                            "internal": false,
-                            "cidr": format!("{}/24", ip)
-                        }
-                    ]),
-                );
-            }
-        }
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        let ip = addr.ip().to_string();
+        let iface_name = if cfg!(windows) { "Ethernet" } else { "eth0" };
+        result.insert(
+            iface_name.to_string(),
+            json!([
+                {
+                    "address": ip,
+                    "netmask": "255.255.255.0",
+                    "family": "IPv4",
+                    "mac": "00:00:00:00:00:00",
+                    "internal": false,
+                    "cidr": format!("{}/24", ip)
+                }
+            ]),
+        );
     }
 
     Value::Object(result)

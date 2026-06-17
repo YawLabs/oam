@@ -109,6 +109,7 @@ fn build_client_config(
 
 /// tls.connect: TCP connect + TLS handshake.
 /// Returns Json {handle, protocol, cipher, authorized, alpnProtocol}.
+#[allow(clippy::too_many_arguments)]
 pub async fn tls_connect(
     registry: TlsRegistry,
     ids: Arc<std::sync::atomic::AtomicU64>,
