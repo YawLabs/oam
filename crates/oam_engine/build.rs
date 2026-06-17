@@ -41,6 +41,9 @@ fn main() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
         // ai.js: oam:ai factory (SSE parser, streaming chat, tool-use loop).
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/ai.js"),
+        // undici.js: native undici-API shim (fetch/request/Agent/dispatchers)
+        // shadowing the npm package; backed by oam's fetch.
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/undici.js"),
     ];
     let sources: Vec<(String, String)> = js_files
         .iter()

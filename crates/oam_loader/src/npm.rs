@@ -220,12 +220,122 @@ pub(crate) fn is_node_builtin(specifier: &str) -> bool {
     set.contains(name)
 }
 
+/// Walk up from `file` to the nearest directory containing a package.json.
+/// Returns (package_dir, parsed_manifest) on hit. The walk anchors subpath
+/// imports (#xxx) to the OWNING package, per Node's subpath-imports spec.
+fn find_owning_package(file: &Path) -> Option<(PathBuf, Value)> {
+    let mut dir = file.parent()?.to_path_buf();
+    loop {
+        let manifest_path = dir.join("package.json");
+        if manifest_path.is_file() {
+            let manifest = cached_manifest(&manifest_path).unwrap_or(Value::Null);
+            return Some((dir, manifest));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve a `#xxx` subpath-import specifier against the importing package's
+/// `imports` field (per the Node packages spec). Targets may be relative
+/// (`./...` within the package) or bare (resolved through node_modules from
+/// the package root, exactly like a regular bare import would be).
+fn resolve_subpath_import(
+    specifier: &str,
+    referrer: &Path,
+    mode: ResolveMode,
+) -> Result<PathBuf, Diagnostic> {
+    let Some((pkg_dir, manifest)) = find_owning_package(referrer) else {
+        return Err(diag(
+            "OAM-MOD0002",
+            format!(
+                "subpath import '{specifier}' has no owning package.json above {}",
+                referrer.display()
+            ),
+        ));
+    };
+    let Some(imports) = manifest.get("imports") else {
+        return Err(diag(
+            "OAM-MOD0007",
+            format!(
+                "subpath import '{specifier}' is not declared in {}/package.json (no 'imports' field)",
+                pkg_dir.display()
+            ),
+        ));
+    };
+    let target = exports_resolve(imports, specifier, mode.conditions()).map_err(
+        |reason| match reason {
+            ExportsError::NotExported => diag(
+                "OAM-MOD0007",
+                format!(
+                    "subpath import '{specifier}' is not declared in {}/package.json imports",
+                    pkg_dir.display()
+                ),
+            ),
+            ExportsError::InvalidTarget(target) => diag(
+                "OAM-MOD0002",
+                format!(
+                    "{}/package.json imports has invalid target '{target}' for '{specifier}'",
+                    pkg_dir.display()
+                ),
+            ),
+        },
+    )?;
+    // Per spec: a target starting with './' is package-relative; anything else
+    // is a bare specifier resolved as a regular import from the package root.
+    if let Some(rel) = target.strip_prefix("./") {
+        let path = pkg_dir.join(rel);
+        if !path.is_file() {
+            return Err(diag(
+                "OAM-MOD0002",
+                format!(
+                    "subpath import '{specifier}' -> {} which does not exist",
+                    path.display()
+                ),
+            ));
+        }
+        return Ok(path);
+    }
+    // Bare target: re-enter resolve_bare from the owning package's root. A
+    // pseudo file under pkg_dir gives the node_modules walk the right anchor
+    // (resolve_bare's loop starts at referrer.parent()).
+    resolve_bare(&target, &pkg_dir.join("__oam_subpath_anchor"), mode)
+}
+
+/// npm packages oam provides NATIVELY, shadowing any installed copy. They
+/// resolve to the matching `oam:` virtual builtin before the node_modules
+/// walk (the Bun/Deno approach). `undici` is shadowed because the real
+/// package cannot load on oam (it pulls node:sqlite + a WASM HTTP stack) and
+/// adds nothing over oam's web-standard fetch.
+fn shadowed_builtin(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "undici" => Some("oam:undici"),
+        _ => None,
+    }
+}
+
 /// Resolve a bare specifier from `referrer` against node_modules.
 pub(crate) fn resolve_bare(
     specifier: &str,
     referrer: &Path,
     mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
+    // Subpath imports (#xxx): resolved against the owning package's
+    // package.json `imports` field (per Node's subpath-imports spec).
+    // chalk and many other published packages use this to expose
+    // package-private modules; the resolver MUST honor it before trying
+    // node_modules (#xxx would never match a bare package name there).
+    if specifier.starts_with('#') {
+        return resolve_subpath_import(specifier, referrer, mode);
+    }
+
+    // Natively-shadowed packages (undici, ...) resolve to their oam: virtual
+    // builtin, ahead of any installed node_modules copy.
+    if let Some(virt) = shadowed_builtin(specifier) {
+        return Ok(PathBuf::from(virt));
+    }
+
     // oam: runtime modules. Same virtual-path mechanism as node: builtins;
     // the registry key is the FULL specifier.
     if let Some(rest) = specifier.strip_prefix("oam:") {

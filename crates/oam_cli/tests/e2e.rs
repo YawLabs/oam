@@ -2730,6 +2730,143 @@ fn dynamic_import_attributes_match_static_path() {
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
 
+// A dynamic-import cycle (A dyn-imports B, B dyn-imports A while A is still
+// Evaluating) must resolve to A's PARTIAL namespace -- the bindings B reads
+// from A must be the ones already initialized in A (fromA). Pre-fix oam
+// rejected this cycle with "top-level await not supported yet" because A's
+// eval promise was still pending. Post-fix, dyn_import_load detects the
+// Evaluating status and returns the partial namespace.
+#[test]
+fn dynamic_import_cycle_resolves_to_partial_namespace() {
+    write_temp(
+        "dynimp_cycle/a.mjs",
+        "export const fromA = 'A';\n\
+         export const bResult = await import('./b.mjs');\n\
+         export const after = 'after-await';\n",
+    );
+    write_temp(
+        "dynimp_cycle/b.mjs",
+        // B only reads bindings of A that are ALREADY initialized at the
+        // point B runs (fromA is the only one set before A's TLA suspends).
+        "const a = await import('./a.mjs');\n\
+         export const sawFromA = a && a.fromA === 'A';\n\
+         export const fromB = 'B';\n",
+    );
+    let main = write_temp(
+        "dynimp_cycle/main.mjs",
+        "const a = await import('./a.mjs');\n\
+         const b = a.bResult;\n\
+         console.log('a_fromA', a.fromA === 'A');\n\
+         console.log('a_after', a.after === 'after-await');\n\
+         console.log('b_sawFromA', b && b.sawFromA === true);\n\
+         console.log('b_fromB', b && b.fromB === 'B');\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("a_fromA true"), "{stdout}");
+    assert!(stdout.contains("a_after true"), "{stdout}");
+    assert!(stdout.contains("b_sawFromA true"), "{stdout}");
+    assert!(stdout.contains("b_fromB true"), "{stdout}");
+}
+
+// Regression for the ActiveHost slot-clear contract: a dynamic import() from
+// inside a test body (which runs under run_registered_tests AFTER the entry
+// execute_module returns) must NOT dereference the stale host pointer. Today
+// the underlying UB is invisible because CliHost is a ZST, so the observable
+// signal is the rejection MESSAGE: post-fix the import must be rejected with
+// the "not wired up on this entry path" diagnostic from the None-branch,
+// proving run_registered_tests cleared ActiveHost before running the test
+// body. If that clear regresses, the import would route through the
+// (stale-but-functional-for-ZST) host and reject with a different message
+// (OAM-MOD0001 cannot resolve), failing this assertion.
+#[test]
+fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
+    let main = write_temp(
+        "dynimp_test_host/main.test.mjs",
+        // Console.log the rejection message to stdout so the assertion has a
+        // direct signal; throw inside the test body if the message is wrong,
+        // so a regression makes oam test exit non-zero.
+        "import { test } from 'oam:test';\n\
+         test('cleared host slot from test body', async () => {\n\
+           let msg = 'no-result';\n\
+           try { await import('./peer.mjs'); msg = 'NO-THROW'; }\n\
+           catch (e) { msg = (e && e.message) || 'no-message'; }\n\
+           console.log('reject_message:', msg);\n\
+           if (!msg.includes('not wired up on this entry path')) {\n\
+             throw new Error('wrong rejection: ' + msg);\n\
+           }\n\
+         });\n",
+    );
+    let out = oam(&["test", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // oam test writes runner output to STDERR (file header, pass/fail markers,
+    // summary); STDOUT only carries the test body's console.log lines. The
+    // test body throws if the rejection message regresses, so exit success
+    // already implies the host slot was cleared. The stdout console.log is a
+    // direct visibility check.
+    assert!(out.status.success(), "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>", out.status);
+    assert!(
+        stdout.contains("not wired up on this entry path"),
+        "expected the test body to log the new rejection message: stdout=<<{stdout}>>"
+    );
+    assert!(
+        stderr.contains("1 passed") || stderr.contains("ok") && stderr.contains("cleared host slot"),
+        "expected the test runner to record 1 passed: stderr=<<{stderr}>>"
+    );
+}
+
+// The native undici-API shim (shadowing the npm package): `import 'undici'`
+// gives fetch/request/stream/Agent/dispatchers backed by oam's fetch. Drives
+// request (GET + POST body echo, body.json()/body.text()), stream into a
+// Writable, fetch delegation, and Agent construction, against an in-process
+// node:http server.
+#[test]
+fn undici_shim_request_stream_fetch_over_http() {
+    let main = write_temp(
+        "undici_shim/main.mjs",
+        "import http from 'node:http';\n\
+         import { request, stream, fetch as ufetch, Agent, getGlobalDispatcher } from 'undici';\n\
+         import { Writable } from 'node:stream';\n\
+         const server = http.createServer((req, res) => {\n\
+           const chunks = [];\n\
+           req.on('data', (c) => chunks.push(c));\n\
+           req.on('end', () => {\n\
+             res.writeHead(req.method === 'POST' ? 201 : 200, { 'content-type': 'application/json', 'x-echo': req.method });\n\
+             res.end(JSON.stringify({ method: req.method, url: req.url, got: Buffer.concat(chunks).toString() }));\n\
+           });\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const g = await request(`${base}/j`);\n\
+         const gj = await g.body.json();\n\
+         console.log('get', g.statusCode === 200 && g.headers['x-echo'] === 'GET' && gj.url === '/j');\n\
+         const p = await request(`${base}/p`, { method: 'POST', body: 'hi-undici' });\n\
+         const pj = JSON.parse(await p.body.text());\n\
+         console.log('post', p.statusCode === 201 && pj.got === 'hi-undici');\n\
+         let streamed = '';\n\
+         const sink = new Writable({ write(c, e, cb) { streamed += c.toString(); cb(); } });\n\
+         await stream(`${base}/s`, {}, () => sink);\n\
+         console.log('stream', streamed.includes('\\\"method\\\":\\\"GET\\\"'));\n\
+         const f = await ufetch(`${base}/f`);\n\
+         console.log('fetch', f.status === 200 && (await f.json()).url === '/f');\n\
+         const a = new Agent({ connect: { lookup: () => {} } });\n\
+         console.log('agent', typeof a.request === 'function' && getGlobalDispatcher() != null);\n\
+         server.close();\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("get true"), "{stdout}");
+    assert!(stdout.contains("post true"), "{stdout}");
+    assert!(stdout.contains("stream true"), "{stdout}");
+    assert!(stdout.contains("fetch true"), "{stdout}");
+    assert!(stdout.contains("agent true"), "{stdout}");
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(
