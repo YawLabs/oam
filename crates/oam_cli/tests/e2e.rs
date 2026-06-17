@@ -2610,6 +2610,109 @@ fn dynamic_import_loads_modules_and_rejects_missing() {
     assert!(stdout.contains("missing true"), "{stdout}");
 }
 
+// Dynamic import of a CJS facade (interop path): the cjs-default and named
+// exports flow through, and the namespace identity matches a static import of
+// the same path (cache).
+#[test]
+fn dynamic_import_cjs_facade_and_cache_identity() {
+    write_temp(
+        "dynimp_cjs/dep.cjs",
+        "module.exports = { answer: 42, name: 'cjs-mod' };\nmodule.exports.default = 'cjs-default';\n",
+    );
+    let main = write_temp(
+        "dynimp_cjs/main.mjs",
+        "import * as staticDep from './dep.cjs';\n\
+         const dyn = await import('./dep.cjs');\n\
+         console.log('answer', dyn.answer === 42);\n\
+         console.log('name', dyn.name === 'cjs-mod');\n\
+         console.log('identity', staticDep === dyn);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("answer true"), "{stdout}");
+    assert!(stdout.contains("name true"), "{stdout}");
+    assert!(stdout.contains("identity true"), "{stdout}");
+}
+
+// A dynamically-imported module that throws synchronously at top level rejects
+// with the REAL thrown value (parity with Node), not a generic stringified
+// "evaluation failed" message.
+#[test]
+fn dynamic_import_propagates_top_level_throw() {
+    write_temp(
+        "dynimp_throw/bad.mjs",
+        "throw new Error('boom-from-dep');\n",
+    );
+    let main = write_temp(
+        "dynimp_throw/main.mjs",
+        "try { await import('./bad.mjs'); console.log('NO-THROW'); }\n\
+         catch (e) { console.log('caught', e && e.message === 'boom-from-dep'); }\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("caught true"), "{stdout}");
+}
+
+// Dynamic import fired from inside a timer callback (during pump_event_loop,
+// AFTER the entry's top-level await settled). Validates the ActiveHost slot
+// stays valid across the whole execute_module call, not just its initial
+// evaluation phase.
+#[test]
+fn dynamic_import_works_from_timer_callback() {
+    write_temp(
+        "dynimp_timer/dep.mjs",
+        "export const value = 'from-timer';\n",
+    );
+    let main = write_temp(
+        "dynimp_timer/main.mjs",
+        "await new Promise((r) => setTimeout(r, 5));\n\
+         const done = new Promise((resolve) => {\n\
+           setTimeout(async () => {\n\
+             try { const m = await import('./dep.mjs'); resolve(m.value); }\n\
+             catch (e) { resolve('ERR:' + e.message); }\n\
+           }, 10);\n\
+         });\n\
+         console.log('result', await done);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("result from-timer"), "{stdout}");
+}
+
+// Import-attributes parity on the dynamic path: type:"json" on a non-.json
+// resolves to a rejection (same diagnostic shape as the static path), and an
+// unsupported type value (other than "json") errors before resolve runs.
+#[test]
+fn dynamic_import_attributes_match_static_path() {
+    write_temp(
+        "dynimp_attrs/notjson.mjs",
+        "export const x = 1;\n",
+    );
+    let main = write_temp(
+        "dynimp_attrs/main.mjs",
+        "let badType = 'NO-THROW';\n\
+         try { await import('./notjson.mjs', { with: { type: 'css' } }); }\n\
+         catch (e) { badType = e && e.message.includes('only supported import-attribute type') ? 'rejected' : 'OTHER:' + e.message; }\n\
+         console.log('type_other', badType);\n\
+         let jsonOnTs = 'NO-THROW';\n\
+         try { await import('./notjson.mjs', { with: { type: 'json' } }); }\n\
+         catch (e) { jsonOnTs = e && e.message.includes('JSON') ? 'rejected' : 'OTHER:' + e.message; }\n\
+         console.log('json_on_nonjson', jsonOnTs);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("type_other rejected"), "{stdout}");
+    assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(

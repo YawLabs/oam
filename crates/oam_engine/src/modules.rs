@@ -1039,16 +1039,58 @@ enum DynResult {
     Error(String),
 }
 
-/// Reject `resolver` with a freshly-built Error carrying `msg`.
+/// Parse the [key, value, source_offset] triples for the one supported import
+/// attribute (type=json). Returns Ok(true) when type:"json" is set, Ok(false)
+/// when no relevant attributes, Err(msg) when an unsupported type value is
+/// declared. Mirrors the static-path validation in load_module_graph so dynamic
+/// import has the same semantics.
+fn dyn_parse_import_attributes(
+    scope: &mut v8::PinScope<'_, '_>,
+    attributes: v8::Local<'_, v8::FixedArray>,
+    spec: &str,
+) -> Result<bool, String> {
+    let mut typed_json = false;
+    let mut index = 0;
+    while index + 1 < attributes.length() {
+        let key = attributes
+            .get(scope, index)
+            .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+            .and_then(|v| v.to_string(scope))
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        let value = attributes
+            .get(scope, index + 1)
+            .and_then(|d| v8::Local::<v8::Value>::try_from(d).ok())
+            .and_then(|v| v.to_string(scope))
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        if key == "type" {
+            if value == "json" {
+                typed_json = true;
+            } else {
+                return Err(format!(
+                    "oam: dynamic import('{spec}') declares type \"{value}\" \
+                     — the only supported import-attribute type is \"json\""
+                ));
+            }
+        }
+        index += 3;
+    }
+    Ok(typed_json)
+}
+
+/// Reject `resolver` with a freshly-built Error carrying `msg`. Defense in
+/// depth: if v8::String::new fails (message exceeds v8::String's max length),
+/// fall back to an Error with an empty string rather than silently leaving the
+/// resolver unsettled (which would hang the caller's awaited promise).
 fn reject_with_message(
     scope: &mut v8::PinScope<'_, '_>,
     resolver: &v8::Local<'_, v8::PromiseResolver>,
     msg: &str,
 ) {
-    if let Some(s) = v8::String::new(scope, msg) {
-        let exception = v8::Exception::error(scope, s);
-        resolver.reject(scope, exception);
-    }
+    let s = v8::String::new(scope, msg).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = v8::Exception::error(scope, s);
+    resolver.reject(scope, exception);
 }
 
 /// Load + instantiate + evaluate a dynamically-imported module through the same
@@ -1112,6 +1154,11 @@ fn dyn_import_load(
         // value as the namespace fallback rather than failing.
         return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
     };
+    // The module's evaluation promise IS the channel we're feeding into the
+    // import resolver — V8 must not report it separately as an unhandled
+    // rejection, since the user catches/handles the rejection via the
+    // dynamically-imported promise we return.
+    eval_promise.mark_as_handled();
     match eval_promise.state() {
         v8::PromiseState::Fulfilled => {
             DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
@@ -1148,12 +1195,23 @@ pub(crate) fn dynamic_import_callback<'s>(
     _host_defined_options: v8::Local<'s, v8::Data>,
     resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
-    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     let spec = specifier.to_rust_string_lossy(scope);
     let referrer = resource_name.to_rust_string_lossy(scope);
+
+    // Parse import attributes (type=json) the same way the static path does.
+    // Unknown keys are silently ignored per spec; an unsupported type VALUE is
+    // an error before we even try to resolve.
+    let typed_json = match dyn_parse_import_attributes(scope, import_attributes, &spec) {
+        Ok(flag) => flag,
+        Err(msg) => {
+            reject_with_message(scope, &resolver, &msg);
+            return Some(promise);
+        }
+    };
 
     // The active host is parked by execute_module; absent on the REPL/timer
     // paths, where dynamic import isn't wired up yet.
@@ -1209,6 +1267,20 @@ pub(crate) fn dynamic_import_callback<'s>(
             }
         }
     };
+
+    // type:"json" requires a .json target (parity with the static path).
+    if typed_json && resolved.extension().and_then(|e| e.to_str()) != Some("json") {
+        reject_with_message(
+            scope,
+            &resolver,
+            &format!(
+                "oam: dynamic import('{spec}') is imported with type \"json\" \
+                 but resolves to {} (only .json files load as JSON modules today)",
+                resolved.display()
+            ),
+        );
+        return Some(promise);
+    }
 
     // Heavy V8 work under a child TryCatch; carry the result out as Globals.
     let result = {
