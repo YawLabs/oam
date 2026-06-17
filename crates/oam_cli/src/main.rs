@@ -794,13 +794,15 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
                     elapsed,
                     errors,
                 } => (installed, elapsed, errors),
-                oam_loader::install::InstallOutcome::Failed(diagnostics) => {
-                    for d in &diagnostics {
-                        render(d, json);
-                    }
-                    return ExitCode::FAILURE;
-                }
             };
+            // Render any diagnostics FIRST so the user sees per-package
+            // failures / bin-shim warnings before the success summary line --
+            // otherwise the summary at the bottom is the last thing on
+            // screen and a reader skimming the tail can miss errors that
+            // scrolled off above the "installed N package(s)" line.
+            for d in &errors {
+                render(d, json);
+            }
             if json {
                 let d = Diagnostic::new(
                     "OAM-PKG0000",
@@ -819,9 +821,6 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
                     installed,
                     elapsed.as_secs_f64()
                 );
-            }
-            for d in &errors {
-                render(d, json);
             }
             // Only Severity::Error diagnostics fail the install -- a
             // bin-shim PKG0005 (Severity::Warning) is informational and

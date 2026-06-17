@@ -469,6 +469,24 @@ fn split_specifier(specifier: &str) -> Option<(String, String)> {
     Some((name, subpath))
 }
 
+/// True for paths ending in `.d.ts` / `.d.mts` / `.d.cts` / `.d.tsx` /
+/// `.d.jsx` (case-insensitive). Declaration files are types-only and must
+/// never be returned as a runtime entry, even if a package's `exports` /
+/// `main` / `module` field happens to point at one. Mirrors the check in
+/// `oam_loader::lib::is_declaration_file` for paths that come back from
+/// `resolve_in_package` rather than from the directory-probe path.
+fn is_declaration_target(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lc = name.to_ascii_lowercase();
+    lc.ends_with(".d.ts")
+        || lc.ends_with(".d.mts")
+        || lc.ends_with(".d.cts")
+        || lc.ends_with(".d.tsx")
+        || lc.ends_with(".d.jsx")
+}
+
 fn resolve_in_package(
     package_dir: &Path,
     package: &str,
@@ -534,6 +552,21 @@ fn resolve_in_package(
             )
         })?
     };
+    // Final guard: even if a package's exports / main / module field points
+    // at a declaration file (rare but real -- some types-only packages or
+    // misconfigured dual builds do this), loading it as a runtime module is
+    // always wrong. Reject with MOD0001 plus a hint so the user knows why
+    // the bare-import didn't work.
+    if is_declaration_target(&resolved) {
+        return Err(diag(
+            "OAM-MOD0001",
+            format!(
+                "package {package} resolves '{specifier}' to {} which is a TypeScript \
+                 declaration file (types-only) -- cannot load as a runtime module",
+                resolved.display()
+            ),
+        ));
+    }
     Ok(resolved)
 }
 
