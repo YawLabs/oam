@@ -264,8 +264,8 @@ fn resolve_subpath_import(
             ),
         ));
     };
-    let target = exports_resolve(imports, specifier, mode.conditions()).map_err(
-        |reason| match reason {
+    let target =
+        exports_resolve(imports, specifier, mode.conditions()).map_err(|reason| match reason {
             ExportsError::NotExported => diag(
                 "OAM-MOD0007",
                 format!(
@@ -280,8 +280,7 @@ fn resolve_subpath_import(
                     pkg_dir.display()
                 ),
             ),
-        },
-    )?;
+        })?;
     // Per spec: a target starting with './' is package-relative; anything else
     // is a bare specifier resolved as a regular import from the package root.
     if let Some(rel) = target.strip_prefix("./") {
@@ -343,12 +342,13 @@ pub(crate) fn resolve_bare(
             "test" => return Ok(PathBuf::from("oam:test")),
             "permissions" => return Ok(PathBuf::from("oam:permissions")),
             "ai" => return Ok(PathBuf::from("oam:ai")),
+            "mcp" => return Ok(PathBuf::from("oam:mcp")),
             _ => {}
         }
         return Err(diag(
             "OAM-MOD0006",
             format!(
-                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions, oam:ai)"
+                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions, oam:ai, oam:mcp)"
             ),
         ));
     }

@@ -12764,3 +12764,67 @@ console.log(typeof http2.sensitiveHeaders);"#,
         "function\nfunction\nfunction\n0\n:status\n:path\nGET\n200\nsymbol"
     );
 }
+
+#[test]
+fn oam_mcp_module_batch_array() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let script = write_temp(
+        "mcp_module_batch.ts",
+        r#"import { McpServer } from 'oam:mcp';
+const s = new McpServer({ name: 'batch', version: '1.0.0' });
+s.tool('double', {
+  description: 'Double a number',
+  parameters: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] },
+  handler: async ({ n }) => String(n * 2),
+});
+await s.serve();
+"#,
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("run")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam run spawns");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e"}}})
+        )
+        .unwrap();
+        // Batch array: two tool calls with a notification interleaved.
+        let batch = serde_json::json!([
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"double","arguments":{"n":5}}},
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"double","arguments":{"n":21}}}
+        ]);
+        writeln!(stdin, "{batch}").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).expect("each line is JSON"))
+        .collect();
+    assert!(child.wait().unwrap().success());
+
+    // initialize response + one batch-array response on a single line.
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    let batch_resp = responses[1]
+        .as_array()
+        .expect("batch response is a JSON array");
+    // Notification produces no entry; two tool calls -> two entries.
+    assert_eq!(batch_resp.len(), 2);
+    assert_eq!(batch_resp[0]["id"], 2);
+    assert_eq!(batch_resp[0]["result"]["content"][0]["text"], "10");
+    assert_eq!(batch_resp[1]["id"], 3);
+    assert_eq!(batch_resp[1]["result"]["content"][0]["text"], "42");
+}
