@@ -784,7 +784,23 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
     let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
 
     match oam_loader::install::install(&project_dir, frozen_lockfile) {
-        Ok(summary) => {
+        Ok(outcome) => {
+            let (installed, elapsed, errors) = match outcome {
+                oam_loader::install::InstallOutcome::Complete(summary) => {
+                    (summary.packages_installed, summary.elapsed, Vec::new())
+                }
+                oam_loader::install::InstallOutcome::Partial {
+                    installed,
+                    elapsed,
+                    errors,
+                } => (installed, elapsed, errors),
+                oam_loader::install::InstallOutcome::Failed(diagnostics) => {
+                    for d in &diagnostics {
+                        render(d, json);
+                    }
+                    return ExitCode::FAILURE;
+                }
+            };
             if json {
                 let d = Diagnostic::new(
                     "OAM-PKG0000",
@@ -792,19 +808,26 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
                     Origin::Install,
                     format!(
                         "installed {} package(s) in {:.1}s",
-                        summary.packages_installed,
-                        summary.elapsed.as_secs_f64()
+                        installed,
+                        elapsed.as_secs_f64()
                     ),
                 );
                 render(&d, true);
             } else {
                 eprintln!(
                     "oam install: {} package(s) in {:.1}s",
-                    summary.packages_installed,
-                    summary.elapsed.as_secs_f64()
+                    installed,
+                    elapsed.as_secs_f64()
                 );
             }
-            ExitCode::SUCCESS
+            for d in &errors {
+                render(d, json);
+            }
+            if errors.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(diagnostics) => {
             for d in &diagnostics {
