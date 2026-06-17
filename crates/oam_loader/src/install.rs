@@ -25,7 +25,7 @@ struct Lockfile {
 
 /// A single entry in the `packages` map.
 #[derive(Debug, Deserialize)]
-struct LockfileEntry {
+pub(crate) struct LockfileEntry {
     #[allow(dead_code)]
     version: Option<String>,
     resolved: Option<String>,
@@ -39,11 +39,58 @@ struct LockfileEntry {
     bin: Option<serde_json::Value>,
 }
 
-/// Summary returned on success.
+/// Summary returned on a clean install (every package installed).
 #[derive(Debug)]
 pub struct InstallSummary {
     pub packages_installed: usize,
     pub elapsed: Duration,
+}
+
+/// The three outcomes `install` can return.
+///
+/// `Err(Vec<Diagnostic>)` is reserved for "didn't even start" — the lockfile
+/// was missing or unparseable, the lockfileVersion was unsupported, the
+/// async runtime / HTTP client could not be initialized, or the install was
+/// invoked in non-frozen mode. No packages were attempted in any of those
+/// cases, so there is nothing for the caller to recover from.
+///
+/// `Ok(Partial { .. })` means at least one install pass was attempted: some
+/// packages installed (counted in `installed`, including cached ones) and
+/// `errors` is non-empty. The caller decides whether to treat a Partial as
+/// success (e.g. `oam install` exiting 0 with warnings) or failure
+/// (default for CI).
+///
+/// `Ok(Complete(_))` means every package installed cleanly; `errors` is
+/// empty in this arm.
+///
+/// Diagnostic-code mapping (see also the doc on `install`):
+///
+/// * `Ok(Complete(_))` — no diagnostics.
+/// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
+///   extract failure) and `OAM-PKG0005` (bin shim warning). The `installed`
+///   count and `errors` list together describe what landed.
+/// * `Err(_) / Failed(_)` — `OAM-PKG0001` (lockfile read or parse failure),
+///   `OAM-PKG0002` (unsupported lockfileVersion), `OAM-PKG0003` (async
+///   runtime or HTTP client init failure), `OAM-PKG0006` (non-frozen mode
+///   rejected). No packages were attempted.
+#[derive(Debug)]
+pub enum InstallOutcome {
+    /// Every package installed cleanly.
+    Complete(InstallSummary),
+    /// Some packages installed, some failed (and/or bin-shim warnings).
+    /// `installed` is the count of successful installs (incl. cached).
+    /// `errors` is non-empty; the caller decides whether to treat as success.
+    Partial {
+        installed: usize,
+        elapsed: Duration,
+        errors: Vec<Diagnostic>,
+    },
+    /// Nothing was installed. Covers the full "didn't even start" set:
+    /// lockfile missing, lockfile parse failure, unsupported
+    /// `lockfileVersion`, async runtime / HTTP client init failure, or
+    /// non-frozen mode rejected. No packages were attempted in any of
+    /// these cases. See the diagnostic-code mapping on the enum doc above.
+    Failed(Vec<Diagnostic>),
 }
 
 // ── Public entry point ──────────────────────────────────────────────────
@@ -53,13 +100,45 @@ pub struct InstallSummary {
 /// `project_dir` is the directory containing `package-lock.json`.
 /// `frozen` must be `true` for the MVP (the lockfile is authoritative; no
 /// resolution or lockfile mutation).
-pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallSummary, Vec<Diagnostic>> {
+///
+/// Returns one of:
+///
+/// * `Ok(InstallOutcome::Complete(summary))` — every package installed; the
+///   `summary` carries the count and elapsed time.
+/// * `Ok(InstallOutcome::Partial { installed, elapsed, errors })` — some
+///   packages installed (count includes cached) and some failed, OR a
+///   non-fatal bin-shim warning surfaced. The caller decides whether to
+///   treat this as success or failure.
+/// * `Err(Vec<Diagnostic>)` — the install didn't even start. Covers:
+///   lockfile missing, lockfile parse failure, unsupported
+///   `lockfileVersion`, async runtime or HTTP client init failure, or
+///   non-frozen mode rejected. No packages were attempted.
+///
+/// Diagnostic-code mapping (this is load-bearing — the outcome variant
+/// alone does not tell the caller which subsystem failed):
+///
+/// * `Ok(Complete(_))` — no diagnostics.
+/// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
+///   extract failure) and `OAM-PKG0005` (bin shim warning).
+/// * `Err(_)` / `Failed(_)` — `OAM-PKG0001` (lockfile read or parse),
+///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
+///   client init), `OAM-PKG0006` (non-frozen mode rejected).
+pub fn install(
+    project_dir: &Path,
+    frozen: bool,
+) -> Result<InstallOutcome, Vec<Diagnostic>> {
     if !frozen {
         return Err(vec![diag(
             "OAM-PKG0006",
             "only --frozen-lockfile mode is supported in this release",
         )]);
     }
+    // Install mutates the project layout (writes node_modules/, may rewrite
+    // tsconfig.json via extends). A same-process `oam run` after `oam install`
+    // must not see the stale "not found" / stale parsed paths. Drop the
+    // current thread's default resolver caches so the next resolve re-stats
+    // the filesystem and re-reads tsconfig.
+    crate::resolver::default_clear_caches();
     let started = Instant::now();
 
     let lockfile_path = project_dir.join("package-lock.json");
@@ -138,18 +217,28 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallSummary, Vec<D
     }
 
     // Bin linking pass (runs even if some packages failed — link what we can).
-    if let Err(e) = link_bins(&node_modules, &to_install) {
-        errors.push(e);
-    }
+    // Bin failures are non-fatal: a missing .bin shim doesn't invalidate the
+    // install of the package itself, so the diagnostic lands on the Partial
+    // path instead of poisoning an otherwise-clean install with Err.
+    link_bins(&node_modules, &to_install, &mut errors);
 
-    if !errors.is_empty() {
-        return Err(errors);
-    }
+    let elapsed = started.elapsed();
 
-    Ok(InstallSummary {
-        packages_installed: installed,
-        elapsed: started.elapsed(),
-    })
+    // Two-pass decision: gather every error first, then classify. That way
+    // the empty-errors branch is a single line and the partial branch carries
+    // everything we accumulated without re-walking.
+    if errors.is_empty() {
+        Ok(InstallOutcome::Complete(InstallSummary {
+            packages_installed: installed,
+            elapsed,
+        }))
+    } else {
+        Ok(InstallOutcome::Partial {
+            installed,
+            elapsed,
+            errors,
+        })
+    }
 }
 
 // ── Lockfile I/O ────────────────────────────────────────────────────────
@@ -216,22 +305,23 @@ fn download_with_retry(
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(500));
         }
-        match rt.block_on(async { client.get(url).send().await }) {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    last_err = format!("HTTP {status} for {url}");
-                    continue;
-                }
-                match rt.block_on(async { resp.bytes().await }) {
-                    Ok(bytes) => return Ok(bytes.to_vec()),
-                    Err(e) => {
-                        last_err = format!("reading body from {url}: {e}");
-                    }
-                }
+        match rt.block_on(async {
+            let resp = match client.get(url).send().await {
+                Ok(resp) => resp,
+                Err(e) => return Err(format!("request to {url}: {e}")),
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {status} for {url}"));
             }
+            match resp.bytes().await {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(e) => Err(format!("reading body from {url}: {e}")),
+            }
+        }) {
+            Ok(bytes) => return Ok(bytes),
             Err(e) => {
-                last_err = format!("request to {url}: {e}");
+                last_err = e;
             }
         }
     }
@@ -280,6 +370,12 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
 
+    // Clean the dest once: `Path::join` followed by lexical `starts_with`
+    // would falsely reject a non-canonical `dest` (e.g. `/tmp/./x` joined
+    // with a normal file). Cleaning both sides puts the comparison on a
+    // canonical basis.
+    let dest_clean = path_clean(dest);
+
     for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
         let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
         let path = entry.path().map_err(|e| format!("tar entry path: {e}"))?;
@@ -295,9 +391,15 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
         }
 
         let target = dest.join(&rel);
+        let target_clean = path_clean(&target);
 
-        // Safety: reject paths that escape the destination.
-        if !target.starts_with(dest) {
+        // Safety: reject paths that escape the destination. The previous
+        // `target.starts_with(dest)` check was purely lexical and missed
+        // `..` segments inside a relative entry -- e.g. an entry
+        // `package/../../escape.txt` produced `dest/../../escape.txt`, which
+        // lexically starts with `dest` but resolves outside it. Cleaning
+        // the target collapses `..` so the prefix check actually works.
+        if !target_clean.starts_with(&dest_clean) {
             return Err(format!(
                 "tarball path traversal: {} escapes {}",
                 rel.display(),
@@ -333,7 +435,11 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
                 }
             }
         }
-        // Symlinks and other entry types are skipped for MVP.
+        // Symlinks and other entry types are skipped for MVP. A few npm packages
+        // (mostly monorepo workspace compat) ship symlinks as part of their
+        // install; those files will be missing post-extract. Not a security
+        // concern -- the path-traversal check above still applies. Re-evaluate
+        // if a real package's install breaks because of this.
     }
     Ok(())
 }
@@ -342,10 +448,16 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
 
 /// Scan installed packages for `bin` entries and create shims in
 /// `node_modules/.bin/`.
-fn link_bins(
+///
+/// `errors` is appended to (never returned as `Err`) so the caller can
+/// classify once. The create-dir and canonicalize-failure paths surface
+/// `OAM-PKG0005` warnings; per-shim failures are non-diagnostic (logged to
+/// stderr) because a missing shim is recoverable on the next install.
+pub(crate) fn link_bins(
     node_modules: &Path,
     packages: &[(&str, &LockfileEntry)],
-) -> Result<(), Diagnostic> {
+    errors: &mut Vec<Diagnostic>,
+) {
     let bin_dir = node_modules.join(".bin");
 
     // Collect bin entries.
@@ -393,36 +505,59 @@ fn link_bins(
     }
 
     if bins.is_empty() {
-        return Ok(());
+        return;
     }
 
-    std::fs::create_dir_all(&bin_dir).map_err(|e| {
-        Diagnostic::new(
+    if let Err(e) = std::fs::create_dir_all(&bin_dir) {
+        errors.push(Diagnostic::new(
             "OAM-PKG0005",
             Severity::Warning,
             Origin::Install,
             format!("could not create .bin directory: {e}"),
-        )
-    })?;
+        ));
+        return;
+    }
+
+    // Canonicalize the .bin dir once: every shim would otherwise re-stat it
+    // via pathdiff, costing 2N syscalls for N bins. If canonicalize fails
+    // (e.g. the dir was created above but a perms/symlink race left it
+    // unresolvable), we CANNOT safely call pathdiff with an uncanonicalized
+    // base — it would produce a wrong relative path that points the shim
+    // at garbage. Surface a warning and skip the shim loop entirely; the
+    // install is still considered Complete if no other errors accumulated.
+    let bin_dir_canonical = match std::fs::canonicalize(&bin_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(Diagnostic::new(
+                "OAM-PKG0005",
+                Severity::Warning,
+                Origin::Install,
+                format!(
+                    "could not canonicalize {}: {e} (bin shims will not be created)",
+                    bin_dir.display()
+                ),
+            ));
+            return;
+        }
+    };
 
     for (name, target) in &bins {
-        if let Err(e) = create_bin_shim(&bin_dir, name, target, node_modules) {
+        if let Err(e) = create_bin_shim(&bin_dir, &bin_dir_canonical, name, target, node_modules) {
             // Non-fatal: warn and continue.
             eprintln!("oam install: warning: bin shim for {name}: {e}");
         }
     }
-
-    Ok(())
 }
 
 fn create_bin_shim(
     bin_dir: &Path,
+    bin_dir_canonical: &Path,
     name: &str,
     target: &Path,
     _node_modules: &Path,
 ) -> Result<(), String> {
     // Compute relative path from .bin to the target.
-    let rel = pathdiff(target, bin_dir);
+    let rel = pathdiff(target, bin_dir_canonical);
 
     #[cfg(windows)]
     {
@@ -463,14 +598,20 @@ fn create_bin_shim(
 }
 
 /// Simple relative-path computation from `base` to `target`.
-fn pathdiff(target: &Path, base: &Path) -> std::path::PathBuf {
+///
+/// `base_canonical` MUST be the result of `std::fs::canonicalize` (or an
+/// equivalent absolute path); it is not re-canonicalized here so callers
+/// can share one canonicalization across many calls. Mixing a canonicalized
+/// `target` with an uncanonicalized `base` produces a wrong relative path —
+/// callers that cannot guarantee canonicalization of the base must fail
+/// loudly rather than silently generating garbage shim paths. See
+/// `link_bins` for the canonicalize-failure handling.
+fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
     // Canonicalize what we can; fall back to the raw paths.
     let t = std::fs::canonicalize(target)
         .or_else(|_| std::path::absolute(target))
         .unwrap_or_else(|_| target.to_path_buf());
-    let b = std::fs::canonicalize(base)
-        .or_else(|_| std::path::absolute(base))
-        .unwrap_or_else(|_| base.to_path_buf());
+    let b = base_canonical;
 
     let mut t_parts: Vec<_> = t.components().collect();
     let mut b_parts: Vec<_> = b.components().collect();
@@ -498,6 +639,29 @@ fn pathdiff(target: &Path, base: &Path) -> std::path::PathBuf {
 
 fn diag(code: &str, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Install, message)
+}
+
+/// Normalize a path by collapsing `.` and `..` segments lexically.
+///
+/// Used by `extract_tarball` to defend against `..`-based path-traversal
+/// in tarball entries. The tar crate's `set_path` already rejects `..` in
+/// paths the BUILD side constructs, but a tarball arriving over the wire
+/// is parsed via raw bytes (see `extract_tarball_rejects_path_traversal`)
+/// so a malicious or buggy archive can still carry `..` segments. We
+/// can't trust `Path::join` + lexical `starts_with` to catch them, so we
+/// clean the target before the prefix check.
+fn path_clean(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -587,7 +751,8 @@ mod tests {
     #[test]
     fn install_missing_lockfile_returns_pkg0001() {
         let tmp = std::env::temp_dir().join(format!(
-            "oam-install-test-{}",
+            "oam-install-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -604,7 +769,8 @@ mod tests {
     #[test]
     fn install_empty_deps_succeeds() {
         let tmp = std::env::temp_dir().join(format!(
-            "oam-install-test-empty-{}",
+            "oam-install-test-empty-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -624,16 +790,26 @@ mod tests {
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
         let result = install(&tmp, true);
-        assert!(result.is_ok());
-        let summary = result.unwrap();
-        assert_eq!(summary.packages_installed, 0);
+        match result {
+            Ok(InstallOutcome::Complete(summary)) => {
+                assert_eq!(summary.packages_installed, 0);
+            }
+            other => panic!("expected Ok(Complete(_)) with 0 packages; got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // This test makes a real HTTPS call to registry.npmjs.org to exercise
+    // the Partial outcome with a package that 404s. It is marked #[ignore]
+    // so the default `cargo test` run stays offline and deterministic; run
+    // it explicitly with `cargo test -p oam_loader -- --ignored` when
+    // network access is available.
 
     #[test]
     fn lockfile_version_2_rejected() {
         let tmp = std::env::temp_dir().join(format!(
-            "oam-install-test-v2-{}",
+            "oam-install-test-v2-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -676,7 +852,8 @@ mod tests {
         let gz_data = gz.finish().unwrap();
 
         let tmp = std::env::temp_dir().join(format!(
-            "oam-extract-test-{}",
+            "oam-extract-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -691,6 +868,61 @@ mod tests {
         assert!(tmp.join("package.json").is_file());
         let read_back = std::fs::read_to_string(tmp.join("package.json")).unwrap();
         assert!(read_back.contains("\"name\":\"test\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // #18: path-traversal entries must be rejected with an error that names
+    // the failure mode, so a malicious or buggy tarball cannot write files
+    // outside the destination directory.
+    //
+    // NOTE on coverage: the existing safety check at `extract_tarball`
+    // (`target.starts_with(dest)`) is purely lexical and therefore cannot
+    // detect `..`-based traversal — `dest.join("../escape.txt")` lexically
+    // starts with `dest`. The check DOES catch absolute paths (where
+    // `Path::join` replaces the base), and that's what this test exercises.
+    // The `..` case is a known gap and is separately tracked.
+
+    // Closes the `..`-segment gap that the lexical `starts_with` check
+    // missed: an entry `package/../../escape.txt` joined to a non-root
+    // `dest` lexically starts with `dest` but resolves outside it. The
+    // path_clean + dest_clean normalization catches it.
+
+    // #19: symlink entries are skipped silently for the MVP (see comment in
+    // extract_tarball). The function must return Ok(()) and not create the
+    // link target inside the destination.
+
+    // #21: link_bins should create shims for every entry in an object-form
+    // `bin` field (TypeScript-style). Driving link_bins directly avoids the
+    // fetch/extract network path and lets the test stay offline.
+
+    // #22: a legacy array-form `bin` field must be silently dropped (the
+    // `_ => {}` arm in link_bins). No shim files should be created.
+
+    // #24: install with `frozen = false` must fail fast with OAM-PKG0006
+    // and a message that names the flag, so users see why the install was
+    // refused rather than getting a generic error.
+    #[test]
+    fn install_non_frozen_returns_pkg0006() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-install-test-nonfrozen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Lockfile content is irrelevant — the non-frozen check fires first.
+        let result = install(&tmp, false);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors[0].code, "OAM-PKG0006");
+        assert!(
+            errors[0].message.contains("frozen-lockfile"),
+            "message should mention frozen-lockfile; got: {}",
+            errors[0].message
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

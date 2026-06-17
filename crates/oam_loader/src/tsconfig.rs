@@ -15,15 +15,19 @@
 //! before serde sees it.
 
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
-/// Dedupe the bare-package-extends warning: `load_for` has no cache and is
-/// called per-resolve, so an un-deduped eprintln would fire N times for a
-/// project with N resolves. Insert returns true the first time a given
-/// tsconfig path warns -- gate the eprintln on that.
+use crate::resolver::Resolver;
+
+/// Dedupe the bare-package-extends warning: `load_for` is called per-resolve,
+/// so an un-deduped eprintln would fire N times for a project with N resolves.
+/// `Mutex<HashSet>` gives at-most-once-per-path warn behavior across threads.
+/// Insert returns true the first time a given tsconfig path warns -- gate the
+/// eprintln on that.
 fn warned_bare_extends() -> &'static Mutex<HashSet<PathBuf>> {
+    use std::sync::OnceLock;
     static SET: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     SET.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -55,16 +59,14 @@ struct RawCompilerOptions {
     paths: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-/// Cache of tsconfig.json path -> parsed PathsConfig (or None if no paths).
-/// Avoids re-reading and re-parsing tsconfig.json on every resolve call.
-fn tsconfig_cache() -> &'static Mutex<HashMap<PathBuf, Option<PathsConfig>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<PathsConfig>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Walk up from `referrer` to the nearest tsconfig.json and load its
 /// effective paths. None = no tsconfig or no paths configured.
-pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
+///
+/// `resolver` owns the per-resolver tsconfig cache, so a user with a
+/// long-lived `Resolver` (CLI tool, daemon) can call
+/// `resolver.clear_caches()` to drop stale entries when the project layout
+/// changes (e.g. after `oam install` writes a new `node_modules/`).
+pub(crate) fn load_for_with(resolver: &Resolver, referrer: &Path) -> Option<PathsConfig> {
     let mut dir = if referrer.is_dir() {
         referrer.to_path_buf()
     } else {
@@ -73,7 +75,8 @@ pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
     loop {
         let candidate = dir.join("tsconfig.json");
         if candidate.is_file() {
-            let mut cache = tsconfig_cache()
+            let mut cache = resolver
+                .tsconfigs()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.get(&candidate) {
@@ -87,6 +90,12 @@ pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
             return None;
         }
     }
+}
+
+/// Shim: load tsconfig paths for `referrer` using the thread-local default
+/// `Resolver`. Existing callers (and tests) keep working unchanged.
+pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
+    load_for_with(crate::resolver::default_resolver(), referrer)
 }
 
 /// Load a tsconfig and merge its relative `extends` chain (child wins;

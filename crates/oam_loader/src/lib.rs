@@ -22,8 +22,10 @@ use oxc_allocator::Allocator;
 
 pub mod install;
 mod npm;
+mod resolver;
 mod tsconfig;
 pub use npm::{ModuleKind, module_kind, resolve_require};
+pub use resolver::{Resolver, default_resolver};
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -118,145 +120,35 @@ fn to_odif(
 
 /// Resolve an import specifier as written in the module at `referrer`.
 ///
-/// Relative + absolute paths: candidate order for './x' is exact (if it has
-/// an extension), TS-source fallback for JS extensions ('./x.js' -> x.ts,
-/// the tsgo rewrite convention), then extensionless probing (.ts, .mts, .js,
-/// .mjs) and directory index (index.ts, index.js).
-///
-/// Bare specifiers resolve via tsconfig paths (if a tsconfig.json is found
-/// in the referrer's ancestor tree) then the Node ESM node_modules walk.
-///
-/// `node:` / `oam:` specifiers resolve to virtual builtin paths.
-/// `node:`-prefixed builtins not yet in wave 1 surface OAM-MOD0006.
+/// This is a thin shim over `Resolver::resolve_import` routed through the
+/// current thread's default `Resolver`. Long-lived consumers (CLI tools,
+/// daemons) should construct their own `Resolver` and call
+/// `resolver.resolve_import(...)` on it, so they can drop stale cache entries
+/// via `clear_caches()` when the project layout changes.
 pub fn resolve_import(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
-    // Shapes that are invalid as ESM specifiers everywhere — npm resolution
-    // will never fix these, so they get their own diagnostic, not MOD0002.
-    if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\') {
-        return Err(Diagnostic::new(
-            "OAM-MOD0004",
-            Severity::Error,
-            Origin::Resolve,
-            format!(
-                "invalid module specifier '{specifier}' in {}: use './name' / '../name' with forward slashes",
-                referrer.display()
-            ),
-        ));
-    }
-
-    let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
-    let is_root_relative = specifier.starts_with('/');
-    if !is_relative && !is_root_relative && !Path::new(specifier).is_absolute() {
-        // Builtins bypass tsconfig paths entirely: Node guarantees node:
-        // (and bare builtin names) never hit userland resolution, and
-        // require() in the same project would disagree otherwise — two
-        // identities for 'fs' in one run. oam: runtime modules get the
-        // same guarantee.
-        if specifier.starts_with("node:")
-            || specifier.starts_with("oam:")
-            || npm::is_node_builtin(specifier)
-        {
-            return npm::resolve_bare(specifier, referrer, npm::ResolveMode::Import);
-        }
-        // Bare specifier: tsconfig paths get first crack (plan §2.6 — the
-        // resolver honors tsconfig exactly as tsgo does), then the Node ESM
-        // node_modules walk.
-        let mut consulted_paths = false;
-        if let Some(config) = tsconfig::load_for(referrer) {
-            consulted_paths = true;
-            for raw in tsconfig::match_specifier(&config, specifier) {
-                if let (Some(found), _) = probe_candidates(&raw) {
-                    return Ok(found);
-                }
-            }
-        }
-        return npm::resolve_bare(specifier, referrer, npm::ResolveMode::Import).map_err(
-            |mut failure| {
-                if consulted_paths && failure.code == "OAM-MOD0002" {
-                    failure
-                        .message
-                        .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
-                }
-                failure
-            },
-        );
-    }
-
-    let raw = if is_relative {
-        let base = referrer.parent().unwrap_or_else(|| Path::new("."));
-        base.join(specifier)
-    } else if is_root_relative && !Path::new(specifier).is_absolute() {
-        // Windows: '/x' is drive-relative — anchor it at the referrer's root
-        // so behavior matches POSIX ('/' = filesystem root of the referrer).
-        let mut root: PathBuf = referrer
-            .components()
-            .take_while(|c| {
-                matches!(
-                    c,
-                    std::path::Component::Prefix(_) | std::path::Component::RootDir
-                )
-            })
-            .collect();
-        root.push(specifier.trim_start_matches('/'));
-        root
-    } else {
-        PathBuf::from(specifier)
-    };
-
-    let (found, candidates) = probe_candidates(&raw);
-    found.ok_or_else(|| {
-        Diagnostic::new(
-            "OAM-MOD0001",
-            Severity::Error,
-            Origin::Resolve,
-            format!(
-                "cannot resolve '{specifier}' from {} (tried {})",
-                referrer.display(),
-                candidates
-                    .iter()
-                    .map(|c| c.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )
-    })
-}
-
-/// Negative probe cache: remembers paths confirmed to NOT exist so repeated
-/// resolves of the same specifier skip redundant `is_file()` stat calls.
-fn negative_probe_cache() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+    default_resolver().resolve_import(specifier, referrer)
 }
 
 /// Check if a candidate path is a file, consulting the negative cache first.
 /// On miss from `is_file()`, insert into the negative set. On hit, remove
 /// from the negative set (in case a file was created since last check).
-fn is_file_cached(path: &Path) -> bool {
-    {
-        let neg = negative_probe_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if neg.contains(path) {
-            return false;
-        }
-    }
-    if path.is_file() {
-        // File exists -- remove from negative cache if present (file may
-        // have been created since last check).
-        let mut neg = negative_probe_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        neg.remove(path);
-        true
-    } else {
-        let mut neg = negative_probe_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        neg.insert(path.to_path_buf());
-        false
-    }
+fn is_file_cached(resolver: &Resolver, path: &Path) -> bool {
+    resolver.is_file_cached(path)
+}
+
+/// True for TypeScript / JS declaration files. These are types-only and
+/// must never be treated as runtime entry points -- loading one as JS is
+/// always wrong. Suffix-based so the match survives odd casings and
+/// platform separators.
+fn is_declaration_file(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".d.ts")
+        || name.ends_with(".d.mts")
+        || name.ends_with(".d.cts")
+        || name.ends_with(".d.tsx")
+        || name.ends_with(".d.jsx")
 }
 
 /// Probe a raw path for the actual module file. Candidate order: exact,
@@ -264,7 +156,7 @@ fn is_file_cached(path: &Path) -> bool {
 /// directory index. Appending (not with_extension) keeps dotted basenames
 /// intact: './my.module' probes 'my.module.ts', never clobbers the
 /// '.module' segment. Returns (found-absolute, every candidate tried).
-fn probe_candidates(raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
+pub(crate) fn probe_candidates(resolver: &Resolver, raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     fn append_ext(p: &Path, ext: &str) -> PathBuf {
         let mut s = p.as_os_str().to_os_string();
         s.push(".");
@@ -289,10 +181,14 @@ fn probe_candidates(raw: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
             }
         }
     }
+    // Declaration files are types-only; they must never resolve as a runtime
+    // entry point. './types' -> 'types.d.ts' would otherwise match and the
+    // engine would try to load the .d.ts as a JS module.
+    candidates.retain(|p| !is_declaration_file(p));
 
     let found = candidates
         .iter()
-        .find(|c| is_file_cached(c))
+        .find(|c| is_file_cached(resolver, c))
         .map(|c| std::path::absolute(c).unwrap_or_else(|_| c.clone()));
     (found, candidates)
 }
