@@ -47,6 +47,7 @@ pub trait ModuleHost {
 ///  - `tick`, `repl_eval`, `execute_script`, and `run_registered_tests` clear
 ///    to `None` at their head -- they accept JS that may call `import()` but
 ///    have no host of their own.
+///
 /// If a new JS-running entry point is added, it MUST clear this slot before
 /// running any JS, or `dynamic_import_callback` will deref a stale pointer.
 struct ActiveHost(Option<*const (dyn ModuleHost + 'static)>);
