@@ -2801,6 +2801,55 @@ fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
     );
 }
 
+// The native undici-API shim (shadowing the npm package): `import 'undici'`
+// gives fetch/request/stream/Agent/dispatchers backed by oam's fetch. Drives
+// request (GET + POST body echo, body.json()/body.text()), stream into a
+// Writable, fetch delegation, and Agent construction, against an in-process
+// node:http server.
+#[test]
+fn undici_shim_request_stream_fetch_over_http() {
+    let main = write_temp(
+        "undici_shim/main.mjs",
+        "import http from 'node:http';\n\
+         import { request, stream, fetch as ufetch, Agent, getGlobalDispatcher } from 'undici';\n\
+         import { Writable } from 'node:stream';\n\
+         const server = http.createServer((req, res) => {\n\
+           const chunks = [];\n\
+           req.on('data', (c) => chunks.push(c));\n\
+           req.on('end', () => {\n\
+             res.writeHead(req.method === 'POST' ? 201 : 200, { 'content-type': 'application/json', 'x-echo': req.method });\n\
+             res.end(JSON.stringify({ method: req.method, url: req.url, got: Buffer.concat(chunks).toString() }));\n\
+           });\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const g = await request(`${base}/j`);\n\
+         const gj = await g.body.json();\n\
+         console.log('get', g.statusCode === 200 && g.headers['x-echo'] === 'GET' && gj.url === '/j');\n\
+         const p = await request(`${base}/p`, { method: 'POST', body: 'hi-undici' });\n\
+         const pj = JSON.parse(await p.body.text());\n\
+         console.log('post', p.statusCode === 201 && pj.got === 'hi-undici');\n\
+         let streamed = '';\n\
+         const sink = new Writable({ write(c, e, cb) { streamed += c.toString(); cb(); } });\n\
+         await stream(`${base}/s`, {}, () => sink);\n\
+         console.log('stream', streamed.includes('\\\"method\\\":\\\"GET\\\"'));\n\
+         const f = await ufetch(`${base}/f`);\n\
+         console.log('fetch', f.status === 200 && (await f.json()).url === '/f');\n\
+         const a = new Agent({ connect: { lookup: () => {} } });\n\
+         console.log('agent', typeof a.request === 'function' && getGlobalDispatcher() != null);\n\
+         server.close();\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("get true"), "{stdout}");
+    assert!(stdout.contains("post true"), "{stdout}");
+    assert!(stdout.contains("stream true"), "{stdout}");
+    assert!(stdout.contains("fetch true"), "{stdout}");
+    assert!(stdout.contains("agent true"), "{stdout}");
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(

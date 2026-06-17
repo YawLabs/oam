@@ -303,6 +303,18 @@ fn resolve_subpath_import(
     resolve_bare(&target, &pkg_dir.join("__oam_subpath_anchor"), mode)
 }
 
+/// npm packages oam provides NATIVELY, shadowing any installed copy. They
+/// resolve to the matching `oam:` virtual builtin before the node_modules
+/// walk (the Bun/Deno approach). `undici` is shadowed because the real
+/// package cannot load on oam (it pulls node:sqlite + a WASM HTTP stack) and
+/// adds nothing over oam's web-standard fetch.
+fn shadowed_builtin(specifier: &str) -> Option<&'static str> {
+    match specifier {
+        "undici" => Some("oam:undici"),
+        _ => None,
+    }
+}
+
 /// Resolve a bare specifier from `referrer` against node_modules.
 pub(crate) fn resolve_bare(
     specifier: &str,
@@ -316,6 +328,12 @@ pub(crate) fn resolve_bare(
     // node_modules (#xxx would never match a bare package name there).
     if specifier.starts_with('#') {
         return resolve_subpath_import(specifier, referrer, mode);
+    }
+
+    // Natively-shadowed packages (undici, ...) resolve to their oam: virtual
+    // builtin, ahead of any installed node_modules copy.
+    if let Some(virt) = shadowed_builtin(specifier) {
+        return Ok(PathBuf::from(virt));
     }
 
     // oam: runtime modules. Same virtual-path mechanism as node: builtins;
