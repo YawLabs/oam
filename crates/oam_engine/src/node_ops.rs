@@ -3103,6 +3103,7 @@ fn op_os_free_mem(
 fn os_release() -> String {
     #[repr(C)]
     #[allow(non_snake_case)]
+    #[allow(clippy::upper_case_acronyms)]
     struct OSVERSIONINFOW {
         dwOSVersionInfoSize: u32,
         dwMajorVersion: u32,
@@ -3144,6 +3145,7 @@ fn os_release() -> String {
 #[cfg(windows)]
 #[repr(C)]
 #[allow(non_snake_case)]
+#[allow(clippy::upper_case_acronyms)]
 struct MEMORYSTATUSEX {
     dwLength: u32,
     dwMemoryLoad: u32,
@@ -3641,6 +3643,7 @@ fn op_process_cpu_usage(
 #[cfg(windows)]
 fn cpu_usage_us() -> (u64, u64) {
     #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)]
     struct FILETIME {
         lo: u32,
         hi: u32,
