@@ -37,9 +37,18 @@ pub trait ModuleHost {
 /// zero-capture `dynamic_import_callback` can resolve+load on demand the same
 /// way the static graph does. The pointer is valid ONLY while `execute_module`
 /// is on the stack (the host is borrowed for that whole call, and the callback
-/// can only fire synchronously during the module evaluation it drives). Entry
-/// points that run JS WITHOUT a host (tick/repl_eval) set this to `None` so a
-/// dynamic import there rejects cleanly instead of dereferencing a stale ptr.
+/// can only fire synchronously during the module evaluation it drives).
+///
+/// SAFETY contract -- enforced by EVERY entry point that runs JS on the
+/// isolate:
+///  - `execute_module` parks `Some(host_ptr)` and clears to `None` on return.
+///  - `reset_run_slots` clears to `None` -- this is the inheritance path for
+///    `execute_cjs` and `execute_worker` (both call `reset_run_slots` first).
+///  - `tick`, `repl_eval`, `execute_script`, and `run_registered_tests` clear
+///    to `None` at their head -- they accept JS that may call `import()` but
+///    have no host of their own.
+/// If a new JS-running entry point is added, it MUST clear this slot before
+/// running any JS, or `dynamic_import_callback` will deref a stale pointer.
 struct ActiveHost(Option<*const (dyn ModuleHost + 'static)>);
 
 #[derive(Default)]
@@ -271,7 +280,20 @@ fn rt_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
 impl JsRuntime {
     /// Reset all per-run isolate slots. Shared by the ESM and CJS entry
     /// paths.
+    /// Clear the dynamic-import host slot. Called by every JS-running entry
+    /// point that has no host of its own (execute_script, repl_eval, tick,
+    /// run_registered_tests). See the `ActiveHost` SAFETY note for why.
+    pub(crate) fn clear_active_host(&mut self) {
+        self.isolate.set_slot(ActiveHost(None));
+    }
+
     pub(crate) fn reset_run_slots(&mut self) -> Result<(), Vec<Diagnostic>> {
+        // Clear any host pointer parked by a prior execute_module on this same
+        // JsRuntime. execute_cjs and execute_worker both call reset_run_slots
+        // before running JS, so this single clear covers both -- a dynamic
+        // import from CJS/worker code rejects cleanly instead of dereffing a
+        // stale ptr. execute_module re-parks Some(ptr) right after this returns.
+        self.isolate.set_slot(ActiveHost(None));
         self.isolate.set_slot(ModuleMap::default());
         self.isolate.set_slot(RejectionLedger::default());
         self.isolate.set_slot(UncaughtLedger::default());
@@ -392,7 +414,7 @@ impl JsRuntime {
         let deadline = std::time::Instant::now() + budget;
         // No host on this path: clear any pointer a prior execute_module parked
         // so a dynamic import() during a tick rejects cleanly, never derefs stale.
-        self.isolate.set_slot(ActiveHost(None));
+        self.clear_active_host();
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
@@ -460,7 +482,7 @@ impl JsRuntime {
     pub fn repl_eval(&mut self, source: &str) -> Result<String, String> {
         // No host on the REPL path: clear any parked pointer (defensive; the
         // REPL never calls execute_module, but keep the invariant uniform).
-        self.isolate.set_slot(ActiveHost(None));
+        self.clear_active_host();
         let has_await = source.contains("await");
         let prepared = if has_await {
             // Top-level await: evaluate as an async IIFE and pump until
@@ -580,6 +602,11 @@ impl JsRuntime {
         &mut self,
         filter: Option<&str>,
     ) -> Result<String, Vec<Diagnostic>> {
+        // Test bodies run user JS that can call import(); the host_ptr from
+        // the preceding execute_module is no longer borrow-valid here, so
+        // clear the slot so dynamic_import_callback rejects cleanly instead
+        // of dereferencing a dangling pointer.
+        self.isolate.set_slot(ActiveHost(None));
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
 
@@ -1104,10 +1131,15 @@ fn dyn_import_load(
 ) -> DynResult {
     // Pull the rest of the graph in (idempotent: already-loaded paths skip).
     if let Err(diags) = load_module_graph(tc, host, resolved.clone()) {
-        let msg = diags
-            .first()
-            .map(|d| format!("{}: {}", d.code, d.message))
-            .unwrap_or_else(|| format!("failed to load '{spec}'"));
+        let msg = if diags.is_empty() {
+            format!("failed to load '{spec}'")
+        } else {
+            diags
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
         return DynResult::Error(format!("oam: dynamic import('{spec}'): {msg}"));
     }
 
@@ -1139,6 +1171,15 @@ fn dyn_import_load(
     if module.get_status() == v8::ModuleStatus::Errored {
         return DynResult::Rejected(v8::Global::new(tc, module.get_exception()));
     }
+    // Cycle: the module is currently being evaluated (cycle from itself or a
+    // mutual dynamic-import dependency). Per the import() spec / Node parity,
+    // the dynamic-import promise resolves with the module's PARTIAL namespace,
+    // not "TLA not supported yet" -- the latter is what the post-evaluate
+    // Pending branch below would otherwise report. get_module_namespace() is
+    // safe here: status is >= Instantiated (Evaluating).
+    if module.get_status() == v8::ModuleStatus::Evaluating {
+        return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
+    }
 
     let Some(value) = module.evaluate(tc) else {
         return match dyn_caught_value(tc) {
@@ -1154,21 +1195,30 @@ fn dyn_import_load(
         // value as the namespace fallback rather than failing.
         return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
     };
-    // The module's evaluation promise IS the channel we're feeding into the
-    // import resolver — V8 must not report it separately as an unhandled
-    // rejection, since the user catches/handles the rejection via the
-    // dynamically-imported promise we return.
-    eval_promise.mark_as_handled();
     match eval_promise.state() {
         v8::PromiseState::Fulfilled => {
+            // The module's evaluation promise is the channel we consumed for
+            // the namespace; mark it handled so V8 doesn't ALSO report it as
+            // an unhandled rejection (it was Fulfilled, but a defensive
+            // mark here is symmetric with the Rejected arm).
+            eval_promise.mark_as_handled();
             DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
         }
         v8::PromiseState::Rejected => {
+            // We're consuming the rejection reason into the import promise;
+            // mark the eval promise handled so V8 doesn't also report it as
+            // a separate unhandled rejection (the user catches via the
+            // dynamically-imported promise we return).
+            eval_promise.mark_as_handled();
             DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
         }
         // Synchronous graphs settle within the microtask checkpoint above. A
         // still-pending promise means real top-level await in the imported
-        // module, which needs a nested event-loop pump — a documented follow-up.
+        // module, which needs a nested event-loop pump — a documented
+        // follow-up. We do NOT mark_as_handled here: we're rejecting the
+        // import promise with our own Error and leaving the eval promise
+        // alone, so a later legitimate rejection of the TLA promise still
+        // surfaces as an unhandled rejection (Node parity).
         v8::PromiseState::Pending => DynResult::Error(format!(
             "oam: dynamic import('{spec}') of a module with top-level await is not supported yet"
         )),
@@ -1220,8 +1270,8 @@ pub(crate) fn dynamic_import_callback<'s>(
             scope,
             &resolver,
             &format!(
-                "oam: dynamic import('{spec}') is only supported during module execution, \
-                 not from the REPL or a timer/op callback yet"
+                "oam: dynamic import('{spec}') is not wired up on this entry path — \
+                 use a static import, or call this from within the module-evaluation phase"
             ),
         );
         return Some(promise);

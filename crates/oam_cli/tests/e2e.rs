@@ -2713,6 +2713,94 @@ fn dynamic_import_attributes_match_static_path() {
     assert!(stdout.contains("json_on_nonjson rejected"), "{stdout}");
 }
 
+// A dynamic-import cycle (A dyn-imports B, B dyn-imports A while A is still
+// Evaluating) must resolve to A's PARTIAL namespace -- the bindings B reads
+// from A must be the ones already initialized in A (fromA). Pre-fix oam
+// rejected this cycle with "top-level await not supported yet" because A's
+// eval promise was still pending. Post-fix, dyn_import_load detects the
+// Evaluating status and returns the partial namespace.
+#[test]
+fn dynamic_import_cycle_resolves_to_partial_namespace() {
+    write_temp(
+        "dynimp_cycle/a.mjs",
+        "export const fromA = 'A';\n\
+         export const bResult = await import('./b.mjs');\n\
+         export const after = 'after-await';\n",
+    );
+    write_temp(
+        "dynimp_cycle/b.mjs",
+        // B only reads bindings of A that are ALREADY initialized at the
+        // point B runs (fromA is the only one set before A's TLA suspends).
+        "const a = await import('./a.mjs');\n\
+         export const sawFromA = a && a.fromA === 'A';\n\
+         export const fromB = 'B';\n",
+    );
+    let main = write_temp(
+        "dynimp_cycle/main.mjs",
+        "const a = await import('./a.mjs');\n\
+         const b = a.bResult;\n\
+         console.log('a_fromA', a.fromA === 'A');\n\
+         console.log('a_after', a.after === 'after-await');\n\
+         console.log('b_sawFromA', b && b.sawFromA === true);\n\
+         console.log('b_fromB', b && b.fromB === 'B');\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("a_fromA true"), "{stdout}");
+    assert!(stdout.contains("a_after true"), "{stdout}");
+    assert!(stdout.contains("b_sawFromA true"), "{stdout}");
+    assert!(stdout.contains("b_fromB true"), "{stdout}");
+}
+
+// Regression for the ActiveHost slot-clear contract: a dynamic import() from
+// inside a test body (which runs under run_registered_tests AFTER the entry
+// execute_module returns) must NOT dereference the stale host pointer. Today
+// the underlying UB is invisible because CliHost is a ZST, so the observable
+// signal is the rejection MESSAGE: post-fix the import must be rejected with
+// the "not wired up on this entry path" diagnostic from the None-branch,
+// proving run_registered_tests cleared ActiveHost before running the test
+// body. If that clear regresses, the import would route through the
+// (stale-but-functional-for-ZST) host and reject with a different message
+// (OAM-MOD0001 cannot resolve), failing this assertion.
+#[test]
+fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
+    let main = write_temp(
+        "dynimp_test_host/main.test.mjs",
+        // Console.log the rejection message to stdout so the assertion has a
+        // direct signal; throw inside the test body if the message is wrong,
+        // so a regression makes oam test exit non-zero.
+        "import { test } from 'oam:test';\n\
+         test('cleared host slot from test body', async () => {\n\
+           let msg = 'no-result';\n\
+           try { await import('./peer.mjs'); msg = 'NO-THROW'; }\n\
+           catch (e) { msg = (e && e.message) || 'no-message'; }\n\
+           console.log('reject_message:', msg);\n\
+           if (!msg.includes('not wired up on this entry path')) {\n\
+             throw new Error('wrong rejection: ' + msg);\n\
+           }\n\
+         });\n",
+    );
+    let out = oam(&["test", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // oam test writes runner output to STDERR (file header, pass/fail markers,
+    // summary); STDOUT only carries the test body's console.log lines. The
+    // test body throws if the rejection message regresses, so exit success
+    // already implies the host slot was cleared. The stdout console.log is a
+    // direct visibility check.
+    assert!(out.status.success(), "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>", out.status);
+    assert!(
+        stdout.contains("not wired up on this entry path"),
+        "expected the test body to log the new rejection message: stdout=<<{stdout}>>"
+    );
+    assert!(
+        stderr.contains("1 passed") || stderr.contains("ok") && stderr.contains("cleared host slot"),
+        "expected the test runner to record 1 passed: stderr=<<{stderr}>>"
+    );
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(
