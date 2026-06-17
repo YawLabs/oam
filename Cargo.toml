@@ -138,3 +138,12 @@ strip = "symbols"
 # Fast iterative builds; release perf work (PGO/BOLT) comes with oam-bench.
 [profile.dev.package."*"]
 opt-level = 1
+
+# ada-url vendors amalgamated C++ (deps/ada.cpp) whose helpers are marked
+# __attribute__((always_inline)) (ada.h `ada_really_inline`). GCC 13 refuses
+# always_inline at low opt (the "*" override above is only -O1, still too low
+# for the indirect-call helper is_forbidden_host_code_point), failing the CI
+# build. -O2 lets GCC inline it. 3.4.5 is the newest crate, so there is no
+# version bump to fix this -- the fix is the C++ opt level.
+[profile.dev.package.ada-url]
+opt-level = 2
