@@ -557,7 +557,7 @@ fn is_test_file(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    if !matches!(ext, "ts" | "mts" | "js" | "mjs" | "cjs") {
+    if !matches!(ext, "ts" | "mts" | "cts" | "js" | "mjs" | "cjs") {
         return false;
     }
     let stem = &name[..name.len() - ext.len() - 1];
@@ -611,7 +611,7 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
     let files = discover_test_files(paths);
     if files.is_empty() {
         eprintln!(
-            "oam test: no test files found (looked for *.test.* / *.spec.* / *_test.* with js/ts extensions)"
+            "oam test: no test files found (looked for *.test.* / *.spec.* / *_test.* with js/mjs/cjs/ts/mts/cts extensions)"
         );
         return ExitCode::FAILURE;
     }
@@ -1164,30 +1164,16 @@ fn run_file(
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
 ) -> Result<u8, Vec<Diagnostic>> {
-    match file.extension().and_then(|e| e.to_str()) {
-        Some("cts") => {
-            return Err(vec![Diagnostic::new(
-                "OAM-MOD0003",
-                Severity::Error,
-                Origin::Resolve,
-                format!(
-                    "TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts): {}",
-                    file.display()
-                ),
-            )]);
-        }
-        Some("json") => {
-            return Err(vec![Diagnostic::new(
-                "OAM-MOD0003",
-                Severity::Error,
-                Origin::Resolve,
-                format!(
-                    "a .json file is not a program — import it from a script instead: {}",
-                    file.display()
-                ),
-            )]);
-        }
-        _ => {}
+    if let Some("json") = file.extension().and_then(|e| e.to_str()) {
+        return Err(vec![Diagnostic::new(
+            "OAM-MOD0003",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "a .json file is not a program — import it from a script instead: {}",
+                file.display()
+            ),
+        )]);
     }
     let mut rt = oam_engine::JsRuntime::new();
     // process.argv: [exe, absolute script path, ...script args] — Node's

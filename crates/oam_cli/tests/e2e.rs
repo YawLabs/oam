@@ -2764,7 +2764,11 @@ fn dynamic_import_cycle_resolves_to_partial_namespace() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("a_fromA true"), "{stdout}");
     assert!(stdout.contains("a_after true"), "{stdout}");
     assert!(stdout.contains("b_sawFromA true"), "{stdout}");
@@ -2807,13 +2811,18 @@ fn dynamic_import_from_test_body_rejects_via_cleared_host_slot() {
     // test body throws if the rejection message regresses, so exit success
     // already implies the host slot was cleared. The stdout console.log is a
     // direct visibility check.
-    assert!(out.status.success(), "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: stdout=<<{stdout}>> stderr=<<{stderr}>>",
+        out.status
+    );
     assert!(
         stdout.contains("not wired up on this entry path"),
         "expected the test body to log the new rejection message: stdout=<<{stdout}>>"
     );
     assert!(
-        stderr.contains("1 passed") || stderr.contains("ok") && stderr.contains("cleared host slot"),
+        stderr.contains("1 passed")
+            || stderr.contains("ok") && stderr.contains("cleared host slot"),
         "expected the test runner to record 1 passed: stderr=<<{stderr}>>"
     );
 }
@@ -2859,7 +2868,11 @@ fn undici_shim_request_stream_fetch_over_http() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     assert!(stdout.contains("get true"), "{stdout}");
     assert!(stdout.contains("post true"), "{stdout}");
     assert!(stdout.contains("stream true"), "{stdout}");
@@ -2896,7 +2909,11 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
     // Pin honored: connected to 127.0.0.1 with Host: example.invalid preserved.
     assert!(
         stdout.contains("pin=200:pinned:example.invalid:"),
@@ -3167,6 +3184,54 @@ fn jsx_is_a_clear_diagnostic_not_a_crash() {
 }
 
 #[test]
+fn runs_typescript_commonjs_module() {
+    // .cts: oxc strips TS, then the CJS path executes the resulting JS
+    // (e2e for the gate removal: an entry file in .cts form must run, not
+    // reject with OAM-MOD0003 from the CLI entry).
+    let file = write_temp(
+        "mod.cts",
+        "enum Mode { Fast = 'fast' }\n\
+         const n: number = 6 * 7;\n\
+         console.log(Mode.Fast, n);\n\
+         module.exports = { name: Mode.Fast, value: n };\n",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fast 42");
+}
+
+#[test]
+fn require_of_typescript_commonjs_strips_types() {
+    // .cts reached via require() from a .cjs sibling: the CJS loader must
+    // strip TS types before CompileFunction sees the source. Bad input
+    // surfaces as OAM-MOD0003 (matching the loader's error code), not a
+    // raw V8 SyntaxError.
+    let module = write_temp(
+        "lib.cts",
+        "interface Shape { n: number }\n\
+         const square = (s: Shape): number => s.n * s.n;\n\
+         module.exports = { square };\n",
+    );
+    let entry = write_temp(
+        "main.cjs",
+        "const lib = require('./lib.cts');\n\
+         console.log(lib.square({ n: 6 }));\n",
+    );
+    let out = oam(&["run", entry.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "36");
+    let _ = module;
+}
+
+#[test]
 fn parent_dir_specifiers_dedup_to_one_module_instance() {
     // The same module reached as './b1_x' and '../b1_x' (through a subdir)
     // must instantiate once: side effect printed exactly once.
@@ -3301,13 +3366,19 @@ fn json_modules_from_packages_bom_and_failure_modes() {
 
 #[test]
 fn cts_is_a_clear_diagnostic() {
-    // .cjs runs via interop since M2; .cts (TypeScript-CJS) stays gated.
+    // .cts is now executable: oxc strips TS, the CJS path runs the
+    // resulting JS. A .cts file with an `export` (ESM syntax) inside a
+    // CJS body surfaces as OAM-RT0001 at parse time inside the compiled
+    // function — the test asserts the diagnostic is structured, not that
+    // .cts is rejected at the resolver.
     let file = write_temp("legacy.cts", "export const a: number = 1;");
     let out = oam(&["run", file.to_str().unwrap(), "--json", "--no-check"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
-    assert!(stderr.contains("ESM TypeScript"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("OAM-RT0001") && stderr.contains("Unexpected token 'export'"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -5207,6 +5278,128 @@ console.log('defaultExtractDelta=' + typeof defaultExtractDelta);
     assert_eq!(lines[5], "openai=function");
     assert_eq!(lines[6], "anthropic=function");
     assert_eq!(lines[7], "defaultExtractDelta=function");
+}
+
+#[test]
+fn oam_mcp_module_stdio_transport() {
+    // oam:mcp virtual module: McpServer with stdio transport processes
+    // JSON-RPC messages and dispatches to registered tool handlers.
+    let file = write_temp(
+        "mcp_stdio.ts",
+        r#"import { McpServer } from 'oam:mcp';
+
+const server = new McpServer({ name: 'test-server', version: '0.1.0' });
+
+server.tool('add', {
+  description: 'Add two numbers',
+  parameters: {
+    type: 'object',
+    properties: { a: { type: 'number' }, b: { type: 'number' } },
+    required: ['a', 'b'],
+  },
+  handler: ({ a, b }: { a: number; b: number }) => ({
+    content: [{ type: 'text', text: String(a + b) }],
+  }),
+});
+
+server.tool('greet', {
+  description: 'Greet someone',
+  parameters: {
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name'],
+  },
+  handler: ({ name }: { name: string }) => `Hello, ${name}!`,
+});
+
+server.serve({ transport: 'stdio' });
+"#,
+    );
+
+    let messages = [
+        // Pre-init request: should be rejected with -32002.
+        r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":3,"b":4}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"greet","arguments":{"name":"World"}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bogus","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#,
+    ];
+    let stdin_data = messages.join("\n") + "\n";
+
+    let cache = write_temp("oam-cache-mcp/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", file.to_str().unwrap()])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(stdin_data.as_bytes());
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("oam binary runs");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "oam:mcp stdio test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let responses: Vec<serde_json::Value> = stdout
+        .trim()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    // 7 responses (notification produces none).
+    assert_eq!(
+        responses.len(),
+        7,
+        "expected 7 JSON-RPC responses, got {}: {stdout}",
+        responses.len()
+    );
+
+    // 0. pre-init tools/list => -32002 "server not initialized"
+    assert_eq!(responses[0]["error"]["code"], -32002);
+
+    // 1. initialize
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(responses[1]["result"]["serverInfo"]["name"], "test-server");
+    assert!(responses[1]["result"]["capabilities"]["tools"].is_object());
+
+    // 2. tools/list (after init)
+    let tools = responses[2]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "add");
+    assert_eq!(tools[1]["name"], "greet");
+
+    // 3. tools/call add => "7"
+    assert_eq!(responses[3]["result"]["content"][0]["text"], "7");
+
+    // 4. tools/call greet => string auto-wrapped
+    assert_eq!(
+        responses[4]["result"]["content"][0]["text"],
+        "Hello, World!"
+    );
+
+    // 5. unknown tool => error
+    assert_eq!(responses[5]["error"]["code"], -32602);
+
+    // 6. ping => empty result
+    assert!(responses[6]["result"].is_object());
 }
 
 #[test]

@@ -222,17 +222,7 @@ pub(crate) fn load_cjs<'s>(
         return Some(exports_value);
     }
 
-    // .cts would execute as raw TypeScript here — gate it with a clear
-    // pointer until a TS-to-CJS transform exists (if ever; .ts is ESM).
-    if key.extension().and_then(|e| e.to_str()) == Some("cts") {
-        throw_error(
-            scope,
-            &format!(
-                "{file}: TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts)"
-            ),
-        );
-        return None;
-    }
+    let is_cts = key.extension().and_then(|e| e.to_str()) == Some("cts");
 
     let source = match std::fs::read_to_string(&key) {
         Ok(source) => source,
@@ -240,6 +230,25 @@ pub(crate) fn load_cjs<'s>(
             throw_error(scope, &format!("cannot read {file}: {e}"));
             return None;
         }
+    };
+
+    // .cts: oxc strips TS syntax and emits plain JS, same path .ts uses for
+    // ESM. The resulting source is fed to CompileFunction below as CJS.
+    let source = if is_cts {
+        match oam_loader::transpile_typescript(&key, &source) {
+            Ok(stripped) => stripped,
+            Err(failure) => {
+                let first = failure
+                    .diagnostics
+                    .first()
+                    .map(|d| d.message.as_str())
+                    .unwrap_or("TypeScript parse/transform error");
+                throw_error_with_code(scope, "OAM-MOD0003", &format!("{file}: {first}"));
+                return None;
+            }
+        }
+    } else {
+        source
     };
 
     // The module object, cached BEFORE execution so cycles see partials.
