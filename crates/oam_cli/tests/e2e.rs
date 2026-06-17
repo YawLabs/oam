@@ -2867,6 +2867,45 @@ fn undici_shim_request_stream_fetch_over_http() {
     assert!(stdout.contains("agent true"), "{stdout}");
 }
 
+// An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
+// (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
+// NON-resolvable host to the server's real IP -- the request must connect
+// (Host preserved); the control without the dispatcher must fail to resolve.
+#[test]
+fn undici_dispatcher_connect_lookup_pins_dns() {
+    let main = write_temp(
+        "undici_pin/main.mjs",
+        "import http from 'node:http';\n\
+         import { Agent } from 'undici';\n\
+         const server = http.createServer((req, res) => { res.writeHead(200); res.end('pinned:' + req.headers.host); });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]) } });\n\
+         let pinned = 'none';\n\
+         try {\n\
+           const res = await fetch(`http://example.invalid:${port}/`, { dispatcher: agent });\n\
+           pinned = res.status + ':' + (await res.text());\n\
+         } catch (e) { pinned = 'ERR:' + e.message; }\n\
+         console.log('pin=' + pinned);\n\
+         let control = 'none';\n\
+         try { await fetch(`http://example.invalid:${port}/`); control = 'resolved'; }\n\
+         catch { control = 'failed'; }\n\
+         console.log('control=' + control);\n\
+         server.close();\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    // Pin honored: connected to 127.0.0.1 with Host: example.invalid preserved.
+    assert!(
+        stdout.contains("pin=200:pinned:example.invalid:"),
+        "expected the pinned request to connect with Host preserved: {stdout}"
+    );
+    // Control proves the pin was load-bearing: the unpinned request can't resolve.
+    assert!(stdout.contains("control=failed"), "{stdout}");
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(
