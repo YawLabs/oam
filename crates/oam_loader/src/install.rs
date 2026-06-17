@@ -279,7 +279,11 @@ fn fetch_and_extract(
     integrity: Option<&str>,
     dest: &Path,
 ) -> Result<(), String> {
-    let data = download_with_retry(rt, client, url, 1)?;
+    // Retry up to 3 times: registry CDNs see transient 5xx and TLS resets on
+    // CI runners; npm itself defaults to 5. One retry (the original) gave up
+    // too easily for flaky-network environments without adding meaningful
+    // resilience over zero retries.
+    let data = download_with_retry(rt, client, url, 3)?;
 
     if let Some(sri) = integrity {
         verify_integrity(&data, sri)?;

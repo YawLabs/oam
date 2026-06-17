@@ -138,17 +138,21 @@ fn is_file_cached(resolver: &Resolver, path: &Path) -> bool {
 
 /// True for TypeScript / JS declaration files. These are types-only and
 /// must never be treated as runtime entry points -- loading one as JS is
-/// always wrong. Suffix-based so the match survives odd casings and
-/// platform separators.
+/// always wrong. Suffix-based so the match survives platform separators
+/// (path components are stripped via `file_name()` first). The compare is
+/// case-insensitive: Windows filesystems are case-insensitive at the OS
+/// level (a literal `FOO.D.TS` on disk would otherwise slip through and
+/// load as runtime), so we lowercase the basename before matching.
 fn is_declaration_file(p: &Path) -> bool {
     let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    name.ends_with(".d.ts")
-        || name.ends_with(".d.mts")
-        || name.ends_with(".d.cts")
-        || name.ends_with(".d.tsx")
-        || name.ends_with(".d.jsx")
+    let lc = name.to_ascii_lowercase();
+    lc.ends_with(".d.ts")
+        || lc.ends_with(".d.mts")
+        || lc.ends_with(".d.cts")
+        || lc.ends_with(".d.tsx")
+        || lc.ends_with(".d.jsx")
 }
 
 /// Probe a raw path for the actual module file. Candidate order: exact,

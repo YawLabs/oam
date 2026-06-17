@@ -823,10 +823,15 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
             for d in &errors {
                 render(d, json);
             }
-            if errors.is_empty() {
-                ExitCode::SUCCESS
-            } else {
+            // Only Severity::Error diagnostics fail the install -- a
+            // bin-shim PKG0005 (Severity::Warning) is informational and
+            // matches npm behavior of warning + exit 0. install.rs emits
+            // PKG0005 with Severity::Warning explicitly.
+            let has_fatal = errors.iter().any(|d| d.severity == Severity::Error);
+            if has_fatal {
                 ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
             }
         }
         Err(diagnostics) => {
