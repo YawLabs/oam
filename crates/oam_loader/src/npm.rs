@@ -535,21 +535,44 @@ fn resolve_in_package(
         })?
     } else {
         // Legacy entry (per mode — see module docs) falling back to index.js.
-        let entry = mode
-            .entry_fields()
-            .iter()
-            .find_map(|field| manifest.get(*field).and_then(Value::as_str))
-            .unwrap_or("index.js");
-        let raw = package_dir.join(entry);
-        mode.probe(&raw).ok_or_else(|| {
-            diag(
-                "OAM-MOD0002",
-                format!(
-                    "package {package} entry '{entry}' does not resolve to a file under {}",
-                    package_dir.display()
-                ),
-            )
-        })?
+        // The import-side `module`-field preference (the bundler ESM build)
+        // only wins if the file it points at actually CLASSIFIES as ESM. A
+        // package like turndown ships `module: ./x.es.js` + `main: ./x.cjs.js`
+        // with no `type: module`, so `x.es.js` (an ESM file) classifies as CJS
+        // and running it as CJS dies on `export`. In that contradiction we
+        // fall through to `main` (the CJS build), which loads via interop --
+        // matching Node, which ignores `module` entirely.
+        let mut chosen: Option<(&str, PathBuf)> = None;
+        for field in mode.entry_fields() {
+            let Some(entry) = manifest.get(*field).and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(found) = mode.probe(&package_dir.join(entry)) else {
+                continue;
+            };
+            if *field == "module" && module_kind(&found) == ModuleKind::Cjs {
+                // `module` promised ESM but the file is CJS -> skip to `main`.
+                continue;
+            }
+            chosen = Some((entry, found));
+            break;
+        }
+        match chosen {
+            Some((_, found)) => found,
+            None => {
+                // No usable declared entry: fall back to index.js probing.
+                let raw = package_dir.join("index.js");
+                mode.probe(&raw).ok_or_else(|| {
+                    diag(
+                        "OAM-MOD0002",
+                        format!(
+                            "package {package} has no resolvable entry (main/module/index) under {}",
+                            package_dir.display()
+                        ),
+                    )
+                })?
+            }
+        }
     };
     Ok(resolved)
 }
@@ -930,6 +953,75 @@ mod tests {
             resolved.ends_with("node_modules/lodash/main.js"),
             "got {resolved:?}"
         );
+    }
+
+    // turndown shape: a dual package with `module: ./x.es.js` (ESM content,
+    // but no `type: module` so it CLASSIFIES as CJS) + `main: ./x.cjs.js`.
+    // The import-side `module` preference must NOT pick x.es.js (running an
+    // ESM file as CJS dies on `export`); it falls through to the CJS main.
+    #[test]
+    fn import_skips_module_field_when_it_classifies_as_cjs() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-dual-cjs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("node_modules/turndownish");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&json!({
+                "name": "turndownish",
+                "main": "lib/t.cjs.js",
+                "module": "lib/t.es.js",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        std::fs::write(pkg.join("lib/t.cjs.js"), "module.exports = {};").unwrap();
+        std::fs::write(pkg.join("lib/t.es.js"), "export default {};").unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let resolved = resolve_bare("turndownish", &entry, ResolveMode::Import).unwrap();
+        assert!(
+            resolved.ends_with("lib/t.cjs.js"),
+            "module field points at a CJS-classified .es.js -> must fall to CJS main; got {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The `module`-field ESM preference is preserved where it's VALID: a dual
+    // package whose `module` points at a real ESM file (.mjs) still wins over
+    // the CJS `main` on the import side (the bundler "better build" intent).
+    #[test]
+    fn import_prefers_module_field_when_it_is_real_esm() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-dual-esm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("node_modules/dualmjs");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&json!({
+                "name": "dualmjs",
+                "main": "index.js",
+                "module": "index.mjs",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = {};").unwrap();
+        std::fs::write(pkg.join("index.mjs"), "export default {};").unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let resolved = resolve_bare("dualmjs", &entry, ResolveMode::Import).unwrap();
+        assert!(
+            resolved.ends_with("index.mjs"),
+            "module field points at real ESM (.mjs) -> must be preferred; got {resolved:?}"
+        );
+        // Require side ignores `module` entirely (Node parity): uses main.
+        let cjs_entry = dir.join("entry.cjs");
+        std::fs::write(&cjs_entry, "").unwrap();
+        let req = resolve_bare("dualmjs", &cjs_entry, ResolveMode::Require).unwrap();
+        assert!(req.ends_with("index.js"), "require uses main; got {req:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
