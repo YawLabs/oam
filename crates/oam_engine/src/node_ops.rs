@@ -2829,7 +2829,7 @@ fn op_spawn_async(
             Ok((child, pid)) => {
                 let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut guard = children2.lock().unwrap_or_else(|e| e.into_inner());
-                guard.insert(handle, oam_core::child::ChildProcess { child, pid });
+                guard.insert(handle, oam_core::child::ChildProcess::new(child, pid));
                 let json = serde_json::json!({ "handle": handle, "pid": pid });
                 oam_core::OpOutcome::Json(json.to_string())
             }
@@ -2844,11 +2844,22 @@ fn op_spawn_kill(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = core_runtime!(scope)
-        .children();
-    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cp) = guard.get_mut(&handle) {
-        let _ = cp.child.start_kill();
+    let signal = arg_kill_signal(scope, &args, 1);
+    let children = core_runtime!(scope).children();
+    oam_core::child::child_kill(&children, handle, signal);
+}
+
+/// Extract an optional signal-name string argument (e.g. "SIGTERM").
+fn arg_kill_signal(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    idx: i32,
+) -> Option<String> {
+    let v = args.get(idx);
+    if v.is_string() {
+        v.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    } else {
+        None
     }
 }
 
@@ -2996,8 +3007,9 @@ fn op_cluster_worker_kill(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let signal = arg_kill_signal(scope, &args, 1);
     let children = core_runtime!(scope).children();
-    oam_core::cluster::cluster_worker_kill(&children, handle);
+    oam_core::cluster::cluster_worker_kill(&children, handle, signal);
 }
 
 fn op_cluster_is_worker(

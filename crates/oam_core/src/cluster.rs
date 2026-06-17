@@ -26,6 +26,9 @@ pub async fn cluster_fork(
     }
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
+    // Reap workers if the primary's runtime drops -- Node leaves orphans, but
+    // here a leaked worker would outlive its only manager (and wedge tests).
+    cmd.kill_on_drop(true);
 
     #[cfg(windows)]
     {
@@ -37,7 +40,7 @@ pub async fn cluster_fork(
             let pid = child.id().unwrap_or(0);
             let handle = ids.fetch_add(1, Ordering::Relaxed);
             let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-            guard.insert(handle, super::child::ChildProcess { child, pid });
+            guard.insert(handle, super::child::ChildProcess::new(child, pid));
             OpOutcome::Json(
                 serde_json::json!({
                     "handle": handle,
@@ -55,11 +58,8 @@ pub async fn cluster_worker_wait(children: ChildRegistry, handle: u64) -> OpOutc
     super::child::child_wait(children, handle).await
 }
 
-pub fn cluster_worker_kill(children: &ChildRegistry, handle: u64) {
-    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cp) = guard.get_mut(&handle) {
-        let _ = cp.child.start_kill();
-    }
+pub fn cluster_worker_kill(children: &ChildRegistry, handle: u64, signal: Option<String>) {
+    super::child::child_kill(children, handle, signal);
 }
 
 pub fn cluster_is_worker() -> bool {

@@ -9280,6 +9280,7 @@
         var sock = tls.connect({ host: host, port: port, rejectUnauthorized: false });
         sock.on("error", function(err) { self.emit("error", err); });
         sock.on("secureConnect", function() {
+          var lc = self._headers; // header names already lowercased
           var bodyBuf = null;
           if (self._body.length > 0) {
             var total = 0;
@@ -9288,29 +9289,116 @@
             var off = 0;
             for (var i = 0; i < self._body.length; i++) { bodyBuf.set(self._body[i], off); off += self._body[i].length; }
           }
+          var needsBody = bodyBuf && self.method !== "GET" && self.method !== "HEAD";
+
+          // Request line + headers. Dedupe Host / Content-Length / Connection:
+          // a caller-supplied value wins and is emitted once (two Host or two
+          // Content-Length fields are an RFC 7230 / request-smuggling hazard).
+          // We force a single Connection: close (no keep-alive reuse here).
           var reqStr = self.method + " " + path + " HTTP/1.1\r\n";
-          reqStr += "Host: " + host + "\r\n";
-          var hkeys = Object.keys(self._headers);
-          for (var i = 0; i < hkeys.length; i++) reqStr += hkeys[i] + ": " + self._headers[hkeys[i]] + "\r\n";
-          if (bodyBuf && self.method !== "GET" && self.method !== "HEAD") {
-            reqStr += "Content-Length: " + bodyBuf.length + "\r\n";
+          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : host) + "\r\n";
+          var hkeys = Object.keys(lc);
+          for (var i = 0; i < hkeys.length; i++) {
+            var hk = hkeys[i];
+            if (hk === "host" || hk === "connection" || hk === "content-length") continue;
+            reqStr += hk + ": " + lc[hk] + "\r\n";
+          }
+          if (needsBody) {
+            reqStr += "Content-Length: " + (lc["content-length"] != null ? lc["content-length"] : bodyBuf.length) + "\r\n";
+          } else if (lc["content-length"] != null) {
+            reqStr += "Content-Length: " + lc["content-length"] + "\r\n";
           }
           reqStr += "Connection: close\r\n\r\n";
           sock.write(reqStr);
-          if (bodyBuf && self.method !== "GET" && self.method !== "HEAD") sock.write(bodyBuf);
+          if (needsBody) sock.write(bodyBuf);
 
-          var raw = globalThis.Buffer.alloc(0);
+          // Response parser. Honors Transfer-Encoding: chunked and
+          // Content-Length, falling back to read-to-EOF only when neither is
+          // present. The header buffer is released once headers are parsed, so
+          // body bytes are never retained (no 2x memory / O(n^2) concat).
+          var headerBuf = globalThis.Buffer.alloc(0);
           var headersDone = false;
           var res = null;
+          var bodyMode = "eof";          // "eof" | "length" | "chunked"
+          var remaining = 0;             // bytes left in "length" mode
+          var chunkBuf = globalThis.Buffer.alloc(0);
+          var chunkState = "size";       // "size" | "data" | "crlf" | "done"
+          var chunkRemaining = 0;
+
+          function finishRes() { if (res) { res.push(null); res = null; } }
+
+          function feedBody(buf) {
+            if (!res) return;
+            if (bodyMode === "eof") {
+              if (buf.length > 0) res.push(buf);
+              return;
+            }
+            if (bodyMode === "length") {
+              if (remaining <= 0) { finishRes(); return; }
+              var take = buf.length <= remaining ? buf : buf.slice(0, remaining);
+              if (take.length > 0) res.push(take);
+              remaining -= take.length;
+              if (remaining <= 0) finishRes();
+              return;
+            }
+            // chunked
+            chunkBuf = globalThis.Buffer.concat([chunkBuf, buf]);
+            for (;;) {
+              if (chunkState === "size") {
+                var nl = chunkBuf.indexOf("\r\n");
+                if (nl === -1) return;
+                var sizeLine = chunkBuf.slice(0, nl).toString().trim();
+                var semi = sizeLine.indexOf(";");
+                if (semi !== -1) sizeLine = sizeLine.slice(0, semi);
+                var size = parseInt(sizeLine, 16);
+                chunkBuf = chunkBuf.slice(nl + 2);
+                if (isNaN(size)) {
+                  // Malformed chunk-size line -- surface a parse error rather
+                  // than silently treating it as the 0-terminator.
+                  chunkState = "done";
+                  var perr = new Error("Parse Error: invalid chunk size");
+                  perr.code = "HPE_INVALID_CHUNK_SIZE";
+                  self.emit("error", perr);
+                  finishRes();
+                  return;
+                }
+                if (size === 0) { chunkState = "done"; finishRes(); return; }
+                chunkRemaining = size;
+                chunkState = "data";
+              } else if (chunkState === "data") {
+                if (chunkBuf.length < chunkRemaining) {
+                  if (chunkBuf.length > 0 && res) {
+                    res.push(chunkBuf);
+                    chunkRemaining -= chunkBuf.length;
+                    chunkBuf = globalThis.Buffer.alloc(0);
+                  }
+                  return;
+                }
+                if (chunkRemaining > 0 && res) res.push(chunkBuf.slice(0, chunkRemaining));
+                chunkBuf = chunkBuf.slice(chunkRemaining);
+                chunkRemaining = 0;
+                chunkState = "crlf";
+              } else if (chunkState === "crlf") {
+                if (chunkBuf.length < 2) return;
+                chunkBuf = chunkBuf.slice(2);
+                chunkState = "size";
+              } else {
+                return;
+              }
+            }
+          }
+
           sock.on("data", function(chunk) {
             if (self._aborted) return;
-            raw = globalThis.Buffer.concat([raw, typeof chunk === "string" ? globalThis.Buffer.from(chunk) : chunk]);
+            var b = typeof chunk === "string" ? globalThis.Buffer.from(chunk) : chunk;
             if (!headersDone) {
-              var idx = raw.indexOf("\r\n\r\n");
+              headerBuf = globalThis.Buffer.concat([headerBuf, b]);
+              var idx = headerBuf.indexOf("\r\n\r\n");
               if (idx === -1) return;
               headersDone = true;
-              var headerStr = raw.slice(0, idx).toString();
-              var bodyStart = raw.slice(idx + 4);
+              var headerStr = headerBuf.slice(0, idx).toString();
+              var bodyStart = headerBuf.slice(idx + 4);
+              headerBuf = null;
               var lines = headerStr.split("\r\n");
               var statusParts = lines[0].split(" ");
               var statusCode = parseInt(statusParts[1]) || 200;
@@ -9319,11 +9407,18 @@
               var rawHeaders = [];
               for (var i = 1; i < lines.length; i++) {
                 var colon = lines[i].indexOf(":");
-                if (colon !== -1) {
-                  var k = lines[i].slice(0, colon).trim();
-                  var v = lines[i].slice(colon + 1).trim();
-                  resHeaders[k.toLowerCase()] = v;
-                  rawHeaders.push(k, v);
+                if (colon === -1) continue;
+                var k = lines[i].slice(0, colon).trim();
+                var v = lines[i].slice(colon + 1).trim();
+                var lk = k.toLowerCase();
+                rawHeaders.push(k, v);
+                if (lk === "set-cookie") {
+                  if (Array.isArray(resHeaders[lk])) resHeaders[lk].push(v);
+                  else resHeaders[lk] = [v];
+                } else if (resHeaders[lk] !== undefined) {
+                  resHeaders[lk] = resHeaders[lk] + ", " + v;
+                } else {
+                  resHeaders[lk] = v;
                 }
               }
               res = new Readable({ read: function() {} });
@@ -9332,14 +9427,43 @@
               res.httpVersion = "1.1";
               res.headers = resHeaders;
               res.rawHeaders = rawHeaders;
+              var te = resHeaders["transfer-encoding"];
+              var cl = resHeaders["content-length"];
+              if (te && String(te).toLowerCase().indexOf("chunked") !== -1) {
+                bodyMode = "chunked";
+              } else if (cl !== undefined) {
+                bodyMode = "length";
+                remaining = parseInt(cl, 10) || 0;
+              } else {
+                bodyMode = "eof";
+              }
               self.emit("response", res);
-              if (bodyStart.length > 0) res.push(bodyStart);
+              if (bodyStart.length > 0) feedBody(bodyStart);
+              else if (bodyMode === "length" && remaining <= 0) finishRes();
             } else {
-              if (res) res.push(chunk);
+              feedBody(b);
             }
           });
           sock.on("end", function() {
-            if (res) res.push(null);
+            if (!headersDone) {
+              // Peer closed before a full header block: surface an error rather
+              // than leaving the caller's callback/promise pending forever.
+              var err = new Error("socket hang up");
+              err.code = "ECONNRESET";
+              self.emit("error", err);
+              return;
+            }
+            // Peer closed mid-body before the declared length / chunk terminator
+            // arrived: surface a truncation error instead of ending cleanly
+            // (a short body must not look complete).
+            if ((bodyMode === "length" && remaining > 0) ||
+                (bodyMode === "chunked" && chunkState !== "done")) {
+              var terr = new Error("aborted");
+              terr.code = "ECONNRESET";
+              self.emit("error", terr);
+            }
+            // Flush end-of-stream (covers eof mode and ends the body stream).
+            finishRes();
           });
         });
       }
@@ -9550,13 +9674,32 @@
       }
       kill(signal) {
         if (this._handle != null) {
-          natives.spawnKill(this._handle);
+          natives.spawnKill(this._handle, signal);
           this.killed = true;
         }
         return true;
       }
       ref() { return this; }
       unref() { return this; }
+    }
+
+    // Run `onReady` once the child has spawned, or invoke `callback(err)` if
+    // the spawn fails -- whichever happens first. Prevents deferred stdin
+    // write/final callbacks from dangling forever on a spawn error.
+    function deferUntilSpawn(cp, onReady, callback) {
+      var done = false;
+      var onSpawn = function() {
+        if (done) return; done = true;
+        cp.removeListener("spawnfail", onFail);
+        onReady();
+      };
+      var onFail = function(err) {
+        if (done) return; done = true;
+        cp.removeListener("spawn", onSpawn);
+        callback(err);
+      };
+      cp.once("spawn", onSpawn);
+      cp.once("spawnfail", onFail);
     }
 
     function spawn(command, args, options) {
@@ -9568,23 +9711,23 @@
       cp.stderr = new Readable({ read() {} });
       cp.stdin = new Writable({
         write(chunk, encoding, callback) {
+          const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+          const doWrite = () => natives.spawnWrite(cp._handle, data).then(() => callback(), (err) => callback(err));
           if (cp._handle === null) {
-            cp.once("spawn", () => {
-              natives.spawnWrite(cp._handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
-                .then(() => callback(), (err) => callback(err));
-            });
+            // spawn not resolved yet: settle on whichever lands first so a
+            // spawn failure never leaves this write callback dangling.
+            deferUntilSpawn(cp, doWrite, callback);
             return;
           }
-          natives.spawnWrite(cp._handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
-            .then(() => callback(), (err) => callback(err));
+          doWrite();
         },
         final(callback) {
+          const doFinal = () => { natives.spawnCloseStdin(cp._handle); callback(); };
           if (cp._handle === null) {
-            cp.once("spawn", () => { natives.spawnCloseStdin(cp._handle); callback(); });
+            deferUntilSpawn(cp, doFinal, callback);
             return;
           }
-          natives.spawnCloseStdin(cp._handle);
-          callback();
+          doFinal();
         },
       });
 
@@ -9633,7 +9776,13 @@
           queueMicrotask(() => cp.emit("close", result.code, result.signal));
         });
       }).catch((err) => {
-        queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+        const e = typeof err === "string" ? new Error(err) : err;
+        // Settle deferred stdin write/final waiters, then end the read streams
+        // so consumers awaiting completion don't hang on a failed spawn.
+        cp.emit("spawnfail", e);
+        cp.stdout.push(null);
+        cp.stderr.push(null);
+        queueMicrotask(() => cp.emit("error", e));
       });
 
       return cp;
@@ -9889,21 +10038,35 @@
         super();
         this.id = id;
         this.exitedAfterDisconnect = false;
+        this.killed = false;
         this.process = {
           pid,
-          kill: () => this.kill(),
+          kill: (signal) => this.kill(signal),
         };
         this._handle = handle;
         this._dead = false;
+        this._pendingKill = null;
       }
       kill(signal) {
         if (this._dead) return;
-        natives.clusterWorkerKill(this._handle);
+        this.killed = true;
+        // fork() hasn't resolved the real handle yet: remember the request and
+        // apply it once the handle lands, so a kill issued right after fork()
+        // isn't silently dropped.
+        if (this._handle === -1) {
+          this._pendingKill = signal || "SIGTERM";
+          return;
+        }
+        natives.clusterWorkerKill(this._handle, signal || "SIGTERM");
       }
       isDead() { return this._dead; }
       isConnected() { return !this._dead; }
       send() { return false; }
-      disconnect() { this.kill(); }
+      disconnect() {
+        this.exitedAfterDisconnect = true;
+        this.kill();
+        return this;
+      }
     }
 
     class Cluster extends EventEmitter {
@@ -9941,6 +10104,11 @@
           (result) => {
             worker._handle = result.handle;
             worker.process.pid = result.pid;
+            // Apply a kill requested before the handle was ready.
+            if (worker._pendingKill) {
+              natives.clusterWorkerKill(worker._handle, worker._pendingKill);
+              worker._pendingKill = null;
+            }
             process.nextTick(() => {
               worker.emit("online");
               this.emit("online", worker);
@@ -9981,9 +10149,10 @@
       setupPrimary() {}
       disconnect(cb) {
         for (const id of Object.keys(this.workers)) {
-          this.workers[id].kill();
+          this.workers[id].disconnect();
         }
         if (typeof cb === "function") queueMicrotask(cb);
+        return this;
       }
     }
     return new Cluster();
@@ -10806,6 +10975,16 @@
         this._protocol = null;
         this._cipher = null;
       }
+      _kickRead() {
+        // If a consumer attached 'data' (or otherwise started flowing) BEFORE
+        // the handle was ready, the initial _read no-op'd. Now that the handle
+        // exists, re-pull so data actually flows. No-ops if already reading.
+        if (this._handle !== null && !this._reading &&
+            (this.readableFlowing === true ||
+             (typeof this.listenerCount === "function" && this.listenerCount("data") > 0))) {
+          this._read(65536);
+        }
+      }
       _read(size) {
         if (this._handle === null || this._reading) return;
         this._reading = true;
@@ -10820,6 +10999,18 @@
           },
           (err) => {
             this._reading = false;
+            var info = typeof err === "string" ? err : ((err && err.code) || "") + " " + ((err && err.message) || "");
+            // A peer that closes/resets mid-read should end the stream, not
+            // crash an otherwise-healthy server with an unhandled 'error'.
+            // Windows surfaces a peer close as WSAECONNRESET (os error 10054);
+            // rustls reports an abrupt TLS close (no close_notify) as EIO with
+            // a "peer closed connection without sending TLS close_notify"
+            // message. Real HTTP-body truncation is still caught at the HTTP
+            // layer (Content-Length / chunked checks), so EOF here is safe.
+            if (/ECONNRESET|ECONNABORTED|EPIPE|forcibly closed|10054|reset by peer|close_notify|peer closed|unexpected eof/i.test(info)) {
+              this.push(null);
+              return;
+            }
             this.destroy(typeof err === "string" ? new Error(err) : err);
           },
         );
@@ -10891,6 +11082,7 @@
           socket._cipher = info.cipher;
           socket.alpnProtocol = info.alpnProtocol || false;
           socket.emit("secureConnect");
+          socket._kickRead();
         },
         (err) => {
           socket.destroy(typeof err === "string" ? new Error(err) : err);
@@ -10953,7 +11145,17 @@
         (async () => {
           while (!this._closed) {
             var accepted;
-            try { accepted = await natives.tcpAccept(serverId); } catch (e) { break; }
+            try {
+              accepted = await natives.tcpAccept(serverId);
+            } catch (e) {
+              // A transient accept() error (EMFILE/ECONNABORTED) rejects but the
+              // listener stays bound -- surface it and keep serving rather than
+              // tearing the server down. Brief backoff avoids a hot spin.
+              if (this._closed) break;
+              this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
+              await new Promise((r) => setTimeout(r, 10));
+              continue;
+            }
             if (accepted === undefined) break;
             var tcpHandle = accepted.handle;
             try {
@@ -10970,6 +11172,7 @@
                 socket._remotePort = accepted.remoteAddr.port;
               }
               this.emit("secureConnection", socket);
+              socket._kickRead();
             } catch (e) {
               this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
             }

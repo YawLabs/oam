@@ -1,11 +1,31 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use super::OpOutcome;
 
 pub struct ChildProcess {
-    pub child: tokio::process::Child,
+    /// The live child. Taken out of the registry entry by `child_wait` for the
+    /// duration of the await, but the entry itself stays so a concurrent
+    /// `child_kill` can still reach the kill-notifier below.
+    pub child: Option<tokio::process::Child>,
     pub pid: u32,
+    /// Wakes the parked `child_wait` future, which owns the `Child` and is the
+    /// only place that can signal it. Lets kill survive `child` being taken.
+    pub kill: Arc<Notify>,
+    /// Signal name the caller requested for the kill (Node reports it on exit).
+    pub kill_signal: Option<String>,
+}
+
+impl ChildProcess {
+    pub fn new(child: tokio::process::Child, pid: u32) -> Self {
+        ChildProcess {
+            child: Some(child),
+            pid,
+            kill: Arc::new(Notify::new()),
+            kill_signal: None,
+        }
+    }
 }
 
 pub type ChildRegistry = Arc<Mutex<HashMap<u64, ChildProcess>>>;
@@ -236,11 +256,14 @@ pub struct SpawnSyncError {
 }
 
 pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
-    let child = {
+    let stdout = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&handle).and_then(|c| c.child.stdout.take())
+        guard
+            .get_mut(&handle)
+            .and_then(|c| c.child.as_mut())
+            .and_then(|ch| ch.stdout.take())
     };
-    match child {
+    match stdout {
         Some(mut stdout) => {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 65536];
@@ -249,8 +272,8 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(c) = guard.get_mut(&handle) {
-                        c.child.stdout = Some(stdout);
+                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
+                        ch.stdout = Some(stdout);
                     }
                     OpOutcome::Bytes(buf)
                 }
@@ -262,11 +285,14 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
 }
 
 pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcome {
-    let child = {
+    let stderr = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&handle).and_then(|c| c.child.stderr.take())
+        guard
+            .get_mut(&handle)
+            .and_then(|c| c.child.as_mut())
+            .and_then(|ch| ch.stderr.take())
     };
-    match child {
+    match stderr {
         Some(mut stderr) => {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 65536];
@@ -275,8 +301,8 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(c) = guard.get_mut(&handle) {
-                        c.child.stderr = Some(stderr);
+                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
+                        ch.stderr = Some(stderr);
                     }
                     OpOutcome::Bytes(buf)
                 }
@@ -289,15 +315,18 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
 
 pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cp) = guard.get_mut(&handle) {
-        drop(cp.child.stdin.take());
+    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
+        drop(ch.stdin.take());
     }
 }
 
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&handle).and_then(|c| c.child.stdin.take())
+        guard
+            .get_mut(&handle)
+            .and_then(|c| c.child.as_mut())
+            .and_then(|ch| ch.stdin.take())
     };
     match stdin {
         Some(mut stdin) => {
@@ -305,8 +334,8 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
             match stdin.write_all(&data).await {
                 Ok(()) => {
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(c) = guard.get_mut(&handle) {
-                        c.child.stdin = Some(stdin);
+                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
+                        ch.stdin = Some(stdin);
                     }
                     OpOutcome::Done
                 }
@@ -317,23 +346,69 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
     }
 }
 
+/// Signal a child to terminate. Wakes the parked `child_wait` future (the only
+/// owner of the `Child`), which performs the actual kill. Survives `child_wait`
+/// having already taken the `Child` out of the registry entry.
+pub fn child_kill(children: &ChildRegistry, handle: u64, signal: Option<String>) {
+    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cp) = guard.get_mut(&handle) {
+        cp.kill_signal = signal;
+        // notify_one stores a permit if the wait future has not parked yet, so
+        // a kill issued before child_wait starts still lands.
+        cp.kill.notify_one();
+    }
+}
+
 pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
-    let child = {
+    // Take the Child for the await but leave the registry entry in place so a
+    // concurrent child_kill can still reach the kill-notifier.
+    let taken = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(&handle)
+        match guard.get_mut(&handle) {
+            Some(cp) => cp.child.take().map(|c| (c, cp.kill.clone())),
+            None => None,
+        }
     };
-    match child {
-        Some(mut cp) => match cp.child.wait().await {
-            Ok(status) => {
-                let code = status.code();
-                let json = serde_json::json!({
-                    "code": code,
-                    "signal": serde_json::Value::Null,
-                });
-                OpOutcome::Json(json.to_string())
-            }
-            Err(e) => OpOutcome::Failed(format!("wait: {e}")),
-        },
-        None => OpOutcome::Failed("unknown child handle".to_string()),
+    let Some((mut child, kill)) = taken else {
+        return OpOutcome::Failed("unknown child handle".to_string());
+    };
+
+    let killed;
+    let status = tokio::select! {
+        s = child.wait() => { killed = false; s }
+        _ = kill.notified() => {
+            let _ = child.start_kill();
+            killed = true;
+            child.wait().await
+        }
+    };
+
+    // Drop the registry entry now that the wait is done, capturing the
+    // requested kill signal for the exit report.
+    let requested_signal = {
+        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+        let sig = guard.get(&handle).and_then(|cp| cp.kill_signal.clone());
+        guard.remove(&handle);
+        sig
+    };
+
+    match status {
+        Ok(status) => {
+            // When we killed the child, report code:null + the requested signal
+            // (Node's convention for a signal-terminated child). start_kill is a
+            // hard kill cross-platform; we cannot deliver arbitrary signals
+            // without a platform dep, so we report the requested name.
+            let (code, signal) = if killed {
+                (
+                    None,
+                    Some(requested_signal.unwrap_or_else(|| "SIGTERM".to_string())),
+                )
+            } else {
+                (status.code(), None)
+            };
+            let json = serde_json::json!({ "code": code, "signal": signal });
+            OpOutcome::Json(json.to_string())
+        }
+        Err(e) => OpOutcome::Failed(format!("wait: {e}")),
     }
 }

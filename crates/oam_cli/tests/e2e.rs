@@ -9377,6 +9377,512 @@ server.close();
     assert!(stdout.contains("url2=/post-path"), "stdout: {stdout}");
 }
 
+// ============== TLS/HTTPS/cluster/child hardening regressions (M2 review) ===
+
+// bug: cluster worker.kill() was a no-op on a running worker (child_wait had
+// removed the handle before kill could reach it). A long-running worker must
+// actually terminate and fire 'exit'.
+#[test]
+fn cluster_worker_kill_terminates() {
+    let src = r#"
+import cluster from 'node:cluster';
+if (cluster.isPrimary) {
+  const w = cluster.fork();
+  w.on('exit', (code, signal) => {
+    console.log('worker_exited=true');
+    console.log('exit_signal=' + signal);
+    console.log('is_dead=' + w.isDead());
+    process.exit(0);
+  });
+  w.on('online', () => { setTimeout(() => w.kill(), 200); });
+  setTimeout(() => { console.log('worker_exited=false'); process.exit(1); }, 6000);
+} else {
+  setInterval(() => {}, 100000);
+}
+"#;
+    let f = write_temp("cluster_kill.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("worker_exited=true"), "{stdout}");
+    assert!(stdout.contains("is_dead=true"), "{stdout}");
+    assert!(stdout.contains("exit_signal=SIGTERM"), "{stdout}");
+}
+
+// coverage: worker non-zero exit code must propagate through the exit event.
+#[test]
+fn cluster_worker_nonzero_exit_code() {
+    let src = r#"
+import cluster from 'node:cluster';
+if (cluster.isPrimary) {
+  const w = cluster.fork();
+  w.on('exit', (code) => { console.log('exit_code=' + code); process.exit(0); });
+  setTimeout(() => { console.log('timeout'); process.exit(1); }, 6000);
+} else {
+  process.exit(3);
+}
+"#;
+    let f = write_temp("cluster_nonzero.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("exit_code=3"), "{stdout}");
+}
+
+// bug: a spawn failure left deferred stdin write/final callbacks dangling, so
+// any consumer awaiting stdin completion hung. The streams must settle.
+#[test]
+fn spawn_failure_stdin_does_not_hang() {
+    let src = r#"
+import { spawn } from 'child_process';
+const cp = spawn('definitely-not-a-real-binary-xyzqq', [], { shell: false });
+cp.on('error', () => { console.log('cp_error=true'); });
+cp.stdin.on('error', () => { console.log('stdin_settled=true'); });
+cp.stdin.write('hello');
+cp.stdin.end();
+setTimeout(() => { console.log('done'); process.exit(0); }, 1500);
+"#;
+    let f = write_temp("spawn_fail_stdin.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("cp_error=true"), "{stdout}");
+    assert!(stdout.contains("stdin_settled=true"), "{stdout}");
+}
+
+// coverage: the sync-stdio change lets stdin be written before spawn resolves
+// (the deferred-handle branch). Exercise it directly.
+#[test]
+fn spawn_stdin_before_spawn_resolves() {
+    let src = r#"
+import { spawn } from 'child_process';
+const cp = spawn('cmd', ['/c', 'findstr', '.*'], { shell: false });
+const chunks = [];
+cp.stdout.on('data', (c) => chunks.push(c));
+cp.stdin.write('deferred-stdin\r\n');
+cp.stdin.end();
+cp.on('close', (code) => {
+  console.log('out=' + Buffer.concat(chunks).toString().trim());
+  console.log('code=' + code);
+});
+"#;
+    let f = write_temp("spawn_stdin_early.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("deferred-stdin"), "{stdout}");
+    assert!(stdout.contains("code=0"), "{stdout}");
+}
+
+// bug: https client ignored Transfer-Encoding: chunked and collapsed duplicate
+// Set-Cookie headers. Body must reassemble and set-cookie must be an array.
+#[test]
+fn https_client_chunked_and_set_cookie() {
+    let src = r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  let sent = false;
+  socket.on('data', () => {
+    if (sent) return;
+    sent = true;
+    socket.write(
+      'HTTP/1.1 200 OK\r\n' +
+      'Transfer-Encoding: chunked\r\n' +
+      'Set-Cookie: a=1\r\n' +
+      'Set-Cookie: b=2\r\n' +
+      '\r\n' +
+      '5\r\nhello\r\n' +
+      '6\r\n world\r\n' +
+      '0\r\n\r\n'
+    );
+    socket.end();
+  });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const result = await new Promise((resolve, reject) => {
+  https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, (res) => {
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => resolve({ body: Buffer.concat(chunks).toString(), cookies: res.headers['set-cookie'] }));
+  }).on('error', reject);
+});
+console.log('body=' + result.body);
+console.log('cookies_is_array=' + Array.isArray(result.cookies));
+console.log('cookie_count=' + (result.cookies || []).length);
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("https_chunked_cookie.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("body=hello world"), "{stdout}");
+    assert!(stdout.contains("cookies_is_array=true"), "{stdout}");
+    assert!(stdout.contains("cookie_count=2"), "{stdout}");
+}
+
+// bug: https client sent a duplicate Host when the caller supplied one, and
+// never exercised the request-body branch. POST a body, echo it, count Host.
+#[test]
+fn https_client_post_body_echo_no_dup_host() {
+    let src = r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  let buf = Buffer.alloc(0);
+  let sent = false;
+  socket.on('data', (c) => {
+    buf = Buffer.concat([buf, c]);
+    if (sent) return;
+    const s = buf.toString('latin1');
+    const idx = s.indexOf('\r\n\r\n');
+    if (idx === -1) return;
+    const headerStr = s.slice(0, idx);
+    const hostCount = headerStr.split('\r\n').filter((l) => /^host:/i.test(l)).length;
+    const m = headerStr.match(/content-length:\s*(\d+)/i);
+    const need = m ? parseInt(m[1], 10) : 0;
+    const body = s.slice(idx + 4);
+    if (body.length < need) return;
+    sent = true;
+    const payload = JSON.stringify({ body: body.slice(0, need), hostCount });
+    socket.write('HTTP/1.1 200 OK\r\nContent-Length: ' + Buffer.byteLength(payload) + '\r\n\r\n' + payload);
+    socket.end();
+  });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const data = await new Promise((resolve, reject) => {
+  const req = https.request(
+    `https://127.0.0.1:${port}/echo`,
+    { method: 'POST', rejectUnauthorized: false, headers: { Host: 'vhost.example.com' } },
+    (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    }
+  );
+  req.on('error', reject);
+  req.write('payload-123');
+  req.end();
+});
+const parsed = JSON.parse(data);
+console.log('echoed_body=' + parsed.body);
+console.log('host_count=' + parsed.hostCount);
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("https_post_echo.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("echoed_body=payload-123"), "{stdout}");
+    assert!(stdout.contains("host_count=1"), "{stdout}");
+}
+
+// bug: https client hung forever if the peer closed before a full header
+// block. It must surface an error instead.
+#[test]
+fn https_client_truncated_response_errors() {
+    let src = r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  socket.on('data', () => { socket.end(); });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+let errored = false;
+let errCode = 'none';
+const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, () => {});
+req.on('error', (e) => { errored = true; errCode = (e && e.code) || 'err'; });
+await new Promise((r) => setTimeout(r, 800));
+console.log('errored=' + errored);
+console.log('err_code=' + errCode);
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("https_truncated.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("errored=true"), "{stdout}");
+}
+
+// coverage: multiple concurrent clients through the TLS accept loop, each must
+// get only its own echo (no cross-talk between server-side sockets).
+#[test]
+fn tls_server_concurrent_clients() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  socket.on('data', (c) => socket.write('echo:' + c.toString()));
+  socket.on('end', () => socket.end());
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const mk = (msg) => new Promise((resolve) => {
+  const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
+  const chunks = [];
+  c.on('secureConnect', () => c.write(msg));
+  c.on('data', (d) => {
+    chunks.push(d.toString());
+    if (chunks.join('').includes('echo:' + msg)) { c.end(); resolve(chunks.join('')); }
+  });
+});
+const [a, b, d] = await Promise.all([mk('alpha'), mk('beta'), mk('gamma')]);
+console.log('a_ok=' + a.includes('echo:alpha'));
+console.log('b_ok=' + b.includes('echo:beta'));
+console.log('d_ok=' + d.includes('echo:gamma'));
+console.log('no_crosstalk=' + (!a.includes('beta') && !b.includes('alpha') && !d.includes('alpha')));
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("tls_concurrent.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("a_ok=true"), "{stdout}");
+    assert!(stdout.contains("b_ok=true"), "{stdout}");
+    assert!(stdout.contains("d_ok=true"), "{stdout}");
+    assert!(stdout.contains("no_crosstalk=true"), "{stdout}");
+}
+
+// coverage: a server created without a cert must emit tlsClientError on a
+// client connection and stay listening (accept loop survives the failure).
+#[test]
+fn tls_server_missing_cert_emits_client_error() {
+    let src = r#"
+import tls from 'node:tls';
+const server = tls.createServer();
+let clientErr = false;
+server.on('tlsClientError', () => { clientErr = true; });
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
+c.on('error', () => {});
+await new Promise((r) => setTimeout(r, 800));
+console.log('client_error_fired=' + clientErr);
+console.log('still_listening=' + server.listening);
+server.close();
+"#;
+    let f = write_temp("tls_missing_cert.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("client_error_fired=true"), "{stdout}");
+    assert!(stdout.contains("still_listening=true"), "{stdout}");
+}
+
+// ============== HTTPS client error/edge paths + cluster/tls coverage ========
+
+// Drive an https (rejectUnauthorized:false) client against a raw TLS server
+// that writes a fixed (possibly malformed/truncated) HTTP/1.1 response then
+// closes. `resp_js` is a JS string literal for the bytes to send. Asserts the
+// request surfaces an error whose code contains `expect_code`.
+fn https_client_error_case(name: &str, resp_js: &str, expect_code: &str) {
+    let src = r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const RESP = __RESP__;
+const server = tls.createServer({ cert, key }, (socket) => {
+  let sent = false;
+  socket.on('data', () => { if (sent) return; sent = true; socket.write(RESP); socket.end(); });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+let result = 'none';
+const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, (res) => {
+  res.on('data', () => {});
+  res.on('end', () => { if (result === 'none') result = 'end'; });
+});
+req.on('error', (e) => { if (result === 'none') result = 'error:' + (e && e.code); });
+await new Promise((r) => setTimeout(r, 800));
+console.log('result=' + result);
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY)
+    .replace("__RESP__", resp_js);
+    let f = write_temp(name, &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("result=error:"), "expected an error, got: {stdout}");
+    assert!(stdout.contains(expect_code), "expected code {expect_code}, got: {stdout}");
+}
+
+// bug-fix coverage: a Content-Length body the peer truncates must error, not
+// deliver a short body as complete.
+#[test]
+fn https_client_content_length_truncation_errors() {
+    https_client_error_case(
+        "https_len_trunc.mjs",
+        r#"'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort'"#,
+        "result=error:",
+    );
+}
+
+// bug-fix coverage: a chunked transfer cut off before the 0-terminator must
+// error rather than end cleanly.
+#[test]
+fn https_client_chunked_truncation_errors() {
+    https_client_error_case(
+        "https_chunk_trunc.mjs",
+        r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n'"#,
+        "result=error:",
+    );
+}
+
+// bug-fix coverage: a malformed (non-hex) chunk-size line must surface a parse
+// error, not be treated as the 0-terminator.
+#[test]
+fn https_client_malformed_chunk_size_errors() {
+    https_client_error_case(
+        "https_chunk_bad.mjs",
+        r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nGG\r\nxxxx\r\n'"#,
+        "HPE_INVALID_CHUNK_SIZE",
+    );
+}
+
+// bug-fix coverage: child_process cp.kill(signal) must propagate the requested
+// signal to the exit event.
+#[test]
+fn child_process_kill_reports_signal() {
+    let src = r#"
+import { spawn } from 'child_process';
+const cp = spawn('node', ['-e', 'setTimeout(() => {}, 60000);']);
+cp.on('spawn', () => { setTimeout(() => cp.kill('SIGTERM'), 200); });
+cp.on('exit', (code, signal) => { console.log('exit_signal=' + signal); process.exit(0); });
+setTimeout(() => { console.log('timeout'); process.exit(1); }, 5000);
+"#;
+    let f = write_temp("cp_kill_signal.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("exit_signal=SIGTERM"), "{stdout}");
+}
+
+// bug-fix coverage: a TLS client that starts flowing via pipe() BEFORE
+// secureConnect must still receive data (the _kickRead readableFlowing path).
+#[test]
+fn tls_client_pipe_before_secure_connect() {
+    let src = r#"
+import tls from 'node:tls';
+import { Writable } from 'node:stream';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  socket.on('data', (c) => socket.write('echo:' + c.toString()));
+  socket.on('end', () => socket.end());
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
+let got = '';
+const sink = new Writable({ write(chunk, enc, cb) { got += chunk.toString(); cb(); } });
+c.pipe(sink);
+c.on('secureConnect', () => c.write('piped-hello'));
+await new Promise((r) => setTimeout(r, 700));
+console.log('piped=' + got);
+c.end();
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("tls_pipe_before_connect.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("piped=echo:piped-hello"), "{stdout}");
+}
+
+// bug-fix coverage: cluster worker.kill() issued before fork() resolves must
+// still terminate the worker (the pending-kill path).
+#[test]
+fn cluster_worker_kill_before_fork_resolves() {
+    let src = r#"
+import cluster from 'node:cluster';
+if (cluster.isPrimary) {
+  const w = cluster.fork();
+  w.kill();
+  w.on('exit', () => { console.log('killed_via_pending=true'); process.exit(0); });
+  setTimeout(() => { console.log('killed_via_pending=false'); process.exit(1); }, 6000);
+} else {
+  setInterval(() => {}, 100000);
+}
+"#;
+    let f = write_temp("cluster_pending_kill.mjs", src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("killed_via_pending=true"), "{stdout}");
+}
+
+// bug-fix coverage: a peer that resets/closes mid-read must end the TLS stream
+// cleanly ('end'), not crash with an unhandled 'error' (Windows WSAECONNRESET).
+#[test]
+fn tls_client_peer_reset_is_clean_end() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, (socket) => {
+  socket.on('data', () => { socket.destroy(); });
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
+let ended = false;
+let errored = false;
+c.on('data', () => {});
+c.on('secureConnect', () => c.write('x'));
+c.on('end', () => { ended = true; });
+c.on('error', () => { errored = true; });
+await new Promise((r) => setTimeout(r, 700));
+console.log('ended=' + ended);
+console.log('errored=' + errored);
+server.close();
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("tls_peer_reset.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("ended=true"), "{stdout}");
+}
+
 // ======================================= dns.resolve + dns.reverse
 
 #[test]
