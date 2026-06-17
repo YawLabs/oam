@@ -12,12 +12,18 @@
 // get/setGlobalDispatcher, errors, interceptors (no-op), and the web globals
 // undici re-exports (Headers/Response/Request/FormData/fetch/...).
 //
+// Supported transport control:
+//  - A Dispatcher/Agent passed as fetch's `dispatcher` with a
+//    `connect.lookup` hook IS honored: globalThis.fetch resolves the hook to
+//    an IP and pins the connection to it (Host header + TLS SNI preserved).
+//    This makes the DNS-rebind / SSRF pin used by e.g. @yawlabs/fetch-mcp a
+//    real control, not a no-op. (See the Dispatcher constructor's
+//    _oamConnectLookup bridge and globalThis.fetch's pin handling.)
+//
 // Documented divergences (a shim over fetch cannot honor everything):
-//  - A Dispatcher/Agent passed as `dispatcher` (undici) is accepted but its
-//    connection-level hooks (connect.lookup, TLS opts, pooling) are NOT
-//    applied -- oam's fetch owns the transport. Notably a custom
-//    `connect.lookup` (used for DNS-rebind pinning) is a NO-OP; callers
-//    relying on it for a security control must not assume it pins.
+//  - Other connection-level dispatcher options (TLS opts, connection
+//    pooling, keep-alive tuning) are accepted but NOT applied -- oam's fetch
+//    owns the transport beyond the connect pin.
 //  - Mock* (MockAgent/MockPool/...) are minimal stubs: constructible, but
 //    they do not intercept requests.
 
@@ -200,6 +206,16 @@
         this._options = options || {};
         this.destroyed = false;
         this.closed = false;
+        // Bridge for connection pinning: oam's globalThis.fetch looks for
+        // `_oamConnectLookup` on a dispatcher passed via init.dispatcher and,
+        // if present, resolves it to an IP and pins the connection (Host +
+        // SNI preserved). This is how a connect.lookup hook -- e.g. the
+        // DNS-rebind pin in @yawlabs/fetch-mcp -- becomes a REAL transport
+        // control instead of a no-op. The hook signature is Node's
+        // lookup(hostname, options, cb) with cb(null, [{address, family}]).
+        const connect = this._options.connect;
+        this._oamConnectLookup =
+          connect && typeof connect.lookup === "function" ? connect.lookup : null;
       }
       // request(opts, handler?) -- callback form is rare; support the
       // promise form (returns the request() result) which is what fetch and

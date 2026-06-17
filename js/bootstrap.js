@@ -636,6 +636,44 @@
       method: init.method ? String(init.method).toUpperCase() : "GET",
       headers,
     };
+    // Connection pin: an undici-style dispatcher (init.dispatcher) may carry a
+    // connect.lookup hook used for DNS-rebind / SSRF pinning. oam owns the
+    // transport (reqwest), so we resolve the hook HERE to an IP and pass it as
+    // a pin: reqwest then dials that IP while keeping Host + TLS SNI = the
+    // hostname. The dispatcher exposes the hook as `_oamConnectLookup` (set by
+    // the oam:undici shim). No dispatcher / no hook = the normal path, no cost.
+    const dispatcher = init.dispatcher;
+    const connectLookup = dispatcher && dispatcher._oamConnectLookup;
+    if (typeof connectLookup === "function") {
+      let host = "";
+      try {
+        host = new globalThis.URL(request.url).hostname;
+      } catch {
+        host = "";
+      }
+      if (host) {
+        const ip = await new Promise((resolve) => {
+          let settled = false;
+          const done = (value) => {
+            if (!settled) {
+              settled = true;
+              resolve(value);
+            }
+          };
+          try {
+            connectLookup(host, { all: true }, (err, addrs) => {
+              if (err) return done(null);
+              if (Array.isArray(addrs) && addrs[0] && addrs[0].address) return done(addrs[0].address);
+              if (typeof addrs === "string" && addrs) return done(addrs);
+              done(null);
+            });
+          } catch {
+            done(null);
+          }
+        });
+        if (ip) request.pin = { host, ip };
+      }
+    }
     if (init.body != null) {
       if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
         const bytes = init.body instanceof ArrayBuffer

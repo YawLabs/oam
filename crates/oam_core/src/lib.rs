@@ -1092,6 +1092,40 @@ pub mod ops {
         pub body: Option<String>,
         #[serde(default)]
         pub body_base64: Option<String>,
+        /// Connection pin: dial this IP for the URL's host instead of
+        /// resolving DNS, while keeping Host header + TLS SNI = the host.
+        /// Set by globalThis.fetch when an undici dispatcher carries a
+        /// connect.lookup hook (DNS-rebind / SSRF pinning).
+        #[serde(default)]
+        pub pin: Option<FetchPin>,
+    }
+
+    /// A DNS/connect pin: `host` (the URL hostname, kept for Host + SNI) ->
+    /// `ip` (the literal address to dial).
+    #[derive(serde::Deserialize)]
+    pub struct FetchPin {
+        pub host: String,
+        pub ip: String,
+    }
+
+    /// Build a one-off reqwest client that resolves `pin.host` to `pin.ip`
+    /// (port from the URL), keeping the shared client's config. Used only for
+    /// pinned requests, so the normal fetch path keeps the pooled client.
+    fn build_pinned_client(url: &str, pin: &FetchPin) -> Result<reqwest::Client, String> {
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| "url has no port and no known default".to_string())?;
+        let ip: std::net::IpAddr = pin
+            .ip
+            .parse()
+            .map_err(|e| format!("pin ip '{}' is not an IP: {e}", pin.ip))?;
+        let addr = std::net::SocketAddr::new(ip, port);
+        reqwest::Client::builder()
+            .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
+            .resolve(&pin.host, addr)
+            .build()
+            .map_err(|e| format!("pinned http client: {e}"))
     }
 
     /// Streaming fetch: resolves at HEADERS time with the response shape
@@ -1108,6 +1142,16 @@ pub mod ops {
         let method = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
             Err(_) => return OpOutcome::Failed(format!("fetch: invalid method '{method}'")),
+        };
+        // Connection pin (DNS-rebind / SSRF protection): a one-off client that
+        // dials the verified IP for this host. Normal requests keep the
+        // pooled client untouched.
+        let client = match &req.pin {
+            Some(pin) => match build_pinned_client(&req.url, pin) {
+                Ok(c) => c,
+                Err(e) => return OpOutcome::Failed(format!("fetch: connect pin failed: {e}")),
+            },
+            None => client,
         };
         let mut builder = client.request(method, &req.url);
         for (name, value) in &req.headers {
