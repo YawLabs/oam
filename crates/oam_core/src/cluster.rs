@@ -1,10 +1,10 @@
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
-use super::child::ChildRegistry;
 use super::OpOutcome;
+use super::child::ChildRegistry;
 
 pub async fn cluster_fork(
     children: ChildRegistry,

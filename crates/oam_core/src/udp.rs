@@ -4,9 +4,9 @@
 //! concurrently without removing from the map. UDP is connectionless
 //! and tokio's send_to/recv_from take `&self`.
 
-use crate::{node_error_code, node_error_message, OpOutcome};
+use crate::{OpOutcome, node_error_code, node_error_message};
 use std::collections::HashMap;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 
 #[derive(Default)]
 pub struct UdpState {

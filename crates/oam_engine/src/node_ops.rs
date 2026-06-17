@@ -326,8 +326,7 @@ fn v8_string_or_fallback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     s: &str,
 ) -> v8::Local<'s, v8::String> {
-    v8::String::new(scope, s)
-        .unwrap_or_else(|| v8::String::new(scope, "internal error").unwrap())
+    v8::String::new(scope, s).unwrap_or_else(|| v8::String::new(scope, "internal error").unwrap())
 }
 
 macro_rules! core_runtime {
@@ -729,7 +728,10 @@ fn op_http_request_body(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bytes = core_runtime!(scope).http().take_request_body(id).unwrap_or_default();
+    let bytes = core_runtime!(scope)
+        .http()
+        .take_request_body(id)
+        .unwrap_or_default();
     if let Some(value) = bytes_to_uint8array(scope, bytes) {
         rv.set(value);
     }
@@ -746,7 +748,11 @@ fn op_http_respond(
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
-    rv.set_bool(core_runtime!(scope).http().respond_full(id, status, headers, body));
+    rv.set_bool(
+        core_runtime!(scope)
+            .http()
+            .respond_full(id, status, headers, body),
+    );
 }
 
 fn op_http_respond_stream(
@@ -759,7 +765,10 @@ fn op_http_respond_stream(
     let headers = arg_string(scope, &args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
-    match core_runtime!(scope).http().respond_stream(id, status, headers) {
+    match core_runtime!(scope)
+        .http()
+        .respond_stream(id, status, headers)
+    {
         Some(stream_id) => rv.set_double(stream_id as f64),
         None => throw_type_error(scope, "request already responded or connection gone"),
     }
@@ -884,8 +893,7 @@ fn op_tcp_read(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let tcp = core_runtime!(scope)
-        .tcp();
+    let tcp = core_runtime!(scope).tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_read(tcp, handle, len));
 }
 
@@ -899,8 +907,7 @@ fn op_tcp_write(
         throw_type_error(scope, "tcpWrite requires data");
         return;
     };
-    let tcp = core_runtime!(scope)
-        .tcp();
+    let tcp = core_runtime!(scope).tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
 }
 
@@ -910,8 +917,7 @@ fn op_tcp_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = core_runtime!(scope)
-        .tcp();
+    let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
 }
 
@@ -921,8 +927,7 @@ fn op_tcp_shutdown(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = core_runtime!(scope)
-        .tcp();
+    let tcp = core_runtime!(scope).tcp();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
 }
 
@@ -972,8 +977,7 @@ fn op_tcp_server_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tcp = core_runtime!(scope)
-        .tcp();
+    let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
 }
 
@@ -1095,8 +1099,7 @@ fn op_tls_read(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let tls = core_runtime!(scope)
-        .tls();
+    let tls = core_runtime!(scope).tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_read(tls, handle, len));
 }
 
@@ -1110,8 +1113,7 @@ fn op_tls_write(
         throw_type_error(scope, "tlsWrite requires data");
         return;
     };
-    let tls = core_runtime!(scope)
-        .tls();
+    let tls = core_runtime!(scope).tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_write(tls, handle, data));
 }
 
@@ -1121,8 +1123,7 @@ fn op_tls_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tls = core_runtime!(scope)
-        .tls();
+    let tls = core_runtime!(scope).tls();
     oam_core::tls::tls_close(&tls, handle);
 }
 
@@ -1132,8 +1133,7 @@ fn op_tls_shutdown(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let tls = core_runtime!(scope)
-        .tls();
+    let tls = core_runtime!(scope).tls();
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
 }
 
@@ -1261,8 +1261,7 @@ fn op_zlib_stream_write(
         throw_type_error(scope, "zlibStreamWrite requires data");
         return;
     };
-    let streams = core_runtime!(scope)
-        .zlib_streams();
+    let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -1279,8 +1278,7 @@ fn op_zlib_stream_flush(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let streams = core_runtime!(scope)
-        .zlib_streams();
+    let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -1297,8 +1295,7 @@ fn op_zlib_stream_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let streams = core_runtime!(scope)
-        .zlib_streams();
+    let streams = core_runtime!(scope).zlib_streams();
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
 
@@ -1341,11 +1338,11 @@ fn op_zlib_handle_write_sync(
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
     let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
 
-    let streams = core_runtime!(scope)
-        .zlib_streams();
+    let streams = core_runtime!(scope).zlib_streams();
 
     let mut output = vec![0u8; out_len];
-    let result = oam_core::ops::zlib_handle_write_sync(&streams, handle, flush, &input, &mut output);
+    let result =
+        oam_core::ops::zlib_handle_write_sync(&streams, handle, flush, &input, &mut output);
 
     match result {
         Ok((avail_out, avail_in)) => {
@@ -1360,11 +1357,7 @@ fn op_zlib_handle_write_sync(
                             if byte_offset + produced <= store.byte_length() {
                                 unsafe {
                                     let dest = (data.as_ptr() as *mut u8).add(byte_offset);
-                                    std::ptr::copy_nonoverlapping(
-                                        output.as_ptr(),
-                                        dest,
-                                        produced,
-                                    );
+                                    std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
                                 }
                             } else {
                                 let message = v8::String::new(
@@ -2260,8 +2253,7 @@ fn op_fs_read_chunk(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
-    let files = core_runtime!(scope)
-        .files();
+    let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2279,8 +2271,7 @@ fn op_fs_write_chunk(
         throw_type_error(scope, "fsWriteChunk requires data");
         return;
     };
-    let files = core_runtime!(scope)
-        .files();
+    let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2295,8 +2286,7 @@ fn op_fs_close(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let files = core_runtime!(scope)
-        .files();
+    let files = core_runtime!(scope).files();
     let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
     // If the File is in flight (removed by a chunk op for its IO await),
     // it is absent here -- record the close so the op's reinsert drops it
@@ -2323,7 +2313,9 @@ fn throw_permission_denied(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     scope.throw_exception(exception);
 }
 
-fn get_permissions(scope: &v8::PinScope<'_, '_>) -> std::sync::Arc<crate::permissions::Permissions> {
+fn get_permissions(
+    scope: &v8::PinScope<'_, '_>,
+) -> std::sync::Arc<crate::permissions::Permissions> {
     scope
         .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
@@ -2459,8 +2451,7 @@ fn op_worker_post_message(
         throw_type_error(scope, "workerPostMessage requires data");
         return;
     };
-    let workers = core_runtime!(scope)
-        .workers();
+    let workers = core_runtime!(scope).workers();
     if let Err(msg) = oam_core::worker::parent_post(&workers, worker_id, json.into_bytes()) {
         let msg_v8 = v8::String::new(scope, &msg).unwrap();
         let exception = v8::Exception::error(scope, msg_v8);
@@ -2474,8 +2465,7 @@ fn op_worker_recv_message(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let workers = core_runtime!(scope)
-        .workers();
+    let workers = core_runtime!(scope).workers();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2489,8 +2479,7 @@ fn op_worker_terminate(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let worker_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let workers = core_runtime!(scope)
-        .workers();
+    let workers = core_runtime!(scope).workers();
     oam_core::worker::parent_terminate(&workers, worker_id);
 }
 
@@ -2816,10 +2805,8 @@ fn op_spawn_async(
         Some(pairs)
     });
 
-    let children = core_runtime!(scope)
-        .children();
-    let ids = core_runtime!(scope)
-        .body_ids();
+    let children = core_runtime!(scope).children();
+    let ids = core_runtime!(scope).body_ids();
 
     let children2 = children.clone();
     crate::ops::spawn_op(scope, &mut rv, async move {
@@ -2869,8 +2856,7 @@ fn op_spawn_read_stdout(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = core_runtime!(scope)
-        .children();
+    let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2884,8 +2870,7 @@ fn op_spawn_read_stderr(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = core_runtime!(scope)
-        .children();
+    let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2903,8 +2888,7 @@ fn op_spawn_write(
         throw_type_error(scope, "spawnWrite: data required");
         return;
     };
-    let children = core_runtime!(scope)
-        .children();
+    let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2928,8 +2912,7 @@ fn op_spawn_wait(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let children = core_runtime!(scope)
-        .children();
+    let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -3744,8 +3727,7 @@ fn op_process_kill(
     let signal = args.get(1).number_value(scope).unwrap_or(15.0) as i32;
 
     // Only child processes of this runtime should be killable.
-    let children = core_runtime!(scope)
-        .children();
+    let children = core_runtime!(scope).children();
     let is_own_child = children
         .lock()
         .unwrap_or_else(|e| e.into_inner())
