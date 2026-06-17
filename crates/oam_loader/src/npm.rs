@@ -793,7 +793,10 @@ mod tests {
         let entry = dir.join("entry.ts");
         std::fs::write(&entry, "").unwrap();
         let resolved = resolve_bare("lodash", &entry, ResolveMode::Import).unwrap();
-        assert!(resolved.ends_with("node_modules/lodash/index.js"), "got {resolved:?}");
+        assert!(
+            resolved.ends_with("node_modules/lodash/index.js"),
+            "got {resolved:?}"
+        );
     }
 
     #[test]
@@ -813,7 +816,10 @@ mod tests {
         let entry = dir.join("entry.cjs");
         std::fs::write(&entry, "").unwrap();
         let resolved = resolve_bare("lodash", &entry, ResolveMode::Require).unwrap();
-        assert!(resolved.ends_with("node_modules/lodash/main.js"), "got {resolved:?}");
+        assert!(
+            resolved.ends_with("node_modules/lodash/main.js"),
+            "got {resolved:?}"
+        );
     }
 
     #[test]

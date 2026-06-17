@@ -100,14 +100,11 @@ impl Resolver {
     ///
     /// `node:` / `oam:` specifiers resolve to virtual builtin paths.
     /// `node:`-prefixed builtins not yet in wave 1 surface OAM-MOD0006.
-    pub fn resolve_import(
-        &self,
-        specifier: &str,
-        referrer: &Path,
-    ) -> Result<PathBuf, Diagnostic> {
+    pub fn resolve_import(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
         // Shapes that are invalid as ESM specifiers everywhere — npm resolution
         // will never fix these, so they get their own diagnostic, not MOD0002.
-        if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\') {
+        if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\')
+        {
             return Err(Diagnostic::new(
                 "OAM-MOD0004",
                 Severity::Error,
@@ -131,7 +128,11 @@ impl Resolver {
                 || specifier.starts_with("oam:")
                 || crate::npm::is_node_builtin(specifier)
             {
-                return crate::npm::resolve_bare(specifier, referrer, crate::npm::ResolveMode::Import);
+                return crate::npm::resolve_bare(
+                    specifier,
+                    referrer,
+                    crate::npm::ResolveMode::Import,
+                );
             }
             // Bare specifier: tsconfig paths get first crack (plan §2.6 — the
             // resolver honors tsconfig exactly as tsgo does), then the Node ESM
@@ -148,9 +149,9 @@ impl Resolver {
             return crate::npm::resolve_bare(specifier, referrer, crate::npm::ResolveMode::Import)
                 .map_err(|mut failure| {
                     if consulted_paths && failure.code == "OAM-MOD0002" {
-                        failure
-                            .message
-                            .push_str(" (tsconfig paths were consulted; no pattern produced a file)");
+                        failure.message.push_str(
+                            " (tsconfig paths were consulted; no pattern produced a file)",
+                        );
                     }
                     failure
                 });

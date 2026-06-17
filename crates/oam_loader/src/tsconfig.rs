@@ -422,21 +422,9 @@ mod tests {
         // tsconfig.json that extends a.json to enter the extends chain.
         let dir = std::env::temp_dir().join(format!("oam-tsc-cycle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("tsconfig.json"),
-            r#"{ "extends": "./a.json" }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("a.json"),
-            r#"{ "extends": "./b.json" }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("b.json"),
-            r#"{ "extends": "./a.json" }"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("tsconfig.json"), r#"{ "extends": "./a.json" }"#).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{ "extends": "./b.json" }"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{ "extends": "./a.json" }"#).unwrap();
         std::fs::write(dir.join("entry.ts"), "").unwrap();
         // Must NOT panic and must NOT infinite-loop.
         let result = load_for(&dir.join("entry.ts"));

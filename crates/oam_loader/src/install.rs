@@ -123,10 +123,7 @@ pub enum InstallOutcome {
 /// * `Err(_)` / `Failed(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
-pub fn install(
-    project_dir: &Path,
-    frozen: bool,
-) -> Result<InstallOutcome, Vec<Diagnostic>> {
+pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<Diagnostic>> {
     if !frozen {
         return Err(vec![diag(
             "OAM-PKG0006",
@@ -208,10 +205,7 @@ pub fn install(
                 installed += 1;
             }
             Err(e) => {
-                errors.push(diag(
-                    "OAM-PKG0004",
-                    format!("failed to install {key}: {e}"),
-                ));
+                errors.push(diag("OAM-PKG0004", format!("failed to install {key}: {e}")));
             }
         }
     }
@@ -338,11 +332,9 @@ pub(crate) fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), Strin
         "sha512" => {
             use sha2::{Digest, Sha512};
             let computed = Sha512::digest(data);
-            let expected = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                hash_b64,
-            )
-            .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
+            let expected =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash_b64)
+                    .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
             if computed.as_slice() != expected.as_slice() {
                 return Err("sha512 integrity mismatch".into());
             }
@@ -350,11 +342,9 @@ pub(crate) fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), Strin
         "sha1" => {
             use sha1::Digest;
             let computed = sha1::Sha1::digest(data);
-            let expected = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                hash_b64,
-            )
-            .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
+            let expected =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, hash_b64)
+                    .map_err(|e| format!("invalid base64 in integrity: {e}"))?;
             if computed.as_slice() != expected.as_slice() {
                 return Err("sha1 integrity mismatch".into());
             }
@@ -381,10 +371,7 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
         let path = entry.path().map_err(|e| format!("tar entry path: {e}"))?;
 
         // npm tarballs wrap everything under a `package/` prefix.
-        let rel = path
-            .strip_prefix("package")
-            .unwrap_or(&path)
-            .to_path_buf();
+        let rel = path.strip_prefix("package").unwrap_or(&path).to_path_buf();
 
         if rel.as_os_str().is_empty() {
             continue;
@@ -464,10 +451,7 @@ pub(crate) fn link_bins(
     let mut bins: Vec<(String, std::path::PathBuf)> = Vec::new();
 
     for (key, entry) in packages {
-        let pkg_dir = node_modules
-            .parent()
-            .unwrap_or(node_modules)
-            .join(key);
+        let pkg_dir = node_modules.parent().unwrap_or(node_modules).join(key);
 
         let bin_field = if let Some(ref bin) = entry.bin {
             bin.clone()
@@ -617,10 +601,7 @@ fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
     let mut b_parts: Vec<_> = b.components().collect();
 
     // Drop common prefix.
-    while !t_parts.is_empty()
-        && !b_parts.is_empty()
-        && t_parts[0] == b_parts[0]
-    {
+    while !t_parts.is_empty() && !b_parts.is_empty() && t_parts[0] == b_parts[0] {
         t_parts.remove(0);
         b_parts.remove(0);
     }
@@ -717,10 +698,8 @@ mod tests {
         use sha2::{Digest, Sha512};
         let data = b"hello";
         let hash = Sha512::digest(data);
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            hash.as_slice(),
-        );
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
         let sri = format!("sha512-{b64}");
         assert!(verify_integrity(data, &sri).is_ok());
 
@@ -733,10 +712,8 @@ mod tests {
         use sha1::Digest;
         let data = b"hello";
         let hash = sha1::Sha1::digest(data);
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            hash.as_slice(),
-        );
+        let b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
         let sri = format!("sha1-{b64}");
         assert!(verify_integrity(data, &sri).is_ok());
         assert!(verify_integrity(b"world", &sri).is_err());
@@ -840,9 +817,7 @@ mod tests {
         let result = install(&tmp, true);
         match result {
             Ok(InstallOutcome::Partial {
-                installed,
-                errors,
-                ..
+                installed, errors, ..
             }) => {
                 assert_eq!(installed, 0);
                 assert_eq!(errors[0].code, "OAM-PKG0004");
@@ -879,8 +854,8 @@ mod tests {
 
     #[test]
     fn extract_tarball_strips_package_prefix() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a minimal gzipped tarball with a package/ prefix.
@@ -930,8 +905,8 @@ mod tests {
     // The `..` case is a known gap and is separately tracked.
     #[test]
     fn extract_tarball_rejects_path_traversal() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // The `tar` crate's `Header::set_path` rejects `..` and absolute
@@ -1014,8 +989,8 @@ mod tests {
     // path_clean + dest_clean normalization catches it.
     #[test]
     fn extract_tarball_rejects_dotdot_path_traversal() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Hand-build the tar header as a raw 512-byte buffer (the same
@@ -1081,7 +1056,10 @@ mod tests {
         // The escape file must NOT have been written outside dest. With
         // `package/../../escape.txt` and a tmp under temp_dir, the bad
         // target lands at <temp_dir>/escape.txt -- two levels up from tmp.
-        let bad_target = tmp.parent().and_then(|p| p.parent()).map(|p| p.join("escape.txt"));
+        let bad_target = tmp
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("escape.txt"));
         if let Some(ref p) = bad_target {
             assert!(!p.exists(), "escape file leaked to {}", p.display());
         }
@@ -1096,8 +1074,8 @@ mod tests {
     // link target inside the destination.
     #[test]
     fn extract_tarball_skips_symlink_entries_silently() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a tarball with one regular file (so the archive is non-empty
@@ -1138,7 +1116,10 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let result = extract_tarball(&gz_data, &tmp);
-        assert!(result.is_ok(), "symlink entry should be skipped silently; got {result:?}");
+        assert!(
+            result.is_ok(),
+            "symlink entry should be skipped silently; got {result:?}"
+        );
 
         // The regular file landed; the symlink did not.
         assert!(tmp.join("real.txt").is_file());

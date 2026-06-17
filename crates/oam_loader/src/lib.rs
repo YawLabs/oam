@@ -25,12 +25,12 @@ mod npm;
 mod resolver;
 mod tsconfig;
 pub use npm::{ModuleKind, module_kind, resolve_require};
-pub use resolver::{Resolver, default_resolver};
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
+pub use resolver::{Resolver, default_resolver};
 
 /// Transpilation failure: one or more ODIF diagnostics (origin: parse).
 #[derive(Debug, thiserror::Error)]
@@ -277,11 +277,7 @@ mod tests {
         // are types-only and would otherwise be loaded as JS modules.
         let dir = std::env::temp_dir().join(format!("oam-dts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("types.d.ts"),
-            "export declare const x: number;\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("types.d.ts"), "export declare const x: number;\n").unwrap();
         std::fs::write(dir.join("entry.ts"), "export const a = 1;\n").unwrap();
         let entry_ts = dir.join("entry.ts");
         let err = resolve_import("./types", &entry_ts)
@@ -343,8 +339,9 @@ mod tests {
         // invariant: the leading '/' is preserved by the root-relative
         // branch and not rewritten as a parent walk.
         let referrer = PathBuf::from("/proj/entry.ts");
-        let err = resolve_import("/x", &referrer)
-            .expect_err("'/x' cannot exist on the test machine, but the candidates list is the contract");
+        let err = resolve_import("/x", &referrer).expect_err(
+            "'/x' cannot exist on the test machine, but the candidates list is the contract",
+        );
         assert_eq!(err.code, "OAM-MOD0001");
         let candidates: Vec<&str> = err
             .message
@@ -449,7 +446,10 @@ mod tests {
         let d = &err.diagnostics[0];
         assert_eq!(d.code, "OAM-PARSE0002", "got: {d:?}");
         assert_eq!(d.origin, oam_diagnostics::Origin::Parse);
-        assert!(!d.spans.is_empty(), "expected a span on the transform error");
+        assert!(
+            !d.spans.is_empty(),
+            "expected a span on the transform error"
+        );
     }
 
     #[test]
@@ -461,16 +461,8 @@ mod tests {
         // doesn't make it a runtime artifact.
         let dir = std::env::temp_dir().join(format!("oam-dts-explicit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("types.d.ts"),
-            "export declare const x: number;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("entry.ts"),
-            "import './types.d.ts';\nexport {};\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("types.d.ts"), "export declare const x: number;\n").unwrap();
+        std::fs::write(dir.join("entry.ts"), "import './types.d.ts';\nexport {};\n").unwrap();
         let entry_ts = dir.join("entry.ts");
         let err = resolve_import("./types.d.ts", &entry_ts)
             .expect_err("explicit .d.ts import must still be filtered");
