@@ -804,6 +804,53 @@ mod tests {
     // so the default `cargo test` run stays offline and deterministic; run
     // it explicitly with `cargo test -p oam_loader -- --ignored` when
     // network access is available.
+    #[test]
+    #[ignore = "requires network; run with `cargo test -p oam_loader -- --ignored`"]
+    fn install_partial_returns_partial_outcome() {
+        // One entry whose `resolved` URL 404s, so the install pass ran but
+        // produced zero successful packages. The function must surface this
+        // as Ok(Partial { installed: 0, .. }) rather than collapsing it
+        // into Err.
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-install-test-partial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let lockfile = r#"{
+            "name": "partial-project",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "partial-project",
+                    "version": "1.0.0"
+                },
+                "node_modules/does-not-exist": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/does-not-exist/-/does-not-exist-1.0.0.tgz",
+                    "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+                }
+            }
+        }"#;
+        std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
+        let result = install(&tmp, true);
+        match result {
+            Ok(InstallOutcome::Partial {
+                installed,
+                errors,
+                ..
+            }) => {
+                assert_eq!(installed, 0);
+                assert_eq!(errors[0].code, "OAM-PKG0004");
+            }
+            other => panic!("expected Ok(Partial {{ installed: 0, .. }}); got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn lockfile_version_2_rejected() {
@@ -881,22 +928,340 @@ mod tests {
     // starts with `dest`. The check DOES catch absolute paths (where
     // `Path::join` replaces the base), and that's what this test exercises.
     // The `..` case is a known gap and is separately tracked.
+    #[test]
+    fn extract_tarball_rejects_path_traversal() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // The `tar` crate's `Header::set_path` rejects `..` and absolute
+        // paths, so we build the tar header by hand. Layout: 512-byte header
+        // (path in the first 100 bytes, null-terminated), then the entry
+        // data, then 512-byte-aligned zero blocks to end-of-archive.
+        //
+        // We use an absolute path (`/etc/passwd`) which the `tar` crate
+        // would refuse via `set_path`; the hand-rolled header stores it
+        // raw, and `Path::join` with an absolute path replaces the base,
+        // so `target.starts_with(dest)` is false -- the safety check
+        // trips.
+        let path = b"/etc/passwd\0";
+        let mut header = [0u8; 512];
+        header[..path.len()].copy_from_slice(path);
+        // Mode (octal, ASCII) at offset 100, length 8, null-terminated.
+        let mode = b"0000644\0";
+        header[100..108].copy_from_slice(mode);
+        // Size (octal, ASCII) at offset 124, length 12, null-terminated.
+        let size = b"00000000004\0";
+        header[124..136].copy_from_slice(size);
+        // Magic "ustar\0" (POSIX) at offset 257, length 8.
+        header[257..265].copy_from_slice(b"ustar\x0000");
+        // Version "00" at offset 265, length 2.
+        header[265..267].copy_from_slice(b"00");
+        // Type flag at offset 156: '0' = regular file.
+        header[156] = b'0';
+        // Compute the header checksum (sum of all bytes treating the chksum
+        // field itself as eight spaces).
+        let chksum_field = &mut header[148..156];
+        for b in chksum_field.iter_mut() {
+            *b = b' ';
+        }
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        let chksum = format!("{:06o}\0 ", sum);
+        header[148..156].copy_from_slice(chksum.as_bytes());
+
+        let content = b"root";
+        // Pad content to 512 bytes.
+        let mut data = [0u8; 512];
+        data[..content.len()].copy_from_slice(content);
+
+        // Two 512-byte zero blocks mark end-of-archive.
+        let mut tar_bytes = Vec::new();
+        tar_bytes.extend_from_slice(&header);
+        tar_bytes.extend_from_slice(&data);
+        tar_bytes.extend_from_slice(&[0u8; 1024]);
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        let gz_data = gz.finish().unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-extract-traversal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let result = extract_tarball(&gz_data, &tmp);
+        assert!(result.is_err(), "expected path-traversal rejection");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("path traversal") || err.contains("escapes"),
+            "error should mention path traversal or escapes; got: {err}"
+        );
+
+        // The escape file must NOT exist at the absolute path or inside dest.
+        assert!(!tmp.join("etc/passwd").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // Closes the `..`-segment gap that the lexical `starts_with` check
     // missed: an entry `package/../../escape.txt` joined to a non-root
     // `dest` lexically starts with `dest` but resolves outside it. The
     // path_clean + dest_clean normalization catches it.
+    #[test]
+    fn extract_tarball_rejects_dotdot_path_traversal() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Hand-build the tar header as a raw 512-byte buffer (the same
+        // pattern the existing path-traversal test uses). Path bytes
+        // are the leading-NUL-terminated string stored at offset 0.
+        let path_bytes = b"package/../../escape.txt\0";
+        let mut header = [0u8; 512];
+        let plen = path_bytes.len().min(100);
+        header[..plen].copy_from_slice(&path_bytes[..plen]);
+        // Size field at offset 124, octal ASCII, NUL-terminated.
+        let size = format!("{:011o}\0", 5);
+        header[124..136].copy_from_slice(size.as_bytes());
+        // Magic "ustar\0" at offset 257, length 8.
+        header[257..265].copy_from_slice(b"ustar\x0000");
+        // Version "00" at offset 265, length 2.
+        header[265..267].copy_from_slice(b"00");
+        // Type flag at offset 156: '0' = regular file.
+        header[156] = b'0';
+        // Compute the header checksum (sum of all bytes treating the chksum
+        // field itself as eight spaces).
+        let chksum_field = &mut header[148..156];
+        for b in chksum_field.iter_mut() {
+            *b = b' ';
+        }
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        let chksum = format!("{:06o}\0 ", sum);
+        header[148..156].copy_from_slice(chksum.as_bytes());
+
+        let content = b"hello";
+        let mut data = [0u8; 512];
+        data[..content.len()].copy_from_slice(content);
+
+        let mut tar_bytes = Vec::new();
+        tar_bytes.extend_from_slice(&header);
+        tar_bytes.extend_from_slice(&data);
+        tar_bytes.extend_from_slice(&[0u8; 1024]);
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        let gz_data = gz.finish().unwrap();
+
+        // Non-root dest matters: if dest is `/`, `..` segments stay
+        // inside it. We want a dest whose parent is genuinely outside it.
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-extract-dotdot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let result = extract_tarball(&gz_data, &tmp);
+        assert!(result.is_err(), "expected .. traversal rejection");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("path traversal") || err.contains("escapes"),
+            "error should mention path traversal or escapes; got: {err}"
+        );
+
+        // The escape file must NOT have been written outside dest. With
+        // `package/../../escape.txt` and a tmp under temp_dir, the bad
+        // target lands at <temp_dir>/escape.txt -- two levels up from tmp.
+        let bad_target = tmp.parent().and_then(|p| p.parent()).map(|p| p.join("escape.txt"));
+        if let Some(ref p) = bad_target {
+            assert!(!p.exists(), "escape file leaked to {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Some(p) = bad_target {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 
     // #19: symlink entries are skipped silently for the MVP (see comment in
     // extract_tarball). The function must return Ok(()) and not create the
     // link target inside the destination.
+    #[test]
+    fn extract_tarball_skips_symlink_entries_silently() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Build a tarball with one regular file (so the archive is non-empty
+        // and the entries iterator is exercised) and one symlink entry.
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let content = b"ok";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("package/real.txt").unwrap();
+        header.set_cksum();
+        builder.append(&header, &content[..]).unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_path("package/link.txt").unwrap();
+        link_header.set_link_name("real.txt").unwrap();
+        link_header.set_cksum();
+        builder.append(&link_header, std::io::empty()).unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        let gz_data = gz.finish().unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-extract-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let result = extract_tarball(&gz_data, &tmp);
+        assert!(result.is_ok(), "symlink entry should be skipped silently; got {result:?}");
+
+        // The regular file landed; the symlink did not.
+        assert!(tmp.join("real.txt").is_file());
+        assert!(!tmp.join("link.txt").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // #21: link_bins should create shims for every entry in an object-form
     // `bin` field (TypeScript-style). Driving link_bins directly avoids the
     // fetch/extract network path and lets the test stay offline.
+    #[test]
+    fn link_bins_object_form_creates_shims() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-linkbins-object-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Fake "installed" package: node_modules/typescript/ with the bin
+        // scripts the shim should point at.
+        let pkg_dir = tmp.join("node_modules/typescript");
+        std::fs::create_dir_all(pkg_dir.join("bin")).unwrap();
+        std::fs::write(pkg_dir.join("bin/tsc"), "#!/bin/sh\necho tsc\n").unwrap();
+        std::fs::write(pkg_dir.join("bin/tsserver"), "#!/bin/sh\necho tsserver\n").unwrap();
+
+        // Lockfile entry carries the bin object directly (npm v3 mirrors it).
+        let entry = LockfileEntry {
+            version: Some("5.4.5".into()),
+            resolved: Some("https://example.invalid/typescript-5.4.5.tgz".into()),
+            integrity: None,
+            dev: None,
+            optional: None,
+            bin: Some(serde_json::json!({
+                "tsc": "./bin/tsc",
+                "tsserver": "./bin/tsserver"
+            })),
+        };
+        let packages: Vec<(&str, &LockfileEntry)> = vec![(
+            "node_modules/typescript",
+            // SAFETY: `entry` is local; nothing in the test outlives it.
+            &entry,
+        )];
+
+        let mut errors: Vec<Diagnostic> = Vec::new();
+        link_bins(&tmp.join("node_modules"), &packages, &mut errors);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        let bin_dir = tmp.join("node_modules/.bin");
+        #[cfg(windows)]
+        {
+            assert!(bin_dir.join("tsc.cmd").is_file());
+            assert!(bin_dir.join("tsserver.cmd").is_file());
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                std::fs::symlink_metadata(bin_dir.join("tsc"))
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "tsc should be a symlink"
+            );
+            assert!(
+                std::fs::symlink_metadata(bin_dir.join("tsserver"))
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "tsserver should be a symlink"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // #22: a legacy array-form `bin` field must be silently dropped (the
     // `_ => {}` arm in link_bins). No shim files should be created.
+    #[test]
+    fn link_bins_array_form_silently_dropped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-linkbins-array-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // The package itself is irrelevant for the array path (link_bins
+        // short-circuits on `_ => {}`), but a pkg.json with a string bin
+        // would push entries even if `entry.bin` is the array — entry.bin
+        // is read first. So we use the entry.bin = array path.
+        let pkg_dir = tmp.join("node_modules/legacy-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"legacy-pkg","version":"1.0.0","bin":["cmd1","cmd2"]}"#,
+        )
+        .unwrap();
+
+        let entry = LockfileEntry {
+            version: Some("1.0.0".into()),
+            resolved: Some("https://example.invalid/legacy-pkg-1.0.0.tgz".into()),
+            integrity: None,
+            dev: None,
+            optional: None,
+            bin: Some(serde_json::json!(["cmd1", "cmd2"])),
+        };
+        let packages: Vec<(&str, &LockfileEntry)> = vec![("node_modules/legacy-pkg", &entry)];
+
+        let mut errors: Vec<Diagnostic> = Vec::new();
+        link_bins(&tmp.join("node_modules"), &packages, &mut errors);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+        // The .bin directory should not even have been created (bins was
+        // empty after the array arm), and no shim files exist.
+        let bin_dir = tmp.join("node_modules/.bin");
+        assert!(!bin_dir.exists(), ".bin dir should not have been created");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // #24: install with `frozen = false` must fail fast with OAM-PKG0006
     // and a message that names the flag, so users see why the install was

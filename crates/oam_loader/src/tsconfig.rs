@@ -410,4 +410,147 @@ mod tests {
         assert_eq!(cfg.patterns.len(), 1);
         assert!(!match_specifier(&cfg, "@x/util").is_empty());
     }
+
+    #[test]
+    fn extends_cycle_depth_limit_returns_none() {
+        // #13: load_chain's depth > 8 guard (tsconfig.rs:104-110) gives up
+        // silently on extends cycles. a -> b -> a -> b -> ... recurses until
+        // depth > 8, then returns None. Must NOT panic and must NOT
+        // infinite-loop.
+        //
+        // load_for walks up looking for tsconfig.json, so we need a
+        // tsconfig.json that extends a.json to enter the extends chain.
+        let dir = std::env::temp_dir().join(format!("oam-tsc-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "extends": "./a.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{ "extends": "./b.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{ "extends": "./a.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "").unwrap();
+        // Must NOT panic and must NOT infinite-loop.
+        let result = load_for(&dir.join("entry.ts"));
+        assert!(
+            result.is_none(),
+            "extends cycle should give up quietly, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn match_specifier_multiple_stars_in_key() {
+        // #14: match_specifier uses key.find('*') (tsconfig.rs:177), which
+        // returns the FIRST star. For "@lib/*/foo/*" with specifier
+        // "@lib/x/foo/y":
+        //   prefix = "@lib/"
+        //   suffix = "/foo/*"  (literal asterisk at the end)
+        // The specifier "@lib/x/foo/y" starts with "@lib/" (true) but does
+        // NOT end with "/foo/*" (the suffix has a literal '*' that the
+        // specifier lacks). The pattern doesn't match, so the function
+        // returns an empty Vec.
+        //
+        // This is silent garbage: a key with multiple stars is not supported
+        // (TS 7 only allows one star per pattern), but match_specifier
+        // doesn't error -- it just returns nothing useful. Callers can't
+        // distinguish "no pattern matched" from "pattern was malformed".
+        let cfg = config(&[("@lib/*/foo/*", &["src/lib/*/foo/*"])]);
+        let candidates = match_specifier(&cfg, "@lib/x/foo/y");
+        assert!(
+            candidates.is_empty(),
+            "multi-star key should not match (silent garbage), got: {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_unterminated_block_comment_does_not_panic() {
+        // #15: a block comment that never closes (no "*/" before EOF).
+        // The block-comment state eats to EOF (tsconfig.rs:257-264), leaving
+        // "{ \"a\": 1 " intact (the space after "1" is preserved, the
+        // "/* unterminated" is consumed). The trailing-comma pass is a no-op
+        // (no trailing commas). The function must NOT panic; the result is
+        // malformed JSON that serde_json::from_str rejects with Err.
+        // load_chain handles the Err via .ok()? (tsconfig.rs:111), so an
+        // unterminated comment in a tsconfig.json silently disables paths.
+        let input = r#"{ "a": 1 /* unterminated"#;
+        let result = strip_jsonc(input);
+        // Document the exact output: the block comment consumed everything
+        // from "/*" to EOF, leaving the prefix intact.
+        assert_eq!(result, r#"{ "a": 1 "#);
+        // The result must be parseable as an Err (not a panic).
+        let parse_result: Result<serde_json::Value, _> = serde_json::from_str(&result);
+        assert!(
+            parse_result.is_err(),
+            "unterminated block comment should produce invalid JSON, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn strip_jsonc_line_comment_with_backslash() {
+        // #16: a line comment ends at "\n" (tsconfig.rs:251-253). A backslash
+        // before "\n" does NOT escape the newline -- line comments are not
+        // string-aware for line endings. The line comment swallows
+        // " backslash at end \" (the backslash is not "\n"), then the "\n"
+        // terminates the comment and IS pushed to the output (see
+        // tsconfig.rs:251-253: the newline is preserved).
+        //
+        // Regular string: "\\" is one backslash, "\n" is a newline.
+        // Input:  "// backslash at end \<newline>{ \"a\": 1 }"
+        // Output: "\n{ \"a\": 1 }"  (the leading newline is the comment
+        // terminator that was pushed to output)
+        let input = "// backslash at end \\\n{ \"a\": 1 }";
+        let result = strip_jsonc(input);
+        assert_eq!(result, "\n{ \"a\": 1 }");
+    }
+
+    #[test]
+    fn load_for_walks_up_to_nearest_tsconfig() {
+        // #17: when nested/tsconfig.json exists, load_for uses it and does
+        // NOT walk up to root/tsconfig.json. The walk-up at tsconfig.rs:75-90
+        // stops at the first tsconfig.json it finds.
+        let dir = std::env::temp_dir().join(format!("oam-tsc-nested-{}", std::process::id()));
+        let root = dir.join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@root/*": ["root-src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            nested.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@nested/*": ["nested-src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(nested.join("entry.ts"), "").unwrap();
+        let cfg = load_for(&nested.join("entry.ts")).expect("nested tsconfig must be found");
+        // Must be the NESTED config, not the root one.
+        let keys: Vec<&str> = cfg.patterns.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            keys.contains(&"@nested/*"),
+            "expected @nested/* in patterns, got: {:?}",
+            keys
+        );
+        assert!(
+            !keys.contains(&"@root/*"),
+            "should NOT have walked up to @root/*, got: {:?}",
+            keys
+        );
+        // base_dir should be the nested dir (the declaring tsconfig's dir).
+        assert_eq!(cfg.base_dir, nested);
+        // Sanity: the nested path actually resolves.
+        assert!(!match_specifier(&cfg, "@nested/thing").is_empty());
+    }
 }

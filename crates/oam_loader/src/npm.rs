@@ -775,4 +775,150 @@ mod tests {
         assert_eq!(module_kind(Path::new("x.cjs")), ModuleKind::Cjs);
         assert_eq!(module_kind(Path::new("x.cts")), ModuleKind::Cjs);
     }
+
+    #[test]
+    fn resolve_bare_happy_path_walks_node_modules() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-6-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("node_modules/lodash")).unwrap();
+        std::fs::write(
+            dir.join("node_modules/lodash/package.json"),
+            serde_json::to_string(&json!({
+                "name": "lodash",
+                "main": "index.js",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("node_modules/lodash/index.js"), "").unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let resolved = resolve_bare("lodash", &entry, ResolveMode::Import).unwrap();
+        assert!(resolved.ends_with("node_modules/lodash/index.js"), "got {resolved:?}");
+    }
+
+    #[test]
+    fn resolve_bare_require_uses_main_only() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-7-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("node_modules/lodash")).unwrap();
+        std::fs::write(
+            dir.join("node_modules/lodash/package.json"),
+            serde_json::to_string(&json!({
+                "name": "lodash",
+                "main": "main.js",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("node_modules/lodash/main.js"), "").unwrap();
+        let entry = dir.join("entry.cjs");
+        std::fs::write(&entry, "").unwrap();
+        let resolved = resolve_bare("lodash", &entry, ResolveMode::Require).unwrap();
+        assert!(resolved.ends_with("node_modules/lodash/main.js"), "got {resolved:?}");
+    }
+
+    #[test]
+    fn node_prefixed_unknown_is_builtin_error() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-8a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let err = resolve_bare("node:foo-does-not-exist", &entry, ResolveMode::Import)
+            .expect_err("unknown node: prefix must error, not walk node_modules");
+        assert_eq!(err.code, "OAM-MOD0006");
+        assert!(
+            err.message.contains("is not a known node: builtin module"),
+            "message was: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn node_sys_still_in_builtins_list() {
+        // `sys` is in NODE_BUILTINS (the legacy alias for 'util' was removed
+        // from Node in 2017, but the resolver still recognizes it). That puts
+        // `node:sys` on the "recognized builtin, not yet shipped" branch
+        // (OAM-MOD0006 with the wave-N preview message), NOT the bare-
+        // specifier / "cannot find package" branch. If a future change drops
+        // `sys` from NODE_BUILTINS, this assertion becomes OAM-MOD0002 with
+        // a "tsconfig paths were consulted" suffix — flip it then.
+        let dir = std::env::temp_dir().join(format!("oam-npm-8b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.ts");
+        std::fs::write(&entry, "").unwrap();
+        let err = resolve_bare("node:sys", &entry, ResolveMode::Import)
+            .expect_err("node:sys should not resolve to a real file");
+        assert_eq!(err.code, "OAM-MOD0006");
+        assert!(
+            err.message.contains("does not implement yet")
+                || err.message.contains("is not a known node: builtin module"),
+            "message was: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn module_kind_node_modules_boundary() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-9-{}", std::process::id()));
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::create_dir_all(proj.join("node_modules/lodash")).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            serde_json::to_string(&json!({})).unwrap(),
+        )
+        .unwrap();
+        let inside = proj.join("node_modules/lodash/index.js");
+        let outside = proj.join("src/index.js");
+        std::fs::write(&inside, "").unwrap();
+        std::fs::write(&outside, "").unwrap();
+        assert_eq!(module_kind(&inside), ModuleKind::Cjs);
+        assert_eq!(module_kind(&outside), ModuleKind::Esm);
+    }
+
+    #[test]
+    fn module_kind_type_commonjs_is_cjs() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            serde_json::to_string(&json!({ "type": "commonjs" })).unwrap(),
+        )
+        .unwrap();
+        let index = dir.join("index.js");
+        std::fs::write(&index, "").unwrap();
+        assert_eq!(module_kind(&index), ModuleKind::Cjs);
+    }
+
+    #[test]
+    fn resolve_require_bare_uses_tsconfig_paths() {
+        // `resolve_require` consults tsconfig paths before the node_modules
+        // walk (mirroring `resolve_import`). Note the require-side probe is
+        // `probe_require` — exact, .js, .json, .node — so we plant a .js
+        // target here, not .ts. (`resolve_import` would probe .ts as well.)
+        let dir = std::env::temp_dir().join(format!("oam-npm-11-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@lib/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/util.js"), "").unwrap();
+        let entry = dir.join("entry.cjs");
+        std::fs::write(&entry, "").unwrap();
+        let resolved = resolve_require("@lib/util", &entry).unwrap();
+        assert!(resolved.ends_with("src/util.js"), "got {resolved:?}");
+    }
+
+    #[test]
+    fn exports_array_falls_through_when_no_condition_matches() {
+        // Distinct from `exports_arrays_fall_back_and_bad_targets_error`
+        // (which uses a string in the array). Here the FIRST slot is a
+        // condition object whose condition ('browser') is not in the import
+        // conditions, so the array walks past it to the string fallback.
+        let exports = json!({ ".": [{ "browser": "./b.js" }, "./fallback.js"] });
+        assert_eq!(
+            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
+            "./fallback.js"
+        );
+    }
 }

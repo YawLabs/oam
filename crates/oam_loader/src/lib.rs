@@ -270,4 +270,211 @@ mod tests {
         assert_eq!(offset_to_position(src, 3), Position { line: 2, col: 1 });
         assert_eq!(offset_to_position(src, 4), Position { line: 2, col: 2 });
     }
+
+    #[test]
+    fn resolver_skips_declaration_files() {
+        // './types' must not resolve to 'types.d.ts' -- declaration files
+        // are types-only and would otherwise be loaded as JS modules.
+        let dir = std::env::temp_dir().join(format!("oam-dts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("types.d.ts"),
+            "export declare const x: number;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.ts"), "export const a = 1;\n").unwrap();
+        let entry_ts = dir.join("entry.ts");
+        let err = resolve_import("./types", &entry_ts)
+            .expect_err("resolving './types' must not pick up types.d.ts");
+        assert_eq!(err.code, "OAM-MOD0001");
+    }
+
+    #[test]
+    fn resolver_clear_caches_lets_newly_added_files_resolve() {
+        // The whole point of owning the cache on `Resolver` is that a
+        // long-lived process (CLI, daemon) can drop stale entries when the
+        // project layout changes. Simulate `oam install` adding a file in
+        // the same process as a subsequent `oam run` resolve.
+        let dir = std::env::temp_dir().join(format!("oam-cache-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry.ts"), "export {};\n").unwrap();
+        let entry_ts = dir.join("entry.ts");
+        let resolver = Resolver::new();
+
+        // 1) First resolve: the file does not exist. The negative cache
+        //    records the probe so the next call short-circuits.
+        let err = resolver
+            .resolve_import("./missing", &entry_ts)
+            .expect_err("expected negative result before the file exists");
+        assert_eq!(err.code, "OAM-MOD0001");
+
+        // 2) The file appears (think: `oam install` wrote node_modules/foo).
+        //    The negative cache still says "not found" -- this is the stale
+        //    state the cache can serve.
+        std::fs::write(dir.join("missing.ts"), "export const x = 1;\n").unwrap();
+        let stale = resolver.resolve_import("./missing", &entry_ts);
+        assert!(
+            stale.is_err(),
+            "without clear_caches the negative entry still wins: {stale:?}"
+        );
+
+        // 3) Drop the stale entries. The next resolve re-stats the
+        //    filesystem and finds the newly-written file.
+        resolver.clear_caches();
+        let fresh = resolver
+            .resolve_import("./missing", &entry_ts)
+            .expect("after clear_caches the file must resolve");
+        assert!(fresh.ends_with("missing.ts"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn root_relative_import_keeps_referrer_prefix() {
+        // A specifier starting with '/' must NOT walk up from the referrer's
+        // parent (the relative-import rule). It anchors at the referrer's
+        // root so behavior matches POSIX semantics: '/x' from anywhere
+        // inside the same logical filesystem is the same '/x'.
+        //
+        // We can't make a real '/x' file exist on the test machine, so the
+        // assertion reads the candidate list out of the OAM-MOD0001 error.
+        // The candidates are exactly `[ /x, /x.ts, /x.mts, /x.js, /x.mjs,
+        // /x/index.ts, /x/index.js ]` — '/x', NOT '/proj/x'. That's the
+        // invariant: the leading '/' is preserved by the root-relative
+        // branch and not rewritten as a parent walk.
+        let referrer = PathBuf::from("/proj/entry.ts");
+        let err = resolve_import("/x", &referrer)
+            .expect_err("'/x' cannot exist on the test machine, but the candidates list is the contract");
+        assert_eq!(err.code, "OAM-MOD0001");
+        let candidates: Vec<&str> = err
+            .message
+            .split("(tried ")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(')')
+            .split(", ")
+            .collect();
+        // Portable structural invariant: the first candidate is the raw
+        // root-relative path with the specifier suffix only — no 'proj'
+        // segment, no 'entry' parent walk. Whatever the platform's
+        // separator display, '/proj/entry.ts' importing '/x' must probe
+        // root-anchored 'x', not 'proj/x' or 'proj/entry.ts/x'.
+        assert!(
+            !candidates[0].contains("proj") && !candidates[0].contains("entry"),
+            "first candidate must be root-anchored '/x', not derived from the referrer's tree; got: {:?}",
+            candidates
+        );
+        assert!(
+            candidates[0].ends_with("x") && candidates[0].len() <= 3,
+            "first candidate is just 'x' (with at most a leading separator); got: {:?}",
+            candidates
+        );
+        // Directory index is also probed at the root anchor.
+        let index_candidate = candidates
+            .iter()
+            .find(|c| c.contains("index.ts"))
+            .expect("directory index must be probed");
+        assert!(
+            !index_candidate.contains("proj") && !index_candidate.contains("entry"),
+            "index probe must be root-anchored, not under the referrer: {index_candidate:?}"
+        );
+    }
+
+    #[test]
+    fn dotted_basename_probes_by_appending_extension() {
+        // './my.module' is a dotted basename: the '.module' segment is part
+        // of the name, not an extension. The probe must APPEND '.ts' (not
+        // `with_extension('ts')`, which would clobber '.module' to give
+        // 'my.ts'). Locks in the tsgo-parity rule for dot-rich basenames.
+        let dir = std::env::temp_dir().join(format!("oam-dotted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry.ts"), "export {};\n").unwrap();
+        std::fs::write(dir.join("my.module.ts"), "export const x = 1;\n").unwrap();
+        let entry_ts = dir.join("entry.ts");
+        let resolved =
+            resolve_import("./my.module", &entry_ts).expect("dotted basename must resolve");
+        assert!(resolved.ends_with("my.module.ts"), "got: {resolved:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn js_extension_falls_back_to_ts_source() {
+        // './x.js' must resolve to './x.ts' on disk -- the tsgo rewrite
+        // convention. This is the inverse of the dotted-basename test: here
+        // the extension IS the suffix to swap, so `with_extension('ts')`
+        // is the right tool. Locks in the symmetric half of the rule.
+        let dir = std::env::temp_dir().join(format!("oam-js2ts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry.ts"), "export {};\n").unwrap();
+        std::fs::write(dir.join("x.ts"), "export const x = 1;\n").unwrap();
+        let entry_ts = dir.join("entry.ts");
+        let resolved = resolve_import("./x.js", &entry_ts).expect("./x.js must hit x.ts");
+        assert!(resolved.ends_with("x.ts"), "got: {resolved:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_specifier_shapes_emit_oam_mod0004() {
+        // Four shapes that are invalid as ESM specifiers regardless of
+        // filesystem state: empty, lone '.', lone '..', backslash. They get
+        // their own diagnostic (OAM-MOD0004) -- npm resolution will never
+        // fix them, so we don't waste a MOD0002 round-trip on them.
+        let referrer = PathBuf::from("entry.ts");
+        for spec in ["", ".", "..", "foo\\bar"] {
+            match resolve_import(spec, &referrer) {
+                Ok(p) => panic!("{spec:?} should be Err, got Ok: {p:?}"),
+                Err(diagnostic) => {
+                    assert_eq!(diagnostic.code, "OAM-MOD0004", "specifier: {spec:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_stage_errors_carry_oam_parse0002() {
+        // Locks in the OAM-PARSE0002 code path: parse-clearly, transform-no.
+        // '<svg:rect />' parses fine in .tsx, but the JSX transformer's
+        // namespace-tag check (throwIfNamespace=true by default in oxc)
+        // rejects it -- surfacing as a transform-stage error in
+        // `Transformer::build_with_scoping` rather than a parse error in
+        // `Parser::parse`. The code on line 89 maps that to OAM-PARSE0002.
+        //
+        // If a future oxc release changes the default to
+        // `throwIfNamespace: false`, this test will start failing -- which
+        // is the right signal: we need a new transform-only failure
+        // candidate (or to accept that OAM-PARSE0002 is unreachable and
+        // remove the code).
+        let src = r#"const x = <svg:rect />;"#;
+        let err = ts("e.tsx", src).expect_err("namespaced JSX should fail at transform stage");
+        let d = &err.diagnostics[0];
+        assert_eq!(d.code, "OAM-PARSE0002", "got: {d:?}");
+        assert_eq!(d.origin, oam_diagnostics::Origin::Parse);
+        assert!(!d.spans.is_empty(), "expected a span on the transform error");
+    }
+
+    #[test]
+    fn declaration_file_filter_is_uniform() {
+        // The filter on probe_candidates::is_declaration_file runs
+        // UNCONDITIONALLY, even when the import specifier names the
+        // declaration file explicitly. `./types.d.ts` is types-only and
+        // must never load as a runtime module -- "importing it by name"
+        // doesn't make it a runtime artifact.
+        let dir = std::env::temp_dir().join(format!("oam-dts-explicit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("types.d.ts"),
+            "export declare const x: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("entry.ts"),
+            "import './types.d.ts';\nexport {};\n",
+        )
+        .unwrap();
+        let entry_ts = dir.join("entry.ts");
+        let err = resolve_import("./types.d.ts", &entry_ts)
+            .expect_err("explicit .d.ts import must still be filtered");
+        assert_eq!(err.code, "OAM-MOD0001", "got: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
