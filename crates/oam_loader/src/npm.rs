@@ -220,12 +220,104 @@ pub(crate) fn is_node_builtin(specifier: &str) -> bool {
     set.contains(name)
 }
 
+/// Walk up from `file` to the nearest directory containing a package.json.
+/// Returns (package_dir, parsed_manifest) on hit. The walk anchors subpath
+/// imports (#xxx) to the OWNING package, per Node's subpath-imports spec.
+fn find_owning_package(file: &Path) -> Option<(PathBuf, Value)> {
+    let mut dir = file.parent()?.to_path_buf();
+    loop {
+        let manifest_path = dir.join("package.json");
+        if manifest_path.is_file() {
+            let manifest = cached_manifest(&manifest_path).unwrap_or(Value::Null);
+            return Some((dir, manifest));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve a `#xxx` subpath-import specifier against the importing package's
+/// `imports` field (per the Node packages spec). Targets may be relative
+/// (`./...` within the package) or bare (resolved through node_modules from
+/// the package root, exactly like a regular bare import would be).
+fn resolve_subpath_import(
+    specifier: &str,
+    referrer: &Path,
+    mode: ResolveMode,
+) -> Result<PathBuf, Diagnostic> {
+    let Some((pkg_dir, manifest)) = find_owning_package(referrer) else {
+        return Err(diag(
+            "OAM-MOD0002",
+            format!(
+                "subpath import '{specifier}' has no owning package.json above {}",
+                referrer.display()
+            ),
+        ));
+    };
+    let Some(imports) = manifest.get("imports") else {
+        return Err(diag(
+            "OAM-MOD0007",
+            format!(
+                "subpath import '{specifier}' is not declared in {}/package.json (no 'imports' field)",
+                pkg_dir.display()
+            ),
+        ));
+    };
+    let target = exports_resolve(imports, specifier, mode.conditions()).map_err(
+        |reason| match reason {
+            ExportsError::NotExported => diag(
+                "OAM-MOD0007",
+                format!(
+                    "subpath import '{specifier}' is not declared in {}/package.json imports",
+                    pkg_dir.display()
+                ),
+            ),
+            ExportsError::InvalidTarget(target) => diag(
+                "OAM-MOD0002",
+                format!(
+                    "{}/package.json imports has invalid target '{target}' for '{specifier}'",
+                    pkg_dir.display()
+                ),
+            ),
+        },
+    )?;
+    // Per spec: a target starting with './' is package-relative; anything else
+    // is a bare specifier resolved as a regular import from the package root.
+    if let Some(rel) = target.strip_prefix("./") {
+        let path = pkg_dir.join(rel);
+        if !path.is_file() {
+            return Err(diag(
+                "OAM-MOD0002",
+                format!(
+                    "subpath import '{specifier}' -> {} which does not exist",
+                    path.display()
+                ),
+            ));
+        }
+        return Ok(path);
+    }
+    // Bare target: re-enter resolve_bare from the owning package's root. A
+    // pseudo file under pkg_dir gives the node_modules walk the right anchor
+    // (resolve_bare's loop starts at referrer.parent()).
+    resolve_bare(&target, &pkg_dir.join("__oam_subpath_anchor"), mode)
+}
+
 /// Resolve a bare specifier from `referrer` against node_modules.
 pub(crate) fn resolve_bare(
     specifier: &str,
     referrer: &Path,
     mode: ResolveMode,
 ) -> Result<PathBuf, Diagnostic> {
+    // Subpath imports (#xxx): resolved against the owning package's
+    // package.json `imports` field (per Node's subpath-imports spec).
+    // chalk and many other published packages use this to expose
+    // package-private modules; the resolver MUST honor it before trying
+    // node_modules (#xxx would never match a bare package name there).
+    if specifier.starts_with('#') {
+        return resolve_subpath_import(specifier, referrer, mode);
+    }
+
     // oam: runtime modules. Same virtual-path mechanism as node: builtins;
     // the registry key is the FULL specifier.
     if let Some(rest) = specifier.strip_prefix("oam:") {
@@ -233,12 +325,13 @@ pub(crate) fn resolve_bare(
             "test" => return Ok(PathBuf::from("oam:test")),
             "permissions" => return Ok(PathBuf::from("oam:permissions")),
             "ai" => return Ok(PathBuf::from("oam:ai")),
+            "mcp" => return Ok(PathBuf::from("oam:mcp")),
             _ => {}
         }
         return Err(diag(
             "OAM-MOD0006",
             format!(
-                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions, oam:ai)"
+                "'{specifier}' is not a known oam: module (available: oam:test, oam:permissions, oam:ai, oam:mcp)"
             ),
         ));
     }
@@ -579,8 +672,17 @@ fn exports_resolve(
     conditions: &[&str],
 ) -> Result<String, ExportsError> {
     // Sugar: a top-level string/array/conditions-object is the "." entry.
+    // Map keys: exports uses './x' (and bare '.'), imports uses '#x'. Both
+    // shapes route through this same function; the subpath shape (specifier
+    // vs '.') matches the key shape.
     let as_map = match exports {
-        Value::Object(map) if map.keys().any(|k| k.starts_with('.')) => Some(map),
+        Value::Object(map)
+            if map
+                .keys()
+                .any(|k| k.starts_with('.') || k.starts_with('#')) =>
+        {
+            Some(map)
+        }
         _ => None,
     };
     let Some(map) = as_map else {
@@ -711,6 +813,102 @@ mod tests {
             "./main.js"
         );
         assert!(exports_resolve(&string_sugar, "./sub", IMPORT).is_err());
+    }
+
+    // Subpath imports (#xxx) reuse exports_resolve with #-keyed maps. Verify
+    // the algorithm covers the shapes that chalk + family ship.
+    #[test]
+    fn subpath_imports_match_string_target_and_wildcards() {
+        let imports = json!({
+            "#ansi-styles": "./source/vendor/ansi-styles/index.js",
+            "#deep/*": "./src/deep/*.js",
+            "#cond": { "import": "./esm.js", "require": "./cjs.js" },
+        });
+        // Exact key.
+        assert_eq!(
+            exports_resolve(&imports, "#ansi-styles", IMPORT).ok().unwrap(),
+            "./source/vendor/ansi-styles/index.js"
+        );
+        // Wildcard subpath.
+        assert_eq!(
+            exports_resolve(&imports, "#deep/feature", IMPORT).ok().unwrap(),
+            "./src/deep/feature.js"
+        );
+        // Conditions branch (import vs require).
+        assert_eq!(
+            exports_resolve(&imports, "#cond", IMPORT).ok().unwrap(),
+            "./esm.js"
+        );
+        assert_eq!(
+            exports_resolve(&imports, "#cond", REQUIRE).ok().unwrap(),
+            "./cjs.js"
+        );
+        // Undeclared specifier rejected.
+        assert!(matches!(
+            exports_resolve(&imports, "#missing", IMPORT),
+            Err(ExportsError::NotExported)
+        ));
+    }
+
+    #[test]
+    fn resolve_subpath_import_walks_to_owning_package_json() {
+        // chalk's package.json imports map points #ansi-styles at a vendored
+        // copy. Re-resolving the specifier from any file in chalk's tree
+        // (nested deep, walking up to find the nearest package.json) must
+        // produce the vendored path on disk.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let id = CNT.fetch_add(1, Ordering::Relaxed);
+        let pkg = std::env::temp_dir().join(format!("oam-subpath-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&pkg);
+        let vendor = pkg.join("source/vendor/ansi-styles");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("index.js"), "// vendored").unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&json!({
+                "name": "chalk",
+                "type": "module",
+                "imports": {
+                    "#ansi-styles": "./source/vendor/ansi-styles/index.js"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Referrer is a file inside the package (the import sites are in
+        // chalk's own modules, not in node_modules above it).
+        let referrer = pkg.join("source/index.js");
+        std::fs::create_dir_all(referrer.parent().unwrap()).unwrap();
+        std::fs::write(&referrer, "import '#ansi-styles';").unwrap();
+        let resolved = resolve_bare("#ansi-styles", &referrer, ResolveMode::Import).unwrap();
+        assert!(
+            resolved.ends_with("source/vendor/ansi-styles/index.js"),
+            "got {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&pkg);
+    }
+
+    #[test]
+    fn resolve_subpath_import_rejects_when_no_imports_field() {
+        // A #-specifier in a package whose package.json has no imports field
+        // is an error (MOD0007), distinct from "no package.json at all".
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let id = CNT.fetch_add(1, Ordering::Relaxed);
+        let pkg = std::env::temp_dir().join(format!("oam-subpath-noimp-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&pkg);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"pkg","type":"module"}"#,
+        )
+        .unwrap();
+        let referrer = pkg.join("entry.js");
+        std::fs::write(&referrer, "").unwrap();
+        let err = resolve_bare("#missing", &referrer, ResolveMode::Import).unwrap_err();
+        assert_eq!(err.code, "OAM-MOD0007", "got {err:?}");
+        let _ = std::fs::remove_dir_all(&pkg);
     }
 
     #[test]
