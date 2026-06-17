@@ -2585,18 +2585,29 @@ fn als_works_from_require_and_nexttick() {
 }
 
 #[test]
-fn dynamic_import_rejects_with_actionable_message() {
+fn dynamic_import_loads_modules_and_rejects_missing() {
+    // Dynamic import() loads builtins, relative modules (named + default), and
+    // rejects a missing specifier with an actionable, catchable error.
+    write_temp(
+        "dynimp/dep.mjs",
+        "export const answer = 42;\nexport default 'hi';\n",
+    );
     let main = write_temp(
-        "dyn.mjs",
-        "try { await import('./whatever.mjs'); } catch (e) { console.log(e.message.includes('dynamic import'), e.message.includes('static import')); }",
+        "dynimp/main.mjs",
+        "const os = await import('node:os');\n\
+         console.log('builtin', typeof os.platform === 'function');\n\
+         const dep = await import('./dep.mjs');\n\
+         console.log('named', dep.answer === 42, 'default', dep.default === 'hi');\n\
+         try { await import('./nope.mjs'); console.log('missing', 'NO-THROW'); }\n\
+         catch (e) { console.log('missing', e.message.includes('dynamic import')); }\n",
     );
-    let out = oam(&["run", main.to_str().unwrap()]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true true");
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {}: {stdout}\n{stderr}", out.status);
+    assert!(stdout.contains("builtin true"), "{stdout}");
+    assert!(stdout.contains("named true default true"), "{stdout}");
+    assert!(stdout.contains("missing true"), "{stdout}");
 }
 
 #[test]

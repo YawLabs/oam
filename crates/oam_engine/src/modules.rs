@@ -33,6 +33,15 @@ pub trait ModuleHost {
     fn load(&self, path: &Path) -> Result<String, Vec<Diagnostic>>;
 }
 
+/// Raw pointer to the active `ModuleHost`, parked in an isolate slot so the
+/// zero-capture `dynamic_import_callback` can resolve+load on demand the same
+/// way the static graph does. The pointer is valid ONLY while `execute_module`
+/// is on the stack (the host is borrowed for that whole call, and the callback
+/// can only fire synchronously during the module evaluation it drives). Entry
+/// points that run JS WITHOUT a host (tick/repl_eval) set this to `None` so a
+/// dynamic import there rejects cleanly instead of dereferencing a stale ptr.
+struct ActiveHost(Option<*const (dyn ModuleHost + 'static)>);
+
 #[derive(Default)]
 struct ModuleMap {
     by_path: HashMap<PathBuf, v8::Global<v8::Module>>,
@@ -295,6 +304,14 @@ impl JsRuntime {
         })?;
         self.reset_run_slots()?;
 
+        // Park the host pointer for dynamic_import_callback. SAFETY: `host`
+        // outlives this whole call, and the callback only fires synchronously
+        // during the evaluation below; the slot is reset to None by tick() /
+        // repl_eval() so no later turn can read a stale pointer.
+        let host_ptr: *const (dyn ModuleHost + 'static) =
+            unsafe { std::mem::transmute(host as *const dyn ModuleHost) };
+        self.isolate.set_slot(ActiveHost(Some(host_ptr)));
+
         // --inspect-brk: cloned out so it owns its ref independently of the
         // upcoming &mut self.isolate borrow.
         let wait = self
@@ -373,6 +390,9 @@ impl JsRuntime {
     /// remaining budget on the op channel. Errors are returned, not fatal.
     pub fn tick(&mut self, budget: std::time::Duration) -> Result<(), Vec<Diagnostic>> {
         let deadline = std::time::Instant::now() + budget;
+        // No host on this path: clear any pointer a prior execute_module parked
+        // so a dynamic import() during a tick rejects cleanly, never derefs stale.
+        self.isolate.set_slot(ActiveHost(None));
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
@@ -438,6 +458,9 @@ impl JsRuntime {
     /// rendered via util.inspect, `_` bound to the last value. Err is the
     /// pretty error text.
     pub fn repl_eval(&mut self, source: &str) -> Result<String, String> {
+        // No host on the REPL path: clear any parked pointer (defensive; the
+        // REPL never calls execute_module, but keep the invariant uniform).
+        self.isolate.set_slot(ActiveHost(None));
         let has_await = source.contains("await");
         let prepared = if has_await {
             // Top-level await: evaluate as an async IIFE and pump until
@@ -1003,29 +1026,207 @@ fn resolve_module_callback<'s>(
     }
 }
 
-/// Dynamic import() host callback — wave-1 interim: reject with a clear,
-/// actionable message instead of V8's bare "Error: Not supported". Full
-/// support (on-demand graph load through the ModuleMap) is roadmapped with
-/// the M2 module work.
+/// Outcome of loading a dynamically-imported module, carried out of the child
+/// TryCatch scope as scope-independent Globals so the parent scope can settle
+/// the import promise after the child scope drops.
+enum DynResult {
+    /// Module evaluated cleanly; carries its namespace object.
+    Namespace(v8::Global<v8::Value>),
+    /// Module (or its graph) threw during evaluation; carries the reason value.
+    Rejected(v8::Global<v8::Value>),
+    /// oam-side failure (resolve/load/instantiate, or an unsupported shape);
+    /// the message becomes an Error the import promise rejects with.
+    Error(String),
+}
+
+/// Reject `resolver` with a freshly-built Error carrying `msg`.
+fn reject_with_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: &v8::Local<'_, v8::PromiseResolver>,
+    msg: &str,
+) {
+    if let Some(s) = v8::String::new(scope, msg) {
+        let exception = v8::Exception::error(scope, s);
+        resolver.reject(scope, exception);
+    }
+}
+
+/// Load + instantiate + evaluate a dynamically-imported module through the same
+/// machinery as the static graph, under the caller's TryCatch scope. Returns a
+/// DynResult of Globals so the namespace/reason survives the scope drop.
+fn dyn_import_load(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    resolved: PathBuf,
+    spec: &str,
+) -> DynResult {
+    // Pull the rest of the graph in (idempotent: already-loaded paths skip).
+    if let Err(diags) = load_module_graph(tc, host, resolved.clone()) {
+        let msg = diags
+            .first()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .unwrap_or_else(|| format!("failed to load '{spec}'"));
+        return DynResult::Error(format!("oam: dynamic import('{spec}'): {msg}"));
+    }
+
+    let module = {
+        let map = tc
+            .get_slot::<ModuleMap>()
+            .expect("module map installed");
+        match map.by_path.get(&resolved) {
+            Some(global) => v8::Local::new(tc, global),
+            None => {
+                return DynResult::Error(format!(
+                    "oam internal: dynamic import('{spec}') loaded but not registered at {}",
+                    resolved.display()
+                ));
+            }
+        }
+    };
+
+    // Instantiate only from a fresh module; a statically-loaded one is already
+    // (at least) Instantiated and re-instantiating would error.
+    if module.get_status() == v8::ModuleStatus::Uninstantiated
+        && module.instantiate_module(tc, resolve_module_callback) != Some(true)
+    {
+        return match dyn_caught_value(tc) {
+            Some(v) => DynResult::Rejected(v),
+            None => DynResult::Error(format!("oam: dynamic import('{spec}'): instantiation failed")),
+        };
+    }
+    if module.get_status() == v8::ModuleStatus::Errored {
+        return DynResult::Rejected(v8::Global::new(tc, module.get_exception()));
+    }
+
+    let Some(value) = module.evaluate(tc) else {
+        return match dyn_caught_value(tc) {
+            Some(v) => DynResult::Rejected(v),
+            None => DynResult::Error(format!("oam: dynamic import('{spec}'): evaluation failed")),
+        };
+    };
+    tc.perform_microtask_checkpoint();
+
+    // evaluate() yields the module's top-level-await promise.
+    let Ok(eval_promise) = v8::Local::<v8::Promise>::try_from(value) else {
+        // Non-promise return is unexpected for a SourceText module; treat the
+        // value as the namespace fallback rather than failing.
+        return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
+    };
+    match eval_promise.state() {
+        v8::PromiseState::Fulfilled => {
+            DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
+        }
+        v8::PromiseState::Rejected => {
+            DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
+        }
+        // Synchronous graphs settle within the microtask checkpoint above. A
+        // still-pending promise means real top-level await in the imported
+        // module, which needs a nested event-loop pump — a documented follow-up.
+        v8::PromiseState::Pending => DynResult::Error(format!(
+            "oam: dynamic import('{spec}') of a module with top-level await is not supported yet"
+        )),
+    }
+}
+
+/// The currently-caught exception (if any) as a Global, for reporting an
+/// instantiate/evaluate failure as a promise rejection with the real value.
+fn dyn_caught_value(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<v8::Global<v8::Value>> {
+    let exception = tc.exception()?;
+    Some(v8::Global::new(tc, exception))
+}
+
+/// Dynamic import() host callback. Resolves `specifier` relative to the
+/// importing module, then loads/instantiates/evaluates it through the same
+/// path as the static graph and settles the import promise with the module
+/// namespace. Synchronous graphs (incl. node:/oam: builtins and CJS) resolve
+/// inline; a module whose own top-level await is still pending is rejected
+/// with a clear message (nested-pump support is a follow-up).
 pub(crate) fn dynamic_import_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     let spec = specifier.to_rust_string_lossy(scope);
-    let message = v8::String::new(
-        scope,
-        &format!(
-            "oam: dynamic import('{spec}') is not supported yet (lands later in M2) — \
-             use a static import, or require() inside CommonJS"
-        ),
-    )?;
-    let exception = v8::Exception::error(scope, message);
-    resolver.reject(scope, exception);
+    let referrer = resource_name.to_rust_string_lossy(scope);
+
+    // The active host is parked by execute_module; absent on the REPL/timer
+    // paths, where dynamic import isn't wired up yet.
+    let Some(host_ptr) = scope.get_slot::<ActiveHost>().and_then(|h| h.0) else {
+        reject_with_message(
+            scope,
+            &resolver,
+            &format!(
+                "oam: dynamic import('{spec}') is only supported during module execution, \
+                 not from the REPL or a timer/op callback yet"
+            ),
+        );
+        return Some(promise);
+    };
+    // SAFETY: the pointer is valid for the whole execute_module call (the host
+    // is borrowed there), and this callback only fires synchronously during the
+    // evaluation that call drives. See ActiveHost.
+    let host: &dyn ModuleHost = unsafe { &*host_ptr };
+
+    // Resolve the specifier relative to the importing module.
+    let referrer_path = PathBuf::from(&referrer);
+    let resolved = match host.resolve(&spec, &referrer_path) {
+        Ok(p) => p,
+        Err(diags) => {
+            let msg = diags
+                .first()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .unwrap_or_else(|| format!("cannot resolve '{spec}'"));
+            reject_with_message(scope, &resolver, &format!("oam: dynamic import('{spec}'): {msg}"));
+            return Some(promise);
+        }
+    };
+    // Virtual builtin paths bypass filesystem normalization (module_key /
+    // absolute() would anchor "node:fs" at cwd); everything else is keyed.
+    let resolved = if resolved
+        .to_str()
+        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+    {
+        resolved
+    } else {
+        match module_key(&resolved) {
+            Ok(k) => k,
+            Err(e) => {
+                reject_with_message(
+                    scope,
+                    &resolver,
+                    &format!(
+                        "oam: dynamic import('{spec}'): bad resolved path {}: {e}",
+                        resolved.display()
+                    ),
+                );
+                return Some(promise);
+            }
+        }
+    };
+
+    // Heavy V8 work under a child TryCatch; carry the result out as Globals.
+    let result = {
+        v8::tc_scope!(let tc, scope);
+        dyn_import_load(tc, host, resolved, &spec)
+    };
+
+    match result {
+        DynResult::Namespace(ns) => {
+            let value = v8::Local::new(scope, &ns);
+            resolver.resolve(scope, value);
+        }
+        DynResult::Rejected(reason) => {
+            let value = v8::Local::new(scope, &reason);
+            resolver.reject(scope, value);
+        }
+        DynResult::Error(msg) => reject_with_message(scope, &resolver, &msg),
+    }
     Some(promise)
 }
 
