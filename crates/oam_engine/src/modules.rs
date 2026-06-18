@@ -602,12 +602,18 @@ impl JsRuntime {
     /// `globalThis.__oamTestRun(filter)` (snapshot JS) and pump the event
     /// loop until its promise settles. Returns the results object as a
     /// JSON string. Reuses the run slots from the preceding
-    /// execute_module/execute_cjs call — do NOT reset them here, the test
+    /// execute_module/execute_cjs call -- do NOT reset them here, the test
     /// file's module state must stay alive.
     pub fn run_registered_tests(
         &mut self,
         filter: Option<&str>,
     ) -> Result<String, Vec<Diagnostic>> {
+        // Clear ActiveHost so dynamic import() calls from inside test bodies
+        // see None and reject with "not wired up on this entry path" instead
+        // of dereferencing the stale host pointer left by execute_module.
+        // Pattern mirrors tick() and repl_eval(): clear before creating the
+        // scope so the borrow checker lets us take &mut self.isolate.
+        self.isolate.set_slot(ActiveHost(None));
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
 
@@ -1183,6 +1189,33 @@ fn dyn_import_load(
             }
         }
     };
+
+    // Handle cycle cases BEFORE calling evaluate() or get_module_namespace(),
+    // both of which CHECK-fail on kEvaluating in all V8 builds:
+    //
+    // kEvaluatingAsync -- the module's TLA is in progress. evaluate() on this
+    //   state returns the existing (pending) TLA promise, and get_module_namespace()
+    //   is safe. Return the partial namespace now: bindings initialized before
+    //   the TLA suspended are live; unset ones are TDZ. This is the correct
+    //   ES2022 semantics for a TLA cycle (A imports B imports A-while-A's-TLA
+    //   is pending).
+    //
+    // kEvaluating -- the module's synchronous body is currently executing
+    //   (we are on its call stack). Calling evaluate() again triggers a V8
+    //   CHECK failure. get_module_namespace() is also forbidden for this
+    //   status. Report as a hard-sync cycle error rather than crashing.
+    match module.get_status() {
+        v8::ModuleStatus::EvaluatingAsync => {
+            return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
+        }
+        v8::ModuleStatus::Evaluating => {
+            return DynResult::Error(format!(
+                "oam: dynamic import('{spec}') hit a synchronous evaluation cycle; \
+                 use top-level await in the importing module to break the cycle"
+            ));
+        }
+        _ => {}
+    }
 
     // Instantiate only from a fresh module; a statically-loaded one is already
     // (at least) Instantiated and re-instantiating would error.
