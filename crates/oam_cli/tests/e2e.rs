@@ -12898,11 +12898,7 @@ fn install_lifecycle_script_suppressed_by_trust() {
     // Trust fake-pkg via project-local .oam/trust.json
     let trust_dir = dir.join(".oam");
     std::fs::create_dir_all(&trust_dir).unwrap();
-    std::fs::write(
-        trust_dir.join("trust.json"),
-        r#"{"packages":["fake-pkg"]}"#,
-    )
-    .unwrap();
+    std::fs::write(trust_dir.join("trust.json"), r#"{"packages":["fake-pkg"]}"#).unwrap();
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(["install"])
@@ -12945,9 +12941,15 @@ fn trust_add_remove_list_round_trip() {
 
     // trust.json was created
     let trust_json = dir.join(".oam/trust.json");
-    assert!(trust_json.is_file(), ".oam/trust.json should exist after trust add");
+    assert!(
+        trust_json.is_file(),
+        ".oam/trust.json should exist after trust add"
+    );
     let content = std::fs::read_to_string(&trust_json).unwrap();
-    assert!(content.contains("esbuild"), ".oam/trust.json should contain esbuild");
+    assert!(
+        content.contains("esbuild"),
+        ".oam/trust.json should contain esbuild"
+    );
 
     // list
     let out = std::process::Command::new(oam)

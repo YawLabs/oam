@@ -662,10 +662,7 @@ fn check_lifecycle_scripts(
         return;
     }
 
-    let version = json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
+    let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
     let script_list = found.join(", ");
     errors.push(Diagnostic::new(
         "OAM-PKG0007",
