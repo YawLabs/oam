@@ -346,7 +346,7 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
         "mcp-cold-start",
     ];
 
-    let scripts = write_scripts(&tmp)?;
+    let scripts = write_scripts(&tmp, &repo)?;
     let mut all_results: Vec<CaseResult> = Vec::new();
 
     for case_name in &case_names {
@@ -372,12 +372,14 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
                     run_timed_case(case_name, rt, &scripts.crypto_hash, TIMED_ITERS, &[])
                 }
                 "mcp-cold-start" => {
-                    if rt.name != "oam" {
-                        // SDK comparison not yet wired; skip non-oam runtimes.
-                        println!("  {}/mcp-cold-start: skipped (oam only)", rt.name);
+                    if rt.name == "oam" {
+                        run_mcp_cold_start(rt, &scripts.mcp_server)
+                    } else if let Some(sdk) = &scripts.sdk_mcp_server {
+                        run_mcp_cold_start(rt, sdk)
+                    } else {
+                        println!("  {}/mcp-cold-start: skipped (SDK install failed)", rt.name);
                         continue;
                     }
-                    run_mcp_cold_start(rt, &scripts.mcp_server)
                 }
                 _ => unreachable!(),
             };
@@ -420,9 +422,11 @@ struct Scripts {
     crypto_hash: PathBuf,
     data_file: PathBuf,
     mcp_server: PathBuf,
+    /// SDK server script for node/bun/deno comparison. None if npm install failed.
+    sdk_mcp_server: Option<PathBuf>,
 }
 
-fn write_scripts(tmp: &Path) -> Result<Scripts> {
+fn write_scripts(tmp: &Path, repo: &Path) -> Result<Scripts> {
     let cold_start = tmp.join("bench_cold_start.mjs");
     std::fs::write(&cold_start, "console.log('ok');\n")?;
 
@@ -536,6 +540,11 @@ server.serve({ transport: 'stdio' });
 "#,
     )?;
 
+    // SDK MCP server: equivalent server using @modelcontextprotocol/sdk for
+    // --compare runs. We install the SDK into bench/sdk-fixtures/ (cached across
+    // runs -- stable path avoids Defender scan churn during the bench itself).
+    let sdk_mcp_server = build_sdk_mcp_server(&repo.join("bench").join("sdk-fixtures"));
+
     Ok(Scripts {
         cold_start,
         url_parse,
@@ -545,7 +554,77 @@ server.serve({ transport: 'stdio' });
         crypto_hash,
         data_file,
         mcp_server,
+        sdk_mcp_server,
     })
+}
+
+/// Ensures @modelcontextprotocol/sdk is installed in `fixtures_dir` and
+/// returns the path to the server script. The fixtures dir is stable across
+/// runs (bench/sdk-fixtures/) so the install only happens once -- avoids
+/// Windows Defender scan churn polluting the benchmark measurements.
+fn build_sdk_mcp_server(fixtures: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(fixtures).ok()?;
+
+    let server = fixtures.join("bench_sdk_server.mjs");
+
+    // Always (re)write the script so changes to the fixture are picked up.
+    std::fs::write(
+        &server,
+        r#"import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+const server = new Server({ name: 'bench', version: '0.0.1' }, { capabilities: { tools: {} } });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: 'noop', description: 'No-op benchmark tool', inputSchema: { type: 'object', properties: {} } }],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async () => ({
+  content: [{ type: 'text', text: 'ok' }],
+}));
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+"#,
+    )
+    .ok()?;
+
+    // Skip npm install if the SDK is already present.
+    let sdk_marker = fixtures
+        .join("node_modules")
+        .join("@modelcontextprotocol")
+        .join("sdk")
+        .join("package.json");
+    if sdk_marker.exists() {
+        return Some(server);
+    }
+
+    // Minimal package.json so npm install works without warnings.
+    std::fs::write(
+        fixtures.join("package.json"),
+        r#"{"name":"bench-sdk-fixtures","version":"0.0.0","private":true,"type":"module"}"#,
+    )
+    .ok()?;
+
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+
+    print!("  sdk-fixtures: npm install @modelcontextprotocol/sdk ... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let status = Command::new(npm)
+        .args(["install", "--save-exact", "@modelcontextprotocol/sdk"])
+        .current_dir(fixtures)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        println!("FAILED (skipping SDK leg)");
+        return None;
+    }
+    println!("ok");
+
+    Some(server)
 }
 
 // ------------------------------------------------------------ table output
@@ -755,7 +834,7 @@ fn build_markdown(
     md.push_str("- **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.\n");
     md.push_str("- **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.\n");
     md.push_str("- **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.\n");
-    md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. Benchmarks a minimal `oam:mcp` server with one tool.\n");
+    md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport).\n");
 
     md
 }
