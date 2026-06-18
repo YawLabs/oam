@@ -9,6 +9,12 @@ pub struct ChildProcess {
     /// duration of the await, but the entry itself stays so a concurrent
     /// `child_kill` can still reach the kill-notifier below.
     pub child: Option<tokio::process::Child>,
+    /// Stored separately from `child` so that `child_wait` taking `child` for
+    /// its `wait()` call does not race with concurrent `child_write_stdin` /
+    /// `child_close_stdin` ops. Without this separation a Windows scheduler
+    /// that runs the `spawnWait` Tokio task before `spawnWrite` causes the
+    /// write to see `child` as `None` and silently drop the stdin data.
+    pub stdin: Option<tokio::process::ChildStdin>,
     pub pid: u32,
     /// Wakes the parked `child_wait` future, which owns the `Child` and is the
     /// only place that can signal it. Lets kill survive `child` being taken.
@@ -18,9 +24,11 @@ pub struct ChildProcess {
 }
 
 impl ChildProcess {
-    pub fn new(child: tokio::process::Child, pid: u32) -> Self {
+    pub fn new(mut child: tokio::process::Child, pid: u32) -> Self {
+        let stdin = child.stdin.take();
         ChildProcess {
             child: Some(child),
+            stdin,
             pid,
             kill: Arc::new(Notify::new()),
             kill_signal: None,
@@ -316,18 +324,15 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
 
 pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-        drop(ch.stdin.take());
+    if let Some(cp) = guard.get_mut(&handle) {
+        drop(cp.stdin.take());
     }
 }
 
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_mut(&handle)
-            .and_then(|c| c.child.as_mut())
-            .and_then(|ch| ch.stdin.take())
+        guard.get_mut(&handle).and_then(|cp| cp.stdin.take())
     };
     match stdin {
         Some(mut stdin) => {
@@ -335,8 +340,8 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
             match stdin.write_all(&data).await {
                 Ok(()) => {
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-                        ch.stdin = Some(stdin);
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stdin = Some(stdin);
                     }
                     OpOutcome::Done
                 }
