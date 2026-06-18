@@ -43,6 +43,33 @@ const NAPI_EXPORTS: &[&str] = &[
     "napi_is_exception_pending",
     "napi_get_and_clear_last_exception",
     "napi_get_version",
+    // Externals (beta)
+    "napi_create_external",
+    "napi_get_value_external",
+    // References (beta)
+    "napi_create_reference",
+    "napi_delete_reference",
+    "napi_get_reference_value",
+    "napi_reference_ref",
+    "napi_reference_unref",
+    // Wrap / classes (beta)
+    "napi_define_class",
+    "napi_wrap",
+    "napi_unwrap",
+    "napi_remove_wrap",
+    "napi_new_instance",
+    "napi_instanceof",
+    // BigInt (beta)
+    "napi_create_bigint_int64",
+    "napi_create_bigint_uint64",
+    "napi_get_value_bigint_int64",
+    "napi_get_value_bigint_uint64",
+    // Buffers (beta)
+    "napi_create_buffer",
+    "napi_create_buffer_copy",
+    "napi_create_external_buffer",
+    "napi_is_buffer",
+    "napi_get_buffer_info",
 ];
 
 fn main() {

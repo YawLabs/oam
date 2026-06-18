@@ -13,6 +13,8 @@ oam_core = { workspace = true }
 # CJS interop: require() resolution + module-kind classification (v8-free).
 oam_loader = { workspace = true }
 # Facade generation JSON-escapes paths/export names.
+# serde Serialize/Deserialize derives used by replay.rs.
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # WHATWG URL parse/mutate natives for the JS URL class, and permission
 # net-gate host extraction in ops.rs.

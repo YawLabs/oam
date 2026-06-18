@@ -1237,7 +1237,7 @@ fn flush_cycle_imports(
                 let module = v8::Local::new(tc, &mg);
                 let status = module.get_status();
                 match status {
-                    v8::ModuleStatus::EvaluatingAsync | v8::ModuleStatus::Evaluated => {
+                    v8::ModuleStatus::Evaluated => {
                         let ns = module.get_module_namespace();
                         let ns_val: v8::Local<v8::Value> = ns.into();
                         resolver.resolve(tc, ns_val);
@@ -1249,7 +1249,7 @@ fn flush_cycle_imports(
                         flushed += 1;
                     }
                     v8::ModuleStatus::Evaluating => {
-                        // Still on the call stack — defer until the outer level.
+                        // Still evaluating (sync body or TLA) -- defer.
                         skipped.push((path, resolver_global));
                     }
                     _ => {
@@ -1268,12 +1268,13 @@ fn flush_cycle_imports(
     }
 
     // Put back any items that couldn't be flushed yet.
+    let skipped_len = skipped.len();
     if !skipped.is_empty() {
         if let Some(p) = tc.get_slot_mut::<PendingCycleImports>() {
             p.0.extend(skipped);
         }
     }
-    (flushed, skipped.len())
+    (flushed, skipped_len)
 }
 
 /// Flush PendingTLAImports: resolve any whose module has reached kEvaluated
@@ -1387,13 +1388,14 @@ fn dyn_import_load(
     //   CHECK failure. get_module_namespace() is also forbidden for this
     //   status. Report as a hard-sync cycle error rather than crashing.
     match module.get_status() {
-        v8::ModuleStatus::EvaluatingAsync => {
+        v8::ModuleStatus::Evaluated => {
+            // Already complete (including any TLA): return the namespace immediately.
             return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
         }
         v8::ModuleStatus::Evaluating => {
-            // We are on this module's call stack. Signal to the caller to store
-            // the resolver in PendingCycleImports; the outer dyn_import_load will
-            // flush it once the module transitions to kEvaluatingAsync.
+            // Either the sync body is on our call stack, or TLA is in progress.
+            // In both cases defer and let flush_cycle_imports retry once the outer
+            // evaluate() returns and the module reaches Evaluated.
             return DynResult::Deferred;
         }
         _ => {}

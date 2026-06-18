@@ -1325,6 +1325,124 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     );
 }
 
+// -------------------------------------------------------------- N-API beta
+
+fn napi_beta_addon() -> std::path::PathBuf {
+    let artifact = if cfg!(windows) {
+        "oam_napi_test_addon.dll"
+    } else if cfg!(target_os = "macos") {
+        "liboam_napi_test_addon.dylib"
+    } else {
+        "liboam_napi_test_addon.so"
+    };
+    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(artifact);
+    if !built.is_file() {
+        panic!(
+            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
+            built.display()
+        );
+    }
+    let addon = write_temp("napi_beta/native.node", "placeholder");
+    std::fs::copy(&built, &addon).expect("copy addon into place");
+    addon.parent().unwrap().to_path_buf()
+}
+
+#[test]
+fn napi_beta_wrap_counter_roundtrip() {
+    let dir = napi_beta_addon();
+    write_temp(
+        "napi_beta/wrap_counter.cjs",
+        "const native = require('./native.node');\n\
+         // wrapCounter() allocates a heap i64 and wraps it on a plain JS object.\n\
+         const c = native.wrapCounter();\n\
+         console.log(native.counterGet(c)); // 0\n\
+         native.counterInc(c);\n\
+         native.counterInc(c);\n\
+         native.counterInc(c);\n\
+         console.log(native.counterGet(c)); // 3\n\
+         // A different counter is independent.\n\
+         const d = native.wrapCounter();\n\
+         native.counterInc(d);\n\
+         console.log(native.counterGet(d)); // 1\n\
+         console.log(native.counterGet(c)); // 3 (unchanged)",
+    );
+    let main = dir.join("wrap_counter.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "0", "initial counter value");
+    assert_eq!(lines[1], "3", "after 3 increments");
+    assert_eq!(lines[2], "1", "independent counter");
+    assert_eq!(lines[3], "3", "first counter unchanged");
+}
+
+#[test]
+fn napi_beta_bigint_int64_create_and_read() {
+    let dir = napi_beta_addon();
+    write_temp(
+        "napi_beta/bigint64.cjs",
+        "const native = require('./native.node');\n\
+         // napi_create_bigint_int64 ALWAYS returns BigInt (unlike napi_create_int64).\n\
+         const small = native.makeBigInt64(42);\n\
+         console.log(typeof small);      // bigint\n\
+         console.log(small === 42n);     // true\n\
+         // napi_get_value_bigint_int64: read back via native, returns as number.\n\
+         console.log(native.readBigInt64(42n));    // 42\n\
+         console.log(native.readBigInt64(-1000n)); // -1000",
+    );
+    let main = dir.join("bigint64.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "bigint", "napi_create_bigint_int64 must return BigInt");
+    assert_eq!(lines[1], "true", "bigint value identity check");
+    assert_eq!(lines[2], "42", "bigint roundtrip 42");
+    assert_eq!(lines[3], "-1000", "bigint roundtrip -1000");
+}
+
+#[test]
+fn napi_beta_buffer_create_and_len() {
+    let dir = napi_beta_addon();
+    write_temp(
+        "napi_beta/buffer.cjs",
+        "const native = require('./native.node');\n\
+         const buf = native.makeBuffer(32);\n\
+         // napi_create_buffer returns a Uint8Array.\n\
+         console.log(buf instanceof Uint8Array); // true\n\
+         console.log(buf.byteLength);            // 32\n\
+         // napi_get_buffer_info: native read of byte length.\n\
+         console.log(native.bufferLen(buf));     // 32\n\
+         // Works on a Buffer too (Buffer extends Uint8Array).\n\
+         const b2 = Buffer.alloc(8);\n\
+         console.log(native.bufferLen(b2));      // 8",
+    );
+    let main = dir.join("buffer.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "true", "napi_create_buffer must return Uint8Array");
+    assert_eq!(lines[1], "32", "byteLength via JS");
+    assert_eq!(lines[2], "32", "napi_get_buffer_info byte length");
+    assert_eq!(lines[3], "8", "napi_get_buffer_info on Buffer.alloc");
+}
+
 // ------------------------------------------------------------- http server
 
 #[test]
