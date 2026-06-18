@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 8] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 13] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         (
             "fetchBodyRead",
@@ -108,6 +108,27 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("wsRecv", v8::Function::new(scope, op_ws_recv).unwrap()),
         ("wsClose", v8::Function::new(scope, op_ws_close).unwrap()),
         ("wsDrop", v8::Function::new(scope, op_ws_drop).unwrap()),
+        // Record-replay ops (installed unconditionally; no-ops when mode=off).
+        (
+            "recordRng",
+            v8::Function::new(scope, op_record_rng).unwrap(),
+        ),
+        (
+            "replayRng",
+            v8::Function::new(scope, op_replay_rng).unwrap(),
+        ),
+        (
+            "recordDateNow",
+            v8::Function::new(scope, op_record_date_now).unwrap(),
+        ),
+        (
+            "replayDateNow",
+            v8::Function::new(scope, op_replay_date_now).unwrap(),
+        ),
+        (
+            "replayGetMode",
+            v8::Function::new(scope, op_replay_get_mode).unwrap(),
+        ),
     ];
     for (name, function) in internal_bindings {
         let key = v8::String::new(scope, name).unwrap();
@@ -498,5 +519,85 @@ pub(crate) fn settle_completion(
             }
             resolver.reject(tc, exception);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record-replay native ops
+// ---------------------------------------------------------------------------
+
+fn op_record_rng(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0).number_value(scope).unwrap_or(0.0);
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(recorder) = &mut state.recorder {
+            let seq = recorder.next_seq();
+            recorder.push(crate::replay::ReplayEvent::Rng { seq, value });
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_rng(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(replayer) = &mut state.replayer {
+            if let Some(v) = replayer.next_rng() {
+                rv.set(v8::Number::new(scope, v).into());
+                return;
+            }
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_record_date_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0).integer_value(scope).unwrap_or(0);
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(recorder) = &mut state.recorder {
+            let seq = recorder.next_seq();
+            recorder.push(crate::replay::ReplayEvent::DateNow { seq, value });
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_date_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(replayer) = &mut state.replayer {
+            if let Some(v) = replayer.next_date_now() {
+                rv.set(v8::Number::new(scope, v as f64).into());
+                return;
+            }
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_get_mode(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mode = scope
+        .get_slot::<crate::replay::ReplayState>()
+        .map(|s| s.mode_str())
+        .unwrap_or("off");
+    if let Some(s) = v8::String::new(scope, mode) {
+        rv.set(s.into());
     }
 }

@@ -396,7 +396,16 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
-            let now = std::time::Instant::now();
+            // In replay mode, advance the virtual clock so all pending timers
+            // are immediately due -- no real sleep is needed.
+            let is_replay = tc
+                .get_slot::<crate::replay::ReplayState>()
+                .is_some_and(|s| s.is_replay());
+            let now = if is_replay {
+                std::time::Instant::now() + std::time::Duration::from_secs(86400)
+            } else {
+                std::time::Instant::now()
+            };
             if now >= deadline {
                 return Ok(());
             }
@@ -410,7 +419,7 @@ impl JsRuntime {
                 let args: Vec<v8::Local<v8::Value>> =
                     extra.iter().map(|g| v8::Local::new(tc, g)).collect();
                 if callback.call(tc, recv, &args).is_none() {
-                    // A timer body threw directly — the canonical async
+                    // A timer body threw directly -- the canonical async
                     // throw. Offer it to uncaughtException before dying.
                     if let Some(failure) = handle_uncaught_throw(tc, "timer callback") {
                         return Err(failure);
@@ -423,6 +432,11 @@ impl JsRuntime {
                 .get_slot_mut::<oam_core::CoreRuntime>()
                 .and_then(|core| core.try_recv())
             {
+                let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                    crate::replay::intercept_completion(state, completion)
+                } else {
+                    completion
+                };
                 crate::ops::settle_completion(tc, completion);
                 tc.perform_microtask_checkpoint();
                 progressed = true;
@@ -442,10 +456,24 @@ impl JsRuntime {
                 Some(timer) if timer < deadline => timer,
                 _ => deadline,
             };
-            let completion = tc
-                .get_slot_mut::<oam_core::CoreRuntime>()
-                .and_then(|core| core.recv_deadline(Some(wait_until)));
+            // In replay mode, skip the sleep -- timers appear due via the
+            // advanced virtual clock above; no real wall-clock wait needed.
+            let replay_active = tc
+                .get_slot::<crate::replay::ReplayState>()
+                .is_some_and(|s| s.is_replay());
+            let completion = if !replay_active {
+                tc.get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.recv_deadline(Some(wait_until)))
+            } else {
+                tc.get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.try_recv())
+            };
             if let Some(completion) = completion {
+                let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                    crate::replay::intercept_completion(state, completion)
+                } else {
+                    completion
+                };
                 crate::ops::settle_completion(tc, completion);
                 tc.perform_microtask_checkpoint();
             } else if next_timer.is_none_or(|t| t >= deadline) {
@@ -674,7 +702,15 @@ pub(crate) fn pump_event_loop(
 
         let mut progressed = false;
 
-        let now = std::time::Instant::now();
+        // In replay mode, advance virtual clock so timers are immediately due.
+        let is_replay = tc
+            .get_slot::<crate::replay::ReplayState>()
+            .is_some_and(|s| s.is_replay());
+        let now = if is_replay {
+            std::time::Instant::now() + std::time::Duration::from_secs(86400)
+        } else {
+            std::time::Instant::now()
+        };
         let due = tc
             .get_slot_mut::<crate::timers::TimerQueue>()
             .and_then(|queue| queue.pop_due(now));
@@ -699,6 +735,11 @@ pub(crate) fn pump_event_loop(
             .get_slot_mut::<oam_core::CoreRuntime>()
             .and_then(|core| core.try_recv())
         {
+            let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                crate::replay::intercept_completion(state, completion)
+            } else {
+                completion
+            };
             crate::ops::settle_completion(tc, completion);
             tc.perform_microtask_checkpoint();
             if let Some(failure) = drain_uncaught(tc) {
@@ -719,10 +760,24 @@ pub(crate) fn pump_event_loop(
         match (next_deadline, has_inflight) {
             (None, false) => break,
             (deadline, true) => {
-                let completion = tc
-                    .get_slot_mut::<oam_core::CoreRuntime>()
-                    .and_then(|core| core.recv_deadline(deadline));
+                // In replay mode, skip the blocking wait.
+                let replay_active = tc
+                    .get_slot::<crate::replay::ReplayState>()
+                    .is_some_and(|s| s.is_replay());
+                let completion = if replay_active {
+                    tc.get_slot_mut::<oam_core::CoreRuntime>()
+                        .and_then(|core| core.try_recv())
+                } else {
+                    tc.get_slot_mut::<oam_core::CoreRuntime>()
+                        .and_then(|core| core.recv_deadline(deadline))
+                };
                 if let Some(completion) = completion {
+                    let completion =
+                        if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                            crate::replay::intercept_completion(state, completion)
+                        } else {
+                            completion
+                        };
                     crate::ops::settle_completion(tc, completion);
                     tc.perform_microtask_checkpoint();
                     if let Some(failure) = drain_uncaught(tc) {
@@ -731,30 +786,35 @@ pub(crate) fn pump_event_loop(
                 }
             }
             (Some(deadline), false) => {
-                let now = std::time::Instant::now();
-                if deadline > now {
-                    let total = deadline - now;
-                    // When the inspector is attached, interleave the sleep with
-                    // polls so CDP messages from a debugger client aren't
-                    // deferred until the timer fires. Without this, a script
-                    // sleeping (setTimeout) is unresponsive to DevTools for the
-                    // full sleep duration.
-                    let inspector = tc
-                        .get_slot::<crate::inspector::InspectorSlot>()
-                        .map(|slot| slot.0.clone());
-                    if let Some(shared) = inspector {
-                        const POLL_INTERVAL: std::time::Duration =
-                            std::time::Duration::from_millis(50);
-                        let mut remaining = total;
-                        while remaining > std::time::Duration::ZERO {
-                            let chunk = remaining.min(POLL_INTERVAL);
-                            std::thread::sleep(chunk);
-                            shared.poll();
-                            remaining =
-                                deadline.saturating_duration_since(std::time::Instant::now());
+                // In replay mode, skip the sleep -- timers appear due via the
+                // advanced virtual clock above.
+                let replay_active = tc
+                    .get_slot::<crate::replay::ReplayState>()
+                    .is_some_and(|s| s.is_replay());
+                if !replay_active {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        let total = deadline - now;
+                        // When the inspector is attached, interleave the sleep
+                        // with polls so CDP messages aren't deferred until the
+                        // timer fires.
+                        let inspector = tc
+                            .get_slot::<crate::inspector::InspectorSlot>()
+                            .map(|slot| slot.0.clone());
+                        if let Some(shared) = inspector {
+                            const POLL_INTERVAL: std::time::Duration =
+                                std::time::Duration::from_millis(50);
+                            let mut remaining = total;
+                            while remaining > std::time::Duration::ZERO {
+                                let chunk = remaining.min(POLL_INTERVAL);
+                                std::thread::sleep(chunk);
+                                shared.poll();
+                                remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
+                            }
+                        } else {
+                            std::thread::sleep(total);
                         }
-                    } else {
-                        std::thread::sleep(total);
                     }
                 }
             }

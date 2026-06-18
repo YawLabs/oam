@@ -58,6 +58,15 @@ enum Command {
         /// first line. Optional value is `[host:]port`.
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect_brk: Option<String>,
+        /// Record all non-deterministic I/O to FILE (JSON Lines). Mutually
+        /// exclusive with --replay.
+        #[arg(long, value_name = "FILE", conflicts_with = "replay")]
+        record: Option<PathBuf>,
+        /// Replay non-deterministic I/O from a FILE previously captured with
+        /// --record. Timers fire instantly; Math.random/Date.now return
+        /// recorded values. Mutually exclusive with --record.
+        #[arg(long, value_name = "FILE", conflicts_with = "record")]
+        replay: Option<PathBuf>,
         /// Arguments passed to the script (process.argv) after `--`.
         #[arg(last = true)]
         script_args: Vec<String>,
@@ -212,6 +221,8 @@ fn main() -> ExitCode {
             no_check,
             inspect,
             inspect_brk,
+            record,
+            replay,
             script_args,
         } => {
             let inspect = match resolve_inspect(inspect.as_deref(), inspect_brk.as_deref()) {
@@ -221,7 +232,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            run_command(file, *check, *no_check, cli.json, script_args, inspect)
+            let replay_mode = if let Some(path) = record {
+                oam_engine::ReplayMode::Record(path.clone())
+            } else if let Some(path) = replay {
+                oam_engine::ReplayMode::Replay(path.clone())
+            } else {
+                oam_engine::ReplayMode::Off
+            };
+            run_command(file, *check, *no_check, cli.json, script_args, inspect, replay_mode)
         }
         Command::Test {
             paths,
@@ -273,7 +291,7 @@ fn main() -> ExitCode {
             if *workers > 0 {
                 serve_with_workers(file, *workers, cli.json, inspect)
             } else {
-                run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
+                run_command(file, CheckMode::Warn, false, cli.json, &[], inspect, oam_engine::ReplayMode::Off)
             }
         }
         Command::Install {
@@ -346,6 +364,7 @@ fn run_command(
     json: bool,
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
+    replay_mode: oam_engine::ReplayMode,
 ) -> ExitCode {
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
@@ -386,7 +405,7 @@ fn run_command(
         rx
     });
 
-    let exit = match run_file(file, script_args, inspect) {
+    let exit = match run_file(file, script_args, inspect, replay_mode) {
         Ok(code) => ExitCode::from(code),
         Err(diagnostics) => {
             for d in &diagnostics {
@@ -1117,7 +1136,7 @@ fn serve_with_workers(
     let dispatcher_path = dir.join("_pool_dispatcher.cjs");
     std::fs::write(&dispatcher_path, &dispatcher_src).expect("write dispatcher");
 
-    let result = run_file(&dispatcher_path, &[], inspect);
+    let result = run_file(&dispatcher_path, &[], inspect, oam_engine::ReplayMode::Off);
     let _ = std::fs::remove_dir_all(&dir);
     match result {
         Ok(code) => ExitCode::from(code),
@@ -1305,6 +1324,7 @@ fn run_file(
     file: &Path,
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
+    replay_mode: oam_engine::ReplayMode,
 ) -> Result<u8, Vec<Diagnostic>> {
     if let Some("json") = file.extension().and_then(|e| e.to_str()) {
         return Err(vec![Diagnostic::new(
@@ -1330,6 +1350,11 @@ fn run_file(
     let mut argv = vec![exe, script];
     argv.extend(script_args.iter().cloned());
     rt.set_process_argv(argv);
+
+    if !matches!(replay_mode, oam_engine::ReplayMode::Off) {
+        rt.set_replay_mode(replay_mode);
+        rt.apply_replay_patches();
+    }
 
     if let Some((addr, brk)) = inspect {
         match rt.attach_inspector(addr, brk) {
