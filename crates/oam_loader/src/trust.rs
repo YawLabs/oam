@@ -122,7 +122,7 @@ fn save_config(config: &TrustConfig, path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut content = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     content.push('\n');
     std::fs::write(path, content)
 }
