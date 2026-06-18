@@ -15,8 +15,8 @@
 
 use oam_core::worker::{WorkerContext, WorkerEvent};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 /// Request sent from the pool to a pre-warmed thread.
 pub struct ForkRequest {

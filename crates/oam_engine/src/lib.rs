@@ -18,11 +18,11 @@ use std::sync::Once;
 
 mod cjs;
 mod crypto_ops;
+pub mod fork;
 mod inspector;
 mod modules;
 pub mod napi;
 mod node_ops;
-pub mod fork;
 mod ops;
 pub mod permissions;
 pub mod replay;

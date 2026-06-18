@@ -559,8 +559,11 @@ fn op_fork_spawn(
 
     let path = std::path::PathBuf::from(&script_path);
     if !path.is_file() {
-        let msg =
-            v8::String::new(scope, &format!("forkSpawn: script not found: {script_path}")).unwrap();
+        let msg = v8::String::new(
+            scope,
+            &format!("forkSpawn: script not found: {script_path}"),
+        )
+        .unwrap();
         let exc = v8::Exception::type_error(scope, msg);
         scope.throw_exception(exc);
         return;

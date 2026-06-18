@@ -239,7 +239,15 @@ fn main() -> ExitCode {
             } else {
                 oam_engine::ReplayMode::Off
             };
-            run_command(file, *check, *no_check, cli.json, script_args, inspect, replay_mode)
+            run_command(
+                file,
+                *check,
+                *no_check,
+                cli.json,
+                script_args,
+                inspect,
+                replay_mode,
+            )
         }
         Command::Test {
             paths,
@@ -291,7 +299,15 @@ fn main() -> ExitCode {
             if *workers > 0 {
                 serve_with_workers(file, *workers, cli.json, inspect)
             } else {
-                run_command(file, CheckMode::Warn, false, cli.json, &[], inspect, oam_engine::ReplayMode::Off)
+                run_command(
+                    file,
+                    CheckMode::Warn,
+                    false,
+                    cli.json,
+                    &[],
+                    inspect,
+                    oam_engine::ReplayMode::Off,
+                )
             }
         }
         Command::Install {
