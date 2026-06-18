@@ -123,7 +123,11 @@ pub enum InstallOutcome {
 /// * `Err(_)` / `Failed(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
-pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<Diagnostic>> {
+pub fn install(
+    project_dir: &Path,
+    frozen: bool,
+    precompile: bool,
+) -> Result<InstallOutcome, Vec<Diagnostic>> {
     if !frozen {
         return Err(vec![diag(
             "OAM-PKG0006",
@@ -183,6 +187,10 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<D
     let mut installed = 0usize;
     let mut errors: Vec<Diagnostic> = Vec::new();
     let trust = crate::trust::TrustConfig::load(project_dir);
+    let cache_root = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile");
 
     for (key, entry) in &to_install {
         let Some(resolved) = &entry.resolved else {
@@ -215,6 +223,18 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<D
             Ok(()) => {
                 installed += 1;
                 check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
+                if precompile {
+                    if let Err(e) =
+                        crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
+                    {
+                        errors.push(Diagnostic::new(
+                            "OAM-PKG0008",
+                            Severity::Warning,
+                            Origin::Install,
+                            format!("precompile {pkg_name}: {e}"),
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 errors.push(diag("OAM-PKG0004", format!("failed to install {key}: {e}")));
@@ -792,7 +812,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0001");
@@ -822,7 +842,7 @@ mod tests {
             }
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         match result {
             Ok(InstallOutcome::Complete(summary)) => {
                 assert_eq!(summary.packages_installed, 0);
@@ -870,7 +890,7 @@ mod tests {
             }
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         match result {
             Ok(InstallOutcome::Partial {
                 installed, errors, ..
@@ -901,7 +921,7 @@ mod tests {
             "packages": {}
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0002");
@@ -1316,7 +1336,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // Lockfile content is irrelevant — the non-frozen check fires first.
-        let result = install(&tmp, false);
+        let result = install(&tmp, false, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0006");

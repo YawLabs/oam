@@ -222,33 +222,37 @@ pub(crate) fn load_cjs<'s>(
         return Some(exports_value);
     }
 
-    let is_cts = key.extension().and_then(|e| e.to_str()) == Some("cts");
+    // .cts: check the pre-compilation cache first. If a cached .js artifact
+    // exists (written by `oam install --precompile`) use it directly and skip
+    // the oxc transpile. Falls through to the block-gate if the cache misses.
+    let precompiled_cts_source: Option<String> =
+        if key.extension().and_then(|e| e.to_str()) == Some("cts") {
+            oam_loader::precompile::try_precompile_cache(&key)
+        } else {
+            None
+        };
 
-    let source = match std::fs::read_to_string(&key) {
-        Ok(source) => source,
-        Err(e) => {
-            throw_error(scope, &format!("cannot read {file}: {e}"));
-            return None;
-        }
-    };
+    // If .cts and NO precompile cache hit, block with a clear error.
+    if key.extension().and_then(|e| e.to_str()) == Some("cts") && precompiled_cts_source.is_none() {
+        throw_error(
+            scope,
+            &format!(
+                "{file}: TypeScript CommonJS (.cts) is not supported -- write ESM TypeScript (.ts)"
+            ),
+        );
+        return None;
+    }
 
-    // .cts: oxc strips TS syntax and emits plain JS, same path .ts uses for
-    // ESM. The resulting source is fed to CompileFunction below as CJS.
-    let source = if is_cts {
-        match oam_loader::transpile_typescript(&key, &source) {
-            Ok(stripped) => stripped,
-            Err(failure) => {
-                let first = failure
-                    .diagnostics
-                    .first()
-                    .map(|d| d.message.as_str())
-                    .unwrap_or("TypeScript parse/transform error");
-                throw_error_with_code(scope, "OAM-MOD0003", &format!("{file}: {first}"));
+    let source = if let Some(cached) = precompiled_cts_source {
+        cached
+    } else {
+        match std::fs::read_to_string(&key) {
+            Ok(source) => source,
+            Err(e) => {
+                throw_error(scope, &format!("cannot read {file}: {e}"));
                 return None;
             }
         }
-    } else {
-        source
     };
 
     // The module object, cached BEFORE execution so cycles see partials.

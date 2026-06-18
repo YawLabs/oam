@@ -120,6 +120,10 @@ enum Command {
         /// Refuse to modify the lockfile (default and only mode for MVP).
         #[arg(long, default_value = "true")]
         frozen_lockfile: bool,
+        /// Pre-compile TypeScript files in installed packages to .js at install
+        /// time. Cached under node_modules/.oam/precompile/ for faster first run.
+        #[arg(long, default_value = "false")]
+        precompile: bool,
     },
     /// Manage the trust list for lifecycle scripts.
     ///
@@ -272,7 +276,10 @@ fn main() -> ExitCode {
                 run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
             }
         }
-        Command::Install { frozen_lockfile } => install_command(*frozen_lockfile, cli.json),
+        Command::Install {
+            frozen_lockfile,
+            precompile,
+        } => install_command(*frozen_lockfile, *precompile, cli.json),
         Command::Trust { action } => trust_command(action),
         Command::Compile {
             entry,
@@ -816,12 +823,12 @@ fn render(d: &Diagnostic, json: bool) {
 }
 
 /// `oam install`: frozen-lockfile package install from package-lock.json v3.
-fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
+fn install_command(frozen_lockfile: bool, precompile: bool, json: bool) -> ExitCode {
     // Walk upward from cwd to find the directory containing package-lock.json.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
 
-    match oam_loader::install::install(&project_dir, frozen_lockfile) {
+    match oam_loader::install::install(&project_dir, frozen_lockfile, precompile) {
         Ok(outcome) => {
             let (installed, elapsed, errors) = match outcome {
                 oam_loader::install::InstallOutcome::Complete(summary) => {

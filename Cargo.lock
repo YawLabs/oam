@@ -1822,7 +1822,9 @@ dependencies = [
 name = "oam_cli"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "clap",
+ "flate2",
  "futures-util",
  "oam_diagnostics",
  "oam_engine",
@@ -1830,6 +1832,8 @@ dependencies = [
  "oam_mcp",
  "oam_ts",
  "serde_json",
+ "sha2",
+ "tar",
  "tokio",
  "tokio-tungstenite",
 ]

@@ -12982,3 +12982,211 @@ fn trust_add_remove_list_round_trip() {
         ".oam/trust.json should not contain esbuild after remove"
     );
 }
+
+// ── oam install --precompile ─────────────────────────────────────────────
+
+/// Build a minimal fake npm tarball (gzipped tar with `package/` prefix).
+fn make_fake_tarball(extra_files: &[(&str, &str)]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pj = r#"{"name":"fake-pkg","version":"1.0.0"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(pj.len() as u64);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_path("package/package.json").unwrap();
+    header.set_cksum();
+    builder.append(&header, pj.as_bytes()).unwrap();
+
+    for (rel, content) in extra_files {
+        let path = format!("package/{rel}");
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_path(&path).unwrap();
+        h.set_cksum();
+        builder.append(&h, content.as_bytes()).unwrap();
+    }
+
+    let tar_data = builder.into_inner().unwrap();
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&tar_data).unwrap();
+    gz.finish().unwrap()
+}
+
+#[test]
+fn install_precompile_creates_cache() {
+    use sha2::{Digest, Sha512};
+
+    let ts_source = "const x: number = 42;\nconsole.log(x);\n";
+    let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
+
+    let hash = Sha512::digest(&tarball);
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
+    let integrity = format!("sha512-{b64}");
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    let tarball = Arc::new(tarball);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tarball_clone = tarball.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let data = tarball_clone.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
+    let lockfile = format!(
+        r#"{{
+            "name": "test-precompile",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{"name":"test-precompile","version":"1.0.0"}},
+                "node_modules/fake-pkg": {{
+                    "version": "1.0.0",
+                    "resolved": "{resolved_url}",
+                    "integrity": "{integrity}"
+                }}
+            }}
+        }}"#
+    );
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-cache-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install", "--precompile"])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "install --precompile should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cache_file = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("fake-pkg")
+        .join("index.js");
+    assert!(
+        cache_file.exists(),
+        "precompile cache file should exist at {}",
+        cache_file.display()
+    );
+
+    let js = std::fs::read_to_string(&cache_file).unwrap();
+    assert!(
+        !js.contains(": number"),
+        "type annotation should be stripped from cache; got: {js}"
+    );
+    assert!(
+        js.contains("console.log"),
+        "js body should be preserved in cache; got: {js}"
+    );
+
+    let gi = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join(".gitignore");
+    assert!(gi.exists(), ".gitignore should be written into .oam/");
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn install_precompile_cts_cache_used_on_run() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-cts-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_dir = project_dir.join("node_modules").join("fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","main":"index.cts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("index.cts"),
+        "const x: number = 99;\nexports.value = x;\n",
+    )
+    .unwrap();
+
+    let cache_dir = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("fake-pkg");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("index.js"),
+        "// oam-precompile-sentinel\nexports.value = 42;\n",
+    )
+    .unwrap();
+
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(
+        &entry,
+        r#"const pkg = require('./node_modules/fake-pkg/index.cts');
+console.log(pkg.value);"#,
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "run with .cts cache hit should succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "42",
+        "sentinel value from cache should be printed; got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
