@@ -21,6 +21,7 @@ use oam_diagnostics::{Diagnostic, Origin, Position, Severity, Span};
 use oxc_allocator::Allocator;
 
 pub mod install;
+pub mod trust;
 mod npm;
 mod resolver;
 mod tsconfig;

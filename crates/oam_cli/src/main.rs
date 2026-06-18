@@ -121,6 +121,15 @@ enum Command {
         #[arg(long, default_value = "true")]
         frozen_lockfile: bool,
     },
+    /// Manage the trust list for lifecycle scripts.
+    ///
+    /// oam install skips all lifecycle scripts (postinstall, preinstall, install)
+    /// by default. Trust a package to see its skipped scripts; script execution
+    /// is not yet supported, but trusted packages suppress the OAM-PKG0007 warning.
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
     /// Compile a pre-bundled JS file into a standalone executable.
     /// The user bundles externally (esbuild/rollup); this embeds the result.
     Compile {
@@ -149,6 +158,36 @@ enum DaemonAction {
     Stop {
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Allow a package to suppress the OAM-PKG0007 lifecycle-script warning.
+    Add {
+        /// npm package name (e.g. "esbuild" or "@scope/pkg").
+        package: String,
+        /// Write to the global trust list (~/.config/oam/trust.json) instead of
+        /// the project-local .oam/trust.json.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove a package from the trust list.
+    Remove {
+        /// npm package name.
+        package: String,
+        /// Remove from the global list instead of the project-local list.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Show trusted packages.
+    List {
+        /// Show only the global list.
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+        /// Show only the project-local list (default).
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -234,6 +273,7 @@ fn main() -> ExitCode {
             }
         }
         Command::Install { frozen_lockfile } => install_command(*frozen_lockfile, cli.json),
+        Command::Trust { action } => trust_command(action),
         Command::Compile {
             entry,
             output,
@@ -832,6 +872,101 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
                 render(d, json);
             }
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `oam trust`: manage the per-project and global lifecycle-script trust list.
+fn trust_command(action: &TrustAction) -> ExitCode {
+    use oam_loader::trust::TrustConfig;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_dir = find_project_dir(&cwd, "package.json")
+        .or_else(|| find_project_dir(&cwd, "package-lock.json"))
+        .unwrap_or(cwd);
+
+    match action {
+        TrustAction::Add { package, global } => {
+            let mut config = if *global {
+                TrustConfig::load_global()
+            } else {
+                TrustConfig::load_local(&project_dir)
+            };
+            if config.add(package) {
+                let result = if *global {
+                    config.save_global()
+                } else {
+                    config.save_local(&project_dir)
+                };
+                match result {
+                    Ok(()) => {
+                        if *global {
+                            eprintln!("oam trust: added '{package}' to global trust list");
+                        } else {
+                            eprintln!("oam trust: added '{package}' to .oam/trust.json");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("oam trust: failed to save: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                eprintln!("oam trust: '{package}' is already trusted");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustAction::Remove { package, global } => {
+            let mut config = if *global {
+                TrustConfig::load_global()
+            } else {
+                TrustConfig::load_local(&project_dir)
+            };
+            if config.remove(package) {
+                let result = if *global {
+                    config.save_global()
+                } else {
+                    config.save_local(&project_dir)
+                };
+                match result {
+                    Ok(()) => eprintln!("oam trust: removed '{package}'"),
+                    Err(e) => {
+                        eprintln!("oam trust: failed to save: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                eprintln!("oam trust: '{package}' was not in the trust list");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustAction::List { global, local: _ } => {
+            if *global {
+                let config = TrustConfig::load_global();
+                let path = TrustConfig::global_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.config/oam/trust.json".to_string());
+                eprintln!("Global trust list ({path}):");
+                for pkg in config.entries() {
+                    println!("  {pkg}");
+                }
+                if config.entries().is_empty() {
+                    eprintln!("  (empty)");
+                }
+            } else {
+                // Default: show local (also used when --local is explicit).
+                let config = TrustConfig::load_local(&project_dir);
+                eprintln!(
+                    "Project trust list ({}):",
+                    project_dir.join(".oam").join("trust.json").display()
+                );
+                for pkg in config.entries() {
+                    println!("  {pkg}");
+                }
+                if config.entries().is_empty() {
+                    eprintln!("  (empty)");
+                }
+            }
+            ExitCode::SUCCESS
         }
     }
 }

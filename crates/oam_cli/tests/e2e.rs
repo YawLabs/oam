@@ -12828,3 +12828,155 @@ await s.serve();
     assert_eq!(batch_resp[1]["id"], 3);
     assert_eq!(batch_resp[1]["result"]["content"][0]["text"], "42");
 }
+
+// ── oam trust + lifecycle-script warnings ─────────────────────────────────
+
+#[test]
+fn install_lifecycle_script_warns_pkg0007() {
+    // Pre-populate node_modules/fake-pkg so the "already installed" skip
+    // fires (no network needed). The skip path still calls check_lifecycle_scripts,
+    // so OAM-PKG0007 should surface for an untrusted package with a postinstall.
+    let pj = write_temp(
+        "install-scripts-warn/package.json",
+        r#"{"name":"install-scripts-warn","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let pkg_dir = dir.join("node_modules/fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","scripts":{"postinstall":"echo installed"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package-lock.json"),
+        r#"{"name":"install-scripts-warn","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"install-scripts-warn","version":"1.0.0"},"node_modules/fake-pkg":{"version":"1.0.0","resolved":"https://example.invalid/fake-pkg-1.0.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(dir)
+        .output()
+        .expect("oam binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("OAM-PKG0007"),
+        "expected OAM-PKG0007 lifecycle warning; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("fake-pkg"),
+        "OAM-PKG0007 should name the package; stderr: {stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "should exit non-zero with unacknowledged lifecycle scripts; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn install_lifecycle_script_suppressed_by_trust() {
+    // Same setup as above but with a .oam/trust.json listing fake-pkg.
+    // OAM-PKG0007 should NOT appear and install should succeed.
+    let pj = write_temp(
+        "install-scripts-trusted/package.json",
+        r#"{"name":"install-scripts-trusted","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let pkg_dir = dir.join("node_modules/fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","scripts":{"postinstall":"echo installed"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package-lock.json"),
+        r#"{"name":"install-scripts-trusted","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"install-scripts-trusted","version":"1.0.0"},"node_modules/fake-pkg":{"version":"1.0.0","resolved":"https://example.invalid/fake-pkg-1.0.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+    )
+    .unwrap();
+    // Trust fake-pkg via project-local .oam/trust.json
+    let trust_dir = dir.join(".oam");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    std::fs::write(
+        trust_dir.join("trust.json"),
+        r#"{"packages":["fake-pkg"]}"#,
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(dir)
+        .output()
+        .expect("oam binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("OAM-PKG0007"),
+        "OAM-PKG0007 must not appear for trusted package; stderr: {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "should succeed when lifecycle scripts are trusted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn trust_add_remove_list_round_trip() {
+    // Tests `oam trust add`, `oam trust list`, and `oam trust remove`
+    // against a project-local .oam/trust.json.
+    let pj = write_temp(
+        "trust-round-trip/package.json",
+        r#"{"name":"trust-round-trip","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let oam = env!("CARGO_BIN_EXE_oam");
+
+    // add
+    let out = std::process::Command::new(oam)
+        .args(["trust", "add", "esbuild"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust add runs");
+    assert!(
+        out.status.success(),
+        "oam trust add should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // trust.json was created
+    let trust_json = dir.join(".oam/trust.json");
+    assert!(trust_json.is_file(), ".oam/trust.json should exist after trust add");
+    let content = std::fs::read_to_string(&trust_json).unwrap();
+    assert!(content.contains("esbuild"), ".oam/trust.json should contain esbuild");
+
+    // list
+    let out = std::process::Command::new(oam)
+        .args(["trust", "list"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust list runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("esbuild"),
+        "trust list should print esbuild; stdout: {stdout}"
+    );
+
+    // remove
+    let out = std::process::Command::new(oam)
+        .args(["trust", "remove", "esbuild"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust remove runs");
+    assert!(
+        out.status.success(),
+        "oam trust remove should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // no longer in list
+    let content = std::fs::read_to_string(&trust_json).unwrap();
+    assert!(
+        !content.contains("esbuild"),
+        ".oam/trust.json should not contain esbuild after remove"
+    );
+}
