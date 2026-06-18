@@ -22,6 +22,7 @@ mod inspector;
 mod modules;
 pub mod napi;
 mod node_ops;
+pub mod fork;
 mod ops;
 pub mod permissions;
 pub mod replay;
@@ -90,6 +91,10 @@ impl JsRuntime {
         isolate.set_slot(crypto_ops::CryptoState::default());
         isolate.set_slot(napi::AddonRegistry::new());
         isolate.set_slot(replay::ReplayState::default());
+        // Fork pool: 2 pre-warmed isolates for oam.fork() cold-start speedup.
+        // The pool lives in an isolate slot so the zero-capture op_fork_spawn
+        // callback can reach it without captures.
+        isolate.set_slot(fork::ForkPool::new(2));
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
         isolate.set_slot(std::sync::Arc::new(permissions::Permissions::from_opts(
