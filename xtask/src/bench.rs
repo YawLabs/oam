@@ -522,7 +522,7 @@ console.log(JSON.stringify({ elapsed_ms: elapsed, ops: N, bytes_per_op: data.len
 
     // MCP cold-start server: a minimal oam:mcp server with one tool.
     // The bench spawns this, sends initialize, and measures time to response.
-    let mcp_server = tmp.join("bench_mcp_server.ts");
+    let mcp_server = tmp.join("bench_mcp_server.mjs");
     std::fs::write(
         &mcp_server,
         r#"import { McpServer } from 'oam:mcp';

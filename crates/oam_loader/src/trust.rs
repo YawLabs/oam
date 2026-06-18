@@ -104,7 +104,17 @@ fn global_trust_path() -> Option<PathBuf> {
 
 fn read_config(path: &Path) -> Option<TrustConfig> {
     let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    match serde_json::from_str(&content) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            eprintln!(
+                "oam: warning: trust config at {} is malformed ({}); treating as empty",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 fn save_config(config: &TrustConfig, path: &Path) -> std::io::Result<()> {

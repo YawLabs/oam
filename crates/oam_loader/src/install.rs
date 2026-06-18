@@ -194,9 +194,13 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<D
         // The key is e.g. "node_modules/foo" or "node_modules/@scope/bar".
         // The extraction target is project_dir joined with the key.
         let dest = project_dir.join(key);
-        // Strip the leading "node_modules/" to get the npm package name
-        // (handles both plain names and scoped names like "@scope/pkg").
-        let pkg_name = key.strip_prefix("node_modules/").unwrap_or(key);
+        // Extract the npm package name from the lockfile key.
+        // Keys can be deeply nested ("node_modules/react/node_modules/scheduler"),
+        // so take the portion after the LAST "node_modules/" segment.
+        let pkg_name = key
+            .rfind("node_modules/")
+            .map(|pos| &key[pos + "node_modules/".len()..])
+            .unwrap_or(key);
 
         // Skip already-installed packages (idempotency for partial installs).
         if dest.join("package.json").is_file() {
