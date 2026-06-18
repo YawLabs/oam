@@ -221,6 +221,93 @@ fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
     })
 }
 
+/// MCP cold-start: time from process spawn to the first JSON-RPC response.
+///
+/// Spawns the server script, sends an MCP `initialize` request via stdin,
+/// and records wall-clock time until a JSON-RPC response line arrives on
+/// stdout. Kills the server after each measurement.
+fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
+    use std::io::{BufRead, Write};
+
+    print!("  {}/mcp-cold-start: ", rt.name);
+    let iters = COLD_START_ITERS;
+    let mut samples = Vec::with_capacity(iters);
+
+    let init_msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "clientInfo": { "name": "bench", "version": "0.0.1" },
+            "capabilities": {}
+        }
+    })
+    .to_string()
+        + "\n";
+
+    for i in 0..iters {
+        let mut cmd = rt.build_cmd(server_script, &[]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let start = Instant::now();
+        let mut child = cmd.spawn().context("spawn MCP server")?;
+
+        // Write the initialize request. Keep stdin open (do NOT drop the handle
+        // yet): closing stdin sends EOF, which the server sees as "no more input"
+        // and may exit before writing its response.
+        let mut stdin = child.stdin.take().context("mcp server stdin")?;
+        stdin.write_all(init_msg.as_bytes())?;
+        stdin.flush()?;
+
+        // Read lines until we get a non-empty JSON line (the initialize response).
+        let stdout = child.stdout.take().context("mcp server stdout")?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let elapsed = loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                bail!(
+                    "{}/mcp-cold-start iter {i}: server closed stdout before response",
+                    rt.name
+                );
+            }
+            if !line.trim().is_empty() {
+                break start.elapsed().as_secs_f64() * 1000.0;
+            }
+        };
+        drop(stdin); // close stdin AFTER reading the response
+
+        let _ = child.kill();
+        let _ = child.wait();
+        samples.push(elapsed);
+        print!(".");
+
+        // Brief pause between iterations to let OS reclaim file descriptors.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(" done");
+
+    let (p50, min, max, p95, p99) = stats(&samples);
+    Ok(CaseResult {
+        runtime: rt.name.clone(),
+        name: "mcp-cold-start".to_string(),
+        median: p50,
+        min,
+        max,
+        p50,
+        p95,
+        p99,
+        unit: "ms".to_string(),
+        iterations: iters,
+        warmup_iterations: 0,
+        samples,
+    })
+}
+
 // ------------------------------------------------------------------ entry
 
 pub fn run(release: bool, compare: bool) -> Result<()> {
@@ -256,6 +343,7 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
         "fs-read",
         "json-parse",
         "crypto-hash",
+        "mcp-cold-start",
     ];
 
     let scripts = write_scripts(&tmp)?;
@@ -282,6 +370,14 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
                 }
                 "crypto-hash" => {
                     run_timed_case(case_name, rt, &scripts.crypto_hash, TIMED_ITERS, &[])
+                }
+                "mcp-cold-start" => {
+                    if rt.name != "oam" {
+                        // SDK comparison not yet wired; skip non-oam runtimes.
+                        println!("  {}/mcp-cold-start: skipped (oam only)", rt.name);
+                        continue;
+                    }
+                    run_mcp_cold_start(rt, &scripts.mcp_server)
                 }
                 _ => unreachable!(),
             };
@@ -323,6 +419,7 @@ struct Scripts {
     json_parse: PathBuf,
     crypto_hash: PathBuf,
     data_file: PathBuf,
+    mcp_server: PathBuf,
 }
 
 fn write_scripts(tmp: &Path) -> Result<Scripts> {
@@ -423,6 +520,22 @@ console.log(JSON.stringify({ elapsed_ms: elapsed, ops: N, bytes_per_op: data.len
     let data_file = tmp.join("bench_data.txt");
     std::fs::write(&data_file, "x".repeat(4096))?;
 
+    // MCP cold-start server: a minimal oam:mcp server with one tool.
+    // The bench spawns this, sends initialize, and measures time to response.
+    let mcp_server = tmp.join("bench_mcp_server.ts");
+    std::fs::write(
+        &mcp_server,
+        r#"import { McpServer } from 'oam:mcp';
+const server = new McpServer({ name: 'bench', version: '0.0.1' });
+server.tool('noop', {
+  description: 'No-op benchmark tool',
+  parameters: {},
+  handler: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+});
+server.serve({ transport: 'stdio' });
+"#,
+    )?;
+
     Ok(Scripts {
         cold_start,
         url_parse,
@@ -431,6 +544,7 @@ console.log(JSON.stringify({ elapsed_ms: elapsed, ops: N, bytes_per_op: data.len
         json_parse,
         crypto_hash,
         data_file,
+        mcp_server,
     })
 }
 
@@ -641,6 +755,7 @@ fn build_markdown(
     md.push_str("- **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.\n");
     md.push_str("- **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.\n");
     md.push_str("- **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.\n");
+    md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. Benchmarks a minimal `oam:mcp` server with one tool.\n");
 
     md
 }
