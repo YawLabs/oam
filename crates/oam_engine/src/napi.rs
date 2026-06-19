@@ -1701,7 +1701,7 @@ pub unsafe extern "C" fn napi_get_buffer_info(
         if !data.is_null() {
             let ptr = store
                 .data()
-                .map(|p| p.as_ptr() as *mut c_void)
+                .map(|p| p.as_ptr())
                 .unwrap_or(std::ptr::null_mut());
             unsafe { *data = ptr };
         }
@@ -1742,7 +1742,7 @@ static NODE_VERSION: NapiNodeVersion = NapiNodeVersion {
     major: 22,
     minor: 0,
     patch: 0,
-    release: b"node\0".as_ptr() as *const c_char,
+    release: c"node".as_ptr(),
 };
 
 // uv_event_loop: a data symbol addons may look up via GetProcAddress.
@@ -2492,7 +2492,7 @@ pub unsafe extern "C" fn napi_get_arraybuffer_info(
         unsafe {
             *data = store
                 .data()
-                .map(|p| p.as_ptr() as *mut c_void)
+                .map(|p| p.as_ptr())
                 .unwrap_or(std::ptr::null_mut())
         };
     }
@@ -2628,11 +2628,7 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
     };
     let byte_off = view.byte_offset();
     let byte_len = view.byte_length();
-    let elem_count = if element_size > 0 {
-        byte_len / element_size
-    } else {
-        0
-    };
+    let elem_count = byte_len.checked_div(element_size).unwrap_or(0);
     if !type_out.is_null() {
         unsafe { *type_out = type_id };
     }
