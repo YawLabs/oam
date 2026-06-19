@@ -9765,15 +9765,22 @@
 
         cp.emit("spawn");
 
-        readStdout(info.handle);
-        readStderr(info.handle);
+        const stdoutDone = readStdout(info.handle);
+        const stderrDone = readStderr(info.handle);
 
         natives.spawnWait(info.handle).then((result) => {
           cp._exited = true;
           cp.exitCode = result.code;
           cp.signalCode = result.signal;
           cp.emit("exit", result.code, result.signal);
-          queueMicrotask(() => cp.emit("close", result.code, result.signal));
+          // Node fires 'close' only AFTER the stdio streams reach EOF, not
+          // merely when the process exits. Wait for both read loops so a
+          // 'data' listener attached in the 'spawn' handler still sees all
+          // output before 'close' -- otherwise stdout capture races the
+          // close emit and is intermittently empty.
+          Promise.allSettled([stdoutDone, stderrDone]).then(() => {
+            cp.emit("close", result.code, result.signal);
+          });
         });
       }).catch((err) => {
         const e = typeof err === "string" ? new Error(err) : err;
@@ -9987,8 +9994,8 @@
               if (cp.stderr) cp.stderr.push(Buffer.from(chunk));
             }
           };
-          readStdout(info.handle);
-          readStderr(info.handle);
+          const stdoutDone = readStdout(info.handle);
+          const stderrDone = readStderr(info.handle);
 
           natives.spawnWait(info.handle).then((result) => {
             cp._exited = true;
@@ -10002,7 +10009,11 @@
             }
             cp.connected = false;
             cp.emit("exit", result.code, result.signal);
-            queueMicrotask(() => cp.emit("close", result.code, result.signal));
+            // 'close' waits for stdio EOF, not just process exit (Node parity;
+            // see spawn() above -- avoids the stdout-capture race on 'close').
+            Promise.allSettled([stdoutDone, stderrDone]).then(() => {
+              cp.emit("close", result.code, result.signal);
+            });
           });
         }).catch((err) => {
           ipcServer.close();
