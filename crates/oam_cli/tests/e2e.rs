@@ -5793,7 +5793,9 @@ fn child_process_spawn_stdin_piped() {
         "cp_stdin.mjs",
         r#"
 import { spawn } from "child_process";
-const cp = spawn("cmd", ["/c", "findstr", ".*"], { shell: false });
+// Use node (portable) rather than cmd /c findstr (Windows-only -> ENOENT on
+// Unix). `node -e stdin.pipe(stdout)` echoes stdin like findstr ".*" did.
+const cp = spawn("node", ["-e", "process.stdin.pipe(process.stdout)"], { shell: false });
 const chunks = [];
 cp.stdout.on("data", (chunk) => chunks.push(chunk));
 cp.on("spawn", () => {
@@ -5851,7 +5853,9 @@ fn child_process_spawn_echo() {
         "cp_echo.mjs",
         r#"
 import { spawn } from "child_process";
-const cp = spawn("cmd", ["/c", "echo", "hello"], { shell: false });
+// Use node (portable) rather than cmd /c echo (Windows-only -> ENOENT on
+// Unix). Tests spawn + stdout capture + exit code, not cmd specifically.
+const cp = spawn("node", ["-e", "process.stdout.write('hello')"], { shell: false });
 const chunks = [];
 cp.on("spawn", () => {
   cp.stdout.on("data", (chunk) => chunks.push(chunk));
@@ -10091,7 +10095,8 @@ setTimeout(() => { console.log('done'); process.exit(0); }, 1500);
 fn spawn_stdin_before_spawn_resolves() {
     let src = r#"
 import { spawn } from 'child_process';
-const cp = spawn('cmd', ['/c', 'findstr', '.*'], { shell: false });
+// Portable echo-stdin (cmd /c findstr is Windows-only -> ENOENT on Unix).
+const cp = spawn('node', ['-e', 'process.stdin.pipe(process.stdout)'], { shell: false });
 const chunks = [];
 cp.stdout.on('data', (c) => chunks.push(c));
 cp.stdin.write('deferred-stdin\r\n');
