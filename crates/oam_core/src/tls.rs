@@ -34,6 +34,14 @@ pub struct TlsState {
     readers: HashMap<u64, TlsReader>,
     writers: HashMap<u64, TlsWriter>,
     closed: HashSet<u64>,
+    /// Per-handle cancellation, mirroring tcp.rs's accept cancel. A parked
+    /// `tls_read` holds a `ReadHalf` from `tokio::io::split` (a BiLock: the
+    /// socket only closes once BOTH halves drop). Without this, `tls_close`
+    /// cannot tear down a connection whose read is parked waiting for bytes
+    /// that never come -- the read stays in-flight, the event loop never
+    /// drains, and the process hangs at exit. `tls_close` fires the Notify so
+    /// the parked read drops its half and the socket closes.
+    cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
 }
 
 pub type TlsRegistry = Arc<std::sync::Mutex<TlsState>>;
@@ -193,41 +201,66 @@ pub async fn tls_connect(
 }
 
 pub async fn tls_read(registry: TlsRegistry, handle: u64, len: usize) -> OpOutcome {
-    let reader = registry
-        .lock()
-        .expect("tls registry lock")
-        .readers
-        .remove(&handle);
+    let (reader, notify) = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reader = guard.readers.remove(&handle);
+        // Get-or-insert the per-handle cancel Notify (same idiom as
+        // tcp_accept) so a concurrent tls_close can wake a parked read.
+        let notify = guard
+            .cancel
+            .entry(handle)
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        (reader, notify)
+    };
     let Some(reader) = reader else {
         return OpOutcome::Failed(format!("tls: read handle {handle} is gone"));
     };
 
     let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
     match reader {
-        TlsReader::Client(mut r) => match r.read(&mut buf).await {
-            Ok(0) => {
-                reinsert_reader(&registry, handle, TlsReader::Client(r));
-                OpOutcome::Done
+        TlsReader::Client(mut r) => {
+            tokio::select! {
+                res = r.read(&mut buf) => match res {
+                    Ok(0) => {
+                        reinsert_reader(&registry, handle, TlsReader::Client(r));
+                        OpOutcome::Done
+                    }
+                    Ok(n) => {
+                        reinsert_reader(&registry, handle, TlsReader::Client(r));
+                        buf.truncate(n);
+                        OpOutcome::Bytes(buf)
+                    }
+                    Err(e) => tls_fail(e, "read", &handle.to_string()),
+                },
+                // tls_close fired: drop the read half so the BiLock releases
+                // and the socket closes; do NOT reinsert.
+                _ = notify.notified() => {
+                    drop(r);
+                    OpOutcome::Done
+                }
             }
-            Ok(n) => {
-                reinsert_reader(&registry, handle, TlsReader::Client(r));
-                buf.truncate(n);
-                OpOutcome::Bytes(buf)
+        }
+        TlsReader::Server(mut r) => {
+            tokio::select! {
+                res = r.read(&mut buf) => match res {
+                    Ok(0) => {
+                        reinsert_reader(&registry, handle, TlsReader::Server(r));
+                        OpOutcome::Done
+                    }
+                    Ok(n) => {
+                        reinsert_reader(&registry, handle, TlsReader::Server(r));
+                        buf.truncate(n);
+                        OpOutcome::Bytes(buf)
+                    }
+                    Err(e) => tls_fail(e, "read", &handle.to_string()),
+                },
+                _ = notify.notified() => {
+                    drop(r);
+                    OpOutcome::Done
+                }
             }
-            Err(e) => tls_fail(e, "read", &handle.to_string()),
-        },
-        TlsReader::Server(mut r) => match r.read(&mut buf).await {
-            Ok(0) => {
-                reinsert_reader(&registry, handle, TlsReader::Server(r));
-                OpOutcome::Done
-            }
-            Ok(n) => {
-                reinsert_reader(&registry, handle, TlsReader::Server(r));
-                buf.truncate(n);
-                OpOutcome::Bytes(buf)
-            }
-            Err(e) => tls_fail(e, "read", &handle.to_string()),
-        },
+        }
     }
 }
 
@@ -284,6 +317,12 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
     guard.closed.insert(handle);
+    // Wake any parked tls_read so it drops its read half and the socket can
+    // close -- otherwise the BiLock keeps the connection (and the event loop)
+    // alive and the process hangs at exit.
+    if let Some(notify) = guard.cancel.remove(&handle) {
+        notify.notify_one();
+    }
 }
 
 pub async fn tls_accept_wrap(

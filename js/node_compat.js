@@ -10970,10 +10970,29 @@
         this.authorized = false;
         this.authorizationError = null;
         this.alpnProtocol = false;
+        // Match net.Socket / Node semantics: when the peer half-closes (our
+        // readable hits EOF), auto-end our write side unless allowHalfOpen.
+        // Without this the peer's parked read never sees a FIN, so the event
+        // loop (which exits on inflight==0) never drains and the process hangs
+        // at exit. oam's Duplex does NOT do this automatically (net.Socket
+        // does it by hand in _readLoop), so TLSSocket must too.
+        this.allowHalfOpen = (options && options.allowHalfOpen) || false;
         this._handle = null;
         this._reading = false;
         this._protocol = null;
         this._cipher = null;
+      }
+      // On readable EOF, half-close our write side (sends FIN) so the peer's
+      // read drains -- mirrors net.Socket._readLoop's allowHalfOpen branch.
+      _onReadEof() {
+        this.push(null);
+        if (!this.allowHalfOpen) {
+          try {
+            this.end();
+          } catch (_) {
+            /* already ending/ended */
+          }
+        }
       }
       _kickRead() {
         // If a consumer attached 'data' (or otherwise started flowing) BEFORE
@@ -10992,7 +11011,7 @@
           (data) => {
             this._reading = false;
             if (data === undefined) {
-              this.push(null);
+              this._onReadEof();
             } else {
               this.push(new globalThis.Buffer(data.buffer, data.byteOffset, data.length));
             }
@@ -11008,7 +11027,7 @@
             // message. Real HTTP-body truncation is still caught at the HTTP
             // layer (Content-Length / chunked checks), so EOF here is safe.
             if (/ECONNRESET|ECONNABORTED|EPIPE|forcibly closed|10054|reset by peer|close_notify|peer closed|unexpected eof/i.test(info)) {
-              this.push(null);
+              this._onReadEof();
               return;
             }
             this.destroy(typeof err === "string" ? new Error(err) : err);
