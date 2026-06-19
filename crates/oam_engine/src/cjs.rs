@@ -258,7 +258,10 @@ pub(crate) fn load_cjs<'s>(
                         .first()
                         .map(|d| (d.code.clone(), d.message.clone()))
                         .unwrap_or_else(|| {
-                            ("OAM-PARSE0002".to_string(), format!("{file}: transpile failed"))
+                            (
+                                "OAM-PARSE0002".to_string(),
+                                format!("{file}: transpile failed"),
+                            )
                         });
                     throw_error_with_code(scope, &code, &message);
                     return None;

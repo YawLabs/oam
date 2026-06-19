@@ -90,10 +90,7 @@ impl JsRuntime {
         Self::new_inner(None, false)
     }
 
-    fn new_inner(
-        opts: Option<permissions::PermissionsOptions>,
-        with_fork_pool: bool,
-    ) -> Self {
+    fn new_inner(opts: Option<permissions::PermissionsOptions>, with_fork_pool: bool) -> Self {
         init_platform();
         let params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
         let mut isolate = v8::Isolate::new(params);
