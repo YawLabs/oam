@@ -1102,9 +1102,7 @@ pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) ->
     }
     let env_ref = unsafe { &mut *env };
     let target = ref_ as *const NapiRefEntry;
-    env_ref
-        .refs
-        .retain(|r| r.as_ref() as *const NapiRefEntry != target);
+    env_ref.refs.retain(|r| !std::ptr::eq(r.as_ref(), target));
     NAPI_OK
 }
 

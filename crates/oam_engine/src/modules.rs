@@ -1239,7 +1239,7 @@ fn flush_cycle_imports(
                 match status {
                     v8::ModuleStatus::Evaluated => {
                         let ns = module.get_module_namespace();
-                        let ns_val: v8::Local<v8::Value> = ns.into();
+                        let ns_val: v8::Local<v8::Value> = ns;
                         resolver.resolve(tc, ns_val);
                         flushed += 1;
                     }
@@ -1269,10 +1269,10 @@ fn flush_cycle_imports(
 
     // Put back any items that couldn't be flushed yet.
     let skipped_len = skipped.len();
-    if !skipped.is_empty() {
-        if let Some(p) = tc.get_slot_mut::<PendingCycleImports>() {
-            p.0.extend(skipped);
-        }
+    if !skipped.is_empty()
+        && let Some(p) = tc.get_slot_mut::<PendingCycleImports>()
+    {
+        p.0.extend(skipped);
     }
     (flushed, skipped_len)
 }
@@ -1311,7 +1311,7 @@ fn flush_tla_imports(
                 match status {
                     v8::ModuleStatus::Evaluated => {
                         let ns = module.get_module_namespace();
-                        let ns_val: v8::Local<v8::Value> = ns.into();
+                        let ns_val: v8::Local<v8::Value> = ns;
                         resolver.resolve(tc, ns_val);
                         flushed += 1;
                     }
@@ -1329,10 +1329,10 @@ fn flush_tla_imports(
         }
     }
 
-    if !still_pending.is_empty() {
-        if let Some(p) = tc.get_slot_mut::<PendingTLAImports>() {
-            p.0.extend(still_pending);
-        }
+    if !still_pending.is_empty()
+        && let Some(p) = tc.get_slot_mut::<PendingTLAImports>()
+    {
+        p.0.extend(still_pending);
     }
     flushed
 }

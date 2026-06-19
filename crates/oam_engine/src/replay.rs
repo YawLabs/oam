@@ -123,12 +123,11 @@ impl Replayer {
 
     pub fn next_op(&mut self, id: u64) -> Option<String> {
         // Fast path: check if the front is the right op.
-        if let Some(ReplayEvent::Op { id: fid, .. }) = self.events.front() {
-            if *fid == id {
-                if let Some(ReplayEvent::Op { outcome_json, .. }) = self.events.pop_front() {
-                    return Some(outcome_json);
-                }
-            }
+        if let Some(ReplayEvent::Op { id: fid, .. }) = self.events.front()
+            && *fid == id
+            && let Some(ReplayEvent::Op { outcome_json, .. }) = self.events.pop_front()
+        {
+            return Some(outcome_json);
         }
         // Slow path: scan for any Op with matching id (out-of-order completions).
         let pos = self
@@ -231,15 +230,14 @@ pub fn intercept_completion(state: &mut ReplayState, completion: OpCompletion) -
         });
         return completion;
     }
-    if let Some(replayer) = &mut state.replayer {
-        if let Some(json) = replayer.next_op(completion.id) {
-            if let Ok(outcome) = serde_json::from_str::<OpOutcome>(&json) {
-                return OpCompletion {
-                    id: completion.id,
-                    outcome,
-                };
-            }
-        }
+    if let Some(replayer) = &mut state.replayer
+        && let Some(json) = replayer.next_op(completion.id)
+        && let Ok(outcome) = serde_json::from_str::<OpOutcome>(&json)
+    {
+        return OpCompletion {
+            id: completion.id,
+            outcome,
+        };
     }
     completion
 }

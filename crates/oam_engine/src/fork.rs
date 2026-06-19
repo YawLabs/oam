@@ -122,7 +122,7 @@ impl ForkPool {
                     msg_rx,
                 };
                 match slot.tx.try_send(req) {
-                    Ok(()) => return,
+                    Ok(()) => (),
                     // Slot disconnected (thread exited early): cold spawn.
                     Err(mpsc::TrySendError::Full(req))
                     | Err(mpsc::TrySendError::Disconnected(req)) => {

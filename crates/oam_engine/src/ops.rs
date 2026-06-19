@@ -637,11 +637,11 @@ fn op_record_rng(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let value = args.get(0).number_value(scope).unwrap_or(0.0);
-    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
-        if let Some(recorder) = &mut state.recorder {
-            let seq = recorder.next_seq();
-            recorder.push(crate::replay::ReplayEvent::Rng { seq, value });
-        }
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(recorder) = &mut state.recorder
+    {
+        let seq = recorder.next_seq();
+        recorder.push(crate::replay::ReplayEvent::Rng { seq, value });
     }
     rv.set(args.get(0));
 }
@@ -651,13 +651,12 @@ fn op_replay_rng(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
-        if let Some(replayer) = &mut state.replayer {
-            if let Some(v) = replayer.next_rng() {
-                rv.set(v8::Number::new(scope, v).into());
-                return;
-            }
-        }
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(replayer) = &mut state.replayer
+        && let Some(v) = replayer.next_rng()
+    {
+        rv.set(v8::Number::new(scope, v).into());
+        return;
     }
     rv.set(args.get(0));
 }
@@ -668,11 +667,11 @@ fn op_record_date_now(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let value = args.get(0).integer_value(scope).unwrap_or(0);
-    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
-        if let Some(recorder) = &mut state.recorder {
-            let seq = recorder.next_seq();
-            recorder.push(crate::replay::ReplayEvent::DateNow { seq, value });
-        }
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(recorder) = &mut state.recorder
+    {
+        let seq = recorder.next_seq();
+        recorder.push(crate::replay::ReplayEvent::DateNow { seq, value });
     }
     rv.set(args.get(0));
 }
@@ -682,13 +681,12 @@ fn op_replay_date_now(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
-        if let Some(replayer) = &mut state.replayer {
-            if let Some(v) = replayer.next_date_now() {
-                rv.set(v8::Number::new(scope, v as f64).into());
-                return;
-            }
-        }
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(replayer) = &mut state.replayer
+        && let Some(v) = replayer.next_date_now()
+    {
+        rv.set(v8::Number::new(scope, v as f64).into());
+        return;
     }
     rv.set(args.get(0));
 }
