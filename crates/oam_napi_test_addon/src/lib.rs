@@ -77,8 +77,11 @@ struct Host {
         unsafe extern "C" fn(NapiEnv, usize, *mut *mut c_void, *mut NapiValue) -> NapiStatus,
     get_buffer_info:
         unsafe extern "C" fn(NapiEnv, NapiValue, *mut *mut c_void, *mut usize) -> NapiStatus,
+    #[allow(dead_code)]
     create_reference: unsafe extern "C" fn(NapiEnv, NapiValue, u32, *mut *mut c_void) -> NapiStatus,
+    #[allow(dead_code)]
     get_reference_value: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut NapiValue) -> NapiStatus,
+    #[allow(dead_code)]
     delete_reference: unsafe extern "C" fn(NapiEnv, *mut c_void) -> NapiStatus,
 }
 
@@ -320,7 +323,7 @@ unsafe extern "C" fn counter_get(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
         if (host().unwrap)(env, argv[0], &mut native) != 0 || native.is_null() {
             return std::ptr::null_mut();
         }
-        let val = unsafe { *(native as *const i64) };
+        let val = *(native as *const i64);
         let mut result: NapiValue = std::ptr::null_mut();
         (host().create_int64)(env, val, &mut result);
         result
@@ -344,7 +347,7 @@ unsafe extern "C" fn counter_inc(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
         if (host().unwrap)(env, argv[0], &mut native) != 0 || native.is_null() {
             return std::ptr::null_mut();
         }
-        unsafe { *(native as *mut i64) += 1 };
+        *(native as *mut i64) += 1;
         let mut undef: NapiValue = std::ptr::null_mut();
         (host().get_undefined)(env, &mut undef);
         undef
@@ -448,6 +451,7 @@ unsafe extern "C" fn buffer_len(env: NapiEnv, info: NapiCallbackInfo) -> NapiVal
 /// Exercises create_reference / get_reference_value / delete_reference.
 /// Creates a reference to `value`, reads it back twice, deletes the reference,
 /// returns [first_read, second_read] -- both should equal the original value.
+#[allow(dead_code)]
 unsafe extern "C" fn test_ref(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
     unsafe {
         let mut argc = 1usize;
