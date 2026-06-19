@@ -71,6 +71,29 @@ impl JsRuntime {
     /// Create a new runtime with the given permission restrictions.
     /// `None` -> all permissions granted (same as `new()`).
     pub fn new_with_permissions(opts: Option<permissions::PermissionsOptions>) -> Self {
+        // Top-level runtime: install the oam.fork() pre-warm pool.
+        Self::new_inner(opts, true)
+    }
+
+    /// Create a runtime for a worker / fork-prewarm thread: identical to
+    /// `new_with_permissions(None)` EXCEPT it does NOT install a `ForkPool`.
+    ///
+    /// This is load-bearing for correctness, not just an optimization: the
+    /// fork pool spawns `oam-fork-prewarm` threads that each call
+    /// `JsRuntime::new()`. If those nested runtimes also installed a pool,
+    /// each prewarm thread would spawn more prewarm threads without bound --
+    /// the recursion overflows the thread stack and exhausts memory (snapshot
+    /// deserialization per level), aborting the process. A worker isolate
+    /// never needs to host its own pool: `op_fork_spawn` handles a missing
+    /// pool by cold-spawning, so a nested `oam.fork()` still works.
+    pub(crate) fn new_worker_runtime() -> Self {
+        Self::new_inner(None, false)
+    }
+
+    fn new_inner(
+        opts: Option<permissions::PermissionsOptions>,
+        with_fork_pool: bool,
+    ) -> Self {
         init_platform();
         let params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
         let mut isolate = v8::Isolate::new(params);
@@ -94,7 +117,15 @@ impl JsRuntime {
         // Fork pool: 2 pre-warmed isolates for oam.fork() cold-start speedup.
         // The pool lives in an isolate slot so the zero-capture op_fork_spawn
         // callback can reach it without captures.
-        isolate.set_slot(fork::ForkPool::new(2));
+        //
+        // Only the TOP-LEVEL runtime gets a pool. Worker / fork-prewarm
+        // isolates pass `with_fork_pool = false` so they do NOT spawn their
+        // own prewarm threads -- otherwise each prewarm thread's
+        // `JsRuntime::new()` would spawn yet more prewarm threads, recursing
+        // until the stack overflows and the process aborts.
+        if with_fork_pool {
+            isolate.set_slot(fork::ForkPool::new(2));
+        }
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
         isolate.set_slot(std::sync::Arc::new(permissions::Permissions::from_opts(

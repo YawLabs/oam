@@ -73,7 +73,11 @@ fn run_worker(
     from_parent: mpsc::Receiver<Vec<u8>>,
     to_parent: mpsc::Sender<WorkerEvent>,
 ) -> i32 {
-    let mut rt = super::JsRuntime::new();
+    // Worker isolate: no fork pool (same recursion hazard as the prewarm
+    // path -- a worker that installed a pool would spawn prewarm threads that
+    // each spawn more pools). A nested oam.fork() inside a worker cold-spawns
+    // via op_fork_spawn's None branch.
+    let mut rt = super::JsRuntime::new_worker_runtime();
     rt.set_process_argv(vec![
         "oam".to_string(),
         script_path.to_string_lossy().into_owned(),

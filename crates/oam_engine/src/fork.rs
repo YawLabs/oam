@@ -63,8 +63,11 @@ impl ForkPool {
             .name("oam-fork-prewarm".to_string())
             .spawn(move || {
                 // Pre-warm: pay the JsRuntime::new() cost before a request arrives.
+                // Use the worker constructor (NO fork pool) -- a prewarm
+                // isolate that installed its own pool would spawn more prewarm
+                // threads, recursing until the stack overflows.
                 super::init_platform();
-                let mut rt = super::JsRuntime::new();
+                let mut rt = super::JsRuntime::new_worker_runtime();
 
                 // Block until a ForkRequest arrives or the pool drops (recv Err).
                 let req = match rx.recv() {
