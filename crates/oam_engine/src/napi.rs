@@ -2076,7 +2076,7 @@ pub unsafe extern "C" fn napi_open_handle_scope(_env: Env, result: *mut *mut c_v
     // We don't implement real handle scopes -- the V8 PinScope on the stack
     // serves the same purpose. Return a sentinel so callers don't null-deref.
     if !result.is_null() {
-        unsafe { *result = 1usize as *mut c_void };
+        unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
@@ -2092,7 +2092,7 @@ pub unsafe extern "C" fn napi_open_escapable_handle_scope(
     result: *mut *mut c_void,
 ) -> NapiStatus {
     if !result.is_null() {
-        unsafe { *result = 1usize as *mut c_void };
+        unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
@@ -2130,7 +2130,7 @@ pub unsafe extern "C" fn napi_open_callback_scope(
     result: *mut *mut c_void,
 ) -> NapiStatus {
     if !result.is_null() {
-        unsafe { *result = 1usize as *mut c_void };
+        unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
@@ -3038,7 +3038,18 @@ pub unsafe extern "C" fn napi_cancel_async_work(_env: Env, _work: *mut c_void) -
     NAPI_GENERIC_FAILURE
 }
 
-// ------------------------------------------------------------------ threadsafe functions (stubs)
+// ------------------------------------------------------------------ threadsafe functions
+//
+// oam has no libuv event loop, so true cross-thread dispatch is not supported.
+// napi-rs 2.x creates a "GC ThreadsafeFunction" during module init to schedule
+// finalizer calls back onto the JS thread.  If napi_create_threadsafe_function
+// returns failure, napi-rs panics immediately.  We return NAPI_OK with a dummy
+// opaque handle so the creation succeeds; napi_call_threadsafe_function is a
+// no-op (finalizers are silently dropped -- acceptable for a sync-only host).
+
+struct TsfnStub {
+    context: *mut c_void,
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_create_threadsafe_function(
@@ -3050,19 +3061,29 @@ pub unsafe extern "C" fn napi_create_threadsafe_function(
     _initial_thread_count: usize,
     _thread_finalize_data: *mut c_void,
     _thread_finalize_cb: *mut c_void,
-    _context: *mut c_void,
+    context: *mut c_void,
     _call_js_cb: *mut c_void,
-    _result: *mut *mut c_void,
+    result: *mut *mut c_void,
 ) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    if result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let stub = Box::new(TsfnStub { context });
+    unsafe { *result = Box::into_raw(stub) as *mut c_void };
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_get_threadsafe_function_context(
-    _func: *mut c_void,
-    _result: *mut *mut c_void,
+    func: *mut c_void,
+    result: *mut *mut c_void,
 ) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    if func.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let stub = unsafe { &*(func as *const TsfnStub) };
+    unsafe { *result = stub.context };
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -3071,12 +3092,13 @@ pub unsafe extern "C" fn napi_call_threadsafe_function(
     _data: *mut c_void,
     _is_blocking: u32,
 ) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    // No event loop -- silently drop. Finalizers will not run.
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_acquire_threadsafe_function(_func: *mut c_void) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -3084,7 +3106,9 @@ pub unsafe extern "C" fn napi_release_threadsafe_function(
     _func: *mut c_void,
     _mode: u32,
 ) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    // Leaks the TsfnStub -- acceptable for a sync host where addons live
+    // until the runtime shuts down.
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -3092,12 +3116,12 @@ pub unsafe extern "C" fn napi_unref_threadsafe_function(
     _env: Env,
     _func: *mut c_void,
 ) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_ref_threadsafe_function(_env: Env, _func: *mut c_void) -> NapiStatus {
-    NAPI_GENERIC_FAILURE
+    NAPI_OK
 }
 
 // =========================================================== addon loading
