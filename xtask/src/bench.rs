@@ -88,21 +88,26 @@ fn discover_runtimes(oam: PathBuf, oam_version: &str) -> Vec<Runtime> {
     runtimes
 }
 
+/// Portable PATH lookup. The previous impl shelled out to `where`, which is
+/// Windows-only -- on Unix it does not exist, so node/bun/deno were silently
+/// dropped and `--compare` benchmarked oam alone. Walk PATH ourselves instead,
+/// trying the Windows executable suffixes where applicable.
 fn which(name: &str) -> Result<PathBuf> {
-    let out = Command::new("where").arg(name).output()?;
-    if !out.status.success() {
-        bail!("{name} not found");
+    let path_var = std::env::var_os("PATH").context("PATH is not set")?;
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path_var) {
+        for ext in exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
     }
-    let first_line = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if first_line.is_empty() {
-        bail!("{name} not found");
-    }
-    Ok(PathBuf::from(first_line))
+    bail!("{name} not found on PATH");
 }
 
 // ------------------------------------------------------------ case runner
