@@ -3190,7 +3190,7 @@ fn free_mem() -> u64 {
     mem_status().ullAvailPhys
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn total_mem() -> u64 {
     use std::fs;
     fs::read_to_string("/proc/meminfo")
@@ -3205,7 +3205,7 @@ fn total_mem() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn free_mem() -> u64 {
     use std::fs;
     fs::read_to_string("/proc/meminfo")
@@ -3317,7 +3317,7 @@ fn process_rss() -> usize {
     counters.WorkingSetSize
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn process_rss() -> usize {
     use std::fs;
     fs::read_to_string("/proc/self/statm")
@@ -3470,7 +3470,7 @@ fn cpu_speed_mhz() -> u32 {
     if result != 0 { 0 } else { val }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn cpu_model() -> String {
     use std::fs;
     fs::read_to_string("/proc/cpuinfo")
@@ -3484,7 +3484,7 @@ fn cpu_model() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn cpu_speed_mhz() -> u32 {
     use std::fs;
     fs::read_to_string("/proc/cpuinfo")
@@ -3616,7 +3616,7 @@ fn parent_pid() -> u32 {
     pbi.InheritedFromUniqueProcessId as u32
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn parent_pid() -> u32 {
     use std::fs;
     fs::read_to_string("/proc/self/stat")
@@ -3626,6 +3626,104 @@ fn parent_pid() -> u32 {
             s[after_comm + 2..].split_whitespace().nth(1)?.parse().ok()
         })
         .unwrap_or(0)
+}
+
+// ================================ sysinfo-backed os/process natives (macOS +
+// other non-linux unix). Windows uses FFI/registry above; linux reads /proc.
+// sysinfo's API is platform-identical, so these compile and verify on Windows
+// even though they are cfg-gated off there in the shipped build. A fresh
+// System per call is fine -- these ops are infrequent and each refreshes only
+// the slice it needs.
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_total_mem() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_free_mem() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.available_memory()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_cpu_model() -> String {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    sys.cpus()
+        .first()
+        .map(|c| c.brand().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_cpu_speed_mhz() -> u32 {
+    // Apple Silicon reports 0 here (no exposed CPU frequency); Node behaves
+    // the same, so the e2e assertion is relaxed for darwin.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    sys.cpus()
+        .first()
+        .map(|c| c.frequency() as u32)
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_process_rss() -> usize {
+    use sysinfo::{ProcessesToUpdate, get_current_pid};
+    let Ok(pid) = get_current_pid() else {
+        return 0;
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(|p| p.memory() as usize).unwrap_or(0)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn sysinfo_parent_pid() -> u32 {
+    use sysinfo::{ProcessesToUpdate, get_current_pid};
+    let Ok(pid) = get_current_pid() else {
+        return 0;
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid)
+        .and_then(|p| p.parent())
+        .map(|pp| pp.as_u32())
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn total_mem() -> u64 {
+    sysinfo_total_mem()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn free_mem() -> u64 {
+    sysinfo_free_mem()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn process_rss() -> usize {
+    sysinfo_process_rss()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn cpu_model() -> String {
+    sysinfo_cpu_model()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn cpu_speed_mhz() -> u32 {
+    sysinfo_cpu_speed_mhz()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn parent_pid() -> u32 {
+    sysinfo_parent_pid()
 }
 
 // ========================================================== process.cpuUsage

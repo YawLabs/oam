@@ -111,6 +111,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # N-API: dlopen for .node addons (and the test addon's host-symbol lookup).
 libloading = "0.8"
 clap = { version = "4", features = ["derive"] }
+# os/process native values on macOS + other non-linux unix: total/free mem,
+# CPU model/speed, process RSS, parent PID. Windows uses FFI/registry and
+# linux reads /proc directly; sysinfo backs only the remaining unix targets.
+sysinfo = "0.39"
 
 # TypeScript strip/transform pipeline (the wedge): pinned as a family —
 # oxc crates must share one version.

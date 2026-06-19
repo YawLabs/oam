@@ -49,6 +49,8 @@ num-bigint-dig = { workspace = true }
 x509-parser = { workspace = true }
 # N-API addon loading.
 libloading = { workspace = true }
+# os/process native values on macOS + other non-linux unix (mem/cpu/rss/ppid).
+sysinfo = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.
 tokio-tungstenite = { workspace = true }
 

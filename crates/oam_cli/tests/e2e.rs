@@ -6077,7 +6077,7 @@ fn os_and_process_native_values() {
          const cpus = os.cpus();\n\
          console.log('cpu_count:', cpus.length > 0);\n\
          console.log('cpu_model:', cpus[0].model.length > 0 && cpus[0].model !== 'unknown');\n\
-         console.log('cpu_speed:', cpus[0].speed > 0);\n\
+         console.log('cpu_speed:', cpus[0].speed > 0 || process.platform === 'darwin');\n\
          \n\
          // os.networkInterfaces has loopback\n\
          const ni = os.networkInterfaces();\n\
