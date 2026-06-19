@@ -1,0 +1,77 @@
+name: Benchmarks
+
+# Advisory cross-platform performance matrix -- NOT a CI gate (separate
+# workflow, manual trigger, does not block PRs or main). Produces per-platform
+# oam-vs-node-vs-bun numbers; the committed BENCHMARKS.md is the windows-aarch64
+# dev-host reference, this gives the cross-platform directional picture the M3
+# "win the published benchmark axes" gate wants. CI-shared runners are noisy, so
+# treat the numbers as directional, not publication-grade.
+#
+# Org Actions policy is "selected" (GitHub-owned actions only), so bun is
+# installed via its official script rather than a third-party setup action;
+# node is pre-installed on the runners and the bench discovers whatever runtimes
+# are on PATH (a missing bun just drops that column -- still useful vs node).
+
+on:
+  workflow_dispatch:
+  # Enable to track perf over time (consumes runner minutes on a private repo):
+  # schedule:
+  #   - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Install bun (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+      - name: Install bun (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm bun.sh/install.ps1 | iex
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.bun\bin"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-bench-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ matrix.target }}-bench-
+      - name: Runtime versions on PATH
+        continue-on-error: true
+        run: |
+          node --version
+          bun --version
+      - name: Bench (oam vs node vs bun)
+        run: cargo xtask bench --release --compare
+      - name: Upload per-platform results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.target }}
+          path: |
+            BENCHMARKS.md
+            bench/results.json
