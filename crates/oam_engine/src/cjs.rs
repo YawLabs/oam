@@ -224,34 +224,48 @@ pub(crate) fn load_cjs<'s>(
 
     // .cts: check the pre-compilation cache first. If a cached .js artifact
     // exists (written by `oam install --precompile`) use it directly and skip
-    // the oxc transpile. Falls through to the block-gate if the cache misses.
-    let precompiled_cts_source: Option<String> =
-        if key.extension().and_then(|e| e.to_str()) == Some("cts") {
-            oam_loader::precompile::try_precompile_cache(&key)
-        } else {
-            None
-        };
-
-    // If .cts and NO precompile cache hit, block with a clear error.
-    if key.extension().and_then(|e| e.to_str()) == Some("cts") && precompiled_cts_source.is_none() {
-        throw_error(
-            scope,
-            &format!(
-                "{file}: TypeScript CommonJS (.cts) is not supported -- write ESM TypeScript (.ts)"
-            ),
-        );
-        return None;
-    }
+    // the oxc transpile. On a cache miss we read the .cts source and strip its
+    // types inline below, mirroring the ESM host's TypeScript path.
+    let is_cts = key.extension().and_then(|e| e.to_str()) == Some("cts");
+    let precompiled_cts_source: Option<String> = if is_cts {
+        oam_loader::precompile::try_precompile_cache(&key)
+    } else {
+        None
+    };
 
     let source = if let Some(cached) = precompiled_cts_source {
+        // Already plain JS from `oam install --precompile`; do NOT re-transpile.
         cached
     } else {
-        match std::fs::read_to_string(&key) {
+        let raw = match std::fs::read_to_string(&key) {
             Ok(source) => source,
             Err(e) => {
                 throw_error(scope, &format!("cannot read {file}: {e}"));
                 return None;
             }
+        };
+        if is_cts {
+            // Bare .cts: oxc strips the TS types, then the CJS wrapper below
+            // compiles+runs the resulting JS. A transpile failure carries the
+            // loader's ODIF code/message rather than a raw oxc panic; any ESM
+            // syntax that survives stripping (e.g. a bare `export`) fails later
+            // at compile_function and surfaces as the V8 SyntaxError.
+            match oam_loader::transpile_typescript(&key, &raw) {
+                Ok(js) => js,
+                Err(e) => {
+                    let (code, message) = e
+                        .diagnostics
+                        .first()
+                        .map(|d| (d.code.clone(), d.message.clone()))
+                        .unwrap_or_else(|| {
+                            ("OAM-PARSE0002".to_string(), format!("{file}: transpile failed"))
+                        });
+                    throw_error_with_code(scope, &code, &message);
+                    return None;
+                }
+            }
+        } else {
+            raw
         }
     };
 
