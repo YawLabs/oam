@@ -36,7 +36,7 @@ struct ForkSlot {
 
 pub struct ForkPool {
     pool: Mutex<Vec<ForkSlot>>,
-    capacity: usize,
+    _capacity: usize,
 }
 
 impl ForkPool {
@@ -44,7 +44,7 @@ impl ForkPool {
     pub fn new(capacity: usize) -> Arc<Self> {
         let pool = Arc::new(Self {
             pool: Mutex::new(Vec::with_capacity(capacity)),
-            capacity,
+            _capacity: capacity,
         });
         for _ in 0..capacity {
             Self::add_slot(&pool);

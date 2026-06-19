@@ -234,17 +234,16 @@ pub fn install(
             Ok(()) => {
                 installed += 1;
                 check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
-                if precompile {
-                    if let Err(e) =
+                if precompile
+                    && let Err(e) =
                         crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
-                    {
-                        errors.push(Diagnostic::new(
-                            "OAM-PKG0008",
-                            Severity::Warning,
-                            Origin::Install,
-                            format!("precompile {pkg_name}: {e}"),
-                        ));
-                    }
+                {
+                    errors.push(Diagnostic::new(
+                        "OAM-PKG0008",
+                        Severity::Warning,
+                        Origin::Install,
+                        format!("precompile {pkg_name}: {e}"),
+                    ));
                 }
             }
             Err(e) => {

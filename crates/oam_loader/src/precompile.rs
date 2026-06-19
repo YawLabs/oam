@@ -136,10 +136,8 @@ pub fn precompile_package(
         };
 
         // Staleness guard: skip if cache entry exists and is non-empty.
-        if let Ok(meta) = std::fs::metadata(&cache_path) {
-            if meta.len() > 0 {
-                continue;
-            }
+        if let Ok(meta) = std::fs::metadata(&cache_path) && meta.len() > 0 {
+            continue;
         }
 
         let source = std::fs::read_to_string(ts_path)?;
