@@ -1327,7 +1327,7 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
 
 // -------------------------------------------------------------- N-API beta
 
-fn napi_beta_addon() -> std::path::PathBuf {
+fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
     let artifact = if cfg!(windows) {
         "oam_napi_test_addon.dll"
     } else if cfg!(target_os = "macos") {
@@ -1344,16 +1344,19 @@ fn napi_beta_addon() -> std::path::PathBuf {
             built.display()
         );
     }
-    let addon = write_temp("napi_beta/native.node", "placeholder");
+    // Each test gets its OWN subdir: napi_beta tests run in parallel, and a
+    // shared native.node path races on Windows (one test's `oam run` holds the
+    // .node open while another overwrites it -> sharing violation).
+    let addon = write_temp(&format!("{subdir}/native.node"), "placeholder");
     std::fs::copy(&built, &addon).expect("copy addon into place");
     addon.parent().unwrap().to_path_buf()
 }
 
 #[test]
 fn napi_beta_wrap_counter_roundtrip() {
-    let dir = napi_beta_addon();
+    let dir = napi_beta_addon("napi_beta_wrap");
     write_temp(
-        "napi_beta/wrap_counter.cjs",
+        "napi_beta_wrap/wrap_counter.cjs",
         "const native = require('./native.node');\n\
          // wrapCounter() allocates a heap i64 and wraps it on a plain JS object.\n\
          const c = native.wrapCounter();\n\
@@ -1385,9 +1388,9 @@ fn napi_beta_wrap_counter_roundtrip() {
 
 #[test]
 fn napi_beta_bigint_int64_create_and_read() {
-    let dir = napi_beta_addon();
+    let dir = napi_beta_addon("napi_beta_bigint");
     write_temp(
-        "napi_beta/bigint64.cjs",
+        "napi_beta_bigint/bigint64.cjs",
         "const native = require('./native.node');\n\
          // napi_create_bigint_int64 ALWAYS returns BigInt (unlike napi_create_int64).\n\
          const small = native.makeBigInt64(42);\n\
@@ -1417,9 +1420,9 @@ fn napi_beta_bigint_int64_create_and_read() {
 
 #[test]
 fn napi_beta_buffer_create_and_len() {
-    let dir = napi_beta_addon();
+    let dir = napi_beta_addon("napi_beta_buffer");
     write_temp(
-        "napi_beta/buffer.cjs",
+        "napi_beta_buffer/buffer.cjs",
         "const native = require('./native.node');\n\
          const buf = native.makeBuffer(32);\n\
          // napi_create_buffer returns a Uint8Array.\n\
@@ -12994,9 +12997,15 @@ fn install_lifecycle_script_warns_pkg0007() {
         stderr.contains("fake-pkg"),
         "OAM-PKG0007 should name the package; stderr: {stderr}"
     );
+    // PKG0007 is Severity::Warning, not Error: the lifecycle script is skipped
+    // (never executed), so the install itself is clean. The CLI exit logic
+    // (main.rs: `has_fatal = errors.any(severity == Error)`) intentionally exits
+    // 0 on warning-only outcomes, matching npm's warn+exit-0 behavior. This
+    // mirrors install_lifecycle_script_suppressed_by_trust, which asserts
+    // success on the same warm-install path.
     assert!(
-        !out.status.success(),
-        "should exit non-zero with unacknowledged lifecycle scripts; stderr: {stderr}"
+        out.status.success(),
+        "warning-only lifecycle skip should still exit zero; stderr: {stderr}"
     );
 }
 
