@@ -54,8 +54,14 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test
+        # Bound a hung test: a deadlocked / lingering test (the class fixed in
+        # the TLS/HTTP exit-lifecycle and child_process close work) fails the
+        # step in minutes instead of hanging the job for hours. The suite runs
+        # in ~1-5 min when healthy.
+        timeout-minutes: 15
         run: cargo test --workspace
       - name: Smoke (oam run)
+        timeout-minutes: 5
         shell: bash
         run: |
           echo "console.log('ci smoke', 6 * 7)" > smoke.js
@@ -100,8 +106,14 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test
+        # Bound a hung test: a deadlocked / lingering test (the class fixed in
+        # the TLS/HTTP exit-lifecycle and child_process close work) fails the
+        # step in minutes instead of hanging the job for hours. The suite runs
+        # in ~1-5 min when healthy.
+        timeout-minutes: 15
         run: cargo test --workspace
       - name: Smoke (oam run)
+        timeout-minutes: 5
         shell: bash
         run: |
           echo "console.log('ci smoke', 6 * 7)" > smoke.js

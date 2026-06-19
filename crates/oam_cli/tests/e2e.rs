@@ -5787,6 +5787,39 @@ cp.on("close", (code) => {
     assert!(stdout.contains("DONE"), "{stdout}");
 }
 
+// Regression: 'close' must fire only AFTER stdout reaches EOF (Node parity).
+// Before the fix, spawn() emitted 'close' as soon as the process exited,
+// racing the stdout read loop, so a 'data' listener attached in the 'spawn'
+// handler intermittently saw empty output. Assert the captured output is
+// complete and stdout 'end' fired before 'close'.
+#[test]
+fn child_process_close_waits_for_stdout_eof() {
+    let f = write_temp(
+        "cp_close_order.mjs",
+        r#"
+import { spawn } from "child_process";
+const cp = spawn("node", ["-e", "process.stdout.write('payload-data')"], { shell: false });
+let captured = "";
+let endBeforeClose = false;
+cp.on("spawn", () => {
+  cp.stdout.on("data", (c) => { captured += c.toString(); });
+  cp.stdout.on("end", () => { endBeforeClose = true; });
+});
+cp.on("close", (code) => {
+  console.log("captured=" + captured);
+  console.log("end_before_close=" + endBeforeClose);
+  console.log("code=" + code);
+});
+"#,
+    );
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {}: {stdout}", out.status);
+    assert!(stdout.contains("captured=payload-data"), "{stdout}");
+    assert!(stdout.contains("end_before_close=true"), "{stdout}");
+    assert!(stdout.contains("code=0"), "{stdout}");
+}
+
 #[test]
 fn child_process_spawn_stdin_piped() {
     let f = write_temp(
@@ -10568,6 +10601,47 @@ process.exit(0);
         out.status
     );
     assert!(stdout.contains("ended=true"), "{stdout}");
+}
+
+// Regression: an explicit socket.destroy() on a TLS socket whose read is
+// PARKED (no peer EOF) must cancel that read so the process exits. Without the
+// tls_close Notify cancel (crates/oam_core/src/tls.rs), the parked tls_read
+// holds its ReadHalf, keeps the event loop in flight, and the process hangs at
+// exit (the CI Test step timeout would catch a regression). The server stays
+// silent so the client's read is genuinely parked, then the client destroys it
+// -- only the cancellation path can drain it, since no FIN/EOF ever arrives.
+#[test]
+fn tls_destroy_while_read_parked_drains_and_exits() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const server = tls.createServer({ cert, key }, () => {});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const port = server.address().port;
+const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
+let closed = false;
+c.on('data', () => {});
+c.on('close', () => { closed = true; });
+await new Promise((r) => c.on('secureConnect', r));
+c.destroy();
+await new Promise((r) => setTimeout(r, 100));
+console.log('closed=' + closed);
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let f = write_temp("tls_destroy_parked.mjs", &src);
+    let out = oam(&["run", "--no-check", f.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // success == the process drained the parked read and exited (no hang).
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    assert!(stdout.contains("closed=true"), "{stdout}");
 }
 
 // ======================================= dns.resolve + dns.reverse
