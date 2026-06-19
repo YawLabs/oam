@@ -4,6 +4,7 @@
 //! strips unreferenced exports unless told otherwise (-export_dynamic).
 
 const NAPI_EXPORTS: &[&str] = &[
+    // alpha wave
     "napi_get_undefined",
     "napi_get_null",
     "napi_get_global",
@@ -70,6 +71,79 @@ const NAPI_EXPORTS: &[&str] = &[
     "napi_create_external_buffer",
     "napi_is_buffer",
     "napi_get_buffer_info",
+    // gamma wave: full napi-sys-2.4.0 surface
+    "napi_get_last_error_info",
+    "napi_create_error",
+    "napi_create_type_error",
+    "napi_create_range_error",
+    "napi_throw_range_error",
+    "napi_is_error",
+    "napi_fatal_exception",
+    "napi_create_string_latin1",
+    "napi_create_string_utf16",
+    "napi_get_value_string_latin1",
+    "napi_get_value_string_utf16",
+    "napi_create_symbol",
+    "napi_open_handle_scope",
+    "napi_close_handle_scope",
+    "napi_open_escapable_handle_scope",
+    "napi_close_escapable_handle_scope",
+    "napi_escape_handle",
+    "napi_open_callback_scope",
+    "napi_close_callback_scope",
+    "napi_has_property",
+    "napi_delete_property",
+    "napi_has_own_property",
+    "napi_has_element",
+    "napi_delete_element",
+    "napi_define_properties",
+    "napi_get_property_names",
+    "napi_get_prototype",
+    "napi_get_new_target",
+    "napi_coerce_to_bool",
+    "napi_coerce_to_number",
+    "napi_coerce_to_object",
+    "napi_is_arraybuffer",
+    "napi_create_arraybuffer",
+    "napi_create_external_arraybuffer",
+    "napi_get_arraybuffer_info",
+    "napi_is_typedarray",
+    "napi_create_typedarray",
+    "napi_get_typedarray_info",
+    "napi_create_dataview",
+    "napi_is_dataview",
+    "napi_get_dataview_info",
+    "napi_create_promise",
+    "napi_resolve_deferred",
+    "napi_reject_deferred",
+    "napi_is_promise",
+    "napi_run_script",
+    "napi_adjust_external_memory",
+    "napi_create_date",
+    "napi_is_date",
+    "napi_get_date_value",
+    "napi_get_node_version",
+    "napi_get_uv_event_loop",
+    "napi_module_register",
+    "napi_add_env_cleanup_hook",
+    "napi_remove_env_cleanup_hook",
+    "napi_add_finalizer",
+    "napi_async_init",
+    "napi_async_destroy",
+    "napi_make_callback",
+    "napi_create_async_work",
+    "napi_delete_async_work",
+    "napi_queue_async_work",
+    "napi_cancel_async_work",
+    "napi_create_threadsafe_function",
+    "napi_get_threadsafe_function_context",
+    "napi_call_threadsafe_function",
+    "napi_acquire_threadsafe_function",
+    "napi_release_threadsafe_function",
+    "napi_unref_threadsafe_function",
+    "napi_ref_threadsafe_function",
+    // data symbol -- exported via static, included here for .def completeness
+    "uv_event_loop",
 ];
 
 fn main() {
@@ -80,8 +154,13 @@ fn main() {
             let def = out.join("napi.def");
             let mut text = String::from("EXPORTS\n");
             for symbol in NAPI_EXPORTS {
-                text.push_str(symbol);
-                text.push('\n');
+                if *symbol == "uv_event_loop" {
+                    // uv_event_loop is a DATA symbol, not a function.
+                    text.push_str("uv_event_loop DATA\n");
+                } else {
+                    text.push_str(symbol);
+                    text.push('\n');
+                }
             }
             std::fs::write(&def, text).expect("write napi.def");
             println!("cargo:rustc-link-arg-bins=/DEF:{}", def.display());
