@@ -1,12 +1,15 @@
 //! `cargo xtask bench`: micro-benchmark harness for the oam JS runtime.
 //!
-//! Six benchmark cases measure different layers of the stack:
-//!   1. cold-start       -- process start to exit on a trivial script
-//!   2. url-parse        -- URL constructor throughput (10k parses)
-//!   3. http-throughput  -- node:http + fetch loopback (200 req)
-//!   4. fs-read          -- fs.readFileSync hot-loop (1000 reads of 4KB)
-//!   5. json-parse       -- JSON.parse + JSON.stringify (1000 round-trips)
-//!   6. crypto-hash      -- SHA-256 hash of 64KB (1000 iterations)
+//! Nine benchmark cases measure different layers of the stack:
+//!   1. cold-start             -- process start to exit on a trivial script
+//!   2. url-parse              -- URL constructor throughput (10k parses)
+//!   3. http-throughput        -- node:http + fetch loopback (200 req)
+//!   4. fs-read                -- fs.readFileSync hot-loop (1000 reads of 4KB)
+//!   5. json-parse             -- JSON.parse + JSON.stringify (1000 round-trips)
+//!   6. crypto-hash            -- SHA-256 hash of 64KB (1000 iterations)
+//!   7. mcp-cold-start         -- process spawn to first MCP initialize response
+//!   8. mcp-idle-rss           -- RSS (MB) after initialize, server idle
+//!   9. mcp-first-call-latency -- tools/call round-trip on warm server
 //!
 //! With `--compare`, the same scripts run under every runtime found on
 //! PATH (node, bun, deno) and the harness reports a comparison table.
@@ -221,6 +224,295 @@ fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
     })
 }
 
+/// MCP cold-start: time from process spawn to the first JSON-RPC response.
+///
+/// Spawns the server script, sends an MCP `initialize` request via stdin,
+/// and records wall-clock time until a JSON-RPC response line arrives on
+/// stdout. Kills the server after each measurement.
+fn run_mcp_cold_start(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
+    use std::io::{BufRead, Write};
+
+    print!("  {}/mcp-cold-start: ", rt.name);
+    let iters = COLD_START_ITERS;
+    let mut samples = Vec::with_capacity(iters);
+
+    let init_msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "clientInfo": { "name": "bench", "version": "0.0.1" },
+            "capabilities": {}
+        }
+    })
+    .to_string()
+        + "\n";
+
+    for i in 0..iters {
+        let mut cmd = rt.build_cmd(server_script, &[]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let start = Instant::now();
+        let mut child = cmd.spawn().context("spawn MCP server")?;
+
+        // Write the initialize request. Keep stdin open (do NOT drop the handle
+        // yet): closing stdin sends EOF, which the server sees as "no more input"
+        // and may exit before writing its response.
+        let mut stdin = child.stdin.take().context("mcp server stdin")?;
+        stdin.write_all(init_msg.as_bytes())?;
+        stdin.flush()?;
+
+        // Read lines until we get a non-empty JSON line (the initialize response).
+        let stdout = child.stdout.take().context("mcp server stdout")?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let elapsed = loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                bail!(
+                    "{}/mcp-cold-start iter {i}: server closed stdout before response",
+                    rt.name
+                );
+            }
+            if !line.trim().is_empty() {
+                break start.elapsed().as_secs_f64() * 1000.0;
+            }
+        };
+        drop(stdin); // close stdin AFTER reading the response
+
+        let _ = child.kill();
+        let _ = child.wait();
+        samples.push(elapsed);
+        print!(".");
+
+        // Brief pause between iterations to let OS reclaim file descriptors.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(" done");
+
+    let (p50, min, max, p95, p99) = stats(&samples);
+    Ok(CaseResult {
+        runtime: rt.name.clone(),
+        name: "mcp-cold-start".to_string(),
+        median: p50,
+        min,
+        max,
+        p50,
+        p95,
+        p99,
+        unit: "ms".to_string(),
+        iterations: iters,
+        warmup_iterations: 0,
+        samples,
+    })
+}
+
+/// Read RSS of a running process in bytes. Best-effort; returns None on failure.
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        // Query Windows via `tasklist /FI "PID eq <pid>" /FO CSV /NH`
+        // Output: "oam.exe","<pid>","Console","1","12,345 K"
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // Find the last quoted field (mem usage) e.g. "12,345 K"
+        let field = text.split(',').rev().take(2).collect::<Vec<_>>().concat();
+        let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
+        let kb: u64 = digits.parse().ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // /proc/<pid>/status VmRSS line: "VmRSS:   12345 kB"
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: u64 = line
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+}
+
+/// MCP idle RSS: spawn server, complete `initialize`, sample RSS, kill.
+/// Unit: MB (megabytes). The initialize round-trip ensures the runtime is
+/// fully loaded (module graph evaluated, event loop alive) before sampling.
+fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
+    use std::io::{BufRead, Write};
+
+    print!("  {}/mcp-idle-rss: ", rt.name);
+    let iters = COLD_START_ITERS;
+    let mut samples = Vec::with_capacity(iters);
+
+    let init_msg = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-11-25",
+                    "clientInfo": { "name": "bench", "version": "0.0.1" },
+                    "capabilities": {} }
+    }).to_string() + "\n";
+
+    for _i in 0..iters {
+        let mut cmd = rt.build_cmd(server_script, &[]);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = cmd.spawn().context("spawn MCP server")?;
+        let pid = child.id();
+
+        let mut stdin = child.stdin.take().context("mcp server stdin")?;
+        stdin.write_all(init_msg.as_bytes())?;
+        stdin.flush()?;
+
+        let stdout = child.stdout.take().context("mcp server stdout")?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 { break; }
+            if !line.trim().is_empty() { break; }
+        }
+
+        // Server is now idle (waiting for next request) -- sample RSS.
+        if let Some(bytes) = process_rss_bytes(pid) {
+            let mb = bytes as f64 / (1024.0 * 1024.0);
+            samples.push(mb);
+        }
+
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        print!(".");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    println!(" done");
+
+    if samples.is_empty() {
+        bail!("no RSS samples collected (process_rss_bytes returned None on every iter)");
+    }
+
+    let (p50, min, max, p95, p99) = stats(&samples);
+    Ok(CaseResult {
+        runtime: rt.name.clone(),
+        name: "mcp-idle-rss".to_string(),
+        median: p50,
+        min,
+        max,
+        p50,
+        p95,
+        p99,
+        unit: "MB".to_string(),
+        iterations: samples.len(),
+        warmup_iterations: 0,
+        samples,
+    })
+}
+
+/// MCP first-call latency: initialize then send a `tools/call` and measure
+/// time from send to response. The initialize is NOT included -- this is
+/// warm-path latency on an already-running server.
+fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
+    use std::io::{BufRead, Write};
+
+    print!("  {}/mcp-first-call-latency: ", rt.name);
+    let iters = COLD_START_ITERS;
+    let mut samples = Vec::with_capacity(iters);
+
+    let init_msg = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-11-25",
+                    "clientInfo": { "name": "bench", "version": "0.0.1" },
+                    "capabilities": {} }
+    }).to_string() + "\n";
+
+    // MCP requires an `initialized` notification after the initialize response.
+    let initialized_notif = serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/initialized"
+    }).to_string() + "\n";
+
+    let call_msg = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "noop", "arguments": {} }
+    }).to_string() + "\n";
+
+    for i in 0..iters {
+        let mut cmd = rt.build_cmd(server_script, &[]);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = cmd.spawn().context("spawn MCP server")?;
+
+        let mut stdin = child.stdin.take().context("mcp server stdin")?;
+        stdin.write_all(init_msg.as_bytes())?;
+        stdin.flush()?;
+
+        let stdout = child.stdout.take().context("mcp server stdout")?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+
+        // Drain the initialize response.
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                bail!("{}/mcp-first-call-latency iter {i}: closed before initialize response", rt.name);
+            }
+            if !line.trim().is_empty() { break; }
+        }
+
+        // Send the initialized notification (required by MCP spec before tools/call).
+        stdin.write_all(initialized_notif.as_bytes())?;
+        stdin.flush()?;
+
+        // Now measure: send tools/call, time to response.
+        let call_start = Instant::now();
+        stdin.write_all(call_msg.as_bytes())?;
+        stdin.flush()?;
+
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                bail!("{}/mcp-first-call-latency iter {i}: closed before tools/call response", rt.name);
+            }
+            if !line.trim().is_empty() {
+                break;
+            }
+        }
+        let elapsed_ms = call_start.elapsed().as_secs_f64() * 1000.0;
+        samples.push(elapsed_ms);
+
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        print!(".");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(" done");
+
+    let (p50, min, max, p95, p99) = stats(&samples);
+    Ok(CaseResult {
+        runtime: rt.name.clone(),
+        name: "mcp-first-call-latency".to_string(),
+        median: p50,
+        min,
+        max,
+        p50,
+        p95,
+        p99,
+        unit: "ms".to_string(),
+        iterations: iters,
+        warmup_iterations: 0,
+        samples,
+    })
+}
+
 // ------------------------------------------------------------------ entry
 
 pub fn run(release: bool, compare: bool) -> Result<()> {
@@ -256,9 +548,12 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
         "fs-read",
         "json-parse",
         "crypto-hash",
+        "mcp-cold-start",
+        "mcp-idle-rss",
+        "mcp-first-call-latency",
     ];
 
-    let scripts = write_scripts(&tmp)?;
+    let scripts = write_scripts(&tmp, &repo)?;
     let mut all_results: Vec<CaseResult> = Vec::new();
 
     for case_name in &case_names {
@@ -282,6 +577,36 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
                 }
                 "crypto-hash" => {
                     run_timed_case(case_name, rt, &scripts.crypto_hash, TIMED_ITERS, &[])
+                }
+                "mcp-cold-start" => {
+                    if rt.name == "oam" {
+                        run_mcp_cold_start(rt, &scripts.mcp_server)
+                    } else if let Some(sdk) = &scripts.sdk_mcp_server {
+                        run_mcp_cold_start(rt, sdk)
+                    } else {
+                        println!("  {}/mcp-cold-start: skipped (SDK install failed)", rt.name);
+                        continue;
+                    }
+                }
+                "mcp-idle-rss" => {
+                    if rt.name == "oam" {
+                        run_mcp_idle_rss(rt, &scripts.mcp_server)
+                    } else if let Some(sdk) = &scripts.sdk_mcp_server {
+                        run_mcp_idle_rss(rt, sdk)
+                    } else {
+                        println!("  {}/mcp-idle-rss: skipped (SDK install failed)", rt.name);
+                        continue;
+                    }
+                }
+                "mcp-first-call-latency" => {
+                    if rt.name == "oam" {
+                        run_mcp_first_call_latency(rt, &scripts.mcp_server)
+                    } else if let Some(sdk) = &scripts.sdk_mcp_server {
+                        run_mcp_first_call_latency(rt, sdk)
+                    } else {
+                        println!("  {}/mcp-first-call-latency: skipped (SDK install failed)", rt.name);
+                        continue;
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -323,9 +648,12 @@ struct Scripts {
     json_parse: PathBuf,
     crypto_hash: PathBuf,
     data_file: PathBuf,
+    mcp_server: PathBuf,
+    /// SDK server script for node/bun/deno comparison. None if npm install failed.
+    sdk_mcp_server: Option<PathBuf>,
 }
 
-fn write_scripts(tmp: &Path) -> Result<Scripts> {
+fn write_scripts(tmp: &Path, repo: &Path) -> Result<Scripts> {
     let cold_start = tmp.join("bench_cold_start.mjs");
     std::fs::write(&cold_start, "console.log('ok');\n")?;
 
@@ -423,6 +751,27 @@ console.log(JSON.stringify({ elapsed_ms: elapsed, ops: N, bytes_per_op: data.len
     let data_file = tmp.join("bench_data.txt");
     std::fs::write(&data_file, "x".repeat(4096))?;
 
+    // MCP cold-start server: a minimal oam:mcp server with one tool.
+    // The bench spawns this, sends initialize, and measures time to response.
+    let mcp_server = tmp.join("bench_mcp_server.mjs");
+    std::fs::write(
+        &mcp_server,
+        r#"import { McpServer } from 'oam:mcp';
+const server = new McpServer({ name: 'bench', version: '0.0.1' });
+server.tool('noop', {
+  description: 'No-op benchmark tool',
+  parameters: {},
+  handler: async () => ({ content: [{ type: 'text', text: 'ok' }] }),
+});
+server.serve({ transport: 'stdio' });
+"#,
+    )?;
+
+    // SDK MCP server: equivalent server using @modelcontextprotocol/sdk for
+    // --compare runs. We install the SDK into bench/sdk-fixtures/ (cached across
+    // runs -- stable path avoids Defender scan churn during the bench itself).
+    let sdk_mcp_server = build_sdk_mcp_server(&repo.join("bench").join("sdk-fixtures"));
+
     Ok(Scripts {
         cold_start,
         url_parse,
@@ -431,7 +780,78 @@ console.log(JSON.stringify({ elapsed_ms: elapsed, ops: N, bytes_per_op: data.len
         json_parse,
         crypto_hash,
         data_file,
+        mcp_server,
+        sdk_mcp_server,
     })
+}
+
+/// Ensures @modelcontextprotocol/sdk is installed in `fixtures_dir` and
+/// returns the path to the server script. The fixtures dir is stable across
+/// runs (bench/sdk-fixtures/) so the install only happens once -- avoids
+/// Windows Defender scan churn polluting the benchmark measurements.
+fn build_sdk_mcp_server(fixtures: &Path) -> Option<PathBuf> {
+    std::fs::create_dir_all(fixtures).ok()?;
+
+    let server = fixtures.join("bench_sdk_server.mjs");
+
+    // Always (re)write the script so changes to the fixture are picked up.
+    std::fs::write(
+        &server,
+        r#"import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+const server = new Server({ name: 'bench', version: '0.0.1' }, { capabilities: { tools: {} } });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [{ name: 'noop', description: 'No-op benchmark tool', inputSchema: { type: 'object', properties: {} } }],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async () => ({
+  content: [{ type: 'text', text: 'ok' }],
+}));
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+"#,
+    )
+    .ok()?;
+
+    // Skip npm install if the SDK is already present.
+    let sdk_marker = fixtures
+        .join("node_modules")
+        .join("@modelcontextprotocol")
+        .join("sdk")
+        .join("package.json");
+    if sdk_marker.exists() {
+        return Some(server);
+    }
+
+    // Minimal package.json so npm install works without warnings.
+    std::fs::write(
+        fixtures.join("package.json"),
+        r#"{"name":"bench-sdk-fixtures","version":"0.0.0","private":true,"type":"module"}"#,
+    )
+    .ok()?;
+
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+
+    print!("  sdk-fixtures: npm install @modelcontextprotocol/sdk ... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let status = Command::new(npm)
+        .args(["install", "--save-exact", "@modelcontextprotocol/sdk"])
+        .current_dir(fixtures)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        println!("FAILED (skipping SDK leg)");
+        return None;
+    }
+    println!("ok");
+
+    Some(server)
 }
 
 // ------------------------------------------------------------ table output
@@ -641,6 +1061,9 @@ fn build_markdown(
     md.push_str("- **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.\n");
     md.push_str("- **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.\n");
     md.push_str("- **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.\n");
+    md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport).\n");
+    md.push_str("- **mcp-idle-rss** -- resident set size (MB) after `initialize` completes and the server is idle, waiting for the next request. Measures runtime memory overhead of a hosted MCP server.\n");
+    md.push_str("- **mcp-first-call-latency** -- wall-clock from sending `tools/call` to receiving the response, on an already-initialized server. Measures warm-path dispatch latency (no cold-start cost).\n");
 
     md
 }

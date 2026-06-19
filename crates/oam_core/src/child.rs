@@ -8,7 +8,16 @@ pub struct ChildProcess {
     /// The live child. Taken out of the registry entry by `child_wait` for the
     /// duration of the await, but the entry itself stays so a concurrent
     /// `child_kill` can still reach the kill-notifier below.
+    ///
+    /// stdin/stdout/stderr are stored as separate fields so that `child_wait`
+    /// taking `child` (which has all three set to None) does not race with
+    /// concurrent read/write ops. Without this separation a Windows Tokio
+    /// scheduler that runs `spawnWait` before `spawnWrite` / `spawnReadStdout`
+    /// causes those ops to see `child` as None and silently fail.
     pub child: Option<tokio::process::Child>,
+    pub stdin: Option<tokio::process::ChildStdin>,
+    pub stdout: Option<tokio::process::ChildStdout>,
+    pub stderr: Option<tokio::process::ChildStderr>,
     pub pid: u32,
     /// Wakes the parked `child_wait` future, which owns the `Child` and is the
     /// only place that can signal it. Lets kill survive `child` being taken.
@@ -18,9 +27,15 @@ pub struct ChildProcess {
 }
 
 impl ChildProcess {
-    pub fn new(child: tokio::process::Child, pid: u32) -> Self {
+    pub fn new(mut child: tokio::process::Child, pid: u32) -> Self {
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         ChildProcess {
             child: Some(child),
+            stdin,
+            stdout,
+            stderr,
             pid,
             kill: Arc::new(Notify::new()),
             kill_signal: None,
@@ -259,10 +274,7 @@ pub struct SpawnSyncError {
 pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
     let stdout = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_mut(&handle)
-            .and_then(|c| c.child.as_mut())
-            .and_then(|ch| ch.stdout.take())
+        guard.get_mut(&handle).and_then(|cp| cp.stdout.take())
     };
     match stdout {
         Some(mut stdout) => {
@@ -273,8 +285,8 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-                        ch.stdout = Some(stdout);
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stdout = Some(stdout);
                     }
                     OpOutcome::Bytes(buf)
                 }
@@ -288,10 +300,7 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
 pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcome {
     let stderr = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_mut(&handle)
-            .and_then(|c| c.child.as_mut())
-            .and_then(|ch| ch.stderr.take())
+        guard.get_mut(&handle).and_then(|cp| cp.stderr.take())
     };
     match stderr {
         Some(mut stderr) => {
@@ -302,8 +311,8 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-                        ch.stderr = Some(stderr);
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stderr = Some(stderr);
                     }
                     OpOutcome::Bytes(buf)
                 }
@@ -316,18 +325,15 @@ pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcom
 
 pub fn child_close_stdin(children: &ChildRegistry, handle: u64) {
     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-        drop(ch.stdin.take());
+    if let Some(cp) = guard.get_mut(&handle) {
+        drop(cp.stdin.take());
     }
 }
 
 pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
     let stdin = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get_mut(&handle)
-            .and_then(|c| c.child.as_mut())
-            .and_then(|ch| ch.stdin.take())
+        guard.get_mut(&handle).and_then(|cp| cp.stdin.take())
     };
     match stdin {
         Some(mut stdin) => {
@@ -335,8 +341,8 @@ pub async fn child_write_stdin(children: ChildRegistry, handle: u64, data: Vec<u
             match stdin.write_all(&data).await {
                 Ok(()) => {
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ch) = guard.get_mut(&handle).and_then(|c| c.child.as_mut()) {
-                        ch.stdin = Some(stdin);
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stdin = Some(stdin);
                     }
                     OpOutcome::Done
                 }

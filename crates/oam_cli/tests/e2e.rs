@@ -3186,6 +3186,54 @@ fn jsx_is_a_clear_diagnostic_not_a_crash() {
 }
 
 #[test]
+fn runs_typescript_commonjs_module() {
+    // .cts: oxc strips TS, then the CJS path executes the resulting JS
+    // (e2e for the gate removal: an entry file in .cts form must run, not
+    // reject with OAM-MOD0003 from the CLI entry).
+    let file = write_temp(
+        "mod.cts",
+        "enum Mode { Fast = 'fast' }\n\
+         const n: number = 6 * 7;\n\
+         console.log(Mode.Fast, n);\n\
+         module.exports = { name: Mode.Fast, value: n };\n",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fast 42");
+}
+
+#[test]
+fn require_of_typescript_commonjs_strips_types() {
+    // .cts reached via require() from a .cjs sibling: the CJS loader must
+    // strip TS types before CompileFunction sees the source. Bad input
+    // surfaces as OAM-MOD0003 (matching the loader's error code), not a
+    // raw V8 SyntaxError.
+    let module = write_temp(
+        "lib.cts",
+        "interface Shape { n: number }\n\
+         const square = (s: Shape): number => s.n * s.n;\n\
+         module.exports = { square };\n",
+    );
+    let entry = write_temp(
+        "main.cjs",
+        "const lib = require('./lib.cts');\n\
+         console.log(lib.square({ n: 6 }));\n",
+    );
+    let out = oam(&["run", entry.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "36");
+    let _ = module;
+}
+
+#[test]
 fn parent_dir_specifiers_dedup_to_one_module_instance() {
     // The same module reached as './b1_x' and '../b1_x' (through a subdir)
     // must instantiate once: side effect printed exactly once.
@@ -3320,13 +3368,19 @@ fn json_modules_from_packages_bom_and_failure_modes() {
 
 #[test]
 fn cts_is_a_clear_diagnostic() {
-    // .cjs runs via interop since M2; .cts (TypeScript-CJS) stays gated.
+    // .cts is now executable: oxc strips TS, the CJS path runs the
+    // resulting JS. A .cts file with an `export` (ESM syntax) inside a
+    // CJS body surfaces as OAM-RT0001 at parse time inside the compiled
+    // function — the test asserts the diagnostic is structured, not that
+    // .cts is rejected at the resolver.
     let file = write_temp("legacy.cts", "export const a: number = 1;");
     let out = oam(&["run", file.to_str().unwrap(), "--json", "--no-check"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-MOD0003"), "stderr: {stderr}");
-    assert!(stderr.contains("ESM TypeScript"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("OAM-RT0001") && stderr.contains("Unexpected token 'export'"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -5226,6 +5280,128 @@ console.log('defaultExtractDelta=' + typeof defaultExtractDelta);
     assert_eq!(lines[5], "openai=function");
     assert_eq!(lines[6], "anthropic=function");
     assert_eq!(lines[7], "defaultExtractDelta=function");
+}
+
+#[test]
+fn oam_mcp_module_stdio_transport() {
+    // oam:mcp virtual module: McpServer with stdio transport processes
+    // JSON-RPC messages and dispatches to registered tool handlers.
+    let file = write_temp(
+        "mcp_stdio.ts",
+        r#"import { McpServer } from 'oam:mcp';
+
+const server = new McpServer({ name: 'test-server', version: '0.1.0' });
+
+server.tool('add', {
+  description: 'Add two numbers',
+  parameters: {
+    type: 'object',
+    properties: { a: { type: 'number' }, b: { type: 'number' } },
+    required: ['a', 'b'],
+  },
+  handler: ({ a, b }: { a: number; b: number }) => ({
+    content: [{ type: 'text', text: String(a + b) }],
+  }),
+});
+
+server.tool('greet', {
+  description: 'Greet someone',
+  parameters: {
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name'],
+  },
+  handler: ({ name }: { name: string }) => `Hello, ${name}!`,
+});
+
+server.serve({ transport: 'stdio' });
+"#,
+    );
+
+    let messages = [
+        // Pre-init request: should be rejected with -32002.
+        r#"{"jsonrpc":"2.0","id":0,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":3,"b":4}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"greet","arguments":{"name":"World"}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bogus","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"ping","params":{}}"#,
+    ];
+    let stdin_data = messages.join("\n") + "\n";
+
+    let cache = write_temp("oam-cache-mcp/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", file.to_str().unwrap()])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(stdin_data.as_bytes());
+            }
+            drop(child.stdin.take());
+            child.wait_with_output()
+        })
+        .expect("oam binary runs");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "oam:mcp stdio test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let responses: Vec<serde_json::Value> = stdout
+        .trim()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    // 7 responses (notification produces none).
+    assert_eq!(
+        responses.len(),
+        7,
+        "expected 7 JSON-RPC responses, got {}: {stdout}",
+        responses.len()
+    );
+
+    // 0. pre-init tools/list => -32002 "server not initialized"
+    assert_eq!(responses[0]["error"]["code"], -32002);
+
+    // 1. initialize
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(responses[1]["result"]["serverInfo"]["name"], "test-server");
+    assert!(responses[1]["result"]["capabilities"]["tools"].is_object());
+
+    // 2. tools/list (after init)
+    let tools = responses[2]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["name"], "add");
+    assert_eq!(tools[1]["name"], "greet");
+
+    // 3. tools/call add => "7"
+    assert_eq!(responses[3]["result"]["content"][0]["text"], "7");
+
+    // 4. tools/call greet => string auto-wrapped
+    assert_eq!(
+        responses[4]["result"]["content"][0]["text"],
+        "Hello, World!"
+    );
+
+    // 5. unknown tool => error
+    assert_eq!(responses[5]["error"]["code"], -32602);
+
+    // 6. ping => empty result
+    assert!(responses[6]["result"].is_object());
 }
 
 #[test]
@@ -12589,4 +12765,430 @@ console.log(typeof http2.sensitiveHeaders);"#,
         stdout,
         "function\nfunction\nfunction\n0\n:status\n:path\nGET\n200\nsymbol"
     );
+}
+
+#[test]
+fn oam_mcp_module_batch_array() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let script = write_temp(
+        "mcp_module_batch.ts",
+        r#"import { McpServer } from 'oam:mcp';
+const s = new McpServer({ name: 'batch', version: '1.0.0' });
+s.tool('double', {
+  description: 'Double a number',
+  parameters: { type: 'object', properties: { n: { type: 'number' } }, required: ['n'] },
+  handler: async ({ n }) => String(n * 2),
+});
+await s.serve();
+"#,
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("run")
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam run spawns");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"e2e"}}})
+        )
+        .unwrap();
+        // Batch array: two tool calls with a notification interleaved.
+        let batch = serde_json::json!([
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"double","arguments":{"n":5}}},
+            {"jsonrpc":"2.0","method":"notifications/initialized"},
+            {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"double","arguments":{"n":21}}}
+        ]);
+        writeln!(stdin, "{batch}").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).expect("each line is JSON"))
+        .collect();
+    assert!(child.wait().unwrap().success());
+
+    // initialize response + one batch-array response on a single line.
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    let batch_resp = responses[1]
+        .as_array()
+        .expect("batch response is a JSON array");
+    // Notification produces no entry; two tool calls -> two entries.
+    assert_eq!(batch_resp.len(), 2);
+    assert_eq!(batch_resp[0]["id"], 2);
+    assert_eq!(batch_resp[0]["result"]["content"][0]["text"], "10");
+    assert_eq!(batch_resp[1]["id"], 3);
+    assert_eq!(batch_resp[1]["result"]["content"][0]["text"], "42");
+}
+
+// ── oam trust + lifecycle-script warnings ─────────────────────────────────
+
+#[test]
+fn install_lifecycle_script_warns_pkg0007() {
+    // Pre-populate node_modules/fake-pkg so the "already installed" skip
+    // fires (no network needed). The skip path still calls check_lifecycle_scripts,
+    // so OAM-PKG0007 should surface for an untrusted package with a postinstall.
+    let pj = write_temp(
+        "install-scripts-warn/package.json",
+        r#"{"name":"install-scripts-warn","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let pkg_dir = dir.join("node_modules/fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","scripts":{"postinstall":"echo installed"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package-lock.json"),
+        r#"{"name":"install-scripts-warn","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"install-scripts-warn","version":"1.0.0"},"node_modules/fake-pkg":{"version":"1.0.0","resolved":"https://example.invalid/fake-pkg-1.0.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(dir)
+        .output()
+        .expect("oam binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("OAM-PKG0007"),
+        "expected OAM-PKG0007 lifecycle warning; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("fake-pkg"),
+        "OAM-PKG0007 should name the package; stderr: {stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "should exit non-zero with unacknowledged lifecycle scripts; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn install_lifecycle_script_suppressed_by_trust() {
+    // Same setup as above but with a .oam/trust.json listing fake-pkg.
+    // OAM-PKG0007 should NOT appear and install should succeed.
+    let pj = write_temp(
+        "install-scripts-trusted/package.json",
+        r#"{"name":"install-scripts-trusted","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let pkg_dir = dir.join("node_modules/fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","scripts":{"postinstall":"echo installed"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package-lock.json"),
+        r#"{"name":"install-scripts-trusted","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"install-scripts-trusted","version":"1.0.0"},"node_modules/fake-pkg":{"version":"1.0.0","resolved":"https://example.invalid/fake-pkg-1.0.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+    )
+    .unwrap();
+    // Trust fake-pkg via project-local .oam/trust.json
+    let trust_dir = dir.join(".oam");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    std::fs::write(trust_dir.join("trust.json"), r#"{"packages":["fake-pkg"]}"#).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(dir)
+        .output()
+        .expect("oam binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("OAM-PKG0007"),
+        "OAM-PKG0007 must not appear for trusted package; stderr: {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "should succeed when lifecycle scripts are trusted; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn trust_add_remove_list_round_trip() {
+    // Tests `oam trust add`, `oam trust list`, and `oam trust remove`
+    // against a project-local .oam/trust.json.
+    let pj = write_temp(
+        "trust-round-trip/package.json",
+        r#"{"name":"trust-round-trip","version":"1.0.0"}"#,
+    );
+    let dir = pj.parent().unwrap();
+    let oam = env!("CARGO_BIN_EXE_oam");
+
+    // add
+    let out = std::process::Command::new(oam)
+        .args(["trust", "add", "esbuild"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust add runs");
+    assert!(
+        out.status.success(),
+        "oam trust add should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // trust.json was created
+    let trust_json = dir.join(".oam/trust.json");
+    assert!(
+        trust_json.is_file(),
+        ".oam/trust.json should exist after trust add"
+    );
+    let content = std::fs::read_to_string(&trust_json).unwrap();
+    assert!(
+        content.contains("esbuild"),
+        ".oam/trust.json should contain esbuild"
+    );
+
+    // list
+    let out = std::process::Command::new(oam)
+        .args(["trust", "list"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust list runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("esbuild"),
+        "trust list should print esbuild; stdout: {stdout}"
+    );
+
+    // remove
+    let out = std::process::Command::new(oam)
+        .args(["trust", "remove", "esbuild"])
+        .current_dir(dir)
+        .output()
+        .expect("oam trust remove runs");
+    assert!(
+        out.status.success(),
+        "oam trust remove should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // no longer in list
+    let content = std::fs::read_to_string(&trust_json).unwrap();
+    assert!(
+        !content.contains("esbuild"),
+        ".oam/trust.json should not contain esbuild after remove"
+    );
+}
+
+// ── oam install --precompile ─────────────────────────────────────────────
+
+/// Build a minimal fake npm tarball (gzipped tar with `package/` prefix).
+fn make_fake_tarball(extra_files: &[(&str, &str)]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut builder = tar::Builder::new(Vec::new());
+
+    let pj = r#"{"name":"fake-pkg","version":"1.0.0"}"#;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(pj.len() as u64);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_path("package/package.json").unwrap();
+    header.set_cksum();
+    builder.append(&header, pj.as_bytes()).unwrap();
+
+    for (rel, content) in extra_files {
+        let path = format!("package/{rel}");
+        let mut h = tar::Header::new_gnu();
+        h.set_size(content.len() as u64);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_path(&path).unwrap();
+        h.set_cksum();
+        builder.append(&h, content.as_bytes()).unwrap();
+    }
+
+    let tar_data = builder.into_inner().unwrap();
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&tar_data).unwrap();
+    gz.finish().unwrap()
+}
+
+#[test]
+fn install_precompile_creates_cache() {
+    use sha2::{Digest, Sha512};
+
+    let ts_source = "const x: number = 42;\nconsole.log(x);\n";
+    let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
+
+    let hash = Sha512::digest(&tarball);
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
+    let integrity = format!("sha512-{b64}");
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    let tarball = Arc::new(tarball);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tarball_clone = tarball.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let data = tarball_clone.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
+    let lockfile = format!(
+        r#"{{
+            "name": "test-precompile",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{"name":"test-precompile","version":"1.0.0"}},
+                "node_modules/fake-pkg": {{
+                    "version": "1.0.0",
+                    "resolved": "{resolved_url}",
+                    "integrity": "{integrity}"
+                }}
+            }}
+        }}"#
+    );
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-cache-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install", "--precompile"])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "install --precompile should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cache_file = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("fake-pkg")
+        .join("index.js");
+    assert!(
+        cache_file.exists(),
+        "precompile cache file should exist at {}",
+        cache_file.display()
+    );
+
+    let js = std::fs::read_to_string(&cache_file).unwrap();
+    assert!(
+        !js.contains(": number"),
+        "type annotation should be stripped from cache; got: {js}"
+    );
+    assert!(
+        js.contains("console.log"),
+        "js body should be preserved in cache; got: {js}"
+    );
+
+    let gi = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join(".gitignore");
+    assert!(gi.exists(), ".gitignore should be written into .oam/");
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn install_precompile_cts_cache_used_on_run() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-cts-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_dir = project_dir.join("node_modules").join("fake-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"fake-pkg","version":"1.0.0","main":"index.cts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("index.cts"),
+        "const x: number = 99;\nexports.value = x;\n",
+    )
+    .unwrap();
+
+    let cache_dir = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("fake-pkg");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("index.js"),
+        "// oam-precompile-sentinel\nexports.value = 42;\n",
+    )
+    .unwrap();
+
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(
+        &entry,
+        r#"const pkg = require('./node_modules/fake-pkg/index.cts');
+console.log(pkg.value);"#,
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "run with .cts cache hit should succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "42",
+        "sentinel value from cache should be printed; got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
 }

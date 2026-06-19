@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 8] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 14] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         (
             "fetchBodyRead",
@@ -108,6 +108,32 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("wsRecv", v8::Function::new(scope, op_ws_recv).unwrap()),
         ("wsClose", v8::Function::new(scope, op_ws_close).unwrap()),
         ("wsDrop", v8::Function::new(scope, op_ws_drop).unwrap()),
+        // oam.fork() -- pre-warmed pool spawn.
+        (
+            "forkSpawn",
+            v8::Function::new(scope, op_fork_spawn).unwrap(),
+        ),
+        // Record-replay ops (installed unconditionally; no-ops when mode=off).
+        (
+            "recordRng",
+            v8::Function::new(scope, op_record_rng).unwrap(),
+        ),
+        (
+            "replayRng",
+            v8::Function::new(scope, op_replay_rng).unwrap(),
+        ),
+        (
+            "recordDateNow",
+            v8::Function::new(scope, op_record_date_now).unwrap(),
+        ),
+        (
+            "replayDateNow",
+            v8::Function::new(scope, op_replay_date_now).unwrap(),
+        ),
+        (
+            "replayGetMode",
+            v8::Function::new(scope, op_replay_get_mode).unwrap(),
+        ),
     ];
     for (name, function) in internal_bindings {
         let key = v8::String::new(scope, name).unwrap();
@@ -498,5 +524,185 @@ pub(crate) fn settle_completion(
             }
             resolver.reject(tc, exception);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// oam.fork() -- pre-warmed pool spawn
+// ---------------------------------------------------------------------------
+
+/// Spawn a worker via the pre-warmed fork pool (or fall back to a cold spawn).
+/// Returns the numeric worker_id synchronously; events arrive via
+/// workerRecvMessage just like a regular worker_threads.Worker.
+///
+/// JS signature: `__oam.forkSpawn(scriptPath: string, workerData: string | null) -> number`
+fn op_fork_spawn(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(script_path) = args.get(0).to_string(scope) else {
+        let msg = v8::String::new(scope, "forkSpawn requires a script path").unwrap();
+        let exc = v8::Exception::type_error(scope, msg);
+        scope.throw_exception(exc);
+        return;
+    };
+    let script_path = script_path.to_rust_string_lossy(scope);
+
+    let worker_data = if args.get(1).is_null_or_undefined() {
+        None
+    } else {
+        args.get(1)
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+    };
+
+    let path = std::path::PathBuf::from(&script_path);
+    if !path.is_file() {
+        let msg = v8::String::new(
+            scope,
+            &format!("forkSpawn: script not found: {script_path}"),
+        )
+        .unwrap();
+        let exc = v8::Exception::type_error(scope, msg);
+        scope.throw_exception(exc);
+        return;
+    }
+
+    let workers = match scope.get_slot::<oam_core::CoreRuntime>() {
+        Some(core) => core.workers(),
+        None => {
+            let msg = v8::String::new(scope, "internal: runtime not initialized").unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            scope.throw_exception(exc);
+            return;
+        }
+    };
+
+    let worker_id = workers.lock().unwrap_or_else(|e| e.into_inner()).next_id();
+
+    let (parent_to_worker_tx, parent_to_worker_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (worker_to_parent_tx, worker_to_parent_rx) =
+        std::sync::mpsc::channel::<oam_core::worker::WorkerEvent>();
+
+    let pool = scope
+        .get_slot::<std::sync::Arc<crate::fork::ForkPool>>()
+        .cloned();
+
+    match pool {
+        Some(pool) => {
+            pool.fork(
+                path,
+                worker_data,
+                worker_id,
+                worker_to_parent_tx,
+                parent_to_worker_rx,
+            );
+        }
+        None => {
+            // Slot not set (e.g. worker thread that didn't initialize a pool):
+            // fall back to a cold spawn.
+            crate::worker::spawn_worker(
+                path,
+                worker_data,
+                worker_id,
+                parent_to_worker_rx,
+                worker_to_parent_tx.clone(),
+            );
+        }
+    }
+
+    {
+        let mut guard = workers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.handles.insert(
+            worker_id,
+            oam_core::worker::WorkerHandle {
+                to_worker: parent_to_worker_tx,
+                thread: None,
+            },
+        );
+        guard.receivers.insert(worker_id, worker_to_parent_rx);
+    }
+
+    rv.set(v8::Number::new(scope, worker_id as f64).into());
+}
+
+// ---------------------------------------------------------------------------
+// Record-replay native ops
+// ---------------------------------------------------------------------------
+
+fn op_record_rng(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0).number_value(scope).unwrap_or(0.0);
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(recorder) = &mut state.recorder {
+            let seq = recorder.next_seq();
+            recorder.push(crate::replay::ReplayEvent::Rng { seq, value });
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_rng(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(replayer) = &mut state.replayer {
+            if let Some(v) = replayer.next_rng() {
+                rv.set(v8::Number::new(scope, v).into());
+                return;
+            }
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_record_date_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0).integer_value(scope).unwrap_or(0);
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(recorder) = &mut state.recorder {
+            let seq = recorder.next_seq();
+            recorder.push(crate::replay::ReplayEvent::DateNow { seq, value });
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_date_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>() {
+        if let Some(replayer) = &mut state.replayer {
+            if let Some(v) = replayer.next_date_now() {
+                rv.set(v8::Number::new(scope, v as f64).into());
+                return;
+            }
+        }
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_get_mode(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mode = scope
+        .get_slot::<crate::replay::ReplayState>()
+        .map(|s| s.mode_str())
+        .unwrap_or("off");
+    if let Some(s) = v8::String::new(scope, mode) {
+        rv.set(s.into());
     }
 }

@@ -419,7 +419,16 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
         loop {
-            let now = std::time::Instant::now();
+            // In replay mode, advance the virtual clock so all pending timers
+            // are immediately due -- no real sleep is needed.
+            let is_replay = tc
+                .get_slot::<crate::replay::ReplayState>()
+                .is_some_and(|s| s.is_replay());
+            let now = if is_replay {
+                std::time::Instant::now() + std::time::Duration::from_secs(86400)
+            } else {
+                std::time::Instant::now()
+            };
             if now >= deadline {
                 return Ok(());
             }
@@ -433,7 +442,7 @@ impl JsRuntime {
                 let args: Vec<v8::Local<v8::Value>> =
                     extra.iter().map(|g| v8::Local::new(tc, g)).collect();
                 if callback.call(tc, recv, &args).is_none() {
-                    // A timer body threw directly — the canonical async
+                    // A timer body threw directly -- the canonical async
                     // throw. Offer it to uncaughtException before dying.
                     if let Some(failure) = handle_uncaught_throw(tc, "timer callback") {
                         return Err(failure);
@@ -446,6 +455,12 @@ impl JsRuntime {
                 .get_slot_mut::<oam_core::CoreRuntime>()
                 .and_then(|core| core.try_recv())
             {
+                let completion =
+                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                        crate::replay::intercept_completion(state, completion)
+                    } else {
+                        completion
+                    };
                 crate::ops::settle_completion(tc, completion);
                 tc.perform_microtask_checkpoint();
                 progressed = true;
@@ -465,10 +480,25 @@ impl JsRuntime {
                 Some(timer) if timer < deadline => timer,
                 _ => deadline,
             };
-            let completion = tc
-                .get_slot_mut::<oam_core::CoreRuntime>()
-                .and_then(|core| core.recv_deadline(Some(wait_until)));
+            // In replay mode, skip the sleep -- timers appear due via the
+            // advanced virtual clock above; no real wall-clock wait needed.
+            let replay_active = tc
+                .get_slot::<crate::replay::ReplayState>()
+                .is_some_and(|s| s.is_replay());
+            let completion = if !replay_active {
+                tc.get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.recv_deadline(Some(wait_until)))
+            } else {
+                tc.get_slot_mut::<oam_core::CoreRuntime>()
+                    .and_then(|core| core.try_recv())
+            };
             if let Some(completion) = completion {
+                let completion =
+                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                        crate::replay::intercept_completion(state, completion)
+                    } else {
+                        completion
+                    };
                 crate::ops::settle_completion(tc, completion);
                 tc.perform_microtask_checkpoint();
             } else if next_timer.is_none_or(|t| t >= deadline) {
@@ -597,16 +627,17 @@ impl JsRuntime {
     /// `globalThis.__oamTestRun(filter)` (snapshot JS) and pump the event
     /// loop until its promise settles. Returns the results object as a
     /// JSON string. Reuses the run slots from the preceding
-    /// execute_module/execute_cjs call — do NOT reset them here, the test
+    /// execute_module/execute_cjs call -- do NOT reset them here, the test
     /// file's module state must stay alive.
     pub fn run_registered_tests(
         &mut self,
         filter: Option<&str>,
     ) -> Result<String, Vec<Diagnostic>> {
-        // Test bodies run user JS that can call import(); the host_ptr from
-        // the preceding execute_module is no longer borrow-valid here, so
-        // clear the slot so dynamic_import_callback rejects cleanly instead
-        // of dereferencing a dangling pointer.
+        // Clear ActiveHost so dynamic import() calls from inside test bodies
+        // see None and reject with "not wired up on this entry path" instead
+        // of dereferencing the stale host pointer left by execute_module.
+        // Pattern mirrors tick() and repl_eval(): clear before creating the
+        // scope so the borrow checker lets us take &mut self.isolate.
         self.isolate.set_slot(ActiveHost(None));
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);
@@ -702,7 +733,15 @@ pub(crate) fn pump_event_loop(
 
         let mut progressed = false;
 
-        let now = std::time::Instant::now();
+        // In replay mode, advance virtual clock so timers are immediately due.
+        let is_replay = tc
+            .get_slot::<crate::replay::ReplayState>()
+            .is_some_and(|s| s.is_replay());
+        let now = if is_replay {
+            std::time::Instant::now() + std::time::Duration::from_secs(86400)
+        } else {
+            std::time::Instant::now()
+        };
         let due = tc
             .get_slot_mut::<crate::timers::TimerQueue>()
             .and_then(|queue| queue.pop_due(now));
@@ -727,6 +766,11 @@ pub(crate) fn pump_event_loop(
             .get_slot_mut::<oam_core::CoreRuntime>()
             .and_then(|core| core.try_recv())
         {
+            let completion = if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                crate::replay::intercept_completion(state, completion)
+            } else {
+                completion
+            };
             crate::ops::settle_completion(tc, completion);
             tc.perform_microtask_checkpoint();
             if let Some(failure) = drain_uncaught(tc) {
@@ -747,10 +791,24 @@ pub(crate) fn pump_event_loop(
         match (next_deadline, has_inflight) {
             (None, false) => break,
             (deadline, true) => {
-                let completion = tc
-                    .get_slot_mut::<oam_core::CoreRuntime>()
-                    .and_then(|core| core.recv_deadline(deadline));
+                // In replay mode, skip the blocking wait.
+                let replay_active = tc
+                    .get_slot::<crate::replay::ReplayState>()
+                    .is_some_and(|s| s.is_replay());
+                let completion = if replay_active {
+                    tc.get_slot_mut::<oam_core::CoreRuntime>()
+                        .and_then(|core| core.try_recv())
+                } else {
+                    tc.get_slot_mut::<oam_core::CoreRuntime>()
+                        .and_then(|core| core.recv_deadline(deadline))
+                };
                 if let Some(completion) = completion {
+                    let completion =
+                        if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                            crate::replay::intercept_completion(state, completion)
+                        } else {
+                            completion
+                        };
                     crate::ops::settle_completion(tc, completion);
                     tc.perform_microtask_checkpoint();
                     if let Some(failure) = drain_uncaught(tc) {
@@ -759,30 +817,35 @@ pub(crate) fn pump_event_loop(
                 }
             }
             (Some(deadline), false) => {
-                let now = std::time::Instant::now();
-                if deadline > now {
-                    let total = deadline - now;
-                    // When the inspector is attached, interleave the sleep with
-                    // polls so CDP messages from a debugger client aren't
-                    // deferred until the timer fires. Without this, a script
-                    // sleeping (setTimeout) is unresponsive to DevTools for the
-                    // full sleep duration.
-                    let inspector = tc
-                        .get_slot::<crate::inspector::InspectorSlot>()
-                        .map(|slot| slot.0.clone());
-                    if let Some(shared) = inspector {
-                        const POLL_INTERVAL: std::time::Duration =
-                            std::time::Duration::from_millis(50);
-                        let mut remaining = total;
-                        while remaining > std::time::Duration::ZERO {
-                            let chunk = remaining.min(POLL_INTERVAL);
-                            std::thread::sleep(chunk);
-                            shared.poll();
-                            remaining =
-                                deadline.saturating_duration_since(std::time::Instant::now());
+                // In replay mode, skip the sleep -- timers appear due via the
+                // advanced virtual clock above.
+                let replay_active = tc
+                    .get_slot::<crate::replay::ReplayState>()
+                    .is_some_and(|s| s.is_replay());
+                if !replay_active {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        let total = deadline - now;
+                        // When the inspector is attached, interleave the sleep
+                        // with polls so CDP messages aren't deferred until the
+                        // timer fires.
+                        let inspector = tc
+                            .get_slot::<crate::inspector::InspectorSlot>()
+                            .map(|slot| slot.0.clone());
+                        if let Some(shared) = inspector {
+                            const POLL_INTERVAL: std::time::Duration =
+                                std::time::Duration::from_millis(50);
+                            let mut remaining = total;
+                            while remaining > std::time::Duration::ZERO {
+                                let chunk = remaining.min(POLL_INTERVAL);
+                                std::thread::sleep(chunk);
+                                shared.poll();
+                                remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
+                            }
+                        } else {
+                            std::thread::sleep(total);
                         }
-                    } else {
-                        std::thread::sleep(total);
                     }
                 }
             }
@@ -1065,7 +1128,27 @@ enum DynResult {
     /// oam-side failure (resolve/load/instantiate, or an unsupported shape);
     /// the message becomes an Error the import promise rejects with.
     Error(String),
+    /// The import target is in kEvaluating (on our call stack). The caller
+    /// (dynamic_import_callback) stores the resolver in PendingCycleImports so
+    /// it can be resolved once the outer module finishes its synchronous body
+    /// and transitions to kEvaluatingAsync.
+    Deferred,
+    /// The imported module has top-level await that is still pending because it
+    /// is waiting for a cycle import (stored in PendingCycleImports). The outer
+    /// dyn_import_load will flush the cycle and settle this module's resolver.
+    /// Carries the module's resolved path for later lookup.
+    EvalAsync(PathBuf),
 }
+
+/// Deferred import resolvers for modules currently in kEvaluating status.
+/// Flushed by flush_cycle_imports once the target reaches kEvaluatingAsync.
+#[derive(Default)]
+struct PendingCycleImports(Vec<(PathBuf, v8::Global<v8::PromiseResolver>)>);
+
+/// Deferred import resolvers for modules that have pending TLA.
+/// Flushed by flush_tla_imports once the module reaches kEvaluated/kErrored.
+#[derive(Default)]
+struct PendingTLAImports(Vec<(PathBuf, v8::Global<v8::PromiseResolver>)>);
 
 /// Parse the [key, value, source_offset] triples for the one supported import
 /// attribute (type=json). Returns Ok(true) when type:"json" is set, Ok(false)
@@ -1121,6 +1204,138 @@ fn reject_with_message(
     resolver.reject(scope, exception);
 }
 
+/// Flush PendingCycleImports: resolve any whose target is now kEvaluatingAsync
+/// or kEvaluated. Skips (puts back) items whose target is still kEvaluating
+/// (we are still on its call stack). Returns (flushed, skipped) counts.
+fn flush_cycle_imports(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> (usize, usize) {
+    let pending = match tc.get_slot_mut::<PendingCycleImports>() {
+        Some(p) => std::mem::take(&mut p.0),
+        None => return (0, 0),
+    };
+    let mut flushed = 0;
+    let mut skipped: Vec<(PathBuf, v8::Global<v8::PromiseResolver>)> = Vec::new();
+
+    for (path, resolver_global) in pending {
+        // Clone the module Global while holding an immutable slot borrow.
+        let module_global: Option<v8::Global<v8::Module>> = {
+            tc.get_slot::<ModuleMap>()
+                .and_then(|m| m.by_path.get(&path))
+                .cloned()
+        };
+        let resolver = v8::Local::new(tc, &resolver_global);
+        match module_global {
+            None => {
+                let s = v8::String::new(tc, "oam: internal: cycle module not in map")
+                    .unwrap_or_else(|| v8::String::empty(tc));
+                let e = v8::Exception::error(tc, s);
+                resolver.reject(tc, e);
+                flushed += 1;
+            }
+            Some(mg) => {
+                let module = v8::Local::new(tc, &mg);
+                let status = module.get_status();
+                match status {
+                    v8::ModuleStatus::EvaluatingAsync | v8::ModuleStatus::Evaluated => {
+                        let ns = module.get_module_namespace();
+                        let ns_val: v8::Local<v8::Value> = ns.into();
+                        resolver.resolve(tc, ns_val);
+                        flushed += 1;
+                    }
+                    v8::ModuleStatus::Errored => {
+                        let exc = module.get_exception();
+                        resolver.reject(tc, exc);
+                        flushed += 1;
+                    }
+                    v8::ModuleStatus::Evaluating => {
+                        // Still on the call stack — defer until the outer level.
+                        skipped.push((path, resolver_global));
+                    }
+                    _ => {
+                        let s = v8::String::new(
+                            tc,
+                            &format!("oam: cycle import: unexpected module status {status:?}"),
+                        )
+                        .unwrap_or_else(|| v8::String::empty(tc));
+                        let e = v8::Exception::error(tc, s);
+                        resolver.reject(tc, e);
+                        flushed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Put back any items that couldn't be flushed yet.
+    if !skipped.is_empty() {
+        if let Some(p) = tc.get_slot_mut::<PendingCycleImports>() {
+            p.0.extend(skipped);
+        }
+    }
+    (flushed, skipped.len())
+}
+
+/// Flush PendingTLAImports: resolve any whose module has reached kEvaluated
+/// or kErrored. Skips (puts back) modules still in kEvaluatingAsync.
+/// Returns number of items flushed.
+fn flush_tla_imports(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> usize {
+    let pending = match tc.get_slot_mut::<PendingTLAImports>() {
+        Some(p) => std::mem::take(&mut p.0),
+        None => return 0,
+    };
+    let mut flushed = 0;
+    let mut still_pending: Vec<(PathBuf, v8::Global<v8::PromiseResolver>)> = Vec::new();
+
+    for (path, resolver_global) in pending {
+        let module_global: Option<v8::Global<v8::Module>> = {
+            tc.get_slot::<ModuleMap>()
+                .and_then(|m| m.by_path.get(&path))
+                .cloned()
+        };
+        let resolver = v8::Local::new(tc, &resolver_global);
+        match module_global {
+            None => {
+                let s = v8::String::new(tc, "oam: internal: TLA module not in map")
+                    .unwrap_or_else(|| v8::String::empty(tc));
+                let e = v8::Exception::error(tc, s);
+                resolver.reject(tc, e);
+                flushed += 1;
+            }
+            Some(mg) => {
+                let module = v8::Local::new(tc, &mg);
+                let status = module.get_status();
+                match status {
+                    v8::ModuleStatus::Evaluated => {
+                        let ns = module.get_module_namespace();
+                        let ns_val: v8::Local<v8::Value> = ns.into();
+                        resolver.resolve(tc, ns_val);
+                        flushed += 1;
+                    }
+                    v8::ModuleStatus::Errored => {
+                        let exc = module.get_exception();
+                        resolver.reject(tc, exc);
+                        flushed += 1;
+                    }
+                    _ => {
+                        // Still evaluating — keep in the queue.
+                        still_pending.push((path, resolver_global));
+                    }
+                }
+            }
+        }
+    }
+
+    if !still_pending.is_empty() {
+        if let Some(p) = tc.get_slot_mut::<PendingTLAImports>() {
+            p.0.extend(still_pending);
+        }
+    }
+    flushed
+}
+
 /// Load + instantiate + evaluate a dynamically-imported module through the same
 /// machinery as the static graph, under the caller's TryCatch scope. Returns a
 /// DynResult of Globals so the namespace/reason survives the scope drop.
@@ -1156,6 +1371,33 @@ fn dyn_import_load(
             }
         }
     };
+
+    // Handle cycle cases BEFORE calling evaluate() or get_module_namespace(),
+    // both of which CHECK-fail on kEvaluating in all V8 builds:
+    //
+    // kEvaluatingAsync -- the module's TLA is in progress. evaluate() on this
+    //   state returns the existing (pending) TLA promise, and get_module_namespace()
+    //   is safe. Return the partial namespace now: bindings initialized before
+    //   the TLA suspended are live; unset ones are TDZ. This is the correct
+    //   ES2022 semantics for a TLA cycle (A imports B imports A-while-A's-TLA
+    //   is pending).
+    //
+    // kEvaluating -- the module's synchronous body is currently executing
+    //   (we are on its call stack). Calling evaluate() again triggers a V8
+    //   CHECK failure. get_module_namespace() is also forbidden for this
+    //   status. Report as a hard-sync cycle error rather than crashing.
+    match module.get_status() {
+        v8::ModuleStatus::EvaluatingAsync => {
+            return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
+        }
+        v8::ModuleStatus::Evaluating => {
+            // We are on this module's call stack. Signal to the caller to store
+            // the resolver in PendingCycleImports; the outer dyn_import_load will
+            // flush it once the module transitions to kEvaluatingAsync.
+            return DynResult::Deferred;
+        }
+        _ => {}
+    }
 
     // Instantiate only from a fresh module; a statically-loaded one is already
     // (at least) Instantiated and re-instantiating would error.
@@ -1213,16 +1455,48 @@ fn dyn_import_load(
             eval_promise.mark_as_handled();
             DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
         }
-        // Synchronous graphs settle within the microtask checkpoint above. A
-        // still-pending promise means real top-level await in the imported
-        // module, which needs a nested event-loop pump — a documented
-        // follow-up. We do NOT mark_as_handled here: we're rejecting the
-        // import promise with our own Error and leaving the eval promise
-        // alone, so a later legitimate rejection of the TLA promise still
-        // surfaces as an unhandled rejection (Node parity).
-        v8::PromiseState::Pending => DynResult::Error(format!(
-            "oam: dynamic import('{spec}') of a module with top-level await is not supported yet"
-        )),
+        // Synchronous graphs settle within the microtask checkpoint above.
+        // A pending promise means the module has TLA. If there are deferred
+        // cycle imports (PendingCycleImports), run a flush loop: resolve them
+        // once the target modules reach kEvaluatingAsync, then drain the
+        // resulting microtasks. Repeat until quiescent. If the flush makes
+        // no progress because all cycle items are still kEvaluating (we are
+        // on their call stack), signal EvalAsync upward so the outer level
+        // can flush after its module's evaluate() returns.
+        v8::PromiseState::Pending => {
+            let mut did_something = true;
+            while did_something {
+                did_something = false;
+                let (cycle_flushed, cycle_skipped) = flush_cycle_imports(tc);
+                if cycle_flushed > 0 {
+                    tc.perform_microtask_checkpoint();
+                    did_something = true;
+                } else if cycle_skipped > 0 {
+                    // All pending cycle imports are still kEvaluating (we're on
+                    // their call stack). Tell the caller to stash our resolver
+                    // in PendingTLAImports; the outer level will flush us.
+                    return DynResult::EvalAsync(resolved);
+                }
+                let tla_flushed = flush_tla_imports(tc);
+                if tla_flushed > 0 {
+                    tc.perform_microtask_checkpoint();
+                    did_something = true;
+                }
+            }
+            // Re-check after all rounds.
+            match eval_promise.state() {
+                v8::PromiseState::Fulfilled => {
+                    DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()))
+                }
+                v8::PromiseState::Rejected => {
+                    DynResult::Rejected(v8::Global::new(tc, eval_promise.result(tc)))
+                }
+                v8::PromiseState::Pending => DynResult::Error(format!(
+                    "oam: dynamic import('{spec}') of a module with top-level \
+                     await is not supported yet"
+                )),
+            }
+        }
     }
 }
 
@@ -1265,14 +1539,15 @@ pub(crate) fn dynamic_import_callback<'s>(
     };
 
     // The active host is parked by execute_module; absent on the REPL/timer
-    // paths, where dynamic import isn't wired up yet.
+    // paths and from inside run_registered_tests (which clears the slot so
+    // test bodies cannot dereference the stale pointer from execute_module).
     let Some(host_ptr) = scope.get_slot::<ActiveHost>().and_then(|h| h.0) else {
         reject_with_message(
             scope,
             &resolver,
             &format!(
-                "oam: dynamic import('{spec}') is not wired up on this entry path — \
-                 use a static import, or call this from within the module-evaluation phase"
+                "oam: dynamic import('{spec}') is not wired up on this entry path \
+                 (REPL, timer, op callback, or test body)"
             ),
         );
         return Some(promise);
@@ -1338,6 +1613,9 @@ pub(crate) fn dynamic_import_callback<'s>(
     }
 
     // Heavy V8 work under a child TryCatch; carry the result out as Globals.
+    // Clone resolved so it is available for the Deferred/EvalAsync branches
+    // after the tc scope (and borrow) drops.
+    let resolved_for_defer = resolved.clone();
     let result = {
         v8::tc_scope!(let tc, scope);
         dyn_import_load(tc, host, resolved, &spec)
@@ -1353,6 +1631,36 @@ pub(crate) fn dynamic_import_callback<'s>(
             resolver.reject(scope, value);
         }
         DynResult::Error(msg) => reject_with_message(scope, &resolver, &msg),
+        DynResult::Deferred => {
+            // The target module is kEvaluating (we are on its call stack).
+            // Stash the resolver; flush_cycle_imports() will resolve it once the
+            // outer module reaches kEvaluatingAsync.
+            let global_resolver = v8::Global::new(scope, resolver);
+            if scope.get_slot::<PendingCycleImports>().is_none() {
+                scope.set_slot(PendingCycleImports::default());
+            }
+            scope
+                .get_slot_mut::<PendingCycleImports>()
+                .expect("just set")
+                .0
+                .push((resolved_for_defer, global_resolver));
+            // Return the unsettled promise — it will be resolved by the flush.
+        }
+        DynResult::EvalAsync(path) => {
+            // The module has pending TLA that will settle once the cycle import
+            // it is waiting for is resolved by the outer level. Stash the
+            // resolver in PendingTLAImports.
+            let global_resolver = v8::Global::new(scope, resolver);
+            if scope.get_slot::<PendingTLAImports>().is_none() {
+                scope.set_slot(PendingTLAImports::default());
+            }
+            scope
+                .get_slot_mut::<PendingTLAImports>()
+                .expect("just set")
+                .0
+                .push((path, global_resolver));
+            // Return the unsettled promise — it will be resolved by the flush.
+        }
     }
     Some(promise)
 }

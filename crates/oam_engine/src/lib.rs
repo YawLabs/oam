@@ -18,16 +18,19 @@ use std::sync::Once;
 
 mod cjs;
 mod crypto_ops;
+pub mod fork;
 mod inspector;
 mod modules;
 pub mod napi;
 mod node_ops;
 mod ops;
 pub mod permissions;
+pub mod replay;
 mod timers;
 mod worker;
 pub use modules::ModuleHost;
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
+pub use replay::ReplayMode;
 
 static V8_INIT: Once = Once::new();
 
@@ -87,6 +90,11 @@ impl JsRuntime {
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
         isolate.set_slot(napi::AddonRegistry::new());
+        isolate.set_slot(replay::ReplayState::default());
+        // Fork pool: 2 pre-warmed isolates for oam.fork() cold-start speedup.
+        // The pool lives in an isolate slot so the zero-capture op_fork_spawn
+        // callback can reach it without captures.
+        isolate.set_slot(fork::ForkPool::new(2));
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
         isolate.set_slot(std::sync::Arc::new(permissions::Permissions::from_opts(
@@ -157,7 +165,56 @@ impl JsRuntime {
         }
     }
 
-    /// Read `process.exitCode` after a completed run — Node honors it at
+    /// Activate record or replay mode. Call before executing the entry (after
+    /// `new()` but before `execute_module` / `execute_cjs`). In off mode this
+    /// is a no-op: the default `ReplayState` slot is already `Off`.
+    pub fn set_replay_mode(&mut self, mode: replay::ReplayMode) {
+        self.isolate.set_slot(replay::ReplayState::from_mode(mode));
+    }
+
+    /// Install JS-side monkey-patches for `Math.random` and `Date.now` that
+    /// route through the record/replay native ops. Must be called AFTER
+    /// `set_replay_mode` and BEFORE executing any user code.
+    pub fn apply_replay_patches(&mut self) {
+        let mode = self
+            .isolate
+            .get_slot::<replay::ReplayState>()
+            .map(|s| s.mode_str())
+            .unwrap_or("off");
+        if mode == "off" {
+            return;
+        }
+        let js = format!(
+            r#"(function() {{
+  var mode = "{}";
+  if (mode === "record") {{
+    var _origRandom = Math.random.bind(Math);
+    Math.random = function random() {{
+      var v = _origRandom();
+      __oam.recordRng(v);
+      return v;
+    }};
+    var _origDateNow = Date.now.bind(Date);
+    Date.now = function now() {{
+      var v = _origDateNow();
+      __oam.recordDateNow(v);
+      return v;
+    }};
+  }} else if (mode === "replay") {{
+    Math.random = function random() {{
+      return __oam.replayRng(Math.random._orig ? Math.random._orig() : 0.5);
+    }};
+    Date.now = function now() {{
+      return __oam.replayDateNow(0);
+    }};
+  }}
+}})();"#,
+            mode
+        );
+        let _ = self.execute_script("__oam_replay_patch.js", &js);
+    }
+
+    /// Read `process.exitCode` after a completed run -- Node honors it at
     /// natural exit, and CI consuming exit codes depends on that.
     pub fn process_exit_code(&mut self) -> Option<i32> {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);

@@ -22,7 +22,9 @@ use oxc_allocator::Allocator;
 
 pub mod install;
 mod npm;
+pub mod precompile;
 mod resolver;
+pub mod trust;
 mod tsconfig;
 pub use npm::{ModuleKind, module_kind, resolve_require};
 use oxc_codegen::Codegen;

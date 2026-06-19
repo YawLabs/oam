@@ -58,6 +58,15 @@ enum Command {
         /// first line. Optional value is `[host:]port`.
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect_brk: Option<String>,
+        /// Record all non-deterministic I/O to FILE (JSON Lines). Mutually
+        /// exclusive with --replay.
+        #[arg(long, value_name = "FILE", conflicts_with = "replay")]
+        record: Option<PathBuf>,
+        /// Replay non-deterministic I/O from a FILE previously captured with
+        /// --record. Timers fire instantly; Math.random/Date.now return
+        /// recorded values. Mutually exclusive with --record.
+        #[arg(long, value_name = "FILE", conflicts_with = "record")]
+        replay: Option<PathBuf>,
         /// Arguments passed to the script (process.argv) after `--`.
         #[arg(last = true)]
         script_args: Vec<String>,
@@ -120,6 +129,19 @@ enum Command {
         /// Refuse to modify the lockfile (default and only mode for MVP).
         #[arg(long, default_value = "true")]
         frozen_lockfile: bool,
+        /// Pre-compile TypeScript files in installed packages to .js at install
+        /// time. Cached under node_modules/.oam/precompile/ for faster first run.
+        #[arg(long, default_value = "false")]
+        precompile: bool,
+    },
+    /// Manage the trust list for lifecycle scripts.
+    ///
+    /// oam install skips all lifecycle scripts (postinstall, preinstall, install)
+    /// by default. Trust a package to see its skipped scripts; script execution
+    /// is not yet supported, but trusted packages suppress the OAM-PKG0007 warning.
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
     },
     /// Compile a pre-bundled JS file into a standalone executable.
     /// The user bundles externally (esbuild/rollup); this embeds the result.
@@ -152,6 +174,36 @@ enum DaemonAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Allow a package to suppress the OAM-PKG0007 lifecycle-script warning.
+    Add {
+        /// npm package name (e.g. "esbuild" or "@scope/pkg").
+        package: String,
+        /// Write to the global trust list (~/.config/oam/trust.json) instead of
+        /// the project-local .oam/trust.json.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove a package from the trust list.
+    Remove {
+        /// npm package name.
+        package: String,
+        /// Remove from the global list instead of the project-local list.
+        #[arg(long)]
+        global: bool,
+    },
+    /// Show trusted packages.
+    List {
+        /// Show only the global list.
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+        /// Show only the project-local list (default).
+        #[arg(long)]
+        local: bool,
+    },
+}
+
 fn main() -> ExitCode {
     if let Some(source) = extract_embedded_js() {
         return run_embedded(&source, std::env::args().collect());
@@ -169,6 +221,8 @@ fn main() -> ExitCode {
             no_check,
             inspect,
             inspect_brk,
+            record,
+            replay,
             script_args,
         } => {
             let inspect = match resolve_inspect(inspect.as_deref(), inspect_brk.as_deref()) {
@@ -178,7 +232,22 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            run_command(file, *check, *no_check, cli.json, script_args, inspect)
+            let replay_mode = if let Some(path) = record {
+                oam_engine::ReplayMode::Record(path.clone())
+            } else if let Some(path) = replay {
+                oam_engine::ReplayMode::Replay(path.clone())
+            } else {
+                oam_engine::ReplayMode::Off
+            };
+            run_command(
+                file,
+                *check,
+                *no_check,
+                cli.json,
+                script_args,
+                inspect,
+                replay_mode,
+            )
         }
         Command::Test {
             paths,
@@ -230,10 +299,22 @@ fn main() -> ExitCode {
             if *workers > 0 {
                 serve_with_workers(file, *workers, cli.json, inspect)
             } else {
-                run_command(file, CheckMode::Warn, false, cli.json, &[], inspect)
+                run_command(
+                    file,
+                    CheckMode::Warn,
+                    false,
+                    cli.json,
+                    &[],
+                    inspect,
+                    oam_engine::ReplayMode::Off,
+                )
             }
         }
-        Command::Install { frozen_lockfile } => install_command(*frozen_lockfile, cli.json),
+        Command::Install {
+            frozen_lockfile,
+            precompile,
+        } => install_command(*frozen_lockfile, *precompile, cli.json),
+        Command::Trust { action } => trust_command(action),
         Command::Compile {
             entry,
             output,
@@ -299,6 +380,7 @@ fn run_command(
     json: bool,
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
+    replay_mode: oam_engine::ReplayMode,
 ) -> ExitCode {
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
@@ -339,7 +421,7 @@ fn run_command(
         rx
     });
 
-    let exit = match run_file(file, script_args, inspect) {
+    let exit = match run_file(file, script_args, inspect, replay_mode) {
         Ok(code) => ExitCode::from(code),
         Err(diagnostics) => {
             for d in &diagnostics {
@@ -557,7 +639,7 @@ fn is_test_file(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
-    if !matches!(ext, "ts" | "mts" | "js" | "mjs" | "cjs") {
+    if !matches!(ext, "ts" | "mts" | "cts" | "js" | "mjs" | "cjs") {
         return false;
     }
     let stem = &name[..name.len() - ext.len() - 1];
@@ -611,7 +693,7 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
     let files = discover_test_files(paths);
     if files.is_empty() {
         eprintln!(
-            "oam test: no test files found (looked for *.test.* / *.spec.* / *_test.* with js/ts extensions)"
+            "oam test: no test files found (looked for *.test.* / *.spec.* / *_test.* with js/mjs/cjs/ts/mts/cts extensions)"
         );
         return ExitCode::FAILURE;
     }
@@ -776,12 +858,12 @@ fn render(d: &Diagnostic, json: bool) {
 }
 
 /// `oam install`: frozen-lockfile package install from package-lock.json v3.
-fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
+fn install_command(frozen_lockfile: bool, precompile: bool, json: bool) -> ExitCode {
     // Walk upward from cwd to find the directory containing package-lock.json.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
 
-    match oam_loader::install::install(&project_dir, frozen_lockfile) {
+    match oam_loader::install::install(&project_dir, frozen_lockfile, precompile) {
         Ok(outcome) => {
             let (installed, elapsed, errors) = match outcome {
                 oam_loader::install::InstallOutcome::Complete(summary) => {
@@ -836,6 +918,101 @@ fn install_command(frozen_lockfile: bool, json: bool) -> ExitCode {
                 render(d, json);
             }
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `oam trust`: manage the per-project and global lifecycle-script trust list.
+fn trust_command(action: &TrustAction) -> ExitCode {
+    use oam_loader::trust::TrustConfig;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_dir = find_project_dir(&cwd, "package.json")
+        .or_else(|| find_project_dir(&cwd, "package-lock.json"))
+        .unwrap_or(cwd);
+
+    match action {
+        TrustAction::Add { package, global } => {
+            let mut config = if *global {
+                TrustConfig::load_global()
+            } else {
+                TrustConfig::load_local(&project_dir)
+            };
+            if config.add(package) {
+                let result = if *global {
+                    config.save_global()
+                } else {
+                    config.save_local(&project_dir)
+                };
+                match result {
+                    Ok(()) => {
+                        if *global {
+                            eprintln!("oam trust: added '{package}' to global trust list");
+                        } else {
+                            eprintln!("oam trust: added '{package}' to .oam/trust.json");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("oam trust: failed to save: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                eprintln!("oam trust: '{package}' is already trusted");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustAction::Remove { package, global } => {
+            let mut config = if *global {
+                TrustConfig::load_global()
+            } else {
+                TrustConfig::load_local(&project_dir)
+            };
+            if config.remove(package) {
+                let result = if *global {
+                    config.save_global()
+                } else {
+                    config.save_local(&project_dir)
+                };
+                match result {
+                    Ok(()) => eprintln!("oam trust: removed '{package}'"),
+                    Err(e) => {
+                        eprintln!("oam trust: failed to save: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                eprintln!("oam trust: '{package}' was not in the trust list");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustAction::List { global, local: _ } => {
+            if *global {
+                let config = TrustConfig::load_global();
+                let path = TrustConfig::global_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.config/oam/trust.json".to_string());
+                eprintln!("Global trust list ({path}):");
+                for pkg in config.entries() {
+                    println!("  {pkg}");
+                }
+                if config.entries().is_empty() {
+                    eprintln!("  (empty)");
+                }
+            } else {
+                // Default: show local (also used when --local is explicit).
+                let config = TrustConfig::load_local(&project_dir);
+                eprintln!(
+                    "Project trust list ({}):",
+                    project_dir.join(".oam").join("trust.json").display()
+                );
+                for pkg in config.entries() {
+                    println!("  {pkg}");
+                }
+                if config.entries().is_empty() {
+                    eprintln!("  (empty)");
+                }
+            }
+            ExitCode::SUCCESS
         }
     }
 }
@@ -979,7 +1156,7 @@ fn serve_with_workers(
     let dispatcher_path = dir.join("_pool_dispatcher.cjs");
     std::fs::write(&dispatcher_path, &dispatcher_src).expect("write dispatcher");
 
-    let result = run_file(&dispatcher_path, &[], inspect);
+    let result = run_file(&dispatcher_path, &[], inspect, oam_engine::ReplayMode::Off);
     let _ = std::fs::remove_dir_all(&dir);
     match result {
         Ok(code) => ExitCode::from(code),
@@ -1167,31 +1344,18 @@ fn run_file(
     file: &Path,
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
+    replay_mode: oam_engine::ReplayMode,
 ) -> Result<u8, Vec<Diagnostic>> {
-    match file.extension().and_then(|e| e.to_str()) {
-        Some("cts") => {
-            return Err(vec![Diagnostic::new(
-                "OAM-MOD0003",
-                Severity::Error,
-                Origin::Resolve,
-                format!(
-                    "TypeScript CommonJS (.cts) is not supported — write ESM TypeScript (.ts): {}",
-                    file.display()
-                ),
-            )]);
-        }
-        Some("json") => {
-            return Err(vec![Diagnostic::new(
-                "OAM-MOD0003",
-                Severity::Error,
-                Origin::Resolve,
-                format!(
-                    "a .json file is not a program — import it from a script instead: {}",
-                    file.display()
-                ),
-            )]);
-        }
-        _ => {}
+    if let Some("json") = file.extension().and_then(|e| e.to_str()) {
+        return Err(vec![Diagnostic::new(
+            "OAM-MOD0003",
+            Severity::Error,
+            Origin::Resolve,
+            format!(
+                "a .json file is not a program — import it from a script instead: {}",
+                file.display()
+            ),
+        )]);
     }
     let mut rt = oam_engine::JsRuntime::new();
     // process.argv: [exe, absolute script path, ...script args] — Node's
@@ -1206,6 +1370,11 @@ fn run_file(
     let mut argv = vec![exe, script];
     argv.extend(script_args.iter().cloned());
     rt.set_process_argv(argv);
+
+    if !matches!(replay_mode, oam_engine::ReplayMode::Off) {
+        rt.set_replay_mode(replay_mode);
+        rt.apply_replay_patches();
+    }
 
     if let Some((addr, brk)) = inspect {
         match rt.attach_inspector(addr, brk) {

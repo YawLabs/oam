@@ -134,7 +134,11 @@ pub enum InstallOutcome {
 /// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
-pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<Diagnostic>> {
+pub fn install(
+    project_dir: &Path,
+    frozen: bool,
+    precompile: bool,
+) -> Result<InstallOutcome, Vec<Diagnostic>> {
     if !frozen {
         return Err(vec![diag(
             "OAM-PKG0006",
@@ -193,6 +197,11 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<D
 
     let mut installed = 0usize;
     let mut errors: Vec<Diagnostic> = Vec::new();
+    let trust = crate::trust::TrustConfig::load(project_dir);
+    let cache_root = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile");
 
     for (key, entry) in &to_install {
         let Some(resolved) = &entry.resolved else {
@@ -204,16 +213,39 @@ pub fn install(project_dir: &Path, frozen: bool) -> Result<InstallOutcome, Vec<D
         // The key is e.g. "node_modules/foo" or "node_modules/@scope/bar".
         // The extraction target is project_dir joined with the key.
         let dest = project_dir.join(key);
+        // Extract the npm package name from the lockfile key.
+        // Keys can be deeply nested ("node_modules/react/node_modules/scheduler"),
+        // so take the portion after the LAST "node_modules/" segment.
+        let pkg_name = key
+            .rfind("node_modules/")
+            .map(|pos| &key[pos + "node_modules/".len()..])
+            .unwrap_or(key);
 
         // Skip already-installed packages (idempotency for partial installs).
         if dest.join("package.json").is_file() {
             installed += 1;
+            // Still check scripts for already-installed packages so the warning
+            // fires even on a warm install (the script remains skipped either way).
+            check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
             continue;
         }
 
         match fetch_and_extract(&rt, &client, resolved, entry.integrity.as_deref(), &dest) {
             Ok(()) => {
                 installed += 1;
+                check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
+                if precompile {
+                    if let Err(e) =
+                        crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
+                    {
+                        errors.push(Diagnostic::new(
+                            "OAM-PKG0008",
+                            Severity::Warning,
+                            Origin::Install,
+                            format!("precompile {pkg_name}: {e}"),
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 errors.push(diag("OAM-PKG0004", format!("failed to install {key}: {e}")));
@@ -719,6 +751,50 @@ fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// After a package is extracted, check its `package.json` for lifecycle scripts.
+///
+/// If the package has `install`, `preinstall`, or `postinstall` scripts and is
+/// not in the trust list, emits an `OAM-PKG0007` warning (the script is always
+/// skipped regardless of trust -- running scripts requires explicit support).
+fn check_lifecycle_scripts(
+    dest: &Path,
+    pkg_name: &str,
+    trust: &crate::trust::TrustConfig,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let Ok(content) = std::fs::read_to_string(dest.join("package.json")) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else {
+        return;
+    };
+
+    let lifecycle = ["install", "preinstall", "postinstall"];
+    let found: Vec<&str> = lifecycle
+        .iter()
+        .copied()
+        .filter(|s| scripts.contains_key(*s))
+        .collect();
+
+    if found.is_empty() || trust.is_trusted(pkg_name) {
+        return;
+    }
+
+    let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+    let script_list = found.join(", ");
+    errors.push(Diagnostic::new(
+        "OAM-PKG0007",
+        Severity::Warning,
+        Origin::Install,
+        format!(
+            "{pkg_name}@{version} has lifecycle script(s) ({script_list}) -- skipped; run 'oam trust add {pkg_name}' to allow"
+        ),
+    ));
+}
+
 fn diag(code: &str, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Install, message)
 }
@@ -837,7 +913,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0001");
@@ -867,7 +943,7 @@ mod tests {
             }
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         match result {
             Ok(InstallOutcome::Complete(summary)) => {
                 assert_eq!(summary.packages_installed, 0);
@@ -915,7 +991,7 @@ mod tests {
             }
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         match result {
             Ok(InstallOutcome::Partial {
                 installed, errors, ..
@@ -946,7 +1022,7 @@ mod tests {
             "packages": {}
         }"#;
         std::fs::write(tmp.join("package-lock.json"), lockfile).unwrap();
-        let result = install(&tmp, true);
+        let result = install(&tmp, true, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0002");
@@ -1361,7 +1437,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // Lockfile content is irrelevant — the non-frozen check fires first.
-        let result = install(&tmp, false);
+        let result = install(&tmp, false, false);
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors[0].code, "OAM-PKG0006");

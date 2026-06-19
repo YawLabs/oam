@@ -41,6 +41,8 @@ fn main() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
         // ai.js: oam:ai factory (SSE parser, streaming chat, tool-use loop).
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/ai.js"),
+        // mcp.js: oam:mcp factory (MCP server primitives, JSON-RPC, transports).
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/mcp.js"),
         // undici.js: native undici-API shim (fetch/request/Agent/dispatchers)
         // shadowing the npm package; backed by oam's fetch.
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/undici.js"),

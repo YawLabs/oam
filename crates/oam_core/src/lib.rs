@@ -36,7 +36,7 @@ pub type OpId = u64;
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
 /// Error(message)).
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OpOutcome {
     Done,
     Text(String),
