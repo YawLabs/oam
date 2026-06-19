@@ -46,7 +46,8 @@ pub struct InstallSummary {
     pub elapsed: Duration,
 }
 
-/// The three outcomes `install` can return.
+/// The two outcomes `install` can return through the success channel; the
+/// "didn't even start" set lands in `Err(Vec<Diagnostic>)`.
 ///
 /// `Err(Vec<Diagnostic>)` is reserved for "didn't even start" — the lockfile
 /// was missing or unparseable, the lockfileVersion was unsupported, the
@@ -57,7 +58,7 @@ pub struct InstallSummary {
 /// `Ok(Partial { .. })` means at least one install pass was attempted: some
 /// packages installed (counted in `installed`, including cached ones) and
 /// `errors` is non-empty. The caller decides whether to treat a Partial as
-/// success (e.g. `oam install` exiting 0 with warnings) or failure
+/// success (e.g. `oam install` exiting 0 with bin-shim warnings) or failure
 /// (default for CI).
 ///
 /// `Ok(Complete(_))` means every package installed cleanly; `errors` is
@@ -69,7 +70,7 @@ pub struct InstallSummary {
 /// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
 ///   extract failure) and `OAM-PKG0005` (bin shim warning). The `installed`
 ///   count and `errors` list together describe what landed.
-/// * `Err(_) / Failed(_)` — `OAM-PKG0001` (lockfile read or parse failure),
+/// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse failure),
 ///   `OAM-PKG0002` (unsupported lockfileVersion), `OAM-PKG0003` (async
 ///   runtime or HTTP client init failure), `OAM-PKG0006` (non-frozen mode
 ///   rejected). No packages were attempted.
@@ -85,12 +86,6 @@ pub enum InstallOutcome {
         elapsed: Duration,
         errors: Vec<Diagnostic>,
     },
-    /// Nothing was installed. Covers the full "didn't even start" set:
-    /// lockfile missing, lockfile parse failure, unsupported
-    /// `lockfileVersion`, async runtime / HTTP client init failure, or
-    /// non-frozen mode rejected. No packages were attempted in any of
-    /// these cases. See the diagnostic-code mapping on the enum doc above.
-    Failed(Vec<Diagnostic>),
 }
 
 // ── Public entry point ──────────────────────────────────────────────────
@@ -100,6 +95,22 @@ pub enum InstallOutcome {
 /// `project_dir` is the directory containing `package-lock.json`.
 /// `frozen` must be `true` for the MVP (the lockfile is authoritative; no
 /// resolution or lockfile mutation).
+///
+/// **Concurrency**: this function takes no file lock on `node_modules`.
+/// Two concurrent `oam install` runs on the same project race on writes,
+/// and the loser's last-writer-wins. The atomic-extract path uses unique
+/// tempdir names (pid + counter) so individual package extracts are safe,
+/// but link_bins and the package-presence idempotency check are not
+/// coordinated across processes. Callers that need cross-process safety
+/// should serialize externally; npm has the same limitation without a
+/// dedicated lockfile mechanism.
+///
+/// **Manifest cache**: package.json files are read through a process-global
+/// cache (`cached_manifest`) that survives `Resolver::clear_caches()`. The
+/// next `oam install` in the same process will re-read each manifest
+/// because `read_lockfile` doesn't touch that cache, but a long-lived
+/// embedder that mutates a package.json after its first resolve will see
+/// the stale parsed value. Restart the process to drop the cache.
 ///
 /// Returns one of:
 ///
@@ -120,7 +131,7 @@ pub enum InstallOutcome {
 /// * `Ok(Complete(_))` — no diagnostics.
 /// * `Ok(Partial { errors, .. })` — `OAM-PKG0004` (per-package fetch /
 ///   extract failure) and `OAM-PKG0005` (bin shim warning).
-/// * `Err(_)` / `Failed(_)` — `OAM-PKG0001` (lockfile read or parse),
+/// * `Err(_)` — `OAM-PKG0001` (lockfile read or parse),
 ///   `OAM-PKG0002` (unsupported version), `OAM-PKG0003` (runtime or HTTP
 ///   client init), `OAM-PKG0006` (non-frozen mode rejected).
 pub fn install(
@@ -311,7 +322,11 @@ fn fetch_and_extract(
     integrity: Option<&str>,
     dest: &Path,
 ) -> Result<(), String> {
-    let data = download_with_retry(rt, client, url, 1)?;
+    // Retry up to 3 times: registry CDNs see transient 5xx and TLS resets on
+    // CI runners; npm itself defaults to 5. One retry (the original) gave up
+    // too easily for flaky-network environments without adding meaningful
+    // resilience over zero retries.
+    let data = download_with_retry(rt, client, url, 3)?;
 
     if let Some(sri) = integrity {
         verify_integrity(&data, sri)?;
@@ -389,6 +404,89 @@ pub(crate) fn verify_integrity(data: &[u8], integrity: &str) -> Result<(), Strin
 // ── Tarball extraction ──────────────────────────────────────────────────
 
 fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
+    // Atomic extract: extract into a sibling tempdir first, then rename to
+    // `dest`. If anything fails mid-extract (ENOSPC, tar truncation, path
+    // traversal, etc.) we remove the tempdir and `dest` stays untouched, so
+    // the next install run will retry from scratch instead of seeing a
+    // half-written package whose package.json exists (the idempotency
+    // shortcut in install() trusts package.json presence).
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("extract destination has no parent dir: {}", dest.display()))?;
+    let base = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("extract destination has no file name: {}", dest.display()))?;
+    // Per-process unique tempdir suffix. We can't randomize across processes
+    // without a syscall, but combining pid + a monotonic counter is enough to
+    // avoid collisions WITHIN this process. A racing sibling process picks a
+    // different pid, so its tempdir is distinct too.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}.oam-tmp-{}-{}",
+        base,
+        std::process::id(),
+        tmp_id
+    ));
+    // A leftover tempdir from a prior crashed run with the same pid+counter
+    // would be unusual but possible; clean it first so create_dir_all below
+    // works on a fresh tree.
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)
+        .map_err(|e| format!("create extract tempdir {}: {e}", tmp.display()))?;
+
+    let result = extract_into(data, &tmp);
+    match result {
+        Ok(()) => {
+            // A peer that FULLY installed dest (package.json present) between
+            // the caller's idempotency check and now wins; drop our tempdir
+            // and accept the peer's copy -- both are SRI-verified upstream,
+            // so functionally equivalent. We key on package.json presence,
+            // NOT bare existence: dest may exist as a stale/partial dir from
+            // a prior crashed extract (dir created, package.json never
+            // written), which must be replaced, not accepted.
+            if dest.join("package.json").is_file() {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Ok(());
+            }
+            // Clear any stale/partial dest: rename() will not overwrite a
+            // non-empty directory, so a leftover from a crashed run would
+            // make the rename fail.
+            if dest.exists() {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            match std::fs::rename(&tmp, dest) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Lost a rename race (a peer populated dest after our
+                    // clear) or a transient FS error. If dest now has a
+                    // package.json, accept the peer's copy; else surface it.
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    if dest.join("package.json").is_file() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "rename {} -> {}: {e}",
+                            tmp.display(),
+                            dest.display()
+                        ))
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // Pre-extract failure: dest still pristine. Tempdir cleanup is
+            // best-effort -- if it fails the tempdir name is unique enough
+            // that it won't poison a later install.
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
     let gz = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
 
@@ -539,8 +637,11 @@ pub(crate) fn link_bins(
     // (e.g. the dir was created above but a perms/symlink race left it
     // unresolvable), we CANNOT safely call pathdiff with an uncanonicalized
     // base — it would produce a wrong relative path that points the shim
-    // at garbage. Surface a warning and skip the shim loop entirely; the
-    // install is still considered Complete if no other errors accumulated.
+    // at garbage. Surface a Severity::Warning and skip the shim loop
+    // entirely; install_command in the CLI filters by severity, so a
+    // Warning-only diagnostic set still exits 0. (Note: install() classifies
+    // ANY non-empty errors list as Partial, but the CLI's severity filter
+    // means a warning-only Partial still succeeds end-to-end.)
     let bin_dir_canonical = match std::fs::canonicalize(&bin_dir) {
         Ok(p) => p,
         Err(e) => {

@@ -2863,7 +2863,8 @@ fn undici_shim_request_stream_fetch_over_http() {
          console.log('fetch', f.status === 200 && (await f.json()).url === '/f');\n\
          const a = new Agent({ connect: { lookup: () => {} } });\n\
          console.log('agent', typeof a.request === 'function' && getGlobalDispatcher() != null);\n\
-         server.close();\n",
+         server.close();\n\
+         process.exit(0);\n",
     );
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2904,7 +2905,8 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
          try { await fetch(`http://example.invalid:${port}/`); control = 'resolved'; }\n\
          catch { control = 'failed'; }\n\
          console.log('control=' + control);\n\
-         server.close();\n",
+         server.close();\n\
+         process.exit(0);\n",
     );
     let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);

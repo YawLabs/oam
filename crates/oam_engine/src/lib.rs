@@ -234,6 +234,11 @@ impl JsRuntime {
     /// Compile and run `source` as a classic script. Returns the stringified
     /// completion value. Exceptions come back as `Err` with script:line info.
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {
+        // Plain classic scripts can still call import() -- V8 routes any
+        // import() through the host_import callback set on the isolate.
+        // Clear any host pointer parked by a prior execute_module so we
+        // reject cleanly instead of dereffing a stale ptr.
+        self.clear_active_host();
         let result = {
             v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
             v8::tc_scope!(let tc, scope);

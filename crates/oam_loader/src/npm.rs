@@ -486,6 +486,24 @@ fn split_specifier(specifier: &str) -> Option<(String, String)> {
     Some((name, subpath))
 }
 
+/// True for paths ending in `.d.ts` / `.d.mts` / `.d.cts` / `.d.tsx` /
+/// `.d.jsx` (case-insensitive). Declaration files are types-only and must
+/// never be returned as a runtime entry, even if a package's `exports` /
+/// `main` / `module` field happens to point at one. Mirrors the check in
+/// `oam_loader::lib::is_declaration_file` for paths that come back from
+/// `resolve_in_package` rather than from the directory-probe path.
+fn is_declaration_target(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lc = name.to_ascii_lowercase();
+    lc.ends_with(".d.ts")
+        || lc.ends_with(".d.mts")
+        || lc.ends_with(".d.cts")
+        || lc.ends_with(".d.tsx")
+        || lc.ends_with(".d.jsx")
+}
+
 fn resolve_in_package(
     package_dir: &Path,
     package: &str,
@@ -574,6 +592,21 @@ fn resolve_in_package(
             }
         }
     };
+    // Final guard: even if a package's exports / main / module field points
+    // at a declaration file (rare but real -- some types-only packages or
+    // misconfigured dual builds do this), loading it as a runtime module is
+    // always wrong. Reject with MOD0001 plus a hint so the user knows why
+    // the bare-import didn't work.
+    if is_declaration_target(&resolved) {
+        return Err(diag(
+            "OAM-MOD0001",
+            format!(
+                "package {package} resolves '{specifier}' to {} which is a TypeScript \
+                 declaration file (types-only) -- cannot load as a runtime module",
+                resolved.display()
+            ),
+        ));
+    }
     Ok(resolved)
 }
 
@@ -712,8 +745,13 @@ fn exports_resolve(
     conditions: &[&str],
 ) -> Result<String, ExportsError> {
     // Sugar: a top-level string/array/conditions-object is the "." entry.
+    // Map keys: exports uses './x' (and bare '.'), imports uses '#x'. Both
+    // shapes route through this same function; the subpath shape (specifier
+    // vs '.') matches the key shape.
     let as_map = match exports {
-        Value::Object(map) if map.keys().any(|k| k.starts_with('.')) => Some(map),
+        Value::Object(map) if map.keys().any(|k| k.starts_with('.') || k.starts_with('#')) => {
+            Some(map)
+        }
         _ => None,
     };
     let Some(map) = as_map else {
@@ -844,6 +882,107 @@ mod tests {
             "./main.js"
         );
         assert!(exports_resolve(&string_sugar, "./sub", IMPORT).is_err());
+    }
+
+    // Subpath imports (#xxx) reuse exports_resolve with #-keyed maps. Verify
+    // the algorithm covers the shapes that chalk + family ship.
+    #[test]
+    fn subpath_imports_match_string_target_and_wildcards() {
+        let imports = json!({
+            "#ansi-styles": "./source/vendor/ansi-styles/index.js",
+            "#deep/*": "./src/deep/*.js",
+            "#cond": { "import": "./esm.js", "require": "./cjs.js" },
+        });
+        // Exact key.
+        assert_eq!(
+            exports_resolve(&imports, "#ansi-styles", IMPORT)
+                .ok()
+                .unwrap(),
+            "./source/vendor/ansi-styles/index.js"
+        );
+        // Wildcard subpath.
+        assert_eq!(
+            exports_resolve(&imports, "#deep/feature", IMPORT)
+                .ok()
+                .unwrap(),
+            "./src/deep/feature.js"
+        );
+        // Conditions branch (import vs require).
+        assert_eq!(
+            exports_resolve(&imports, "#cond", IMPORT).ok().unwrap(),
+            "./esm.js"
+        );
+        assert_eq!(
+            exports_resolve(&imports, "#cond", REQUIRE).ok().unwrap(),
+            "./cjs.js"
+        );
+        // Undeclared specifier rejected.
+        assert!(matches!(
+            exports_resolve(&imports, "#missing", IMPORT),
+            Err(ExportsError::NotExported)
+        ));
+    }
+
+    #[test]
+    fn resolve_subpath_import_walks_to_owning_package_json() {
+        // chalk's package.json imports map points #ansi-styles at a vendored
+        // copy. Re-resolving the specifier from any file in chalk's tree
+        // (nested deep, walking up to find the nearest package.json) must
+        // produce the vendored path on disk.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let id = CNT.fetch_add(1, Ordering::Relaxed);
+        let pkg = std::env::temp_dir().join(format!("oam-subpath-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&pkg);
+        let vendor = pkg.join("source/vendor/ansi-styles");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("index.js"), "// vendored").unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            serde_json::to_string(&json!({
+                "name": "chalk",
+                "type": "module",
+                "imports": {
+                    "#ansi-styles": "./source/vendor/ansi-styles/index.js"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Referrer is a file inside the package (the import sites are in
+        // chalk's own modules, not in node_modules above it).
+        let referrer = pkg.join("source/index.js");
+        std::fs::create_dir_all(referrer.parent().unwrap()).unwrap();
+        std::fs::write(&referrer, "import '#ansi-styles';").unwrap();
+        let resolved = resolve_bare("#ansi-styles", &referrer, ResolveMode::Import).unwrap();
+        assert!(
+            resolved.ends_with("source/vendor/ansi-styles/index.js"),
+            "got {resolved:?}"
+        );
+        let _ = std::fs::remove_dir_all(&pkg);
+    }
+
+    #[test]
+    fn resolve_subpath_import_rejects_when_no_imports_field() {
+        // A #-specifier in a package whose package.json has no imports field
+        // is an error (MOD0007), distinct from "no package.json at all".
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CNT: AtomicU64 = AtomicU64::new(0);
+        let id = CNT.fetch_add(1, Ordering::Relaxed);
+        let pkg =
+            std::env::temp_dir().join(format!("oam-subpath-noimp-{}-{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&pkg);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"pkg","type":"module"}"#,
+        )
+        .unwrap();
+        let referrer = pkg.join("entry.js");
+        std::fs::write(&referrer, "").unwrap();
+        let err = resolve_bare("#missing", &referrer, ResolveMode::Import).unwrap_err();
+        assert_eq!(err.code, "OAM-MOD0007", "got {err:?}");
+        let _ = std::fs::remove_dir_all(&pkg);
     }
 
     #[test]

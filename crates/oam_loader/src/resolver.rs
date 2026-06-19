@@ -230,6 +230,16 @@ pub fn default_resolver() -> &'static Resolver {
 /// Drop every cache entry on the current thread's default `Resolver`.
 /// `oam install` calls this so a same-process `oam run` after `oam install`
 /// sees the freshly-installed files instead of a stale "not found".
+///
+/// **Scope note**: this is thread-local. The default `Resolver` is one per
+/// thread, so this clear affects ONLY the calling thread. A worker thread
+/// that resolves AFTER another thread's install has its own `Resolver`
+/// and its own (possibly stale) cache. For a multi-threaded embedder
+/// (server worker pool, daemon), construct one shared `Resolver` and call
+/// `clear_caches()` on it after layout-mutating operations -- do not rely
+/// on the thread-local default for cross-thread cache invalidation. For
+/// the single-thread CLI use case (`oam install` exits the process, then
+/// a fresh `oam run` is a new process) this scope is sufficient.
 pub fn default_clear_caches() {
     default_resolver().clear_caches();
 }
