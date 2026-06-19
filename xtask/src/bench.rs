@@ -334,11 +334,7 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         for line in status.lines() {
             if line.starts_with("VmRSS:") {
-                let kb: u64 = line
-                    .split_whitespace()
-                    .nth(1)?
-                    .parse()
-                    .ok()?;
+                let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
                 return Some(kb * 1024);
             }
         }
@@ -361,11 +357,15 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
         "params": { "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "bench", "version": "0.0.1" },
                     "capabilities": {} }
-    }).to_string() + "\n";
+    })
+    .to_string()
+        + "\n";
 
     for _i in 0..iters {
         let mut cmd = rt.build_cmd(server_script, &[]);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().context("spawn MCP server")?;
         let pid = child.id();
 
@@ -378,8 +378,12 @@ fn run_mcp_idle_rss(rt: &Runtime, server_script: &Path) -> Result<CaseResult> {
         let mut line = String::new();
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 { break; }
-            if !line.trim().is_empty() { break; }
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if !line.trim().is_empty() {
+                break;
+            }
         }
 
         // Server is now idle (waiting for next request) -- sample RSS.
@@ -432,21 +436,29 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
         "params": { "protocolVersion": "2025-11-25",
                     "clientInfo": { "name": "bench", "version": "0.0.1" },
                     "capabilities": {} }
-    }).to_string() + "\n";
+    })
+    .to_string()
+        + "\n";
 
     // MCP requires an `initialized` notification after the initialize response.
     let initialized_notif = serde_json::json!({
         "jsonrpc": "2.0", "method": "notifications/initialized"
-    }).to_string() + "\n";
+    })
+    .to_string()
+        + "\n";
 
     let call_msg = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": { "name": "noop", "arguments": {} }
-    }).to_string() + "\n";
+    })
+    .to_string()
+        + "\n";
 
     for i in 0..iters {
         let mut cmd = rt.build_cmd(server_script, &[]);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = cmd.spawn().context("spawn MCP server")?;
 
         let mut stdin = child.stdin.take().context("mcp server stdin")?;
@@ -461,9 +473,14 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
         loop {
             line.clear();
             if reader.read_line(&mut line)? == 0 {
-                bail!("{}/mcp-first-call-latency iter {i}: closed before initialize response", rt.name);
+                bail!(
+                    "{}/mcp-first-call-latency iter {i}: closed before initialize response",
+                    rt.name
+                );
             }
-            if !line.trim().is_empty() { break; }
+            if !line.trim().is_empty() {
+                break;
+            }
         }
 
         // Send the initialized notification (required by MCP spec before tools/call).
@@ -479,7 +496,10 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
             line.clear();
             let n = reader.read_line(&mut line)?;
             if n == 0 {
-                bail!("{}/mcp-first-call-latency iter {i}: closed before tools/call response", rt.name);
+                bail!(
+                    "{}/mcp-first-call-latency iter {i}: closed before tools/call response",
+                    rt.name
+                );
             }
             if !line.trim().is_empty() {
                 break;
@@ -604,7 +624,10 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
                     } else if let Some(sdk) = &scripts.sdk_mcp_server {
                         run_mcp_first_call_latency(rt, sdk)
                     } else {
-                        println!("  {}/mcp-first-call-latency: skipped (SDK install failed)", rt.name);
+                        println!(
+                            "  {}/mcp-first-call-latency: skipped (SDK install failed)",
+                            rt.name
+                        );
                         continue;
                     }
                 }

@@ -1406,7 +1406,10 @@ fn napi_beta_bigint_int64_create_and_read() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines[0], "bigint", "napi_create_bigint_int64 must return BigInt");
+    assert_eq!(
+        lines[0], "bigint",
+        "napi_create_bigint_int64 must return BigInt"
+    );
     assert_eq!(lines[1], "true", "bigint value identity check");
     assert_eq!(lines[2], "42", "bigint roundtrip 42");
     assert_eq!(lines[3], "-1000", "bigint roundtrip -1000");
@@ -1437,7 +1440,10 @@ fn napi_beta_buffer_create_and_len() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines[0], "true", "napi_create_buffer must return Uint8Array");
+    assert_eq!(
+        lines[0], "true",
+        "napi_create_buffer must return Uint8Array"
+    );
     assert_eq!(lines[1], "32", "byteLength via JS");
     assert_eq!(lines[2], "32", "napi_get_buffer_info byte length");
     assert_eq!(lines[3], "8", "napi_get_buffer_info on Buffer.alloc");

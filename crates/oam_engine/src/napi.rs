@@ -1102,7 +1102,9 @@ pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) ->
     }
     let env_ref = unsafe { &mut *env };
     let target = ref_ as *const NapiRefEntry;
-    env_ref.refs.retain(|r| r.as_ref() as *const NapiRefEntry != target);
+    env_ref
+        .refs
+        .retain(|r| r.as_ref() as *const NapiRefEntry != target);
     NAPI_OK
 }
 
@@ -1274,8 +1276,16 @@ pub unsafe extern "C" fn napi_define_class(
         if let Some(method_cb) = prop.method {
             // Method descriptor: create a function via the trampoline.
             let mut fn_out: NapiValue = std::ptr::null_mut();
-            let status =
-                unsafe { napi_create_function(env, prop.utf8name, usize::MAX, method_cb, prop.data, &mut fn_out) };
+            let status = unsafe {
+                napi_create_function(
+                    env,
+                    prop.utf8name,
+                    usize::MAX,
+                    method_cb,
+                    prop.data,
+                    &mut fn_out,
+                )
+            };
             if status != NAPI_OK {
                 continue;
             }
@@ -1468,7 +1478,12 @@ pub unsafe extern "C" fn napi_create_bigint_int64(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { out(result, from_local(v8::BigInt::new_from_i64(scope, value).into())) }
+    unsafe {
+        out(
+            result,
+            from_local(v8::BigInt::new_from_i64(scope, value).into()),
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1480,7 +1495,12 @@ pub unsafe extern "C" fn napi_create_bigint_uint64(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    unsafe { out(result, from_local(v8::BigInt::new_from_u64(scope, value).into())) }
+    unsafe {
+        out(
+            result,
+            from_local(v8::BigInt::new_from_u64(scope, value).into()),
+        )
+    }
 }
 
 /// Returns `(value, lossless)` where `lossless` is false if the BigInt
@@ -1557,7 +1577,10 @@ pub unsafe extern "C" fn napi_create_buffer(
     let ab = v8::ArrayBuffer::new(scope, size);
     if !data.is_null() {
         let store = ab.get_backing_store();
-        let ptr = store.data().map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        let ptr = store
+            .data()
+            .map(|p| p.as_ptr())
+            .unwrap_or(std::ptr::null_mut()) as *mut c_void;
         unsafe { *data = ptr };
     }
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
@@ -1613,8 +1636,7 @@ pub unsafe extern "C" fn napi_create_external_buffer(
         return NAPI_INVALID_ARG;
     };
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
-    let store =
-        v8::ArrayBuffer::new_backing_store_from_bytes(bytes.to_vec().into_boxed_slice());
+    let store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.to_vec().into_boxed_slice());
     let ab = v8::ArrayBuffer::with_backing_store(scope, &store.make_shared());
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
         return NAPI_GENERIC_FAILURE;
