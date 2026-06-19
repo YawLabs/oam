@@ -699,12 +699,16 @@ pub async fn https_serve(
 /// Long-poll the next request. Json metadata, or Done when the server
 /// closed (queue drained + senders dropped).
 pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutcome {
-    let queue = state
-        .servers
-        .lock()
-        .expect("http servers lock")
-        .get_mut(&server_id)
-        .and_then(|entry| entry.queue.take());
+    let (queue, mut shutdown_rx) = {
+        let mut guard = state.servers.lock().expect("http servers lock");
+        match guard.get_mut(&server_id) {
+            Some(entry) => (
+                entry.queue.take(),
+                entry.shutdown.as_ref().map(|tx| tx.subscribe()),
+            ),
+            None => (None, None),
+        }
+    };
     let Some(mut queue) = queue else {
         // Server was already closed (close_server removed the entry) or
         // another accept is in flight.  Either way, signal Done so the JS
@@ -712,7 +716,19 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         // rejection.
         return super::OpOutcome::Done;
     };
-    let next = queue.recv().await;
+    // Wait for the next request OR a server.close() shutdown. Idle keep-alive
+    // connection tasks hold queue_tx clones that can outlive graceful_shutdown,
+    // so queue.recv() alone may park forever after close(); the shutdown watch
+    // lets accept return Done promptly, matching Node's closeIdleConnections.
+    let next = match shutdown_rx {
+        Some(ref mut sd) => {
+            tokio::select! {
+                n = queue.recv() => n,
+                _ = sd.changed() => None,
+            }
+        }
+        None => queue.recv().await,
+    };
     if let Some(entry) = state
         .servers
         .lock()
