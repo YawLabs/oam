@@ -30,6 +30,11 @@ pub mod udp;
 pub mod websocket;
 pub mod worker;
 
+/// io_uring FS fast path (Linux-only, opt-in via OAM_IO_URING). See
+/// docs/design/io_uring.md. cfg'd out on every other platform.
+#[cfg(target_os = "linux")]
+mod io_uring_fs;
+
 pub type OpId = u64;
 
 /// What an async op produced. v8-free by design; the engine maps these to
@@ -859,6 +864,19 @@ pub mod ops {
         // Always raw bytes: encodings decode JS-side via Buffer#toString
         // (a Rust-side utf8-lossy decode was silently wrong for base64/
         // hex/latin1 requests).
+        //
+        // io_uring fast path (Linux, opt-in via OAM_IO_URING): on success use
+        // the bytes; on ANY error (incl. io_uring unavailable / worker gone)
+        // fall through to the std path below, which is authoritative for the
+        // node-shaped error mapping. io_uring is a pure optimization here.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(uring) = crate::io_uring_fs::global()
+                && let Ok(bytes) = uring.read_file(path.clone()).await
+            {
+                return OpOutcome::Bytes(bytes);
+            }
+        }
         match tokio::fs::read(&path).await {
             Ok(bytes) => OpOutcome::Bytes(bytes),
             Err(e) => node_fail(e, "open", &path),
