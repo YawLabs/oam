@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use std::sync::Once;
 
 mod cjs;
+mod code_cache;
 mod crypto_ops;
 pub mod fork;
 mod inspector;

@@ -13492,3 +13492,93 @@ fn install_precompile_esm_ts_cache_used_on_run() {
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+// ── B3: V8 bytecode code-cache ───────────────────────────────────────────
+
+/// Recursively count `.v8c` bytecode-cache blobs under `dir`.
+fn count_v8c(dir: &std::path::Path) -> usize {
+    let mut n = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += count_v8c(&p);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("v8c") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+// B3c: a required CJS module produces a V8 bytecode blob on first run and the
+// second run reuses it (the content-addressed path is stable) while staying
+// correct. Direct "did it skip compile?" isn't observable from outside, so we
+// assert produce (a blob appears) + reuse (count doesn't grow) + correctness.
+#[test]
+fn cjs_bytecode_cache_produced_and_reused() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-cjs-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+
+    std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const v = require('./lib.cjs');\nconsole.log('v=' + v);\n",
+    )
+    .unwrap();
+
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", entry.to_str().unwrap()])
+            .current_dir(&project_dir)
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    // Run 1: produces the bytecode cache.
+    let out1 = run();
+    assert!(
+        out1.status.success(),
+        "first run should succeed; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out1.stdout).contains("v=42"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out1.stdout)
+    );
+
+    let bytecode_dir = cache.join("bytecode");
+    let count1 = count_v8c(&bytecode_dir);
+    assert!(
+        count1 >= 1,
+        "first run should produce at least one .v8c blob; found {count1}"
+    );
+
+    // Run 2: the blob is present, so this exercises the consume path; output
+    // stays correct and the cache is reused, not regrown.
+    let out2 = run();
+    assert!(out2.status.success(), "second run should succeed");
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("v=42"),
+        "second run output: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    let count2 = count_v8c(&bytecode_dir);
+    assert_eq!(
+        count1, count2,
+        "second run should reuse the cache (stable content-addressed path), not regrow it"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

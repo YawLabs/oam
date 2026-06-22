@@ -328,7 +328,21 @@ pub(crate) fn load_cjs<'s>(
     let origin = v8::ScriptOrigin::new(
         scope, name, 0, 0, false, 0, None, false, false, /* is_module */ false, None,
     );
-    let mut compiler_source = v8::script_compiler::Source::new(source_v8, Some(&origin));
+    // V8 bytecode cache: consume a stored blob for this exact source if one
+    // exists (skips the parse+compile) else compile fresh. The blob is keyed by
+    // source + V8 version so a foreign blob can't be served here; V8 also flags
+    // a bad blob via `rejected()` below. `cached_blob` is held for the whole
+    // compile because `CachedData` borrows it (BufferNotOwned).
+    let cached_blob = crate::code_cache::load(&source, crate::code_cache::Kind::Function);
+    let consuming = cached_blob.is_some();
+    let mut compiler_source = match cached_blob {
+        Some(ref blob) => v8::script_compiler::Source::new_with_cached_data(
+            source_v8,
+            Some(&origin),
+            v8::script_compiler::CachedData::new(blob),
+        ),
+        None => v8::script_compiler::Source::new(source_v8, Some(&origin)),
+    };
     let params: Vec<v8::Local<v8::String>> = [
         "exports",
         "require",
@@ -340,18 +354,32 @@ pub(crate) fn load_cjs<'s>(
     .iter()
     .map(|p| v8::String::new(scope, p).unwrap())
     .collect();
+    let compile_options = if consuming {
+        v8::script_compiler::CompileOptions::ConsumeCodeCache
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
     let Some(wrapper) = v8::script_compiler::compile_function(
         scope,
         &mut compiler_source,
         &params,
         &[],
-        v8::script_compiler::CompileOptions::NoCompileOptions,
+        compile_options,
         v8::script_compiler::NoCacheReason::NoReason,
     ) else {
         // Syntax error is pending; a broken module must not stay cached.
         evict(scope, &key);
         return None;
     };
+
+    // (Re)write the cache after the body runs (below) on a miss, or if V8
+    // rejected the consumed blob (stale/foreign) and recompiled. Producing
+    // AFTER the call captures the body bytecode, not just the outer wrapper.
+    let refresh_cache = !consuming
+        || compiler_source
+            .get_cached_data()
+            .map(|cd| cd.rejected())
+            .unwrap_or(true);
 
     let require = make_require(scope, &file)?;
     let dirname = key
@@ -376,6 +404,15 @@ pub(crate) fn load_cjs<'s>(
         // re-executes on the next require).
         evict(scope, &key);
         return None;
+    }
+
+    // Persist the bytecode now that the body has executed, so the cached blob
+    // includes the body and not just the outer wrapper. Best-effort: a failed
+    // produce or write just means the next run pays the compile again.
+    if refresh_cache
+        && let Some(cd) = wrapper.create_code_cache()
+    {
+        crate::code_cache::store(&source, crate::code_cache::Kind::Function, &cd);
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;
