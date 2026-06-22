@@ -12841,6 +12841,11 @@ const req = http.request({
 });
 req.on('upgrade', (res, socket, head) => {
   gotUpgrade = true;
+  // `head` carries bytes already read past the response headers: when the
+  // 101 and the payload land in one TCP segment (common on Windows) the
+  // payload arrives here, not via a later 'data' event. Consume both so the
+  // assertion is deterministic regardless of TCP segmentation (Node parity).
+  if (head && head.length) upgradeData += head.toString();
   socket.on('data', c => upgradeData += c.toString());
   socket.on('end', () => {
     console.log('got_upgrade:', gotUpgrade);
