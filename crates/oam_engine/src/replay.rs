@@ -4,6 +4,17 @@
 //! `ReplayState` lives in an isolate slot (single-threaded, no Mutex needed).
 //! `Recorder` flushes its buffer to disk on `Drop` (clean exit and panics).
 //! `Replayer` loads the file once at startup and drains events in order.
+//!
+//! Determinism scope (what record/replay reproduces): async op completions
+//! (`fetch`, fs, dns, ...), `Math.random`, `Date.now`, and `performance.now`.
+//! When the replay trace runs out of a given event type, the corresponding
+//! native falls back to the live value rather than erroring -- replay degrades
+//! gracefully instead of stranding a longer run.
+//!
+//! NOT yet captured (known limitations): `crypto.getRandomValues` /
+//! `randomUUID` and other `OsRng`-backed crypto (see crypto_ops), and
+//! wall-clock read inside timers. A program leaning on those will diverge on
+//! replay; capturing crypto randomness is the next increment.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -159,6 +170,18 @@ impl Replayer {
             .iter()
             .position(|e| matches!(e, ReplayEvent::DateNow { .. }))?;
         if let Some(ReplayEvent::DateNow { value, .. }) = self.events.remove(pos) {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    pub fn next_perf_now(&mut self) -> Option<f64> {
+        let pos = self
+            .events
+            .iter()
+            .position(|e| matches!(e, ReplayEvent::PerfNow { .. }))?;
+        if let Some(ReplayEvent::PerfNow { value, .. }) = self.events.remove(pos) {
             Some(value)
         } else {
             None

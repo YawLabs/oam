@@ -206,9 +206,9 @@ impl JsRuntime {
         self.isolate.set_slot(replay::ReplayState::from_mode(mode));
     }
 
-    /// Install JS-side monkey-patches for `Math.random` and `Date.now` that
-    /// route through the record/replay native ops. Must be called AFTER
-    /// `set_replay_mode` and BEFORE executing any user code.
+    /// Install JS-side monkey-patches for `Math.random`, `Date.now`, and
+    /// `performance.now` that route through the record/replay native ops. Must
+    /// be called AFTER `set_replay_mode` and BEFORE executing any user code.
     pub fn apply_replay_patches(&mut self) {
         let mode = self
             .isolate
@@ -234,6 +234,14 @@ impl JsRuntime {
       __oam.recordDateNow(v);
       return v;
     }};
+    if (typeof performance !== "undefined" && performance.now) {{
+      var _origPerfNow = performance.now.bind(performance);
+      performance.now = function now() {{
+        var v = _origPerfNow();
+        __oam.recordPerfNow(v);
+        return v;
+      }};
+    }}
   }} else if (mode === "replay") {{
     Math.random = function random() {{
       return __oam.replayRng(Math.random._orig ? Math.random._orig() : 0.5);
@@ -241,6 +249,11 @@ impl JsRuntime {
     Date.now = function now() {{
       return __oam.replayDateNow(0);
     }};
+    if (typeof performance !== "undefined" && performance.now) {{
+      performance.now = function now() {{
+        return __oam.replayPerfNow(0);
+      }};
+    }}
   }}
 }})();"#,
             mode

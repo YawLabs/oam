@@ -12227,6 +12227,78 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
     let _ = std::fs::remove_dir_all(&run_cache);
 }
 
+// ── record-replay ──
+
+// record-replay beta: a run's non-deterministic values (Math.random, Date.now,
+// and -- newly wired -- performance.now) are captured in record mode and
+// reproduced exactly in replay mode, so the replayed stdout is byte-identical
+// to the recorded run. This is the end-to-end determinism guarantee.
+#[test]
+fn record_then_replay_is_deterministic() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-replay-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("nd.mjs");
+    std::fs::write(
+        &script,
+        "console.log('r=' + Math.random());\n\
+         console.log('d=' + Date.now());\n\
+         console.log('p=' + performance.now());\n",
+    )
+    .unwrap();
+    let recfile = dir.join("trace.jsonl");
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .output()
+            .expect("oam runs")
+    };
+
+    // Record: values are live; the trace is flushed on clean exit.
+    let rec = run(&[
+        "run",
+        "--record",
+        recfile.to_str().unwrap(),
+        script.to_str().unwrap(),
+    ]);
+    assert!(
+        rec.status.success(),
+        "record run failed: {}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    let recorded = String::from_utf8_lossy(&rec.stdout).to_string();
+    assert!(
+        recorded.contains("r=") && recorded.contains("d=") && recorded.contains("p="),
+        "record output should have all three values; got: {recorded}"
+    );
+    assert!(recfile.is_file(), "record should write the trace file");
+
+    // Replay: Math.random / Date.now / performance.now return the recorded
+    // values, so stdout matches the recorded run exactly.
+    let rep = run(&[
+        "run",
+        "--replay",
+        recfile.to_str().unwrap(),
+        script.to_str().unwrap(),
+    ]);
+    assert!(
+        rep.status.success(),
+        "replay run failed: {}",
+        String::from_utf8_lossy(&rep.stderr)
+    );
+    let replayed = String::from_utf8_lossy(&rep.stdout).to_string();
+    assert_eq!(
+        recorded, replayed,
+        "replay output must reproduce the recorded run exactly"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Wave 9: Crypto Phase A ──────────────────────────────────────────
 
 #[test]

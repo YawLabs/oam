@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 14] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 16] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         (
             "fetchBodyRead",
@@ -129,6 +129,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "replayDateNow",
             v8::Function::new(scope, op_replay_date_now).unwrap(),
+        ),
+        (
+            "recordPerfNow",
+            v8::Function::new(scope, op_record_perf_now).unwrap(),
+        ),
+        (
+            "replayPerfNow",
+            v8::Function::new(scope, op_replay_perf_now).unwrap(),
         ),
         (
             "replayGetMode",
@@ -686,6 +694,36 @@ fn op_replay_date_now(
         && let Some(v) = replayer.next_date_now()
     {
         rv.set(v8::Number::new(scope, v as f64).into());
+        return;
+    }
+    rv.set(args.get(0));
+}
+
+fn op_record_perf_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0).number_value(scope).unwrap_or(0.0);
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(recorder) = &mut state.recorder
+    {
+        let seq = recorder.next_seq();
+        recorder.push(crate::replay::ReplayEvent::PerfNow { seq, value });
+    }
+    rv.set(args.get(0));
+}
+
+fn op_replay_perf_now(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(state) = scope.get_slot_mut::<crate::replay::ReplayState>()
+        && let Some(replayer) = &mut state.replayer
+        && let Some(v) = replayer.next_perf_now()
+    {
+        rv.set(v8::Number::new(scope, v).into());
         return;
     }
     rv.set(args.get(0));
