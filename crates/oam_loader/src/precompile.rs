@@ -105,6 +105,39 @@ fn ensure_gitignore(oam_dir: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// SHA-256 of the source bytes — the staleness key for a cached artifact.
+/// A content hash (not mtime) keeps the cache correct across in-place package
+/// updates, git checkouts, and npm reinstalls that don't preserve timestamps.
+fn source_hash(source: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Sidecar path holding the source hash for a cached `.js`:
+/// `<cache>.js` -> `<cache>.js.hash`. Appended (not `with_extension`) so the
+/// `.js` is preserved.
+fn hash_sidecar(cache_js: &Path) -> PathBuf {
+    let mut s = cache_js.as_os_str().to_os_string();
+    s.push(".hash");
+    PathBuf::from(s)
+}
+
+/// A cached artifact is fresh when its `.js` is present and non-empty AND its
+/// hash sidecar equals the current source hash. A missing/short `.js` or a
+/// missing/mismatched sidecar (e.g. a cache from an older transpiler, or a
+/// package updated in place) is stale.
+fn cache_is_fresh(cache_js: &Path, expected: &[u8; 32]) -> bool {
+    match std::fs::metadata(cache_js) {
+        Ok(meta) if meta.len() > 0 => {}
+        _ => return false,
+    }
+    std::fs::read(hash_sidecar(cache_js))
+        .map(|stored| stored.as_slice() == expected.as_slice())
+        .unwrap_or(false)
+}
+
 /// Transpile all `.ts`/`.tsx`/`.mts`/`.cts` files in `pkg_dir` and write
 /// `.js` outputs to `cache_root/<pkg_name>/` mirroring the relative paths.
 ///
@@ -135,14 +168,17 @@ pub fn precompile_package(
             continue;
         };
 
-        // Staleness guard: skip if cache entry exists and is non-empty.
-        if let Ok(meta) = std::fs::metadata(&cache_path)
-            && meta.len() > 0
-        {
+        let source = std::fs::read_to_string(ts_path)?;
+        let hash = source_hash(&source);
+
+        // Staleness guard: skip only if the cached .js is non-empty AND its
+        // hash sidecar matches the CURRENT source. A package updated in place
+        // (or a cache from an older transpiler) mismatches and is recompiled.
+        // (install.rs also skips precompile for already-installed packages, so
+        // this is the second line of defense.)
+        if cache_is_fresh(&cache_path, &hash) {
             continue;
         }
-
-        let source = std::fs::read_to_string(ts_path)?;
 
         let js = super::transpile_typescript(ts_path, &source).map_err(|e| {
             let message = e
@@ -156,11 +192,12 @@ pub fn precompile_package(
             }
         })?;
 
-        // Create parent directories and write the output.
+        // Create parent directories and write the output + hash sidecar.
         if let Some(parent) = cache_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&cache_path, &js)?;
+        std::fs::write(hash_sidecar(&cache_path), hash)?;
         compiled += 1;
     }
 
@@ -169,13 +206,18 @@ pub fn precompile_package(
 
 /// Check the pre-compilation cache for a TypeScript file inside node_modules.
 ///
-/// `ts_path` is the absolute path of the `.ts`/`.tsx`/`.mts`/`.cts` file
-/// being loaded.  Returns `Some(js_source)` if a non-empty cache entry
-/// exists, `None` otherwise (caller falls through to normal oxc transpile).
+/// `ts_path` is the absolute path of the `.ts`/`.tsx`/`.mts`/`.cts` file being
+/// loaded; `source` is its current on-disk contents (the caller has already
+/// read it). Returns `Some(js_source)` only when a cache entry exists AND its
+/// hash sidecar matches `source` — a stale entry (package updated in place, or
+/// a cache from an older transpiler) is a miss, so the caller re-transpiles
+/// the same `source` and stays correct. Returns `None` for any file outside a
+/// `node_modules` tree (project sources are never precompiled).
 ///
-/// Cache layout: `node_modules/.oam/precompile/<pkg>/<rel>.js`
-/// where `<rel>` is `ts_path` relative to `node_modules/<pkg>/`.
-pub fn try_precompile_cache(ts_path: &Path) -> Option<String> {
+/// Cache layout: `node_modules/.oam/precompile/<pkg>/<rel>.js` (+ a
+/// `<rel>.js.hash` sidecar) where `<rel>` is `ts_path` relative to
+/// `node_modules/<pkg>/`.
+pub fn try_precompile_cache(ts_path: &Path, source: &str) -> Option<String> {
     // Walk up to find the node_modules ancestor.
     let nm = ts_path
         .ancestors()
@@ -189,9 +231,8 @@ pub fn try_precompile_cache(ts_path: &Path) -> Option<String> {
         .join(rel)
         .with_extension("js");
 
-    // Only serve non-empty cache entries.
-    let meta = std::fs::metadata(&cache_path).ok()?;
-    if meta.len() == 0 {
+    // Serve only a fresh entry (non-empty .js whose sidecar matches `source`).
+    if !cache_is_fresh(&cache_path, &source_hash(source)) {
         return None;
     }
 
@@ -265,24 +306,38 @@ mod tests {
     }
 
     #[test]
-    fn precompile_skips_nonempty_cache_entries() {
-        let root = temp_dir("skip-cached");
+    fn precompile_skips_fresh_and_recompiles_stale() {
+        let root = temp_dir("skip-fresh");
         let pkg_dir = root.join("node_modules/mypkg");
         fs::create_dir_all(&pkg_dir).unwrap();
-        fs::write(pkg_dir.join("index.ts"), "export const x = 1;\n").unwrap();
+        let src = pkg_dir.join("index.ts");
+        fs::write(&src, "export const x: number = 1;\n").unwrap();
 
         let cache_root = root.join("node_modules/.oam/precompile");
+
+        // First pass compiles the file and writes the hash sidecar.
+        assert_eq!(
+            precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap(),
+            1
+        );
         let cache_file = cache_root.join("mypkg/index.js");
-        fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
-        fs::write(&cache_file, "// sentinel\n").unwrap();
+        assert!(cache_file.is_file());
+        assert!(hash_sidecar(&cache_file).is_file(), "sidecar written");
 
-        // Should skip because cache entry is non-empty.
-        let count = precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap();
-        assert_eq!(count, 0, "should skip already-cached file");
+        // Second pass on UNCHANGED source skips (sidecar hash matches).
+        assert_eq!(
+            precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap(),
+            0,
+            "fresh entry should be skipped"
+        );
 
-        // Cache file should be unchanged.
-        let contents = fs::read_to_string(&cache_file).unwrap();
-        assert_eq!(contents, "// sentinel\n");
+        // Changing the source invalidates the cache -> recompiled.
+        fs::write(&src, "export const x: number = 2;\n").unwrap();
+        assert_eq!(
+            precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap(),
+            1,
+            "stale entry should be recompiled"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -311,17 +366,25 @@ mod tests {
         let nm = root.join("node_modules");
         let pkg_dir = nm.join("mypkg");
         fs::create_dir_all(&pkg_dir).unwrap();
-        fs::write(pkg_dir.join("index.ts"), "const x: number = 1;\n").unwrap();
+        let source = "const x: number = 1;\n";
+        fs::write(pkg_dir.join("index.ts"), source).unwrap();
 
-        // Write a cache entry manually.
+        // Write a cache entry + matching hash sidecar manually.
         let cache_file = nm.join(".oam/precompile/mypkg/index.js");
         fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
         fs::write(&cache_file, "const x = 1;\n").unwrap();
+        fs::write(hash_sidecar(&cache_file), source_hash(source)).unwrap();
 
         let ts_path = pkg_dir.join("index.ts");
-        let cached = try_precompile_cache(&ts_path);
+        let cached = try_precompile_cache(&ts_path, source);
         assert!(cached.is_some(), "cache hit expected");
         assert_eq!(cached.unwrap(), "const x = 1;\n");
+
+        // A changed source (hash mismatch) is a miss even with the .js present.
+        assert!(
+            try_precompile_cache(&ts_path, "const x: number = 2;\n").is_none(),
+            "stale hash should miss"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -332,11 +395,12 @@ mod tests {
         let nm = root.join("node_modules");
         let pkg_dir = nm.join("mypkg");
         fs::create_dir_all(&pkg_dir).unwrap();
-        fs::write(pkg_dir.join("index.ts"), "const x: number = 1;\n").unwrap();
+        let source = "const x: number = 1;\n";
+        fs::write(pkg_dir.join("index.ts"), source).unwrap();
 
         // No cache entry written -- should be a miss.
         let ts_path = pkg_dir.join("index.ts");
-        let cached = try_precompile_cache(&ts_path);
+        let cached = try_precompile_cache(&ts_path, source);
         assert!(cached.is_none(), "cache miss expected");
 
         let _ = fs::remove_dir_all(&root);

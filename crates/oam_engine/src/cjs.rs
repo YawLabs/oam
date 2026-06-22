@@ -222,34 +222,31 @@ pub(crate) fn load_cjs<'s>(
         return Some(exports_value);
     }
 
-    // .cts: check the pre-compilation cache first. If a cached .js artifact
-    // exists (written by `oam install --precompile`) use it directly and skip
-    // the oxc transpile. On a cache miss we read the .cts source and strip its
-    // types inline below, mirroring the ESM host's TypeScript path.
-    let is_cts = key.extension().and_then(|e| e.to_str()) == Some("cts");
-    let precompiled_cts_source: Option<String> = if is_cts {
-        oam_loader::precompile::try_precompile_cache(&key)
-    } else {
-        None
+    // TypeScript reached via require() (.ts/.cts/.mts): read the source, then
+    // consult the install-time pre-compilation cache (written by
+    // `oam install --precompile`, keyed by source hash). A cache hit skips the
+    // oxc transpile; a miss strips types inline below, mirroring the ESM host.
+    let ext = key.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_ts = matches!(ext, "ts" | "cts" | "mts");
+
+    let raw = match std::fs::read_to_string(&key) {
+        Ok(source) => source,
+        Err(e) => {
+            throw_error(scope, &format!("cannot read {file}: {e}"));
+            return None;
+        }
     };
 
-    let source = if let Some(cached) = precompiled_cts_source {
-        // Already plain JS from `oam install --precompile`; do NOT re-transpile.
-        cached
-    } else {
-        let raw = match std::fs::read_to_string(&key) {
-            Ok(source) => source,
-            Err(e) => {
-                throw_error(scope, &format!("cannot read {file}: {e}"));
-                return None;
-            }
-        };
-        if is_cts {
-            // Bare .cts: oxc strips the TS types, then the CJS wrapper below
-            // compiles+runs the resulting JS. A transpile failure carries the
-            // loader's ODIF code/message rather than a raw oxc panic; any ESM
-            // syntax that survives stripping (e.g. a bare `export`) fails later
-            // at compile_function and surfaces as the V8 SyntaxError.
+    let source = if is_ts {
+        if let Some(cached) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
+            // Already plain JS from `oam install --precompile`; do NOT re-transpile.
+            cached
+        } else {
+            // oxc strips the TS types, then the CJS wrapper below compiles+runs
+            // the resulting JS. A transpile failure carries the loader's ODIF
+            // code/message rather than a raw oxc panic; any ESM syntax that
+            // survives stripping (e.g. a bare `export`) fails later at
+            // compile_function and surfaces as the V8 SyntaxError.
             match oam_loader::transpile_typescript(&key, &raw) {
                 Ok(js) => js,
                 Err(e) => {
@@ -267,9 +264,9 @@ pub(crate) fn load_cjs<'s>(
                     return None;
                 }
             }
-        } else {
-            raw
         }
+    } else {
+        raw
     };
 
     // The module object, cached BEFORE execution so cycles see partials.

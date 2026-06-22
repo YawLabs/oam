@@ -1109,7 +1109,14 @@ impl oam_engine::ModuleHost for CliHost {
 
         match kind {
             SourceKind::TypeScript => {
-                oam_loader::transpile_typescript(path, &source).map_err(|e| e.diagnostics)
+                // Install-time pre-compilation cache (oam install --precompile),
+                // keyed by source hash; a hit skips the oxc transpile. Misses
+                // (project sources, stale entries) fall through to transpile.
+                if let Some(cached) = oam_loader::precompile::try_precompile_cache(path, &source) {
+                    Ok(cached)
+                } else {
+                    oam_loader::transpile_typescript(path, &source).map_err(|e| e.diagnostics)
+                }
             }
             _ => Ok(source),
         }

@@ -13378,6 +13378,15 @@ fn install_precompile_cts_cache_used_on_run() {
         "// oam-precompile-sentinel\nexports.value = 42;\n",
     )
     .unwrap();
+    // B2: the cache is served only when its hash sidecar matches the current
+    // source. Hash the actual .cts bytes so the sentinel entry is considered
+    // fresh (a mismatched/missing sidecar would fall through to a real
+    // transpile of the source, printing 99 instead of the sentinel's 42).
+    {
+        use sha2::{Digest, Sha256};
+        let src = std::fs::read(pkg_dir.join("index.cts")).unwrap();
+        std::fs::write(cache_dir.join("index.js.hash"), Sha256::digest(&src)).unwrap();
+    }
 
     let entry = project_dir.join("main.cjs");
     std::fs::write(
@@ -13405,6 +13414,80 @@ console.log(pkg.value);"#,
         stdout.trim(),
         "42",
         "sentinel value from cache should be printed; got: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// B1: the ESM host (not just the CJS `.cts` path) consults the precompile
+// cache for node_modules TypeScript. Seed a sentinel cache for an ESM `.ts`
+// module and confirm an `import` serves the cached JS rather than transpiling
+// the real source. (Before B1 the ESM host always transpiled, ignoring the
+// cache, so this would have printed 99.)
+#[test]
+fn install_precompile_esm_ts_cache_used_on_run() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-esm-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let pkg_dir = project_dir.join("node_modules").join("esm-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"esm-pkg","version":"1.0.0","type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("index.ts"),
+        "export const value: number = 99;\n",
+    )
+    .unwrap();
+
+    let cache_dir = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("esm-pkg");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("index.js"), "export const value = 42;\n").unwrap();
+    // Matching hash sidecar so the sentinel entry is considered fresh (B2).
+    {
+        use sha2::{Digest, Sha256};
+        let src = std::fs::read(pkg_dir.join("index.ts")).unwrap();
+        std::fs::write(cache_dir.join("index.js.hash"), Sha256::digest(&src)).unwrap();
+    }
+
+    let entry = project_dir.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import { value } from './node_modules/esm-pkg/index.ts';\nconsole.log(value);\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "run with ESM .ts cache hit should succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "42",
+        "ESM host should serve the cached JS (B1); got: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&project_dir);
