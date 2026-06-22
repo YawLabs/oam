@@ -75,6 +75,63 @@ fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: 
     scope.throw_exception(exception);
 }
 
+/// CJS wrapper parameters, in order. Shared between the require() loader and
+/// the `oam compile` bytecode producer so their compiled functions -- and thus
+/// their V8 code-cache blobs -- are interchangeable.
+pub(crate) const CJS_PARAMS: [&str; 6] = [
+    "exports",
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    "global",
+];
+
+/// Replace a leading `#!` shebang with a `//` comment, byte-for-byte so every
+/// source offset is preserved. Shared so the loader, the bytecode producer, and
+/// the embedded-seed key all transform the source identically -- a mismatch
+/// would silently miss the cache, never miscompile.
+pub(crate) fn strip_shebang(source: String) -> String {
+    if let Some(rest) = source.strip_prefix("#!") {
+        format!("//{rest}")
+    } else {
+        source
+    }
+}
+
+/// Compile `source` as a CJS wrapper function and return its V8 bytecode blob,
+/// WITHOUT executing it. Used by `oam compile` to embed bytecode so a compiled
+/// binary's first run skips parse+compile (even with no writable cache dir).
+/// The compile mirrors the require() loader -- same `CJS_PARAMS`, same origin
+/// shape, same shebang transform -- so the runtime consume path accepts the
+/// blob; a rejected blob would only trigger a recompile, never a wrong result.
+/// Returns None on a syntax error or if V8 declines to produce a cache.
+pub(crate) fn produce_cjs_code_cache(
+    scope: &mut v8::PinScope<'_, '_>,
+    source: &str,
+) -> Option<Vec<u8>> {
+    let source = strip_shebang(source.to_string());
+    let source_v8 = v8::String::new(scope, &source)?;
+    let name: v8::Local<v8::Value> = v8::String::new(scope, "<oam-compile>")?.into();
+    let origin = v8::ScriptOrigin::new(
+        scope, name, 0, 0, false, 0, None, false, false, /* is_module */ false, None,
+    );
+    let mut compiler_source = v8::script_compiler::Source::new(source_v8, Some(&origin));
+    let params: Vec<v8::Local<v8::String>> = CJS_PARAMS
+        .iter()
+        .map(|p| v8::String::new(scope, p).unwrap())
+        .collect();
+    let wrapper = v8::script_compiler::compile_function(
+        scope,
+        &mut compiler_source,
+        &params,
+        &[],
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    )?;
+    wrapper.create_code_cache().map(|cd| cd.to_vec())
+}
+
 /// `__oam.requireCjs(path)`: pure cache lookup used by generated ESM
 /// facades. The module was executed during graph load; a miss here is an
 /// internal invariant violation, not a user error.
@@ -309,12 +366,9 @@ pub(crate) fn load_cjs<'s>(
             .insert(key.clone(), global);
     }
 
-    // Shebang: byte-for-byte replacement keeps every offset intact.
-    let source = if let Some(rest) = source.strip_prefix("#!") {
-        format!("//{rest}")
-    } else {
-        source
-    };
+    // Shebang: byte-for-byte replacement keeps every offset intact. Shared
+    // with produce_cjs_code_cache so the cache key matches at compile time.
+    let source = strip_shebang(source);
 
     let source_v8 = match v8::String::new(scope, &source) {
         Some(source_v8) => source_v8,
@@ -343,17 +397,10 @@ pub(crate) fn load_cjs<'s>(
         ),
         None => v8::script_compiler::Source::new(source_v8, Some(&origin)),
     };
-    let params: Vec<v8::Local<v8::String>> = [
-        "exports",
-        "require",
-        "module",
-        "__filename",
-        "__dirname",
-        "global",
-    ]
-    .iter()
-    .map(|p| v8::String::new(scope, p).unwrap())
-    .collect();
+    let params: Vec<v8::Local<v8::String>> = CJS_PARAMS
+        .iter()
+        .map(|p| v8::String::new(scope, p).unwrap())
+        .collect();
     let compile_options = if consuming {
         v8::script_compiler::CompileOptions::ConsumeCodeCache
     } else {

@@ -12154,6 +12154,79 @@ fn compile_missing_entry_fails() {
     );
 }
 
+// B3e: `oam compile` embeds V8 bytecode (format v2). Running the compiled
+// binary consumes that bytecode from the in-memory seed -- proven by pointing
+// OAM_CACHE_DIR at a FRESH dir and asserting ZERO .v8c blobs are written. If
+// the seed were missed, or V8 rejected the cross-isolate blob, the run would
+// recompile and produce a disk blob. Zero writes proves the embedded bytecode
+// is both consumed AND accepted, needing no writable cache dir (the whole point
+// of embedding over the lazy cache).
+#[test]
+fn compile_embeds_bytecode_consumed_without_disk_cache() {
+    let entry = write_temp(
+        "compile_bytecode.cjs",
+        "function add(a, b) { return a + b; }\nconsole.log('compiled-result=' + add(20, 22));\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-bc-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    // The v2 path (bytecode embedded) ran, not the v1 fallback. The v2 message
+    // is "... bytes JS + N bytes bytecode -> ..."; v1 is "no bytecode embedded".
+    let compile_msg = String::from_utf8_lossy(&compile_out.stderr);
+    assert!(
+        compile_msg.contains("bytes bytecode"),
+        "expected v2 (embedded bytecode); got: {compile_msg}"
+    );
+
+    // Run the compiled binary with a fresh, isolated cache dir.
+    let run_cache = std::env::temp_dir().join(format!(
+        "oam-compile-bc-cache-{}-{nanos}",
+        std::process::id()
+    ));
+    let run_out = std::process::Command::new(&output)
+        .env("OAM_CACHE_DIR", &run_cache)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        run_out.status.success(),
+        "compiled binary failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert!(
+        stdout.contains("compiled-result=42"),
+        "expected correct output; got: {stdout}"
+    );
+    assert_eq!(
+        count_v8c(&run_cache.join("bytecode")),
+        0,
+        "embedded bytecode should be consumed from the seed and accepted by V8, \
+         so the run writes no disk blob"
+    );
+
+    let _ = std::fs::remove_dir_all(&run_cache);
+}
+
 // ── Wave 9: Crypto Phase A ──────────────────────────────────────────
 
 #[test]

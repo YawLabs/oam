@@ -205,8 +205,8 @@ enum TrustAction {
 }
 
 fn main() -> ExitCode {
-    if let Some(source) = extract_embedded_js() {
-        return run_embedded(&source, std::env::args().collect());
+    if let Some((source, bytecode)) = extract_embedded() {
+        return run_embedded(&source, bytecode, std::env::args().collect());
     }
 
     let cli = Cli::parse();
@@ -1416,44 +1416,86 @@ fn run_file(
 
 // -- oam compile: embed a pre-bundled JS file into a standalone binary --
 
-/// 8-byte magic trailer written after the JS payload + length.
-/// Format: [JS bytes][u64 LE length][b"OAMEXEC\0"]
+/// Magic trailers marking an embedded payload, checked at startup.
+/// - v1 (JS only):     `[JS][u64 LE js_len][b"OAMEXEC\0"]` (16-byte trailer)
+/// - v2 (JS+bytecode): `[JS][bytecode][u64 LE js_len][u64 LE bc_len][b"OAMEXC2\0"]`
+///   (24-byte trailer). v2 embeds V8 bytecode so the compiled binary's first
+///   run skips parse+compile even with no writable cache dir.
+///
+/// Both are read by `extract_embedded`. `oam compile` writes v2 when bytecode
+/// production succeeds, else falls back to v1.
 const COMPILE_MAGIC: &[u8; 8] = b"OAMEXEC\0";
+const COMPILE_MAGIC_V2: &[u8; 8] = b"OAMEXC2\0";
 
-/// Read the last 16 bytes of the current executable to check for an
-/// embedded JS payload. Returns `Some(source)` if the magic marker and
-/// length are valid, `None` otherwise (normal CLI binary).
-fn extract_embedded_js() -> Option<String> {
+/// Inspect the tail of the current executable for an embedded payload.
+/// Returns `Some((source, bytecode))` where `bytecode` is `Some` only for a
+/// v2 binary that carries embedded V8 bytecode; `None` for a normal CLI
+/// binary. Both the v1 and v2 trailer formats are recognized.
+fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
     let exe = std::env::current_exe().ok()?;
     let mut f = std::fs::File::open(&exe).ok()?;
     let file_len = f.metadata().ok()?.len();
-    // Trailer is 16 bytes: 8 (length) + 8 (magic).
-    if file_len < 16 {
+    if file_len < 8 {
         return None;
     }
-    let mut trailer = [0u8; 16];
-    f.seek(SeekFrom::End(-16)).ok()?;
-    f.read_exact(&mut trailer).ok()?;
-    // Check magic marker (last 8 bytes of trailer).
-    if &trailer[8..16] != COMPILE_MAGIC {
-        return None;
+    // The magic is always the final 8 bytes.
+    let mut magic = [0u8; 8];
+    f.seek(SeekFrom::End(-8)).ok()?;
+    f.read_exact(&mut magic).ok()?;
+
+    if &magic == COMPILE_MAGIC_V2 {
+        // v2 trailer (24 bytes): [js_len u64][bc_len u64][magic].
+        if file_len < 24 {
+            return None;
+        }
+        let mut lens = [0u8; 16];
+        f.seek(SeekFrom::End(-24)).ok()?;
+        f.read_exact(&mut lens).ok()?;
+        let js_len = u64::from_le_bytes(lens[0..8].try_into().unwrap());
+        let bc_len = u64::from_le_bytes(lens[8..16].try_into().unwrap());
+        // The two payloads + 24-byte trailer must fit in the file.
+        let payload = js_len.checked_add(bc_len)?;
+        if payload > file_len - 24 {
+            return None;
+        }
+        let js_off = file_len - 24 - payload;
+        f.seek(SeekFrom::Start(js_off)).ok()?;
+        let mut js_buf = vec![0u8; js_len as usize];
+        f.read_exact(&mut js_buf).ok()?;
+        // The cursor is now at the start of the bytecode (js_off + js_len).
+        let mut bc_buf = vec![0u8; bc_len as usize];
+        f.read_exact(&mut bc_buf).ok()?;
+        let source = String::from_utf8(js_buf).ok()?;
+        let bytecode = (!bc_buf.is_empty()).then_some(bc_buf);
+        return Some((source, bytecode));
     }
-    let js_len = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
-    // Sanity: JS payload + 16-byte trailer must fit in the file.
-    if js_len > file_len - 16 {
-        return None;
+
+    if &magic == COMPILE_MAGIC {
+        // v1 trailer (16 bytes): [js_len u64][magic]. JS only.
+        if file_len < 16 {
+            return None;
+        }
+        let mut len_bytes = [0u8; 8];
+        f.seek(SeekFrom::End(-16)).ok()?;
+        f.read_exact(&mut len_bytes).ok()?;
+        let js_len = u64::from_le_bytes(len_bytes);
+        if js_len > file_len - 16 {
+            return None;
+        }
+        let offset = file_len - 16 - js_len;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0u8; js_len as usize];
+        f.read_exact(&mut buf).ok()?;
+        return Some((String::from_utf8(buf).ok()?, None));
     }
-    let offset = file_len - 16 - js_len;
-    f.seek(SeekFrom::Start(offset)).ok()?;
-    let mut buf = vec![0u8; js_len as usize];
-    f.read_exact(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
+
+    None
 }
 
 /// Execute embedded JS source as a CJS script (the typical output of
 /// esbuild/rollup --format=cjs). Supports `--inspect` / `--inspect-brk`
 /// flags for debugging the compiled binary.
-fn run_embedded(source: &str, args: Vec<String>) -> ExitCode {
+fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> ExitCode {
     // Parse --inspect / --inspect-brk from raw args (we bypass clap for
     // embedded binaries so the user's positional args pass through).
     let mut inspect: Option<(std::net::SocketAddr, bool)> = None;
@@ -1496,6 +1538,13 @@ fn run_embedded(source: &str, args: Vec<String>) -> ExitCode {
     }
 
     let mut rt = oam_engine::JsRuntime::new();
+    // Seed embedded bytecode (v2 binaries) now that V8 is initialized, so the
+    // CJS loader consumes it without needing a writable cache dir. Keyed by the
+    // embedded source -- the same string the loader keys on after writing it to
+    // the temp file below.
+    if let Some(blob) = bytecode {
+        oam_engine::seed_cjs_bytecode(source, blob);
+    }
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam-compiled".to_string());
@@ -1603,24 +1652,48 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
         }
     };
     use std::io::Write;
+
+    // Produce V8 bytecode for the entry so the compiled binary's first run
+    // skips parse+compile (v2). If production fails for any reason, fall back
+    // to a JS-only v1 binary -- the lazy runtime cache still kicks in there.
+    let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
+    let bytecode = oam_engine::JsRuntime::precompile_cjs_source(source_str);
+
     let js_len = source.len() as u64;
-    if let Err(e) = out_file
-        .write_all(&source)
-        .and_then(|()| out_file.write_all(&js_len.to_le_bytes()))
-        .and_then(|()| out_file.write_all(COMPILE_MAGIC))
-    {
+    let write_result = match &bytecode {
+        Some(bc) => out_file
+            .write_all(&source)
+            .and_then(|()| out_file.write_all(bc))
+            .and_then(|()| out_file.write_all(&js_len.to_le_bytes()))
+            .and_then(|()| out_file.write_all(&(bc.len() as u64).to_le_bytes()))
+            .and_then(|()| out_file.write_all(COMPILE_MAGIC_V2)),
+        None => out_file
+            .write_all(&source)
+            .and_then(|()| out_file.write_all(&js_len.to_le_bytes()))
+            .and_then(|()| out_file.write_all(COMPILE_MAGIC)),
+    };
+    if let Err(e) = write_result {
         eprintln!("oam compile: write failed: {e}");
         let _ = std::fs::remove_file(output);
         return ExitCode::FAILURE;
     }
 
     let out_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
-    eprintln!(
-        "oam compile: {} ({} bytes JS) -> {}",
-        entry.display(),
-        source.len(),
-        out_abs.display()
-    );
+    match &bytecode {
+        Some(bc) => eprintln!(
+            "oam compile: {} ({} bytes JS + {} bytes bytecode) -> {}",
+            entry.display(),
+            source.len(),
+            bc.len(),
+            out_abs.display()
+        ),
+        None => eprintln!(
+            "oam compile: {} ({} bytes JS, no bytecode embedded) -> {}",
+            entry.display(),
+            source.len(),
+            out_abs.display()
+        ),
+    }
     ExitCode::SUCCESS
 }
 
@@ -1679,5 +1752,7 @@ mod tests {
     fn compile_magic_is_8_bytes() {
         assert_eq!(super::COMPILE_MAGIC.len(), 8);
         assert_eq!(super::COMPILE_MAGIC, b"OAMEXEC\0");
+        assert_eq!(super::COMPILE_MAGIC_V2.len(), 8);
+        assert_eq!(super::COMPILE_MAGIC_V2, b"OAMEXC2\0");
     }
 }

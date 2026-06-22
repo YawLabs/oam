@@ -303,6 +303,27 @@ impl JsRuntime {
         };
         Ok(result)
     }
+
+    /// Produce a V8 bytecode blob for `source` compiled as a CommonJS module
+    /// (the shape the `require()` path uses), WITHOUT executing it. Returns
+    /// `None` on a syntax error or if V8 declines to produce a cache. Spins up
+    /// a throwaway runtime for the isolate+context. Used by `oam compile` to
+    /// embed bytecode so a compiled binary's first run skips parse+compile.
+    pub fn precompile_cjs_source(source: &str) -> Option<Vec<u8>> {
+        let mut rt = Self::new();
+        v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
+        crate::cjs::produce_cjs_code_cache(scope, source)
+    }
+}
+
+/// Seed embedded CJS bytecode (from `oam compile`) into the in-process code
+/// cache so the next load of the same source consumes it without touching disk
+/// -- a compiled binary then skips parse+compile on its first run even in a
+/// read-only / ephemeral environment. The source is shebang-stripped to match
+/// the loader's cache key. Pairs with [`JsRuntime::precompile_cjs_source`].
+pub fn seed_cjs_bytecode(source: &str, blob: Vec<u8>) {
+    let key = crate::cjs::strip_shebang(source.to_string());
+    crate::code_cache::seed(&key, crate::code_cache::Kind::Function, blob);
 }
 
 impl Default for JsRuntime {

@@ -18,8 +18,9 @@
 //! is a pure optimization: every read/write failure is swallowed, and a miss
 //! just falls through to a normal compile.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Whether the bytecode cache is active for this process. On by default; set
 /// `OAM_CODE_CACHE=0` (or `off`/`false`/`no`) to disable it entirely -- no
@@ -95,30 +96,69 @@ fn hex32(bytes: &[u8; 32]) -> String {
     s
 }
 
-/// Content-addressed path for a (source, kind) pair under the current V8 build.
-/// The V8 version tag is folded into the key so blobs from a different engine
-/// build never collide with -- or get served to -- this one.
-fn entry_path(source: &str, kind: Kind) -> PathBuf {
+/// Content-addressed hash for a (source, kind) pair under the current V8 build:
+/// `sha256(version_tag || kind || source)` as 64 lowercase hex chars. The V8
+/// version tag is folded in so a blob from a different engine build never
+/// collides with -- or is served to -- this one.
+fn entry_hash(source: &str, kind: Kind) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
     hasher.update([kind.tag()]);
     hasher.update(source.as_bytes());
-    let hex = hex32(&hasher.finalize().into());
+    hex32(&hasher.finalize().into())
+}
+
+/// Disk path for a content hash: `<cache_root>/<aa>/<rest>.v8c`.
+fn path_for_hash(hash: &str) -> PathBuf {
     cache_root()
-        .join(&hex[..2])
-        .join(format!("{}.v8c", &hex[2..]))
+        .join(&hash[..2])
+        .join(format!("{}.v8c", &hash[2..]))
+}
+
+/// In-process bytecode seed: blobs handed to the runtime directly (not via
+/// disk), keyed by the same content hash as the disk store. `oam compile`
+/// seeds the embedded bytecode here at startup, so a compiled binary's first
+/// run consumes it WITHOUT needing a writable cache dir (containers, read-only
+/// or ephemeral filesystems). `load()` checks the seed before disk.
+fn seed_map() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+    static SEED: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+    SEED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Seed an in-memory bytecode blob for `source` of `kind`. The next `load()`
+/// for the same source in this process returns it ahead of any disk entry.
+/// No-op on an empty blob. V8 still validates the blob on consume (`rejected()`
+/// -> recompile), so a stale or tampered seed can only cost a recompile.
+pub(crate) fn seed(source: &str, kind: Kind, blob: Vec<u8>) {
+    if blob.is_empty() {
+        return;
+    }
+    let hash = entry_hash(source, kind);
+    if let Ok(mut map) = seed_map().lock() {
+        map.insert(hash, blob);
+    }
 }
 
 /// Load a cached bytecode blob for `source` of `kind`, if one exists for the
-/// current V8 build. Returns the raw bytes; the caller wraps them in a
+/// current V8 build. Checks the in-memory seed first (embedded bytecode from
+/// `oam compile`), then disk. Returns the raw bytes; the caller wraps them in a
 /// `v8::script_compiler::CachedData` to consume. `None` on miss or any I/O
 /// error (the cache is never a correctness dependency).
 pub(crate) fn load(source: &str, kind: Kind) -> Option<Vec<u8>> {
     if !enabled() {
         return None;
     }
-    std::fs::read(entry_path(source, kind))
+    let hash = entry_hash(source, kind);
+    // In-memory seed (oam compile embedded bytecode) wins over disk: it needs
+    // no writable cache dir.
+    if let Ok(map) = seed_map().lock()
+        && let Some(blob) = map.get(&hash)
+        && !blob.is_empty()
+    {
+        return Some(blob.clone());
+    }
+    std::fs::read(path_for_hash(&hash))
         .ok()
         .filter(|b| !b.is_empty())
 }
@@ -130,7 +170,7 @@ pub(crate) fn store(source: &str, kind: Kind, bytes: &[u8]) {
     if !enabled() || bytes.is_empty() {
         return;
     }
-    let path = entry_path(source, kind);
+    let path = path_for_hash(&entry_hash(source, kind));
     let Some(parent) = path.parent() else { return };
     if std::fs::create_dir_all(parent).is_err() {
         return;
