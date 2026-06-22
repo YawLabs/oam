@@ -111,15 +111,20 @@ impl JsRuntime {
         isolate.set_slot(crypto_ops::CryptoState::default());
         isolate.set_slot(napi::AddonRegistry::new());
         isolate.set_slot(replay::ReplayState::default());
-        // Fork pool: 2 pre-warmed isolates for oam.fork() cold-start speedup.
-        // The pool lives in an isolate slot so the zero-capture op_fork_spawn
-        // callback can reach it without captures.
+        // Fork pool: up to 2 pre-warmed isolates for oam.fork() cold-start
+        // speedup. The pool lives in an isolate slot so the zero-capture
+        // op_fork_spawn callback can reach it without captures.
+        //
+        // Constructing the pool here is cheap: warming is LAZY, so the prewarm
+        // isolates are only spawned on the first oam.fork() (see ForkPool).
+        // A program that never forks pays nothing -- no extra isolates, no
+        // snapshot deserialization, lower idle RSS.
         //
         // Only the TOP-LEVEL runtime gets a pool. Worker / fork-prewarm
-        // isolates pass `with_fork_pool = false` so they do NOT spawn their
-        // own prewarm threads -- otherwise each prewarm thread's
-        // `JsRuntime::new()` would spawn yet more prewarm threads, recursing
-        // until the stack overflows and the process aborts.
+        // isolates pass `with_fork_pool = false` so they do NOT install one --
+        // otherwise a prewarm thread's `JsRuntime::new()` could install a pool
+        // that warms more prewarm threads, recursing until the stack overflows
+        // and the process aborts.
         if with_fork_pool {
             isolate.set_slot(fork::ForkPool::new(2));
         }

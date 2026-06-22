@@ -1,9 +1,16 @@
 //! Pre-warmed isolate pool: oam.fork() checkpoint pools.
 //!
-//! `ForkPool` eagerly spawns OS threads that each call `JsRuntime::new()` and
-//! then block waiting for a `ForkRequest`. When `fork()` is called, the first
+//! `ForkPool` spawns OS threads that each call `JsRuntime::new()` and then
+//! block waiting for a `ForkRequest`. When `fork()` is called, the first
 //! available pre-warmed slot receives the (script, worker_data) pair and
 //! immediately executes it -- the cold `JsRuntime::new()` cost is already paid.
+//!
+//! Warming is LAZY: `ForkPool::new()` installs no threads. The prewarm
+//! isolates are spawned on the FIRST `fork()` call (`ensure_warm`). A program
+//! that never forks therefore pays nothing -- no extra V8 isolates, no snapshot
+//! deserialization, lower idle RSS, faster startup. The cost is that the first
+//! fork pays the cold `JsRuntime::new()` (its request is buffered onto a
+//! still-warming slot); every fork after that is served warm.
 //!
 //! JsRuntime is NOT Send (holds V8 isolate-thread locals), so pre-warmed
 //! isolates stay pinned to their creation thread. The pool communicates over
@@ -15,6 +22,7 @@
 
 use oam_core::worker::{WorkerContext, WorkerEvent};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -36,20 +44,37 @@ struct ForkSlot {
 
 pub struct ForkPool {
     pool: Mutex<Vec<ForkSlot>>,
-    _capacity: usize,
+    capacity: usize,
+    /// Flipped true the first time `ensure_warm` spawns the prewarm threads,
+    /// so warming happens exactly once across concurrent `fork()` calls.
+    warm_started: AtomicBool,
 }
 
 impl ForkPool {
-    /// Spawn `capacity` pre-warmed threads and return the pool.
+    /// Build the pool WITHOUT spawning any prewarm threads. Warming is
+    /// deferred to the first `fork()` (see `ensure_warm`), so a runtime that
+    /// never forks costs nothing -- no isolates, no snapshot deserialization.
     pub fn new(capacity: usize) -> Arc<Self> {
-        let pool = Arc::new(Self {
+        Arc::new(Self {
             pool: Mutex::new(Vec::with_capacity(capacity)),
-            _capacity: capacity,
-        });
-        for _ in 0..capacity {
-            Self::add_slot(&pool);
+            capacity,
+            warm_started: AtomicBool::new(false),
+        })
+    }
+
+    /// Spawn the `capacity` pre-warmed threads exactly once, on first use.
+    /// Idempotent and thread-safe: concurrent first forks race on the
+    /// compare-exchange and only the winner spawns.
+    fn ensure_warm(pool: &Arc<Self>) {
+        if pool
+            .warm_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for _ in 0..pool.capacity {
+                Self::add_slot(pool);
+            }
         }
-        pool
     }
 
     /// Spawn one pre-warmed thread and push its sender into the pool.
@@ -99,13 +124,16 @@ impl ForkPool {
     /// Hand off a fork request to a pre-warmed slot if available, or fall
     /// back to a cold spawn (same as the existing `spawn_worker` path).
     pub fn fork(
-        &self,
+        self: &Arc<Self>,
         script: PathBuf,
         worker_data: Option<String>,
         worker_id: u64,
         event_tx: mpsc::Sender<WorkerEvent>,
         msg_rx: mpsc::Receiver<Vec<u8>>,
     ) {
+        // First fork warms the pool; later forks find slots already spawned.
+        Self::ensure_warm(self);
+
         let slot = {
             let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_empty() {
