@@ -54,6 +54,19 @@ sysinfo = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.
 tokio-tungstenite = { workspace = true }
 
+# Hardware SHA-256 on aarch64 (Apple Silicon et al.): enable sha2's built-in
+# ARMv8 SHA2-extension backend (src/sha256/aarch64.rs), gated behind sha2's
+# `asm` feature and runtime-detected via cpufeatures "sha2" (falls back to the
+# soft backend when the CPU lacks FEAT_SHA256, so it stays correct everywhere).
+#
+# Scoped to non-Windows aarch64: the `asm` feature also compiles the sha2-asm
+# crate, whose cc/assembler build step fails on aarch64-pc-windows-msvc
+# (LNK1181 -- MSVC cannot link the GNU-as .o). macOS/Linux aarch64 assemble it
+# fine. x86 is untouched -- it already uses runtime SHA-NI intrinsics without
+# `asm`. Closes the ~6.8x createHash('sha256') gap vs node on mac-arm.
+[target.'cfg(all(target_arch = "aarch64", not(target_os = "windows")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).
 v8 = { workspace = true }
