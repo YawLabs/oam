@@ -19,6 +19,27 @@
 //! just falls through to a normal compile.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Whether the bytecode cache is active for this process. On by default; set
+/// `OAM_CODE_CACHE=0` (or `off`/`false`/`no`) to disable it entirely -- no
+/// consume, no produce, no write. Useful for benchmarking a cold compile,
+/// debugging a suspected cache issue, or a read-only environment where the
+/// write is unwanted. Read once: the env is fixed for a process lifetime, and
+/// keeping it off the per-module-load hot path matters.
+///
+/// `pub(crate)` so the produce call sites can skip the `create_code_cache()`
+/// serialize work too, not just the read/write -- a true off switch leaves no
+/// residual cost.
+pub(crate) fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("OAM_CODE_CACHE").as_deref(),
+            Ok("0") | Ok("off") | Ok("false") | Ok("no")
+        )
+    })
+}
 
 /// What was compiled. ESM modules and CJS require-wrappers produce different
 /// bytecode, so they are keyed apart even for identical source text.
@@ -94,6 +115,9 @@ fn entry_path(source: &str, kind: Kind) -> PathBuf {
 /// `v8::script_compiler::CachedData` to consume. `None` on miss or any I/O
 /// error (the cache is never a correctness dependency).
 pub(crate) fn load(source: &str, kind: Kind) -> Option<Vec<u8>> {
+    if !enabled() {
+        return None;
+    }
     std::fs::read(entry_path(source, kind))
         .ok()
         .filter(|b| !b.is_empty())
@@ -103,7 +127,7 @@ pub(crate) fn load(source: &str, kind: Kind) -> Option<Vec<u8>> {
 /// a write failure (read-only dir, ENOSPC) is silently ignored. Atomic via a
 /// unique temp file + rename so a concurrent reader never observes a torn blob.
 pub(crate) fn store(source: &str, kind: Kind, bytes: &[u8]) {
-    if bytes.is_empty() {
+    if !enabled() || bytes.is_empty() {
         return;
     }
     let path = entry_path(source, kind);

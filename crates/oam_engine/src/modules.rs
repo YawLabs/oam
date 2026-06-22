@@ -1013,7 +1013,11 @@ fn load_module_graph(
                 .get_cached_data()
                 .map(|cd| cd.rejected())
                 .unwrap_or(true);
-        if refresh_cache && let Some(cd) = module.get_unbound_module_script(tc).create_code_cache()
+        // enabled() skips the create_code_cache() serialize work when the cache
+        // is off, not just the read/write -- a true off switch (OAM_CODE_CACHE=0).
+        if refresh_cache
+            && crate::code_cache::enabled()
+            && let Some(cd) = module.get_unbound_module_script(tc).create_code_cache()
         {
             crate::code_cache::store(&code, crate::code_cache::Kind::Module, &cd);
         }

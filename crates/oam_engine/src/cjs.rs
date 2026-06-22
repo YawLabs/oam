@@ -408,8 +408,12 @@ pub(crate) fn load_cjs<'s>(
 
     // Persist the bytecode now that the body has executed, so the cached blob
     // includes the body and not just the outer wrapper. Best-effort: a failed
-    // produce or write just means the next run pays the compile again.
-    if refresh_cache && let Some(cd) = wrapper.create_code_cache() {
+    // produce or write just means the next run pays the compile again. The
+    // enabled() guard skips the serialize work entirely when the cache is off.
+    if refresh_cache
+        && crate::code_cache::enabled()
+        && let Some(cd) = wrapper.create_code_cache()
+    {
         crate::code_cache::store(&source, crate::code_cache::Kind::Function, &cd);
     }
 

@@ -13658,3 +13658,146 @@ fn esm_bytecode_cache_produced_and_reused() {
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Collect every `.v8c` bytecode blob path under `dir` (recursive).
+fn collect_v8c(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_v8c(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("v8c") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+// B3d: OAM_CODE_CACHE=0 is a true off switch -- a run produces NO bytecode
+// blobs (and the program still works). Proves the opt-out skips the write
+// (and, with the call-site guard, the produce serialize too).
+#[test]
+fn code_cache_opt_out_disables_produce() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-optout-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+
+    std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const v = require('./lib.cjs');\nconsole.log('v=' + v);\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_CODE_CACHE", "0")
+        .output()
+        .expect("oam binary runs");
+
+    assert!(
+        out.status.success(),
+        "run with cache disabled should still succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("v=42"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        count_v8c(&cache.join("bytecode")),
+        0,
+        "OAM_CODE_CACHE=0 must produce no bytecode blobs"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// B3d: a corrupt on-disk blob must NEVER break execution. V8 rejects a blob it
+// can't deserialize (the same path a version-skewed blob takes) and recompiles
+// from source; our refresh logic then rewrites a valid blob. This is the
+// load-bearing safety property of the whole cache: disk corruption, a partial
+// write from a killed process, or engine skew can only cost a recompile, never
+// a wrong result or a crash.
+#[test]
+fn code_cache_corrupt_blob_falls_back_and_refreshes() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-corrupt-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+
+    std::fs::write(project_dir.join("lib.cjs"), "module.exports = 21 * 2;\n").unwrap();
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(
+        &entry,
+        "const v = require('./lib.cjs');\nconsole.log('v=' + v);\n",
+    )
+    .unwrap();
+
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", entry.to_str().unwrap()])
+            .current_dir(&project_dir)
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    // Run 1 produces the blobs.
+    let out1 = run();
+    assert!(out1.status.success(), "first run should succeed");
+    let bytecode_dir = cache.join("bytecode");
+    let mut blobs = Vec::new();
+    collect_v8c(&bytecode_dir, &mut blobs);
+    assert!(!blobs.is_empty(), "first run should produce blobs");
+
+    // Corrupt every blob with bytes that are not a valid V8 code cache.
+    const GARBAGE: &[u8] = b"oam-corrupt-sentinel-not-a-valid-v8-code-cache-blob";
+    for p in &blobs {
+        std::fs::write(p, GARBAGE).unwrap();
+    }
+
+    // Run 2: V8 rejects the garbage, recompiles from source -> correct output.
+    let out2 = run();
+    assert!(
+        out2.status.success(),
+        "run with a corrupt cache must still succeed; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("v=42"),
+        "corrupt-cache run output must be correct; got: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+
+    // The rejected blobs were refreshed -- none still holds the garbage.
+    let mut after = Vec::new();
+    collect_v8c(&bytecode_dir, &mut after);
+    for p in &after {
+        assert_ne!(
+            std::fs::read(p).unwrap().as_slice(),
+            GARBAGE,
+            "a rejected blob should have been rewritten: {}",
+            p.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
