@@ -96,14 +96,15 @@ pub enum InstallOutcome {
 /// `frozen` must be `true` for the MVP (the lockfile is authoritative; no
 /// resolution or lockfile mutation).
 ///
-/// **Concurrency**: this function takes no file lock on `node_modules`.
-/// Two concurrent `oam install` runs on the same project race on writes,
-/// and the loser's last-writer-wins. The atomic-extract path uses unique
-/// tempdir names (pid + counter) so individual package extracts are safe,
-/// but link_bins and the package-presence idempotency check are not
-/// coordinated across processes. Callers that need cross-process safety
-/// should serialize externally; npm has the same limitation without a
-/// dedicated lockfile mechanism.
+/// **Concurrency**: this function takes a best-effort advisory lock on
+/// `node_modules/.oam/install.lock` (std `File::lock`), so two concurrent
+/// `oam install` runs on the same project serialize instead of racing
+/// `link_bins` / the package-presence idempotency check. The lock is held for
+/// the duration of the install and released when the function returns (RAII).
+/// If the lock cannot be set up (unusual filesystem), the install proceeds
+/// unlocked rather than failing -- and individual package extracts are atomic
+/// (unique tempdir + rename) regardless, so the worst unlocked race is a
+/// harmless last-writer-wins on bin shims.
 ///
 /// **Manifest cache**: package.json files are read through a process-global
 /// cache (`cached_manifest`) that survives `Resolver::clear_caches()`. The
@@ -167,6 +168,12 @@ pub fn install(
     }
 
     let node_modules = project_dir.join("node_modules");
+
+    // A5: serialize concurrent `oam install` runs on the same project with an
+    // advisory lock under node_modules/.oam. Best-effort -- proceed unlocked if
+    // it can't be set up. Held for the rest of the function; dropping it
+    // releases the lock (RAII), so every early return below also unlocks.
+    let _install_lock = acquire_install_lock(&node_modules);
 
     // Collect non-root packages (the "" key is the project root).
     let mut to_install: Vec<(&str, &LockfileEntry)> = lockfile
@@ -275,6 +282,24 @@ pub fn install(
             errors,
         })
     }
+}
+
+/// Acquire the cross-process install lock (A5). Returns the held lock file
+/// (drop releases it) or `None` if the lock could not be set up -- in which
+/// case the caller proceeds unlocked. `File::lock` blocks until any concurrent
+/// holder releases, which is exactly the desired serialize behavior; only a
+/// setup *error* (dir/file creation, lock syscall failure) yields `None`.
+fn acquire_install_lock(node_modules: &Path) -> Option<std::fs::File> {
+    let oam_dir = node_modules.join(".oam");
+    std::fs::create_dir_all(&oam_dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(oam_dir.join("install.lock"))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
 }
 
 // ── Lockfile I/O ────────────────────────────────────────────────────────
@@ -550,12 +575,69 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
                         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode));
                 }
             }
+        } else if kind == tar::EntryType::Symlink {
+            let link_name = match entry.link_name() {
+                Ok(Some(name)) => name.into_owned(),
+                _ => continue, // unreadable / empty link target: skip
+            };
+            create_symlink_entry(&link_name, &target, &dest_clean, &rel)?;
         }
-        // Symlinks and other entry types are skipped for MVP. A few npm packages
-        // (mostly monorepo workspace compat) ship symlinks as part of their
-        // install; those files will be missing post-extract. Not a security
-        // concern -- the path-traversal check above still applies. Re-evaluate
-        // if a real package's install breaks because of this.
+        // Other entry types (hardlinks, char/block devices, FIFOs) are not
+        // produced by `npm pack` and are skipped.
+    }
+    Ok(())
+}
+
+/// Create a symlink entry from an npm tarball, with a target-traversal guard.
+///
+/// `target` is the link's (already dest-validated) location; `link_name` is the
+/// stored target path. The target is resolved relative to the link's own
+/// directory and must stay within `dest_clean`: a within-package link (the
+/// common case) is created; one that escapes the package -- whether a malicious
+/// `../../etc/passwd` or an unsupported cross-package/workspace link -- is
+/// skipped with a warning rather than created or aborted.
+///
+/// Unix creates the symlink. On non-Unix it is skipped with a warning: Windows
+/// symlinks need a privilege normal accounts lack and require knowing file-vs-
+/// dir up front, and npm itself shims bins separately rather than relying on
+/// tarball symlinks there. Either way the warning means the omission is not
+/// silent (the prior MVP dropped symlinks with no trace).
+fn create_symlink_entry(
+    link_name: &Path,
+    target: &Path,
+    dest_clean: &Path,
+    rel: &Path,
+) -> Result<(), String> {
+    let link_parent = target.parent().unwrap_or(target);
+    let resolved = path_clean(&link_parent.join(link_name));
+    if !resolved.starts_with(dest_clean) {
+        eprintln!(
+            "oam install: warning: skipping symlink {} -> {} (target outside package)",
+            rel.display(),
+            link_name.display()
+        );
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        // Replace any stale entry so a re-extract is idempotent.
+        let _ = std::fs::remove_file(target);
+        std::os::unix::fs::symlink(link_name, target).map_err(|e| {
+            format!(
+                "symlink {} -> {}: {e}",
+                target.display(),
+                link_name.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!(
+            "oam install: warning: skipping symlink {} -> {} (symlinks need a privilege on this platform)",
+            rel.display(),
+            link_name.display()
+        );
     }
     Ok(())
 }
@@ -1245,17 +1327,14 @@ mod tests {
         }
     }
 
-    // #19: symlink entries are skipped silently for the MVP (see comment in
-    // extract_tarball). The function must return Ok(()) and not create the
-    // link target inside the destination.
+    // A3: a within-package symlink entry is created on Unix (no longer dropped)
+    // and skipped on platforms where symlinks need a privilege (Windows).
     #[test]
-    fn extract_tarball_skips_symlink_entries_silently() {
+    fn extract_tarball_creates_within_package_symlink() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use std::io::Write;
 
-        // Build a tarball with one regular file (so the archive is non-empty
-        // and the entries iterator is exercised) and one symlink entry.
         let mut builder = tar::Builder::new(Vec::new());
 
         let content = b"ok";
@@ -1294,12 +1373,86 @@ mod tests {
         let result = extract_tarball(&gz_data, &tmp);
         assert!(
             result.is_ok(),
-            "symlink entry should be skipped silently; got {result:?}"
+            "symlink extract should succeed; got {result:?}"
         );
-
-        // The regular file landed; the symlink did not.
         assert!(tmp.join("real.txt").is_file());
-        assert!(!tmp.join("link.txt").exists());
+
+        #[cfg(unix)]
+        {
+            let link = tmp.join("link.txt");
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "link.txt should be a symlink on unix"
+            );
+            // The link resolves to real.txt's contents.
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "ok");
+        }
+        #[cfg(not(unix))]
+        {
+            // Skipped on platforms without unprivileged symlinks.
+            assert!(!tmp.join("link.txt").exists());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A3 guard: a symlink whose target escapes the package is skipped (not
+    // created, not a hard error) -- covers both malicious `../../etc/passwd`
+    // links and unsupported cross-package links.
+    #[test]
+    fn extract_tarball_skips_escaping_symlink_target() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // A regular file so the archive is non-empty.
+        let content = b"ok";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("package/real.txt").unwrap();
+        header.set_cksum();
+        builder.append(&header, &content[..]).unwrap();
+
+        // A symlink pointing well outside the package.
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_path("package/escape").unwrap();
+        link_header.set_link_name("../../../../etc/passwd").unwrap();
+        link_header.set_cksum();
+        builder.append(&link_header, std::io::empty()).unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar_data).unwrap();
+        let gz_data = gz.finish().unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-extract-symlink-escape-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Escaping target is skipped, not an error; extraction still succeeds.
+        let result = extract_tarball(&gz_data, &tmp);
+        assert!(
+            result.is_ok(),
+            "escaping symlink should be skipped; got {result:?}"
+        );
+        assert!(tmp.join("real.txt").is_file());
+        assert!(
+            std::fs::symlink_metadata(tmp.join("escape")).is_err(),
+            "escaping symlink must not be created"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
