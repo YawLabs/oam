@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
@@ -204,6 +204,10 @@ pub fn install(
 
     let mut installed = 0usize;
     let mut errors: Vec<Diagnostic> = Vec::new();
+    // A4: lifecycle scripts for TRUSTED packages, collected during the extract
+    // loop and run in one pass AFTER link_bins, so a script can call tools in
+    // node_modules/.bin (which isn't populated until then).
+    let mut pending_scripts: Vec<PendingScripts> = Vec::new();
     let trust = crate::trust::TrustConfig::load(project_dir);
     let cache_root = project_dir
         .join("node_modules")
@@ -231,16 +235,21 @@ pub fn install(
         // Skip already-installed packages (idempotency for partial installs).
         if dest.join("package.json").is_file() {
             installed += 1;
-            // Still check scripts for already-installed packages so the warning
-            // fires even on a warm install (the script remains skipped either way).
-            check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
+            // Still check scripts for already-installed packages so a trusted
+            // package's scripts run (or an untrusted one warns) even on a warm
+            // install.
+            if let Some(ps) = check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors) {
+                pending_scripts.push(ps);
+            }
             continue;
         }
 
         match fetch_and_extract(&rt, &client, resolved, entry.integrity.as_deref(), &dest) {
             Ok(()) => {
                 installed += 1;
-                check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors);
+                if let Some(ps) = check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors) {
+                    pending_scripts.push(ps);
+                }
                 if precompile
                     && let Err(e) =
                         crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
@@ -264,6 +273,10 @@ pub fn install(
     // install of the package itself, so the diagnostic lands on the Partial
     // path instead of poisoning an otherwise-clean install with Err.
     link_bins(&node_modules, &to_install, &mut errors);
+
+    // A4: now that the tree and .bin shims are in place, run the lifecycle
+    // scripts collected from trusted packages.
+    run_lifecycle_scripts(&pending_scripts, &node_modules, &mut errors);
 
     let elapsed = started.elapsed();
 
@@ -832,48 +845,156 @@ fn pathdiff(target: &Path, base_canonical: &Path) -> std::path::PathBuf {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// After a package is extracted, check its `package.json` for lifecycle scripts.
-///
-/// If the package has `install`, `preinstall`, or `postinstall` scripts and is
-/// not in the trust list, emits an `OAM-PKG0007` warning (the script is always
-/// skipped regardless of trust -- running scripts requires explicit support).
+/// Lifecycle scripts recorded for a trusted package, to run after the tree and
+/// bin shims are in place. `scripts` is `(phase, command)` pairs in npm
+/// execution order: preinstall, install, postinstall.
+struct PendingScripts {
+    pkg_dir: PathBuf,
+    pkg_name: String,
+    scripts: Vec<(&'static str, String)>,
+}
+
+/// After a package is extracted, inspect its `package.json` for lifecycle
+/// scripts. Returns `Some(PendingScripts)` ONLY when the package is in the
+/// trust list and has at least one lifecycle script (the caller runs them in a
+/// later pass). An untrusted package with scripts emits an `OAM-PKG0007`
+/// warning and returns `None` -- scripts run only after explicit
+/// `oam trust add <pkg>`. No scripts, or unreadable package.json, returns
+/// `None` quietly.
 fn check_lifecycle_scripts(
     dest: &Path,
     pkg_name: &str,
     trust: &crate::trust::TrustConfig,
     errors: &mut Vec<Diagnostic>,
-) {
-    let Ok(content) = std::fs::read_to_string(dest.join("package.json")) else {
-        return;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-    let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) else {
-        return;
-    };
+) -> Option<PendingScripts> {
+    let content = std::fs::read_to_string(dest.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let scripts = json.get("scripts").and_then(|s| s.as_object())?;
 
-    let lifecycle = ["install", "preinstall", "postinstall"];
-    let found: Vec<&str> = lifecycle
+    // npm execution order: preinstall -> install -> postinstall.
+    const PHASES: [&str; 3] = ["preinstall", "install", "postinstall"];
+    let present: Vec<(&'static str, String)> = PHASES
         .iter()
-        .copied()
-        .filter(|s| scripts.contains_key(*s))
+        .filter_map(|phase| {
+            scripts
+                .get(*phase)
+                .and_then(|v| v.as_str())
+                .map(|cmd| (*phase, cmd.to_string()))
+        })
         .collect();
 
-    if found.is_empty() || trust.is_trusted(pkg_name) {
+    if present.is_empty() {
+        return None;
+    }
+
+    if !trust.is_trusted(pkg_name) {
+        let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        let script_list = present
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>()
+            .join(", ");
+        errors.push(Diagnostic::new(
+            "OAM-PKG0007",
+            Severity::Warning,
+            Origin::Install,
+            format!(
+                "{pkg_name}@{version} has lifecycle script(s) ({script_list}) -- skipped; run 'oam trust add {pkg_name}' to allow"
+            ),
+        ));
+        return None;
+    }
+
+    Some(PendingScripts {
+        pkg_dir: dest.to_path_buf(),
+        pkg_name: pkg_name.to_string(),
+        scripts: present,
+    })
+}
+
+/// Run the lifecycle scripts collected from trusted packages, after the full
+/// tree and bin shims exist. Each script runs via the platform shell with
+/// cwd = the package dir and `node_modules/.bin` prepended to PATH. A failed
+/// script is surfaced as an `OAM-PKG0009` error (the install becomes Partial);
+/// execution continues with the next package so one bad script doesn't strand
+/// the rest. `OAM_IGNORE_SCRIPTS` (1/true/on/yes) is a global kill-switch that
+/// skips ALL execution regardless of trust -- like `npm --ignore-scripts`, for
+/// CI / hardened environments.
+fn run_lifecycle_scripts(
+    pending: &[PendingScripts],
+    node_modules: &Path,
+    errors: &mut Vec<Diagnostic>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    if scripts_globally_ignored() {
+        for pkg in pending {
+            errors.push(Diagnostic::new(
+                "OAM-PKG0007",
+                Severity::Warning,
+                Origin::Install,
+                format!(
+                    "{}: lifecycle scripts skipped (OAM_IGNORE_SCRIPTS set)",
+                    pkg.pkg_name
+                ),
+            ));
+        }
         return;
     }
 
-    let version = json.get("version").and_then(|v| v.as_str()).unwrap_or("?");
-    let script_list = found.join(", ");
-    errors.push(Diagnostic::new(
-        "OAM-PKG0007",
-        Severity::Warning,
-        Origin::Install,
-        format!(
-            "{pkg_name}@{version} has lifecycle script(s) ({script_list}) -- skipped; run 'oam trust add {pkg_name}' to allow"
-        ),
-    ));
+    let bin_dir = node_modules.join(".bin");
+    for pkg in pending {
+        for (phase, cmd) in &pkg.scripts {
+            if let Err(e) = run_one_script(cmd, phase, &pkg.pkg_dir, &bin_dir) {
+                errors.push(Diagnostic::new(
+                    "OAM-PKG0009",
+                    Severity::Error,
+                    Origin::Install,
+                    format!("{}: {phase} script failed: {e}", pkg.pkg_name),
+                ));
+            }
+        }
+    }
+}
+
+/// Whether `OAM_IGNORE_SCRIPTS` requests skipping all lifecycle execution.
+fn scripts_globally_ignored() -> bool {
+    matches!(
+        std::env::var("OAM_IGNORE_SCRIPTS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Run a single lifecycle script via the platform shell (`sh -c` / `cmd /C`),
+/// with `node_modules/.bin` prepended to PATH and `npm_lifecycle_event` set.
+fn run_one_script(cmd: &str, phase: &str, pkg_dir: &Path, bin_dir: &Path) -> Result<(), String> {
+    // Prepend node_modules/.bin to PATH so scripts can call installed bins.
+    let mut paths: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let new_path = std::env::join_paths(paths).map_err(|e| format!("PATH join: {e}"))?;
+
+    #[cfg(windows)]
+    let (sh, flag) = ("cmd", "/C");
+    #[cfg(not(windows))]
+    let (sh, flag) = ("sh", "-c");
+
+    let status = std::process::Command::new(sh)
+        .arg(flag)
+        .arg(cmd)
+        .current_dir(pkg_dir)
+        .env("PATH", new_path)
+        .env("npm_lifecycle_event", phase)
+        .status()
+        .map_err(|e| format!("spawn {sh}: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("exit code {:?}", status.code()))
+    }
 }
 
 fn diag(code: &str, message: impl Into<String>) -> Diagnostic {
@@ -1394,6 +1515,84 @@ mod tests {
             // Skipped on platforms without unprivileged symlinks.
             assert!(!tmp.join("link.txt").exists());
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A4: a TRUSTED package with a lifecycle script yields PendingScripts (to
+    // run later) and emits no warning; an UNTRUSTED one warns + returns None.
+    #[test]
+    fn check_lifecycle_scripts_trusted_vs_untrusted() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-a4-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pkg = tmp.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"p","version":"1.0.0","scripts":{"postinstall":"echo hi","build":"tsc"}}"#,
+        )
+        .unwrap();
+
+        // Untrusted: warns, returns None.
+        let empty = crate::trust::TrustConfig::default();
+        let mut errors = Vec::new();
+        assert!(check_lifecycle_scripts(&pkg, "p", &empty, &mut errors).is_none());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "OAM-PKG0007");
+
+        // Trusted: returns the lifecycle scripts only (not "build"), no warning.
+        let mut trusted = crate::trust::TrustConfig::default();
+        trusted.add("p");
+        let mut errors2 = Vec::new();
+        let pending = check_lifecycle_scripts(&pkg, "p", &trusted, &mut errors2)
+            .expect("trusted pkg with scripts yields pending");
+        assert!(errors2.is_empty(), "trusted: no warning; got {errors2:?}");
+        assert_eq!(
+            pending.scripts.len(),
+            1,
+            "only lifecycle scripts, not build"
+        );
+        assert_eq!(pending.scripts[0].0, "postinstall");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // A4: run_lifecycle_scripts actually executes a trusted package's script
+    // (here a postinstall that writes a marker file in the package dir).
+    #[test]
+    fn run_lifecycle_scripts_executes_trusted() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oam-a4-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nm = tmp.join("node_modules");
+        let pkg_dir = nm.join("trusted-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        // `echo ... > marker.txt` works under both `sh -c` and `cmd /C`.
+        let pending = vec![PendingScripts {
+            pkg_dir: pkg_dir.clone(),
+            pkg_name: "trusted-pkg".to_string(),
+            scripts: vec![("postinstall", "echo done > marker.txt".to_string())],
+        }];
+        let mut errors = Vec::new();
+        run_lifecycle_scripts(&pending, &nm, &mut errors);
+
+        assert!(errors.is_empty(), "script should succeed; got {errors:?}");
+        assert!(
+            pkg_dir.join("marker.txt").is_file(),
+            "postinstall should have created the marker"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
