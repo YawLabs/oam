@@ -13582,3 +13582,79 @@ fn cjs_bytecode_cache_produced_and_reused() {
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+// B3b: an ESM module produces a V8 bytecode blob on first run and the second
+// run consumes it, staying correct. Same produce/reuse/correctness shape as
+// the CJS test, exercising the compile_module site instead of compile_function.
+#[test]
+fn esm_bytecode_cache_produced_and_reused() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-esm-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+
+    std::fs::write(
+        project_dir.join("lib.mjs"),
+        "export const answer = 21 * 2;\n",
+    )
+    .unwrap();
+    let entry = project_dir.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import { answer } from './lib.mjs';\nconsole.log('a=' + answer);\n",
+    )
+    .unwrap();
+
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", entry.to_str().unwrap()])
+            .current_dir(&project_dir)
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    // Run 1: compiles both ESM modules and produces bytecode blobs.
+    let out1 = run();
+    assert!(
+        out1.status.success(),
+        "first run should succeed; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out1.stdout).contains("a=42"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out1.stdout)
+    );
+
+    let bytecode_dir = cache.join("bytecode");
+    let count1 = count_v8c(&bytecode_dir);
+    // Two real ESM modules (entry + lib); at least those two blobs appear
+    // (builtin facades may add more, hence >=).
+    assert!(
+        count1 >= 2,
+        "first run should produce a blob per ESM module; found {count1}"
+    );
+
+    // Run 2: consumes the blobs; output stays correct, cache is not regrown.
+    let out2 = run();
+    assert!(out2.status.success(), "second run should succeed");
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("a=42"),
+        "second run output: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    assert_eq!(
+        count1,
+        count_v8c(&bytecode_dir),
+        "second run should reuse the cache, not regrow it"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

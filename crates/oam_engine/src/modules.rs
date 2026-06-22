@@ -967,11 +967,56 @@ fn load_module_graph(
         let origin = v8::ScriptOrigin::new(
             tc, name, 0, 0, false, 0, None, false, false, /* is_module */ true, None,
         );
-        let mut source = v8::script_compiler::Source::new(source_str, Some(&origin));
+        // V8 bytecode cache (B3b): consume a stored blob for this module
+        // source if present (skips parse + top-level compile), else compile
+        // fresh. Keyed by source + V8 version, so a foreign blob is never
+        // deserialized here; V8's rejected() guards a stale one. `cached_blob`
+        // is held across the compile because CachedData borrows it
+        // (BufferNotOwned). Applies to every module source -- real ESM files
+        // AND the generated builtin/CJS/JSON facades, all of which are
+        // deterministic for a given source string (a different facade is a
+        // different key, hence a miss, never a wrong hit).
+        let cached_blob = crate::code_cache::load(&code, crate::code_cache::Kind::Module);
+        let consuming = cached_blob.is_some();
+        let mut source = match cached_blob {
+            Some(ref blob) => v8::script_compiler::Source::new_with_cached_data(
+                source_str,
+                Some(&origin),
+                v8::script_compiler::CachedData::new(blob),
+            ),
+            None => v8::script_compiler::Source::new(source_str, Some(&origin)),
+        };
+        let compile_options = if consuming {
+            v8::script_compiler::CompileOptions::ConsumeCodeCache
+        } else {
+            v8::script_compiler::CompileOptions::NoCompileOptions
+        };
 
-        let Some(module) = v8::script_compiler::compile_module(tc, &mut source) else {
+        let Some(module) = v8::script_compiler::compile_module2(
+            tc,
+            &mut source,
+            compile_options,
+            v8::script_compiler::NoCacheReason::NoReason,
+        ) else {
             return Err(vec![catch_to_diagnostic(tc, &file)]);
         };
+
+        // Produce the bytecode on a miss (or if V8 rejected a stale blob).
+        // Produced at compile time, so the cache captures top-level module
+        // bytecode -- enough to skip the parse on the next run, which is the
+        // dominant cost. Inner-function bytecode (a post-evaluation produce)
+        // is a later refinement. Best-effort: a failed produce/write just
+        // means the next run re-compiles. `module` is a Copy Local, so this
+        // does not disturb the Global::new below.
+        let refresh_cache = !consuming
+            || source
+                .get_cached_data()
+                .map(|cd| cd.rejected())
+                .unwrap_or(true);
+        if refresh_cache && let Some(cd) = module.get_unbound_module_script(tc).create_code_cache()
+        {
+            crate::code_cache::store(&code, crate::code_cache::Kind::Module, &cd);
+        }
 
         let hash = module.get_identity_hash();
         let global = v8::Global::new(tc, module);

@@ -24,10 +24,9 @@ use std::path::PathBuf;
 /// bytecode, so they are keyed apart even for identical source text.
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
-    /// ESM module bytecode. Wired by B3b (the `compile_module` site); the
-    /// variant exists now so the cache key space is reserved and stable.
-    #[allow(dead_code)]
+    /// ESM module bytecode (the `compile_module` site).
     Module,
+    /// CJS require-wrapper bytecode (the `compile_function` site).
     Function,
 }
 
@@ -85,7 +84,9 @@ fn entry_path(source: &str, kind: Kind) -> PathBuf {
     hasher.update([kind.tag()]);
     hasher.update(source.as_bytes());
     let hex = hex32(&hasher.finalize().into());
-    cache_root().join(&hex[..2]).join(format!("{}.v8c", &hex[2..]))
+    cache_root()
+        .join(&hex[..2])
+        .join(format!("{}.v8c", &hex[2..]))
 }
 
 /// Load a cached bytecode blob for `source` of `kind`, if one exists for the
