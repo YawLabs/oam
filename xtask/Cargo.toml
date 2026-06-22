@@ -10,3 +10,7 @@ publish = false
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+# bench mcp-idle-rss reads a child process's RSS by PID. Windows uses
+# tasklist, linux reads /proc; sysinfo backs the remaining unix targets
+# (macOS) where /proc is absent. Same crate the engine os natives use.
+sysinfo = { workspace = true }

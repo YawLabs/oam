@@ -333,7 +333,7 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
         let kb: u64 = digits.parse().ok()?;
         Some(kb * 1024)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         // /proc/<pid>/status VmRSS line: "VmRSS:   12345 kB"
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -344,6 +344,16 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
             }
         }
         None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // macOS (and other non-linux unix): no /proc. Read the child's RSS by
+        // PID via sysinfo. sysinfo's Process::memory() already returns bytes.
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        sys.process(pid).map(|p| p.memory())
     }
 }
 
