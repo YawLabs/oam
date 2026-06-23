@@ -123,25 +123,38 @@ out and only ever compile the `else` branch.
      io_uring `File`s -- a registry refactor). Out of scope.
 3. Slice 3 (maybe): stat via statx; evaluate the socket reactor, separately.
 
-## Measurement (results)
+## Measurement (results) -- io_uring is NOT a win here; stays opt-in
 
-The `io-uring-ab` job in `bench.yml` A/Bs the same oam binary with the fast path
-off vs on, running `bench/io_uring_ab.mjs` (64 concurrent async file ops x 200
-timed iters, median ms) on `ubuntu-latest`. Result (run 27994979860, 3 reps per
-mode, tight variance):
+The `io-uring-ab` job in `bench.yml` A/Bs the same oam binary off vs on
+(`bench/io_uring_ab.mjs`, a size x concurrency read sweep, median ms, ubuntu).
 
-| op    | baseline median | io_uring median | speedup     |
-|-------|-----------------|-----------------|-------------|
-| read  | ~2.30 ms        | ~1.52 ms        | ~1.5x (-34%) |
-| write | ~3.64 ms        | ~3.31 ms        | ~1.1x (-9%)  |
+A first single-point run (16 KiB / concurrency 64) looked like a ~1.5x read win,
+but a full **size x concurrency sweep did not reproduce it** -- and a re-sweep
+after the chunking fix below confirmed it. Ratio = io_uring / baseline (>1 =
+io_uring SLOWER), large-file rows, robust across both sweeps and all reps:
 
-Concurrent async **reads are ~1.4-1.5x faster** with io_uring -- the dispatch
-hop pays off for the primary case. Writes see a modest ~8-10%.
+| size  | conc | io_uring vs baseline |
+|-------|------|----------------------|
+| 1 MiB | 1    | ~2.5x SLOWER         |
+| 1 MiB | 8    | ~2x SLOWER           |
+| 1 MiB | 64   | ~2.2x SLOWER         |
 
-Caveats: shared CI runner (directional, though the 3 reps were tight); a single
-file size (16 KiB) and concurrency (64) -- one data point, not a curve. The read
-win justifies *considering* default-on (it is opt-in today); writes are
-marginal. Re-measure across sizes/concurrency before flipping the default.
+Small/mid files (4-64 KiB) are noise at this scale (0.08-2 ms on a shared
+runner) -- one cell won in sweep 1 and lost in sweep 2. The **only robust signal
+is that io_uring loses ~2x on large reads**, consistently.
+
+**Conclusion:** the dedicated-thread dispatch hop (channel + worker + oneshot,
+plus cross-thread coordination) costs more than io_uring saves at oam's file
+sizes; tokio's blocking pool (large `std::fs` syscalls) already does well. The
+read-chunk fix below did NOT change the large-file loss, which confirms the
+bottleneck is architectural, not chunk count.
+
+**Decision: io_uring stays OPT-IN (`OAM_IO_URING=1`), default OFF.** Default-on
+would regress large reads ~2x. The lane is kept (CI-verified, correct,
+fallback-safe) as a foundation for a future architecture that could actually win
+-- inline io_uring on the executor thread (no dispatch hop) or batched
+submission -- not because the current dispatch-hop design wins. Revisit only
+with such a redesign.
 
 ## Verification (Linux-only code, developed via CI)
 
