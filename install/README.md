@@ -56,9 +56,20 @@ Windows Authenticode later, insert a signing step in each `release.yml` build
 job (there's a documented seam) and supply the cert material as secrets; the
 installers don't change.
 
+## Updating
+
+```sh
+oam self-update              # update in place to the latest release
+oam self-update --version v0.7.0   # pin a specific tag
+oam self-update --dry-run    # print the installer command, run nothing
+```
+
+`oam self-update` re-runs the canonical installer above (so there's ONE source
+of download + checksum-verify + running-exe-replace logic). It updates oam where
+it currently lives -- it points the installer at the running binary's directory
+via `OAM_INSTALL_DIR`. Override the installer URL with `OAM_SELF_UPDATE_URL`.
+
 ## Not yet wired
 
-- `oam self-update` (next slice): version-check against the update channel,
-  download + verify + atomic self-replace.
 - npm package `@yawlabs/oam` (a thin postinstall wrapper that fetches the
   matching binary, esbuild-style).
