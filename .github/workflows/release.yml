@@ -1,0 +1,144 @@
+name: Release
+
+# Cuts a GitHub Release on a v* tag: cross-compiles `oam` on each platform's
+# native runner, names each binary `oam-<target-triple>[.exe]`, and publishes
+# them plus a SHA256SUMS manifest as release assets. The oam.sh install script
+# and `oam self-update` consume exactly these asset names (see install/).
+#
+# NOTE: the YawLabs org Actions policy is "selected" (GitHub-owned actions
+# only). This workflow uses ONLY actions/checkout, actions/upload-artifact,
+# actions/download-artifact; the release itself is cut with `gh release create`
+# (the gh CLI ships on every hosted runner, authed by GITHUB_TOKEN) rather than
+# a third-party release action, which would fail the workflow at startup.
+#
+# Signing seam: binaries are shipped UNSIGNED + checksummed (the @yawlabs
+# distribution model -- scoop/curl/brew fetch bypass Gatekeeper/SmartScreen
+# quarantine). To add Apple notarization / Windows Authenticode later, insert a
+# signing step in each build job after "Stage binary" and before "Upload
+# artifact", and add the cert material as org/repo secrets. The rest of the
+# pipeline is unchanged.
+
+on:
+  push:
+    tags: ['v*']
+  # Manual dry-run: build + checksum the assets without cutting a release.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build release oam
+        run: cargo build --release -p oam_cli
+      - name: Stage binary as oam-<target>
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/oam.exe "dist/oam-${{ matrix.target }}.exe"
+          else
+            cp target/release/oam "dist/oam-${{ matrix.target }}"
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oam-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ARM hosted runners (windows-11-arm, ubuntu-24.04-arm) are PUBLIC-repo only,
+  # same as ci.yml's test-arm. Gated on visibility so these targets join the
+  # release automatically once the repo goes public. While private, releases
+  # ship the four core targets above (the win-arm64 binary is the daily-driven
+  # dev target and is covered locally until then).
+  build-arm:
+    name: build ${{ matrix.target }}
+    if: ${{ !github.event.repository.private }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build release oam
+        run: cargo build --release -p oam_cli
+      - name: Stage binary as oam-<target>
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/oam.exe "dist/oam-${{ matrix.target }}.exe"
+          else
+            cp target/release/oam "dist/oam-${{ matrix.target }}"
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oam-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [build, build-arm]
+    # Run when the core build succeeded, even if build-arm was skipped (private
+    # repo) or one ARM leg failed -- ship whatever targets built.
+    if: ${{ always() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets + SHA256SUMS
+        shell: bash
+        run: |
+          mkdir -p release
+          # Each artifact is a dir (oam-<target>/) holding one binary; flatten.
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          ls -1
+          sha256sum oam-* > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+      - name: Cut GitHub Release (tag push only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            release/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --verify-tag
