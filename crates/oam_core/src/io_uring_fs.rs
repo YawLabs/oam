@@ -124,14 +124,21 @@ fn enabled() -> bool {
     )
 }
 
-/// Read a whole file via io_uring: open, `read_at` in 64 KiB chunks until EOF,
-/// close. A fresh buffer per chunk keeps the owned-buffer dance unambiguous.
+/// Read a whole file via io_uring: open, `read_at` until EOF, close.
+///
+/// Chunks start at 64 KiB and DOUBLE up to a 4 MiB cap, so a small file is one
+/// op while a large file ramps to a few large reads. The original fixed-64 KiB
+/// loop did 16+ ring round-trips for a 1 MiB file -- the A/B sweep showed that
+/// losing ~2x to the blocking pool (which reads in big syscalls). A short read
+/// on a regular file means EOF, so we skip the trailing zero-length read.
 async fn read_whole(path: &str) -> std::io::Result<Vec<u8>> {
+    const MAX_CHUNK: usize = 4 * 1024 * 1024;
     let file = tokio_uring::fs::File::open(path).await?;
     let mut out = Vec::new();
     let mut pos = 0u64;
+    let mut chunk = 64 * 1024usize;
     loop {
-        let buf = vec![0u8; 64 * 1024];
+        let buf = vec![0u8; chunk];
         // BufResult<usize, Vec<u8>> = (io::Result<usize>, Vec<u8>): the buffer
         // is moved in and handed back.
         let (res, buf) = file.read_at(buf, pos).await;
@@ -141,6 +148,10 @@ async fn read_whole(path: &str) -> std::io::Result<Vec<u8>> {
         }
         out.extend_from_slice(&buf[..n]);
         pos += n as u64;
+        if n < chunk {
+            break; // short read on a regular file = EOF
+        }
+        chunk = (chunk * 2).min(MAX_CHUNK);
     }
     // Best-effort close; the bytes are already read.
     let _ = file.close().await;
