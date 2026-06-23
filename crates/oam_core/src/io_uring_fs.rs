@@ -53,13 +53,27 @@ impl UringFs {
             .name("oam-io-uring".to_string())
             .spawn(move || {
                 tokio_uring::start(async move {
+                    // Backpressure: cap concurrent in-flight ops so a worker
+                    // stall can't let unbounded ops/buffers pile up (the request
+                    // channel is unbounded). Each spawned task acquires a permit
+                    // and holds it across read_whole/write_all, so at most
+                    // CONCURRENCY ops -- and their per-op buffers, which are only
+                    // allocated after the permit is held -- are live at once.
+                    // Tasks past the cap park on acquire() before touching the
+                    // ring or allocating, which is where the bound bites.
+                    const CONCURRENCY: usize = 128;
+                    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
                     while let Some(req) = rx.recv().await {
                         // Spawn each op so multiple are in flight on the ring
                         // concurrently (tokio_uring::spawn = spawn_local on the
                         // io_uring current-thread runtime). The recv loop keeps
                         // accepting while prior ops complete -- the point of
                         // io_uring over the blocking pool.
+                        let sem = sem.clone();
                         tokio_uring::spawn(async move {
+                            // Hold the permit for the lifetime of the op so it
+                            // bounds in-flight ops, not just dispatch.
+                            let _permit = sem.acquire().await;
                             match req {
                                 UringRequest::Read { path, reply } => {
                                     let _ = reply.send(read_whole(&path).await);
@@ -89,15 +103,43 @@ impl UringFs {
     }
 
     /// Write a file via io_uring (create + truncate + write). `data` is moved
-    /// in -- no clone -- so the caller returns this result directly rather than
-    /// retrying via std (the rare "worker gone" error is reported as-is).
-    pub async fn write_file(&self, path: String, data: Vec<u8>) -> std::io::Result<()> {
+    /// in -- no clone on the happy path.
+    ///
+    /// On a worker-channel failure ("worker stopped" / "reply dropped") the
+    /// un-consumed `data` is handed back as `Err((err, data))` so the caller can
+    /// retry via the std path with no clone. A genuine io error from the worker
+    /// (the buffer is already consumed by then) is returned as `Err((err,
+    /// Vec::new()))` -- the empty `Vec` is the caller's "this is a real error,
+    /// surface it" signal, distinct from the populated `Vec` on a send failure.
+    pub async fn write_file(
+        &self,
+        path: String,
+        data: Vec<u8>,
+    ) -> Result<(), (std::io::Error, Vec<u8>)> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(UringRequest::Write { path, data, reply })
-            .map_err(|_| std::io::Error::other("io_uring worker stopped"))?;
-        rx.await
-            .map_err(|_| std::io::Error::other("io_uring reply dropped"))?
+        // Send failure: the worker is gone and `data` rides back inside the
+        // returned UringRequest::Write, so we can hand it to the caller for a
+        // std retry without cloning.
+        if let Err(send_err) = self.tx.send(UringRequest::Write { path, data, reply }) {
+            let data = match send_err.0 {
+                UringRequest::Write { data, .. } => data,
+                // Unreachable: we only ever send a Write here. Recover an empty
+                // buffer rather than panic.
+                _ => Vec::new(),
+            };
+            return Err((std::io::Error::other("io_uring worker stopped"), data));
+        }
+        match rx.await {
+            // Worker replied: the buffer was consumed by write_all, so a genuine
+            // io error carries no recoverable data -- signal "real error" with
+            // an empty Vec.
+            Ok(res) => res.map_err(|e| (e, Vec::new())),
+            // Reply dropped: the worker died after we sent but before replying.
+            // The buffer went with the dropped task, so we can't recover it;
+            // signal "real error" with an empty Vec. The caller surfaces this
+            // directly (it has no buffer of its own to retry std with).
+            Err(_) => Err((std::io::Error::other("io_uring reply dropped"), Vec::new())),
+        }
     }
 }
 

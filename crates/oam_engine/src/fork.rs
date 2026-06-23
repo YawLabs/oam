@@ -154,9 +154,8 @@ impl ForkPool {
                 };
                 match slot.tx.try_send(req) {
                     Ok(()) => (),
-                    // Slot disconnected (thread exited early): cold spawn.
-                    Err(mpsc::TrySendError::Full(req))
-                    | Err(mpsc::TrySendError::Disconnected(req)) => {
+                    // Slot full (thread still alive but busy): cold spawn.
+                    Err(mpsc::TrySendError::Full(req)) => {
                         cold_spawn(
                             req.script,
                             req.worker_data,
@@ -164,6 +163,22 @@ impl ForkPool {
                             req.msg_rx,
                             event_tx,
                         );
+                    }
+                    // Slot disconnected: the prewarm thread died (e.g. panicked
+                    // before recv), so this slot's tx had no live receiver. We
+                    // just removed that dead slot from the pool above, and the
+                    // dead thread never reached the refill path -- so without a
+                    // refill here the pool would shrink by one permanently. Spawn
+                    // a fresh slot so the pool self-heals back to `capacity`.
+                    Err(mpsc::TrySendError::Disconnected(req)) => {
+                        cold_spawn(
+                            req.script,
+                            req.worker_data,
+                            req.worker_id,
+                            req.msg_rx,
+                            event_tx,
+                        );
+                        Self::add_slot(self);
                     }
                 }
             }
@@ -188,6 +203,15 @@ fn cold_spawn(
 
 /// Execute a `ForkRequest` on an already-initialized `JsRuntime`.
 fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) -> i32 {
+    // Match the cold-fork path (worker::run_worker): set process.argv so a
+    // forked worker sees process.argv[1] == script path. Without this, argv is
+    // present on cold spawns but ABSENT on warm spawns -- non-deterministic by
+    // pool state. Per-request: the script path isn't known until the request.
+    rt.set_process_argv(vec![
+        "oam".to_string(),
+        req.script.to_string_lossy().into_owned(),
+    ]);
+
     let ctx = WorkerContext {
         inbox: std::sync::Arc::new(Mutex::new(Some(req.msg_rx))),
         outbox: req.event_tx.clone(),

@@ -13461,7 +13461,7 @@ fn install_precompile_creates_cache() {
         .join(".oam")
         .join("precompile")
         .join("fake-pkg")
-        .join("index.js");
+        .join("index.ts.js");
     assert!(
         cache_file.exists(),
         "precompile cache file should exist at {}",
@@ -13519,7 +13519,7 @@ fn install_precompile_cts_cache_used_on_run() {
         .join("fake-pkg");
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(
-        cache_dir.join("index.js"),
+        cache_dir.join("index.cts.js"),
         "// oam-precompile-sentinel\nexports.value = 42;\n",
     )
     .unwrap();
@@ -13530,7 +13530,7 @@ fn install_precompile_cts_cache_used_on_run() {
     {
         use sha2::{Digest, Sha256};
         let src = std::fs::read(pkg_dir.join("index.cts")).unwrap();
-        std::fs::write(cache_dir.join("index.js.hash"), Sha256::digest(&src)).unwrap();
+        std::fs::write(cache_dir.join("index.cts.js.hash"), Sha256::digest(&src)).unwrap();
     }
 
     let entry = project_dir.join("main.cjs");
@@ -13600,12 +13600,12 @@ fn install_precompile_esm_ts_cache_used_on_run() {
         .join("precompile")
         .join("esm-pkg");
     std::fs::create_dir_all(&cache_dir).unwrap();
-    std::fs::write(cache_dir.join("index.js"), "export const value = 42;\n").unwrap();
+    std::fs::write(cache_dir.join("index.ts.js"), "export const value = 42;\n").unwrap();
     // Matching hash sidecar so the sentinel entry is considered fresh (B2).
     {
         use sha2::{Digest, Sha256};
         let src = std::fs::read(pkg_dir.join("index.ts")).unwrap();
-        std::fs::write(cache_dir.join("index.js.hash"), Sha256::digest(&src)).unwrap();
+        std::fs::write(cache_dir.join("index.ts.js.hash"), Sha256::digest(&src)).unwrap();
     }
 
     let entry = project_dir.join("main.mjs");

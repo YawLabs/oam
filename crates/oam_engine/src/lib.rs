@@ -243,15 +243,18 @@ impl JsRuntime {
       }};
     }}
   }} else if (mode === "replay") {{
+    var _origRandom = Math.random.bind(Math);
     Math.random = function random() {{
-      return __oam.replayRng(Math.random._orig ? Math.random._orig() : 0.5);
+      return __oam.replayRng(_origRandom());
     }};
+    var _origDateNow = Date.now.bind(Date);
     Date.now = function now() {{
-      return __oam.replayDateNow(0);
+      return __oam.replayDateNow(_origDateNow());
     }};
     if (typeof performance !== "undefined" && performance.now) {{
+      var _origPerfNow = performance.now.bind(performance);
       performance.now = function now() {{
-        return __oam.replayPerfNow(0);
+        return __oam.replayPerfNow(_origPerfNow());
       }};
     }}
   }}

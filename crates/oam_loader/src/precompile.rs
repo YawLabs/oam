@@ -90,8 +90,15 @@ fn cache_path_for(
     cache_root: &Path,
 ) -> Option<PathBuf> {
     let rel = ts_path.strip_prefix(pkg_dir).ok()?;
-    let js_rel = rel.with_extension("js");
-    Some(cache_root.join(pkg_name).join(js_rel))
+    // Append ".js" to the FULL relative path rather than replacing the final
+    // extension. with_extension("js") is NOT injective over the TS extension
+    // set (index.ts/.tsx/.cts/.mts all map to index.js, and dotted basenames
+    // like my.module.ts collide with my.ts), so colliding files share one
+    // cache slot and clobber each other. Appending preserves the original
+    // extension -> index.ts.js, index.tsx.js, my.module.ts.js are all distinct.
+    let mut js_rel = rel.as_os_str().to_os_string();
+    js_rel.push(".js");
+    Some(cache_root.join(pkg_name).join(PathBuf::from(js_rel)))
 }
 
 /// Ensure the `node_modules/.oam/.gitignore` file exists so the cache is
@@ -225,11 +232,15 @@ pub fn try_precompile_cache(ts_path: &Path, source: &str) -> Option<String> {
 
     // rel is e.g. "ms/index.ts" (pkg/...path)
     let rel = ts_path.strip_prefix(nm).ok()?;
+    // MUST match the writer (cache_path_for): append ".js" to the full
+    // relative path so the lookup is injective over the TS extension set and
+    // agrees with what precompile_package wrote (index.ts -> index.ts.js).
+    let mut js_rel = rel.as_os_str().to_os_string();
+    js_rel.push(".js");
     let cache_path = nm
         .join(".oam")
         .join("precompile")
-        .join(rel)
-        .with_extension("js");
+        .join(PathBuf::from(js_rel));
 
     // Serve only a fresh entry (non-empty .js whose sidecar matches `source`).
     if !cache_is_fresh(&cache_path, &source_hash(source)) {
@@ -272,7 +283,7 @@ mod tests {
         let count = precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap();
         assert_eq!(count, 1);
 
-        let out = cache_root.join("mypkg/index.js");
+        let out = cache_root.join("mypkg/index.ts.js");
         assert!(out.exists(), "cache file should exist");
         let js = fs::read_to_string(&out).unwrap();
         assert!(
@@ -300,7 +311,7 @@ mod tests {
         let count = precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap();
         // Only index.ts should be compiled; index.d.ts is skipped.
         assert_eq!(count, 1);
-        assert!(!cache_root.join("mypkg/index.d.js").exists());
+        assert!(!cache_root.join("mypkg/index.d.ts.js").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -320,7 +331,7 @@ mod tests {
             precompile_package(&pkg_dir, "mypkg", &cache_root).unwrap(),
             1
         );
-        let cache_file = cache_root.join("mypkg/index.js");
+        let cache_file = cache_root.join("mypkg/index.ts.js");
         assert!(cache_file.is_file());
         assert!(hash_sidecar(&cache_file).is_file(), "sidecar written");
 
@@ -370,7 +381,7 @@ mod tests {
         fs::write(pkg_dir.join("index.ts"), source).unwrap();
 
         // Write a cache entry + matching hash sidecar manually.
-        let cache_file = nm.join(".oam/precompile/mypkg/index.js");
+        let cache_file = nm.join(".oam/precompile/mypkg/index.ts.js");
         fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
         fs::write(&cache_file, "const x = 1;\n").unwrap();
         fs::write(hash_sidecar(&cache_file), source_hash(source)).unwrap();

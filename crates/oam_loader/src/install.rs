@@ -209,6 +209,13 @@ pub fn install(
     // node_modules/.bin (which isn't populated until then).
     let mut pending_scripts: Vec<PendingScripts> = Vec::new();
     let trust = crate::trust::TrustConfig::load(project_dir);
+    // Per-package "scripts already ran" stamps live here. A marker is written
+    // AFTER a package's lifecycle scripts complete successfully, so a warm
+    // install can tell "extracted AND scripts ran" (skip) apart from
+    // "extracted but scripts never ran" (a crash between extract and the
+    // script pass -- run them once now). This is what gives oam npm's
+    // run-once semantics across repeated install() calls.
+    let scripts_ran_dir = node_modules.join(".oam").join("scripts-ran");
     let cache_root = project_dir
         .join("node_modules")
         .join(".oam")
@@ -233,12 +240,19 @@ pub fn install(
             .unwrap_or(key);
 
         // Skip already-installed packages (idempotency for partial installs).
+        // WARM path: the package was extracted by a prior install run. npm runs
+        // pre/install/postinstall exactly ONCE, at extract time -- not on every
+        // resolve -- so we do NOT re-run scripts here just because the package
+        // is present. We DO run them if the stamp marker is absent, which means
+        // a prior run extracted the package but died before the script pass
+        // (so the scripts genuinely never ran). The marker is written only
+        // after a successful run, below.
         if dest.join("package.json").is_file() {
             installed += 1;
-            // Still check scripts for already-installed packages so a trusted
-            // package's scripts run (or an untrusted one warns) even on a warm
-            // install.
-            if let Some(ps) = check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors) {
+            if !script_marker_path(&scripts_ran_dir, pkg_name).is_file()
+                && let Some(ps) =
+                    check_lifecycle_scripts(&dest, pkg_name, &scripts_ran_dir, &trust, &mut errors)
+            {
                 pending_scripts.push(ps);
             }
             continue;
@@ -247,7 +261,11 @@ pub fn install(
         match fetch_and_extract(&rt, &client, resolved, entry.integrity.as_deref(), &dest) {
             Ok(()) => {
                 installed += 1;
-                if let Some(ps) = check_lifecycle_scripts(&dest, pkg_name, &trust, &mut errors) {
+                // FRESH path: the package was just extracted this call, so its
+                // scripts have never run -- enqueue them unconditionally.
+                if let Some(ps) =
+                    check_lifecycle_scripts(&dest, pkg_name, &scripts_ran_dir, &trust, &mut errors)
+                {
                     pending_scripts.push(ps);
                 }
                 if precompile
@@ -852,6 +870,20 @@ struct PendingScripts {
     pkg_dir: PathBuf,
     pkg_name: String,
     scripts: Vec<(&'static str, String)>,
+    /// `node_modules/.oam/scripts-ran/<sanitized-pkg-name>` -- written AFTER
+    /// every phase for this package succeeds, so a later warm install skips
+    /// re-running (npm run-once semantics).
+    marker_path: PathBuf,
+}
+
+/// Path of the per-package "scripts already ran" stamp under
+/// `node_modules/.oam/scripts-ran/`. The npm package name keys the marker
+/// (consistent with how `trust.json` keys packages), but a scoped name like
+/// `@scope/name` contains a `/`; we replace it with `+` so the marker is a
+/// single flat file (no nested dirs, no `@scope`-dir-vs-file collision).
+fn script_marker_path(scripts_ran_dir: &Path, pkg_name: &str) -> PathBuf {
+    let safe = pkg_name.replace('/', "+");
+    scripts_ran_dir.join(safe)
 }
 
 /// After a package is extracted, inspect its `package.json` for lifecycle
@@ -864,6 +896,7 @@ struct PendingScripts {
 fn check_lifecycle_scripts(
     dest: &Path,
     pkg_name: &str,
+    scripts_ran_dir: &Path,
     trust: &crate::trust::TrustConfig,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<PendingScripts> {
@@ -909,6 +942,7 @@ fn check_lifecycle_scripts(
         pkg_dir: dest.to_path_buf(),
         pkg_name: pkg_name.to_string(),
         scripts: present,
+        marker_path: script_marker_path(scripts_ran_dir, pkg_name),
     })
 }
 
@@ -945,8 +979,10 @@ fn run_lifecycle_scripts(
 
     let bin_dir = node_modules.join(".bin");
     for pkg in pending {
+        let mut all_ok = true;
         for (phase, cmd) in &pkg.scripts {
             if let Err(e) = run_one_script(cmd, phase, &pkg.pkg_dir, &bin_dir) {
+                all_ok = false;
                 errors.push(Diagnostic::new(
                     "OAM-PKG0009",
                     Severity::Error,
@@ -954,6 +990,17 @@ fn run_lifecycle_scripts(
                     format!("{}: {phase} script failed: {e}", pkg.pkg_name),
                 ));
             }
+        }
+        // Stamp the run-once marker only when EVERY phase succeeded. A failed
+        // phase leaves no marker, so the next install re-attempts the scripts
+        // (matching the partial-install retry semantics elsewhere in install()).
+        // Marker-write failure is non-fatal: worst case a future warm install
+        // re-runs an idempotent script -- better than poisoning the install.
+        if all_ok {
+            if let Some(parent) = pkg.marker_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pkg.marker_path, b"");
         }
     }
 }
@@ -1538,10 +1585,14 @@ mod tests {
         )
         .unwrap();
 
+        let scripts_ran_dir = tmp.join("node_modules").join(".oam").join("scripts-ran");
+
         // Untrusted: warns, returns None.
         let empty = crate::trust::TrustConfig::default();
         let mut errors = Vec::new();
-        assert!(check_lifecycle_scripts(&pkg, "p", &empty, &mut errors).is_none());
+        assert!(
+            check_lifecycle_scripts(&pkg, "p", &scripts_ran_dir, &empty, &mut errors).is_none()
+        );
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "OAM-PKG0007");
 
@@ -1549,7 +1600,7 @@ mod tests {
         let mut trusted = crate::trust::TrustConfig::default();
         trusted.add("p");
         let mut errors2 = Vec::new();
-        let pending = check_lifecycle_scripts(&pkg, "p", &trusted, &mut errors2)
+        let pending = check_lifecycle_scripts(&pkg, "p", &scripts_ran_dir, &trusted, &mut errors2)
             .expect("trusted pkg with scripts yields pending");
         assert!(errors2.is_empty(), "trusted: no warning; got {errors2:?}");
         assert_eq!(
@@ -1579,10 +1630,13 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
         // `echo ... > marker.txt` works under both `sh -c` and `cmd /C`.
+        let scripts_ran_dir = nm.join(".oam").join("scripts-ran");
+        let stamp = script_marker_path(&scripts_ran_dir, "trusted-pkg");
         let pending = vec![PendingScripts {
             pkg_dir: pkg_dir.clone(),
             pkg_name: "trusted-pkg".to_string(),
             scripts: vec![("postinstall", "echo done > marker.txt".to_string())],
+            marker_path: stamp.clone(),
         }];
         let mut errors = Vec::new();
         run_lifecycle_scripts(&pending, &nm, &mut errors);
@@ -1591,6 +1645,12 @@ mod tests {
         assert!(
             pkg_dir.join("marker.txt").is_file(),
             "postinstall should have created the marker"
+        );
+        // The run-once stamp must be written after a successful run, so a later
+        // warm install skips re-running the script.
+        assert!(
+            stamp.is_file(),
+            "scripts-ran stamp should exist after a successful run"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

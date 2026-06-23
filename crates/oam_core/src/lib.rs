@@ -885,19 +885,35 @@ pub mod ops {
 
     pub async fn fs_write_file(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
         // io_uring fast path (Linux, opt-in): non-append writes only (create +
-        // truncate + write_all_at). `data` is moved in -- no clone -- so on
-        // error we return the node-shaped error directly rather than retrying
-        // via std (the rare "worker gone" case is reported as-is). Append and
-        // the no-io_uring case use the std path below.
+        // truncate + write_all_at). `data` is moved in -- no clone on the happy
+        // path. On a worker-channel failure write_file hands the un-consumed
+        // `data` back (a non-empty Vec) so we fall through to the std path with
+        // it; a genuine io error from the worker comes back with an empty Vec
+        // and is surfaced directly (node_fail), matching the read path's
+        // "io_uring is a pure optimization, never a correctness dependency"
+        // contract. Append and the no-io_uring case use the std path below.
         #[cfg(target_os = "linux")]
         {
             if !append && let Some(uring) = crate::io_uring_fs::global() {
-                return match uring.write_file(path.clone(), data).await {
-                    Ok(()) => OpOutcome::Done,
-                    Err(e) => node_fail(e, "open", &path),
-                };
+                match uring.write_file(path.clone(), data).await {
+                    Ok(()) => return OpOutcome::Done,
+                    // Channel failure with the buffer recovered: retry via std.
+                    Err((_chan_err, recovered)) if !recovered.is_empty() => {
+                        return fs_write_file_std(path, recovered, append).await;
+                    }
+                    // Genuine io error (empty buffer), or an unrecoverable
+                    // channel failure where the data is gone: surface directly.
+                    Err((e, _)) => return node_fail(e, "open", &path),
+                }
             }
         }
+        fs_write_file_std(path, data, append).await
+    }
+
+    /// std write path (blocking-pool append / `tokio::fs::write`). Factored out
+    /// so the io_uring fast path can fall through to it with a recovered buffer
+    /// on a worker-channel failure.
+    async fn fs_write_file_std(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
         let result = if append {
             tokio::task::spawn_blocking({
                 let path = path.clone();
