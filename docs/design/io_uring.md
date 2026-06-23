@@ -123,13 +123,25 @@ out and only ever compile the `else` branch.
      io_uring `File`s -- a registry refactor). Out of scope.
 3. Slice 3 (maybe): stat via statx; evaluate the socket reactor, separately.
 
-## Measurement (still TODO)
+## Measurement (results)
 
-io_uring is opt-in (`OAM_IO_URING=1`) and off by default, so the standard CI
-runs exercise the fallback. A formal A/B (bench.yml ubuntu leg, fast path on vs
-off) is its own step and has not been done yet -- the slices so far establish
-*correctness* on the ubuntu leg; the perf win is asserted by design, not yet
-measured. Do not claim a speedup until the bench shows one.
+The `io-uring-ab` job in `bench.yml` A/Bs the same oam binary with the fast path
+off vs on, running `bench/io_uring_ab.mjs` (64 concurrent async file ops x 200
+timed iters, median ms) on `ubuntu-latest`. Result (run 27994979860, 3 reps per
+mode, tight variance):
+
+| op    | baseline median | io_uring median | speedup     |
+|-------|-----------------|-----------------|-------------|
+| read  | ~2.30 ms        | ~1.52 ms        | ~1.5x (-34%) |
+| write | ~3.64 ms        | ~3.31 ms        | ~1.1x (-9%)  |
+
+Concurrent async **reads are ~1.4-1.5x faster** with io_uring -- the dispatch
+hop pays off for the primary case. Writes see a modest ~8-10%.
+
+Caveats: shared CI runner (directional, though the 3 reps were tight); a single
+file size (16 KiB) and concurrency (64) -- one data point, not a curve. The read
+win justifies *considering* default-on (it is opt-in today); writes are
+marginal. Re-measure across sizes/concurrency before flipping the default.
 
 ## Verification (Linux-only code, developed via CI)
 
