@@ -75,3 +75,30 @@ jobs:
           path: |
             BENCHMARKS.md
             bench/results.json
+
+  # io_uring fast path (Linux-only): A/B the SAME oam binary with the fast path
+  # off vs on. Distinct from the oam-vs-node matrix above -- this is oam-vs-oam.
+  # See docs/design/io_uring.md.
+  io-uring-ab:
+    name: io_uring A/B (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: io-uring-ab-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: io-uring-ab-
+      - name: Build oam (release)
+        run: cargo build --release -p oam_cli
+      - name: io_uring A/B (concurrent async reads + writes; lower ms is better)
+        run: |
+          echo "## baseline (io_uring off):"
+          for i in 1 2 3; do ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
+          echo "## io_uring on (OAM_IO_URING=1):"
+          for i in 1 2 3; do OAM_IO_URING=1 ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
