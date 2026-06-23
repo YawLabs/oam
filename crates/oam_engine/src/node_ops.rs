@@ -383,7 +383,17 @@ pub(crate) fn arg_string(
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
 ) -> Option<String> {
-    args.get(index)
+    let value = args.get(index);
+    // A missing arg is `undefined`; v8's ToString would coerce that (and
+    // `null`) to the literal "undefined"/"null", silently turning an absent
+    // optional string into a present-but-bogus value. Treat null/undefined as
+    // absent so optional args are truly `None`. (This coercion is what tripped
+    // tls.connect's client-auth path -- a no-cert connection arrived as
+    // Some("undefined") and failed `no private key found in client key PEM`.)
+    if value.is_null_or_undefined() {
+        return None;
+    }
+    value
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
 }
@@ -1063,11 +1073,14 @@ fn op_tls_connect(
         return;
     };
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let server_name = arg_string(scope, &args, 2);
-    let ca_pem = arg_string(scope, &args, 3);
+    let server_name = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
+    let ca_pem = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(4).boolean_value(scope);
-    let client_cert_pem = arg_string(scope, &args, 5);
-    let client_key_pem = arg_string(scope, &args, 6);
+    // Empty PEM strings mean "not provided" -- only the (Some, Some) cert+key
+    // pair should build a client-auth config (build_client_config:103);
+    // otherwise a server-auth-only connection wrongly enters that branch.
+    let client_cert_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
+    let client_key_pem = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;

@@ -9909,6 +9909,63 @@ server.close();
 }
 
 #[test]
+fn tls_connect_server_auth_does_not_require_client_cert() {
+    // Regression: a server-auth-only `tls.connect` (no client cert/key,
+    // rejectUnauthorized:true) must reach real certificate validation -- it must
+    // NOT wrongly enter the client-auth path. That path was triggered by
+    // `arg_string` coercing a missing/undefined arg to the literal "undefined"
+    // (Some("undefined") instead of None), so the optional clientCert/clientKey
+    // arrived as present-but-bogus and failed with
+    // `no private key found in client key PEM` (tls.rs) before any handshake.
+    // Here the self-signed test cert is also passed as `ca`, so validation still
+    // fails (CaUsedAsEndEntity) -- but that proves build_client_config succeeded
+    // with no client auth; the bug error string must be absent.
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+
+const cert = `{cert}`;
+const key = `{key}`;
+
+const server = tls.createServer({{ cert, key }}, (s) => s.resume());
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+
+let outcome;
+try {{
+  const sock = tls.connect({{ host: '127.0.0.1', port, ca: cert, servername: 'localhost', rejectUnauthorized: true }});
+  await new Promise((res, rej) => {{ sock.on('secureConnect', () => res()); sock.on('error', rej); }});
+  outcome = 'connected';
+  sock.end();
+}} catch (e) {{
+  outcome = 'err:' + e.message;
+}}
+console.log('outcome=' + outcome);
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_server_auth.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("no private key found in client key PEM"),
+        "server-auth tls.connect wrongly entered the client-auth path (arg_string bug regressed): {combined}"
+    );
+    // It reached cert validation rather than the config error.
+    assert!(
+        combined.contains("outcome="),
+        "probe did not run: {combined}"
+    );
+}
+
+#[test]
 fn tls_create_server_echo() {
     let src = format!(
         r#"
