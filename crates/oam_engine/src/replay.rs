@@ -263,47 +263,6 @@ impl ReplayState {
 
 /// In record mode: serialize the outcome and push a ReplayEvent::Op, return
 /// completion unchanged. In replay mode: replace outcome with recorded one.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Regression: f64 ReplayEvents must round-trip through JSON bit-exactly, so
-    // a replayed Math.random / performance.now reproduces the recorded run
-    // character-for-character. 0.10534155930636513 is a value serde_json's
-    // decimal float round-trip got wrong (came back 1 ULP low) before the
-    // bits-based encoding.
-    #[test]
-    fn f64_events_roundtrip_bit_exact() {
-        let values = [
-            0.10534155930636513f64,
-            0.10534155930636512f64,
-            0.5,
-            0.0,
-            1.0,
-            f64::MIN_POSITIVE,
-            0.123456789012345678,
-        ];
-        for v in values {
-            for ev in [
-                ReplayEvent::Rng { seq: 1, value: v },
-                ReplayEvent::PerfNow { seq: 2, value: v },
-            ] {
-                let json = serde_json::to_string(&ev).unwrap();
-                let back: ReplayEvent = serde_json::from_str(&json).unwrap();
-                let got = match back {
-                    ReplayEvent::Rng { value, .. } | ReplayEvent::PerfNow { value, .. } => value,
-                    _ => unreachable!(),
-                };
-                assert_eq!(
-                    v.to_bits(),
-                    got.to_bits(),
-                    "f64 must round-trip bit-exact; {v} -> {json} -> {got}"
-                );
-            }
-        }
-    }
-}
-
 /// In off mode: return unchanged (zero overhead -- no slot access on hot path).
 pub fn intercept_completion(state: &mut ReplayState, completion: OpCompletion) -> OpCompletion {
     if let Some(recorder) = &mut state.recorder {
@@ -326,4 +285,45 @@ pub fn intercept_completion(state: &mut ReplayState, completion: OpCompletion) -
         };
     }
     completion
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: f64 ReplayEvents must round-trip through JSON bit-exactly, so
+    // a replayed Math.random / performance.now reproduces the recorded run
+    // character-for-character. 0.10534155930636513 is a value serde_json's
+    // decimal float round-trip got wrong (came back 1 ULP low) before the
+    // bits-based encoding.
+    #[test]
+    fn f64_events_roundtrip_bit_exact() {
+        let values = [
+            0.10534155930636513f64,
+            0.10534155930636512f64,
+            0.5,
+            0.0,
+            1.0,
+            f64::MIN_POSITIVE,
+            0.123_456_789_012_345_68,
+        ];
+        for v in values {
+            for ev in [
+                ReplayEvent::Rng { seq: 1, value: v },
+                ReplayEvent::PerfNow { seq: 2, value: v },
+            ] {
+                let json = serde_json::to_string(&ev).unwrap();
+                let back: ReplayEvent = serde_json::from_str(&json).unwrap();
+                let got = match back {
+                    ReplayEvent::Rng { value, .. } | ReplayEvent::PerfNow { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    v.to_bits(),
+                    got.to_bits(),
+                    "f64 must round-trip bit-exact; {v} -> {json} -> {got}"
+                );
+            }
+        }
+    }
 }
