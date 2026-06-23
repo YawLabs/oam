@@ -23,6 +23,11 @@ enum UringRequest {
         path: String,
         reply: oneshot::Sender<std::io::Result<Vec<u8>>>,
     },
+    Write {
+        path: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<std::io::Result<()>>,
+    },
 }
 
 /// Handle to the dedicated io_uring worker thread. `UnboundedSender` is `Send +
@@ -48,16 +53,22 @@ impl UringFs {
             .name("oam-io-uring".to_string())
             .spawn(move || {
                 tokio_uring::start(async move {
-                    // Sequential: each read completes before the next is taken.
-                    // The executor is only needed to drive io_uring while a read
-                    // is in flight (inside read_whole's awaits), so awaiting
-                    // recv between reads holds nothing open.
                     while let Some(req) = rx.recv().await {
-                        match req {
-                            UringRequest::Read { path, reply } => {
-                                let _ = reply.send(read_whole(&path).await);
+                        // Spawn each op so multiple are in flight on the ring
+                        // concurrently (tokio_uring::spawn = spawn_local on the
+                        // io_uring current-thread runtime). The recv loop keeps
+                        // accepting while prior ops complete -- the point of
+                        // io_uring over the blocking pool.
+                        tokio_uring::spawn(async move {
+                            match req {
+                                UringRequest::Read { path, reply } => {
+                                    let _ = reply.send(read_whole(&path).await);
+                                }
+                                UringRequest::Write { path, data, reply } => {
+                                    let _ = reply.send(write_all(&path, data).await);
+                                }
                             }
-                        }
+                        });
                     }
                 });
             })
@@ -72,6 +83,18 @@ impl UringFs {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(UringRequest::Read { path, reply })
+            .map_err(|_| std::io::Error::other("io_uring worker stopped"))?;
+        rx.await
+            .map_err(|_| std::io::Error::other("io_uring reply dropped"))?
+    }
+
+    /// Write a file via io_uring (create + truncate + write). `data` is moved
+    /// in -- no clone -- so the caller returns this result directly rather than
+    /// retrying via std (the rare "worker gone" error is reported as-is).
+    pub async fn write_file(&self, path: String, data: Vec<u8>) -> std::io::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(UringRequest::Write { path, data, reply })
             .map_err(|_| std::io::Error::other("io_uring worker stopped"))?;
         rx.await
             .map_err(|_| std::io::Error::other("io_uring reply dropped"))?
@@ -124,6 +147,18 @@ async fn read_whole(path: &str) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Write a whole file via io_uring: create (truncate) + `write_all_at` + close.
+/// Matches the non-append `fs.writeFile` semantics.
+async fn write_all(path: &str, data: Vec<u8>) -> std::io::Result<()> {
+    let file = tokio_uring::fs::File::create(path).await?;
+    // BufResult<(), Vec<u8>>: data is moved in and handed back; we only need
+    // the io::Result.
+    let (res, _data) = file.write_all_at(data, 0).await;
+    res?;
+    let _ = file.close().await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +196,45 @@ mod tests {
             .expect("io_uring read should succeed");
 
         assert_eq!(got, content, "io_uring read must match the written bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Slice 2: write a file via io_uring, then read it back via io_uring, and
+    // assert the round-trip matches. Exercises the write path + the concurrent
+    // worker on a real kernel. Skips gracefully if io_uring is unavailable.
+    #[test]
+    fn uring_write_then_read_roundtrips() {
+        let Some(uring) = UringFs::try_start() else {
+            eprintln!("io_uring unavailable on this runner; skipping");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "oam-uring-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin");
+        let pstr = path.to_string_lossy().into_owned();
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(uring.write_file(pstr.clone(), content.clone()))
+            .expect("io_uring write should succeed");
+        // Verify via std (independent of io_uring) AND via the io_uring reader.
+        assert_eq!(std::fs::read(&path).unwrap(), content, "on-disk bytes");
+        let got = rt
+            .block_on(uring.read_file(pstr))
+            .expect("io_uring read should succeed");
+        assert_eq!(got, content, "io_uring write->read round-trip");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

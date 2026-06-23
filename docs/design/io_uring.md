@@ -106,10 +106,30 @@ out and only ever compile the `else` branch.
 
 ## Rollout plan
 
-1. **Slice 1 (this change): file reads.** io_uring lane + probe + fallback,
-   wired into `fs_read_file` only. Proves the architecture end to end on CI.
-2. Slice 2: extend to write / open+read-chunk / stat as the win is measured.
-3. Slice 3 (maybe): evaluate the socket reactor, separately.
+1. **Slice 1 (done): file reads.** io_uring lane + probe + fallback, wired into
+   `fs_read_file`. Reads were sequential. Proved the architecture on CI (ubuntu
+   leg green).
+2. **Slice 2 (done): concurrency + writes.** Each request is now
+   `tokio_uring::spawn`'d (= `spawn_local` on the io_uring runtime), so multiple
+   ops are in flight on the ring concurrently -- the actual point of io_uring
+   over the blocking pool. Added a write fast path (`fs_write_file`, non-append:
+   `File::create` + `write_all_at`; `data` moved in, no clone). Bounded by what
+   tokio-uring 0.5 exposes:
+   - **stat** is feasible via `tokio_uring::fs::statx` (the API exists) but
+     deferred -- converting a raw `statx` to oam's Node-stat JSON is fiddly and
+     write-blind-risky; do it when stat-heavy paths are shown to matter.
+   - **readdir / open+read-chunk** are NOT in tokio-uring 0.5's surface
+     (no getdents; chunked reads would need the open-file `FileRegistry` to hold
+     io_uring `File`s -- a registry refactor). Out of scope.
+3. Slice 3 (maybe): stat via statx; evaluate the socket reactor, separately.
+
+## Measurement (still TODO)
+
+io_uring is opt-in (`OAM_IO_URING=1`) and off by default, so the standard CI
+runs exercise the fallback. A formal A/B (bench.yml ubuntu leg, fast path on vs
+off) is its own step and has not been done yet -- the slices so far establish
+*correctness* on the ubuntu leg; the perf win is asserted by design, not yet
+measured. Do not claim a speedup until the bench shows one.
 
 ## Verification (Linux-only code, developed via CI)
 

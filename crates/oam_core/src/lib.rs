@@ -884,6 +884,20 @@ pub mod ops {
     }
 
     pub async fn fs_write_file(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
+        // io_uring fast path (Linux, opt-in): non-append writes only (create +
+        // truncate + write_all_at). `data` is moved in -- no clone -- so on
+        // error we return the node-shaped error directly rather than retrying
+        // via std (the rare "worker gone" case is reported as-is). Append and
+        // the no-io_uring case use the std path below.
+        #[cfg(target_os = "linux")]
+        {
+            if !append && let Some(uring) = crate::io_uring_fs::global() {
+                return match uring.write_file(path.clone(), data).await {
+                    Ok(()) => OpOutcome::Done,
+                    Err(e) => node_fail(e, "open", &path),
+                };
+            }
+        }
         let result = if append {
             tokio::task::spawn_blocking({
                 let path = path.clone();
