@@ -96,9 +96,9 @@ jobs:
           restore-keys: io-uring-ab-
       - name: Build oam (release)
         run: cargo build --release -p oam_cli
-      - name: io_uring A/B (concurrent async reads + writes; lower ms is better)
+      - name: io_uring A/B sweep (size x concurrency; lower read_ms is better)
         run: |
           echo "## baseline (io_uring off):"
-          for i in 1 2 3; do ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
+          for i in 1 2; do ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
           echo "## io_uring on (OAM_IO_URING=1):"
-          for i in 1 2 3; do OAM_IO_URING=1 ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
+          for i in 1 2; do OAM_IO_URING=1 ./target/release/oam run bench/io_uring_ab.mjs --no-check; done

@@ -1,63 +1,58 @@
-// io_uring A/B micro-benchmark (Linux). Run the SAME script under oam twice --
-// once with OAM_IO_URING unset (baseline: tokio::fs blocking pool) and once with
-// OAM_IO_URING=1 (the io_uring fast path) -- and compare the medians. See
-// docs/design/io_uring.md.
+// io_uring A/B sweep (Linux). Run under oam twice -- OAM_IO_URING unset
+// (baseline: tokio::fs blocking pool) vs =1 (io_uring fast path) -- and compare
+// cell-by-cell across file SIZE x CONCURRENCY. See docs/design/io_uring.md.
 //
-// It must use the ASYNC, CONCURRENT fs APIs: io_uring is wired into the async
-// fs_read_file / fs_write_file ops (NOT readFileSync/writeFileSync), and the
-// win is concurrent in-flight ops, so each timed iteration does Promise.all over
-// many files. Self-timing: prints one `mode=... read_ms=... write_ms=...` line.
+// Sweeping both axes is what informs the default-on decision: io_uring's win is
+// concurrent in-flight ops, so the critical question is whether it still helps
+// (or at least doesn't hurt) at concurrency=1 / small files, where the dispatch
+// hop has no parallelism to amortize. Reads only -- the primary, clearest win
+// (writes measured separately at ~1.1x).
+//
+// Uses the ASYNC fs API (io_uring is wired into async fs_read_file, not
+// readFileSync). Prints one `mode=... size=... conc=... read_ms=...` line/cell.
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const N_FILES = 64;
-const SIZE = 16 * 1024;
-const ITERS = 200;
-const WARMUP = 5;
+const SIZES = [4096, 65536, 1048576]; // 4 KiB, 64 KiB, 1 MiB
+const CONCURRENCIES = [1, 8, 64];
+const TARGET_BYTES = 32 * 1024 * 1024; // ~work budget per cell -> adaptive iters
+const WARMUP = 3;
 
 const mode = process.env.OAM_IO_URING ? 'io_uring' : 'baseline';
-const dir = mkdtempSync(join(tmpdir(), 'oam-iouring-ab-'));
-const payload = Buffer.alloc(SIZE, 7);
-
-// Setup via SYNC writes (not part of the measurement; sync ops don't hit the
-// io_uring path).
-const files = [];
-for (let i = 0; i < N_FILES; i++) {
-  const p = join(dir, `f${i}.bin`);
-  writeFileSync(p, payload);
-  files.push(p);
-}
 
 function median(xs) {
   xs.sort((a, b) => a - b);
   return xs[Math.floor(xs.length / 2)];
 }
 
-async function timeLoop(fn) {
-  for (let w = 0; w < WARMUP; w++) await fn();
-  const times = [];
-  for (let i = 0; i < ITERS; i++) {
-    const t0 = performance.now();
-    await fn();
-    times.push(performance.now() - t0);
+for (const size of SIZES) {
+  const payload = Buffer.alloc(size, 7);
+  for (const conc of CONCURRENCIES) {
+    const dir = mkdtempSync(join(tmpdir(), 'oam-uring-sweep-'));
+    const files = [];
+    for (let i = 0; i < conc; i++) {
+      const p = join(dir, `f${i}.bin`);
+      writeFileSync(p, payload); // sync setup; not measured, not on the io_uring path
+      files.push(p);
+    }
+    // Bound per-cell work to ~TARGET_BYTES so the 1 MiB x 64 cell stays cheap.
+    const iters = Math.max(10, Math.min(200, Math.round(TARGET_BYTES / (size * conc))));
+    const run = () => Promise.all(files.map((f) => readFile(f)));
+
+    for (let w = 0; w < WARMUP; w++) await run();
+    const times = [];
+    for (let i = 0; i < iters; i++) {
+      const t0 = performance.now();
+      await run();
+      times.push(performance.now() - t0);
+    }
+    rmSync(dir, { recursive: true, force: true });
+
+    console.log(
+      `mode=${mode} size=${size} conc=${conc} iters=${iters} read_ms=${median(times).toFixed(4)}`,
+    );
   }
-  return median(times);
 }
-
-// Read phase: N concurrent async reads per iteration.
-const readMs = await timeLoop(() => Promise.all(files.map((f) => readFile(f))));
-
-// Write phase: N concurrent async (non-append) writes per iteration.
-const writeMs = await timeLoop(() =>
-  Promise.all(files.map((f) => writeFile(f, payload))),
-);
-
-rmSync(dir, { recursive: true, force: true });
-
-console.log(
-  `mode=${mode} read_ms=${readMs.toFixed(4)} write_ms=${writeMs.toFixed(4)} ` +
-    `files=${N_FILES} size=${SIZE} iters=${ITERS}`,
-);
