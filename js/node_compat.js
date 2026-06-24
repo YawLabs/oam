@@ -1681,6 +1681,28 @@
     };
   };
 
+  // ------------------------------------------------------------ constants
+  // Legacy node:constants -- the deprecated flat union of the os signal /
+  // errno / priority constants, the fs flags (O_*/S_*/F_OK...), and crypto's
+  // constants. Still require()'d by graceful-fs and other older fs packages.
+  registry.factories.constants = () => {
+    const os = registry.get("os");
+    const fs = registry.get("fs");
+    const merged = {
+      ...os.constants.signals,
+      ...os.constants.errno,
+      ...os.constants.priority,
+      ...fs.constants,
+    };
+    try {
+      const cryptoConstants = registry.get("crypto").constants;
+      if (cryptoConstants) Object.assign(merged, cryptoConstants);
+    } catch {
+      // crypto constants are optional for the legacy module
+    }
+    return merged;
+  };
+
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
     function inspect(value, options = {}) {

@@ -658,11 +658,11 @@ fn npm_blocked_subpath_is_mod0007_and_builtins_are_mod0006() {
         "blocked subpath"
     );
 
-    // Shipped builtins resolve; the MOD0006 gate covers the rest,
-    // prefixed or bare. Use `constants` (deprecated legacy alias, not in
-    // SUPPORTED_BUILTINS) and `sys` (ancient alias) as permanent canaries --
-    // they will never ship and keep this test from needing to chase the list.
-    std::fs::write(proj.join("builtin_main.ts"), "import 'node:constants';").unwrap();
+    // Shipped builtins resolve; the MOD0006 gate covers the rest, prefixed
+    // or bare. `sys` (the ancient alias for util) is a permanent canary -- it
+    // will never ship, so it keeps this test from chasing the support list.
+    // (constants used to serve this role but now ships, for graceful-fs.)
+    std::fs::write(proj.join("builtin_main.ts"), "import 'node:sys';").unwrap();
     let out = oam(&[
         "run",
         proj.join("builtin_main.ts").to_str().unwrap(),

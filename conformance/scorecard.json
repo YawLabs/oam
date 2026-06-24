@@ -1,5 +1,5 @@
 {
-  "commit": "636e3b2",
+  "commit": "8a01b06",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -82,10 +82,14 @@
         {
           "case": "19-fs-fd-callbacks.mjs",
           "status": "pass"
+        },
+        {
+          "case": "20-constants.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 19,
-      "total": 19
+      "pass": 20,
+      "total": 20
     },
     "surface": {
       "globals": {
