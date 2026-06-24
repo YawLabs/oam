@@ -9145,11 +9145,19 @@
         };
       }
     }
-    function createInterface(options) {
-      if (typeof options === "string" || (options && !("input" in options) && !("output" in options))) {
-        return new Interface(typeof options === "string" ? { prompt: options } : options || {});
-      }
-      return new Interface(options || {});
+    function createInterface(input, output) {
+      // Node accepts createInterface(options) AND createInterface(input[, output])
+      // where the first positional arg is a stream. @puppeteer/browsers (and
+      // many CLIs) call createInterface(childProcess.stderr) -- a Readable, not
+      // an options object -- to read a subprocess line-by-line.
+      if (typeof input === "string") return new Interface({ prompt: input });
+      const isOptions =
+        input &&
+        typeof input === "object" &&
+        ("input" in input || "output" in input || "terminal" in input || "prompt" in input);
+      if (isOptions) return new Interface(input);
+      if (input && typeof input.on === "function") return new Interface({ input, output });
+      return new Interface(input || {});
     }
     function clearLine(stream, dir, cb) {
       if (!stream || typeof stream.write !== "function") {

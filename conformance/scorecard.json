@@ -1,5 +1,5 @@
 {
-  "commit": "eb9a63b",
+  "commit": "d56ce32",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -98,10 +98,14 @@
         {
           "case": "23-child-extra-fd.mjs",
           "status": "pass"
+        },
+        {
+          "case": "24-readline-stream.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 23,
-      "total": 23
+      "pass": 24,
+      "total": 24
     },
     "surface": {
       "globals": {
