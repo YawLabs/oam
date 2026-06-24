@@ -1,5 +1,5 @@
 {
-  "commit": "8a01b06",
+  "commit": "8a44046",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -86,10 +86,14 @@
         {
           "case": "20-constants.mjs",
           "status": "pass"
+        },
+        {
+          "case": "21-fs-streams.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 20,
-      "total": 20
+      "pass": 21,
+      "total": 21
     },
     "surface": {
       "globals": {

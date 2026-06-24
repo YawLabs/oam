@@ -2962,6 +2962,124 @@
       return "r";
     }
 
+    // ReadStream / WriteStream as real Readable / Writable subclasses, built
+    // lazily on first use (avoids a stream<->fs require cycle at fs-factory
+    // time). Node exposes these as CONSTRUCTORS with a real `.prototype`;
+    // graceful-fs does `Object.create(fs.ReadStream.prototype)`, which the
+    // previous arrow-function alias (no `.prototype`) broke.
+    let _rwStreams;
+    function rwStreams() {
+      if (_rwStreams) return _rwStreams;
+      const { Readable, Writable } = registry.get("stream");
+      class ReadStream extends Readable {
+        constructor(path, options) {
+          const opts = readOptions(options);
+          const highWaterMark = opts.highWaterMark ?? 65536;
+          const endByte = typeof opts.end === "number" ? opts.end : Infinity;
+          const startByte = typeof opts.start === "number" ? opts.start : 0;
+          const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
+          let handle = null;
+          let totalRead = 0;
+          super({
+            highWaterMark,
+            encoding: opts.encoding ?? null,
+            async read(size) {
+              try {
+                if (handle === null) {
+                  handle = (await natives.fsOpen(String(path), "r")).handle;
+                  this.emit("open", handle);
+                  this.emit("ready");
+                }
+                const remaining = maxBytes - totalRead;
+                if (remaining <= 0) {
+                  await Promise.resolve(natives.fsClose(handle)).catch(() => {});
+                  handle = null;
+                  this.push(null);
+                  process.nextTick(() => this.emit("close"));
+                  return;
+                }
+                const want = Math.min(size || highWaterMark, remaining);
+                const chunk = await natives.fsReadChunk(handle, want);
+                if (chunk === undefined) {
+                  await Promise.resolve(natives.fsClose(handle)).catch(() => {});
+                  handle = null;
+                  this.push(null);
+                  process.nextTick(() => this.emit("close"));
+                } else {
+                  const buf = new globalThis.Buffer(chunk.buffer, chunk.byteOffset, chunk.length);
+                  totalRead += buf.length;
+                  this.bytesRead = totalRead;
+                  this.push(buf);
+                }
+              } catch (e) {
+                this.destroy(e);
+              }
+            },
+            destroy(err, cb) {
+              if (handle !== null) {
+                Promise.resolve(natives.fsClose(handle)).catch(() => {});
+                handle = null;
+              }
+              cb(err);
+            },
+          });
+          this.path = path;
+          this.bytesRead = 0;
+        }
+      }
+      class WriteStream extends Writable {
+        constructor(path, options) {
+          const opts = readOptions(options);
+          const flags = opts.flags === "a" ? "a" : "w";
+          let handle = null;
+          let totalWritten = 0;
+          super({
+            highWaterMark: opts.highWaterMark ?? 65536,
+            async write(chunk, _encoding, cb) {
+              try {
+                if (handle === null) {
+                  handle = (await natives.fsOpen(String(path), flags)).handle;
+                  this.emit("open", handle);
+                  this.emit("ready");
+                }
+                await natives.fsWriteChunk(handle, chunk);
+                totalWritten += chunk.length;
+                this.bytesWritten = totalWritten;
+                cb();
+              } catch (e) {
+                cb(e);
+              }
+            },
+            async final(cb) {
+              try {
+                // Zero-write stream: the file must still exist afterwards.
+                if (handle === null) {
+                  handle = (await natives.fsOpen(String(path), flags)).handle;
+                }
+                natives.fsClose(handle);
+                handle = null;
+                cb();
+                this.emit("close");
+              } catch (e) {
+                cb(e);
+              }
+            },
+            destroy(err, cb) {
+              if (handle !== null) {
+                natives.fsClose(handle);
+                handle = null;
+              }
+              cb(err);
+            },
+          });
+          this.path = path;
+          this.bytesWritten = 0;
+        }
+      }
+      _rwStreams = { ReadStream, WriteStream };
+      return _rwStreams;
+    }
+
     const fs = {
       promises,
       constants: {
@@ -3150,121 +3268,29 @@
         );
       },
 
-      createReadStream: (path, options) => {
-        const { Readable } = registry.get("stream");
-        const opts = readOptions(options);
-        const highWaterMark = opts.highWaterMark ?? 65536;
-        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
-        const startByte = typeof opts.start === "number" ? opts.start : 0;
-        const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
-        let handle = null;
-        let totalRead = 0;
-        const stream = new Readable({
-          highWaterMark,
-          encoding: opts.encoding ?? null,
-          async read(size) {
-            try {
-              if (handle === null) {
-                handle = (await natives.fsOpen(String(path), "r")).handle;
-                stream.emit("open", handle);
-                stream.emit("ready");
-              }
-              const remaining = maxBytes - totalRead;
-              if (remaining <= 0) {
-                await Promise.resolve(natives.fsClose(handle)).catch(() => {});
-                handle = null;
-                this.push(null);
-                process.nextTick(() => stream.emit("close"));
-                return;
-              }
-              const want = Math.min(size || highWaterMark, remaining);
-              const chunk = await natives.fsReadChunk(handle, want);
-              if (chunk === undefined) {
-                await Promise.resolve(natives.fsClose(handle)).catch(() => {});
-                handle = null;
-                this.push(null);
-                process.nextTick(() => stream.emit("close"));
-              } else {
-                const buf = new globalThis.Buffer(chunk.buffer, chunk.byteOffset, chunk.length);
-                totalRead += buf.length;
-                stream.bytesRead = totalRead;
-                this.push(buf);
-              }
-            } catch (e) {
-              this.destroy(e);
-            }
-          },
-          destroy(err, cb) {
-            if (handle !== null) {
-              Promise.resolve(natives.fsClose(handle)).catch(() => {});
-              handle = null;
-            }
-            cb(err);
-          },
-        });
-        stream.path = path;
-        stream.bytesRead = 0;
-        return stream;
-      },
-      createWriteStream: (path, options) => {
-        const { Writable } = registry.get("stream");
-        const opts = readOptions(options);
-        const flags = opts.flags === "a" ? "a" : "w";
-        let handle = null;
-        let totalWritten = 0;
-        const stream = new Writable({
-          highWaterMark: opts.highWaterMark ?? 65536,
-          async write(chunk, _encoding, cb) {
-            try {
-              if (handle === null) {
-                handle = (await natives.fsOpen(String(path), flags)).handle;
-                stream.emit("open", handle);
-                stream.emit("ready");
-              }
-              await natives.fsWriteChunk(handle, chunk);
-              totalWritten += chunk.length;
-              stream.bytesWritten = totalWritten;
-              cb();
-            } catch (e) {
-              cb(e);
-            }
-          },
-          async final(cb) {
-            try {
-              // Zero-write stream: the file must still exist afterwards.
-              if (handle === null) {
-                handle = (await natives.fsOpen(String(path), flags)).handle;
-              }
-              natives.fsClose(handle);
-              handle = null;
-              cb();
-              stream.emit("close");
-            } catch (e) {
-              cb(e);
-            }
-          },
-          destroy(err, cb) {
-            if (handle !== null) {
-              natives.fsClose(handle);
-              handle = null;
-            }
-            cb(err);
-          },
-        });
-        stream.path = path;
-        stream.bytesWritten = 0;
-        return stream;
-      },
+      createReadStream: (path, options) => new (rwStreams().ReadStream)(path, options),
+      createWriteStream: (path, options) => new (rwStreams().WriteStream)(path, options),
       watch: fsWatch,
       watchFile: fsWatchFile,
     };
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
     fs.Stats = function Stats() {};
-    fs.ReadStream = fs.createReadStream;
-    fs.WriteStream = fs.createWriteStream;
-    fs.FileReadStream = fs.createReadStream;
-    fs.FileWriteStream = fs.createWriteStream;
+    // Real constructors (lazy) with a `.prototype`, exposed as configurable
+    // getters so graceful-fs can read fs.ReadStream.prototype AND later
+    // redefine fs.ReadStream with its own wrapper.
+    for (const [name, kind] of [
+      ["ReadStream", "ReadStream"],
+      ["WriteStream", "WriteStream"],
+      ["FileReadStream", "ReadStream"],
+      ["FileWriteStream", "WriteStream"],
+    ]) {
+      Object.defineProperty(fs, name, {
+        get: () => rwStreams()[kind],
+        configurable: true,
+        enumerable: true,
+      });
+    }
     return fs;
   };
 
