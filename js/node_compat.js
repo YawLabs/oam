@@ -6825,8 +6825,14 @@
         const result = natives.zlibHandleWriteSync(
           this._nativeHandle, flush, input, buffer, outOff, outLen
         );
+        // native returns [availOutAfter, availInAfter]; keep that order in
+        // _writeState (Node's documented internal order) but RETURN
+        // [availInAfter, availOutAfter] -- the pair a synchronous _processChunk
+        // loop consumes as `res = writeSync(...)` then
+        // `handleChunk(res[0]=availInAfter, res[1]=availOutAfter)` (pngjs).
         this._writeState[0] = result[0];
         this._writeState[1] = result[1];
+        return [result[1], result[0]];
       }
       close() {
         if (this._nativeHandle !== null) {
@@ -7000,6 +7006,66 @@
       );
     };
 
+    // ---- Node-faithful stream CLASS constructors (Inflate/Deflate/...) -----
+    // Exported so transpiled CJS that INHERITS from them works -- pngjs does
+    //   util.inherits(MyInflate, zlib.Inflate); zlib.Inflate.call(this, opts);
+    // then drives this._handle.writeSync(...) from its own sync _processChunk.
+    // Both init paths share the streaming Transform prototype, so instances
+    // are real Transforms / EventEmitters either way:
+    //   new zlib.Inflate(opts)        -> async streaming Transform
+    //   zlib.Inflate.call(this, opts) -> Node sync-handle state on `this`
+    const Z_DEFAULT_CHUNK = 16384;
+    const Z_MIN_CHUNK = 64;
+    // The low-level sync handle (flate2) supports only DEFLATE/INFLATE and
+    // their raw forms; gzip/unzip/brotli have no sync-handle mode, so the
+    // .call(this) path maps them to the zlib-wrapped deflate handle. No known
+    // consumer inherits from those -- pngjs only inherits zlib.Inflate.
+    const handleModeFor = (format, compress) =>
+      format === "deflateRaw"
+        ? (compress ? DEFLATERAW : INFLATERAW)
+        : (compress ? DEFLATE : INFLATE);
+    function initSyncHandleState(self, mode, options) {
+      const opts = options || {};
+      let chunkSize = opts.chunkSize != null ? opts.chunkSize : Z_DEFAULT_CHUNK;
+      if (chunkSize < Z_MIN_CHUNK) chunkSize = Z_MIN_CHUNK;
+      self._chunkSize = chunkSize;
+      self._writeState = new Uint32Array(2);
+      self._offset = 0;
+      self._outOffset = 0;
+      self._buffer = BufferCtor.allocUnsafe(chunkSize);
+      self._outBuffer = self._buffer;
+      self._hadError = false;
+      self._finishFlushFlag = Z_FINISH;
+      const handle = new ZlibHandle(mode);
+      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, opts.dictionary);
+      self._handle = handle;
+      return self;
+    }
+    function makeZlibClass(format, compress) {
+      const Stream = transformClass(format, compress); // class extends Transform
+      const mode = handleModeFor(format, compress);
+      function ZlibClass(options) {
+        // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
+        if (new.target) return Reflect.construct(Stream, [options], new.target);
+        // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
+        return initSyncHandleState(this, mode, options);
+      }
+      // Share the streaming Transform prototype so `new` instances get the
+      // streaming methods AND util.inherits(Sub, ZlibClass) chains
+      // Sub -> Stream.prototype -> Transform.prototype -> ... -> EventEmitter.
+      ZlibClass.prototype = Stream.prototype;
+      return ZlibClass;
+    }
+    const Gzip = makeZlibClass("gzip", true);
+    const Gunzip = makeZlibClass("gzip", false);
+    const Deflate = makeZlibClass("deflate", true);
+    const Inflate = makeZlibClass("deflate", false);
+    const DeflateRaw = makeZlibClass("deflateRaw", true);
+    const InflateRaw = makeZlibClass("deflateRaw", false);
+    const Unzip = makeZlibClass("unzip", false);
+    const BrotliCompress = makeZlibClass("brotli", true);
+    const BrotliDecompress = makeZlibClass("brotli", false);
+
     return {
       gzipSync: sync("gzip", true),
       gunzipSync: sync("gzip", false),
@@ -7015,20 +7081,35 @@
       deflateRaw: callbackForm("deflateRaw", true),
       inflateRaw: callbackForm("deflateRaw", false),
       unzip: callbackForm("unzip", false),
-      createGzip: (o) => new (transformClass("gzip", true))(o),
-      createGunzip: (o) => new (transformClass("gzip", false))(o),
-      createDeflate: (o) => new (transformClass("deflate", true))(o),
-      createInflate: (o) => new (transformClass("deflate", false))(o),
-      createDeflateRaw: (o) => new (transformClass("deflateRaw", true))(o),
-      createInflateRaw: (o) => new (transformClass("deflateRaw", false))(o),
-      createUnzip: (o) => new (transformClass("unzip", false))(o),
-      createBrotliCompress: (o) => new (transformClass("brotli", true))(o),
-      createBrotliDecompress: (o) => new (transformClass("brotli", false))(o),
+      createGzip: (o) => new Gzip(o),
+      createGunzip: (o) => new Gunzip(o),
+      createDeflate: (o) => new Deflate(o),
+      createInflate: (o) => new Inflate(o),
+      createDeflateRaw: (o) => new DeflateRaw(o),
+      createInflateRaw: (o) => new InflateRaw(o),
+      createUnzip: (o) => new Unzip(o),
+      createBrotliCompress: (o) => new BrotliCompress(o),
+      createBrotliDecompress: (o) => new BrotliDecompress(o),
+      Gzip, Gunzip, Deflate, Inflate, DeflateRaw, InflateRaw, Unzip,
+      BrotliCompress, BrotliDecompress,
       brotliCompressSync: brotliSyncGate,
       brotliDecompressSync: brotliSyncGate,
       brotliCompress: brotliCallbackForm(true),
       brotliDecompress: brotliCallbackForm(false),
+      // Top-level chunk/flush constants (Node exposes these on the module
+      // itself, not only under `constants`; pngjs reads zlib.Z_MIN_CHUNK).
+      Z_MIN_CHUNK,
+      Z_DEFAULT_CHUNK,
+      Z_MAX_CHUNK: Infinity,
+      Z_NO_FLUSH,
+      Z_PARTIAL_FLUSH,
+      Z_SYNC_FLUSH,
+      Z_FULL_FLUSH,
+      Z_FINISH,
       constants: {
+        Z_MIN_CHUNK,
+        Z_DEFAULT_CHUNK,
+        Z_MAX_CHUNK: Infinity,
         Z_NO_COMPRESSION: 0,
         Z_BEST_SPEED: 1,
         Z_BEST_COMPRESSION: 9,

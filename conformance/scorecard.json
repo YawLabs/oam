@@ -1,5 +1,5 @@
 {
-  "commit": "f37fb10",
+  "commit": "e425491",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -74,10 +74,14 @@
         {
           "case": "17-class-extends-emitter.mjs",
           "status": "pass"
+        },
+        {
+          "case": "18-zlib-classes.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 17,
-      "total": 17
+      "pass": 18,
+      "total": 18
     },
     "surface": {
       "globals": {
