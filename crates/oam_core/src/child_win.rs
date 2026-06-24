@@ -22,22 +22,21 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileType, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_PIPE, OPEN_EXISTING,
+    CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 use super::OpOutcome;
@@ -92,7 +91,10 @@ fn crt_flag(h: HANDLE) -> u8 {
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// Canonical Windows argv quoting (CommandLineToArgvW-compatible).
@@ -197,19 +199,20 @@ pub fn spawn_extra(
         let mut child_close: Vec<HANDLE> = Vec::new();
         let mut nul_handles: Vec<HANDLE> = Vec::new();
 
-        let cleanup_fail = |child_close: &[HANDLE], nul: &[HANDLE], parent: &HashMap<u32, FdEnd>| {
-            for h in child_close {
-                CloseHandle(*h);
-            }
-            for h in nul {
-                CloseHandle(*h);
-            }
-            for fd in parent.values() {
-                if let Some(SendHandle(h)) = fd.handle {
-                    CloseHandle(h);
+        let cleanup_fail =
+            |child_close: &[HANDLE], nul: &[HANDLE], parent: &HashMap<u32, FdEnd>| {
+                for h in child_close {
+                    CloseHandle(*h);
                 }
-            }
-        };
+                for h in nul {
+                    CloseHandle(*h);
+                }
+                for fd in parent.values() {
+                    if let Some(SendHandle(h)) = fd.handle {
+                        CloseHandle(h);
+                    }
+                }
+            };
 
         for (i, spec) in stdio.iter().enumerate() {
             let fd = i as u32;
@@ -240,7 +243,10 @@ pub fn spawn_extra(
                     child_handles.push(child_read);
                     parent_fds.insert(
                         fd,
-                        FdEnd { handle: Some(SendHandle(parent_write)), readable: false },
+                        FdEnd {
+                            handle: Some(SendHandle(parent_write)),
+                            readable: false,
+                        },
                     );
                 }
                 StdioFd::ChildWrite => {
@@ -256,7 +262,10 @@ pub fn spawn_extra(
                     child_handles.push(child_write);
                     parent_fds.insert(
                         fd,
-                        FdEnd { handle: Some(SendHandle(parent_read)), readable: true },
+                        FdEnd {
+                            handle: Some(SendHandle(parent_read)),
+                            readable: true,
+                        },
                     );
                 }
             }
@@ -277,9 +286,18 @@ pub fn spawn_extra(
         let mut si: STARTUPINFOW = std::mem::zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = child_handles.first().copied().unwrap_or(INVALID_HANDLE_VALUE);
-        si.hStdOutput = child_handles.get(1).copied().unwrap_or(INVALID_HANDLE_VALUE);
-        si.hStdError = child_handles.get(2).copied().unwrap_or(INVALID_HANDLE_VALUE);
+        si.hStdInput = child_handles
+            .first()
+            .copied()
+            .unwrap_or(INVALID_HANDLE_VALUE);
+        si.hStdOutput = child_handles
+            .get(1)
+            .copied()
+            .unwrap_or(INVALID_HANDLE_VALUE);
+        si.hStdError = child_handles
+            .get(2)
+            .copied()
+            .unwrap_or(INVALID_HANDLE_VALUE);
         si.cbReserved2 = blob.len() as u16;
         si.lpReserved2 = blob.as_mut_ptr();
 
@@ -380,7 +398,11 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
         if ok == 0 {
             // ERROR_BROKEN_PIPE (109) on a closed write end == clean EOF.
             let err = unsafe { GetLastError() };
-            if err == 109 { Ok(None) } else { Err(format!("ReadFile: {err}")) }
+            if err == 109 {
+                Ok(None)
+            } else {
+                Err(format!("ReadFile: {err}"))
+            }
         } else if n == 0 {
             Ok(None)
         } else {

@@ -3220,7 +3220,11 @@ fn op_spawn_extra(
     }
     let opts = {
         let v = args.get(2);
-        if v.is_null_or_undefined() { None } else { v8::Local::<v8::Object>::try_from(v).ok() }
+        if v.is_null_or_undefined() {
+            None
+        } else {
+            v8::Local::<v8::Object>::try_from(v).ok()
+        }
     };
     let cwd = opts.and_then(|o| {
         let key = v8::String::new(scope, "cwd")?;
@@ -3293,7 +3297,9 @@ fn op_spawn_extra(
         Ok(child) => {
             let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pid = child.pid;
-            reg.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, child);
+            reg.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(handle, child);
             let json = serde_json::json!({ "handle": handle, "pid": pid });
             if let Some(s) = v8::String::new(scope, &json.to_string()) {
                 rv.set(s.into());
@@ -3312,7 +3318,11 @@ fn op_spawn_extra_read(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let reg = core_runtime!(scope).raw_children();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_read(reg, handle, fd));
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child_extra::raw_read(reg, handle, fd),
+    );
 }
 
 #[cfg(any(windows, unix))]
@@ -3328,7 +3338,11 @@ fn op_spawn_extra_write(
         return;
     };
     let reg = core_runtime!(scope).raw_children();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_write(reg, handle, fd, data));
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::child_extra::raw_write(reg, handle, fd, data),
+    );
 }
 
 #[cfg(any(windows, unix))]
@@ -3374,7 +3388,10 @@ fn op_spawn_extra(
     _args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    throw_type_error(scope, "spawnExtra: extra-fd stdio is only implemented on Windows");
+    throw_type_error(
+        scope,
+        "spawnExtra: extra-fd stdio is only implemented on Windows",
+    );
 }
 #[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_read(

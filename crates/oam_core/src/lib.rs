@@ -35,6 +35,8 @@ pub mod worker;
 #[cfg(target_os = "linux")]
 mod io_uring_fs;
 
+#[cfg(unix)]
+pub mod child_unix;
 /// Extra-fd stdio (numbered child fds beyond 0/1/2, for CDP-over-pipe). Two
 /// platform backends with one shared public surface, re-exported as
 /// `child_extra` so the engine ops are `cfg(any(windows, unix))` over one path.
@@ -43,11 +45,9 @@ mod io_uring_fs;
 #[cfg(windows)]
 pub mod child_win;
 #[cfg(unix)]
-pub mod child_unix;
+pub use child_unix as child_extra;
 #[cfg(windows)]
 pub use child_win as child_extra;
-#[cfg(unix)]
-pub use child_unix as child_extra;
 
 pub type OpId = u64;
 

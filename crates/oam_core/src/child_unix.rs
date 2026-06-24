@@ -103,7 +103,10 @@ fn open_dev_null() -> Result<RawFd, String> {
         )
     };
     if fd < 0 {
-        return Err(format!("open(/dev/null): {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open(/dev/null): {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(fd)
 }
@@ -112,7 +115,11 @@ fn open_dev_null() -> Result<RawFd, String> {
 /// `fd` (closes it on both success and failure), so callers never re-close it.
 fn relocate(fd: RawFd, base: RawFd) -> Result<RawFd, String> {
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, base) };
-    let err = if high < 0 { Some(std::io::Error::last_os_error()) } else { None };
+    let err = if high < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
     unsafe { libc::close(fd) };
     match err {
         Some(e) => Err(format!("fcntl(F_DUPFD_CLOEXEC): {e}")),
@@ -218,7 +225,13 @@ pub fn spawn_extra(
                     Err(e) => bail!(w; e), // relocate already closed `r`
                 };
                 dup_plan.push((high, target));
-                parent_fds.insert(fd, FdEnd { fd: Some(w), readable: false });
+                parent_fds.insert(
+                    fd,
+                    FdEnd {
+                        fd: Some(w),
+                        readable: false,
+                    },
+                );
             }
             StdioFd::ChildWrite => {
                 let (r, w) = match make_pipe() {
@@ -231,7 +244,13 @@ pub fn spawn_extra(
                     Err(e) => bail!(r; e), // relocate already closed `w`
                 };
                 dup_plan.push((high, target));
-                parent_fds.insert(fd, FdEnd { fd: Some(r), readable: true });
+                parent_fds.insert(
+                    fd,
+                    FdEnd {
+                        fd: Some(r),
+                        readable: true,
+                    },
+                );
             }
         }
     }
@@ -239,7 +258,9 @@ pub fn spawn_extra(
     let mut cmd = Command::new(command);
     cmd.args(args);
     // 0/1/2 inherit by default; pre_exec overrides them when the spec says so.
-    cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
@@ -273,7 +294,11 @@ pub fn spawn_extra(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let code = if e.kind() == std::io::ErrorKind::NotFound { "ENOENT" } else { "UNKNOWN" };
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                "ENOENT"
+            } else {
+                "UNKNOWN"
+            };
             let msg = format!(
                 "{{\"code\":\"{code}\",\"message\":\"spawn failed ({}) for {}\"}}",
                 e,
@@ -290,7 +315,12 @@ pub fn spawn_extra(
         unsafe { libc::close(src) };
     }
 
-    Ok(RawChild { child: Some(child), pid, fds: parent_fds, kill_signal: None })
+    Ok(RawChild {
+        child: Some(child),
+        pid,
+        fds: parent_fds,
+        kill_signal: None,
+    })
 }
 
 /// Read up to 64 KiB from a parent-readable fd end. EOF (0 bytes) -> Done.
@@ -425,7 +455,10 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
         // means the pid may already be reaped -- and the kernel can recycle a
         // reaped pid immediately, so a kill then could hit an unrelated process.
         if child.child.is_some() {
-            let signum = signal.as_deref().map(signal_number).unwrap_or(libc::SIGTERM);
+            let signum = signal
+                .as_deref()
+                .map(signal_number)
+                .unwrap_or(libc::SIGTERM);
             child.kill_signal = Some(signal.unwrap_or_else(|| signal_name(signum)));
             unsafe { libc::kill(child.pid as libc::pid_t, signum) };
         }
