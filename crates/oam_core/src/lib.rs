@@ -35,10 +35,19 @@ pub mod worker;
 #[cfg(target_os = "linux")]
 mod io_uring_fs;
 
-/// Windows extra-fd stdio (raw CreateProcessW + lpReserved2). See child_win.rs.
-/// cfg'd out on every other platform (Unix extra-fd is a follow-up).
+/// Extra-fd stdio (numbered child fds beyond 0/1/2, for CDP-over-pipe). Two
+/// platform backends with one shared public surface, re-exported as
+/// `child_extra` so the engine ops are `cfg(any(windows, unix))` over one path.
+/// Windows: raw CreateProcessW + lpReserved2 (child_win.rs). Unix: Command +
+/// pre_exec dup2 (child_unix.rs).
 #[cfg(windows)]
 pub mod child_win;
+#[cfg(unix)]
+pub mod child_unix;
+#[cfg(windows)]
+pub use child_win as child_extra;
+#[cfg(unix)]
+pub use child_unix as child_extra;
 
 pub type OpId = u64;
 
@@ -143,8 +152,8 @@ pub struct CoreRuntime {
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
     children: child::ChildRegistry,
-    #[cfg(windows)]
-    raw_children: child_win::RawChildRegistry,
+    #[cfg(any(windows, unix))]
+    raw_children: child_extra::RawChildRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -185,7 +194,7 @@ impl CoreRuntime {
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
@@ -259,9 +268,9 @@ impl CoreRuntime {
         self.children.clone()
     }
 
-    /// Raw (extra-fd) child process registry, Windows only (Arc clone).
-    #[cfg(windows)]
-    pub fn raw_children(&self) -> child_win::RawChildRegistry {
+    /// Raw (extra-fd) child process registry (Arc clone). Windows + Unix.
+    #[cfg(any(windows, unix))]
+    pub fn raw_children(&self) -> child_extra::RawChildRegistry {
         self.raw_children.clone()
     }
 

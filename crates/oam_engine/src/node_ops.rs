@@ -3197,13 +3197,13 @@ fn op_spawn_wait(
 // 2=child-read(parent writes) 3=child-write(parent reads). Used for
 // CDP-over-pipe so a browser child gets numbered fds 3/4.
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    use oam_core::child_win::StdioFd;
+    use oam_core::child_extra::StdioFd;
     let Some(command) = arg_string(scope, &args, 0) else {
         throw_type_error(scope, "spawnExtra: command required");
         return;
@@ -3282,7 +3282,7 @@ fn op_spawn_extra(
 
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();
-    match oam_core::child_win::spawn_extra(
+    match oam_core::child_extra::spawn_extra(
         &command,
         &child_args,
         cwd.as_deref(),
@@ -3303,7 +3303,7 @@ fn op_spawn_extra(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra_read(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3312,10 +3312,10 @@ fn op_spawn_extra_read(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let reg = core_runtime!(scope).raw_children();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_read(reg, handle, fd));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_read(reg, handle, fd));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3328,10 +3328,10 @@ fn op_spawn_extra_write(
         return;
     };
     let reg = core_runtime!(scope).raw_children();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_write(reg, handle, fd, data));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_write(reg, handle, fd, data));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra_close_fd(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3340,10 +3340,10 @@ fn op_spawn_extra_close_fd(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let reg = core_runtime!(scope).raw_children();
-    oam_core::child_win::raw_close_fd(&reg, handle, fd);
+    oam_core::child_extra::raw_close_fd(&reg, handle, fd);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra_wait(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3351,10 +3351,10 @@ fn op_spawn_extra_wait(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let reg = core_runtime!(scope).raw_children();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_wait(reg, handle));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_wait(reg, handle));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn op_spawn_extra_kill(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3363,12 +3363,12 @@ fn op_spawn_extra_kill(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let signal = arg_kill_signal(scope, &args, 1);
     let reg = core_runtime!(scope).raw_children();
-    oam_core::child_win::raw_kill(&reg, handle, signal);
+    oam_core::child_extra::raw_kill(&reg, handle, signal);
 }
 
 // Non-Windows: extra-fd stdio is not implemented yet (Unix needs pre_exec
 // dup2). Stubs keep the op table symbol-complete across platforms.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3376,7 +3376,7 @@ fn op_spawn_extra(
 ) {
     throw_type_error(scope, "spawnExtra: extra-fd stdio is only implemented on Windows");
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_read(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3384,7 +3384,7 @@ fn op_spawn_extra_read(
 ) {
     throw_type_error(scope, "spawnExtraRead: Windows only");
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_write(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3392,14 +3392,14 @@ fn op_spawn_extra_write(
 ) {
     throw_type_error(scope, "spawnExtraWrite: Windows only");
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_close_fd(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_wait(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -3407,7 +3407,7 @@ fn op_spawn_extra_wait(
 ) {
     throw_type_error(scope, "spawnExtraWait: Windows only");
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn op_spawn_extra_kill(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,

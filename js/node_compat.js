@@ -10047,9 +10047,10 @@
       return 1;
     }
 
-    // Windows extra-fd spawn: a child with numbered fds beyond 0/1/2 (Chromium
+    // Extra-fd spawn: a child with numbered fds beyond 0/1/2 (Chromium
     // --remote-debugging-pipe needs fds 3/4 for CDP). Synchronous like Node's
-    // spawn(); exposes cp.stdio[n] as Readable/Writable streams.
+    // spawn(); exposes cp.stdio[n] as Readable/Writable streams. The native
+    // backend is Windows (CreateProcessW) or Unix (Command+pre_exec dup2).
     function spawnExtra(norm, stdioArr) {
       const opts = norm.options;
       const cp = new ChildProcess();
@@ -10066,7 +10067,22 @@
       try {
         info = JSON.parse(natives.spawnExtra(norm.command, norm.args, nativeOpts, codes));
       } catch (err) {
-        const e = typeof err === "string" ? new Error(err) : err;
+        // The native op throws with a JSON body {code,message} on spawn failure
+        // (child_win.rs / child_unix.rs) so we can surface a Node-shaped error
+        // (err.code === "ENOENT" etc.) that ecosystem code branches on.
+        let e = typeof err === "string" ? new Error(err) : err;
+        const raw = typeof err === "string" ? err : (e && e.message) || "";
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.code) {
+            e = new Error(parsed.message || raw);
+            e.code = parsed.code;
+            e.syscall = "spawn " + norm.command;
+            e.path = norm.command;
+          }
+        } catch {
+          /* message was not the JSON body: emit the original error unchanged */
+        }
         queueMicrotask(() => cp.emit("error", e));
         return cp;
       }
@@ -10133,9 +10149,16 @@
     function spawn(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
-      // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries on
-      // Windows routes to the raw CreateProcessW + lpReserved2 path.
-      if (Array.isArray(opts.stdio) && opts.stdio.length > 3 && natives.platform === "win32") {
+      // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
+      // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
+      // pre_exec dup2 on Unix). Gated to platforms with a real native backend.
+      if (
+        Array.isArray(opts.stdio) &&
+        opts.stdio.length > 3 &&
+        (natives.platform === "win32" ||
+          natives.platform === "linux" ||
+          natives.platform === "darwin")
+      ) {
         return spawnExtra(norm, opts.stdio);
       }
       const cp = new ChildProcess();

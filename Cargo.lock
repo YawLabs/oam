@@ -1887,6 +1887,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "io-uring",
+ "libc",
  "oam_diagnostics",
  "reqwest",
  "rustls",
