@@ -88,6 +88,13 @@ pub struct FileState {
 }
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 
+/// Synchronous open-file registry (std::fs::File, fd-keyed) backing the
+/// classic fs.openSync/readSync/writeSync/closeSync/fstatSync family. Kept
+/// separate from the async (tokio) `files` registry: sync ops run inline in
+/// the op callback (no spawn_op), so they need a blocking File. Dies with the
+/// run, so leaked fds are reclaimed per-run.
+pub type SyncFileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, std::fs::File>>>;
+
 /// Incremental zlib/brotli stream state. Each entry is an encoder or decoder
 /// that accepts chunks one at a time. The JS Transform wires _transform to
 /// zlibStreamWrite and _flush to zlibStreamFlush.
@@ -122,6 +129,7 @@ pub struct CoreRuntime {
     inflight: usize,
     bodies: BodyRegistry,
     files: FileRegistry,
+    sync_files: SyncFileRegistry,
     zlib_streams: ZlibRegistry,
     http_state: std::sync::Arc<http_server::HttpState>,
     tcp: tcp::TcpRegistry,
@@ -161,6 +169,7 @@ impl CoreRuntime {
             inflight: 0,
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
+            sync_files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
@@ -193,6 +202,12 @@ impl CoreRuntime {
     /// Open-file registry for fs streams (Arc clone; dies with the run).
     pub fn files(&self) -> FileRegistry {
         self.files.clone()
+    }
+
+    /// Synchronous open-file registry for fs.openSync & friends (Arc clone;
+    /// dies with the run).
+    pub fn sync_files(&self) -> SyncFileRegistry {
+        self.sync_files.clone()
     }
 
     /// Incremental zlib stream registry (Arc clone; dies with the run).

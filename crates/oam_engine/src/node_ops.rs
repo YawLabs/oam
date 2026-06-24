@@ -164,6 +164,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadChunk", op_fs_read_chunk),
         ("fsWriteChunk", op_fs_write_chunk),
         ("fsClose", op_fs_close),
+        // fs classic synchronous fd ops (openSync/readSync/writeSync/...)
+        ("fsOpenSync", op_fs_open_sync),
+        ("fsReadSync", op_fs_read_sync),
+        ("fsWriteSync", op_fs_write_sync),
+        ("fsCloseSync", op_fs_close_sync),
+        ("fsFstatSync", op_fs_fstat_sync),
         // node:zlib (one-shot)
         ("zlibSync", op_zlib_sync),
         ("zlibAsync", op_zlib_async),
@@ -2306,6 +2312,252 @@ fn op_fs_close(
     // instead of resurrecting a leaked fd (destroy()-during-read race).
     if guard.files.remove(&handle).is_none() {
         guard.closed.insert(handle);
+    }
+}
+
+/// Throw an `Error` carrying `.code`/`.syscall` for a bad/missing fd. Node
+/// uses EBADF; mirrors throw_node_error's object shape without an io::Error.
+fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
+    let msg = format!("EBADF: bad file descriptor, {syscall}");
+    let msg_v8 =
+        v8::String::new(scope, &msg).unwrap_or_else(|| v8::String::new(scope, "EBADF").unwrap());
+    let exception = v8::Exception::error(scope, msg_v8);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        for (name, value) in [("code", "EBADF"), ("syscall", syscall)] {
+            let key = v8::String::new(scope, name).unwrap();
+            if let Some(v) = v8::String::new(scope, value) {
+                obj.set(scope, key.into(), v.into());
+            }
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// fopen-style flag string -> OpenOptions. Mirrors Node's fs flag set; an
+/// unknown flag defaults to read-only (Node would throw, but lenient is
+/// safer for compat). `+`/`w`/`a`/`x` imply write.
+fn open_options_for(flags: &str) -> std::fs::OpenOptions {
+    let mut oo = std::fs::OpenOptions::new();
+    match flags {
+        "r" => {
+            oo.read(true);
+        }
+        "r+" | "rs+" | "sr+" => {
+            oo.read(true).write(true);
+        }
+        "w" => {
+            oo.write(true).create(true).truncate(true);
+        }
+        "wx" | "xw" => {
+            oo.write(true).create_new(true);
+        }
+        "w+" => {
+            oo.read(true).write(true).create(true).truncate(true);
+        }
+        "wx+" | "xw+" => {
+            oo.read(true).write(true).create_new(true);
+        }
+        "a" => {
+            oo.append(true).create(true);
+        }
+        "ax" | "xa" => {
+            oo.append(true).create_new(true);
+        }
+        "a+" => {
+            oo.read(true).append(true).create(true);
+        }
+        "ax+" | "xa+" => {
+            oo.read(true).append(true).create_new(true);
+        }
+        _ => {
+            oo.read(true);
+        }
+    }
+    oo
+}
+
+/// fsOpenSync(path, flags) -> fd. Synchronous open backed by std::fs::File in
+/// the sync-file registry; the returned number is the integer fd. The classic
+/// callback/`*Sync` fd API some packages (graceful-fs/playwright lock probe)
+/// require -- they read `err.code === "ENOENT"` to distinguish missing from
+/// locked, so a faithful error code is the whole point.
+fn op_fs_open_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "openSync requires a path");
+        return;
+    };
+    let flags = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
+    let is_write =
+        flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x');
+    if is_write {
+        if !check_write_perm(scope, &path) {
+            return;
+        }
+    } else if !check_read_perm(scope, &path) {
+        return;
+    }
+    match open_options_for(&flags).open(&path) {
+        Ok(file) => {
+            let core = core_runtime!(scope);
+            let id = core
+                .body_ids()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            core.sync_files()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, file);
+            let val = v8::Number::new(scope, id as f64);
+            rv.set(val.into());
+        }
+        Err(e) => throw_node_error(scope, "open", &path, &e),
+    }
+}
+
+/// fsReadSync(fd, buffer, offset, length, position) -> bytesRead. Reads into
+/// buffer's backing store at `offset`; `position` (a number) seeks first,
+/// null reads from the current position.
+fn op_fs_read_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let offset = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
+    let length = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
+    let position = args.get(4);
+    let pos_seek = if position.is_number() {
+        let p = position.number_value(scope).unwrap_or(-1.0);
+        if p >= 0.0 { Some(p as u64) } else { None }
+    } else {
+        None
+    };
+
+    let files = core_runtime!(scope).sync_files();
+    let mut tmp = vec![0u8; length];
+    let read_result = {
+        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get_mut(&fd) {
+            Some(file) => {
+                if let Some(p) = pos_seek {
+                    let _ = file.seek(SeekFrom::Start(p));
+                }
+                Some(file.read(&mut tmp))
+            }
+            None => None,
+        }
+    };
+    match read_result {
+        None => throw_ebadf(scope, "read"),
+        Some(Err(e)) => throw_node_error(scope, "read", "", &e),
+        Some(Ok(n)) => {
+            if n > 0 {
+                let buf_value = args.get(1);
+                if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(buf_value)
+                    && let Some(buffer) = view.buffer(scope)
+                {
+                    let store = buffer.get_backing_store();
+                    if let Some(data) = store.data() {
+                        let byte_offset = view.byte_offset() + offset;
+                        if byte_offset + n <= store.byte_length() {
+                            unsafe {
+                                let dest = (data.as_ptr() as *mut u8).add(byte_offset);
+                                std::ptr::copy_nonoverlapping(tmp.as_ptr(), dest, n);
+                            }
+                        }
+                    }
+                }
+            }
+            let val = v8::Number::new(scope, n as f64);
+            rv.set(val.into());
+        }
+    }
+}
+
+/// fsWriteSync(fd, data, position?) -> bytesWritten. `data` is bytes (Buffer)
+/// or a string (UTF-8). `position` (a number) seeks first; null appends at the
+/// current position.
+fn op_fs_write_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    use std::io::{Seek, SeekFrom, Write};
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "writeSync requires data");
+        return;
+    };
+    let position = args.get(2);
+    let pos_seek = if position.is_number() {
+        let p = position.number_value(scope).unwrap_or(-1.0);
+        if p >= 0.0 { Some(p as u64) } else { None }
+    } else {
+        None
+    };
+    let files = core_runtime!(scope).sync_files();
+    let write_result = {
+        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get_mut(&fd) {
+            Some(file) => {
+                if let Some(p) = pos_seek {
+                    let _ = file.seek(SeekFrom::Start(p));
+                }
+                Some(file.write_all(&bytes))
+            }
+            None => None,
+        }
+    };
+    match write_result {
+        None => throw_ebadf(scope, "write"),
+        Some(Err(e)) => throw_node_error(scope, "write", "", &e),
+        Some(Ok(())) => {
+            let val = v8::Number::new(scope, bytes.len() as f64);
+            rv.set(val.into());
+        }
+    }
+}
+
+/// fsCloseSync(fd). Dropping the File closes it. Throws EBADF if the fd is
+/// unknown (Node parity).
+fn op_fs_close_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    let removed = files
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&fd)
+        .is_some();
+    if !removed {
+        throw_ebadf(scope, "close");
+    }
+}
+
+/// fsFstatSync(fd) -> stat json (same shape as statSync). Throws EBADF if the
+/// fd is unknown.
+fn op_fs_fstat_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    let meta = {
+        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&fd).map(|f| f.metadata())
+    };
+    match meta {
+        None => throw_ebadf(scope, "fstat"),
+        Some(Err(e)) => throw_node_error(scope, "fstat", "", &e),
+        Some(Ok(meta)) => return_json(scope, &mut rv, &oam_core::ops::stat_to_json(&meta)),
     }
 }
 

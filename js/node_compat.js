@@ -3149,6 +3149,34 @@
       linkSync: (existing, newPath) => natives.fsLinkSync(String(existing), String(newPath)),
       chmodSync: (path, mode) => natives.fsChmodSync(String(path), mode),
       truncateSync: (path, len) => natives.fsTruncateSync(String(path), len ?? 0),
+      // Classic synchronous fd ops. The native handle (a number) IS the fd.
+      // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
+      // on err.code === "ENOENT" to tell missing from locked.
+      openSync: (path, flags, _mode) =>
+        natives.fsOpenSync(String(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
+      closeSync: (fd) => { natives.fsCloseSync(fd); },
+      fstatSync: (fd) => wrapStat(natives.fsFstatSync(fd)),
+      readSync: (fd, buffer, offset, length, position) => {
+        // (fd, buffer, {offset,length,position}) object form.
+        if (offset !== null && typeof offset === "object") {
+          const o = offset;
+          offset = o.offset ?? 0; length = o.length ?? (buffer ? buffer.length - offset : 0); position = o.position ?? null;
+        }
+        return natives.fsReadSync(fd, buffer, offset ?? 0, length ?? (buffer ? buffer.length - (offset ?? 0) : 0), position ?? null);
+      },
+      writeSync: (fd, data, offsetOrPosition, length, position) => {
+        // Buffer form: (fd, buffer, offset, length, position).
+        // String form: (fd, string, position, encoding).
+        if (typeof data === "string") {
+          const enc = typeof length === "string" ? length : "utf8";
+          const buf = globalThis.Buffer.from(data, enc);
+          return natives.fsWriteSync(fd, buf, typeof offsetOrPosition === "number" ? offsetOrPosition : null);
+        }
+        const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
+        const len = typeof length === "number" ? length : (data.length - offset);
+        const slice = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
+        return natives.fsWriteSync(fd, slice, typeof position === "number" ? position : null);
+      },
       opendirSync: function (path) {
         var dirPath = String(path);
         var entries = natives.fsReaddirSync(dirPath);
