@@ -1,5 +1,5 @@
 {
-  "commit": "d56ce32",
+  "commit": "31fa4c1",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -102,10 +102,14 @@
         {
           "case": "24-readline-stream.mjs",
           "status": "pass"
+        },
+        {
+          "case": "25-global.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 24,
-      "total": 24
+      "pass": 25,
+      "total": 25
     },
     "surface": {
       "globals": {

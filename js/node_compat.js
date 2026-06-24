@@ -11859,6 +11859,10 @@
   registry.installRuntimeGlobals = function installRuntimeGlobals() {
     const natives = globalThis.__oam.node;
     globalThis.process = registry.get("process");
+    // Node defines `global` as an alias for the global object (global === globalThis).
+    // Transpiled CJS deps (e.g. node-postgres) reference bare `global`; without
+    // this they throw "global is not defined" the moment that path runs.
+    if (typeof globalThis.global === "undefined") globalThis.global = globalThis;
 
     // Fork IPC child side: store port for lazy connect.
     // Cannot connect during installRuntimeGlobals because CoreRuntime
