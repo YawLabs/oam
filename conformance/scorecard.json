@@ -1,5 +1,5 @@
 {
-  "commit": "e425491",
+  "commit": "636e3b2",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -78,10 +78,14 @@
         {
           "case": "18-zlib-classes.mjs",
           "status": "pass"
+        },
+        {
+          "case": "19-fs-fd-callbacks.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 18,
-      "total": 18
+      "pass": 19,
+      "total": 19
     },
     "surface": {
       "globals": {

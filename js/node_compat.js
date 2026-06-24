@@ -2930,6 +2930,16 @@
       };
     }
 
+    // Map numeric O_* open flags to the fopen-style string natives.fsOpen
+    // takes. Most callers pass a string ("r"/"w"/...); chokidar does.
+    function numericOpenFlags(n) {
+      var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+      var append = (n & 1024) !== 0; // O_APPEND
+      if (acc === 1) return append ? "a" : "w";
+      if (acc === 2) return append ? "a+" : "r+";
+      return "r";
+    }
+
     const fs = {
       promises,
       constants: {
@@ -3066,6 +3076,56 @@
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild.
         cb(natives.fsExistsSync(String(path)));
+      },
+
+      // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
+      // native open handle (a number) IS the integer fd. fsReadChunk reads
+      // sequentially, so `position` is honored only as null/current (no seek).
+      open: function (path, flags, mode, cb) {
+        if (typeof flags === "function") { cb = flags; flags = "r"; }
+        else if (typeof mode === "function") { cb = mode; }
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
+        Promise.resolve(natives.fsOpen(String(path), String(flagStr))).then(
+          function (info) { queueMicrotask(function () { cb(null, info.handle); }); },
+          function (err) { queueMicrotask(function () { cb(err); }); },
+        );
+      },
+      close: function (fd, cb) {
+        var err = null;
+        try { natives.fsClose(fd); } catch (e) { err = e; }
+        if (typeof cb === "function") queueMicrotask(function () { cb(err); });
+      },
+      read: function (fd, buffer, offset, length, position, cb) {
+        // Variants: (fd, buffer, offset, length, position, cb),
+        // (fd, options, cb), and trailing-callback short forms.
+        if (typeof buffer === "function") {
+          cb = buffer; buffer = globalThis.Buffer.alloc(16384); offset = 0; length = buffer.length;
+        } else if (buffer && typeof buffer === "object" && !ArrayBuffer.isView(buffer)) {
+          var o = buffer; cb = offset;
+          buffer = o.buffer || globalThis.Buffer.alloc(o.length || 16384);
+          offset = o.offset || 0;
+          length = o.length != null ? o.length : buffer.length - offset;
+        }
+        if (typeof offset === "function") { cb = offset; offset = 0; length = buffer ? buffer.length : 16384; }
+        if (typeof length === "function") { cb = length; length = buffer ? buffer.length - (offset || 0) : 16384; }
+        if (typeof position === "function") { cb = position; }
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
+        Promise.resolve(natives.fsReadChunk(fd, want)).then(
+          function (chunk) {
+            if (chunk === undefined || chunk === null) {
+              queueMicrotask(function () { cb(null, 0, buffer); });
+              return;
+            }
+            if (buffer) {
+              var view = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
+              view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
+            }
+            queueMicrotask(function () { cb(null, chunk.length, buffer); });
+          },
+          function (err) { queueMicrotask(function () { cb(err); }); },
+        );
       },
 
       createReadStream: (path, options) => {
