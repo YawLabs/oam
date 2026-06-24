@@ -1,8 +1,8 @@
 {
-  "commit": "9420c8a",
+  "commit": "f37fb10",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.0.1",
+  "oamVersion": "oam 0.6.0",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -66,10 +66,18 @@
         {
           "case": "15-timers-promises-console.mjs",
           "status": "pass"
+        },
+        {
+          "case": "16-diagnostics-channel.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "17-class-extends-emitter.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 15,
-      "total": 15
+      "pass": 17,
+      "total": 17
     },
     "surface": {
       "globals": {
