@@ -8,3 +8,7 @@ node_modules/
 /bench/sdk-fixtures/
 .vscode/
 .idea/
+# Browser-driving (playwright-mcp / CDP-over-pipe) artifacts. The live MCP
+# broker runs from the repo root, so its screenshots/snapshots land here.
+/.playwright-mcp/
+/oam-example-render.png
