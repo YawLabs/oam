@@ -34,6 +34,21 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pemfile = { workspace = true }
 
+# Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
+# child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std
+# Command only wires stdin/stdout/stderr; this is the libuv mechanism. cfg-
+# gated so non-Windows builds never compile or link it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
 # io_uring FS fast path: Linux-only async file I/O via io_uring, opt-in and
 # runtime-probed (see docs/design/io_uring.md). cfg-gated so non-Linux builds
 # never compile or link it -- they use the existing tokio::fs path.

@@ -284,6 +284,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("spawnWrite", op_spawn_write),
         ("spawnCloseStdin", op_spawn_close_stdin),
         ("spawnWait", op_spawn_wait),
+        // Windows extra-fd stdio (CDP-over-pipe for browsers). Real on Windows,
+        // platform-error stubs elsewhere.
+        ("spawnExtra", op_spawn_extra),
+        ("spawnExtraRead", op_spawn_extra_read),
+        ("spawnExtraWrite", op_spawn_extra_write),
+        ("spawnExtraCloseFd", op_spawn_extra_close_fd),
+        ("spawnExtraWait", op_spawn_extra_wait),
+        ("spawnExtraKill", op_spawn_extra_kill),
         // cluster
         ("clusterFork", op_cluster_fork),
         ("clusterWorkerWait", op_cluster_worker_wait),
@@ -3181,6 +3189,230 @@ fn op_spawn_wait(
         &mut rv,
         oam_core::child::child_wait(children, handle),
     );
+}
+
+// -------------------------------------------------- extra-fd stdio (Windows)
+// spawnExtra(command, args, opts, stdioCodes) -> {handle, pid} (synchronous,
+// like Node's spawn). stdioCodes is a number per fd: 0=ignore 1=inherit
+// 2=child-read(parent writes) 3=child-write(parent reads). Used for
+// CDP-over-pipe so a browser child gets numbered fds 3/4.
+
+#[cfg(windows)]
+fn op_spawn_extra(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    use oam_core::child_win::StdioFd;
+    let Some(command) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtra: command required");
+        return;
+    };
+    let mut child_args: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(1)) {
+        for i in 0..arr.length() {
+            if let Some(v) = arr.get_index(scope, i)
+                && let Some(s) = v.to_string(scope)
+            {
+                child_args.push(s.to_rust_string_lossy(scope));
+            }
+        }
+    }
+    let opts = {
+        let v = args.get(2);
+        if v.is_null_or_undefined() { None } else { v8::Local::<v8::Object>::try_from(v).ok() }
+    };
+    let cwd = opts.and_then(|o| {
+        let key = v8::String::new(scope, "cwd")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    });
+    let clear_env = opts
+        .and_then(|o| {
+            let key = v8::String::new(scope, "clearEnv")?;
+            o.get(scope, key.into())
+        })
+        .is_some_and(|v| v.is_true());
+    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
+        let key = v8::String::new(scope, "env")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+        let names = env_obj.get_own_property_names(scope, Default::default())?;
+        let mut pairs = Vec::new();
+        for i in 0..names.length() {
+            if let Some(name) = names.get_index(scope, i)
+                && let Some(val) = env_obj.get(scope, name)
+                && let (Some(k), Some(v)) = (
+                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                )
+            {
+                pairs.push((k, v));
+            }
+        }
+        Some(pairs)
+    });
+
+    // stdio codes (arg 3): one number per fd.
+    let mut stdio: Vec<StdioFd> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(3)) {
+        for i in 0..arr.length() {
+            let code = arr
+                .get_index(scope, i)
+                .map(|v| v.uint32_value(scope).unwrap_or(0))
+                .unwrap_or(0);
+            stdio.push(match code {
+                1 => StdioFd::Inherit,
+                2 => StdioFd::ChildRead,
+                3 => StdioFd::ChildWrite,
+                _ => StdioFd::Ignore,
+            });
+        }
+    }
+    if stdio.is_empty() {
+        throw_type_error(scope, "spawnExtra: stdio codes required");
+        return;
+    }
+
+    let reg = core_runtime!(scope).raw_children();
+    let ids = core_runtime!(scope).body_ids();
+    match oam_core::child_win::spawn_extra(
+        &command,
+        &child_args,
+        cwd.as_deref(),
+        env_pairs.as_deref(),
+        clear_env,
+        &stdio,
+    ) {
+        Ok(child) => {
+            let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pid = child.pid;
+            reg.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, child);
+            let json = serde_json::json!({ "handle": handle, "pid": pid });
+            if let Some(s) = v8::String::new(scope, &json.to_string()) {
+                rv.set(s.into());
+            }
+        }
+        Err(msg) => throw_type_error(scope, &msg),
+    }
+}
+
+#[cfg(windows)]
+fn op_spawn_extra_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = args.get(1).uint32_value(scope).unwrap_or(0);
+    let reg = core_runtime!(scope).raw_children();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_read(reg, handle, fd));
+}
+
+#[cfg(windows)]
+fn op_spawn_extra_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = args.get(1).uint32_value(scope).unwrap_or(0);
+    let Some(data) = arg_bytes(scope, &args, 2) else {
+        throw_type_error(scope, "spawnExtraWrite: data required");
+        return;
+    };
+    let reg = core_runtime!(scope).raw_children();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_write(reg, handle, fd, data));
+}
+
+#[cfg(windows)]
+fn op_spawn_extra_close_fd(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = args.get(1).uint32_value(scope).unwrap_or(0);
+    let reg = core_runtime!(scope).raw_children();
+    oam_core::child_win::raw_close_fd(&reg, handle, fd);
+}
+
+#[cfg(windows)]
+fn op_spawn_extra_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let reg = core_runtime!(scope).raw_children();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::child_win::raw_wait(reg, handle));
+}
+
+#[cfg(windows)]
+fn op_spawn_extra_kill(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let signal = arg_kill_signal(scope, &args, 1);
+    let reg = core_runtime!(scope).raw_children();
+    oam_core::child_win::raw_kill(&reg, handle, signal);
+}
+
+// Non-Windows: extra-fd stdio is not implemented yet (Unix needs pre_exec
+// dup2). Stubs keep the op table symbol-complete across platforms.
+#[cfg(not(windows))]
+fn op_spawn_extra(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    throw_type_error(scope, "spawnExtra: extra-fd stdio is only implemented on Windows");
+}
+#[cfg(not(windows))]
+fn op_spawn_extra_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    throw_type_error(scope, "spawnExtraRead: Windows only");
+}
+#[cfg(not(windows))]
+fn op_spawn_extra_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    throw_type_error(scope, "spawnExtraWrite: Windows only");
+}
+#[cfg(not(windows))]
+fn op_spawn_extra_close_fd(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+}
+#[cfg(not(windows))]
+fn op_spawn_extra_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    throw_type_error(scope, "spawnExtraWait: Windows only");
+}
+#[cfg(not(windows))]
+fn op_spawn_extra_kill(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
 }
 
 // ================================================================ cluster

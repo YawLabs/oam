@@ -35,6 +35,11 @@ pub mod worker;
 #[cfg(target_os = "linux")]
 mod io_uring_fs;
 
+/// Windows extra-fd stdio (raw CreateProcessW + lpReserved2). See child_win.rs.
+/// cfg'd out on every other platform (Unix extra-fd is a follow-up).
+#[cfg(windows)]
+pub mod child_win;
+
 pub type OpId = u64;
 
 /// What an async op produced. v8-free by design; the engine maps these to
@@ -138,6 +143,8 @@ pub struct CoreRuntime {
     ws: websocket::WsRegistry,
     workers: worker::WorkerRegistry,
     children: child::ChildRegistry,
+    #[cfg(windows)]
+    raw_children: child_win::RawChildRegistry,
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -178,6 +185,8 @@ impl CoreRuntime {
             ws: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             workers: std::sync::Arc::new(std::sync::Mutex::new(worker::WorkerState::default())),
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(windows)]
+            raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         })
     }
@@ -248,6 +257,12 @@ impl CoreRuntime {
     /// Child process registry (Arc clone; dies with the run).
     pub fn children(&self) -> child::ChildRegistry {
         self.children.clone()
+    }
+
+    /// Raw (extra-fd) child process registry, Windows only (Arc clone).
+    #[cfg(windows)]
+    pub fn raw_children(&self) -> child_win::RawChildRegistry {
+        self.raw_children.clone()
     }
 
     /// Spawn an async op; its completion will surface via try_recv /

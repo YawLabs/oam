@@ -1,5 +1,5 @@
 {
-  "commit": "5161649",
+  "commit": "eb9a63b",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -94,10 +94,14 @@
         {
           "case": "22-fs-fd-sync.mjs",
           "status": "pass"
+        },
+        {
+          "case": "23-child-extra-fd.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 22,
-      "total": 22
+      "pass": 23,
+      "total": 23
     },
     "surface": {
       "globals": {

@@ -9988,10 +9988,12 @@
         this.stderr = null;
         this._handle = null;
         this._exited = false;
+        this._extra = false;
       }
       kill(signal) {
         if (this._handle != null) {
-          natives.spawnKill(this._handle, signal);
+          if (this._extra) natives.spawnExtraKill(this._handle, signal);
+          else natives.spawnKill(this._handle, signal);
           this.killed = true;
         }
         return true;
@@ -10019,9 +10021,115 @@
       cp.once("spawnfail", onFail);
     }
 
+    // Map a Node stdio entry to the native spawnExtra direction code:
+    //   0=ignore 1=inherit 2=child-read(parent writes) 3=child-write(parent reads).
+    // For 'pipe', direction is by fd: fd0 child-reads (stdin); fd1/fd2
+    // child-write (stdout/stderr); fd3 child-reads, fd4 child-writes -- the CDP
+    // pipe-transport convention (Chromium reads commands on 3, writes on 4).
+    // Anonymous pipes are unidirectional, so extra fds carry one direction;
+    // full-duplex extra fds (named pipes) are a future enhancement.
+    function stdioCode(entry, fd) {
+      if (entry === "ignore" || entry === null || entry === undefined) return 0;
+      if (entry === "pipe" || entry === "overlapped") {
+        if (fd === 0) return 2;
+        if (fd === 1 || fd === 2) return 3;
+        return fd === 3 ? 2 : 3;
+      }
+      // 'inherit', a numeric fd, or a stream: inherit the parent's fd.
+      return 1;
+    }
+
+    // Windows extra-fd spawn: a child with numbered fds beyond 0/1/2 (Chromium
+    // --remote-debugging-pipe needs fds 3/4 for CDP). Synchronous like Node's
+    // spawn(); exposes cp.stdio[n] as Readable/Writable streams.
+    function spawnExtra(norm, stdioArr) {
+      const opts = norm.options;
+      const cp = new ChildProcess();
+      cp._extra = true;
+      const codes = stdioArr.map((e, i) => stdioCode(e, i));
+      const nativeOpts = {
+        cwd: opts.cwd || undefined,
+        env: opts.env || undefined,
+        clearEnv: false,
+      };
+
+      cp.stdio = new Array(stdioArr.length).fill(null);
+      let info;
+      try {
+        info = JSON.parse(natives.spawnExtra(norm.command, norm.args, nativeOpts, codes));
+      } catch (err) {
+        const e = typeof err === "string" ? new Error(err) : err;
+        queueMicrotask(() => cp.emit("error", e));
+        return cp;
+      }
+      cp._handle = info.handle;
+      cp.pid = info.pid;
+
+      const reads = [];
+      for (let fd = 0; fd < codes.length; fd++) {
+        if (codes[fd] === 2) {
+          // child reads -> parent writes: a Writable.
+          const w = new Writable({
+            write(chunk, encoding, callback) {
+              const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
+              natives.spawnExtraWrite(cp._handle, fd, data).then(() => callback(), (er) => callback(er));
+            },
+            final(callback) {
+              natives.spawnExtraCloseFd(cp._handle, fd);
+              callback();
+            },
+          });
+          cp.stdio[fd] = w;
+        } else if (codes[fd] === 3) {
+          // child writes -> parent reads: a Readable + a pump loop.
+          const r = new Readable({ read() {} });
+          cp.stdio[fd] = r;
+          reads.push((async () => {
+            while (true) {
+              let chunk;
+              try {
+                chunk = await natives.spawnExtraRead(cp._handle, fd);
+              } catch {
+                r.push(null);
+                break;
+              }
+              if (chunk === undefined || chunk === null || chunk.length === 0) {
+                r.push(null);
+                break;
+              }
+              r.push(Buffer.from(chunk));
+            }
+          })());
+        }
+      }
+      // Node aliases: stdin/stdout/stderr are stdio[0..2].
+      cp.stdin = cp.stdio[0];
+      cp.stdout = cp.stdio[1];
+      cp.stderr = cp.stdio[2];
+
+      queueMicrotask(() => cp.emit("spawn"));
+
+      natives.spawnExtraWait(cp._handle).then((result) => {
+        cp._exited = true;
+        cp.exitCode = result.code;
+        cp.signalCode = result.signal;
+        cp.emit("exit", result.code, result.signal);
+        Promise.allSettled(reads).then(() => {
+          cp.emit("close", result.code, result.signal);
+        });
+      });
+
+      return cp;
+    }
+
     function spawn(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
+      // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries on
+      // Windows routes to the raw CreateProcessW + lpReserved2 path.
+      if (Array.isArray(opts.stdio) && opts.stdio.length > 3 && natives.platform === "win32") {
+        return spawnExtra(norm, opts.stdio);
+      }
       const cp = new ChildProcess();
 
       cp.stdout = new Readable({ read() {} });
