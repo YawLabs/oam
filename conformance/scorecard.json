@@ -1,5 +1,5 @@
 {
-  "commit": "72c066d",
+  "commit": "4de1972",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -110,10 +110,14 @@
         {
           "case": "26-child-extra-fd-enoent.mjs",
           "status": "pass"
+        },
+        {
+          "case": "27-fs-constants-platform.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 26,
-      "total": 26
+      "pass": 27,
+      "total": 27
     },
     "surface": {
       "globals": {

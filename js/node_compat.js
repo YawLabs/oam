@@ -1590,6 +1590,24 @@
   registry.factories["path/posix"] = () => registry.get("path").posix;
   registry.factories["path/win32"] = () => registry.get("path").win32;
 
+  // Node's fs.constants O_* are the platform's fcntl/CRT values: O_CREAT/O_EXCL/
+  // O_TRUNC/O_APPEND differ between Linux, Windows (MSVCRT), and macOS (BSD).
+  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) numericOpenFlags() must use
+  // the same per-platform values, so this is the single source for both.
+  function platformOFlags(platform) {
+    if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
+    if (platform === "darwin") return { O_CREAT: 512, O_EXCL: 2048, O_TRUNC: 1024, O_APPEND: 8 };
+    return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024 }; // linux + other
+  }
+
+  // os.constants.errno is POSITIVE in Node (POSIX errno; ENOENT=2), unlike the
+  // libuv-negative codes used elsewhere. Flip the sign of the negative table.
+  function positiveErrno(table) {
+    const out = {};
+    for (const k of Object.keys(table)) out[k] = -table[k];
+    return out;
+  }
+
   // ------------------------------------------------------------------- os
   registry.factories.os = (natives) => {
     const isWin = natives.platform === "win32";
@@ -1650,7 +1668,7 @@
           SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
           SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
         },
-        errno: {
+        errno: positiveErrno({
           E2BIG: -7, EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99,
           EAFNOSUPPORT: -97, EAGAIN: -11, EALREADY: -114, EBADF: -9,
           EBADMSG: -74, EBUSY: -16, ECANCELED: -125, ECHILD: -10,
@@ -1672,7 +1690,7 @@
           ERANGE: -34, EROFS: -30, ESPIPE: -29, ESRCH: -3,
           ESTALE: -116, ETIME: -62, ETIMEDOUT: -110, ETXTBSY: -26,
           EWOULDBLOCK: -11, EXDEV: -18,
-        },
+        }),
         priority: {
           PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
           PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
@@ -2850,7 +2868,7 @@
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
-        O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_SYNC: 1052672,
+        ...platformOFlags(natives.platform), O_SYNC: 1052672,
         O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
         S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
         S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,
@@ -2956,7 +2974,7 @@
     // takes. Most callers pass a string ("r"/"w"/...); chokidar does.
     function numericOpenFlags(n) {
       var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-      var append = (n & 1024) !== 0; // O_APPEND
+      var append = (n & platformOFlags(natives.platform).O_APPEND) !== 0; // O_APPEND
       if (acc === 1) return append ? "a" : "w";
       if (acc === 2) return append ? "a+" : "r+";
       return "r";
@@ -3085,7 +3103,7 @@
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
-        O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_SYNC: 1052672,
+        ...platformOFlags(natives.platform), O_SYNC: 1052672,
         O_DIRECTORY: 65536, O_NOFOLLOW: 131072,
         S_IFMT: 61440, S_IFREG: 32768, S_IFDIR: 16384, S_IFLNK: 40960,
         S_IFBLK: 24576, S_IFCHR: 8192, S_IFIFO: 4096, S_IFSOCK: 49152,

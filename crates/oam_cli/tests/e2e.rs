@@ -8314,10 +8314,10 @@ console.log('report_actual=' + report[0].actual);
         "SIGKILL=9",
         "SIGINT=2",
         "SIGHUP=1",
-        "ENOENT=-2",
-        "EACCES=-13",
-        "EEXIST=-17",
-        "EPERM=-1",
+        "ENOENT=2",
+        "EACCES=13",
+        "EEXIST=17",
+        "EPERM=1",
         "PRIORITY_NORMAL=0",
         "tc_start_type=function",
         "tc_end_type=function",
@@ -8393,6 +8393,14 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
         out.status.success(),
         "misc m3f failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
+    // fs.constants.O_CREAT is the platform's fcntl/CRT value (differs per OS).
+    const O_CREAT_EXP: &str = if cfg!(target_os = "windows") {
+        "O_CREAT=256"
+    } else if cfg!(target_os = "macos") {
+        "O_CREAT=512"
+    } else {
+        "O_CREAT=64"
+    };
     let expected = [
         "Dirent_type=function",
         "instanceof=true",
@@ -8407,7 +8415,7 @@ console.log('fsp_S_IFMT=' + fsp.constants.S_IFMT);
         "O_RDONLY=0",
         "O_WRONLY=1",
         "O_RDWR=2",
-        "O_CREAT=64",
+        O_CREAT_EXP,
         "S_IFMT=61440",
         "S_IFREG=32768",
         "S_IFDIR=16384",
