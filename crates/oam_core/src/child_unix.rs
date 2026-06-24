@@ -96,12 +96,7 @@ fn make_pipe() -> Result<(RawFd, RawFd), String> {
 
 /// Open `/dev/null` read-write, `CLOEXEC`.
 fn open_dev_null() -> Result<RawFd, String> {
-    let fd = unsafe {
-        libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_RDWR | libc::O_CLOEXEC,
-        )
-    };
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(format!(
             "open(/dev/null): {}",
