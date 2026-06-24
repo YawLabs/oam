@@ -1,5 +1,5 @@
 {
-  "commit": "4de1972",
+  "commit": "95f760f",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -114,10 +114,14 @@
         {
           "case": "27-fs-constants-platform.mjs",
           "status": "pass"
+        },
+        {
+          "case": "28-fs-error-errno.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 27,
-      "total": 27
+      "pass": 28,
+      "total": 28
     },
     "surface": {
       "globals": {
