@@ -980,154 +980,158 @@
       return self._events;
     }
 
-    class EventEmitter {
-      constructor() {
+    // Defined as a function constructor (NOT an ES6 class) for Node parity:
+    // transpiled CJS subclasses (TS `__extends`, ioredis, pg) invoke the
+    // superclass as a plain function -- `EventEmitter.call(this)` -- which an
+    // ES6 class rejects with "Class constructor cannot be invoked without
+    // 'new'". A function constructor accepts both that call form AND native
+    // `class X extends EventEmitter { super() }`.
+    function EventEmitter() {
+      this._events = { __proto__: null };
+      this._eventsCount = 0;
+    }
+    EventEmitter.prototype.setMaxListeners = function (n) {
+      this[kMax] = n;
+      return this;
+    };
+    EventEmitter.prototype.getMaxListeners = function () {
+      return this[kMax] ?? EventEmitter.defaultMaxListeners;
+    };
+    EventEmitter.prototype._add = function (type, listener, prepend, once) {
+      eventsOf(this);
+      if (typeof listener !== "function") {
+        throw new TypeError(`The "listener" argument must be a function`);
+      }
+      let entry = listener;
+      if (once) {
+        const wrapper = (...args) => {
+          this.removeListener(type, wrapper);
+          listener.apply(this, args);
+        };
+        wrapper.listener = listener;
+        entry = wrapper;
+      }
+      if (this._events.newListener) {
+        this.emit("newListener", type, entry.listener ?? entry);
+      }
+      const existing = this._events[type];
+      if (existing === undefined) {
+        this._events[type] = entry;
+        this._eventsCount++;
+      } else if (typeof existing === "function") {
+        this._events[type] = prepend ? [entry, existing] : [existing, entry];
+      } else if (prepend) {
+        existing.unshift(entry);
+      } else {
+        existing.push(entry);
+      }
+      const count = this.listenerCount(type);
+      const max = this.getMaxListeners();
+      if (max > 0 && count > max && !this._events[type].warned) {
+        this._events[type].warned = true;
+        if (globalThis.console) {
+          globalThis.console.warn(
+            `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
+              `Use emitter.setMaxListeners() to increase limit`,
+          );
+        }
+      }
+      return this;
+    };
+    EventEmitter.prototype.addListener = function (type, listener) {
+      return this._add(type, listener, false, false);
+    };
+    EventEmitter.prototype.on = function (type, listener) {
+      return this._add(type, listener, false, false);
+    };
+    EventEmitter.prototype.once = function (type, listener) {
+      return this._add(type, listener, false, true);
+    };
+    EventEmitter.prototype.prependListener = function (type, listener) {
+      return this._add(type, listener, true, false);
+    };
+    EventEmitter.prototype.prependOnceListener = function (type, listener) {
+      return this._add(type, listener, true, true);
+    };
+    EventEmitter.prototype.removeListener = function (type, listener) {
+      const existing = eventsOf(this)[type];
+      if (existing === undefined) return this;
+      if (existing === listener || existing.listener === listener) {
+        delete this._events[type];
+        this._eventsCount--;
+        if (this._events.removeListener) {
+          this.emit("removeListener", type, existing.listener ?? existing);
+        }
+        return this;
+      }
+      if (typeof existing !== "function") {
+        for (let i = existing.length - 1; i >= 0; i--) {
+          if (existing[i] === listener || existing[i].listener === listener) {
+            const removed = existing[i];
+            existing.splice(i, 1);
+            if (existing.length === 1) this._events[type] = existing[0];
+            else if (existing.length === 0) {
+              delete this._events[type];
+              this._eventsCount--;
+            }
+            if (this._events.removeListener) {
+              this.emit("removeListener", type, removed.listener ?? removed);
+            }
+            break;
+          }
+        }
+      }
+      return this;
+    };
+    EventEmitter.prototype.off = function (type, listener) {
+      return this.removeListener(type, listener);
+    };
+    EventEmitter.prototype.removeAllListeners = function (type) {
+      eventsOf(this);
+      if (type === undefined) {
         this._events = { __proto__: null };
         this._eventsCount = 0;
+      } else if (this._events[type] !== undefined) {
+        delete this._events[type];
+        this._eventsCount--;
       }
-      setMaxListeners(n) {
-        this[kMax] = n;
-        return this;
+      return this;
+    };
+    EventEmitter.prototype.listeners = function (type) {
+      return this.rawListeners(type).map((l) => l.listener ?? l);
+    };
+    EventEmitter.prototype.rawListeners = function (type) {
+      const existing = eventsOf(this)[type];
+      if (existing === undefined) return [];
+      return typeof existing === "function" ? [existing] : existing.slice();
+    };
+    EventEmitter.prototype.listenerCount = function (type) {
+      const existing = eventsOf(this)[type];
+      if (existing === undefined) return 0;
+      return typeof existing === "function" ? 1 : existing.length;
+    };
+    EventEmitter.prototype.eventNames = function () {
+      return Reflect.ownKeys(eventsOf(this));
+    };
+    EventEmitter.prototype.emit = function (type, ...args) {
+      const events = eventsOf(this);
+      if (type === "error" && events[errorMonitor]) {
+        for (const l of this.rawListeners(errorMonitor)) l.apply(this, args);
       }
-      getMaxListeners() {
-        return this[kMax] ?? EventEmitter.defaultMaxListeners;
-      }
-      _add(type, listener, prepend, once) {
-        eventsOf(this);
-        if (typeof listener !== "function") {
-          throw new TypeError(`The "listener" argument must be a function`);
+      const existing = events[type];
+      if (existing === undefined) {
+        if (type === "error") {
+          const err = args[0];
+          throw err instanceof Error
+            ? err
+            : new Error(`Unhandled error. (${String(err)})`);
         }
-        let entry = listener;
-        if (once) {
-          const wrapper = (...args) => {
-            this.removeListener(type, wrapper);
-            listener.apply(this, args);
-          };
-          wrapper.listener = listener;
-          entry = wrapper;
-        }
-        if (this._events.newListener) {
-          this.emit("newListener", type, entry.listener ?? entry);
-        }
-        const existing = this._events[type];
-        if (existing === undefined) {
-          this._events[type] = entry;
-          this._eventsCount++;
-        } else if (typeof existing === "function") {
-          this._events[type] = prepend ? [entry, existing] : [existing, entry];
-        } else if (prepend) {
-          existing.unshift(entry);
-        } else {
-          existing.push(entry);
-        }
-        const count = this.listenerCount(type);
-        const max = this.getMaxListeners();
-        if (max > 0 && count > max && !this._events[type].warned) {
-          this._events[type].warned = true;
-          if (globalThis.console) {
-            globalThis.console.warn(
-              `(oam) MaxListenersExceededWarning: ${count} ${String(type)} listeners added to EventEmitter. ` +
-                `Use emitter.setMaxListeners() to increase limit`,
-            );
-          }
-        }
-        return this;
+        return false;
       }
-      addListener(type, listener) {
-        return this._add(type, listener, false, false);
-      }
-      on(type, listener) {
-        return this._add(type, listener, false, false);
-      }
-      once(type, listener) {
-        return this._add(type, listener, false, true);
-      }
-      prependListener(type, listener) {
-        return this._add(type, listener, true, false);
-      }
-      prependOnceListener(type, listener) {
-        return this._add(type, listener, true, true);
-      }
-      removeListener(type, listener) {
-        const existing = eventsOf(this)[type];
-        if (existing === undefined) return this;
-        if (existing === listener || existing.listener === listener) {
-          delete this._events[type];
-          this._eventsCount--;
-          if (this._events.removeListener) {
-            this.emit("removeListener", type, existing.listener ?? existing);
-          }
-          return this;
-        }
-        if (typeof existing !== "function") {
-          for (let i = existing.length - 1; i >= 0; i--) {
-            if (existing[i] === listener || existing[i].listener === listener) {
-              const removed = existing[i];
-              existing.splice(i, 1);
-              if (existing.length === 1) this._events[type] = existing[0];
-              else if (existing.length === 0) {
-                delete this._events[type];
-                this._eventsCount--;
-              }
-              if (this._events.removeListener) {
-                this.emit("removeListener", type, removed.listener ?? removed);
-              }
-              break;
-            }
-          }
-        }
-        return this;
-      }
-      off(type, listener) {
-        return this.removeListener(type, listener);
-      }
-      removeAllListeners(type) {
-        eventsOf(this);
-        if (type === undefined) {
-          this._events = { __proto__: null };
-          this._eventsCount = 0;
-        } else if (this._events[type] !== undefined) {
-          delete this._events[type];
-          this._eventsCount--;
-        }
-        return this;
-      }
-      listeners(type) {
-        return this.rawListeners(type).map((l) => l.listener ?? l);
-      }
-      rawListeners(type) {
-        const existing = eventsOf(this)[type];
-        if (existing === undefined) return [];
-        return typeof existing === "function" ? [existing] : existing.slice();
-      }
-      listenerCount(type) {
-        const existing = eventsOf(this)[type];
-        if (existing === undefined) return 0;
-        return typeof existing === "function" ? 1 : existing.length;
-      }
-      eventNames() {
-        return Reflect.ownKeys(eventsOf(this));
-      }
-      emit(type, ...args) {
-        const events = eventsOf(this);
-        if (type === "error" && events[errorMonitor]) {
-          for (const l of this.rawListeners(errorMonitor)) l.apply(this, args);
-        }
-        const existing = events[type];
-        if (existing === undefined) {
-          if (type === "error") {
-            const err = args[0];
-            throw err instanceof Error
-              ? err
-              : new Error(`Unhandled error. (${String(err)})`);
-          }
-          return false;
-        }
-        const list = typeof existing === "function" ? [existing] : existing.slice();
-        for (const listener of list) listener.apply(this, args);
-        return true;
-      }
-    }
+      const list = typeof existing === "function" ? [existing] : existing.slice();
+      for (const listener of list) listener.apply(this, args);
+      return true;
+    };
     EventEmitter.defaultMaxListeners = 10;
     EventEmitter.errorMonitor = errorMonitor;
 
@@ -8692,26 +8696,122 @@
     function unsubscribe(name, fn) { return channel(name).unsubscribe(fn); }
     function tracingChannel(nameOrChannel) {
       var name = typeof nameOrChannel === "string" ? nameOrChannel : nameOrChannel.name;
-      var ch = (suffix) => channel(name + ":" + suffix);
+      // Pin the five sub-channels so the trace methods publish to the SAME
+      // Channel instances the caller subscribed to.
+      var startCh = channel(name + ":start");
+      var endCh = channel(name + ":end");
+      var asyncStartCh = channel(name + ":asyncStart");
+      var asyncEndCh = channel(name + ":asyncEnd");
+      var errorCh = channel(name + ":error");
       return {
-        start: ch("start"),
-        end: ch("end"),
-        asyncStart: ch("asyncStart"),
-        asyncEnd: ch("asyncEnd"),
-        error: ch("error"),
+        start: startCh,
+        end: endCh,
+        asyncStart: asyncStartCh,
+        asyncEnd: asyncEndCh,
+        error: errorCh,
+        get hasSubscribers() {
+          return (
+            startCh.hasSubscribers ||
+            endCh.hasSubscribers ||
+            asyncStartCh.hasSubscribers ||
+            asyncEndCh.hasSubscribers ||
+            errorCh.hasSubscribers
+          );
+        },
         subscribe: (handlers) => {
-          if (handlers.start) ch("start").subscribe(handlers.start);
-          if (handlers.end) ch("end").subscribe(handlers.end);
-          if (handlers.asyncStart) ch("asyncStart").subscribe(handlers.asyncStart);
-          if (handlers.asyncEnd) ch("asyncEnd").subscribe(handlers.asyncEnd);
-          if (handlers.error) ch("error").subscribe(handlers.error);
+          if (handlers.start) startCh.subscribe(handlers.start);
+          if (handlers.end) endCh.subscribe(handlers.end);
+          if (handlers.asyncStart) asyncStartCh.subscribe(handlers.asyncStart);
+          if (handlers.asyncEnd) asyncEndCh.subscribe(handlers.asyncEnd);
+          if (handlers.error) errorCh.subscribe(handlers.error);
         },
         unsubscribe: (handlers) => {
-          if (handlers.start) ch("start").unsubscribe(handlers.start);
-          if (handlers.end) ch("end").unsubscribe(handlers.end);
-          if (handlers.asyncStart) ch("asyncStart").unsubscribe(handlers.asyncStart);
-          if (handlers.asyncEnd) ch("asyncEnd").unsubscribe(handlers.asyncEnd);
-          if (handlers.error) ch("error").unsubscribe(handlers.error);
+          if (handlers.start) startCh.unsubscribe(handlers.start);
+          if (handlers.end) endCh.unsubscribe(handlers.end);
+          if (handlers.asyncStart) asyncStartCh.unsubscribe(handlers.asyncStart);
+          if (handlers.asyncEnd) asyncEndCh.unsubscribe(handlers.asyncEnd);
+          if (handlers.error) errorCh.unsubscribe(handlers.error);
+        },
+        // Node's TracingChannel trace API. The no-subscriber fast path
+        // (the common case -- no tracer attached) just runs fn, matching
+        // Node, so the publish bookkeeping never runs when nobody listens.
+        traceSync(fn, context, thisArg, ...args) {
+          context = context || {};
+          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
+          startCh.publish(context);
+          try {
+            const result = Reflect.apply(fn, thisArg, args);
+            context.result = result;
+            return result;
+          } catch (err) {
+            context.error = err;
+            errorCh.publish(context);
+            throw err;
+          } finally {
+            endCh.publish(context);
+          }
+        },
+        tracePromise(fn, context, thisArg, ...args) {
+          context = context || {};
+          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
+          startCh.publish(context);
+          let promise;
+          try {
+            promise = Reflect.apply(fn, thisArg, args);
+          } catch (err) {
+            context.error = err;
+            errorCh.publish(context);
+            endCh.publish(context);
+            throw err;
+          }
+          endCh.publish(context);
+          return Promise.resolve(promise).then(
+            (result) => {
+              context.result = result;
+              asyncStartCh.publish(context);
+              asyncEndCh.publish(context);
+              return result;
+            },
+            (err) => {
+              context.error = err;
+              errorCh.publish(context);
+              asyncStartCh.publish(context);
+              asyncEndCh.publish(context);
+              throw err;
+            },
+          );
+        },
+        traceCallback(fn, position, context, thisArg, ...args) {
+          context = context || {};
+          if (!startCh.hasSubscribers) return Reflect.apply(fn, thisArg, args);
+          if (position === undefined || position === -1) position = args.length - 1;
+          const callback = args[position];
+          if (typeof callback === "function") {
+            args[position] = function wrapped(err) {
+              if (err) {
+                context.error = err;
+                errorCh.publish(context);
+              } else {
+                context.result = arguments[1];
+              }
+              asyncStartCh.publish(context);
+              try {
+                return Reflect.apply(callback, this, arguments);
+              } finally {
+                asyncEndCh.publish(context);
+              }
+            };
+          }
+          startCh.publish(context);
+          try {
+            return Reflect.apply(fn, thisArg, args);
+          } catch (err) {
+            context.error = err;
+            errorCh.publish(context);
+            throw err;
+          } finally {
+            endCh.publish(context);
+          }
         },
       };
     }
