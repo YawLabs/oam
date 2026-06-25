@@ -14018,3 +14018,120 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+// -- gated regression guards for runtime-lifecycle + node-compat behaviors that
+// the advisory conformance/node-suite suites cover but per-PR CI does not. --
+
+#[test]
+fn node_test_exit_code_reflects_pass_fail() {
+    // The node:test oracle (exit 0 == pass) depends on a FAILING test setting
+    // process.exitCode = 1. If this wiring breaks, every failing node:test reports
+    // exit 0 and vacuously passes -- the integrity hole closed for mustCall.
+    let pass = write_temp(
+        "nt_pass.mjs",
+        "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('p', () => assert.ok(true));\n",
+    );
+    let fail = write_temp(
+        "nt_fail.mjs",
+        "import { test } from 'node:test';\nimport assert from 'node:assert';\ntest('f', () => assert.strictEqual(1, 2));\n",
+    );
+    let p = oam(&["run", pass.to_str().unwrap(), "--no-check"]);
+    let f = oam(&["run", fail.to_str().unwrap(), "--no-check"]);
+    assert_eq!(p.status.code(), Some(0), "a passing node:test must exit 0");
+    assert_eq!(f.status.code(), Some(1), "a failing node:test must exit 1");
+}
+
+#[test]
+fn process_exit_event_fires_on_uncaught_fatal() {
+    // process.on('exit') must run even when the program dies on an uncaught throw
+    // (Node parity). A regression in the run-completion path would silently drop
+    // exit handlers on crash.
+    let path = write_temp(
+        "exit_fatal.cjs",
+        "process.on('exit', () => console.log('EXIT_FIRED'));\nthrow new Error('boom');\n",
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("EXIT_FIRED"),
+        "exit handler must run on a fatal throw; stdout: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an uncaught throw must exit non-zero"
+    );
+}
+
+#[test]
+fn buffer_callable_without_new_and_static_surface() {
+    // Buffer() callable with AND without `new`, instanceof + the full static
+    // surface survive the callable shim, and Buffer(number, "encoding") throws
+    // ERR_INVALID_ARG_TYPE. `new Buffer()` is heavy in legacy / MCP-dep code.
+    let path = write_temp(
+        "buf_callable.cjs",
+        r#"
+const a = new Buffer(3);
+const b = Buffer.from([1, 2]);
+console.log('new_len=' + a.length);
+console.log('new_inst=' + (a instanceof Buffer));
+console.log('from_inst=' + (b instanceof Buffer));
+console.log('isBuffer=' + Buffer.isBuffer(Buffer.alloc(1)));
+console.log('statics=' + ['from','alloc','allocUnsafe','concat','compare','byteLength','isBuffer'].every(k => typeof Buffer[k] === 'function'));
+console.log('poolSize=' + (typeof Buffer.poolSize));
+let code = 'none';
+try { Buffer(3, 'utf8'); } catch (e) { code = e.code; }
+console.log('num_enc=' + code);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The DEP0005 deprecation warning goes to stderr; keep only the data lines.
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.contains('=')).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "new_len=3",
+            "new_inst=true",
+            "from_inst=true",
+            "isBuffer=true",
+            "statics=true",
+            "poolSize=number",
+            "num_enc=ERR_INVALID_ARG_TYPE",
+        ],
+        "Buffer callable/statics divergence; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn assert_throws_validation_fn_must_return_true() {
+    // A validation function returning non-true is its own failure mode in Node:
+    // a specific AssertionError ('expected to return "true"'), NOT the generic
+    // "does not match the expected pattern", and it must embed the caught error
+    // rather than silently swallowing it.
+    let path = write_temp(
+        "assert_valfn.cjs",
+        r#"
+const assert = require('node:assert');
+let name = 'none', starts = false, caught = false;
+try {
+  assert.throws(() => { throw new TypeError('orig'); }, () => false);
+} catch (e) {
+  name = e.constructor.name;
+  starts = e.message.startsWith('The validation function is expected to return "true". Received false');
+  caught = e.message.includes('Caught error:') && e.message.includes('TypeError: orig');
+}
+console.log('name=' + name);
+console.log('starts=' + starts);
+console.log('caught=' + caught);
+"#,
+    );
+    let out = oam(&["run", path.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.contains('=')).collect();
+    assert_eq!(
+        lines,
+        vec!["name=AssertionError", "starts=true", "caught=true"],
+        "validation-fn non-true behavior; stdout: {stdout}"
+    );
+}

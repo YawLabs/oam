@@ -156,22 +156,44 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| "-".into())
         );
-        if manifest_skips > max {
-            bail!(
-                "skip-ratchet violation: {manifest_skips} manifest skips > ceiling {max}. \
-                 Fix the tests, or (with review) raise ratchet.maxSkips in manifest.json -- it should only ever go DOWN."
-            );
-        }
     }
-    if let Some(max) = manifest.max_known_issues
-        && manifest.known_issues > max
-    {
-        bail!(
-            "known-issues ceiling violation: {} known_issues/flaky skips > ceiling {max}.",
-            manifest.known_issues
-        );
+    if let Some(msg) = ratchet_violation(
+        manifest_skips,
+        manifest.known_issues,
+        manifest.max_skips,
+        manifest.max_known_issues,
+    ) {
+        bail!("{msg}");
     }
     Ok(())
+}
+
+/// Pure ratchet check (extracted for unit testing): returns Some(message) when
+/// the discretionary skip count or the known-issues count exceeds its committed
+/// ceiling. None = within limits or ceiling unset. `== ceiling` is allowed;
+/// only `> ceiling` violates.
+fn ratchet_violation(
+    skips: usize,
+    known_issues: usize,
+    max_skips: Option<usize>,
+    max_known_issues: Option<usize>,
+) -> Option<String> {
+    if let Some(max) = max_skips
+        && skips > max
+    {
+        return Some(format!(
+            "skip-ratchet violation: {skips} manifest skips > ceiling {max}. \
+             Fix the tests, or (with review) raise ratchet.maxSkips in manifest.json -- it should only ever go DOWN."
+        ));
+    }
+    if let Some(max) = max_known_issues
+        && known_issues > max
+    {
+        return Some(format!(
+            "known-issues ceiling violation: {known_issues} known_issues/flaky skips > ceiling {max}."
+        ));
+    }
+    None
 }
 
 /// Run one test, with a 3x flaky rerun: a Pass on any attempt wins; otherwise
@@ -445,4 +467,69 @@ fn write_scorecard(
     }
     std::fs::write(repo.join("CONFORMANCE-NODE.md"), md)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cap(stderr: &str) -> Captured {
+        Captured {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            code: 1,
+            timed_out: false,
+        }
+    }
+
+    // -- skip-ratchet: the integrity mechanism against denominator-gaming --
+
+    #[test]
+    fn ratchet_within_or_at_ceiling_is_ok() {
+        assert!(ratchet_violation(0, 0, Some(0), Some(0)).is_none());
+        assert!(ratchet_violation(3, 1, Some(5), Some(2)).is_none());
+        // == ceiling is allowed; only > ceiling violates.
+        assert!(ratchet_violation(5, 2, Some(5), Some(2)).is_none());
+        // Unset ceilings = unenforced, even with a high count.
+        assert!(ratchet_violation(99, 99, None, None).is_none());
+    }
+
+    #[test]
+    fn ratchet_skips_over_ceiling_violates() {
+        let msg = ratchet_violation(1, 0, Some(0), Some(0)).expect("must violate");
+        assert!(msg.contains("skip-ratchet violation"));
+        assert!(msg.contains("1 manifest skips > ceiling 0"));
+    }
+
+    #[test]
+    fn ratchet_known_issues_over_ceiling_violates() {
+        let msg = ratchet_violation(0, 3, Some(10), Some(2)).expect("must violate");
+        assert!(msg.contains("known-issues ceiling violation"));
+        assert!(msg.contains("3 known_issues/flaky skips > ceiling 2"));
+    }
+
+    // -- missing_builtin: reclassifies "oam lacks node:X" fail -> unrunnable.
+    // Pinned to oam's exact error strings; if the wording drifts, node:test-
+    // dependent tests would silently flip unrunnable->fail and tank the number.
+
+    #[test]
+    fn missing_builtin_extracts_unknown_node_builtin() {
+        let c = cap("error[OAM-MOD0006]: 'node:test' is not a known node: builtin module");
+        assert_eq!(missing_builtin(&c).as_deref(), Some("node:test"));
+    }
+
+    #[test]
+    fn missing_builtin_extracts_cannot_find_module() {
+        let c = cap("Error: Cannot find module 'node:inspector/promises' required from x");
+        assert_eq!(
+            missing_builtin(&c).as_deref(),
+            Some("node:inspector/promises")
+        );
+    }
+
+    #[test]
+    fn missing_builtin_none_for_ordinary_assertion_failure() {
+        let c = cap("AssertionError: 1 strictEqual 2");
+        assert!(missing_builtin(&c).is_none());
+    }
 }

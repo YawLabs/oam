@@ -4314,7 +4314,20 @@
         if (expected === Error || Error.isPrototypeOf(expected)) {
           return false;
         }
-        return expected(err) === true;
+        // Validation function: Node requires it to return EXACTLY `true`. Any
+        // other return value is its own failure mode -- a specific AssertionError
+        // embedding the inspected return + the caught error -- NOT the generic
+        // "does not match the expected pattern". A throw inside propagates.
+        const ret = expected(err);
+        if (ret === true) return true;
+        throw new AssertionError({
+          message:
+            'The validation function is expected to return "true". Received ' +
+            util.inspect(ret) +
+            "\n\nCaught error:\n\n" +
+            String(err),
+          operator: "throws",
+        });
       }
       if (expected && typeof expected === "object") {
         // Validation object (Node's compareExceptionKey): for every own
