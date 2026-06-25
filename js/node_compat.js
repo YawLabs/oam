@@ -12634,6 +12634,317 @@
     };
   };
 
+  // ------------------------------------------------------------- node:test
+  // Node's built-in test runner (focused subset): describe/suite/it/test +
+  // before/after/beforeEach/afterEach + a minimal TestContext. Auto-runs the
+  // registered tests after the file finishes evaluating (scheduled via
+  // queueMicrotask, which runs once the synchronous top-level registration is
+  // done) and sets process.exitCode = 1 on any failure -- which the harness
+  // oracle (exit 0 == pass) and the natural-'exit' path then surface. TAP-lite
+  // output to stdout. Prefix-only: only require('node:test') resolves here.
+  registry.factories["test"] = () => {
+    const assert = registry.get("assert");
+    const log = (s) => globalThis.console.log(s);
+
+    const root = makeTestSuite("", null);
+    let current = root;
+    let scheduled = false;
+    let hasOnly = false;
+    let passed = 0;
+    let failed = 0;
+    let skipped = 0;
+    let counter = 0;
+
+    function makeTestSuite(name, parent) {
+      return {
+        name,
+        parent,
+        children: [],
+        before: [],
+        after: [],
+        beforeEach: [],
+        afterEach: [],
+        mode: "normal",
+      };
+    }
+    function lineage(s) {
+      const c = [];
+      for (; s; s = s.parent) c.unshift(s);
+      return c;
+    }
+    function inheritedSkip(s) {
+      for (; s; s = s.parent) if (s.mode === "skip") return true;
+      return false;
+    }
+    function hasOnlyAncestor(s) {
+      for (; s; s = s.parent) if (s.mode === "only") return true;
+      return false;
+    }
+
+    // Node's (name?, options?, fn?) overload soup, normalized.
+    function norm(name, options, fn) {
+      if (typeof name === "function") {
+        fn = name;
+        options = undefined;
+        name = fn.name || "<anonymous>";
+      } else if (typeof options === "function") {
+        fn = options;
+        options = undefined;
+      }
+      if (typeof name !== "string") name = (fn && fn.name) || "<anonymous>";
+      return { name, options: options || {}, fn };
+    }
+
+    function schedule() {
+      if (scheduled) return;
+      scheduled = true;
+      // Runs after the file's synchronous top-level registration completes.
+      queueMicrotask(() => {
+        runRoot();
+      });
+    }
+
+    function addSuite(name, options, fn, forced) {
+      const a = norm(name, options, fn);
+      const s = makeTestSuite(a.name, current);
+      if (forced) s.mode = forced;
+      else if (a.options.only) {
+        s.mode = "only";
+        hasOnly = true;
+      } else if (a.options.skip || a.options.todo) s.mode = "skip";
+      current.children.push({ kind: "suite", suite: s });
+      const prev = current;
+      current = s;
+      try {
+        if (a.fn) a.fn();
+      } finally {
+        current = prev;
+      }
+      schedule();
+    }
+
+    function addTest(name, options, fn, forced) {
+      const a = norm(name, options, fn);
+      let mode = forced || "normal";
+      if (!forced) {
+        if (a.options.only) {
+          mode = "only";
+          hasOnly = true;
+        } else if (a.options.todo) mode = "todo";
+        else if (a.options.skip) mode = "skip";
+      }
+      const entry = {
+        kind: "test",
+        name: a.name,
+        fn: a.fn,
+        mode,
+        suite: current,
+        resolve: null,
+      };
+      current.children.push(entry);
+      schedule();
+      // Thenable resolving when this test finishes (covers `await test(...)`).
+      return new Promise((res) => {
+        entry.resolve = res;
+      });
+    }
+
+    function describe(n, o, f) {
+      return addSuite(n, o, f);
+    }
+    describe.skip = (n, o, f) => addSuite(n, o, f, "skip");
+    describe.todo = (n, o, f) => addSuite(n, o, f, "skip");
+    describe.only = (n, o, f) => {
+      hasOnly = true;
+      return addSuite(n, o, f, "only");
+    };
+    const suite = describe;
+
+    function test(n, o, f) {
+      return addTest(n, o, f);
+    }
+    test.skip = (n, o, f) => addTest(n, o, f, "skip");
+    test.todo = (n, o, f) => addTest(n, o, f, "todo");
+    test.only = (n, o, f) => {
+      hasOnly = true;
+      return addTest(n, o, f, "only");
+    };
+    const it = test;
+
+    const before = (fn) => current.before.push(fn);
+    const after = (fn) => current.after.push(fn);
+    const beforeEach = (fn) => current.beforeEach.push(fn);
+    const afterEach = (fn) => current.afterEach.push(fn);
+
+    function diag(e) {
+      const msg = e instanceof Error ? e.stack || e.message : String(e);
+      log("  ---");
+      for (const line of String(msg).split("\n")) log("  " + line);
+      log("  ...");
+    }
+
+    function makeContext(name) {
+      const ctx = {
+        name,
+        assert,
+        diagnostic: (msg) => log("# " + msg),
+        skip(msg) {
+          ctx._skipped = msg ?? true;
+        },
+        todo(msg) {
+          ctx._todo = msg ?? true;
+        },
+        before,
+        after,
+        beforeEach,
+        afterEach,
+        signal: undefined,
+        runOnly() {},
+        // Subtests run inline within the parent test, awaited.
+        test(n, o, f) {
+          return runSubtest(norm(n, o, f));
+        },
+      };
+      return ctx;
+    }
+
+    async function runSubtest(a) {
+      const id = ++counter;
+      if (a.options.skip) {
+        skipped++;
+        log(`ok ${id} - ${a.name} # SKIP`);
+        return;
+      }
+      if (a.options.todo) {
+        log(`ok ${id} - ${a.name} # TODO`);
+        return;
+      }
+      const ctx = makeContext(a.name);
+      try {
+        await a.fn?.(ctx);
+        if (ctx._skipped) {
+          skipped++;
+          log(`ok ${id} - ${a.name} # SKIP`);
+        } else {
+          passed++;
+          log(`ok ${id} - ${a.name}`);
+        }
+      } catch (e) {
+        failed++;
+        log(`not ok ${id} - ${a.name}`);
+        diag(e);
+      }
+    }
+
+    async function runTestEntry(entry) {
+      const id = ++counter;
+      if (entry.mode === "todo") {
+        log(`ok ${id} - ${entry.name} # TODO`);
+        entry.resolve?.();
+        return;
+      }
+      const skip =
+        entry.mode === "skip" ||
+        inheritedSkip(entry.suite) ||
+        (hasOnly && entry.mode !== "only" && !hasOnlyAncestor(entry.suite));
+      if (skip) {
+        skipped++;
+        log(`ok ${id} - ${entry.name} # SKIP`);
+        entry.resolve?.();
+        return;
+      }
+      const ctx = makeContext(entry.name);
+      let err = null;
+      try {
+        for (const s of lineage(entry.suite)) for (const h of s.beforeEach) await h(ctx);
+        try {
+          await entry.fn?.(ctx);
+        } catch (e) {
+          err = e;
+        }
+        for (const s of lineage(entry.suite).reverse())
+          for (const h of s.afterEach) {
+            try {
+              await h(ctx);
+            } catch (e) {
+              err ??= e;
+            }
+          }
+      } catch (e) {
+        err = e;
+      }
+      if (err) {
+        failed++;
+        log(`not ok ${id} - ${entry.name}`);
+        diag(err);
+      } else if (ctx._skipped) {
+        skipped++;
+        log(`ok ${id} - ${entry.name} # SKIP`);
+      } else {
+        passed++;
+        log(`ok ${id} - ${entry.name}`);
+      }
+      entry.resolve?.();
+    }
+
+    async function runSuiteTree(s) {
+      for (const h of s.before) await h();
+      for (const child of s.children) {
+        if (child.kind === "suite") await runSuiteTree(child.suite);
+        else await runTestEntry(child);
+      }
+      for (const h of s.after) {
+        try {
+          await h();
+        } catch (e) {
+          failed++;
+          diag(e);
+        }
+      }
+    }
+
+    async function runRoot() {
+      log("TAP version 13");
+      try {
+        await runSuiteTree(root);
+      } catch (e) {
+        failed++;
+        diag(e);
+      }
+      const total = passed + failed + skipped;
+      log(`1..${total}`);
+      log(`# tests ${total}`);
+      log(`# pass ${passed}`);
+      log(`# fail ${failed}`);
+      log(`# skipped ${skipped}`);
+      if (failed > 0) globalThis.process.exitCode = 1;
+    }
+
+    const mock = {
+      fn: (impl) => {
+        const f = (...args) => {
+          f.mock.calls.push({ arguments: args });
+          return impl ? impl(...args) : undefined;
+        };
+        f.mock = { calls: [] };
+        return f;
+      },
+    };
+
+    return {
+      test,
+      it,
+      describe,
+      suite,
+      before,
+      after,
+      beforeEach,
+      afterEach,
+      mock,
+      default: test,
+    };
+  };
+
   // ------------------------------------------------- runtime global setup
   // Called from Rust after snapshot restore + native install. Installs the
   // globals that need runtime data, and upgrades console with the
