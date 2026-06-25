@@ -1,5 +1,5 @@
 {
-  "commit": "63a7302",
+  "commit": "6fa03a9",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -134,10 +134,18 @@
         {
           "case": "32-process-exit-and-globals.mjs",
           "status": "pass"
+        },
+        {
+          "case": "33-buffer-numeric-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "34-buffer-api-validation.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 32,
-      "total": 32
+      "pass": 34,
+      "total": 34
     },
     "surface": {
       "globals": {
