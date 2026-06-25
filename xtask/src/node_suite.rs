@@ -83,7 +83,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
             .unwrap_or_default();
         let module = module_of(&name);
 
-        let outcome = if let Some(reason) = manifest.get(&format!("parallel/{name}")) {
+        let outcome = if let Some(reason) = manifest.skips.get(&format!("parallel/{name}")) {
             Outcome::Unrunnable(reason.clone())
         } else if let Some(flags) = read_flags_header(test) {
             Outcome::Unrunnable(format!("// Flags:{flags}"))
@@ -141,6 +141,36 @@ pub(crate) fn run(release: bool) -> Result<()> {
     );
     println!("  {pass} pass  {fail} fail  {skip} skip  {unrunnable} unrunnable-by-harness");
     println!("wrote CONFORMANCE-NODE.md + conformance/node-suite-scorecard.json");
+
+    // Skip-ratchet: the discretionary manifest skip count must stay within the
+    // committed ceilings. Raising a ceiling is a reviewable diff; exceeding it
+    // fails the run so CI catches skip-inflation of the denominator. Auto-
+    // detected unrunnables (// Flags, missing node: builtin) are NOT counted.
+    let manifest_skips = manifest.skips.len();
+    if let Some(max) = manifest.max_skips {
+        println!(
+            "manifest skips: {manifest_skips}/{max} (ratchet ceiling), known-issues {}/{}",
+            manifest.known_issues,
+            manifest
+                .max_known_issues
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+        if manifest_skips > max {
+            bail!(
+                "skip-ratchet violation: {manifest_skips} manifest skips > ceiling {max}. \
+                 Fix the tests, or (with review) raise ratchet.maxSkips in manifest.json -- it should only ever go DOWN."
+            );
+        }
+    }
+    if let Some(max) = manifest.max_known_issues
+        && manifest.known_issues > max
+    {
+        bail!(
+            "known-issues ceiling violation: {} known_issues/flaky skips > ceiling {max}.",
+            manifest.known_issues
+        );
+    }
     Ok(())
 }
 
@@ -223,15 +253,45 @@ fn module_of(name: &str) -> String {
     "other".to_string()
 }
 
-/// manifest.json: { "tests": { "parallel/test-x.js": { "skip": true, "reason": "..." } } }
-fn load_manifest(path: &Path) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+/// manifest.json:
+/// {
+///   "ratchet": { "maxSkips": N, "maxKnownIssues": M },
+///   "tests": { "parallel/test-x.js": { "skip": true, "reason": "...", "category": "known_issues" } }
+/// }
+struct Manifest {
+    /// path -> reason, for DISCRETIONARY skips -- the one denominator lever oam
+    /// controls (auto-detected unrunnables are separate and not counted here).
+    skips: BTreeMap<String, String>,
+    /// subset of `skips` tagged category "known_issues" or "flaky".
+    known_issues: usize,
+    /// ratchet ceilings; None = not enforced.
+    max_skips: Option<usize>,
+    max_known_issues: Option<usize>,
+}
+
+fn load_manifest(path: &Path) -> Manifest {
+    let mut m = Manifest {
+        skips: BTreeMap::new(),
+        known_issues: 0,
+        max_skips: None,
+        max_known_issues: None,
+    };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return map;
+        return m;
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return map;
+        return m;
     };
+    if let Some(r) = v.get("ratchet") {
+        m.max_skips = r
+            .get("maxSkips")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
+        m.max_known_issues = r
+            .get("maxKnownIssues")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
+    }
     if let Some(tests) = v.get("tests").and_then(|t| t.as_object()) {
         for (k, cfg) in tests {
             if cfg.get("skip").and_then(|s| s.as_bool()) == Some(true) {
@@ -240,11 +300,15 @@ fn load_manifest(path: &Path) -> BTreeMap<String, String> {
                     .and_then(|r| r.as_str())
                     .unwrap_or("manifest skip")
                     .to_string();
-                map.insert(k.clone(), reason);
+                let category = cfg.get("category").and_then(|c| c.as_str()).unwrap_or("");
+                if category == "known_issues" || category == "flaky" {
+                    m.known_issues += 1;
+                }
+                m.skips.insert(k.clone(), reason);
             }
         }
     }
-    map
+    m
 }
 
 /// Read the `// Flags: ...` preamble (Node scans the first ~1.5KB).

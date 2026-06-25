@@ -1,5 +1,9 @@
 {
-  "_doc": "Per-test overrides for the node-suite harness. Default = runnable on all platforms. Add { \"skip\": true, \"reason\": \"...\" } only for genuinely-unrunnable tests (native addon, internals flag, platform-N/A). Skip count should only DECREASE over time (skip-ratchet, enforced in CI in a later slice).",
+  "_doc": "Per-test overrides + denominator ratchet for the node-suite harness. Default = a test is runnable. Add { \"skip\": true, \"reason\": \"...\", \"category\": \"known_issues\"|\"flaky\"|\"\" } ONLY for genuinely-unrunnable tests (native addon, internals flag, platform-N/A). 'ratchet' caps the discretionary skip count -- the one denominator lever oam controls. maxSkips should only ever be LOWERED; raising it is a reviewable diff and node-suite exits non-zero (CI fails) if the actual skip count exceeds it. Auto-detected unrunnables (// Flags, missing node: builtin) are NOT counted against the ratchet.",
   "nodeVersion": "v22.22.2",
+  "ratchet": {
+    "maxSkips": 0,
+    "maxKnownIssues": 0
+  },
   "tests": {}
 }
