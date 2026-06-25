@@ -281,6 +281,35 @@ impl JsRuntime {
         value.int32_value(scope)
     }
 
+    /// Run process 'exit' listeners (Node natural-termination semantics): sets
+    /// `process._exiting` and emits `'exit'` synchronously, exactly once (the JS
+    /// side guards re-entry). Call after the event loop drains, before reading
+    /// the final exit code. Touches `globalThis.process` first so a lazily-built
+    /// process is instantiated. A throwing listener is printed to stderr (Node
+    /// prints uncaught exit-handler errors); `process.exit()` inside a handler
+    /// still terminates via the native path.
+    pub fn emit_process_exit(&mut self) {
+        // Inline the emit (no leaked global): touch process to build it if
+        // lazy, guard on process._exiting so it fires once, emit 'exit' with the
+        // current exitCode. Mirrors the JS-side emitProcessExit used by
+        // process.exit(); process._exiting is the shared once-guard.
+        // IIFE so the locals stay function-scoped: top-level `var` in a classic
+        // script would leak onto globalThis (and trip Node common's leak check).
+        if let Err(e) = self.execute_script(
+            "<process-exit>",
+            "(function () { \
+               var p = globalThis.process; \
+               if (p && !p._exiting) { \
+                 p._exiting = true; \
+                 var c = typeof p.exitCode === 'number' ? p.exitCode : 0; \
+                 p.emit('exit', c); \
+               } \
+             })();",
+        ) {
+            eprintln!("{e}");
+        }
+    }
+
     /// Compile and run `source` as a classic script. Returns the stringified
     /// completion value. Exceptions come back as `Err` with script:line info.
     pub fn execute_script(&mut self, name: &str, source: &str) -> Result<String> {

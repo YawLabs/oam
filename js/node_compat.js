@@ -3545,6 +3545,27 @@
       configurable: true,
     });
 
+    // Node fires a synchronous 'exit' event at termination -- natural
+    // event-loop drain OR process.exit() -- with process._exiting set so
+    // handlers can detect it. Emitted exactly once: the Rust runtime calls
+    // __oamEmitExit at natural drain (before reading the final exit code), and
+    // process.exit() calls it inline before the native exit.
+    process._exiting = false;
+    // process._exiting is the once-guard, shared with the runtime's
+    // natural-drain emit (oam_engine emit_process_exit) so 'exit' fires exactly
+    // once whichever path reaches it first. Not exposed as a global.
+    function emitProcessExit(explicitCode) {
+      if (process._exiting) return;
+      process._exiting = true;
+      const code =
+        typeof explicitCode === "number"
+          ? explicitCode
+          : typeof process.exitCode === "number"
+            ? process.exitCode
+            : 0;
+      process.emit("exit", code);
+    }
+
     Object.assign(process, {
       env,
       execArgv: [],
@@ -3563,7 +3584,11 @@
       title: "oam",
       exitCode: undefined,
       exit(code) {
-        natives.exit(code ?? process.exitCode ?? 0);
+        const c = code ?? process.exitCode ?? 0;
+        process.exitCode = c;
+        const numeric = typeof c === "number" ? c : 0;
+        emitProcessExit(numeric);
+        natives.exit(numeric);
       },
       cwd: () => natives.cwd(),
       chdir: (dir) => natives.chdir(String(dir)),
@@ -12413,5 +12438,28 @@
       },
       clear: () => {},
     };
+
+    // Match Node's globalThis property attributes. Node defines web globals
+    // (and process) as NON-enumerable, so `for (const k in globalThis)` is
+    // nearly empty; oam installed several via plain assignment (enumerable),
+    // which diverged from Node AND tripped Node test/common's global-leak check.
+    // Flip them to non-enumerable (value/getter preserved). The handful that are
+    // genuinely enumerable in Node -- timers, atob/btoa, structuredClone,
+    // performance, fetch, navigator, queueMicrotask, global -- are left as-is.
+    for (const name of [
+      "DOMException", "Event", "EventTarget", "AbortSignal", "AbortController",
+      "Headers", "Response", "Request", "Blob", "File", "MessagePort", "FormData",
+      "BroadcastChannel", "MessageEvent", "CloseEvent", "WebSocket",
+      "TextEncoder", "TextDecoder", "Buffer", "URL", "URLSearchParams",
+      "ReadableStream", "WritableStream", "TransformStream",
+      "TextDecoderStream", "TextEncoderStream", "process",
+      "oam", "__oam", "__oamServe", "__oamTestRun",
+    ]) {
+      const desc = Object.getOwnPropertyDescriptor(globalThis, name);
+      if (desc && desc.enumerable && desc.configurable) {
+        desc.enumerable = false;
+        Object.defineProperty(globalThis, name, desc);
+      }
+    }
   };
 })();

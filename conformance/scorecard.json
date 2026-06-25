@@ -1,5 +1,5 @@
 {
-  "commit": "29d4d6f",
+  "commit": "63a7302",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -130,10 +130,14 @@
         {
           "case": "31-assert-calltracker.mjs",
           "status": "pass"
+        },
+        {
+          "case": "32-process-exit-and-globals.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 31,
-      "total": 31
+      "pass": 32,
+      "total": 32
     },
     "surface": {
       "globals": {

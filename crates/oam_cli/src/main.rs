@@ -1511,7 +1511,12 @@ fn run_file(
     } else {
         rt.execute_module(file, &CliHost)
     };
-    result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+    result.map(|()| {
+        // Natural termination: the event loop drained, so fire process 'exit'
+        // listeners before reading the final exit code (Node parity).
+        rt.emit_process_exit();
+        rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8
+    })
 }
 
 // -- oam compile: embed a pre-bundled JS file into a standalone binary --
@@ -1683,7 +1688,10 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     let result = rt.execute_cjs(&tmp_file);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     match result {
-        Ok(()) => ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8),
+        Ok(()) => {
+            rt.emit_process_exit();
+            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+        }
         Err(diagnostics) => {
             for d in &diagnostics {
                 render(d, false);
