@@ -1,5 +1,5 @@
 {
-  "commit": "45e3ea7",
+  "commit": "a34320b",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -150,10 +150,26 @@
         {
           "case": "36-buffer-callable-no-new.mjs",
           "status": "pass"
+        },
+        {
+          "case": "37-path-node-faithful.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "38-assert-api-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "39-util-fidelity.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "40-string-decoder-streaming.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 36,
-      "total": 36
+      "pass": 40,
+      "total": 40
     },
     "surface": {
       "globals": {

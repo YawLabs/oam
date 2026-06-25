@@ -1,8 +1,8 @@
 {
   "byModule": {
     "assert": {
-      "fail": 9,
-      "pass": 5,
+      "fail": 6,
+      "pass": 8,
       "skip": 0,
       "unrunnable": 4
     },
@@ -13,14 +13,14 @@
       "unrunnable": 10
     },
     "events": {
-      "fail": 4,
-      "pass": 1,
+      "fail": 2,
+      "pass": 3,
       "skip": 0,
       "unrunnable": 4
     },
     "path": {
-      "fail": 10,
-      "pass": 2,
+      "fail": 2,
+      "pass": 10,
       "skip": 0,
       "unrunnable": 0
     },
@@ -31,36 +31,36 @@
       "unrunnable": 0
     },
     "string_decoder": {
-      "fail": 2,
-      "pass": 0,
+      "fail": 1,
+      "pass": 1,
       "skip": 0,
       "unrunnable": 0
     },
     "url": {
-      "fail": 9,
-      "pass": 4,
+      "fail": 5,
+      "pass": 8,
       "skip": 0,
       "unrunnable": 1
     },
     "util": {
-      "fail": 12,
-      "pass": 5,
-      "skip": 1,
+      "fail": 7,
+      "pass": 9,
+      "skip": 2,
       "unrunnable": 10
     }
   },
-  "commit": "45e3ea7",
+  "commit": "a34320b",
   "corpus": "test/parallel (pure non-I/O core modules: buffer, events, assert, util, querystring, string_decoder, url, path)",
-  "fail": 63,
+  "fail": 40,
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
-  "pass": 59,
-  "passOverRunnable": "48.4%",
-  "passOverTotal": "38.8%",
+  "pass": 81,
+  "passOverRunnable": "66.9%",
+  "passOverTotal": "53.3%",
   "runnable": 123,
   "schema": "oam-node-suite/1",
-  "skip": 1,
+  "skip": 2,
   "total": 152,
   "unrunnable": 29
 }

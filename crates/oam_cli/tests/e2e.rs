@@ -7247,9 +7247,14 @@ const boldRed = util.styleText(['bold', 'red'], 'hi');
 console.log('bold_red_has_bold=' + boldRed.includes('\x1b[1m'));
 console.log('bold_red_has_red=' + boldRed.includes('\x1b[31m'));
 
-// util.styleText with unknown format
-const unknown = util.styleText('nonexistent', 'text');
-console.log('unknown_passthrough=' + unknown);
+// util.styleText with unknown format throws ERR_INVALID_ARG_VALUE (Node parity)
+let unknownCode = 'none';
+try {
+  util.styleText('nonexistent', 'text');
+} catch (e) {
+  unknownCode = e.code;
+}
+console.log('unknown_throws=' + unknownCode);
 
 // structuredClone undefined
 const u = structuredClone(undefined);
@@ -7279,7 +7284,7 @@ console.log('clone_null=' + (structuredClone(null) === null));
         "red_has_text=true",
         "bold_red_has_bold=true",
         "bold_red_has_red=true",
-        "unknown_passthrough=text",
+        "unknown_throws=ERR_INVALID_ARG_VALUE",
         "clone_undef=true",
         "clone_num=true",
         "clone_str=true",
@@ -8063,7 +8068,9 @@ import buffer from 'node:buffer';
 assert.ifError(null);
 assert.ifError(undefined);
 try { assert.ifError(new Error('boom')); console.log('FAIL'); } catch(e) {
-  console.log('ifError_err=' + e.message);
+  // Node wraps the unwanted error in an AssertionError whose message embeds
+  // the original error's message.
+  console.log('ifError_err=' + (e.name === 'AssertionError' && e.message.includes('boom')));
 }
 try { assert.ifError('oops'); console.log('FAIL'); } catch(e) {
   console.log('ifError_str=' + e.message.includes('oops'));
@@ -8114,7 +8121,7 @@ console.log('sb_len=' + sb.length);
         "misc m3c failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
     let expected = [
-        "ifError_err=boom",
+        "ifError_err=true",
         "ifError_str=true",
         "ifError_op=ifError",
         "getMax_ee=42",

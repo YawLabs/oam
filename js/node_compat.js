@@ -319,9 +319,114 @@
   }
 
   var codes = {};
+
+  // Faithful port of Node's internal `lib/internal/errors.js`
+  // invalidArgTypeHelper -- renders the "Received ..." tail of an
+  // ERR_INVALID_ARG_TYPE message the way Node does (type + inspected value,
+  // class names, function names, negative zero, etc.). Many conformance tests
+  // assert on this exact text, so it must match byte-for-byte.
+  function invalidArgTypeHelper(input) {
+    if (input == null) {
+      return ` Received ${input}`;
+    }
+    if (typeof input === "function" && input.name) {
+      return ` Received function ${input.name}`;
+    }
+    if (typeof input === "object") {
+      if (input.constructor && input.constructor.name) {
+        return ` Received an instance of ${input.constructor.name}`;
+      }
+      try {
+        return ` Received ${nodeInspect(input, { depth: -1 })}`;
+      } catch {
+        return ` Received an object`;
+      }
+    }
+    let inspected;
+    try {
+      inspected = nodeInspect(input, { colors: false });
+    } catch {
+      inspected = String(input);
+    }
+    if (inspected.length > 28) {
+      inspected = `${inspected.slice(0, 25)}...`;
+    }
+    return ` Received type ${typeof input} (${inspected})`;
+  }
+
+  // Build the "must be of type X" / "must be one of type X, Y, or Z" clause and
+  // pick "argument" vs "property" exactly as Node does (a name containing a dot
+  // is treated as a property path).
+  function buildArgTypeMessage(name, expected, actual) {
+    if (!Array.isArray(expected)) expected = [expected];
+    let msg = "The ";
+    if (name.endsWith(" argument")) {
+      msg += `${name} `;
+    } else {
+      const type = name.includes(".") ? "property" : "argument";
+      msg += `"${name}" ${type} `;
+    }
+    msg += "must be ";
+
+    const types = [];
+    const instances = [];
+    const other = [];
+    for (const value of expected) {
+      const low = String(value).toLowerCase();
+      if (
+        ["string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function"].includes(low)
+      ) {
+        types.push(low);
+      } else if (/^[A-Z]/.test(String(value))) {
+        instances.push(String(value));
+      } else {
+        other.push(String(value));
+      }
+    }
+    if (instances.length > 0) {
+      const pos = types.indexOf("object");
+      if (pos !== -1) {
+        types.splice(pos, 1);
+        instances.push("Object");
+      }
+    }
+    if (types.length > 0) {
+      msg += `${types.length > 1 ? "one of type" : "of type"} ${formatList(types, "or")}`;
+      if (instances.length > 0 || other.length > 0) msg += " or ";
+    }
+    if (instances.length > 0) {
+      msg += `an instance of ${formatList(instances, "or")}`;
+      if (other.length > 0) msg += " or ";
+    }
+    if (other.length > 0) {
+      if (other.length > 1) msg += `one of ${formatList(other, "or")}`;
+      else {
+        if (other[0].toLowerCase() !== other[0]) msg += "an ";
+        msg += `${other[0]}`;
+      }
+    }
+    return `${msg}.${invalidArgTypeHelper(actual)}`;
+  }
+
+  // Node's formatList helper: join with commas + the final conjunction.
+  function formatList(arr, type) {
+    if (arr.length <= 2) return arr.join(` ${type} `);
+    return `${arr.slice(0, -1).join(", ")}, ${type} ${arr[arr.length - 1]}`;
+  }
+
+  // util.inspect bound late (util factory may not be built yet when an error is
+  // thrown). Resolve lazily so the helper works during early bootstrap.
+  function nodeInspect(value, opts) {
+    try {
+      return registry.get("util").inspect(value, opts);
+    } catch {
+      return String(value);
+    }
+  }
+
   // ---- TypeError family ----
   codes.ERR_INVALID_ARG_TYPE = E("ERR_INVALID_ARG_TYPE", TypeError, function(name, expected, actual) {
-    return 'The "' + name + '" argument must be of type ' + expected + '. Received ' + typeof actual;
+    return buildArgTypeMessage(name, expected, actual);
   });
   codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, function(name, value, reason) {
     return 'The argument "' + name + '" is invalid. Received ' + String(value) + (reason ? ". " + reason : "");
@@ -341,6 +446,9 @@
   });
   codes.ERR_UNKNOWN_ENCODING = E("ERR_UNKNOWN_ENCODING", TypeError, function(enc) {
     return 'Unknown encoding: ' + enc;
+  });
+  codes.ERR_CONSTRUCT_CALL_REQUIRED = E("ERR_CONSTRUCT_CALL_REQUIRED", TypeError, function(name) {
+    return 'Class constructor ' + name + ' cannot be invoked without `new`';
   });
   codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input) {
     return 'Invalid URL: ' + input;
@@ -1689,10 +1797,24 @@
       if (existing === undefined) return [];
       return typeof existing === "function" ? [existing] : existing.slice();
     };
-    EventEmitter.prototype.listenerCount = function (type) {
+    EventEmitter.prototype.listenerCount = function (type, listener) {
       const existing = eventsOf(this)[type];
       if (existing === undefined) return 0;
-      return typeof existing === "function" ? 1 : existing.length;
+      if (typeof existing === "function") {
+        // 2-arg form: count only matching listeners (incl. once-wrappers).
+        if (listener !== undefined) {
+          return existing === listener || existing.listener === listener ? 1 : 0;
+        }
+        return 1;
+      }
+      if (listener !== undefined) {
+        let count = 0;
+        for (let i = 0; i < existing.length; i++) {
+          if (existing[i] === listener || existing[i].listener === listener) count++;
+        }
+        return count;
+      }
+      return existing.length;
     };
     EventEmitter.prototype.eventNames = function () {
       return Reflect.ownKeys(eventsOf(this));
@@ -1813,11 +1935,25 @@
       return [];
     }
 
+    // Internal slot used to attach a max-listeners value to a native
+    // EventTarget (which has no get/setMaxListeners method of its own), the way
+    // Node stores it via kMaxEventTargetListeners.
+    const kMaxEventTargetListeners = Symbol("kMaxEventTargetListeners");
+
     function setMaxListeners(n) {
       if (arguments.length > 1) {
         for (var i = 1; i < arguments.length; i++) {
-          if (typeof arguments[i].setMaxListeners === "function") {
-            arguments[i].setMaxListeners(n);
+          const target = arguments[i];
+          if (typeof target.setMaxListeners === "function") {
+            target.setMaxListeners(n);
+          } else {
+            // Native EventTarget / AbortSignal: stash the value in a slot.
+            Object.defineProperty(target, kMaxEventTargetListeners, {
+              value: n,
+              writable: true,
+              configurable: true,
+              enumerable: false,
+            });
           }
         }
       }
@@ -1829,12 +1965,32 @@
     EventEmitter.on = on;
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
-    EventEmitter.listenerCount = (emitter, type) => emitter.listenerCount(type);
+    EventEmitter.listenerCount = (emitter, type, listener) =>
+      emitter.listenerCount(type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
-      if (typeof emitterOrTarget.getMaxListeners === "function") return emitterOrTarget.getMaxListeners();
+      if (typeof emitterOrTarget.getMaxListeners === "function") {
+        return emitterOrTarget.getMaxListeners();
+      }
+      if (
+        emitterOrTarget != null &&
+        emitterOrTarget[kMaxEventTargetListeners] !== undefined
+      ) {
+        return emitterOrTarget[kMaxEventTargetListeners];
+      }
+      // An AbortSignal defaults to 0 listeners; a bare EventTarget to the
+      // module default.
+      if (typeof AbortSignal === "function" && emitterOrTarget instanceof AbortSignal) {
+        return 0;
+      }
       return EventEmitter.defaultMaxListeners;
     };
     EventEmitter.addAbortListener = function addAbortListener(signal, listener) {
+      if (typeof AbortSignal !== "function" || !(signal instanceof AbortSignal)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
+      }
+      if (typeof listener !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("listener", "function", listener);
+      }
       if (signal.aborted) {
         queueMicrotask(() => listener());
         return { [Symbol.dispose]() {} };
@@ -1857,306 +2013,1124 @@
   };
 
   // ----------------------------------------------------------------- path
+  // Faithful port of Node v22's lib/path.js (win32 + posix), char-code driven
+  // so the many edge cases (UNC roots, '\\?\' device paths, drive-relative
+  // 'C:.', trailing './' preservation, '..' above-root handling) match Node
+  // exactly. The two platform objects share normalizeString().
   function makePathModule(isWin, natives) {
-    const sep = isWin ? "\\" : "/";
-    const delimiter = isWin ? ";" : ":";
-    const isSep = isWin ? (c) => c === "/" || c === "\\" : (c) => c === "/";
-    const isDrive = (p, i = 0) =>
-      isWin && /[A-Za-z]/.test(p[i] ?? "") && p[i + 1] === ":";
+    const CHAR_DOT = 46;
+    const CHAR_FORWARD_SLASH = 47;
+    const CHAR_BACKWARD_SLASH = 92;
+    const CHAR_COLON = 58;
+    const CHAR_QUESTION_MARK = 63;
+    const CHAR_UPPERCASE_A = 65;
+    const CHAR_LOWERCASE_A = 97;
+    const CHAR_UPPERCASE_Z = 90;
+    const CHAR_LOWERCASE_Z = 122;
+    const cc = (s, i) => s.charCodeAt(i);
 
-    function assertPath(p) {
+    const isPathSeparator = isWin
+      ? (code) => code === CHAR_FORWARD_SLASH || code === CHAR_BACKWARD_SLASH
+      : (code) => code === CHAR_FORWARD_SLASH;
+    const isPosixPathSeparator = (code) => code === CHAR_FORWARD_SLASH;
+    const isWindowsDeviceRoot = (code) =>
+      (code >= CHAR_UPPERCASE_A && code <= CHAR_UPPERCASE_Z) ||
+      (code >= CHAR_LOWERCASE_A && code <= CHAR_LOWERCASE_Z);
+
+    // Faithful port of Node's internal isWindowsReservedName. `index` is the
+    // length of the device-name slice to inspect (the position of ':').
+    // Reserved: CON/PRN/AUX/NUL and COM/LPT followed by a single 1-9 or the
+    // superscript digits 0xB2/0xB3/0xB9. COM0, COM10, COMa, CONOUT, etc. are
+    // NOT reserved.
+    function isWindowsReservedName(str, index) {
+      if (index !== 3 && index !== 4) return false;
+      let i = 0;
+      const first = str.charCodeAt(0) | 0x20; // lowercase
+      const second = str.charCodeAt(1) | 0x20;
+      const third = str.charCodeAt(2) | 0x20;
+      // CON / PRN / AUX / NUL (index === 3)
+      if (index === 3) {
+        if (first === 0x63 && second === 0x6f && third === 0x6e) return true; // con
+        if (first === 0x70 && second === 0x72 && third === 0x6e) return true; // prn
+        if (first === 0x61 && second === 0x75 && third === 0x78) return true; // aux
+        if (first === 0x6e && second === 0x75 && third === 0x6c) return true; // nul
+        return false;
+      }
+      // COM<n> / LPT<n>  (index === 4)
+      const isCom = first === 0x63 && second === 0x6f && third === 0x6d; // com
+      const isLpt = first === 0x6c && second === 0x70 && third === 0x74; // lpt
+      if (!isCom && !isLpt) return false;
+      const fourth = str.charCodeAt(3);
+      // '1'..'9'
+      if (fourth >= 0x31 && fourth <= 0x39) return true;
+      // superscript 1 (0xB9), 2 (0xB2), 3 (0xB3)
+      if (fourth === 0xb9 || fourth === 0xb2 || fourth === 0xb3) return true;
+      void i;
+      return false;
+    }
+
+    function assertPath(p, name) {
       if (typeof p !== "string") {
-        throw new TypeError(`Path must be a string. Received ${typeof p}`);
+        throw new codes.ERR_INVALID_ARG_TYPE(name || "path", "string", p);
       }
     }
 
-    /// {root, rest}: root is "" (relative), "/" or "\", "C:\", "C:"
-    /// (drive-relative), or "\\host\share\".
-    function splitRoot(p) {
-      if (!isWin) {
-        return isSep(p[0]) ? { root: "/", rest: p.slice(1) } : { root: "", rest: p };
-      }
-      if (p.length >= 2 && isSep(p[0]) && isSep(p[1])) {
-        let i = 2;
-        while (i < p.length && !isSep(p[i])) i++;
-        if (i > 2 && i < p.length) {
-          let j = i + 1;
-          let k = j;
-          while (k < p.length && !isSep(p[k])) k++;
-          if (k > j) {
-            return {
-              root: "\\\\" + p.slice(2, i) + "\\" + p.slice(j, k) + "\\",
-              rest: k < p.length ? p.slice(k + 1) : "",
-            };
+    // Resolves . and .. elements in a path with directory names. `separator`
+    // is the single-char separator to emit; `isSep` tests for a boundary.
+    function normalizeString(path, allowAboveRoot, separator, isSep) {
+      let res = "";
+      let lastSegmentLength = 0;
+      let lastSlash = -1;
+      let dots = 0;
+      let code = 0;
+      for (let i = 0; i <= path.length; ++i) {
+        if (i < path.length) code = cc(path, i);
+        else if (isSep(code)) break;
+        else code = CHAR_FORWARD_SLASH;
+
+        if (isSep(code)) {
+          if (lastSlash === i - 1 || dots === 1) {
+            // NOOP
+          } else if (dots === 2) {
+            if (
+              res.length < 2 ||
+              lastSegmentLength !== 2 ||
+              cc(res, res.length - 1) !== CHAR_DOT ||
+              cc(res, res.length - 2) !== CHAR_DOT
+            ) {
+              if (res.length > 2) {
+                const lastSlashIndex = res.lastIndexOf(separator);
+                if (lastSlashIndex === -1) {
+                  res = "";
+                  lastSegmentLength = 0;
+                } else {
+                  res = res.slice(0, lastSlashIndex);
+                  lastSegmentLength = res.length - 1 - res.lastIndexOf(separator);
+                }
+                lastSlash = i;
+                dots = 0;
+                continue;
+              } else if (res.length !== 0) {
+                res = "";
+                lastSegmentLength = 0;
+                lastSlash = i;
+                dots = 0;
+                continue;
+              }
+            }
+            if (allowAboveRoot) {
+              res += res.length > 0 ? `${separator}..` : "..";
+              lastSegmentLength = 2;
+            }
+          } else {
+            if (res.length > 0) res += `${separator}${path.slice(lastSlash + 1, i)}`;
+            else res = path.slice(lastSlash + 1, i);
+            lastSegmentLength = i - lastSlash - 1;
           }
-        }
-        return { root: "\\", rest: p.slice(1) };
-      }
-      if (isDrive(p)) {
-        // Drive letter case is preserved (Node parity); comparisons that
-        // need case-insensitivity fold at the comparison site.
-        if (p.length > 2 && isSep(p[2])) {
-          return { root: p.slice(0, 2) + "\\", rest: p.slice(3) };
-        }
-        return { root: p.slice(0, 2), rest: p.slice(2) };
-      }
-      if (isSep(p[0])) return { root: "\\", rest: p.slice(1) };
-      return { root: "", rest: p };
-    }
-
-    /// Is this root drive-relative ('C:' with no separator)? Such paths are
-    /// NOT absolute: '..' segments survive normalization, and resolve()
-    /// keeps scanning for an absolute anchor.
-    const isDriveRelativeRoot = (root) => isWin && root.length === 2 && root[1] === ":";
-
-    function normalizeParts(rest, allowAboveRoot) {
-      const out = [];
-      let part = "";
-      const flush = () => {
-        if (part === "" || part === ".") {
-          // skip
-        } else if (part === "..") {
-          if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
-          else if (allowAboveRoot) out.push("..");
+          lastSlash = i;
+          dots = 0;
+        } else if (code === CHAR_DOT && dots !== -1) {
+          ++dots;
         } else {
-          out.push(part);
-        }
-        part = "";
-      };
-      for (let i = 0; i < rest.length; i++) {
-        if (isSep(rest[i])) flush();
-        else part += rest[i];
-      }
-      flush();
-      return out;
-    }
-
-    function normalize(p) {
-      assertPath(p);
-      if (p.length === 0) return ".";
-      const { root, rest } = splitRoot(p);
-      // '..' survives when there is no ABSOLUTE anchor â€” that includes
-      // drive-relative roots ('C:..' stays 'C:..', per Node).
-      const parts = normalizeParts(rest, root === "" || isDriveRelativeRoot(root));
-      let out = root + parts.join(sep);
-      if (out.length === 0) out = ".";
-      // Preserve a single trailing separator, per Node.
-      if (isSep(p[p.length - 1]) && !isSep(out[out.length - 1]) && out !== ".") {
-        out += sep;
-      }
-      return out;
-    }
-
-    function isAbsolute(p) {
-      assertPath(p);
-      if (!isWin) return isSep(p[0]);
-      if (isSep(p[0])) return true;
-      return isDrive(p) && isSep(p[2]);
-    }
-
-    function join(...args) {
-      if (args.length === 0) return ".";
-      let joined = "";
-      let firstPart = "";
-      for (const arg of args) {
-        assertPath(arg);
-        if (arg.length > 0) {
-          if (joined.length === 0) firstPart = arg;
-          joined += joined.length > 0 ? sep + arg : arg;
+          dots = -1;
         }
       }
-      if (joined.length === 0) return ".";
-      if (isWin) {
-        // Node's UNC guard: joining must never FABRICATE a network path.
-        // join('\\\\', 'host') would otherwise normalize as UNC root
-        // '\\\\host'. Only a first argument that itself spells >= 2 leading
-        // separators (with a server name following) keeps UNC intent.
-        let needsReplace = true;
-        let slashCount = 0;
-        if (isSep(firstPart[0])) {
-          slashCount++;
-          if (firstPart.length > 1 && isSep(firstPart[1])) {
-            slashCount++;
-            if (firstPart.length > 2) {
-              if (isSep(firstPart[2])) slashCount++;
-              else needsReplace = false; // genuine '\\\\host...' UNC intent
+      return res;
+    }
+
+    function formatExt(ext) {
+      return ext ? `${ext[0] === "." ? "" : "."}${ext}` : "";
+    }
+
+    function _format(sep, pathObject) {
+      if (pathObject === null || typeof pathObject !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE("pathObject", "object", pathObject);
+      }
+      const dir = pathObject.dir || pathObject.root;
+      const base =
+        pathObject.base || `${pathObject.name || ""}${formatExt(pathObject.ext)}`;
+      if (!dir) return base;
+      return dir === pathObject.root ? `${dir}${base}` : `${dir}${sep}${base}`;
+    }
+
+    let mod;
+    if (isWin) {
+      mod = {
+        resolve(...args) {
+          let resolvedDevice = "";
+          let resolvedTail = "";
+          let resolvedAbsolute = false;
+          for (let i = args.length - 1; i >= -1; i--) {
+            let path;
+            if (i >= 0) {
+              path = args[i];
+              assertPath(path, `paths[${i}]`);
+              if (path.length === 0) continue;
+            } else if (resolvedDevice.length === 0) {
+              path = natives ? natives.cwd() : "/";
+            } else {
+              // Windows has per-drive CWDs; oam tracks only the process CWD,
+              // so fall back to it when the device matches, else the drive root.
+              const envCwd = natives ? natives.cwd() : "/";
+              path =
+                envCwd.slice(0, 2).toLowerCase() === resolvedDevice.toLowerCase()
+                  ? envCwd
+                  : `${resolvedDevice}\\`;
+              if (path === undefined) path = `${resolvedDevice}\\`;
+            }
+
+            const len = path.length;
+            let rootEnd = 0;
+            let device = "";
+            let isAbsolute = false;
+            const code = cc(path, 0);
+            if (len === 1) {
+              if (isPathSeparator(code)) {
+                rootEnd = 1;
+                isAbsolute = true;
+              }
+            } else if (isPathSeparator(code)) {
+              isAbsolute = true;
+              if (isPathSeparator(cc(path, 1))) {
+                let j = 2;
+                let last = j;
+                while (j < len && !isPathSeparator(cc(path, j))) j++;
+                if (j < len && j !== last) {
+                  const firstPart = path.slice(last, j);
+                  last = j;
+                  while (j < len && isPathSeparator(cc(path, j))) j++;
+                  if (j < len && j !== last) {
+                    last = j;
+                    while (j < len && !isPathSeparator(cc(path, j))) j++;
+                    if (j === len || j !== last) {
+                      if (firstPart !== "." && firstPart !== "?") {
+                        // UNC root
+                        device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                        rootEnd = j;
+                      } else {
+                        // device root (e.g. \\.\PHYSICALDRIVE0)
+                        device = `\\\\${firstPart}`;
+                        rootEnd = 4;
+                      }
+                    }
+                  }
+                }
+              } else {
+                rootEnd = 1;
+              }
+            } else if (isWindowsDeviceRoot(code) && cc(path, 1) === CHAR_COLON) {
+              device = path.slice(0, 2);
+              rootEnd = 2;
+              if (len > 2 && isPathSeparator(cc(path, 2))) {
+                isAbsolute = true;
+                rootEnd = 3;
+              }
+            }
+
+            if (device.length > 0) {
+              if (resolvedDevice.length > 0) {
+                if (device.toLowerCase() !== resolvedDevice.toLowerCase()) continue;
+              } else {
+                resolvedDevice = device;
+              }
+            }
+
+            if (resolvedAbsolute) {
+              if (resolvedDevice.length > 0) break;
+            } else {
+              resolvedTail = `${path.slice(rootEnd)}\\${resolvedTail}`;
+              resolvedAbsolute = isAbsolute;
+              if (isAbsolute && resolvedDevice.length > 0) break;
             }
           }
+
+          resolvedTail = normalizeString(
+            resolvedTail,
+            !resolvedAbsolute,
+            "\\",
+            isPathSeparator,
+          );
+
+          return resolvedAbsolute
+            ? `${resolvedDevice}\\${resolvedTail}`
+            : `${resolvedDevice}${resolvedTail}` || ".";
+        },
+
+        normalize(path) {
+          assertPath(path);
+          const len = path.length;
+          if (len === 0) return ".";
+          let rootEnd = 0;
+          let device;
+          let isAbsolute = false;
+          const code = cc(path, 0);
+
+          if (len === 1) {
+            return isPosixPathSeparator(code) ? "\\" : path;
+          }
+
+          if (isPathSeparator(code)) {
+            isAbsolute = true;
+            if (isPathSeparator(cc(path, 1))) {
+              let j = 2;
+              let last = j;
+              while (j < len && !isPathSeparator(cc(path, j))) j++;
+              if (j < len && j !== last) {
+                const firstPart = path.slice(last, j);
+                last = j;
+                while (j < len && isPathSeparator(cc(path, j))) j++;
+                if (j < len && j !== last) {
+                  last = j;
+                  while (j < len && !isPathSeparator(cc(path, j))) j++;
+                  if (j === len || j !== last) {
+                    if (firstPart === "." || firstPart === "?") {
+                      // device root (e.g. \\.\PHYSICALDRIVE0)
+                      device = `\\\\${firstPart}`;
+                      rootEnd = 4;
+                      const colonIndex = path.indexOf(":");
+                      const possibleDevice = path.slice(4, colonIndex + 1);
+                      if (
+                        isWindowsReservedName(possibleDevice, possibleDevice.length - 1)
+                      ) {
+                        device = `\\\\?\\${possibleDevice}`;
+                        rootEnd = 4 + possibleDevice.length;
+                      }
+                    } else if (j === len) {
+                      // UNC root only -- nothing left to process
+                      return `\\\\${firstPart}\\${path.slice(last)}\\`;
+                    } else {
+                      // UNC root with leftovers
+                      device = `\\\\${firstPart}\\${path.slice(last, j)}`;
+                      rootEnd = j;
+                    }
+                  }
+                }
+              }
+            } else {
+              rootEnd = 1;
+            }
+          } else {
+            const colonIndex = path.indexOf(":");
+            if (colonIndex > 0) {
+              if (isWindowsDeviceRoot(code) && colonIndex === 1) {
+                device = path.slice(0, 2);
+                rootEnd = 2;
+                if (len > 2 && isPathSeparator(cc(path, 2))) {
+                  isAbsolute = true;
+                  rootEnd = 3;
+                }
+              } else if (isWindowsReservedName(path, colonIndex)) {
+                device = path.slice(0, colonIndex + 1);
+                rootEnd = colonIndex + 1;
+              }
+            }
+          }
+
+          let tail =
+            rootEnd < len
+              ? normalizeString(path.slice(rootEnd), !isAbsolute, "\\", isPathSeparator)
+              : "";
+          if (tail.length === 0 && !isAbsolute) tail = ".";
+          if (tail.length > 0 && isPathSeparator(cc(path, len - 1))) tail += "\\";
+          if (!isAbsolute && device === undefined && path.includes(":")) {
+            // CVE-2024-36139: keep a relative path from becoming something
+            // Windows could read as absolute.
+            if (
+              tail.length >= 2 &&
+              isWindowsDeviceRoot(cc(tail, 0)) &&
+              cc(tail, 1) === CHAR_COLON
+            ) {
+              return `.\\${tail}`;
+            }
+            let index = path.indexOf(":");
+            do {
+              if (index === len - 1 || isPathSeparator(cc(path, index + 1))) {
+                return `.\\${tail}`;
+              }
+            } while ((index = path.indexOf(":", index + 1)) !== -1);
+          }
+          const colonIndex2 = path.indexOf(":");
+          if (isWindowsReservedName(path, colonIndex2)) {
+            return `.\\${device ?? ""}${tail}`;
+          }
+          if (device === undefined) {
+            return isAbsolute ? `\\${tail}` : tail;
+          }
+          return isAbsolute ? `${device}\\${tail}` : `${device}${tail}`;
+        },
+
+        isAbsolute(path) {
+          assertPath(path);
+          const len = path.length;
+          if (len === 0) return false;
+          const code = cc(path, 0);
+          return (
+            isPathSeparator(code) ||
+            (len > 2 &&
+              isWindowsDeviceRoot(code) &&
+              cc(path, 1) === CHAR_COLON &&
+              isPathSeparator(cc(path, 2)))
+          );
+        },
+
+        join(...args) {
+          if (args.length === 0) return ".";
+          let joined;
+          let firstPart;
+          for (let i = 0; i < args.length; ++i) {
+            const arg = args[i];
+            assertPath(arg);
+            if (arg.length > 0) {
+              if (joined === undefined) joined = firstPart = arg;
+              else joined += `\\${arg}`;
+            }
+          }
+          if (joined === undefined) return ".";
+
+          let needsReplace = true;
+          let slashCount = 0;
+          if (isPathSeparator(cc(firstPart, 0))) {
+            ++slashCount;
+            const firstLen = firstPart.length;
+            if (firstLen > 1 && isPathSeparator(cc(firstPart, 1))) {
+              ++slashCount;
+              if (firstLen > 2) {
+                if (isPathSeparator(cc(firstPart, 2))) ++slashCount;
+                else {
+                  needsReplace = false;
+                }
+              }
+            }
+          }
+          if (needsReplace) {
+            while (slashCount < joined.length && isPathSeparator(cc(joined, slashCount)))
+              slashCount++;
+            if (slashCount >= 2) joined = `\\${joined.slice(slashCount)}`;
+          }
+
+          // Skip normalization when a reserved device name (CON, COM1, ...)
+          // appears in any segment -- normalize would otherwise eat it.
+          const parts = [];
+          let part = "";
+          for (let i = 0; i < joined.length; i++) {
+            if (joined[i] === "\\") {
+              if (part) parts.push(part);
+              part = "";
+              while (i + 1 < joined.length && joined[i + 1] === "\\") i++;
+            } else {
+              part += joined[i];
+            }
+          }
+          if (part) parts.push(part);
+          if (
+            parts.some((p) => {
+              const colonIndex = p.indexOf(":");
+              return colonIndex !== -1 && isWindowsReservedName(p, colonIndex);
+            })
+          ) {
+            let result = "";
+            for (let i = 0; i < joined.length; i++) {
+              result += joined[i] === "/" ? "\\" : joined[i];
+            }
+            return result;
+          }
+
+          return mod.normalize(joined);
+        },
+
+        relative(from, to) {
+          assertPath(from, "from");
+          assertPath(to, "to");
+          if (from === to) return "";
+
+          const fromOrig = mod.resolve(from);
+          const toOrig = mod.resolve(to);
+          if (fromOrig === toOrig) return "";
+
+          from = fromOrig.toLowerCase();
+          to = toOrig.toLowerCase();
+          if (from === to) return "";
+
+          // When lowercasing changed the string LENGTH (e.g. the Turkish
+          // dotted-I), the char-index arithmetic below would be off, so fall
+          // back to a segment-wise comparison on the original-cased paths.
+          if (fromOrig.length !== from.length || toOrig.length !== to.length) {
+            const fromSplit = fromOrig.split("\\");
+            const toSplit = toOrig.split("\\");
+            if (fromSplit[fromSplit.length - 1] === "") fromSplit.pop();
+            if (toSplit[toSplit.length - 1] === "") toSplit.pop();
+            const fLen = fromSplit.length;
+            const tLen = toSplit.length;
+            const lim = fLen < tLen ? fLen : tLen;
+            let k;
+            for (k = 0; k < lim; k++) {
+              if (fromSplit[k].toLowerCase() !== toSplit[k].toLowerCase()) break;
+            }
+            if (k === 0) return toOrig;
+            if (k === lim) {
+              if (tLen > lim) return toSplit.slice(k).join("\\");
+              if (fLen > lim) return "..\\".repeat(fLen - 1 - k) + "..";
+              return "";
+            }
+            return "..\\".repeat(fLen - k) + toSplit.slice(k).join("\\");
+          }
+
+          let fromStart = 0;
+          while (
+            fromStart < from.length &&
+            cc(from, fromStart) === CHAR_BACKWARD_SLASH
+          )
+            fromStart++;
+          let fromEnd = from.length;
+          while (
+            fromEnd - 1 > fromStart &&
+            cc(from, fromEnd - 1) === CHAR_BACKWARD_SLASH
+          )
+            fromEnd--;
+          const fromLen = fromEnd - fromStart;
+
+          let toStart = 0;
+          while (toStart < to.length && cc(to, toStart) === CHAR_BACKWARD_SLASH)
+            toStart++;
+          let toEnd = to.length;
+          while (toEnd - 1 > toStart && cc(to, toEnd - 1) === CHAR_BACKWARD_SLASH)
+            toEnd--;
+          const toLen = toEnd - toStart;
+
+          const length = fromLen < toLen ? fromLen : toLen;
+          let lastCommonSep = -1;
+          let i = 0;
+          for (; i < length; i++) {
+            const fromCode = cc(from, fromStart + i);
+            if (fromCode !== cc(to, toStart + i)) break;
+            else if (fromCode === CHAR_BACKWARD_SLASH) lastCommonSep = i;
+          }
+
+          if (i !== length) {
+            if (lastCommonSep === -1) return toOrig;
+          } else {
+            if (toLen > length) {
+              if (cc(to, toStart + i) === CHAR_BACKWARD_SLASH) {
+                return toOrig.slice(toStart + i + 1);
+              }
+              if (i === 2) {
+                return toOrig.slice(toStart + i);
+              }
+            }
+            if (fromLen > length) {
+              if (cc(from, fromStart + i) === CHAR_BACKWARD_SLASH) lastCommonSep = i;
+              else if (i === 2) lastCommonSep = 3;
+            }
+            if (lastCommonSep === -1) lastCommonSep = 0;
+          }
+
+          let out = "";
+          for (i = fromStart + lastCommonSep + 1; i <= fromEnd; ++i) {
+            if (i === fromEnd || cc(from, i) === CHAR_BACKWARD_SLASH) {
+              out += out.length === 0 ? ".." : "\\..";
+            }
+          }
+
+          toStart += lastCommonSep;
+          if (out.length > 0) {
+            return `${out}${toOrig.slice(toStart, toEnd)}`;
+          }
+          if (cc(toOrig, toStart) === CHAR_BACKWARD_SLASH) ++toStart;
+          return toOrig.slice(toStart, toEnd);
+        },
+
+        toNamespacedPath(path) {
+          if (typeof path !== "string" || path.length === 0) return path;
+          const resolvedPath = mod.resolve(path);
+          if (resolvedPath.length <= 2) return path;
+
+          if (cc(resolvedPath, 0) === CHAR_BACKWARD_SLASH) {
+            if (cc(resolvedPath, 1) === CHAR_BACKWARD_SLASH) {
+              const code = cc(resolvedPath, 2);
+              if (code !== CHAR_QUESTION_MARK && code !== CHAR_DOT) {
+                return `\\\\?\\UNC\\${resolvedPath.slice(2)}`;
+              }
+            }
+          } else if (
+            isWindowsDeviceRoot(cc(resolvedPath, 0)) &&
+            cc(resolvedPath, 1) === CHAR_COLON &&
+            cc(resolvedPath, 2) === CHAR_BACKWARD_SLASH
+          ) {
+            return `\\\\?\\${resolvedPath}`;
+          }
+          return resolvedPath;
+        },
+
+        dirname(path) {
+          assertPath(path);
+          const len = path.length;
+          if (len === 0) return ".";
+          let rootEnd = -1;
+          let offset = 0;
+          const code = cc(path, 0);
+
+          if (len === 1) {
+            return isPathSeparator(code) ? path : ".";
+          }
+
+          if (isPathSeparator(code)) {
+            rootEnd = offset = 1;
+            if (isPathSeparator(cc(path, 1))) {
+              let j = 2;
+              let last = j;
+              while (j < len && !isPathSeparator(cc(path, j))) j++;
+              if (j < len && j !== last) {
+                last = j;
+                while (j < len && isPathSeparator(cc(path, j))) j++;
+                if (j < len && j !== last) {
+                  last = j;
+                  while (j < len && !isPathSeparator(cc(path, j))) j++;
+                  if (j === len) return path;
+                  if (j !== last) rootEnd = offset = j + 1;
+                }
+              }
+            }
+          } else if (isWindowsDeviceRoot(code) && cc(path, 1) === CHAR_COLON) {
+            rootEnd = len > 2 && isPathSeparator(cc(path, 2)) ? 3 : 2;
+            offset = rootEnd;
+          }
+
+          let end = -1;
+          let matchedSlash = true;
+          for (let i = len - 1; i >= offset; --i) {
+            if (isPathSeparator(cc(path, i))) {
+              if (!matchedSlash) {
+                end = i;
+                break;
+              }
+            } else {
+              matchedSlash = false;
+            }
+          }
+
+          if (end === -1) {
+            if (rootEnd === -1) return ".";
+            end = rootEnd;
+          }
+          return path.slice(0, end);
+        },
+
+        basename(path, suffix) {
+          if (suffix !== undefined) assertPath(suffix, "suffix");
+          assertPath(path);
+          let start = 0;
+          let end = -1;
+          let matchedSlash = true;
+
+          if (
+            path.length >= 2 &&
+            isWindowsDeviceRoot(cc(path, 0)) &&
+            cc(path, 1) === CHAR_COLON
+          ) {
+            start = 2;
+          }
+
+          if (suffix !== undefined && suffix.length > 0 && suffix.length <= path.length) {
+            if (suffix === path) return "";
+            let extIdx = suffix.length - 1;
+            let firstNonSlashEnd = -1;
+            for (let i = path.length - 1; i >= start; --i) {
+              const code = cc(path, i);
+              if (isPathSeparator(code)) {
+                if (!matchedSlash) {
+                  start = i + 1;
+                  break;
+                }
+              } else {
+                if (firstNonSlashEnd === -1) {
+                  matchedSlash = false;
+                  firstNonSlashEnd = i + 1;
+                }
+                if (extIdx >= 0) {
+                  if (code === cc(suffix, extIdx)) {
+                    if (--extIdx === -1) {
+                      end = i;
+                    }
+                  } else {
+                    extIdx = -1;
+                    end = firstNonSlashEnd;
+                  }
+                }
+              }
+            }
+            if (start === end) end = firstNonSlashEnd;
+            else if (end === -1) end = path.length;
+            return path.slice(start, end);
+          }
+          for (let i = path.length - 1; i >= start; --i) {
+            if (isPathSeparator(cc(path, i))) {
+              if (!matchedSlash) {
+                start = i + 1;
+                break;
+              }
+            } else if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+          }
+          if (end === -1) return "";
+          return path.slice(start, end);
+        },
+
+        extname(path) {
+          assertPath(path);
+          let start = 0;
+          let startDot = -1;
+          let startPart = 0;
+          let end = -1;
+          let matchedSlash = true;
+          let preDotState = 0;
+
+          if (
+            path.length >= 2 &&
+            cc(path, 1) === CHAR_COLON &&
+            isWindowsDeviceRoot(cc(path, 0))
+          ) {
+            start = startPart = 2;
+          }
+
+          for (let i = path.length - 1; i >= start; --i) {
+            const code = cc(path, i);
+            if (isPathSeparator(code)) {
+              if (!matchedSlash) {
+                startPart = i + 1;
+                break;
+              }
+              continue;
+            }
+            if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+            if (code === CHAR_DOT) {
+              if (startDot === -1) startDot = i;
+              else if (preDotState !== 1) preDotState = 1;
+            } else if (startDot !== -1) {
+              preDotState = -1;
+            }
+          }
+
+          if (
+            startDot === -1 ||
+            end === -1 ||
+            preDotState === 0 ||
+            (preDotState === 1 && startDot === end - 1 && startDot === startPart + 1)
+          ) {
+            return "";
+          }
+          return path.slice(startDot, end);
+        },
+
+        format: _format.bind(null, "\\"),
+
+        parse(path) {
+          assertPath(path);
+          const ret = { root: "", dir: "", base: "", ext: "", name: "" };
+          if (path.length === 0) return ret;
+          const len = path.length;
+          let rootEnd = 0;
+          let code = cc(path, 0);
+
+          if (len === 1) {
+            if (isPathSeparator(code)) {
+              ret.root = ret.dir = path;
+              return ret;
+            }
+            ret.base = ret.name = path;
+            return ret;
+          }
+
+          if (isPathSeparator(code)) {
+            rootEnd = 1;
+            if (isPathSeparator(cc(path, 1))) {
+              let j = 2;
+              let last = j;
+              while (j < len && !isPathSeparator(cc(path, j))) j++;
+              if (j < len && j !== last) {
+                last = j;
+                while (j < len && isPathSeparator(cc(path, j))) j++;
+                if (j < len && j !== last) {
+                  last = j;
+                  while (j < len && !isPathSeparator(cc(path, j))) j++;
+                  if (j === len) rootEnd = j;
+                  else if (j !== last) rootEnd = j + 1;
+                }
+              }
+            }
+          } else if (isWindowsDeviceRoot(code) && cc(path, 1) === CHAR_COLON) {
+            if (len <= 2) {
+              ret.root = ret.dir = path;
+              return ret;
+            }
+            rootEnd = 2;
+            if (isPathSeparator(cc(path, 2))) {
+              if (len === 3) {
+                ret.root = ret.dir = path;
+                return ret;
+              }
+              rootEnd = 3;
+            }
+          }
+          if (rootEnd > 0) ret.root = path.slice(0, rootEnd);
+
+          let startDot = -1;
+          let startPart = rootEnd;
+          let end = -1;
+          let matchedSlash = true;
+          let i = len - 1;
+          let preDotState = 0;
+
+          for (; i >= rootEnd; --i) {
+            code = cc(path, i);
+            if (isPathSeparator(code)) {
+              if (!matchedSlash) {
+                startPart = i + 1;
+                break;
+              }
+              continue;
+            }
+            if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+            if (code === CHAR_DOT) {
+              if (startDot === -1) startDot = i;
+              else if (preDotState !== 1) preDotState = 1;
+            } else if (startDot !== -1) {
+              preDotState = -1;
+            }
+          }
+
+          if (end !== -1) {
+            if (
+              startDot === -1 ||
+              preDotState === 0 ||
+              (preDotState === 1 && startDot === end - 1 && startDot === startPart + 1)
+            ) {
+              ret.base = ret.name = path.slice(startPart, end);
+            } else {
+              ret.name = path.slice(startPart, startDot);
+              ret.base = path.slice(startPart, end);
+              ret.ext = path.slice(startDot, end);
+            }
+          }
+
+          if (startPart > 0 && startPart !== rootEnd) {
+            ret.dir = path.slice(0, startPart - 1);
+          } else {
+            ret.dir = ret.root;
+          }
+          return ret;
+        },
+
+        sep: "\\",
+        delimiter: ";",
+      };
+    } else {
+      // Node's internal posixCwd: on Windows, expose the process CWD in POSIX
+      // form (drive letter dropped, '\' -> '/') so path.posix.* on a Windows
+      // host behaves like the test corpus expects.
+      const posixCwd = () => {
+        const raw = natives ? natives.cwd() : "/";
+        if (natives && natives.platform === "win32") {
+          const slashed = raw.replace(/\\/g, "/");
+          const idx = slashed.indexOf("/");
+          return idx === -1 ? slashed : slashed.slice(idx);
         }
-        if (needsReplace) {
-          while (slashCount < joined.length && isSep(joined[slashCount])) slashCount++;
-          if (slashCount >= 2) joined = sep + joined.slice(slashCount);
-        }
-      }
-      return normalize(joined);
-    }
+        return raw;
+      };
 
-    function resolve(...args) {
-      // Node's win32 algorithm: scan right-to-left tracking DEVICE and
-      // ABSOLUTENESS separately. An arg on a different device than the one
-      // already chosen is skipped; scanning continues until both a device
-      // and an absolute anchor are found (so resolve('C:\\\\base','C:file')
-      // is 'C:\\\\base\\\\file', and resolve('C:\\\\a','\\\\b') is 'C:\\\\b').
-      let device = "";
-      let tail = "";
-      let absolute = false;
-      for (let i = args.length - 1; i >= 0 && !(device !== "" && absolute); i--) {
-        const p = args[i];
-        assertPath(p);
-        if (p.length === 0) continue;
-        const { root, rest } = splitRoot(p);
-        const argDevice = isWin
-          ? isDriveRelativeRoot(root)
-            ? root
-            : root.length >= 3 && root[1] === ":"
-              ? root.slice(0, 2)
-              : root.startsWith("\\\\")
-                ? root
-                : ""
-          : root;
-        const argAbsolute = root !== "" && !isDriveRelativeRoot(root);
-        if (
-          device !== "" &&
-          argDevice !== "" &&
-          argDevice.toUpperCase() !== device.toUpperCase()
-        ) {
-          continue; // different drive: irrelevant to this resolution
-        }
-        if (device === "" && argDevice !== "") device = argDevice;
-        if (!absolute) {
-          tail = rest + (tail.length > 0 ? sep + tail : "");
-          absolute = argAbsolute;
-        }
-      }
-      if (!absolute || (isWin && device === "")) {
-        // cwd fills whatever is missing: the tail anchor (when nothing was
-        // absolute; same-device cwd anchors fully, foreign-device cwd
-        // anchors at the device root â€” wave-1 simplification of Node's
-        // per-drive cwd tracking) and/or the device (when an absolute
-        // driveless '\\x' path needs qualification).
-        const cwd = natives ? natives.cwd() : "/";
-        const cwdSplit = splitRoot(cwd);
-        const cwdDevice =
-          isWin && cwdSplit.root.length >= 2 ? cwdSplit.root.slice(0, 2) : cwdSplit.root;
-        if (!absolute && (device === "" || cwdDevice.toUpperCase() === device.toUpperCase())) {
-          tail = cwdSplit.rest + (tail.length > 0 ? sep + tail : "");
-        }
-        if (device === "") device = isWin ? cwdDevice : "";
-        absolute = true;
-      }
-      const root = isWin ? (device.startsWith("\\\\") ? device : device + "\\") : "/";
-      const parts = normalizeParts(tail, false);
-      const out = root + parts.join(sep);
-      return out.length > 0 ? out : ".";
-    }
+      mod = {
+        resolve(...args) {
+          let resolvedPath = "";
+          let resolvedAbsolute = false;
+          for (let i = args.length - 1; i >= -1 && !resolvedAbsolute; i--) {
+            const path = i >= 0 ? args[i] : posixCwd();
+            assertPath(path, `paths[${i}]`);
+            if (path.length === 0) continue;
+            resolvedPath = `${path}/${resolvedPath}`;
+            resolvedAbsolute = cc(path, 0) === CHAR_FORWARD_SLASH;
+          }
+          resolvedPath = normalizeString(
+            resolvedPath,
+            !resolvedAbsolute,
+            "/",
+            isPosixPathSeparator,
+          );
+          if (resolvedAbsolute) return `/${resolvedPath}`;
+          return resolvedPath.length > 0 ? resolvedPath : ".";
+        },
 
-    function relative(from, to) {
-      assertPath(from);
-      assertPath(to);
-      const f = resolve(from);
-      const t = resolve(to);
-      const cmp = (s) => (isWin ? s.toLowerCase() : s);
-      if (cmp(f) === cmp(t)) return "";
-      const fSplit = splitRoot(f);
-      const tSplit = splitRoot(t);
-      if (cmp(fSplit.root) !== cmp(tSplit.root)) return t;
-      const fParts = fSplit.rest.length > 0 ? fSplit.rest.split(sep) : [];
-      const tParts = tSplit.rest.length > 0 ? tSplit.rest.split(sep) : [];
-      let common = 0;
-      while (
-        common < fParts.length &&
-        common < tParts.length &&
-        cmp(fParts[common]) === cmp(tParts[common])
-      ) {
-        common++;
-      }
-      const ups = fParts.length - common;
-      const segments = [];
-      for (let i = 0; i < ups; i++) segments.push("..");
-      segments.push(...tParts.slice(common));
-      return segments.join(sep);
-    }
+        normalize(path) {
+          assertPath(path);
+          if (path.length === 0) return ".";
+          const isAbsolute = cc(path, 0) === CHAR_FORWARD_SLASH;
+          const trailingSeparator = cc(path, path.length - 1) === CHAR_FORWARD_SLASH;
+          path = normalizeString(path, !isAbsolute, "/", isPosixPathSeparator);
+          if (path.length === 0) {
+            if (isAbsolute) return "/";
+            return trailingSeparator ? "./" : ".";
+          }
+          if (trailingSeparator) path += "/";
+          return isAbsolute ? `/${path}` : path;
+        },
 
-    function basename(p, suffix) {
-      assertPath(p);
-      const { rest } = splitRoot(p);
-      let end = rest.length;
-      while (end > 0 && isSep(rest[end - 1])) end--;
-      let start = end;
-      while (start > 0 && !isSep(rest[start - 1])) start--;
-      let base = rest.slice(start, end);
-      if (suffix !== undefined && base.endsWith(suffix) && base !== suffix) {
-        base = base.slice(0, base.length - suffix.length);
-      }
-      return base;
-    }
+        isAbsolute(path) {
+          assertPath(path);
+          return path.length > 0 && cc(path, 0) === CHAR_FORWARD_SLASH;
+        },
 
-    function extname(p) {
-      const base = basename(p);
-      const dot = base.lastIndexOf(".");
-      return dot <= 0 ? "" : base.slice(dot);
-    }
+        join(...args) {
+          if (args.length === 0) return ".";
+          let joined;
+          for (let i = 0; i < args.length; ++i) {
+            const arg = args[i];
+            assertPath(arg);
+            if (arg.length > 0) {
+              if (joined === undefined) joined = arg;
+              else joined += `/${arg}`;
+            }
+          }
+          if (joined === undefined) return ".";
+          return mod.normalize(joined);
+        },
 
-    function dirname(p) {
-      assertPath(p);
-      const { root, rest } = splitRoot(p);
-      let end = rest.length;
-      while (end > 0 && isSep(rest[end - 1])) end--;
-      let cut = end;
-      while (cut > 0 && !isSep(rest[cut - 1])) cut--;
-      while (cut > 0 && isSep(rest[cut - 1])) cut--;
-      if (cut === 0) return root.length > 0 ? root : ".";
-      return root + rest.slice(0, cut);
-    }
+        relative(from, to) {
+          assertPath(from, "from");
+          assertPath(to, "to");
+          if (from === to) return "";
 
-    function parse(p) {
-      assertPath(p);
-      const { root } = splitRoot(p);
-      const base = basename(p);
-      const ext = extname(p);
-      const dir = dirname(p);
-      return {
-        root,
-        dir: dir === "." && !p.startsWith(".") && root === "" && p.indexOf(sep) === -1 ? "" : dir,
-        base,
-        ext,
-        name: base.slice(0, base.length - ext.length),
+          from = mod.resolve(from);
+          to = mod.resolve(to);
+          if (from === to) return "";
+
+          const fromStart = 1;
+          const fromEnd = from.length;
+          const fromLen = fromEnd - fromStart;
+          const toStart = 1;
+          const toLen = to.length - toStart;
+
+          const length = fromLen < toLen ? fromLen : toLen;
+          let lastCommonSep = -1;
+          let i = 0;
+          for (; i < length; i++) {
+            const fromCode = cc(from, fromStart + i);
+            if (fromCode !== cc(to, toStart + i)) break;
+            else if (fromCode === CHAR_FORWARD_SLASH) lastCommonSep = i;
+          }
+          if (i === length) {
+            if (toLen > length) {
+              if (cc(to, toStart + i) === CHAR_FORWARD_SLASH) {
+                return to.slice(toStart + i + 1);
+              }
+              if (i === 0) {
+                return to.slice(toStart + i);
+              }
+            } else if (fromLen > length) {
+              if (cc(from, fromStart + i) === CHAR_FORWARD_SLASH) lastCommonSep = i;
+              else if (i === 0) lastCommonSep = 0;
+            }
+          }
+
+          let out = "";
+          for (i = fromStart + lastCommonSep + 1; i <= fromEnd; ++i) {
+            if (i === fromEnd || cc(from, i) === CHAR_FORWARD_SLASH) {
+              out += out.length === 0 ? ".." : "/..";
+            }
+          }
+          return `${out}${to.slice(toStart + lastCommonSep)}`;
+        },
+
+        toNamespacedPath(path) {
+          return path;
+        },
+
+        dirname(path) {
+          assertPath(path);
+          if (path.length === 0) return ".";
+          const hasRoot = cc(path, 0) === CHAR_FORWARD_SLASH;
+          let end = -1;
+          let matchedSlash = true;
+          for (let i = path.length - 1; i >= 1; --i) {
+            if (cc(path, i) === CHAR_FORWARD_SLASH) {
+              if (!matchedSlash) {
+                end = i;
+                break;
+              }
+            } else {
+              matchedSlash = false;
+            }
+          }
+          if (end === -1) return hasRoot ? "/" : ".";
+          if (hasRoot && end === 1) return "//";
+          return path.slice(0, end);
+        },
+
+        basename(path, suffix) {
+          if (suffix !== undefined) assertPath(suffix, "suffix");
+          assertPath(path);
+          let start = 0;
+          let end = -1;
+          let matchedSlash = true;
+
+          if (suffix !== undefined && suffix.length > 0 && suffix.length <= path.length) {
+            if (suffix === path) return "";
+            let extIdx = suffix.length - 1;
+            let firstNonSlashEnd = -1;
+            for (let i = path.length - 1; i >= 0; --i) {
+              const code = cc(path, i);
+              if (code === CHAR_FORWARD_SLASH) {
+                if (!matchedSlash) {
+                  start = i + 1;
+                  break;
+                }
+              } else {
+                if (firstNonSlashEnd === -1) {
+                  matchedSlash = false;
+                  firstNonSlashEnd = i + 1;
+                }
+                if (extIdx >= 0) {
+                  if (code === cc(suffix, extIdx)) {
+                    if (--extIdx === -1) {
+                      end = i;
+                    }
+                  } else {
+                    extIdx = -1;
+                    end = firstNonSlashEnd;
+                  }
+                }
+              }
+            }
+            if (start === end) end = firstNonSlashEnd;
+            else if (end === -1) end = path.length;
+            return path.slice(start, end);
+          }
+          for (let i = path.length - 1; i >= 0; --i) {
+            if (cc(path, i) === CHAR_FORWARD_SLASH) {
+              if (!matchedSlash) {
+                start = i + 1;
+                break;
+              }
+            } else if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+          }
+          if (end === -1) return "";
+          return path.slice(start, end);
+        },
+
+        extname(path) {
+          assertPath(path);
+          let startDot = -1;
+          let startPart = 0;
+          let end = -1;
+          let matchedSlash = true;
+          let preDotState = 0;
+          for (let i = path.length - 1; i >= 0; --i) {
+            const code = cc(path, i);
+            if (code === CHAR_FORWARD_SLASH) {
+              if (!matchedSlash) {
+                startPart = i + 1;
+                break;
+              }
+              continue;
+            }
+            if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+            if (code === CHAR_DOT) {
+              if (startDot === -1) startDot = i;
+              else if (preDotState !== 1) preDotState = 1;
+            } else if (startDot !== -1) {
+              preDotState = -1;
+            }
+          }
+          if (
+            startDot === -1 ||
+            end === -1 ||
+            preDotState === 0 ||
+            (preDotState === 1 && startDot === end - 1 && startDot === startPart + 1)
+          ) {
+            return "";
+          }
+          return path.slice(startDot, end);
+        },
+
+        format: _format.bind(null, "/"),
+
+        parse(path) {
+          assertPath(path);
+          const ret = { root: "", dir: "", base: "", ext: "", name: "" };
+          if (path.length === 0) return ret;
+          const isAbsolute = cc(path, 0) === CHAR_FORWARD_SLASH;
+          let start;
+          if (isAbsolute) {
+            ret.root = "/";
+            start = 1;
+          } else {
+            start = 0;
+          }
+          let startDot = -1;
+          let startPart = 0;
+          let end = -1;
+          let matchedSlash = true;
+          let i = path.length - 1;
+          let preDotState = 0;
+
+          for (; i >= start; --i) {
+            const code = cc(path, i);
+            if (code === CHAR_FORWARD_SLASH) {
+              if (!matchedSlash) {
+                startPart = i + 1;
+                break;
+              }
+              continue;
+            }
+            if (end === -1) {
+              matchedSlash = false;
+              end = i + 1;
+            }
+            if (code === CHAR_DOT) {
+              if (startDot === -1) startDot = i;
+              else if (preDotState !== 1) preDotState = 1;
+            } else if (startDot !== -1) {
+              preDotState = -1;
+            }
+          }
+
+          if (end !== -1) {
+            const startVal = startPart === 0 && isAbsolute ? 1 : startPart;
+            if (
+              startDot === -1 ||
+              preDotState === 0 ||
+              (preDotState === 1 && startDot === end - 1 && startDot === startPart + 1)
+            ) {
+              ret.base = ret.name = path.slice(startVal, end);
+            } else {
+              ret.name = path.slice(startVal, startDot);
+              ret.base = path.slice(startVal, end);
+              ret.ext = path.slice(startDot, end);
+            }
+          }
+
+          if (startPart > 0) ret.dir = path.slice(0, startPart - 1);
+          else if (isAbsolute) ret.dir = "/";
+          return ret;
+        },
+
+        sep: "/",
+        delimiter: ":",
       };
     }
 
-    function format(obj) {
-      const dir = obj.dir || obj.root || "";
-      const base = obj.base || (obj.name || "") + (obj.ext || "");
-      if (!dir) return base;
-      return dir === obj.root ? dir + base : dir + sep + base;
-    }
-
-    function toNamespacedPath(p) {
-      if (!isWin || typeof p !== "string" || p.length === 0) return p;
-      const resolved = resolve(p);
-      if (resolved.startsWith("\\\\")) {
-        if (resolved.startsWith("\\\\?\\")) return resolved;
-        return "\\\\?\\UNC\\" + resolved.slice(2);
-      }
-      if (isDrive(resolved) && resolved[2] === "\\") return "\\\\?\\" + resolved;
-      return p;
-    }
-
-    return {
-      sep,
-      delimiter,
-      normalize,
-      isAbsolute,
-      join,
-      resolve,
-      relative,
-      basename,
-      extname,
-      dirname,
-      parse,
-      format,
-      toNamespacedPath,
-    };
+    return mod;
   }
 
   registry.factories.path = (natives) => {
@@ -2315,7 +3289,8 @@
         if (v === null) return "null";
         const t = typeof v;
         if (t === "string") return level === 0 && options.bare ? v : `'${v}'`;
-        if (t === "number" || t === "boolean" || t === "undefined") return String(v);
+        if (t === "number") return Object.is(v, -0) ? "-0" : String(v);
+        if (t === "boolean" || t === "undefined") return String(v);
         if (t === "bigint") return `${v}n`;
         if (t === "symbol") return v.toString();
         if (t === "function") {
@@ -2339,7 +3314,7 @@
             const max = 100;
             const items = v.slice(0, max).map((item) => walk(item, level + 1));
             if (v.length > max) items.push(`... ${v.length - max} more items`);
-            return `[ ${items.join(", ")} ]`;
+            return items.length === 0 ? "[]" : `[ ${items.join(", ")} ]`;
           }
           if (v instanceof Map) {
             const items = [];
@@ -2389,11 +3364,40 @@
       return walk(value, 0);
     }
 
+    // util.inspect.defaultOptions / .custom -- present so code that reads or
+    // mutates them (the conformance corpus does) doesn't crash. Not all of
+    // these options are honored by the walker yet.
+    inspect.defaultOptions = {
+      showHidden: false,
+      depth: 2,
+      colors: false,
+      customInspect: true,
+      showProxy: false,
+      maxArrayLength: 100,
+      maxStringLength: 10000,
+      breakLength: 80,
+      compact: 3,
+      sorted: false,
+      getters: false,
+      numericSeparator: false,
+    };
+    inspect.custom = Symbol.for("nodejs.util.inspect.custom");
+
+    // Number -> string preserving negative zero ("-0"), the way Node's
+    // formatters do (String(-0) is "0", which loses the sign).
+    function numToStr(n) {
+      if (Object.is(n, -0)) return "-0";
+      return String(n);
+    }
+
     function formatValue(v) {
-      return typeof v === "string" ? v : inspect(v);
+      if (typeof v === "string") return v;
+      return inspect(v);
     }
 
     function format(f, ...args) {
+      // util.format() with no arguments returns '' (Node parity).
+      if (arguments.length === 0) return "";
       if (typeof f !== "string") {
         return [f, ...args].map(formatValue).join(" ");
       }
@@ -2406,17 +3410,22 @@
         if (i >= args.length) return spec;
         const arg = args[i++];
         switch (spec) {
-          case "%s":
-            return typeof arg === "string" ? arg : inspect(arg, { bare: true });
+          case "%s": {
+            if (typeof arg === "string") return arg;
+            // Node special-cases negative zero / bigint in %s.
+            if (typeof arg === "number") return numToStr(arg);
+            if (typeof arg === "bigint") return `${arg}n`;
+            return inspect(arg, { bare: true });
+          }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
-            return typeof arg === "bigint" ? `${arg}n` : String(Number(arg));
+            return typeof arg === "bigint" ? `${arg}n` : numToStr(Number(arg));
           case "%i":
             if (typeof arg === "symbol") return "NaN";
-            return typeof arg === "bigint" ? `${arg}n` : String(parseInt(arg, 10));
+            return typeof arg === "bigint" ? `${arg}n` : numToStr(parseInt(arg, 10));
           case "%f":
             if (typeof arg === "symbol") return "NaN";
-            return String(parseFloat(arg));
+            return numToStr(parseFloat(arg));
           case "%j":
             try {
               return JSON.stringify(arg);
@@ -2469,11 +3478,27 @@
     }
 
     function inherits(ctor, superCtor) {
+      if (ctor === undefined || ctor === null) {
+        throw new codes.ERR_INVALID_ARG_TYPE("ctor", "Function", ctor);
+      }
+      if (superCtor === undefined || superCtor === null) {
+        throw new codes.ERR_INVALID_ARG_TYPE("superCtor", "Function", superCtor);
+      }
+      if (superCtor.prototype === undefined) {
+        throw new codes.ERR_INVALID_ARG_TYPE(
+          "superCtor.prototype",
+          "Object",
+          superCtor.prototype,
+        );
+      }
       Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
-    function deprecate(fn, msg) {
+    function deprecate(fn, msg, code) {
+      if (code !== undefined && typeof code !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
+      }
       let warned = false;
       function deprecated(...args) {
         if (!warned) {
@@ -2501,6 +3526,50 @@
       return logger;
     }
 
+    // Identify a boxed-primitive's TRUE internal class by probing each
+    // wrapper's valueOf (throws on a mismatched receiver) -- robust against a
+    // Symbol.toStringTag / prototype override. Returns null for non-wrappers.
+    function boxedKind(v) {
+      if (v === null || typeof v !== "object") return null;
+      try {
+        Number.prototype.valueOf.call(v);
+        return "Number";
+      } catch {}
+      try {
+        String.prototype.valueOf.call(v);
+        return "String";
+      } catch {}
+      try {
+        Boolean.prototype.valueOf.call(v);
+        return "Boolean";
+      } catch {}
+      try {
+        Symbol.prototype.valueOf.call(v);
+        return "Symbol";
+      } catch {}
+      try {
+        BigInt.prototype.valueOf.call(v);
+        return "BigInt";
+      } catch {}
+      return null;
+    }
+    function boxedValue(v, kind) {
+      switch (kind) {
+        case "Number":
+          return Number.prototype.valueOf.call(v);
+        case "String":
+          return String.prototype.valueOf.call(v);
+        case "Boolean":
+          return Boolean.prototype.valueOf.call(v);
+        case "Symbol":
+          return Symbol.prototype.valueOf.call(v);
+        case "BigInt":
+          return BigInt.prototype.valueOf.call(v);
+        default:
+          return v;
+      }
+    }
+
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
       // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
@@ -2513,6 +3582,21 @@
       }
       if (a === b) return true;
       if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+      // Boxed primitives (new Number/String/Boolean/Symbol/BigInt). Detect the
+      // TRUE internal class by probing each wrapper's valueOf (which throws on a
+      // mismatched receiver), so a Symbol.toStringTag override can't disguise
+      // the slot. Two wrappers are equal only if the same kind AND the same
+      // primitive value AND their own enumerable keys match (the key check runs
+      // below after this branch falls through for equal-valued wrappers).
+      {
+        const ka = boxedKind(a);
+        const kb = boxedKind(b);
+        if (ka !== null || kb !== null) {
+          if (ka !== kb) return false;
+          if (!primitiveEqual(boxedValue(a, ka), boxedValue(b, kb))) return false;
+          // fall through to the own-enumerable-key comparison below.
+        }
+      }
       if (a instanceof Date) return b instanceof Date && a.getTime() === b.getTime();
       if (a instanceof RegExp) {
         return b instanceof RegExp && a.source === b.source && a.flags === b.flags;
@@ -2523,6 +3607,23 @@
         const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
         if (ua.length !== ub.length) return false;
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+        // Bytes match -- but extra own enumerable (non-index) properties still
+        // count, so fall through to the key comparison below rather than
+        // returning early.
+        const extraKeys = (o) =>
+          [
+            ...Object.keys(o).filter((k) => !/^\d+$/.test(k)),
+            ...Object.getOwnPropertySymbols(o).filter(
+              (s) => Object.getOwnPropertyDescriptor(o, s)?.enumerable,
+            ),
+          ];
+        const ea = extraKeys(a);
+        const eb = extraKeys(b);
+        if (ea.length !== eb.length) return false;
+        for (const k of ea) {
+          if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+          if (!deepEqualImpl(a[k], b[k], strict, memo ?? new Map())) return false;
+        }
         return true;
       }
       memo = memo ?? new Map();
@@ -2575,13 +3676,73 @@
         if (!(b instanceof Error) || a.name !== b.name || a.message !== b.message) {
           return false;
         }
+        // Node compares the (non-enumerable) `cause` too: errors with
+        // differing causes are not deep-equal.
+        const aHasCause = "cause" in a;
+        const bHasCause = "cause" in b;
+        if (aHasCause !== bHasCause) return false;
+        if (aHasCause && !deepEqualImpl(a.cause, b.cause, strict, memo)) return false;
       }
-      const aKeys = Object.keys(a);
-      const bKeys = Object.keys(b);
+      // Own ENUMERABLE keys, string + symbol (Node compares both; non-
+      // enumerable symbols are ignored).
+      const ownEnumerableKeys = (obj) => {
+        const out = Object.keys(obj);
+        for (const s of Object.getOwnPropertySymbols(obj)) {
+          if (Object.getOwnPropertyDescriptor(obj, s)?.enumerable) out.push(s);
+        }
+        return out;
+      };
+      const aKeys = ownEnumerableKeys(a);
+      const bKeys = ownEnumerableKeys(b);
       if (aKeys.length !== bKeys.length) return false;
       for (const key of aKeys) {
         if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+        const bDesc = Object.getOwnPropertyDescriptor(b, key);
+        if (!bDesc || !bDesc.enumerable) return false;
         if (!deepEqualImpl(a[key], b[key], strict, memo)) return false;
+      }
+      return true;
+    }
+
+    // Partial deep-strict-equal: every own enumerable key of `expected` must
+    // deep-strict-equal the same key in `actual`; `actual` may have extras.
+    // Used by assert.partialDeepStrictEqual.
+    function partialDeepEqualImpl(actual, expected, memo) {
+      if (
+        expected === null ||
+        typeof expected !== "object" ||
+        actual === null ||
+        typeof actual !== "object"
+      ) {
+        return deepEqualImpl(actual, expected, true);
+      }
+      if (actual === expected) return true;
+      memo = memo ?? new Map();
+      const prior = memo.get(expected);
+      if (prior && prior.has(actual)) return true;
+      if (prior) prior.add(actual);
+      else memo.set(expected, new Set([actual]));
+
+      if (Array.isArray(expected)) {
+        if (!Array.isArray(actual)) return false;
+        // Each expected element must match some actual element in order.
+        let ai = 0;
+        for (let ei = 0; ei < expected.length; ei++) {
+          let matched = false;
+          for (; ai < actual.length; ai++) {
+            if (partialDeepEqualImpl(actual[ai], expected[ei], memo)) {
+              matched = true;
+              ai++;
+              break;
+            }
+          }
+          if (!matched) return false;
+        }
+        return true;
+      }
+      for (const key of Object.keys(expected)) {
+        if (!Object.prototype.hasOwnProperty.call(actual, key)) return false;
+        if (!partialDeepEqualImpl(actual[key], expected[key], memo)) return false;
       }
       return true;
     }
@@ -2846,9 +4007,28 @@
         return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
       },
       _deepEqual: deepEqualImpl,
-      stripVTControlCharacters: (str) =>
+      _partialDeepEqual: partialDeepEqualImpl,
+      stripVTControlCharacters: (str) => {
+        if (typeof str !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
+        }
+        // Node's ANSI matcher (lib/internal/util/colors.js): covers CSI
+        // escapes AND OSC sequences (]8;; hyperlinks terminated by BEL),
+        // which the old CSI-only regex left behind.
+        const ESC = String.fromCharCode(0x1b);
+        const CSI8 = String.fromCharCode(0x9b);
+        const BEL = String.fromCharCode(0x07);
+        const ST9C = String.fromCharCode(0x9c);
+        // OSC string terminator: BEL, ESC+'\' (7-bit ST), or 0x9C (8-bit ST).
+        const STTERM = "(?:" + BEL + "|" + ESC + "\\\\|" + ST9C + ")";
+        const ansiPattern =
+          "[" + ESC + CSI8 + "][[\\]()#;?]*" +
+          "(?:(?:(?:(?:;[-a-zA-Z0-9/#&.:=?%@~_]+)*" +
+          "|[a-zA-Z0-9]+(?:;[-a-zA-Z0-9/#&.:=?%@~_]*)*)?" + STTERM + ")" +
+          "|(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~]))";
         // eslint-disable-next-line no-control-regex
-        String(str).replace(/\[[0-9;]*[A-Za-z]/g, ""),
+        return str.replace(new RegExp(ansiPattern, "g"), "");
+      },
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
       getSystemErrorName: function getSystemErrorName(err) {
@@ -2886,54 +4066,105 @@
           [-23, ["ETIMEDOUT", "connection timed out"]],
         ]);
       },
-      styleText: function styleText(format, text) {
-        var ESC = String.fromCharCode(27);
-        var codes = {
-          reset: [0, 0],
-          bold: [1, 22],
-          dim: [2, 22],
-          italic: [3, 23],
-          underline: [4, 24],
-          inverse: [7, 27],
-          hidden: [8, 28],
-          strikethrough: [9, 29],
-          black: [30, 39],
-          red: [31, 39],
-          green: [32, 39],
-          yellow: [33, 39],
-          blue: [34, 39],
-          magenta: [35, 39],
-          cyan: [36, 39],
-          white: [37, 39],
-          gray: [90, 39],
-          grey: [90, 39],
-          redBright: [91, 39],
-          greenBright: [92, 39],
-          yellowBright: [93, 39],
-          blueBright: [94, 39],
-          magentaBright: [95, 39],
-          cyanBright: [96, 39],
-          whiteBright: [97, 39],
-          bgBlack: [40, 49],
-          bgRed: [41, 49],
-          bgGreen: [42, 49],
-          bgYellow: [43, 49],
-          bgBlue: [44, 49],
-          bgMagenta: [45, 49],
-          bgCyan: [46, 49],
-          bgWhite: [47, 49],
+      styleText: function styleText(format, text, options) {
+        // Node's inspect.colors table (open/close SGR pairs).
+        const colors = {
+          reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23],
+          underline: [4, 24], blink: [5, 25], inverse: [7, 27], hidden: [8, 28],
+          strikethrough: [9, 29], doubleunderline: [21, 24], black: [30, 39],
+          red: [31, 39], green: [32, 39], yellow: [33, 39], blue: [34, 39],
+          magenta: [35, 39], cyan: [36, 39], white: [37, 39], bgBlack: [40, 49],
+          bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49], bgBlue: [44, 49],
+          bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49], framed: [51, 54],
+          overlined: [53, 55], gray: [90, 39], redBright: [91, 39],
+          greenBright: [92, 39], yellowBright: [93, 39], blueBright: [94, 39],
+          magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
+          bgGray: [100, 49], bgRedBright: [101, 49], bgGreenBright: [102, 49],
+          bgYellowBright: [103, 49], bgBlueBright: [104, 49],
+          bgMagentaBright: [105, 49], bgCyanBright: [106, 49],
+          bgWhiteBright: [107, 49],
         };
-        if (Array.isArray(format)) {
-          var result = String(text);
-          for (var fi = 0; fi < format.length; fi++) {
-            var c = codes[format[fi]];
-            if (c) result = ESC + "[" + c[0] + "m" + result + ESC + "[" + c[1] + "m";
-          }
-          return result;
+        const escapeStyleCode = (code) => `[${code}m`;
+
+        const opts = options || {};
+        const validateStream = opts.validateStream === undefined ? true : opts.validateStream;
+        const stream = opts.stream === undefined ? globalThis.process?.stdout : opts.stream;
+        if (typeof text !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("text", "string", text);
         }
-        var pair = codes[format];
-        if (!pair) return String(text);
-        return ESC + "[" + pair[0] + "m" + String(text) + ESC + "[" + pair[1] + "m";
+        if (typeof validateStream !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE(
+            "options.validateStream",
+            "boolean",
+            validateStream,
+          );
+        }
+        if (validateStream) {
+          // A stream-shaped object has write()/on(); reject anything else
+          // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
+          // Stream; this heuristic covers the corpus cases.
+          const looksLikeStream =
+            stream != null &&
+            (typeof stream.write === "function" ||
+              typeof stream.on === "function" ||
+              typeof stream.pipe === "function" ||
+              typeof stream.getReader === "function" ||
+              typeof stream.getWriter === "function");
+          if (!looksLikeStream) {
+            throw new codes.ERR_INVALID_ARG_TYPE(
+              "stream",
+              ["ReadableStream", "WritableStream", "Stream"],
+              stream,
+            );
+          }
+        }
+        // oam cannot meaningfully introspect the stream's TTY-ness here; once a
+        // valid stream is present, colorize (validateStream:false skips this).
+
+        const formatArray = Array.isArray(format) ? format : [format];
+        const codeList = [];
+        for (const key of formatArray) {
+          if (key === "none") continue;
+          const formatCodes = colors[key];
+          if (formatCodes == null) {
+            throw new codes.ERR_INVALID_ARG_VALUE(
+              "format",
+              key,
+              `must be one of: ${Object.keys(colors)
+                .map((k) => `'${k}'`)
+                .join(", ")}`,
+            );
+          }
+          codeList.push(formatCodes);
+        }
+
+        let openCodes = "";
+        for (let i = 0; i < codeList.length; i++) {
+          openCodes += escapeStyleCode(codeList[i][0]);
+        }
+
+        let processedText = text;
+        if (codeList.length > 0) {
+          processedText = codeList.reduce(
+            (acc, code) =>
+              acc.replace(new RegExp(`\\u001b\\[${code[1]}m`, "g"), (match, offset) => {
+                if (offset + match.length < acc.length) {
+                  if (code[0] === colors.dim[0] || code[0] === colors.bold[0]) {
+                    return `${match}${escapeStyleCode(code[0])}`;
+                  }
+                  return escapeStyleCode(code[0]);
+                }
+                return match;
+              }),
+            text,
+          );
+        }
+
+        let closeCodes = "";
+        for (let i = codeList.length - 1; i >= 0; i--) {
+          closeCodes += escapeStyleCode(codeList[i][1]);
+        }
+        return `${openCodes}${processedText}${closeCodes}`;
       },
       log: function utilLog() {
         var d = new Date();
@@ -3018,16 +4249,28 @@
 
     class AssertionError extends Error {
       constructor(options) {
-        super(
-          options.message ||
-            `${util.inspect(options.actual)} ${options.operator} ${util.inspect(options.expected)}`,
-        );
+        let message = options.message;
+        let generatedMessage = false;
+        if (message == null) {
+          generatedMessage = true;
+          if (options.operator === "fail") {
+            message = "Failed";
+          } else {
+            message = `${util.inspect(options.actual)} ${options.operator} ${util.inspect(options.expected)}`;
+          }
+        }
+        super(message);
         this.name = "AssertionError";
         this.code = "ERR_ASSERTION";
         this.actual = options.actual;
         this.expected = options.expected;
         this.operator = options.operator;
-        this.generatedMessage = !options.message;
+        this.generatedMessage = generatedMessage;
+        // Trim oam-internal frames (and the asserting helper itself) from the
+        // stack, the way Node's `stackStartFn` does.
+        if (options.stackStartFn && typeof Error.captureStackTrace === "function") {
+          Error.captureStackTrace(this, options.stackStartFn);
+        }
       }
     }
 
@@ -3112,8 +4355,9 @@
         throw new AssertionError({
           actual: undefined,
           expected,
-          message: message ?? "Missing expected exception",
+          message: message ?? "Missing expected exception.",
           operator: "throws",
+          stackStartFn: throws,
         });
       }
       if (expected !== undefined && !checkExpected(thrown, expected)) {
@@ -3164,9 +4408,37 @@
     const assert = Object.assign(ok, {
       AssertionError,
       ok,
-      fail: (message) => {
+      fail: (...failArgs) => {
+        const argsLen = failArgs.length;
+        const [actual, expected, message, operator] = failArgs;
+        // assert.fail() -- no args: generated "Failed" message.
+        if (argsLen === 0) {
+          throw new AssertionError({
+            actual: undefined,
+            expected: undefined,
+            message: undefined,
+            operator: "fail",
+          });
+        }
+        // assert.fail(message) -- 1 arg: an Error rethrows; otherwise the arg
+        // is the user-supplied message.
+        if (argsLen === 1) {
+          if (actual instanceof Error) throw actual;
+          throw new AssertionError({
+            actual: undefined,
+            expected: undefined,
+            message: actual,
+            operator: "fail",
+          });
+        }
+        if (expected instanceof Error) throw expected;
         if (message instanceof Error) throw message;
-        throw new AssertionError({ message: message ?? "Failed", operator: "fail" });
+        throw new AssertionError({
+          actual,
+          expected,
+          message,
+          operator: operator || "fail",
+        });
       },
       equal: (actual, expected, message) => {
         // eslint-disable-next-line eqeqeq
@@ -3239,14 +4511,50 @@
           innerFail(string, regexp, message ?? `The input did not match the regular expression`, "match");
         }
       },
-      ifError: (value) => {
-        if (value !== null && value !== undefined) {
-          if (value instanceof Error) throw value;
-          var e = new Error("ifError got unwanted exception: " + value);
-          e.actual = value;
-          e.expected = null;
-          e.operator = "ifError";
-          throw e;
+      ifError: (err) => {
+        if (err !== null && err !== undefined) {
+          // Node renders the offending value via util.inspect (so a string is
+          // quoted); an Error contributes its message (or constructor name when
+          // empty).
+          let message = "ifError got unwanted exception: ";
+          if (typeof err === "object" && typeof err.message === "string") {
+            if (err.message.length === 0 && err.constructor) {
+              message += err.constructor.name;
+            } else {
+              message += err.message;
+            }
+          } else {
+            message += util.inspect(err);
+          }
+          const newErr = new AssertionError({
+            actual: err,
+            expected: null,
+            operator: "ifError",
+            message,
+          });
+
+          // Merge the original error's frames into the new stack the way Node
+          // does (so the unwanted exception's origin is visible) -- but only
+          // when the original stack actually has "\n    at" frames.
+          const origStack = err && err.stack;
+          if (typeof origStack === "string") {
+            const origStackStart = origStack.indexOf("\n    at");
+            if (origStackStart !== -1) {
+              const originalFrames = origStack
+                .slice(origStackStart + 1)
+                .split("\n");
+              let newFrames = String(newErr.stack).split("\n");
+              for (const errFrame of originalFrames) {
+                const pos = newFrames.indexOf(errFrame);
+                if (pos !== -1) {
+                  newFrames = newFrames.slice(0, pos);
+                  break;
+                }
+              }
+              newErr.stack = `${newFrames.join("\n")}\n${originalFrames.join("\n")}`;
+            }
+          }
+          throw newErr;
         }
       },
       doesNotMatch: (string, regexp, message) => {
@@ -3389,6 +4697,82 @@
         throw new AssertionError({ message, details: errors });
       }
     };
+    // ---- regexp validation for match / doesNotMatch ----
+    function validateRegExp(regexp, name) {
+      if (!(regexp instanceof RegExp)) {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "RegExp", regexp);
+      }
+    }
+    const origMatch = assert.match;
+    assert.match = (string, regexp, message) => {
+      validateRegExp(regexp, "regexp");
+      return origMatch(string, regexp, message);
+    };
+    const origDoesNotMatch = assert.doesNotMatch;
+    assert.doesNotMatch = (string, regexp, message) => {
+      validateRegExp(regexp, "regexp");
+      return origDoesNotMatch(string, regexp, message);
+    };
+
+    // ---- partialDeepStrictEqual ----
+    // A structural "expected is a partial subset of actual" check. Full
+    // colored Myers-diff message output is out of scope; the function exists,
+    // validates arity, and throws an ERR_ASSERTION AssertionError on mismatch.
+    function partialDeepStrictEqual(actual, expected, message) {
+      if (arguments.length < 2) {
+        throw new codes.ERR_MISSING_ARGS("actual", "expected");
+      }
+      if (!util._partialDeepEqual(actual, expected)) {
+        innerFail(actual, expected, message, "partialDeepStrictEqual");
+      }
+    }
+    assert.partialDeepStrictEqual = partialDeepStrictEqual;
+
+    // ---- Assert class (constructable; bare call requires `new`) ----
+    // new Assert({ strict, diff }) yields an assert-like instance. Errors it
+    // throws carry `.diff` from the instance option (default 'simple'). When a
+    // method is destructured off the instance it loses `this`, so `.diff`
+    // falls back to 'simple' -- matching Node's observable behavior.
+    function bindAssertMethod(fn) {
+      return function (...args) {
+        // The error's `diff` comes from the receiver instance when the method
+        // is called as a method; a destructured (receiver-less) call loses
+        // `this`, so it falls back to the default 'simple'.
+        const d = this && this.diff !== undefined ? this.diff : "simple";
+        try {
+          return fn.apply(this, args);
+        } catch (e) {
+          if (e instanceof AssertionError && e.diff === undefined) e.diff = d;
+          throw e;
+        }
+      };
+    }
+    function Assert(options) {
+      if (!new.target) {
+        throw new codes.ERR_CONSTRUCT_CALL_REQUIRED("Assert");
+      }
+      const strict = !!(options && options.strict);
+      const diff = options && options.diff !== undefined ? options.diff : "simple";
+      const base = strict ? assert.strict : assert;
+      const self = this;
+      self.diff = diff;
+      self.strict = strict;
+      self.AssertionError = AssertionError;
+      const methods = [
+        "ok", "equal", "notEqual", "strictEqual", "notStrictEqual",
+        "deepEqual", "notDeepEqual", "deepStrictEqual", "notDeepStrictEqual",
+        "throws", "doesNotThrow", "rejects", "doesNotReject", "match",
+        "doesNotMatch", "ifError", "fail", "partialDeepStrictEqual",
+      ];
+      for (const m of methods) {
+        if (typeof base[m] === "function") {
+          self[m] = bindAssertMethod(base[m]);
+        }
+      }
+      return self;
+    }
+    assert.Assert = Assert;
+
     assert.strict = Object.assign(
       (value, message) => ok(value, message),
       assert,
@@ -5713,28 +7097,266 @@
   // per chunk. base64/hex per-chunk decoding can tear at chunk boundaries
   // (punch-listed; rare in stream position).
   registry.factories.string_decoder = () => {
-    class StringDecoder {
-      constructor(encoding = "utf8") {
-        this.encoding = String(encoding).toLowerCase();
-        this._decoder =
-          this.encoding === "utf8" || this.encoding === "utf-8"
-            ? new TextDecoder("utf-8", { ignoreBOM: true })
-            : null;
-      }
-      write(buffer) {
-        if (typeof buffer === "string") return buffer;
-        if (this._decoder) return this._decoder.decode(buffer, { stream: true });
-        return globalThis.Buffer.prototype.toString.call(buffer, this.encoding);
-      }
-      end(buffer) {
-        let out = buffer !== undefined && buffer !== null ? this.write(buffer) : "";
-        if (this._decoder) out += this._decoder.decode();
-        return out;
-      }
-      text(buffer, offset) {
-        return this.write(buffer.subarray(offset ?? 0));
+    const Buffer = globalThis.Buffer;
+
+    // Faithful port of Node's pure-JS StringDecoder reference (the algorithm
+    // behind lib/string_decoder.js): it buffers an incomplete multi-byte
+    // sequence (utf8), an incomplete 2-byte code unit (utf16le/ucs2), or an
+    // incomplete 3-byte group (base64/base64url) across write() calls and
+    // flushes it on end() exactly the way Node does (lone bytes -> U+FFFD).
+
+    function normalizeEncoding(enc) {
+      const e = String(enc || "utf8").toLowerCase();
+      switch (e) {
+        case "utf8":
+        case "utf-8":
+          return "utf8";
+        case "ucs2":
+        case "ucs-2":
+        case "utf16le":
+        case "utf-16le":
+          return "utf16le";
+        case "latin1":
+        case "binary":
+          return "latin1";
+        case "base64":
+          return "base64";
+        case "base64url":
+          return "base64url";
+        case "ascii":
+        case "hex":
+          return e;
+        default:
+          throw new codes.ERR_UNKNOWN_ENCODING(enc);
       }
     }
+
+    // How many continuation bytes a UTF-8 lead byte still needs, or -1/-2 for
+    // invalid leads (Node's utf8CheckByte semantics).
+    function utf8CheckByte(byte) {
+      if (byte <= 0x7f) return 0;
+      if (byte >> 5 === 0x06) return 2;
+      if (byte >> 4 === 0x0e) return 3;
+      if (byte >> 3 === 0x1e) return 4;
+      return byte >> 6 === 0x02 ? -1 : -2;
+    }
+
+    class StringDecoder {
+      constructor(encoding) {
+        this.encoding = normalizeEncoding(encoding);
+        let nb;
+        switch (this.encoding) {
+          case "utf16le":
+            this.text = utf16Text;
+            this.end = utf16End;
+            this.fillLast = simpleFillLast;
+            nb = 4;
+            break;
+          case "utf8":
+            this.fillLast = utf8FillLast;
+            nb = 4;
+            break;
+          case "base64":
+          case "base64url":
+            this.text = base64Text;
+            this.end = base64End;
+            this.fillLast = simpleFillLast;
+            nb = 3;
+            break;
+          default:
+            this.write = simpleWrite;
+            this.end = simpleEnd;
+            return;
+        }
+        this.lastNeed = 0;
+        this.lastTotal = 0;
+        this.lastChar = Buffer.allocUnsafe(nb);
+      }
+
+      write(buf) {
+        if (buf.length === 0) return "";
+        let r;
+        let i;
+        if (this.lastNeed) {
+          r = this.fillLast(buf);
+          if (r === undefined) return "";
+          i = this.lastNeed;
+          this.lastNeed = 0;
+        } else {
+          i = 0;
+        }
+        if (i < buf.length) {
+          return r ? r + this.text(buf, i) : this.text(buf, i);
+        }
+        return r || "";
+      }
+
+      end(buf) {
+        const r = buf && buf.length ? this.write(buf) : "";
+        if (this.lastNeed) {
+          // Reset so the SAME decoder can be reused after a flush (Node parity:
+          // the corpus reuses one StringDecoder across write/end pairs).
+          this.lastNeed = 0;
+          this.lastTotal = 0;
+          return r + "�";
+        }
+        return r;
+      }
+
+      // utf8 text + utf8 end (overridable below for other encodings).
+      text(buf, i) {
+        const total = utf8CheckIncomplete(this, buf, i);
+        if (!this.lastNeed) return buf.toString("utf8", i);
+        this.lastTotal = total;
+        const end = buf.length - (total - this.lastNeed);
+        buf.copy(this.lastChar, 0, end);
+        return buf.toString("utf8", i, end);
+      }
+
+      fillLast(buf) {
+        return utf8FillLast.call(this, buf);
+      }
+    }
+
+    // ---- simple fillLast (utf16le / base64): accumulate raw bytes ----
+    function simpleFillLast(buf) {
+      if (this.lastNeed <= buf.length) {
+        buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, this.lastNeed);
+        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
+      }
+      buf.copy(this.lastChar, this.lastTotal - this.lastNeed, 0, buf.length);
+      this.lastNeed -= buf.length;
+      return undefined;
+    }
+
+    // ---- utf8 helpers ----
+    function utf8FillLast(buf) {
+      const p = this.lastTotal - this.lastNeed;
+      const r = utf8CheckExtraBytes(this, buf);
+      if (r !== undefined) return r;
+      if (this.lastNeed <= buf.length) {
+        buf.copy(this.lastChar, p, 0, this.lastNeed);
+        return this.lastChar.toString(this.encoding, 0, this.lastTotal);
+      }
+      buf.copy(this.lastChar, p, 0, buf.length);
+      this.lastNeed -= buf.length;
+      return undefined;
+    }
+
+    function utf8CheckExtraBytes(self, buf) {
+      if ((buf[0] & 0xc0) !== 0x80) {
+        self.lastNeed = 0;
+        return "�";
+      }
+      if (self.lastNeed > 1 && buf.length > 1) {
+        if ((buf[1] & 0xc0) !== 0x80) {
+          self.lastNeed = 1;
+          return "�";
+        }
+        if (self.lastNeed > 2 && buf.length > 2) {
+          if ((buf[2] & 0xc0) !== 0x80) {
+            self.lastNeed = 2;
+            return "�";
+          }
+        }
+      }
+      return undefined;
+    }
+
+    function utf8CheckIncomplete(self, buf, i) {
+      let j = buf.length - 1;
+      if (j < i) return 0;
+      let nb = utf8CheckByte(buf[j]);
+      if (nb >= 0) {
+        if (nb > 0) self.lastNeed = nb - 1;
+        return nb;
+      }
+      if (--j < i || nb === -2) return 0;
+      nb = utf8CheckByte(buf[j]);
+      if (nb >= 0) {
+        if (nb > 0) self.lastNeed = nb - 2;
+        return nb;
+      }
+      if (--j < i || nb === -2) return 0;
+      nb = utf8CheckByte(buf[j]);
+      if (nb >= 0) {
+        if (nb > 0) {
+          if (nb === 2) nb = 0;
+          else self.lastNeed = nb - 3;
+        }
+        return nb;
+      }
+      return 0;
+    }
+
+    // ---- utf16le helpers ----
+    function utf16Text(buf, i) {
+      if ((buf.length - i) % 2 === 0) {
+        const r = buf.toString("utf16le", i);
+        if (r) {
+          const c = r.charCodeAt(r.length - 1);
+          if (c >= 0xd800 && c <= 0xdbff) {
+            this.lastNeed = 2;
+            this.lastTotal = 4;
+            this.lastChar[0] = buf[buf.length - 2];
+            this.lastChar[1] = buf[buf.length - 1];
+            return r.slice(0, -1);
+          }
+        }
+        return r;
+      }
+      this.lastNeed = 1;
+      this.lastTotal = 2;
+      this.lastChar[0] = buf[buf.length - 1];
+      return buf.toString("utf16le", i, buf.length - 1);
+    }
+
+    function utf16End(buf) {
+      const r = buf && buf.length ? this.write(buf) : "";
+      if (this.lastNeed) {
+        const end = this.lastTotal - this.lastNeed;
+        const out = this.lastChar.toString("utf16le", 0, end);
+        this.lastNeed = 0;
+        this.lastTotal = 0;
+        return r + out;
+      }
+      return r;
+    }
+
+    // ---- base64 helpers ----
+    function base64Text(buf, i) {
+      const n = (buf.length - i) % 3;
+      if (n === 0) return buf.toString(this.encoding, i);
+      this.lastNeed = 3 - n;
+      this.lastTotal = 3;
+      if (n === 1) {
+        this.lastChar[0] = buf[buf.length - 1];
+      } else {
+        this.lastChar[0] = buf[buf.length - 2];
+        this.lastChar[1] = buf[buf.length - 1];
+      }
+      return buf.toString(this.encoding, i, buf.length - n);
+    }
+
+    function base64End(buf) {
+      const r = buf && buf.length ? this.write(buf) : "";
+      if (this.lastNeed) {
+        const out = this.lastChar.toString(this.encoding, 0, 3 - this.lastNeed);
+        this.lastNeed = 0;
+        this.lastTotal = 0;
+        return r + out;
+      }
+      return r;
+    }
+
+    // ---- simple (latin1/ascii/hex) ----
+    function simpleWrite(buf) {
+      return buf.toString(this.encoding);
+    }
+    function simpleEnd(buf) {
+      return buf && buf.length ? this.write(buf) : "";
+    }
+
     return { StringDecoder };
   };
 
@@ -6051,6 +7673,9 @@
     const isWin = natives.platform === "win32";
 
     function fileURLToPath(input) {
+      if (typeof input !== "string" && !(input instanceof globalThis.URL)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("path", ["string", "URL"], input);
+      }
       const url = typeof input === "string" ? new globalThis.URL(input) : input;
       if (url.protocol !== "file:") {
         throw makeNodeError(
@@ -6061,10 +7686,12 @@
       // Encoded separators would let a URL smuggle path segments past
       // consumers â€” Node throws, so do we.
       if (/%2f|%5c/i.test(url.pathname)) {
-        throw makeNodeError(
+        const e = makeNodeError(
           "ERR_INVALID_FILE_URL_PATH",
           "File URL path must not include encoded \\ or / characters",
         );
+        e.input = url;
+        throw e;
       }
       let pathname = decodeURIComponent(url.pathname);
       if (isWin) {
@@ -6076,10 +7703,12 @@
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
           // drive â€” fail loud like Node.
-          throw makeNodeError(
+          const e = makeNodeError(
             "ERR_INVALID_FILE_URL_PATH",
             "File URL path must be absolute",
           );
+          e.input = url;
+          throw e;
         }
         return pathname.slice(1); // strip the slash before the drive letter
       }
@@ -6087,8 +7716,22 @@
     }
 
     function pathToFileURL(path) {
+      if (typeof path !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE("path", "string", path);
+      }
       const pathModule = registry.get("path");
-      let p = String(path);
+      let p = path;
+      if (isWin) {
+        // Reject a malformed UNC prefix (Node throws ERR_INVALID_ARG_VALUE for
+        // a leading '\\' run with no server, or a missing share).
+        if (/^\\\\\\/.test(p) || /^\\\\[^\\]+$/.test(p)) {
+          throw new codes.ERR_INVALID_ARG_VALUE(
+            "path",
+            path,
+            "Missing UNC resource path",
+          );
+        }
+      }
       if (isWin) {
         // \\?\ device paths: resolve the prefix away (Node parity);
         // \\?\UNC\server\share is the long form of \\server\share.
@@ -6115,21 +7758,115 @@
       return new globalThis.URL("file://" + (encoded.startsWith("/") ? "" : "/") + encoded);
     }
 
+    // Legacy url.format: a WHATWG URL stringifies to .href; a plain object is
+    // assembled from its components; a string is reparsed via the WHATWG URL.
+    // Non-string/non-object input throws ERR_INVALID_ARG_TYPE.
+    function legacyFormat(urlObject, options) {
+      if (typeof urlObject === "string") {
+        // Legacy url.format('') is '' (and a relative string with no scheme
+        // formats to itself); only a parseable absolute URL round-trips.
+        if (urlObject === "") return "";
+        try {
+          urlObject = new globalThis.URL(urlObject);
+        } catch {
+          return urlObject;
+        }
+      } else if (urlObject instanceof globalThis.URL) {
+        // fall through to WHATWG serializer below
+      } else if (urlObject === null || typeof urlObject !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE(
+          "urlObject",
+          ["object", "string"],
+          urlObject,
+        );
+      }
+      if (urlObject instanceof globalThis.URL) {
+        const o = options || {};
+        const auth = o.auth !== false;
+        const fragment = o.fragment !== false;
+        const search = o.search !== false;
+        let ret = "";
+        ret += urlObject.protocol;
+        if (urlObject.host) {
+          ret += "//";
+          if (auth && (urlObject.username || urlObject.password)) {
+            ret += urlObject.username;
+            if (urlObject.password) ret += `:${urlObject.password}`;
+            ret += "@";
+          }
+          ret += urlObject.host;
+        } else if (urlObject.protocol === "file:") {
+          ret += "//";
+        }
+        ret += urlObject.pathname;
+        if (search) ret += urlObject.search;
+        if (fragment) ret += urlObject.hash;
+        return ret;
+      }
+      // Legacy object form: assemble from components (subset Node supports).
+      let result = "";
+      let protocol = urlObject.protocol || "";
+      if (protocol && !protocol.endsWith(":")) protocol += ":";
+      result += protocol;
+      let host = "";
+      if (urlObject.host) host = urlObject.host;
+      else if (urlObject.hostname) {
+        host =
+          urlObject.hostname.includes(":") && urlObject.hostname[0] !== "["
+            ? `[${urlObject.hostname}]`
+            : urlObject.hostname;
+        if (urlObject.port) host += `:${urlObject.port}`;
+      }
+      let auth = "";
+      if (urlObject.auth) auth = urlObject.auth;
+      if (host || (protocol && protocol !== "" && urlObject.slashes !== false && host)) {
+        result += "//";
+      }
+      if (host) {
+        if (auth) result += `${auth}@`;
+        result += host;
+      }
+      let pathname = urlObject.pathname || "";
+      if (pathname && pathname[0] !== "/" && host) pathname = `/${pathname}`;
+      result += pathname;
+      let query = "";
+      if (urlObject.search) query = urlObject.search;
+      else if (urlObject.query && typeof urlObject.query === "object") {
+        const sp = new globalThis.URLSearchParams(urlObject.query);
+        const s = sp.toString();
+        if (s) query = `?${s}`;
+      } else if (typeof urlObject.query === "string" && urlObject.query) {
+        query = `?${urlObject.query}`;
+      }
+      if (query) result += query[0] === "?" ? query : `?${query}`;
+      let hash = urlObject.hash || "";
+      if (hash && hash[0] !== "#") hash = `#${hash}`;
+      result += hash;
+      return result;
+    }
+
     function urlToHttpOptions(url) {
+      if (url === null || typeof url !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE("url", "object", url);
+      }
+      const { hostname, pathname, port, username, password, search } = url;
       const options = {
+        __proto__: null,
+        ...url, // preserve any user-added properties on the url object
         protocol: url.protocol,
-        hostname: url.hostname.startsWith("[")
-          ? url.hostname.slice(1, -1) // IPv6: net/dns want it bracket-free
-          : url.hostname,
+        hostname:
+          hostname && hostname[0] === "["
+            ? hostname.slice(1, -1) // IPv6: net/dns want it bracket-free
+            : hostname,
         hash: url.hash,
-        search: url.search,
-        pathname: url.pathname,
-        path: `${url.pathname}${url.search}`,
+        search,
+        pathname,
+        path: `${pathname || ""}${search || ""}`,
         href: url.href,
       };
-      if (url.port !== "") options.port = Number(url.port);
-      if (url.username || url.password) {
-        options.auth = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+      if (port !== "") options.port = Number(port);
+      if (username || password) {
+        options.auth = `${decodeURIComponent(username)}:${decodeURIComponent(password)}`;
       }
       return options;
     }
@@ -6140,7 +7877,7 @@
       fileURLToPath,
       pathToFileURL,
       urlToHttpOptions,
-      format: (url) => String(url),
+      format: legacyFormat,
       domainToASCII: (domain) => {
         try {
           return new globalThis.URL(`http://${domain}`).hostname;
