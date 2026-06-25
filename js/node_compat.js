@@ -2141,10 +2141,55 @@
       return result;
     }
 
+    // util.getCallSites([frameCount[, options]]) (Node >=22.9): structured
+    // current call stack. Built on V8's CallSite API (Error.prepareStackTrace +
+    // captureStackTrace, both supported by oam). Named so captureStackTrace can
+    // exclude getCallSites' own frame -> [0] is the immediate caller (Node parity).
+    function getCallSites(frameCountOrOptions, options) {
+      let frameCount = 10;
+      if (typeof frameCountOrOptions === "number") frameCount = frameCountOrOptions;
+      else if (frameCountOrOptions && typeof frameCountOrOptions === "object") {
+        options = frameCountOrOptions;
+      }
+      void options; // the sourceMap option is not yet applied
+      const target = {};
+      const originalPrepare = Error.prepareStackTrace;
+      const originalLimit = Error.stackTraceLimit;
+      Error.prepareStackTrace = (_e, frames) => frames;
+      Error.stackTraceLimit = Math.max(frameCount + 1, 10);
+      try {
+        Error.captureStackTrace(target, getCallSites);
+        const frames = Array.isArray(target.stack) ? target.stack : [];
+        return frames.slice(0, frameCount).map((f) => {
+          const sourceURL =
+            typeof f.getScriptNameOrSourceURL === "function" ? f.getScriptNameOrSourceURL() : null;
+          const scriptName = sourceURL || f.getFileName() || "";
+          const columnNumber = f.getColumnNumber() || 0;
+          let scriptId = "";
+          if (typeof f.getScriptId === "function") {
+            const id = f.getScriptId();
+            if (id !== null && id !== undefined) scriptId = String(id);
+          }
+          return {
+            functionName: f.getFunctionName() || "",
+            scriptId,
+            scriptName,
+            lineNumber: f.getLineNumber() || 0,
+            columnNumber,
+            column: columnNumber,
+          };
+        });
+      } finally {
+        Error.prepareStackTrace = originalPrepare;
+        Error.stackTraceLimit = originalLimit;
+      }
+    }
+
     return {
       format,
       formatWithOptions: (_opts, ...args) => format(...args),
       inspect,
+      getCallSites,
       parseArgs,
       aborted: (signal, resource) => {
         return new Promise((resolve) => {
