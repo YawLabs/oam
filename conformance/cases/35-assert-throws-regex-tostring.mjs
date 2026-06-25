@@ -49,6 +49,14 @@ tag("obj-code-regex", () =>
 tag("obj-name-regex", () =>
   assert.throws(() => { throw new TypeError("z"); }, { name: /Type/ }));
 
+// (c) Error-constructor `expected` at depth >= 2: a class check at any depth,
+// not a validation fn. A non-matching throw reports the mismatch cleanly --
+// must NOT throw "Class constructor cannot be invoked without 'new'".
+class A extends Error {}
+class B extends A {}
+tag("ctor-depth2-match", () => assert.throws(() => { throw new B("hi"); }, B));
+tag("ctor-depth2-nomatch", () => assert.throws(() => { throw new A("hi"); }, B));
+
 // async parity: assert.rejects shares the same matching logic.
 await assert.rejects(async () => { throw coded; }, /ERR_OUT_OF_RANGE/);
 console.log("rejects-regex-toString:ok");

@@ -3063,8 +3063,13 @@
       }
       if (typeof expected === "function") {
         if (expected.prototype !== undefined && err instanceof expected) return true;
-        if (expected === Error || Object.getPrototypeOf(expected) === Error) {
-          return err instanceof expected;
+        // An Error constructor at ANY depth (B extends A extends Error) is a
+        // class check, not a validation function: instanceof already failed
+        // above, so report the mismatch. Calling it as expected(err) would throw
+        // "Class constructor cannot be invoked without 'new'". Error.isPrototypeOf
+        // catches the whole chain; `=== Error` covers Error itself.
+        if (expected === Error || Error.isPrototypeOf(expected)) {
+          return false;
         }
         return expected(err) === true;
       }
