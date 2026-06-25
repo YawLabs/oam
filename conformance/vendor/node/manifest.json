@@ -1,0 +1,5 @@
+{
+  "_doc": "Per-test overrides for the node-suite harness. Default = runnable on all platforms. Add { \"skip\": true, \"reason\": \"...\" } only for genuinely-unrunnable tests (native addon, internals flag, platform-N/A). Skip count should only DECREASE over time (skip-ratchet, enforced in CI in a later slice).",
+  "nodeVersion": "v22.22.2",
+  "tests": {}
+}
