@@ -1427,7 +1427,89 @@
     return out;
   }
 
-  globalThis.Buffer = Buffer;
+  // Node's `Buffer` is a FUNCTION callable WITHOUT `new` (legacy/deprecated --
+  // DEP0005), not an ES6 class. `class Buffer extends Uint8Array` above rejects
+  // `Buffer([1,2,3])` / `Buffer(10)` with "Class constructor cannot be invoked
+  // without 'new'". The vendored Node buffer tests (alloc / slice / new /
+  // zero-fill / no-negative-allocation / over-max-length) exercise the callable
+  // form. Mirror the EventEmitter / zlib.Inflate "callable as plain function AND
+  // as class" pattern: expose a plain function that shares the real class's
+  // `.prototype` (so `instanceof` + every prototype method survives) and all
+  // static methods, dispatching args exactly as Node's legacy constructor does:
+  //   Buffer(number)            -> alloc(number)  (zero-filled, Node v22)
+  //   Buffer(string[, enc])     -> from(string, enc)
+  //   Buffer(array)             -> from(array)
+  //   Buffer(buffer/TypedArray) -> from(buffer)
+  //   Buffer(arrayBuffer[, off[, len]]) -> from(arrayBuffer, off, len)
+  // `new Buffer(...)` behaves identically. The internal `new Buffer(...)` call
+  // sites above keep using the raw class binding (lexical), so the fast
+  // allocation/view paths are untouched -- only the PUBLIC `globalThis.Buffer`
+  // becomes the callable shim. `Symbol.species` still returns the raw class so
+  // subarray/slice construction stays on the raw path.
+  const RealBuffer = Buffer;
+  let buffer_dep0005_warned = false;
+  function emitBufferCtorDeprecation() {
+    if (buffer_dep0005_warned) return;
+    buffer_dep0005_warned = true;
+    // Node emits DEP0005 once. Route through process.emitWarning if the process
+    // factory is already realized; never throw if it isn't (Buffer is top-level,
+    // process is a lazy registry factory built later).
+    try {
+      const proc = globalThis.process;
+      if (proc && typeof proc.emitWarning === "function") {
+        proc.emitWarning(
+          "Buffer() is deprecated due to security and usability issues. Please use " +
+            "the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.",
+          { type: "DeprecationWarning", code: "DEP0005" },
+        );
+      }
+    } catch {
+      // Best-effort: a missing/partial process must not break Buffer().
+    }
+  }
+  function CallableBuffer(arg, encodingOrOffset, length) {
+    emitBufferCtorDeprecation();
+    if (typeof arg === "number") {
+      // Node legacy Buffer(number): an allocation (Node v22 zero-fills). BUT a
+      // STRING 2nd arg means the caller used the string-constructor form -- Node
+      // routes there and throws the "string" arg-type error for the number.
+      if (typeof encodingOrOffset === "string") {
+        throw applyNodeErrorShape(
+          new TypeError(
+            'The "string" argument must be of type string.' + receivedSuffix(arg),
+          ),
+          "ERR_INVALID_ARG_TYPE",
+        );
+      }
+      return RealBuffer.alloc(arg);
+    }
+    if (typeof arg === "string") {
+      return RealBuffer.from(arg, encodingOrOffset);
+    }
+    // array / Buffer / TypedArray / ArrayBuffer(+offset/length) / array-like.
+    return RealBuffer.from(arg, encodingOrOffset, length);
+  }
+  // Share the real class's prototype so `instanceof Buffer` and every prototype
+  // method resolve identically for instances produced by either binding.
+  CallableBuffer.prototype = RealBuffer.prototype;
+  Object.defineProperty(CallableBuffer.prototype, "constructor", {
+    value: CallableBuffer,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  Object.setPrototypeOf(CallableBuffer, RealBuffer); // inherit statics on the fn object too
+  // Copy every own (enumerable) static across so `for..in` cloners
+  // (safe-buffer / iconv-lite) see them on the callable shim as well.
+  for (const name of Object.getOwnPropertyNames(RealBuffer)) {
+    if (name === "prototype" || name === "name" || name === "length") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(RealBuffer, name);
+    if (descriptor) Object.defineProperty(CallableBuffer, name, descriptor);
+  }
+  // `Buffer.name` should read "Buffer" (some libs assert it).
+  Object.defineProperty(CallableBuffer, "name", { value: "Buffer", configurable: true });
+
+  globalThis.Buffer = CallableBuffer;
   globalThis.atob = atob;
   globalThis.btoa = btoa;
   globalThis.setImmediate = function setImmediate(fn, ...args) {
@@ -2973,7 +3055,11 @@
 
     function checkExpected(err, expected) {
       if (expected instanceof RegExp) {
-        return expected.test(err instanceof Error ? err.message : String(err));
+        // Node tests the regexp against String(err) -- i.e. err.toString(),
+        // which for coded errors renders "TypeError [ERR_X]: msg" via
+        // applyNodeErrorShape. A regex like /ERR_OUT_OF_RANGE/ matches that
+        // rendered form even though it isn't present in the bare .message.
+        return expected.test(String(err));
       }
       if (typeof expected === "function") {
         if (expected.prototype !== undefined && err instanceof expected) return true;
@@ -2983,9 +3069,16 @@
         return expected(err) === true;
       }
       if (expected && typeof expected === "object") {
+        // Validation object (Node's compareExceptionKey): for every own
+        // enumerable key of `expected`, compare against the error. A RegExp
+        // value is `.test()`ed against String(error[key]); any other value
+        // (string message, name, code, arbitrary prop) is deepStrictEqual'd.
+        // String `message` therefore compares by EQUALITY, RegExp `message`
+        // by `.test`, exactly matching Node.
         for (const key of Object.keys(expected)) {
           const want = expected[key];
-          const got = err?.[key];
+          // `message` is read off the Error even when not an own key.
+          const got = key === "message" && err instanceof Error ? err.message : err?.[key];
           if (want instanceof RegExp) {
             if (!want.test(String(got))) return false;
           } else if (!deepEqual(got, want, true)) {

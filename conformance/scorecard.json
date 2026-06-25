@@ -1,5 +1,5 @@
 {
-  "commit": "66c59e4",
+  "commit": "866eff7",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -142,10 +142,18 @@
         {
           "case": "34-buffer-api-validation.mjs",
           "status": "pass"
+        },
+        {
+          "case": "35-assert-throws-regex-tostring.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "36-buffer-callable-no-new.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 34,
-      "total": 34
+      "pass": 36,
+      "total": 36
     },
     "surface": {
       "globals": {
