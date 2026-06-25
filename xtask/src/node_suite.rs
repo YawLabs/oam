@@ -160,8 +160,10 @@ pub(crate) fn run(release: bool) -> Result<()> {
     if let Some(msg) = ratchet_violation(
         manifest_skips,
         manifest.known_issues,
+        pass,
         manifest.max_skips,
         manifest.max_known_issues,
+        manifest.min_pass,
     ) {
         bail!("{msg}");
     }
@@ -169,14 +171,16 @@ pub(crate) fn run(release: bool) -> Result<()> {
 }
 
 /// Pure ratchet check (extracted for unit testing): returns Some(message) when
-/// the discretionary skip count or the known-issues count exceeds its committed
-/// ceiling. None = within limits or ceiling unset. `== ceiling` is allowed;
-/// only `> ceiling` violates.
+/// the discretionary skip count or known-issues count exceeds its ceiling, OR
+/// the pass count falls below its floor. None = all within limits / unset.
+/// `== ceiling` and `== floor` are allowed; only strictly past them violates.
 fn ratchet_violation(
     skips: usize,
     known_issues: usize,
+    pass: usize,
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
+    min_pass: Option<usize>,
 ) -> Option<String> {
     if let Some(max) = max_skips
         && skips > max
@@ -191,6 +195,14 @@ fn ratchet_violation(
     {
         return Some(format!(
             "known-issues ceiling violation: {known_issues} known_issues/flaky skips > ceiling {max}."
+        ));
+    }
+    if let Some(min) = min_pass
+        && pass < min
+    {
+        return Some(format!(
+            "pass-floor violation: {pass} passing < floor {min}. A node-compat regression \
+             dropped the pass count. Fix it, or (with review) lower ratchet.minPass -- it should only ever go UP."
         ));
     }
     None
@@ -277,7 +289,7 @@ fn module_of(name: &str) -> String {
 
 /// manifest.json:
 /// {
-///   "ratchet": { "maxSkips": N, "maxKnownIssues": M },
+///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "minPass": K },
 ///   "tests": { "parallel/test-x.js": { "skip": true, "reason": "...", "category": "known_issues" } }
 /// }
 struct Manifest {
@@ -289,6 +301,10 @@ struct Manifest {
     /// ratchet ceilings; None = not enforced.
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
+    /// pass-count FLOOR: the suite fails if fewer tests pass than this. The
+    /// counterpart to the skip ceiling -- it should only ever be RAISED, so a
+    /// node-compat regression that drops the pass count reddens CI. None = off.
+    min_pass: Option<usize>,
 }
 
 fn load_manifest(path: &Path) -> Manifest {
@@ -297,6 +313,7 @@ fn load_manifest(path: &Path) -> Manifest {
         known_issues: 0,
         max_skips: None,
         max_known_issues: None,
+        min_pass: None,
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return m;
@@ -311,6 +328,10 @@ fn load_manifest(path: &Path) -> Manifest {
             .map(|x| x as usize);
         m.max_known_issues = r
             .get("maxKnownIssues")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
+        m.min_pass = r
+            .get("minPass")
             .and_then(|x| x.as_u64())
             .map(|x| x as usize);
     }
@@ -486,26 +507,34 @@ mod tests {
 
     #[test]
     fn ratchet_within_or_at_ceiling_is_ok() {
-        assert!(ratchet_violation(0, 0, Some(0), Some(0)).is_none());
-        assert!(ratchet_violation(3, 1, Some(5), Some(2)).is_none());
-        // == ceiling is allowed; only > ceiling violates.
-        assert!(ratchet_violation(5, 2, Some(5), Some(2)).is_none());
-        // Unset ceilings = unenforced, even with a high count.
-        assert!(ratchet_violation(99, 99, None, None).is_none());
+        assert!(ratchet_violation(0, 0, 81, Some(0), Some(0), Some(81)).is_none());
+        assert!(ratchet_violation(3, 1, 90, Some(5), Some(2), Some(81)).is_none());
+        // == ceiling / == floor is allowed; only strictly past them violates.
+        assert!(ratchet_violation(5, 2, 81, Some(5), Some(2), Some(81)).is_none());
+        // Unset ceilings/floor = unenforced, even with extreme counts.
+        assert!(ratchet_violation(99, 99, 0, None, None, None).is_none());
     }
 
     #[test]
     fn ratchet_skips_over_ceiling_violates() {
-        let msg = ratchet_violation(1, 0, Some(0), Some(0)).expect("must violate");
+        let msg = ratchet_violation(1, 0, 81, Some(0), Some(0), None).expect("must violate");
         assert!(msg.contains("skip-ratchet violation"));
         assert!(msg.contains("1 manifest skips > ceiling 0"));
     }
 
     #[test]
     fn ratchet_known_issues_over_ceiling_violates() {
-        let msg = ratchet_violation(0, 3, Some(10), Some(2)).expect("must violate");
+        let msg = ratchet_violation(0, 3, 81, Some(10), Some(2), None).expect("must violate");
         assert!(msg.contains("known-issues ceiling violation"));
         assert!(msg.contains("3 known_issues/flaky skips > ceiling 2"));
+    }
+
+    #[test]
+    fn ratchet_pass_below_floor_violates() {
+        // A node-compat regression that drops the pass count must redden CI.
+        let msg = ratchet_violation(0, 0, 80, Some(0), Some(0), Some(81)).expect("must violate");
+        assert!(msg.contains("pass-floor violation"));
+        assert!(msg.contains("80 passing < floor 81"));
     }
 
     // -- missing_builtin: reclassifies "oam lacks node:X" fail -> unrunnable.

@@ -243,6 +243,17 @@ pub fn run(release: bool) -> Result<()> {
         "surface: modules {modules_have}/{modules_total}, globals {globals_have}/{globals_total}"
     );
     println!("wrote CONFORMANCE.md + conformance/scorecard.json");
+
+    // Gate: the hand-curated node-differential cases are the deterministic
+    // node-compat guard (byte-identical stdout+exit vs Node). Any divergence
+    // fails the run (non-zero exit) so the conformance CI job can be REQUIRED,
+    // not advisory. The scorecard receipts above are still written first.
+    if diff_pass < diff_total {
+        bail!(
+            "node-differential: {diff_pass}/{diff_total} -- {} case(s) diverge from Node",
+            diff_total - diff_pass
+        );
+    }
     Ok(())
 }
 

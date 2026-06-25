@@ -121,9 +121,11 @@ jobs:
           [ "$out" = "ci smoke 42" ] || { echo "unexpected: $out"; exit 1; }
 
   conformance:
-    name: conformance scorecard (advisory)
+    name: conformance (node-differential gate)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Gating: `xtask conformance` exits non-zero if any node-differential case
+    # diverges from Node. The cases are deterministic (byte-identical stdout),
+    # so this is a hard guard against node-compat regressions, not advisory.
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust (per rust-toolchain.toml)
