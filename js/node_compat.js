@@ -8107,6 +8107,24 @@
       return isIPv4(input) ? 4 : isIPv6(input) ? 6 : 0;
     }
 
+    // Happy-Eyeballs (autoSelectFamily) default attempt timeout. Node's
+    // default is 250ms; setDefault validates an integer >= 1 and clamps the
+    // effective floor to 10ms (node/lib/net.js).
+    let autoSelectFamilyAttemptTimeoutDefault = 250;
+    function getDefaultAutoSelectFamilyAttemptTimeout() {
+      return autoSelectFamilyAttemptTimeoutDefault;
+    }
+    function setDefaultAutoSelectFamilyAttemptTimeout(value) {
+      value = Number(value);
+      if (!Number.isInteger(value) || value < 1) {
+        throw new RangeError(
+          `The value of "value" is out of range. It must be an integer >= 1. Received ${value}`,
+        );
+      }
+      if (value < 10) value = 10;
+      autoSelectFamilyAttemptTimeoutDefault = value;
+    }
+
     function toBytes(data, encoding) {
       if (data === null || data === undefined) return new Uint8Array(0);
       if (typeof data === "string") return globalThis.Buffer.from(data, encoding || "utf8");
@@ -8473,6 +8491,8 @@
 
     return {
       isIPv4, isIPv6, isIP,
+      getDefaultAutoSelectFamilyAttemptTimeout,
+      setDefaultAutoSelectFamilyAttemptTimeout,
       Socket, Server,
       SocketAddress, BlockList,
       createConnection, connect: createConnection, createServer,

@@ -246,7 +246,7 @@ pub fn run(release: bool) -> Result<()> {
     Ok(())
 }
 
-fn repo_root() -> Result<PathBuf> {
+pub(crate) fn repo_root() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(manifest
         .parent()
@@ -254,7 +254,7 @@ fn repo_root() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
+pub(crate) fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
     let profile = if release { "release" } else { "debug" };
     let exe = repo
         .join(format!("target/{profile}"))
@@ -309,16 +309,16 @@ fn git_short_commit(repo: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-struct Captured {
-    stdout: String,
-    stderr: String,
-    code: i32,
-    timed_out: bool,
+pub(crate) struct Captured {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) code: i32,
+    pub(crate) timed_out: bool,
 }
 
 /// Spawn with piped output and a hard deadline (the oam_mcp try_wait
 /// pattern): a hung case must fail the suite, not the harness.
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
+pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     use std::io::Read;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -362,7 +362,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     })
 }
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim_end().to_string()
 }
 

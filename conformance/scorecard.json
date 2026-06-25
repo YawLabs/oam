@@ -1,5 +1,5 @@
 {
-  "commit": "95f760f",
+  "commit": "7ff63ce",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -118,10 +118,14 @@
         {
           "case": "28-fs-error-errno.mjs",
           "status": "pass"
+        },
+        {
+          "case": "29-net-autoselect-timeout.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 28,
-      "total": 28
+      "pass": 29,
+      "total": 29
     },
     "surface": {
       "globals": {

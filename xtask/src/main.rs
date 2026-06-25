@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod conformance;
+mod node_suite;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "oam repo automation")]
@@ -37,6 +38,16 @@ enum Command {
         #[arg(long)]
         release: bool,
     },
+    /// Run a vendored subset of Node's own test suite under oam (oracle:
+    /// exit 0 == pass, since Node core tests self-assert). Slice 1 of the
+    /// Node-suite conformance harness; covers conformance/vendor/node/test/parallel.
+    ///
+    /// Pass --release to test the release binary instead of debug.
+    NodeSuite {
+        /// Build and test the release binary (cargo build --release).
+        #[arg(long)]
+        release: bool,
+    },
     /// Open a PR bumping the pinned rusty_v8/V8 version (4-week cadence; never >2 majors behind).
     V8Bump,
     /// Rebuild the startup snapshot blobs.
@@ -50,6 +61,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Bench { release, compare } => bench::run(release, compare),
         Command::Conformance { release } => conformance::run(release),
+        Command::NodeSuite { release } => node_suite::run(release),
         Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
         Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
         Command::Package => bail!("not implemented: lands with first public release"),
