@@ -1511,12 +1511,12 @@ fn run_file(
     } else {
         rt.execute_module(file, &CliHost)
     };
-    result.map(|()| {
-        // Natural termination: the event loop drained, so fire process 'exit'
-        // listeners before reading the final exit code (Node parity).
-        rt.emit_process_exit();
-        rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8
-    })
+    // Node fires 'exit' on BOTH natural completion AND a fatal/uncaught error,
+    // so emit before returning either way (process.on('exit') handlers must run
+    // even when the program crashed). emit_process_exit is idempotent and runs
+    // in a fresh scope, so a pending exception from the failed run is fine.
+    rt.emit_process_exit();
+    result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
 }
 
 // -- oam compile: embed a pre-bundled JS file into a standalone binary --
@@ -1687,11 +1687,10 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
     let result = rt.execute_cjs(&tmp_file);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    // Fire 'exit' on both natural completion and a fatal error (Node parity).
+    rt.emit_process_exit();
     match result {
-        Ok(()) => {
-            rt.emit_process_exit();
-            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
-        }
+        Ok(()) => ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8),
         Err(diagnostics) => {
             for d in &diagnostics {
                 render(d, false);

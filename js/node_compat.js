@@ -296,12 +296,14 @@
       configurable: true,
       enumerable: false,
     });
-    // Node renders the code into the stack header too.
+    // Node renders the code into the stack header too. Anchor the rewrite to
+    // the first line only -- never risk hitting a "Name:" substring in the
+    // message or a deeper frame.
     if (typeof inst.stack === "string") {
-      inst.stack = inst.stack.replace(
-        baseName + ":",
-        baseName + " [" + code + "]:",
-      );
+      const nl = inst.stack.indexOf("\n");
+      const head = nl === -1 ? inst.stack : inst.stack.slice(0, nl);
+      const rest = nl === -1 ? "" : inst.stack.slice(nl);
+      inst.stack = head.replace(baseName + ":", baseName + " [" + code + "]:") + rest;
     }
     return inst;
   }
@@ -12645,6 +12647,9 @@
   registry.factories["test"] = () => {
     const assert = registry.get("assert");
     const log = (s) => globalThis.console.log(s);
+    // Captured real setTimeout (immune to a test swapping the global) used to
+    // defer the auto-run to a macrotask.
+    const realSetTimeout = globalThis.setTimeout;
 
     const root = makeTestSuite("", null);
     let current = root;
@@ -12698,10 +12703,13 @@
     function schedule() {
       if (scheduled) return;
       scheduled = true;
-      // Runs after the file's synchronous top-level registration completes.
-      queueMicrotask(() => {
+      // A MACROTASK (not a microtask) so the run starts only after the test
+      // file has FULLY evaluated -- including ESM top-level await, whose
+      // continuations are microtasks that must all drain first. A pending
+      // timer also keeps the event loop alive until the run begins.
+      realSetTimeout(() => {
         runRoot();
-      });
+      }, 0);
     }
 
     function addSuite(name, options, fn, forced) {
