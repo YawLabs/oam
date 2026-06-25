@@ -2656,27 +2656,138 @@
       },
     });
     // assert.strict: equal family promoted to strict semantics.
-    assert.CallTracker = class CallTracker {
-      constructor() { this._calls = []; }
-      calls(fn, exact) {
-        var expected = typeof exact === "number" ? exact : 1;
-        var count = 0;
-        var entry = { expected, actual: 0 };
-        this._calls.push(entry);
-        return function tracked() { entry.actual++; count++; return fn ? fn.apply(this, arguments) : undefined; };
+    // assert.CallTracker (deprecated DEP0173) -- faithful port of Node's
+    // internal/assert/calltracker.js. Proxy-wraps the tracked fn so length /
+    // own properties survive; tracks {thisArg, arguments} per call; report()
+    // entries carry .operator (fn name) + .stack; verify() throws AssertionError.
+    const codedError = (Ctor, code, message) => {
+      const e = new Ctor(message);
+      e.code = code;
+      return e;
+    };
+    const validateExpectedUint32 = (value) => {
+      if (typeof value !== "number") {
+        throw codedError(
+          TypeError,
+          "ERR_INVALID_ARG_TYPE",
+          'The "expected" argument must be of type number. Received ' + typeof value,
+        );
       }
-      getCalls(fn) { return this._calls; }
+      if (!Number.isInteger(value)) {
+        throw codedError(
+          RangeError,
+          "ERR_OUT_OF_RANGE",
+          'The value of "expected" is out of range. It must be an integer. Received ' + value,
+        );
+      }
+      if (value < 1 || value > 4294967295) {
+        throw codedError(
+          RangeError,
+          "ERR_OUT_OF_RANGE",
+          'The value of "expected" is out of range. It must be >= 1 && <= 4294967295. Received ' + value,
+        );
+      }
+    };
+    assert.CallTracker = class CallTracker {
+      constructor() {
+        this._callChecks = new Set();
+        this._trackedFunctions = new WeakMap();
+      }
+      _getTracked(tracked) {
+        if (!this._trackedFunctions.has(tracked)) {
+          throw codedError(
+            TypeError,
+            "ERR_INVALID_ARG_VALUE",
+            'The argument "tracked" is invalid. Received ' + String(tracked) +
+              ". is not a tracked function",
+          );
+        }
+        return this._trackedFunctions.get(tracked);
+      }
+      calls(fn, expected = 1) {
+        if (process._exiting) {
+          throw codedError(
+            Error,
+            "ERR_UNAVAILABLE_DURING_EXIT",
+            "Cannot call a CallTracker function during process exit",
+          );
+        }
+        if (typeof fn === "number") {
+          expected = fn;
+          fn = function () {};
+        } else if (fn === undefined) {
+          fn = function () {};
+        }
+        validateExpectedUint32(expected);
+
+        const calls = [];
+        const name = fn.name || "calls";
+        const stackTrace = new Error();
+        const context = {
+          track(thisArg, args) {
+            calls.push(
+              Object.freeze({ thisArg, arguments: Object.freeze(Array.prototype.slice.call(args)) }),
+            );
+          },
+          reset() {
+            calls.length = 0;
+          },
+          getCalls() {
+            return Object.freeze(calls.slice());
+          },
+          report() {
+            if (calls.length - expected !== 0) {
+              return {
+                message:
+                  "Expected the " + name + " function to be executed " + expected +
+                  " time(s) but was executed " + calls.length + " time(s).",
+                actual: calls.length,
+                expected,
+                operator: name,
+                stack: stackTrace,
+              };
+            }
+            return undefined;
+          },
+        };
+        const tracked = new Proxy(fn, {
+          __proto__: null,
+          apply(target, thisArg, argList) {
+            context.track(thisArg, argList);
+            return Reflect.apply(target, thisArg, argList);
+          },
+        });
+        this._callChecks.add(context);
+        this._trackedFunctions.set(tracked, context);
+        return tracked;
+      }
+      getCalls(tracked) {
+        return this._getTracked(tracked).getCalls();
+      }
+      reset(tracked) {
+        if (tracked === undefined) {
+          this._callChecks.forEach((check) => check.reset());
+          return;
+        }
+        this._getTracked(tracked).reset();
+      }
       report() {
-        return this._calls.filter(c => c.actual !== c.expected).map(c => ({
-          message: "Expected " + c.expected + " calls but got " + c.actual,
-          actual: c.actual, expected: c.expected,
-        }));
+        const errors = [];
+        this._callChecks.forEach((context) => {
+          const message = context.report();
+          if (message !== undefined) errors.push(message);
+        });
+        return errors;
       }
       verify() {
-        var errs = this.report();
-        if (errs.length > 0) throw new Error(errs[0].message);
+        const errors = this.report();
+        if (errors.length === 0) return;
+        const message =
+          errors.length === 1
+            ? errors[0].message
+            : "Functions were not called the expected number of times";
+        throw new AssertionError({ message, details: errors });
       }
-      reset(fn) { this._calls = []; }
     };
     assert.strict = Object.assign(
       (value, message) => ok(value, message),

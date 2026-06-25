@@ -1,5 +1,5 @@
 {
-  "commit": "7bbe6a6",
+  "commit": "29d4d6f",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -126,10 +126,14 @@
         {
           "case": "30-util-getcallsites.mjs",
           "status": "pass"
+        },
+        {
+          "case": "31-assert-calltracker.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 30,
-      "total": 30
+      "pass": 31,
+      "total": 31
     },
     "surface": {
       "globals": {
