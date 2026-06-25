@@ -12785,9 +12785,21 @@
     const afterEach = (fn) => current.afterEach.push(fn);
 
     function diag(e) {
-      const msg = e instanceof Error ? e.stack || e.message : String(e);
+      let msg = e instanceof Error ? e.stack || e.message : String(e);
+      // Drop oam's runner-internal frames (runTestEntry / runSuiteTree /
+      // runRoot / runSubtest): the factory is evaluated inside the snapshot
+      // with no resource name, so its frames read '<anonymous>'. Node's
+      // node:test never prints them. User test files always carry a real path.
+      msg = String(msg)
+        .split("\n")
+        .filter((line) => {
+          const t = line.trim();
+          if (!t.startsWith("at ")) return true; // keep the header + message
+          return !t.includes("<anonymous>");
+        })
+        .join("\n");
       log("  ---");
-      for (const line of String(msg).split("\n")) log("  " + line);
+      for (const line of msg.split("\n")) log("  " + line);
       log("  ...");
     }
 
