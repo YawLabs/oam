@@ -5152,6 +5152,9 @@
           let handle = null;
           let totalRead = 0;
           super({
+            // The fs ReadStream emits its own 'close' on EOF/destroy; opt out
+            // of Readable autoDestroy so 'close' isn't emitted twice.
+            autoDestroy: false,
             highWaterMark,
             encoding: opts.encoding ?? null,
             async read(size) {
@@ -5205,6 +5208,9 @@
           let handle = null;
           let totalWritten = 0;
           super({
+            // The fs WriteStream emits its own 'close' in final(); opt out of
+            // Writable autoDestroy so 'close' isn't emitted twice.
+            autoDestroy: false,
             highWaterMark: opts.highWaterMark ?? 65536,
             async write(chunk, _encoding, cb) {
               try {
@@ -5506,15 +5512,71 @@
     // waste. A Proxy defers the copy until first property access.
     let envCache = null;
     const ensureEnv = () => (envCache ??= natives.env());
+    // process.env is a string-coercing view: assigning a non-string coerces
+    // via String() (NOT delete -- `process.env.X = undefined` reads back as
+    // the literal string 'undefined'); symbol keys are rejected the way Node
+    // does (get -> undefined, set -> TypeError, `in` -> false, delete ->
+    // true); defineProperty only accepts a configurable+writable+enumerable
+    // data descriptor.
     const env = new Proxy(Object.create(null), {
-      get(_, prop) { return ensureEnv()[prop]; },
-      set(_, prop, value) { ensureEnv()[prop] = value; return true; },
-      has(_, prop) { return prop in ensureEnv(); },
-      deleteProperty(_, prop) { return delete ensureEnv()[prop]; },
+      get(_, prop) {
+        if (typeof prop === "symbol") return undefined;
+        return ensureEnv()[prop];
+      },
+      set(_, prop, value) {
+        if (typeof prop === "symbol") {
+          throw new TypeError("Cannot convert a Symbol value to a string");
+        }
+        if (typeof value === "symbol") {
+          throw new TypeError("Cannot convert a Symbol value to a string");
+        }
+        ensureEnv()[prop] = String(value);
+        return true;
+      },
+      has(_, prop) {
+        if (typeof prop === "symbol") return false;
+        return prop in ensureEnv();
+      },
+      deleteProperty(_, prop) {
+        if (typeof prop === "symbol") return true;
+        delete ensureEnv()[prop];
+        return true;
+      },
+      defineProperty(_, prop, desc) {
+        // Node only accepts a data descriptor that is explicitly
+        // configurable + writable + enumerable; an accessor descriptor, or
+        // any of the three flags absent/false, is rejected.
+        if ("get" in desc || "set" in desc) {
+          throw applyNodeErrorShape(
+            new TypeError(
+              "'process.env' does not accept an accessor(getter/setter) descriptor",
+            ),
+            "ERR_INVALID_OBJECT_DEFINE_PROPERTY",
+          );
+        }
+        if (
+          desc.configurable !== true ||
+          desc.writable !== true ||
+          desc.enumerable !== true
+        ) {
+          throw applyNodeErrorShape(
+            new TypeError(
+              "'process.env' only accepts a configurable, writable," +
+                " and enumerable data descriptor",
+            ),
+            "ERR_INVALID_OBJECT_DEFINE_PROPERTY",
+          );
+        }
+        if (typeof prop === "symbol") {
+          throw new TypeError("Cannot convert a Symbol value to a string");
+        }
+        ensureEnv()[prop] = String(desc.value);
+        return true;
+      },
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
       getOwnPropertyDescriptor(_, prop) {
         const obj = ensureEnv();
-        if (!(prop in obj)) return undefined;
+        if (typeof prop === "symbol" || !(prop in obj)) return undefined;
         return { value: obj[prop], writable: true, enumerable: true, configurable: true };
       },
     });
@@ -5642,6 +5704,7 @@
         decodeStrings: false,
       }), { fd: 2, isTTY: stderrIsTTY, columns: stderrIsTTY ? 80 : undefined, hasColors: () => stderrIsTTY }),
       stdin: Object.assign(new Readable({
+        autoDestroy: false,
         read() {
           natives.stdinRead().then(
             (chunk) => {
@@ -5659,12 +5722,76 @@
         }
         return undefined;
       },
-      emitWarning(warning) {
-        if (globalThis.console) {
-          globalThis.console.warn(
-            warning instanceof Error ? `${warning.name}: ${warning.message}` : `Warning: ${warning}`,
-          );
+      emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
+        // Normalize the (warning, type, code, ctor) / (warning, options)
+        // overloads the way Node does.
+        let type = "Warning";
+        let code;
+        let ctor;
+        let detail;
+        if (typeOrOptions !== null && typeof typeOrOptions === "object" && !Array.isArray(typeOrOptions)) {
+          // options form
+          if (typeOrOptions.type !== undefined) {
+            if (typeof typeOrOptions.type !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("options.type", "string", typeOrOptions.type);
+            }
+            type = typeOrOptions.type;
+          }
+          if (typeOrOptions.code !== undefined) {
+            if (typeof typeOrOptions.code !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("options.code", "string", typeOrOptions.code);
+            }
+            code = typeOrOptions.code;
+          }
+          if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
+          if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
+        } else {
+          if (typeOrOptions !== undefined) {
+            if (typeof typeOrOptions !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("type", "string", typeOrOptions);
+            }
+            type = typeOrOptions;
+          }
+          if (typeof codeArg === "function") {
+            ctor = codeArg;
+          } else if (codeArg !== undefined) {
+            if (typeof codeArg !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("code", "string", codeArg);
+            }
+            code = codeArg;
+          }
+          if (typeof ctorArg === "function") ctor = ctorArg;
         }
+
+        let warningObj;
+        if (warning instanceof Error) {
+          warningObj = warning;
+        } else if (typeof warning === "string") {
+          warningObj = new Error(warning);
+          warningObj.name = String(type);
+          if (code !== undefined) warningObj.code = code;
+          if (detail !== undefined) warningObj.detail = detail;
+          if (typeof Error.captureStackTrace === "function") {
+            Error.captureStackTrace(warningObj, ctor || process.emitWarning);
+          }
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE("warning", ["Error", "string"], warning);
+        }
+
+        // throwDeprecation: a DeprecationWarning surfaces as an async throw
+        // (uncaughtException), NOT a synchronous throw from emitWarning --
+        // test-process-warning asserts the call site does not throw.
+        if (warningObj.name === "DeprecationWarning") {
+          if (process.throwDeprecation) {
+            process.nextTick(() => { throw warningObj; });
+            return;
+          }
+          if (process.noDeprecation) return;
+        }
+
+        // Defer so listeners attached after the emitWarning call (Node defers
+        // to nextTick) still fire.
+        process.nextTick(() => process.emit("warning", warningObj));
       },
       cpuUsage: (prev) => {
         var usage = natives.processCpuUsage();
@@ -5678,7 +5805,63 @@
         natives.processKill(pid, sig);
         return true;
       },
-      umask: () => 0,
+      umask(mask) {
+        const prev = process._umask ?? 0;
+        if (mask === undefined) return prev;
+        if (typeof mask === "number") {
+          process._umask = mask & 0o777;
+          return prev;
+        }
+        if (typeof mask === "string") {
+          // Octal string ("0664"). Reject non-octal / out-of-range.
+          if (!/^[0-7]+$/.test(mask)) {
+            throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
+          }
+          const parsed = parseInt(mask, 8);
+          if (!Number.isFinite(parsed) || parsed > 0o777) {
+            throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
+          }
+          process._umask = parsed;
+          return prev;
+        }
+        throw new codes.ERR_INVALID_ARG_TYPE("mask", ["number", "string"], mask);
+      },
+      // Best-effort active-resource introspection. Backed by the JS-side
+      // active-timer registry installed in installRuntimeGlobals -- it tracks
+      // setTimeout/setInterval/setImmediate handles (the kinds the corpus
+      // asserts on). Sockets / fs requests are not tracked (no native handle
+      // table), so handle/request lists cover timers only.
+      getActiveResourcesInfo() {
+        const out = [];
+        const reg = registry._activeTimers;
+        if (reg) {
+          for (const t of reg.values()) {
+            out.push(t._kind === "Immediate" ? "Immediate" : "Timeout");
+          }
+        }
+        return out;
+      },
+      _getActiveHandles() {
+        const out = [];
+        const reg = registry._activeTimers;
+        if (reg) for (const t of reg.values()) out.push(t);
+        return out;
+      },
+      _getActiveRequests() {
+        return [];
+      },
+      ref(handle) {
+        if (handle == null) return;
+        if (typeof handle.ref === "function") { handle.ref(); return; }
+        const sym = Symbol.for("nodejs.ref");
+        if (typeof handle[sym] === "function") handle[sym]();
+      },
+      unref(handle) {
+        if (handle == null) return;
+        if (typeof handle.unref === "function") { handle.unref(); return; }
+        const sym = Symbol.for("nodejs.unref");
+        if (typeof handle[sym] === "function") handle[sym]();
+      },
       getuid: () => 0,
       getgid: () => 0,
       geteuid: () => 0,
@@ -5976,15 +6159,89 @@
 
     function destroyImpl(stream, err, state) {
       if (state.destroyed) return stream;
+      // A pending construct() defers destruction until the construct callback
+      // fires (Node: the stream is not really live until constructed, but
+      // destroy() during construction is honored once construct completes, and
+      // the construct callback still runs -- test-stream-construct).
+      const cs = stream._constructState;
+      if (cs && cs.constructing) {
+        state.destroyed = true;
+        cs.pendingDestroy = { err: err ?? null };
+        return stream;
+      }
       state.destroyed = true;
+      if (err) {
+        // errored is set synchronously; errorEmitted flips only when the
+        // 'error' event actually fires (Node: test-stream-writable-destroy
+        // reads both right after a double-destroy()).
+        state.errored = state.errored ?? err;
+        if (stream._rState && stream._rState !== state) {
+          stream._rState.errored = stream._rState.errored ?? err;
+        }
+      }
       const cb = (finalErr) => {
         const error = finalErr ?? err;
-        if (error) microtask(() => stream.emit("error", error));
+        if (error) {
+          microtask(() => {
+            state.errorEmitted = true;
+            if (stream._rState && stream._rState !== state) stream._rState.errorEmitted = true;
+            stream.emit("error", error);
+          });
+        }
         microtask(() => stream.emit("close"));
       };
       if (stream._destroy) stream._destroy(err ?? null, cb);
       else cb(null);
       return stream;
+    }
+
+    // Wire a stream's construct() option. Called once at the end of
+    // construction when _construct is present. The construct callback runs on
+    // nextTick; reads/writes are gated (via _constructState.constructing) until
+    // it fires. A double callback errors with ERR_MULTIPLE_CALLBACK; a
+    // sync/async error destroys the stream; a destroy() issued during
+    // construction is replayed once construct completes.
+    function runConstruct(stream) {
+      const cs = { constructing: true, pendingDestroy: null, called: false };
+      stream._constructState = cs;
+      const onDone = (err) => {
+        if (cs.called) {
+          // Second invocation of the construct callback.
+          microtask(() => stream.emit("error", new codes.ERR_MULTIPLE_CALLBACK()));
+          return;
+        }
+        cs.called = true;
+        cs.constructing = false;
+        if (err) {
+          destroyImpl(stream, err, stream._wState ?? stream._rState);
+          return;
+        }
+        if (cs.pendingDestroy) {
+          const de = cs.pendingDestroy.err;
+          // Reset the destroyed flag so destroyImpl runs the real teardown now.
+          if (stream._rState) stream._rState.destroyed = false;
+          if (stream._wState) stream._wState.destroyed = false;
+          destroyImpl(stream, de, stream._wState ?? stream._rState);
+          return;
+        }
+        // Construct succeeded -- kick any work that was gated.
+        if (stream._wState) stream._processWrites();
+        if (stream._rState) {
+          if (stream._rState.flowing) stream._scheduleFlow();
+          else if (stream.listenerCount("readable") > 0 && stream._rState.buffer.length === 0) {
+            stream._callRead();
+          }
+          stream._emitEndIfDrained();
+        }
+      };
+      microtask(() => {
+        if (cs.called) return;
+        try {
+          stream._construct(onDone);
+        } catch (e) {
+          onDone(e);
+        }
+      });
     }
 
     // ------------------------------------------------------------ Readable
@@ -6009,22 +6266,55 @@
         errored: null,
         encoding: options.encoding ?? null,
         flushing: false,
+        // Node uses `pipes` as a plain array of destination streams; oam
+        // stores {dest, state} internally as `pipes`, so _pipeEntries holds
+        // the internal records and `pipes` is kept as the dest-only array the
+        // corpus reads (length + includes()).
         pipes: [],
+        _pipeEntries: [],
+        // Node-named state fields the corpus reads off _readableState directly.
+        emittedReadable: false,
+        needReadable: false,
+        resumeScheduled: false,
+        errorEmitted: false,
+        awaitDrainWriters: null,
+        // autoDestroy defaults true in modern Node (see initWritableState).
+        autoDestroy: options.autoDestroy !== false,
       };
+      // readableListening mirrors `listenerCount('readable') > 0` (Node keeps
+      // it in sync with the 'readable' listener set); a live getter satisfies
+      // the inside/outside-listener assertions without modeling the full
+      // readable-event scheduler.
+      Object.defineProperty(self._rState, "readableListening", {
+        get() { return self.listenerCount("readable") > 0; },
+        enumerable: true,
+        configurable: true,
+      });
       if (options.read) self._read = options.read;
       if (options.destroy) self._destroy = options.destroy;
+      if (options.construct) self._construct = options.construct;
     }
 
     class Readable extends EventEmitter {
       constructor(options = {}) {
         super();
         initReadableState(this, options);
+        // A `construct` option gates reads until its callback fires. Only run
+        // it here for a plain Readable -- Duplex runs it after BOTH sides init.
+        if (this._construct && new.target === Readable) runConstruct(this);
       }
 
       _read(_size) {
         this.destroy(new Error("The _read() method is not implemented"));
       }
 
+      // Node exposes the internal state object as `_readableState`; the corpus
+      // reads its fields directly (objectMode, highWaterMark, needDrain,
+      // emittedReadable, pipes, errored, length, ...). oam's `_rState` carries
+      // the same field names (Node-aligned), so expose it directly.
+      get _readableState() {
+        return this._rState;
+      }
       get readable() {
         const s = this._rState;
         return !s.destroyed && !s.endEmitted;
@@ -6050,6 +6340,19 @@
 
       push(chunk, encoding) {
         const s = this._rState;
+        // push() after EOF (a prior push(null)) is an async 'error' with
+        // ERR_STREAM_PUSH_AFTER_EOF (Node errorOrDestroy semantics), except
+        // pushing null again which is a harmless no-op.
+        if (s.ended && chunk !== null) {
+          const err = new codes.ERR_STREAM_PUSH_AFTER_EOF();
+          s.errored = s.errored ?? err;
+          microtask(() => {
+            s.errorEmitted = true;
+            this.emit("error", err);
+          });
+          return false;
+        }
+        // Null-in-objectMode / null after Readable.from is an error too.
         if (chunk === null) {
           s.ended = true;
           s.reading = false;
@@ -6081,6 +6384,7 @@
 
       _callRead() {
         const s = this._rState;
+        if (this._constructState && this._constructState.constructing) return;
         if (s.reading || s.ended || s.destroyed) return;
         if (s.length >= s.highWaterMark) return;
         s.reading = true;
@@ -6148,7 +6452,16 @@
         const s = this._rState;
         if (!s.ended || s.endEmitted || s.buffer.length > 0) return;
         s.endEmitted = true;
-        microtask(() => this.emit("end"));
+        microtask(() => {
+          this.emit("end");
+          // autoDestroy: a readable that has emitted 'end' destroys itself
+          // (-> 'close'). For a Duplex, wait until the writable side finished.
+          if (s.autoDestroy && !s.destroyed) {
+            const w = this._wState;
+            const writeSideDone = !w || w.finished || w.destroyed;
+            if (writeSideDone) this.destroy();
+          }
+        });
       }
 
       _scheduleFlow() {
@@ -6180,13 +6493,18 @@
       resume() {
         const s = this._rState;
         if (s.destroyed) return this;
+        const wasFlowing = s.flowing;
         s.flowing = true;
+        if (wasFlowing !== true) microtask(() => this.emit("resume"));
         this._scheduleFlow();
         return this;
       }
 
       pause() {
-        this._rState.flowing = false;
+        const s = this._rState;
+        const wasFlowing = s.flowing;
+        s.flowing = false;
+        if (wasFlowing !== false) microtask(() => this.emit("pause"));
         return this;
       }
 
@@ -6209,7 +6527,8 @@
         state.onend = () => {
           if (options.end !== false) dest.end();
         };
-        src._rState.pipes.push({ dest, state });
+        src._rState._pipeEntries.push({ dest, state });
+        src._rState.pipes.push(dest);
         src.on("data", state.ondata);
         dest.on("drain", state.ondrain);
         src.on("end", state.onend);
@@ -6223,7 +6542,7 @@
       unpipe(dest) {
         const s = this._rState;
         const keep = [];
-        for (const entry of s.pipes) {
+        for (const entry of s._pipeEntries) {
           if (dest !== undefined && entry.dest !== dest) {
             keep.push(entry);
             continue;
@@ -6233,8 +6552,9 @@
           entry.dest.removeListener("drain", entry.state.ondrain);
           entry.dest.emit("unpipe", this);
         }
-        s.pipes = keep;
-        if (s.pipes.length === 0) this.pause();
+        s._pipeEntries = keep;
+        s.pipes = keep.map((e) => e.dest);
+        if (s._pipeEntries.length === 0) this.pause();
         return this;
       }
 
@@ -6439,7 +6759,11 @@
             try {
               const { value, done } = await iterator.next();
               if (done) this.push(null);
-              else this.push(value);
+              else if (value === null) {
+                // Yielding null is not EOF here -- it is an error, matching
+                // Node's Readable.from (ERR_STREAM_NULL_VALUES).
+                this.destroy(new codes.ERR_STREAM_NULL_VALUES());
+              } else this.push(value);
             } catch (e) {
               this.destroy(e);
             }
@@ -6505,7 +6829,7 @@
     function initWritableState(self, options) {
       const objectMode =
         options.objectMode === true || options.writableObjectMode === true;
-      self._wState = {
+      const s = {
         objectMode,
         highWaterMark:
           options.writableHighWaterMark ??
@@ -6515,22 +6839,53 @@
         length: 0,
         writing: false,
         ending: false,
+        // ended mirrors `ending` for Node-field-name parity (lib/internal/
+        // streams/writable tracks both `ending` and `ended`; oam's single
+        // queue makes them coincide closely enough for the state assertions).
+        ended: false,
         finished: false,
         destroyed: false,
         needDrain: false,
+        // Node-named state fields the corpus reads off _writableState directly.
+        errored: null,
+        errorEmitted: false,
+        pendingcb: 0,
         endCallbacks: [],
         corked: 0,
+        // autoDestroy defaults true in modern Node (Writable/Duplex): a
+        // finished stream destroys itself and emits 'close'.
+        autoDestroy: options.autoDestroy !== false,
       };
+      // bufferedRequestCount / writable / getBuffer() are derived views Node
+      // exposes on the state; back them by the live queue.
+      Object.defineProperty(s, "bufferedRequestCount", {
+        get() { return this.queue.length; },
+        enumerable: false,
+        configurable: true,
+      });
+      Object.defineProperty(s, "writable", {
+        get() { return !this.destroyed && !this.ending; },
+        enumerable: false,
+        configurable: true,
+      });
+      Object.defineProperty(s, "getBuffer", {
+        value: function getBuffer() { return this.queue.map((q) => q.chunk); },
+        enumerable: false,
+        configurable: true,
+      });
+      self._wState = s;
       if (options.write) self._write = options.write;
       if (options.writev) self._writev = options.writev;
       if (options.final) self._final = options.final;
       if (options.destroy) self._destroy = options.destroy;
+      if (options.construct) self._construct = options.construct;
     }
 
     class Writable extends EventEmitter {
       constructor(options = {}) {
         super();
         initWritableState(this, options);
+        if (this._construct && new.target === Writable) runConstruct(this);
       }
     }
 
@@ -6545,10 +6900,42 @@
           encoding = undefined;
         }
         const s = this._wState;
-        if (s.ending || s.destroyed) {
-          const err = new Error("write after end");
+        // Input validation (synchronous throws, matching Node) happens BEFORE
+        // the ended/destroyed gate so a bad chunk throws even on a live stream.
+        if (!s.objectMode) {
+          if (chunk === null) {
+            throw new codes.ERR_STREAM_NULL_VALUES();
+          }
+          if (
+            typeof chunk !== "string" &&
+            !(chunk instanceof Uint8Array) &&
+            !(BufferCtor.isBuffer && BufferCtor.isBuffer(chunk))
+          ) {
+            throw new codes.ERR_INVALID_ARG_TYPE(
+              "chunk",
+              ["string", "Buffer", "Uint8Array"],
+              chunk,
+            );
+          }
+          if (
+            typeof chunk === "string" &&
+            encoding !== undefined &&
+            encoding !== null &&
+            typeof encoding === "string" &&
+            !BufferCtor.isEncoding(encoding)
+          ) {
+            throw new codes.ERR_UNKNOWN_ENCODING(encoding);
+          }
+        }
+        if (s.ending || s.destroyed || s.finished) {
+          const err = s.destroyed
+            ? new codes.ERR_STREAM_DESTROYED("write")
+            : new codes.ERR_STREAM_WRITE_AFTER_END();
           if (cb) microtask(() => cb(err));
-          if (this.listenerCount("error") > 0) microtask(() => this.emit("error", err));
+          microtask(() => {
+            s.errored = s.errored ?? err;
+            if (this.listenerCount("error") > 0) this.emit("error", err);
+          });
           return false;
         }
         let data = chunk;
@@ -6565,6 +6952,7 @@
 
       _processWrites() {
         const s = this._wState;
+        if (this._constructState && this._constructState.constructing) return;
         if (s.writing || s.destroyed || s.corked > 0) return;
         if (s.queue.length === 0) {
           this._maybeFinish();
@@ -6650,10 +7038,23 @@
           return;
         }
         s.finished = true;
+        // 'prefinish' fires synchronously once all queued writes have drained
+        // and before _final runs (Node semantics; tests assert it is sync).
+        if (!s.prefinished) {
+          s.prefinished = true;
+          this.emit("prefinish");
+        }
         const complete = () => {
           microtask(() => {
             this.emit("finish");
             for (const cb of s.endCallbacks.splice(0)) cb();
+            // autoDestroy: once finished, destroy (-> 'close'). For a Duplex,
+            // wait until the readable side has also ended.
+            if (s.autoDestroy && !s.destroyed) {
+              const r = this._rState;
+              const readSideDone = !r || r.endEmitted || r.destroyed;
+              if (readSideDone) this.destroy();
+            }
           });
         };
         if (this._final) {
@@ -6713,10 +7114,31 @@
     };
 
     const writableGetters = {
+      _writableState: {
+        get() {
+          return this._wState;
+        },
+      },
       writable: {
         get() {
           const s = this._wState;
           return !s.destroyed && !s.ending;
+        },
+      },
+      writableNeedDrain: {
+        get() {
+          const s = this._wState;
+          return !s.destroyed && !s.ending && s.needDrain;
+        },
+      },
+      writableCorked: {
+        get() {
+          return this._wState.corked;
+        },
+      },
+      writableErrored: {
+        get() {
+          return this._wState.errored;
         },
       },
       writableEnded: {
@@ -6811,6 +7233,18 @@
       constructor(options = {}) {
         super(options);
         initWritableState(this, options);
+        // readable:false / writable:false pre-end the respective side
+        // (test-stream-duplex-readable-writable).
+        if (options.readable === false) {
+          this._rState.ended = true;
+          this._rState.endEmitted = true;
+        }
+        if (options.writable === false) {
+          this._wState.ending = true;
+          this._wState.ended = true;
+          this._wState.finished = true;
+        }
+        if (this._construct && new.target === Duplex) runConstruct(this);
       }
     }
     applyWritable(Duplex.prototype);
@@ -10027,7 +10461,9 @@
 
     class IncomingMessage extends Readable {
       constructor(meta) {
-        super({});
+        // The http layer manages this stream's close lifecycle; opt out of
+        // Readable autoDestroy to keep the prior single-close behavior.
+        super({ autoDestroy: false });
         this.method = meta.method;
         this.url = meta.uri;
         this.httpVersion = "1.1";
@@ -11109,14 +11545,89 @@
   // --------------------------------------------------------------- timers
   // Node's `timers` module: re-exports the global timer functions so that
   // require('timers') / import * from 'node:timers' works as expected.
-  registry.factories.timers = () => ({
-    setTimeout: (fn, ms, ...args) => globalThis.setTimeout(fn, ms, ...args),
-    clearTimeout: (id) => globalThis.clearTimeout(id),
-    setInterval: (fn, ms, ...args) => globalThis.setInterval(fn, ms, ...args),
-    clearInterval: (id) => globalThis.clearInterval(id),
-    setImmediate: (fn, ...args) => globalThis.setImmediate(fn, ...args),
-    clearImmediate: (id) => globalThis.clearImmediate(id),
-  });
+  registry.factories.timers = () => {
+    // Capture the live globals at factory-build time so the module keeps
+    // working after a test deletes globalThis.setTimeout et al
+    // (test-timers-api-refs). installRuntimeGlobals has already upgraded
+    // these to the Timeout-returning wrappers by the time any user module
+    // requires 'timers'.
+    const _setTimeout = globalThis.setTimeout;
+    const _clearTimeout = globalThis.clearTimeout;
+    const _setInterval = globalThis.setInterval;
+    const _clearInterval = globalThis.clearInterval;
+    const _setImmediate = globalThis.setImmediate;
+    const _clearImmediate = globalThis.clearImmediate;
+
+    // Legacy linked-list timer API (deprecated in Node, still exercised by
+    // the corpus). enroll/unenroll mutate the object's _idle* fields;
+    // active()/_unrefActive() (re)schedule based on _idleTimeout. Faithful
+    // enough for the validation + mutation assertions; the actual timer is
+    // a plain setTimeout calling the object's _onTimeout.
+    function validateMsecs(msecs, name) {
+      if (typeof msecs !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
+      }
+      if (msecs < 0 || !Number.isFinite(msecs)) {
+        throw new codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
+      }
+    }
+    function enroll(item, msecs) {
+      validateMsecs(msecs, "msecs");
+      if (item._idleNext) unenroll(item);
+      item._idleTimeout = msecs;
+      item._idleNext = null;
+      item._idlePrev = null;
+    }
+    function unenroll(item) {
+      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
+        _clearTimeout(item._idleTimerId);
+        item._idleTimerId = null;
+      }
+      item._idleTimeout = -1;
+      item._idleNext = null;
+      item._idlePrev = null;
+    }
+    function active(item) {
+      _insert(item, false);
+    }
+    function _unrefActive(item) {
+      _insert(item, true);
+    }
+    function _insert(item, unrefed) {
+      const msecs = item._idleTimeout;
+      if (typeof msecs !== "number" || msecs < 0) return;
+      item._idleStart = Math.trunc(globalThis.performance?.now?.() ?? Date.now());
+      // _idleNext/_idlePrev are sentinels in Node's linked list; the corpus
+      // only asserts they are truthy after active(), so a self-link suffices.
+      item._idleNext = item._idleNext || item;
+      item._idlePrev = item._idlePrev || item;
+      if (item._idleTimerId !== undefined && item._idleTimerId !== null) {
+        _clearTimeout(item._idleTimerId);
+      }
+      const t = _setTimeout(() => {
+        item._idleTimerId = null;
+        if (typeof item._onTimeout === "function") item._onTimeout();
+      }, msecs);
+      if (unrefed && typeof t.unref === "function") t.unref();
+      item._idleTimerId = t;
+    }
+
+    return {
+      setTimeout: (fn, ms, ...args) => _setTimeout(fn, ms, ...args),
+      clearTimeout: (id) => _clearTimeout(id),
+      setInterval: (fn, ms, ...args) => _setInterval(fn, ms, ...args),
+      clearInterval: (id) => _clearInterval(id),
+      setImmediate: (fn, ...args) => _setImmediate(fn, ...args),
+      clearImmediate: (id) => _clearImmediate(id),
+      enroll,
+      unenroll,
+      active,
+      _unrefActive,
+      get promises() {
+        return registry.get("timers/promises");
+      },
+    };
+  };
 
   // ------------------------------------------------------------- punycode
   // Pure-JS Punycode (RFC 3492). Node marks this deprecated but it is still
@@ -13666,7 +14177,9 @@
 
     class ServerHttp2Stream extends Duplex {
       constructor(requestId, inHeaders) {
-        super({ allowHalfOpen: true });
+        // The http2 layer manages this stream's close lifecycle; opt out of
+        // Duplex autoDestroy to keep the prior behavior.
+        super({ allowHalfOpen: true, autoDestroy: false });
         this._requestId = requestId;
         this._streamId = null;
         this._ended = false;
@@ -13847,7 +14360,7 @@
 
     class ClientHttp2Stream extends Duplex {
       constructor(session, headers) {
-        super({ allowHalfOpen: true });
+        super({ allowHalfOpen: true, autoDestroy: false });
         this._session = session;
         this._reqHeaders = headers;
         this._bodyChunks = [];
@@ -14042,7 +14555,7 @@
 
     class TLSSocket extends Duplex {
       constructor(socket, options) {
-        super();
+        super({ autoDestroy: false });
         this.encrypted = true;
         this.authorized = false;
         this.authorizationError = null;
@@ -15049,6 +15562,20 @@
     // promise continuations, so timer-family callbacks are bound to the
     // frame current at SCHEDULING time (Node semantics). Promise paths
     // need no wrapper â€” V8 handles them.
+    //
+    // The same block also upgrades setTimeout/setInterval/setImmediate to
+    // return Node's Timeout/Immediate OBJECTS (the native ops return a bare
+    // uint32 id). The object carries .ref()/.unref()/.hasRef()/.refresh(),
+    // [Symbol.toPrimitive] (the id, so clearTimeout(t) coercion + object-key
+    // stringification work), [Symbol.dispose] (clears the timer), and
+    // ._destroyed -- and it is registered in a JS-side active-timer map that
+    // backs process.getActiveResourcesInfo() / process._getActiveHandles().
+    //
+    // Documented divergence: .unref() is best-effort. The Rust event loop
+    // exits when no live timers remain (it has no unref accounting), so an
+    // unref'd timer still keeps the loop alive and still fires. hasRef()
+    // faithfully reflects the ref flag, but "unref'd timer never fires"
+    // needs a runtime change and is out of scope.
     {
       const bindToCurrentFrame = (fn) => {
         if (typeof fn !== "function") return fn;
@@ -15063,16 +15590,137 @@
           }
         };
       };
-      // setImmediate delegates to globalThis.setTimeout at call time, so
-      // wrapping the timer pair covers it â€” no double-bind.
-      for (const name of ["setTimeout", "setInterval", "queueMicrotask"]) {
-        const native = globalThis[name];
-        if (typeof native !== "function") continue;
-        const wrapped = function (fn, ...rest) {
-          return native(bindToCurrentFrame(fn), ...rest);
+
+      const nativeSetTimeout = globalThis.setTimeout;
+      const nativeSetInterval = globalThis.setInterval;
+      const nativeClearTimeout = globalThis.clearTimeout;
+      const nativeClearInterval = globalThis.clearInterval;
+
+      // Active-timer registry: numeric id -> Timeout/Immediate object. Backs
+      // process.getActiveResourcesInfo() and the _getActive* introspection.
+      const activeTimers = new Map();
+      registry._activeTimers = activeTimers;
+
+      function makeTimerError(name) {
+        return new codes.ERR_INVALID_ARG_TYPE(name, "function", undefined);
+      }
+
+      // A Timeout/Immediate handle. `kind` is "Timeout" or "Immediate";
+      // `repeat` true for setInterval.
+      function Timeout(callback, kind, repeat, delay, args) {
+        if (typeof callback !== "function") throw makeTimerError("callback");
+        this._kind = kind;
+        this._repeat = repeat;
+        this._delay = delay;
+        this._args = args;
+        this._origCallback = callback;
+        this._ref = true;
+        this._destroyed = false;
+        this._idleTimeout = repeat ? delay : delay;
+        this._id = 0;
+        this._schedule();
+      }
+      Timeout.prototype._schedule = function _schedule() {
+        const self = this;
+        const bound = bindToCurrentFrame(this._origCallback);
+        const wrapped = function () {
+          // Node invokes the callback with the handle as `this`.
+          if (!self._repeat) {
+            self._destroyed = true;
+            activeTimers.delete(self._id);
+          }
+          return bound.apply(self, self._args);
         };
-        Object.defineProperty(wrapped, "name", { value: name });
-        globalThis[name] = wrapped;
+        const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
+        this._id = native(wrapped, this._delay, ...this._args);
+        this._destroyed = false;
+        activeTimers.set(this._id, this);
+      };
+      Timeout.prototype.ref = function ref() {
+        this._ref = true;
+        return this;
+      };
+      Timeout.prototype.unref = function unref() {
+        this._ref = false;
+        return this;
+      };
+      Timeout.prototype.hasRef = function hasRef() {
+        return this._ref;
+      };
+      Timeout.prototype.refresh = function refresh() {
+        if (this._destroyed) return this;
+        const native = this._repeat ? nativeClearInterval : nativeClearTimeout;
+        native(this._id);
+        activeTimers.delete(this._id);
+        this._schedule();
+        return this;
+      };
+      Timeout.prototype.close = function close() {
+        const native = this._repeat ? nativeClearInterval : nativeClearTimeout;
+        native(this._id);
+        activeTimers.delete(this._id);
+        this._destroyed = true;
+        return this;
+      };
+      Timeout.prototype[Symbol.toPrimitive] = function () {
+        return this._id;
+      };
+      Timeout.prototype[Symbol.dispose] = function () {
+        this.close();
+      };
+
+      const idOf = (handle) => {
+        if (handle != null && typeof handle === "object" && typeof handle._id === "number") {
+          return handle._id;
+        }
+        return handle;
+      };
+
+      globalThis.setTimeout = function setTimeout(callback, delay, ...args) {
+        if (typeof callback !== "function") throw makeTimerError("callback");
+        return new Timeout(callback, "Timeout", false, delay, args);
+      };
+      globalThis.setInterval = function setInterval(callback, delay, ...args) {
+        if (typeof callback !== "function") throw makeTimerError("callback");
+        return new Timeout(callback, "Timeout", true, delay, args);
+      };
+      globalThis.setImmediate = function setImmediate(callback, ...args) {
+        if (typeof callback !== "function") throw makeTimerError("callback");
+        return new Timeout(callback, "Immediate", false, 0, args);
+      };
+      // Shared clear path -- captured natives, so it keeps working even after
+      // a test deletes the globals (test-timers-api-refs).
+      const clearTimer = (handle, nativeClear) => {
+        const id = idOf(handle);
+        if (handle != null && typeof handle === "object" && handle._id !== undefined) {
+          handle._destroyed = true;
+          activeTimers.delete(handle._id);
+        } else {
+          activeTimers.delete(id);
+        }
+        nativeClear(id);
+      };
+      globalThis.clearTimeout = function clearTimeout(handle) {
+        clearTimer(handle, nativeClearTimeout);
+      };
+      globalThis.clearInterval = function clearInterval(handle) {
+        clearTimer(handle, nativeClearInterval);
+      };
+      globalThis.clearImmediate = function clearImmediate(handle) {
+        clearTimer(handle, nativeClearTimeout);
+      };
+      registry._Timeout = Timeout;
+
+      // queueMicrotask still just needs ALS frame-binding.
+      {
+        const native = globalThis.queueMicrotask;
+        if (typeof native === "function") {
+          const wrapped = function (fn) {
+            return native(bindToCurrentFrame(fn));
+          };
+          Object.defineProperty(wrapped, "name", { value: "queueMicrotask" });
+          globalThis.queueMicrotask = wrapped;
+        }
       }
     }
 

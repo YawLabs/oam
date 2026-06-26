@@ -1176,7 +1176,13 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
             "7",         // _ holds the last value
             "undefined", // multi-line function declaration
             "'multi'",
-            "1",                // timer id
+            // setTimeout now returns Node's Timeout OBJECT (with
+            // ref/unref/hasRef/Symbol.dispose), not a bare numeric id, so the
+            // REPL inspects the handle. Node's REPL prints a Timeout object
+            // here too; the field set is oam's.
+            "Timeout { _kind: 'Timeout', _repeat: false, _delay: 40, _args: [], \
+             _origCallback: [Function (anonymous)], _ref: true, _destroyed: false, \
+             _idleTimeout: 40, _id: 1 }",
             "background fired", // fired while AWAITING the next line — live loop
             "'timer-live'",
         ],

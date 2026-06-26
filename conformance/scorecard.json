@@ -1,5 +1,5 @@
 {
-  "commit": "a34320b",
+  "commit": "25bcafd",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -166,10 +166,22 @@
         {
           "case": "40-string-decoder-streaming.mjs",
           "status": "pass"
+        },
+        {
+          "case": "41-stream-state-surface.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "42-process-env-coercion.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "43-timers-handle-api.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 40,
-      "total": 40
+      "pass": 43,
+      "total": 43
     },
     "surface": {
       "globals": {
