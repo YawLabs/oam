@@ -6864,11 +6864,26 @@
 
       pipe(dest, options = {}) {
         const src = this;
-        const state = { ondata: null, ondrain: null, onend: null, onerror: null };
-        state.ondata = (chunk) => {
-          if (dest.write(chunk) === false) src.pause();
+        const state = { ondata: null, ondrain: null, onend: null, onerror: null, drainAttached: false };
+        // Node attaches the dest 'drain' listener LAZILY -- only when a write()
+        // actually returns false (backpressure). A pipe that never backpressures
+        // never registers it (test-stream-pipe-flow asserts listenerCount 0).
+        const attachDrain = () => {
+          if (state.drainAttached) return;
+          state.drainAttached = true;
+          dest.on("drain", state.ondrain);
         };
-        state.ondrain = () => src.resume();
+        state.ondata = (chunk) => {
+          if (dest.write(chunk) === false) {
+            attachDrain();
+            src._rState.awaitDrainWriters = dest;
+            src.pause();
+          }
+        };
+        state.ondrain = () => {
+          if (src._rState.awaitDrainWriters === dest) src._rState.awaitDrainWriters = null;
+          src.resume();
+        };
         state.onend = () => {
           if (options.end !== false) dest.end();
         };
@@ -6903,7 +6918,7 @@
         src._rState._pipeEntries.push({ dest, state });
         src._rState.pipes.push(dest);
         src.on("data", state.ondata);
-        dest.on("drain", state.ondrain);
+        // 'drain' is attached lazily by attachDrain() on first backpressure.
         src.on("end", state.onend);
         // Prepend so the pipe's teardown runs before any userland 'error'
         // listener; fall back to on() when the dest nulled out prependListener
@@ -6916,27 +6931,63 @@
         dest.emit("pipe", src);
         // pipe() flows the source even if it was explicitly paused (Node
         // semantics) â€” backpressure re-pauses as needed.
-        src.resume();
+        // Start flow respecting the dest's CURRENT backpressure: if it already
+        // needs to drain, pause the source (the initial 'pause') and attach
+        // drain so its later 'drain' resumes us; otherwise resume unless already
+        // flowing (Node's flow-start branch -- test-stream-pipe-needDrain).
+        if (dest.writableNeedDrain === true) {
+          attachDrain();
+          src._rState.awaitDrainWriters = dest;
+          src.pause();
+        } else if (src._rState.flowing !== true) {
+          src.resume();
+        }
         return dest;
       }
 
       unpipe(dest) {
         const s = this._rState;
         const keep = [];
+        const removed = [];
+        // F5: a single unpipe(dest) removes only the FIRST matching entry
+        // (Node's indexOf+splice), so piping the same dest twice then unpiping
+        // once leaves one pipe. unpipe() with no dest still removes all.
+        let removedOne = false;
         for (const entry of s._pipeEntries) {
-          if (dest !== undefined && entry.dest !== dest) {
+          if (dest !== undefined && (entry.dest !== dest || removedOne)) {
             keep.push(entry);
             continue;
           }
+          removedOne = true;
+          removed.push(entry);
+        }
+        // Tear down listeners + update state BEFORE emitting 'unpipe', so a
+        // synchronous 'unpipe' handler observes the post-unpipe pipes/flowing
+        // (test-stream-pipe-unpipe-streams).
+        let unblocked = false;
+        for (const entry of removed) {
           this.removeListener("data", entry.state.ondata);
           this.removeListener("end", entry.state.onend);
-          entry.dest.removeListener("drain", entry.state.ondrain);
+          if (entry.state.drainAttached) {
+            entry.dest.removeListener("drain", entry.state.ondrain);
+          }
           entry.dest.removeListener("error", entry.state.onerror);
-          entry.dest.emit("unpipe", this);
+          // If this dest was backpressuring the source, clear the marker and
+          // remember to re-resume below (test-stream-pipe-flow-after-unpipe).
+          if (s.awaitDrainWriters === entry.dest) {
+            s.awaitDrainWriters = null;
+            unblocked = true;
+          }
         }
         s._pipeEntries = keep;
         s.pipes = keep.map((e) => e.dest);
         if (s._pipeEntries.length === 0) this.pause();
+        // A source the pipe had paused via backpressure resumes on unpipe when a
+        // 'data' listener survives to keep it flowing.
+        if (unblocked && this.listenerCount("data") > 0) this.resume();
+        for (const entry of removed) {
+          entry.dest.emit("unpipe", this);
+        }
         return this;
       }
 
