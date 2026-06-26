@@ -6230,7 +6230,12 @@
         }
       }
       const cb = (finalErr) => {
-        const error = finalErr ?? err;
+        // Node's onDestroy emits ONLY the error the _destroy callback hands
+        // back -- a custom _destroy(err, cb) that calls cb() with no error
+        // SUPPRESSES the re-emit. The default _destroy is (err, cb) => cb(err),
+        // so the no-custom-_destroy branch below passes `err` through cb()
+        // explicitly to keep the default re-emit behaviour.
+        const error = finalErr;
         if (error) {
           microtask(() => {
             state.errorEmitted = true;
@@ -6241,7 +6246,7 @@
         microtask(() => stream.emit("close"));
       };
       if (stream._destroy) stream._destroy(err ?? null, cb);
-      else cb(null);
+      else cb(err ?? null);
       return stream;
     }
 
@@ -6374,6 +6379,9 @@
       }
       get destroyed() {
         return this._rState.destroyed;
+      }
+      set destroyed(value) {
+        if (this._rState) this._rState.destroyed = value;
       }
       get readableFlowing() {
         return this._rState.flowing;
@@ -6591,7 +6599,7 @@
 
       pipe(dest, options = {}) {
         const src = this;
-        const state = { ondata: null, ondrain: null, onend: null };
+        const state = { ondata: null, ondrain: null, onend: null, onerror: null };
         state.ondata = (chunk) => {
           if (dest.write(chunk) === false) src.pause();
         };
@@ -6599,11 +6607,47 @@
         state.onend = () => {
           if (options.end !== false) dest.end();
         };
+        // Route a piped destination's 'error' the way Node does: a handler
+        // prepended BEFORE any userland 'error' listener that tears the pipe
+        // down, then -- only if the dest has no other 'error' listener and is
+        // still live -- runs errorOrDestroy (autoDestroy => dest.destroy(er),
+        // which fires the dest's _destroy; otherwise re-emit). Without this a
+        // dest 'error' has no listener and throws uncaught.
+        state.onerror = (er) => {
+          src.unpipe(dest);
+          dest.removeListener("error", state.onerror);
+          if (dest.listenerCount("error") > 0) return;
+          const ws = dest._wState;
+          const rs = dest._rState;
+          // Node's onerror discriminates on errorEmitted, NOT autoDestroy:
+          // - errorEmitted already set (the dest was torn down via
+          //   dest.destroy(err), which set it just before emitting) -> re-emit,
+          //   which throws uncaught when there's no other 'error' listener
+          //   (test-stream-pipe-error-unhandled).
+          // - not yet errored (an 'error' emitted directly on a live dest) ->
+          //   route through destroy so the dest's _destroy/autoDestroy fires
+          //   (test-stream-auto-destroy).
+          if ((ws && ws.errorEmitted) || (rs && rs.errorEmitted)) {
+            dest.emit("error", er);
+            return;
+          }
+          if ((ws && ws.destroyed) || (rs && rs.destroyed)) return;
+          if (typeof dest.destroy === "function") dest.destroy(er);
+          else dest.emit("error", er);
+        };
         src._rState._pipeEntries.push({ dest, state });
         src._rState.pipes.push(dest);
         src.on("data", state.ondata);
         dest.on("drain", state.ondrain);
         src.on("end", state.onend);
+        // Prepend so the pipe's teardown runs before any userland 'error'
+        // listener; fall back to on() when the dest nulled out prependListener
+        // (test-stream-events-prepend deliberately removes it).
+        if (typeof dest.prependListener === "function") {
+          dest.prependListener("error", state.onerror);
+        } else {
+          dest.on("error", state.onerror);
+        }
         dest.emit("pipe", src);
         // pipe() flows the source even if it was explicitly paused (Node
         // semantics) â€” backpressure re-pauses as needed.
@@ -6622,6 +6666,7 @@
           this.removeListener("data", entry.state.ondata);
           this.removeListener("end", entry.state.onend);
           entry.dest.removeListener("drain", entry.state.ondrain);
+          entry.dest.removeListener("error", entry.state.onerror);
           entry.dest.emit("unpipe", this);
         }
         s._pipeEntries = keep;
@@ -7277,6 +7322,9 @@
       get() {
         return this._wState.destroyed;
       },
+      set(value) {
+        if (this._wState) this._wState.destroyed = value;
+      },
       configurable: true,
     });
 
@@ -7350,6 +7398,10 @@
     Object.defineProperty(Duplex.prototype, "destroyed", {
       get() {
         return this._rState.destroyed || this._wState.destroyed;
+      },
+      set(value) {
+        if (this._rState) this._rState.destroyed = value;
+        if (this._wState) this._wState.destroyed = value;
       },
       configurable: true,
     });

@@ -1,5 +1,5 @@
 {
-  "commit": "6c97fcd",
+  "commit": "d58f2ef",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -202,10 +202,18 @@
         {
           "case": "49-stream-duplex-half-open.mjs",
           "status": "pass"
+        },
+        {
+          "case": "50-stream-destroyed-settable.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "51-stream-pipe-dest-error-autodestroy.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 49,
-      "total": 49
+      "pass": 51,
+      "total": 51
     },
     "surface": {
       "globals": {
