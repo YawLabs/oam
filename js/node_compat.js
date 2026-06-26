@@ -1660,6 +1660,10 @@
   registry.factories.events = () => {
     const kMax = Symbol("maxListeners");
     const errorMonitor = Symbol("events.errorMonitor");
+    // captureRejections: when set on an instance (via opts.captureRejections),
+    // emit() routes a listener's rejected thenable to the emitter's
+    // nodejs.rejection handler instead of letting it become unhandled.
+    const kCapture = Symbol("kCapture");
 
     // Lazy state init (Node parity): express-style code mixes
     // EventEmitter.prototype onto plain functions WITHOUT running the
@@ -1678,10 +1682,12 @@
     // ES6 class rejects with "Class constructor cannot be invoked without
     // 'new'". A function constructor accepts both that call form AND native
     // `class X extends EventEmitter { super() }`.
-    function EventEmitter() {
+    function EventEmitter(opts) {
       this._events = { __proto__: null };
       this._eventsCount = 0;
+      if (opts && opts.captureRejections) this[kCapture] = true;
     }
+    EventEmitter.prototype[kCapture] = false;
     EventEmitter.prototype.setMaxListeners = function (n) {
       this[kMax] = n;
       return this;
@@ -1835,7 +1841,32 @@
         return false;
       }
       const list = typeof existing === "function" ? [existing] : existing.slice();
-      for (const listener of list) listener.apply(this, args);
+      const capture = this[kCapture] === true;
+      for (const listener of list) {
+        const result = listener.apply(this, args);
+        // captureRejections: a listener returning a rejecting thenable is routed
+        // to the emitter's nodejs.rejection handler (streams override it to
+        // destroy(err)) instead of surfacing as an unhandled rejection.
+        if (capture && result != null && typeof result.then === "function") {
+          result.then(undefined, (err) => {
+            queueMicrotask(() => {
+              const onRejection = this[EventEmitter.captureRejectionSymbol];
+              if (typeof onRejection === "function") {
+                onRejection.call(this, err, type, ...args);
+              } else {
+                // Disable capture while emitting 'error' to avoid recursion.
+                const prev = this[kCapture];
+                try {
+                  this[kCapture] = false;
+                  this.emit("error", err);
+                } finally {
+                  this[kCapture] = prev;
+                }
+              }
+            });
+          });
+        }
+      }
       return true;
     };
     EventEmitter.defaultMaxListeners = 10;
@@ -5981,6 +6012,11 @@
       "stream/consumers",
       "stream/promises",
       "stream/web",
+      "_stream_readable",
+      "_stream_writable",
+      "_stream_duplex",
+      "_stream_transform",
+      "_stream_passthrough",
       "string_decoder",
       "timers",
       "timers/promises",
@@ -6311,7 +6347,7 @@
 
     class Readable extends EventEmitter {
       constructor(options = {}) {
-        super();
+        super(options);
         initReadableState(this, options);
         // A `construct` option gates reads until its callback fires. Only run
         // it here for a plain Readable -- Duplex runs it after BOTH sides init.
@@ -6472,10 +6508,28 @@
         s.endEmitted = true;
         microtask(() => {
           this.emit("end");
+          const w = this._wState;
+          // Half-open: a Duplex with allowHalfOpen===false auto-ends its
+          // writable side once the readable side ends (-> 'finish'). Read
+          // w.ended DIRECTLY -- oam's `writable` getter ignores the ended
+          // field, and test-stream-duplex-end pre-sets _writableState.ended
+          // to suppress this. Plain Readables (allowHalfOpen undefined, no
+          // _wState) and default Duplexes (allowHalfOpen true) fall through
+          // to the autoDestroy path below.
+          if (
+            this.allowHalfOpen === false &&
+            w &&
+            !w.ending &&
+            !w.ended &&
+            !w.finished &&
+            !w.destroyed
+          ) {
+            this.end();
+            return;
+          }
           // autoDestroy: a readable that has emitted 'end' destroys itself
           // (-> 'close'). For a Duplex, wait until the writable side finished.
           if (s.autoDestroy && !s.destroyed) {
-            const w = this._wState;
             const writeSideDone = !w || w.finished || w.destroyed;
             if (writeSideDone) this.destroy();
           }
@@ -6843,6 +6897,13 @@
       }
     }
 
+    // captureRejections: a Readable built with { captureRejections: true }
+    // routes a rejecting async listener to destroy(err) (Node defines this
+    // nodejs.rejection handler on Readable.prototype).
+    Readable.prototype[EventEmitter.captureRejectionSymbol] = function (err) {
+      this.destroy(err);
+    };
+
     // ------------------------------------------------------------ Writable
     function initWritableState(self, options) {
       const objectMode =
@@ -6901,11 +6962,16 @@
 
     class Writable extends EventEmitter {
       constructor(options = {}) {
-        super();
+        super(options);
         initWritableState(this, options);
         if (this._construct && new.target === Writable) runConstruct(this);
       }
     }
+
+    // captureRejections counterpart for Writable (see Readable above).
+    Writable.prototype[EventEmitter.captureRejectionSymbol] = function (err) {
+      this.destroy(err);
+    };
 
     const writableMethods = {
       _write(_chunk, _encoding, cb) {
@@ -7039,11 +7105,15 @@
             this.destroy(err);
             return;
           }
-          if (next.cb) next.cb();
+          // Node (afterWrite) emits 'drain' BEFORE running the chunk callback,
+          // so a write() issued from inside that callback re-arms needDrain and
+          // earns its own later 'drain' (test-stream-catch-rejections relies on
+          // 'drain' firing twice this way).
           if (s.queue.length === 0 && s.needDrain && !s.ending) {
             s.needDrain = false;
             this.emit("drain");
           }
+          if (next.cb) next.cb();
           this._processWrites();
         };
         try {
@@ -7257,6 +7327,10 @@
       constructor(options = {}) {
         super(options);
         initWritableState(this, options);
+        // A Duplex defaults to allowHalfOpen=true; allowHalfOpen:false makes
+        // the readable side's EOF auto-end the writable side (see
+        // _emitEndIfDrained). net.Socket / TLSSocket override this after super.
+        this.allowHalfOpen = options.allowHalfOpen !== false;
         // readable:false / writable:false pre-end the respective side
         // (test-stream-duplex-readable-writable).
         if (options.readable === false) {
@@ -7563,6 +7637,13 @@
     return Stream;
   };
   registry.factories["stream/promises"] = () => registry.get("stream").promises;
+  // Legacy internal stream module aliases: Node exposes require()able builtins
+  // that point at the public stream constructors (test-stream-aliases-legacy).
+  registry.factories["_stream_readable"] = () => registry.get("stream").Readable;
+  registry.factories["_stream_writable"] = () => registry.get("stream").Writable;
+  registry.factories["_stream_duplex"] = () => registry.get("stream").Duplex;
+  registry.factories["_stream_transform"] = () => registry.get("stream").Transform;
+  registry.factories["_stream_passthrough"] = () => registry.get("stream").PassThrough;
   registry.factories["stream/web"] = () => ({
     ReadableStream: globalThis.ReadableStream,
     WritableStream: globalThis.WritableStream,

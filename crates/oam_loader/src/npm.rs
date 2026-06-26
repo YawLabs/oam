@@ -61,7 +61,7 @@ impl ResolveMode {
 }
 
 /// Node builtin module names (bare or node:-prefixed) as of Node 26.
-const NODE_BUILTINS: [&str; 41] = [
+const NODE_BUILTINS: [&str; 46] = [
     "assert",
     "async_hooks",
     "buffer",
@@ -103,13 +103,22 @@ const NODE_BUILTINS: [&str; 41] = [
     "vm",
     "worker_threads",
     "zlib",
+    // Legacy internal stream module aliases: require()able builtins Node keeps
+    // as aliases of stream.{Readable,Writable,Duplex,Transform,PassThrough}
+    // (also reported by module.builtinModules). Mapped to the public exports
+    // by the registry factories in node_compat.js.
+    "_stream_readable",
+    "_stream_writable",
+    "_stream_duplex",
+    "_stream_transform",
+    "_stream_passthrough",
 ];
 
 /// node: compat wave 1 + wave 2 stubs — builtins that resolve to virtual
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 53] = [
+const SUPPORTED_BUILTINS: [&str; 58] = [
     "assert",
     "assert/strict",
     "async_hooks",
@@ -163,6 +172,13 @@ const SUPPORTED_BUILTINS: [&str; 53] = [
     "vm",
     "worker_threads",
     "zlib",
+    // Legacy internal stream module aliases (require()able builtins; resolve to
+    // node:_stream_* virtual paths instantiated from the registry factories).
+    "_stream_readable",
+    "_stream_writable",
+    "_stream_duplex",
+    "_stream_transform",
+    "_stream_passthrough",
 ];
 
 /// Subpath builtins Node recognizes by EXACT name. Anything else with a

@@ -1,5 +1,5 @@
 {
-  "commit": "0d44ab9",
+  "commit": "6c97fcd",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -190,10 +190,22 @@
         {
           "case": "46-stream-callable-constructors.mjs",
           "status": "pass"
+        },
+        {
+          "case": "47-stream-capture-rejections.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "48-stream-legacy-aliases.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "49-stream-duplex-half-open.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 46,
-      "total": 46
+      "pass": 49,
+      "total": 49
     },
     "surface": {
       "globals": {
