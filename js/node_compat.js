@@ -6440,7 +6440,15 @@
         if (chunk === null) {
           s.ended = true;
           s.reading = false;
-          this._emitEndIfDrained();
+          // Node does NOT set endEmitted / emit 'end' on push(null) for a
+          // paused, unconsumed stream -- end is deferred until the consumer
+          // drains it (flowing mode, or read() returning null after EOF).
+          // Emitting 'end' eagerly here wrongly flips endEmitted before
+          // consumption (breaks readableAborted). Only drain-to-end when
+          // already flowing; a paused stream signals EOF via 'readable' and
+          // ends when read() next returns null.
+          if (s.flowing) this._emitEndIfDrained();
+          else microtask(() => this.emit("readable"));
           return false;
         }
         let data = chunk;
