@@ -7466,13 +7466,32 @@
     }
     Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
     Object.setPrototypeOf(Stream, EventEmitter);
+    // Node's stream constructors are callable WITHOUT `new` (factory form):
+    // `stream.Writable({...})` returns a new instance. ES6 classes reject
+    // call-without-new, so wrap the five public exports in a Proxy whose `apply`
+    // trap constructs, and whose `construct` trap normalises new.target back to
+    // the raw class for a direct `new Export()` (so the internal
+    // `new.target === Readable/Writable/Duplex` runConstruct gates still fire)
+    // while preserving the subclass's new.target for `class X extends
+    // stream.Writable` -- which fs/http/http2/tls/zlib/child_process all rely on
+    // via registry.get("stream"). Proxy forwards .prototype (instanceof) and
+    // statics (Readable.from/Duplex.from). Internal `class Duplex extends
+    // Readable` uses the lexical raw classes, so the hierarchy is unaffected.
+    const callableCtor = (Cls) => {
+      const proxy = new Proxy(Cls, {
+        apply: (_t, _thisArg, args) => Reflect.construct(Cls, args, Cls),
+        construct: (_t, args, newTarget) =>
+          Reflect.construct(Cls, args, newTarget === proxy ? Cls : newTarget),
+      });
+      return proxy;
+    };
     Object.assign(Stream, {
       Stream,
-      Readable,
-      Writable,
-      Duplex,
-      Transform,
-      PassThrough,
+      Readable: callableCtor(Readable),
+      Writable: callableCtor(Writable),
+      Duplex: callableCtor(Duplex),
+      Transform: callableCtor(Transform),
+      PassThrough: callableCtor(PassThrough),
       pipeline,
       finished,
       promises: {
