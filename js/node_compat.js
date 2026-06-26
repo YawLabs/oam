@@ -6731,8 +6731,14 @@
         const s = this._rState;
         if (s.destroyed) return null;
         if (s.buffer.length === 0) {
-          if (s.ended) this._emitEndIfDrained();
-          else this._callRead();
+          if (s.ended) {
+            this._emitEndIfDrained();
+          } else {
+            this._callRead();
+            // A _read() that synchronously push(null)s on a paused stream sets
+            // s.ended without flowing; Node still schedules 'end' from read().
+            if (s.ended && s.buffer.length === 0) this._emitEndIfDrained();
+          }
           return null;
         }
         let out;
@@ -7441,10 +7447,16 @@
         }
         s.queue.push({ chunk: data, encoding: encoding ?? "buffer", cb });
         s.length += s.objectMode ? 1 : (data.length ?? 1);
+        // Arm needDrain from the buffered length BEFORE processing (Node's
+        // writeOrBuffer sets needDrain before calling _write): a PassThrough/
+        // Transform whose _write synchronously drains s.length would otherwise
+        // never co-satisfy the "queue empty AND needDrain" drain-emit guard in
+        // done(). The RETURN value must still reflect post-process backpressure
+        // (computing it pre-process wrongly reports false for a sync-drain
+        // Transform -> false backpressure -> zlib/gzip deadlock).
+        if (s.length >= s.highWaterMark) s.needDrain = true;
         this._processWrites();
-        const below = s.length < s.highWaterMark;
-        if (!below) s.needDrain = true;
-        return below;
+        return s.length < s.highWaterMark;
       },
 
       _processWrites() {
@@ -8427,6 +8439,61 @@
     }
     Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
     Object.setPrototypeOf(Stream, EventEmitter);
+    // Legacy Stream.prototype.pipe (Node lib/internal/streams/legacy.js): the
+    // classic streams1 pipe that older packages and the legacy Stream base rely
+    // on (modern Readable.prototype.pipe overrides it). Wires data->write with
+    // pause/resume backpressure, drain->resume, end->dest.end(), and error
+    // cleanup.
+    Stream.prototype.pipe = function pipe(dest, options) {
+      const source = this;
+      function ondata(chunk) {
+        if (dest.writable && dest.write(chunk) === false && source.pause) {
+          source.pause();
+        }
+      }
+      source.on("data", ondata);
+      function ondrain() {
+        if (source.readable && source.resume) source.resume();
+      }
+      dest.on("drain", ondrain);
+      if (!dest._isStdio && (!options || options.end !== false)) {
+        source.on("end", onend);
+        source.on("close", onclose);
+      }
+      let didOnEnd = false;
+      function onend() {
+        if (didOnEnd) return;
+        didOnEnd = true;
+        dest.end();
+      }
+      function onclose() {
+        if (didOnEnd) return;
+        didOnEnd = true;
+        if (typeof dest.destroy === "function") dest.destroy();
+      }
+      function onerror(er) {
+        cleanup();
+        if (source.listenerCount("error") === 0) throw er;
+      }
+      source.on("error", onerror);
+      dest.on("error", onerror);
+      function cleanup() {
+        source.removeListener("data", ondata);
+        dest.removeListener("drain", ondrain);
+        source.removeListener("end", onend);
+        source.removeListener("close", onclose);
+        source.removeListener("error", onerror);
+        dest.removeListener("error", onerror);
+        source.removeListener("end", cleanup);
+        source.removeListener("close", cleanup);
+        dest.removeListener("close", cleanup);
+      }
+      source.on("end", cleanup);
+      source.on("close", cleanup);
+      dest.on("close", cleanup);
+      dest.emit("pipe", source);
+      return dest;
+    };
     // Node's stream constructors are callable WITHOUT `new` (factory form):
     // `stream.Writable({...})` returns a new instance. ES6 classes reject
     // call-without-new, so wrap the five public exports in a Proxy whose `apply`
