@@ -6843,7 +6843,11 @@
         s.flushing = true;
         microtask(() => {
           s.flushing = false;
-          while (s.flowing && s.buffer.length > 0 && !s.destroyed) {
+          // Drain buffered chunks even if the stream was destroyed AFTER this
+          // flow was scheduled: Node still emits the already-buffered 'data'
+          // (the flow microtask only exists because resume() ran pre-destroy).
+          // _emitEndIfDrained's destroyed guard stops a spurious 'end'.
+          while (s.flowing && s.buffer.length > 0) {
             const chunk = s.buffer.shift();
             s.length -= s.objectMode ? 1 : (chunk.length ?? 1);
             s.dataEmitted = true;
