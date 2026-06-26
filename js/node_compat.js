@@ -7451,12 +7451,18 @@
       return last;
     }
 
-    // require('stream') IS the legacy Stream class in Node (an
-    // EventEmitter subclass with .prototype) â€” packages do
-    // util.inherits(X, require('stream')) (jws/jsonwebtoken among them),
-    // so the module export must be the CLASS, with everything else
+    // require('stream') IS the legacy Stream constructor in Node (an
+    // EventEmitter "subclass" with .prototype) -- packages do
+    // util.inherits(X, require('stream')) then Stream.call(this) in their ctor
+    // (jws/jsonwebtoken among them). An ES6 `class` rejects call-without-new, so
+    // Stream must be a FUNCTION-style constructor chaining to EventEmitter
+    // (itself a plain function for exactly this reason), with everything else
     // attached as properties.
-    class Stream extends EventEmitter {}
+    function Stream(opts) {
+      EventEmitter.call(this, opts);
+    }
+    Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
+    Object.setPrototypeOf(Stream, EventEmitter);
     Object.assign(Stream, {
       Stream,
       Readable,

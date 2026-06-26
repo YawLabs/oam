@@ -1,5 +1,5 @@
 {
-  "commit": "a987b5c",
+  "commit": "bf4bb3e",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -182,10 +182,14 @@
         {
           "case": "44-review-followup-fixes.mjs",
           "status": "pass"
+        },
+        {
+          "case": "45-legacy-stream-inherits.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 44,
-      "total": 44
+      "pass": 45,
+      "total": 45
     },
     "surface": {
       "globals": {
