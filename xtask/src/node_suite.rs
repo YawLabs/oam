@@ -27,9 +27,13 @@ use crate::conformance::{Captured, ensure_oam_built, repo_root, run_with_timeout
 const MODULES: &[&str] = &[
     "string-decoder",
     "querystring",
+    "child-process",
     "buffer",
     "events",
     "assert",
+    "stream",
+    "timers",
+    "process",
     "util",
     "url",
     "path",
@@ -430,7 +434,7 @@ fn write_scorecard(
         "oamVersion": oam_version,
         "nodeVersion": "v22.22.2",
         "host": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        "corpus": "test/parallel (pure non-I/O core modules: buffer, events, assert, util, querystring, string_decoder, url, path)",
+        "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
         "total": total,
         "runnable": runnable,
         "pass": pass,
@@ -479,7 +483,7 @@ fn write_scorecard(
             pct(c[0], s)
         ));
     }
-    md.push_str("\nCorpus: a pure non-I/O core-module cross-section of `test/parallel` (slice 2). I/O modules (fs, net, stream, child_process, http) and the full corpus + an out-of-band CI run land in later slices.\n");
+    md.push_str("\nCorpus: core modules + the I/O-adjacent `stream` / `process` / `timers` tranche. The big socket/fixture-heavy modules (fs, net, http, child_process, tls) land in later tranches. pass/runnable drops as harder modules are added -- that is the honest denominator widening toward the >85% gate, not a regression; the pass COUNT is floored by ratchet.minPass.\n");
     if !failures.is_empty() {
         md.push_str("\n## Failures (first divergence, triage backlog)\n\n");
         for (name, detail) in failures {
