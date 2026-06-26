@@ -5791,7 +5791,21 @@
 
         // Defer so listeners attached after the emitWarning call (Node defers
         // to nextTick) still fire.
-        process.nextTick(() => process.emit("warning", warningObj));
+        process.nextTick(() => {
+          process.emit("warning", warningObj);
+          // Node's built-in default 'warning' handler always writes the
+          // formatted warning to stderr (it fires even when a user listener is
+          // also present). emitWarning always builds an Error, so this path is
+          // Error-shaped; a raw-string warning emitted via process.emit(...)
+          // bypasses emitWarning and is correctly NOT printed (test-process-
+          // warning). Use name+message rather than toString() so a warning with
+          // a non-function toString does not crash. The (node:PID) prefix
+          // matches Node's format so tooling that greps warnings still works.
+          const code = warningObj.code ? `[${warningObj.code}] ` : "";
+          let line = `(node:${process.pid}) ${code}${warningObj.name}: ${warningObj.message}\n`;
+          if (typeof warningObj.detail === "string") line += `${warningObj.detail}\n`;
+          natives.stderrWrite(line);
+        });
       },
       cpuUsage: (prev) => {
         var usage = natives.processCpuUsage();
@@ -6255,7 +6269,7 @@
         highWaterMark:
           options.readableHighWaterMark ??
           options.highWaterMark ??
-          (objectMode ? 16 : 65536),
+          (objectMode ? 16 : 16384),
         buffer: [],
         length: 0,
         flowing: null, // null = neither; true = flowing; false = paused
@@ -6834,7 +6848,7 @@
         highWaterMark:
           options.writableHighWaterMark ??
           options.highWaterMark ??
-          (objectMode ? 16 : 65536),
+          (objectMode ? 16 : 16384),
         queue: [], // {chunk, encoding, cb}
         length: 0,
         writing: false,
@@ -6902,10 +6916,12 @@
         const s = this._wState;
         // Input validation (synchronous throws, matching Node) happens BEFORE
         // the ended/destroyed gate so a bad chunk throws even on a live stream.
+        // null is rejected in BOTH byte and object mode (Node throws
+        // ERR_STREAM_NULL_VALUES regardless of objectMode).
+        if (chunk === null) {
+          throw new codes.ERR_STREAM_NULL_VALUES();
+        }
         if (!s.objectMode) {
-          if (chunk === null) {
-            throw new codes.ERR_STREAM_NULL_VALUES();
-          }
           if (
             typeof chunk !== "string" &&
             !(chunk instanceof Uint8Array) &&
@@ -15624,12 +15640,21 @@
         const self = this;
         const bound = bindToCurrentFrame(this._origCallback);
         const wrapped = function () {
-          // Node invokes the callback with the handle as `this`.
-          if (!self._repeat) {
-            self._destroyed = true;
-            activeTimers.delete(self._id);
+          // Node invokes the callback with the handle as `this`, and keeps a
+          // one-shot's _destroyed === false DURING the callback so an in-callback
+          // self.refresh() can re-arm it (self-rescheduling heartbeat/poll loops).
+          // Only AFTER the callback returns -- and only if it was not refreshed/
+          // rescheduled in the meantime (the _id is unchanged) -- is a spent
+          // one-shot marked destroyed and dropped from the active set.
+          const firedId = self._id;
+          try {
+            return bound.apply(self, self._args);
+          } finally {
+            if (!self._repeat && self._id === firedId) {
+              self._destroyed = true;
+              activeTimers.delete(self._id);
+            }
           }
-          return bound.apply(self, self._args);
         };
         const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
         this._id = native(wrapped, this._delay, ...this._args);
@@ -15648,7 +15673,11 @@
         return this._ref;
       };
       Timeout.prototype.refresh = function refresh() {
-        if (this._destroyed) return this;
+        // An explicitly-cleared timer (clearTimeout/close set _idleTimeout = -1)
+        // is terminal -- refresh() is a no-op, matching Node. A timer that merely
+        // FIRED keeps a non-negative _idleTimeout and re-arms here, so a
+        // self-rescheduling setTimeout(..., t.refresh()) loop keeps running.
+        if (this._idleTimeout < 0) return this;
         const native = this._repeat ? nativeClearInterval : nativeClearTimeout;
         native(this._id);
         activeTimers.delete(this._id);
@@ -15660,6 +15689,7 @@
         native(this._id);
         activeTimers.delete(this._id);
         this._destroyed = true;
+        this._idleTimeout = -1; // terminal: a later refresh() must no-op (Node parity)
         return this;
       };
       Timeout.prototype[Symbol.toPrimitive] = function () {
@@ -15694,6 +15724,7 @@
         const id = idOf(handle);
         if (handle != null && typeof handle === "object" && handle._id !== undefined) {
           handle._destroyed = true;
+          handle._idleTimeout = -1; // terminal: a later refresh() must no-op (Node parity)
           activeTimers.delete(handle._id);
         } else {
           activeTimers.delete(id);
