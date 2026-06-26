@@ -1881,18 +1881,61 @@
     EventEmitter.defaultMaxListeners = 10;
     EventEmitter.errorMonitor = errorMonitor;
 
-    function once(emitter, type) {
+    function once(emitter, type, options) {
+      const signal = options ? options.signal : undefined;
+      if (signal && signal.aborted) {
+        return Promise.reject(
+          new (globalThis.DOMException ?? Error)(
+            "The operation was aborted",
+            "AbortError",
+          ),
+        );
+      }
+      // Support BOTH EventEmitter (.once/.removeListener) and EventTarget
+      // (AbortSignal et al, .addEventListener/.removeEventListener), the way
+      // Node's events.once does -- the stream operator tests await
+      // once(abortSignal, 'abort') inside a mapper.
+      const isEventTarget =
+        typeof emitter.once !== "function" &&
+        typeof emitter.addEventListener === "function";
       return new Promise((resolve, reject) => {
         const onEvent = (...args) => {
-          emitter.removeListener("error", onError);
+          if (isEventTarget) {
+            if (type !== "error" && typeof emitter.removeEventListener === "function") {
+              emitter.removeEventListener("error", onError);
+            }
+          } else {
+            emitter.removeListener("error", onError);
+          }
           resolve(args);
         };
         const onError = (err) => {
-          emitter.removeListener(type, onEvent);
+          if (isEventTarget) emitter.removeEventListener(type, onEvent);
+          else emitter.removeListener(type, onEvent);
           reject(err);
         };
-        emitter.once(type, onEvent);
-        if (type !== "error") emitter.once("error", onError);
+        if (isEventTarget) {
+          emitter.addEventListener(type, onEvent, { once: true });
+        } else {
+          emitter.once(type, onEvent);
+          if (type !== "error") emitter.once("error", onError);
+        }
+        if (signal) {
+          signal.addEventListener(
+            "abort",
+            () => {
+              if (isEventTarget) emitter.removeEventListener(type, onEvent);
+              else emitter.removeListener(type, onEvent);
+              reject(
+                new (globalThis.DOMException ?? Error)(
+                  "The operation was aborted",
+                  "AbortError",
+                ),
+              );
+            },
+            { once: true },
+          );
+        }
       });
     }
 
@@ -6360,6 +6403,184 @@
       if (options.construct) self._construct = options.construct;
     }
 
+    // ------------------------------------------------------------------------
+    // Node v22 async-iterator helpers (lib/internal/streams/operators.js).
+    // streamOpMapIterable is the concurrency-bounded, order-preserving mapping
+    // core; filter/flatMap/forEach/some/every/find build on it, drop/take are
+    // count-based slices, reduce/toArray consume the stream directly. The
+    // Readable methods below wrap the stream-returning operators with
+    // Readable.from -- which pulls ONE value per read() via iterator.next(), so
+    // the source generator is never re-entered. That is the fix for the
+    // "stream.push() after EOF" crash the old naive helpers hit: those did
+    // new Readable({ async read(){ for await(c of src){...} this.push(null) } }),
+    // and oam re-invokes read() while the first drain is still awaiting, so a
+    // second read() re-entered the consumed source and pushed null twice.
+    // ------------------------------------------------------------------------
+    const kStreamOpEmpty = Symbol("kStreamOpEmpty");
+    const kStreamOpEof = Symbol("kStreamOpEof");
+    function streamOpAbortError() {
+      return new (globalThis.DOMException ?? Error)(
+        "The operation was aborted",
+        "AbortError",
+      );
+    }
+    function streamOpValidateFunction(value, name) {
+      if (typeof value !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "Function", value);
+      }
+    }
+    function streamOpValidateObject(value, name) {
+      if (value === null || typeof value !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "Object", value);
+      }
+    }
+    function streamOpValidateAbortSignal(signal, name) {
+      if (
+        signal !== undefined &&
+        (signal === null || typeof signal !== "object" || !("aborted" in signal))
+      ) {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "AbortSignal", signal);
+      }
+    }
+    function streamOpValidateInteger(value, name, min, max) {
+      if (typeof value !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      }
+      if (!Number.isInteger(value)) {
+        throw new codes.ERR_OUT_OF_RANGE(name, "an integer", value);
+      }
+      if (value < min || value > max) {
+        throw new codes.ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
+      }
+    }
+    function streamOpToIntegerOrInfinity(number) {
+      number = Number(number);
+      if (Number.isNaN(number)) return 0;
+      if (number < 0) throw new codes.ERR_OUT_OF_RANGE("number", ">= 0", number);
+      return number;
+    }
+    function streamOpMapIterable(self, fn, options) {
+      streamOpValidateFunction(fn, "fn");
+      if (options != null) streamOpValidateObject(options, "options");
+      if (options != null && options.signal != null) {
+        streamOpValidateAbortSignal(options.signal, "options.signal");
+      }
+      let concurrency = 1;
+      if (options != null && options.concurrency != null) {
+        concurrency = Math.floor(options.concurrency);
+      }
+      let highWaterMark = concurrency - 1;
+      if (options != null && options.highWaterMark != null) {
+        highWaterMark = Math.floor(options.highWaterMark);
+      }
+      streamOpValidateInteger(concurrency, "options.concurrency", 1, Number.MAX_SAFE_INTEGER);
+      streamOpValidateInteger(highWaterMark, "options.highWaterMark", 0, Number.MAX_SAFE_INTEGER);
+      highWaterMark += concurrency;
+      return (async function* map() {
+        const signal = (options && options.signal) || new AbortController().signal;
+        const stream = this;
+        const queue = [];
+        const signalOpt = { signal };
+        let next;
+        let resume;
+        let done = false;
+        let cnt = 0;
+        function onCatch() {
+          done = true;
+          afterItemProcessed();
+        }
+        function afterItemProcessed() {
+          cnt -= 1;
+          maybeResume();
+        }
+        function maybeResume() {
+          if (resume && !done && cnt < concurrency && queue.length < highWaterMark) {
+            resume();
+            resume = null;
+          }
+        }
+        async function pump() {
+          // oam's stream async-iterator only keeps an 'error' listener while it
+          // is parked awaiting the next chunk, so an 'error' emitted at any other
+          // moment (a direct stream.emit('error') from a mapper, or the redundant
+          // emit from destroy(err)) has no handler and throws uncaught. A
+          // persistent listener recording the error into the iterator-polled
+          // `errored` field absorbs the emit AND still propagates it.
+          if (stream && stream._rState && typeof stream.on === "function") {
+            stream.on("error", (err) => {
+              stream._rState.errored = stream._rState.errored ?? err;
+            });
+          }
+          try {
+            for await (let val of stream) {
+              if (done) return;
+              if (signal.aborted) throw streamOpAbortError();
+              try {
+                val = fn(val, signalOpt);
+                if (val === kStreamOpEmpty) continue;
+                val = Promise.resolve(val);
+              } catch (err) {
+                val = Promise.reject(err);
+              }
+              cnt += 1;
+              val.then(afterItemProcessed, onCatch);
+              queue.push(val);
+              if (next) {
+                next();
+                next = null;
+              }
+              if (!done && (queue.length >= highWaterMark || cnt >= concurrency)) {
+                await new Promise((r) => {
+                  resume = r;
+                });
+              }
+            }
+            queue.push(kStreamOpEof);
+          } catch (err) {
+            const val = Promise.reject(err);
+            val.then(afterItemProcessed, onCatch);
+            queue.push(val);
+          } finally {
+            done = true;
+            if (next) {
+              next();
+              next = null;
+            }
+          }
+        }
+        pump();
+        try {
+          while (true) {
+            while (queue.length > 0) {
+              const val = await queue[0];
+              if (val === kStreamOpEof) return;
+              if (signal.aborted) throw streamOpAbortError();
+              if (val !== kStreamOpEmpty) yield val;
+              queue.shift();
+              maybeResume();
+            }
+            await new Promise((r) => {
+              next = r;
+            });
+          }
+        } finally {
+          done = true;
+          if (resume) {
+            resume();
+            resume = null;
+          }
+        }
+      }).call(self);
+    }
+    function streamOpFilter(self, fn, options) {
+      streamOpValidateFunction(fn, "fn");
+      async function filterFn(value, opts) {
+        if (await fn(value, opts)) return value;
+        return kStreamOpEmpty;
+      }
+      return streamOpMapIterable(self, filterFn, options);
+    }
+
     class Readable extends EventEmitter {
       constructor(options = {}) {
         super(options);
@@ -6478,7 +6699,10 @@
         const s = this._rState;
         if (this._constructState && this._constructState.constructing) return;
         if (s.reading || s.ended || s.destroyed) return;
-        if (s.length >= s.highWaterMark) return;
+        // hwm 0 must still pull one chunk when the buffer is empty (Node reads
+        // on demand at hwm 0); the bare `>= highWaterMark` guard would never
+        // read at hwm 0, so a Readable({ read, highWaterMark: 0 }) never produces.
+        if (s.length >= s.highWaterMark && s.length > 0) return;
         s.reading = true;
         try {
           const result = this._read(s.highWaterMark);
@@ -6763,142 +6987,149 @@
         };
       }
 
-      map(fn) {
-        const src = this;
-        return new Readable({
-          objectMode: true,
-          async read() {
-            for await (const chunk of src) {
-              var result = fn(chunk);
-              if (result && typeof result.then === "function") result = await result;
-              this.push(result);
-            }
-            this.push(null);
-          },
-        });
+      map(fn, options) {
+        return Readable.from(streamOpMapIterable(this, fn, options));
       }
 
-      filter(fn) {
-        const src = this;
-        return new Readable({
-          objectMode: true,
-          async read() {
-            for await (const chunk of src) {
-              var keep = fn(chunk);
-              if (keep && typeof keep.then === "function") keep = await keep;
-              if (keep) this.push(chunk);
-            }
-            this.push(null);
-          },
-        });
+      filter(fn, options) {
+        return Readable.from(streamOpFilter(this, fn, options));
       }
 
-      async reduce(fn, initial) {
-        var acc = initial;
-        var first = true;
-        for await (const chunk of this) {
-          if (first && acc === undefined) {
-            acc = chunk;
-            first = false;
-            continue;
+      async reduce(reducer, initialValue, options) {
+        streamOpValidateFunction(reducer, "reducer");
+        if (options != null) streamOpValidateObject(options, "options");
+        if (options != null && options.signal != null) {
+          streamOpValidateAbortSignal(options.signal, "options.signal");
+        }
+        let hasInitialValue = arguments.length > 1;
+        if (options != null && options.signal != null && options.signal.aborted) {
+          const err = streamOpAbortError();
+          this.once("error", () => {});
+          this.destroy(err);
+          throw err;
+        }
+        const ac = new AbortController();
+        const signal = ac.signal;
+        if (options != null && options.signal) {
+          options.signal.addEventListener("abort", () => ac.abort(), { once: true });
+        }
+        let gotAnyItemFromStream = false;
+        try {
+          for await (const value of this) {
+            gotAnyItemFromStream = true;
+            if (options != null && options.signal != null && options.signal.aborted) {
+              throw streamOpAbortError();
+            }
+            if (!hasInitialValue) {
+              initialValue = value;
+              hasInitialValue = true;
+            } else {
+              initialValue = await reducer(initialValue, value, { signal });
+            }
           }
-          first = false;
-          acc = fn(acc, chunk);
-          if (acc && typeof acc.then === "function") acc = await acc;
+          if (!gotAnyItemFromStream && !hasInitialValue) {
+            throw new codes.ERR_MISSING_ARGS("reduce");
+          }
+        } finally {
+          ac.abort();
         }
-        return acc;
+        return initialValue;
       }
 
-      async toArray() {
-        const arr = [];
-        for await (const chunk of this) arr.push(chunk);
-        return arr;
-      }
-
-      async forEach(fn) {
-        for await (const chunk of this) {
-          var r = fn(chunk);
-          if (r && typeof r.then === "function") await r;
+      async toArray(options) {
+        if (options != null) streamOpValidateObject(options, "options");
+        if (options != null && options.signal != null) {
+          streamOpValidateAbortSignal(options.signal, "options.signal");
         }
+        const result = [];
+        for await (const chunk of this) {
+          if (options != null && options.signal != null && options.signal.aborted) {
+            throw streamOpAbortError();
+          }
+          result.push(chunk);
+        }
+        return result;
       }
 
-      async some(fn) {
-        for await (const chunk of this) {
-          var result = fn(chunk);
-          if (result && typeof result.then === "function") result = await result;
-          if (result) return true;
+      async forEach(fn, options) {
+        streamOpValidateFunction(fn, "fn");
+        async function forEachFn(value, opts) {
+          await fn(value, opts);
+          return kStreamOpEmpty;
+        }
+        // eslint-disable-next-line no-unused-vars
+        for await (const unused of streamOpMapIterable(this, forEachFn, options));
+      }
+
+      async some(fn, options = undefined) {
+        for await (const unused of streamOpFilter(this, fn, options)) {
+          return true;
         }
         return false;
       }
 
-      async every(fn) {
-        for await (const chunk of this) {
-          var result = fn(chunk);
-          if (result && typeof result.then === "function") result = await result;
-          if (!result) return false;
-        }
-        return true;
+      async every(fn, options = undefined) {
+        streamOpValidateFunction(fn, "fn");
+        return !(await this.some(async (...args) => !(await fn(...args)), options));
       }
 
-      async find(fn) {
-        for await (const chunk of this) {
-          var result = fn(chunk);
-          if (result && typeof result.then === "function") result = await result;
-          if (result) return chunk;
+      async find(fn, options) {
+        for await (const result of streamOpFilter(this, fn, options)) {
+          return result;
         }
         return undefined;
       }
 
-      flatMap(fn) {
-        const src = this;
-        return new Readable({
-          objectMode: true,
-          async read() {
-            for await (const chunk of src) {
-              var result = fn(chunk);
-              if (result && typeof result.then === "function") result = await result;
-              if (result != null && typeof result[Symbol.asyncIterator] === "function") {
-                for await (const item of result) this.push(item);
-              } else if (result != null && typeof result[Symbol.iterator] === "function" && typeof result !== "string") {
-                for (const item of result) this.push(item);
-              } else {
-                this.push(result);
+      flatMap(fn, options) {
+        const values = streamOpMapIterable(this, fn, options);
+        return Readable.from(
+          (async function* flatMap() {
+            for await (const val of values) yield* val;
+          })(),
+        );
+      }
+
+      drop(number, options = undefined) {
+        if (options != null) streamOpValidateObject(options, "options");
+        if (options != null && options.signal != null) {
+          streamOpValidateAbortSignal(options.signal, "options.signal");
+        }
+        number = streamOpToIntegerOrInfinity(number);
+        return Readable.from(
+          (async function* drop() {
+            if (options != null && options.signal != null && options.signal.aborted) {
+              throw streamOpAbortError();
+            }
+            for await (const val of this) {
+              if (options != null && options.signal != null && options.signal.aborted) {
+                throw streamOpAbortError();
               }
+              if (number-- <= 0) yield val;
             }
-            this.push(null);
-          },
-        });
+          }).call(this),
+        );
       }
 
-      drop(n) {
-        const src = this;
-        return new Readable({
-          objectMode: true,
-          async read() {
-            var skipped = 0;
-            for await (const chunk of src) {
-              if (skipped < n) { skipped++; continue; }
-              this.push(chunk);
+      take(number, options = undefined) {
+        if (options != null) streamOpValidateObject(options, "options");
+        if (options != null && options.signal != null) {
+          streamOpValidateAbortSignal(options.signal, "options.signal");
+        }
+        number = streamOpToIntegerOrInfinity(number);
+        return Readable.from(
+          (async function* take() {
+            if (options != null && options.signal != null && options.signal.aborted) {
+              throw streamOpAbortError();
             }
-            this.push(null);
-          },
-        });
-      }
-
-      take(n) {
-        const src = this;
-        return new Readable({
-          objectMode: true,
-          async read() {
-            var taken = 0;
-            for await (const chunk of src) {
-              this.push(chunk);
-              taken++;
-              if (taken >= n) break;
+            for await (const val of this) {
+              if (options != null && options.signal != null && options.signal.aborted) {
+                throw streamOpAbortError();
+              }
+              if (number-- > 0) yield val;
+              if (number <= 0) return;
             }
-            this.push(null);
-          },
-        });
+          }).call(this),
+        );
       }
 
       compose(stream, options) {
@@ -6976,11 +7207,11 @@
         return composed;
       }
 
-            static from(iterable) {
+            static from(iterable, options) {
         const iterator =
           iterable[Symbol.asyncIterator]?.() ?? iterable[Symbol.iterator]?.();
         if (!iterator) throw new TypeError("Readable.from requires an iterable");
-        return new Readable({
+        const readable = new Readable({
           objectMode: true,
           async read() {
             try {
@@ -6996,6 +7227,27 @@
             }
           },
         });
+        // A `signal` option destroys the stream with an AbortError on abort
+        // (Node wires this via the Readable constructor's signal option;
+        // test-stream-forEach builds Readable.from(gen, { signal }) and aborts
+        // mid-iteration). The destroy is deferred to a microtask so the
+        // consumer's async iterator attaches before the error lands.
+        const signal = options ? options.signal : undefined;
+        if (signal) {
+          const onAbort = () => {
+            if (!readable.destroyed) {
+              readable.destroy(
+                new (globalThis.DOMException ?? Error)(
+                  "The operation was aborted",
+                  "AbortError",
+                ),
+              );
+            }
+          };
+          if (signal.aborted) microtask(onAbort);
+          else signal.addEventListener("abort", () => microtask(onAbort), { once: true });
+        }
+        return readable;
       }
 
       static fromWeb(webStream, options = {}) {

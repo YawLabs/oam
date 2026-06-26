@@ -1,5 +1,5 @@
 {
-  "commit": "9b9fb05",
+  "commit": "1c92abb",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -218,10 +218,14 @@
         {
           "case": "53-stream-readable-writable-getters.mjs",
           "status": "pass"
+        },
+        {
+          "case": "54-stream-async-iterator-helpers.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 53,
-      "total": 53
+      "pass": 54,
+      "total": 54
     },
     "surface": {
       "globals": {
