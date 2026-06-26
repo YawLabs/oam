@@ -1743,7 +1743,16 @@
       return this._add(type, listener, false, false);
     };
     EventEmitter.prototype.once = function (type, listener) {
-      return this._add(type, listener, false, true);
+      if (typeof listener !== "function") {
+        throw new TypeError(`The "listener" argument must be a function`);
+      }
+      const wrapper = (...args) => {
+        this.removeListener(type, wrapper);
+        return listener.apply(this, args);
+      };
+      wrapper.listener = listener;
+      this.on(type, wrapper);
+      return this;
     };
     EventEmitter.prototype.prependListener = function (type, listener) {
       return this._add(type, listener, true, false);
@@ -6538,7 +6547,7 @@
           // autoDestroy: a readable that has emitted 'end' destroys itself
           // (-> 'close'). For a Duplex, wait until the writable side finished.
           if (s.autoDestroy && !s.destroyed) {
-            const writeSideDone = !w || w.finished || w.destroyed;
+            const writeSideDone = !w || (w.finished && !w.finalizing) || w.destroyed;
             if (writeSideDone) this.destroy();
           }
         });
@@ -6864,6 +6873,81 @@
             this.push(null);
           },
         });
+      }
+
+      compose(stream, options) {
+        // Validate options / signal synchronously (Node throws here, before any
+        // async work): compose() with no/invalid argument is ERR_INVALID_ARG_TYPE;
+        // a non-writable node stream (e.g. another Readable) is ERR_INVALID_ARG_VALUE.
+        if (options != null && typeof options !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        const signal = options ? options.signal : undefined;
+        if (
+          signal != null &&
+          !(typeof signal === "object" &&
+            typeof signal.addEventListener === "function" &&
+            "aborted" in signal)
+        ) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+        }
+        const isNodeStream =
+          !!stream && (stream._rState !== undefined || stream._wState !== undefined);
+        const isWritableStream = !!stream && stream._wState !== undefined;
+        if (isNodeStream && !isWritableStream) {
+          throw new codes.ERR_INVALID_ARG_VALUE("stream", stream, "must be writable");
+        }
+        // Resolve `stream` to an async iterable of composed output: a function
+        // (sync/async generator) is invoked with `this` as its source; a writable
+        // node stream (Transform/Duplex) is fed by `this` via pipe and its
+        // readable side IS the output.
+        const src = this;
+        let iterable;
+        if (typeof stream === "function") {
+          iterable = stream(src);
+        } else if (isWritableStream) {
+          src.pipe(stream);
+          iterable = stream;
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE(
+            "stream",
+            ["Stream", "Iterable", "AsyncIterable", "Function"],
+            stream,
+          );
+        }
+        const composed = new Readable({ objectMode: true, read() {} });
+        (async () => {
+          try {
+            for await (const chunk of iterable) {
+              if (composed.destroyed) break;
+              composed.push(chunk);
+            }
+            if (!composed.destroyed) composed.push(null);
+          } catch (e) {
+            if (!composed.destroyed) composed.destroy(e);
+          }
+        })();
+        // AbortSignal wiring. The destroy MUST be deferred to a microtask: a
+        // synchronous abort (signal already aborted, or aborted right after
+        // compose() returns and before the consumer iterates) would set `errored`
+        // before the consumer's async iterator attaches its 'error' listener,
+        // turning destroy's 'error' emit into an UNCAUGHT throw. Deferring lets the
+        // consumer attach first, so the AbortError lands on the composed stream.
+        if (signal) {
+          const onAbort = () => {
+            if (composed.destroyed) return;
+            composed.destroy(
+              signal.reason ??
+                new (globalThis.DOMException ?? Error)(
+                  "The operation was aborted",
+                  "AbortError",
+                ),
+            );
+          };
+          if (signal.aborted) microtask(onAbort);
+          else signal.addEventListener("abort", () => microtask(onAbort), { once: true });
+        }
+        return composed;
       }
 
             static from(iterable) {
@@ -7198,9 +7282,11 @@
         };
         if (this._final) {
           let called = false;
+          s.finalizing = true;
           const cb = (err) => {
             if (called) return;
             called = true;
+            s.finalizing = false;
             if (err) this.destroy(err);
             else complete();
           };
@@ -7414,32 +7500,499 @@
       configurable: true,
     });
 
-    // ----------------------------------------------------------- Transform
-    Duplex.from = function duplexFrom(source) {
-      if (source && typeof source.pipe === "function" && typeof source.write === "function") return source;
-      if (source && typeof source[Symbol.asyncIterator] === "function") {
-        return new Duplex({
-          objectMode: true,
-          write(chunk, enc, cb) { cb(); },
-          async read() {
-            for await (var v of source) { if (!this.push(v)) break; }
-            this.push(null);
-          },
-        });
+    // --------------------------------------------- compose / Duplex.from
+    // Faithful port of Node's internal/streams/{utils,from,duplexify,compose}
+    // and a general internal/streams/pipeline. Built on the lexical Readable/
+    // Writable/Duplex/Transform/PassThrough/finished classes above and the
+    // outer `codes` registry, so `stream.compose`, `Duplex.from`, and the
+    // function/iterable forms of `pipeline` accept every Node source shape
+    // (stream, async-generator-function, async-function, iterable, string,
+    // Buffer, Promise, Blob, { readable, writable } pair, web streams).
+    function isNodeStream(obj) {
+      return !!(obj && (obj._readableState || obj._writableState ||
+        (typeof obj.write === "function" && typeof obj.on === "function") ||
+        (typeof obj.pipe === "function" && typeof obj.on === "function")));
+    }
+    function isReadableNodeStream(obj, strict) {
+      return !!(obj && typeof obj.pipe === "function" && typeof obj.on === "function" &&
+        (!strict || (typeof obj.pause === "function" && typeof obj.resume === "function")) &&
+        (!obj._writableState || (obj._readableState && obj._readableState.readable !== false)) &&
+        (!obj._writableState || obj._readableState));
+    }
+    function isWritableNodeStream(obj) {
+      return !!(obj && typeof obj.write === "function" && typeof obj.on === "function" &&
+        (!obj._readableState || (obj._writableState && obj._writableState.writable !== false)));
+    }
+    function isDuplexNodeStream(obj) {
+      return !!(obj && typeof obj.pipe === "function" && obj._readableState &&
+        typeof obj.on === "function" && typeof obj.write === "function");
+    }
+    function isReadableStreamWeb(obj) {
+      return !!(obj && !isNodeStream(obj) && typeof obj.pipeThrough === "function" &&
+        typeof obj.getReader === "function" && typeof obj.cancel === "function");
+    }
+    function isWritableStreamWeb(obj) {
+      return !!(obj && !isNodeStream(obj) && typeof obj.getWriter === "function" &&
+        typeof obj.abort === "function");
+    }
+    function isTransformStreamWeb(obj) {
+      return !!(obj && !isNodeStream(obj) && typeof obj.readable === "object" &&
+        typeof obj.writable === "object");
+    }
+    function isWebStream(obj) {
+      return isReadableStreamWeb(obj) || isWritableStreamWeb(obj) || isTransformStreamWeb(obj);
+    }
+    function isIterable(obj, isAsync) {
+      if (obj == null) return false;
+      if (isAsync === true) return typeof obj[Symbol.asyncIterator] === "function";
+      if (isAsync === false) return typeof obj[Symbol.iterator] === "function";
+      return typeof obj[Symbol.asyncIterator] === "function" || typeof obj[Symbol.iterator] === "function";
+    }
+    function isDestroyed(stream) {
+      return !!(stream && ((stream._readableState && stream._readableState.destroyed) ||
+        (stream._writableState && stream._writableState.destroyed)));
+    }
+    function isReadableFinished(stream) {
+      if (!isReadableNodeStream(stream)) return null;
+      const r = stream._readableState;
+      if (r && r.errored) return false;
+      if (typeof (r && r.endEmitted) !== "boolean") return null;
+      return !!r.endEmitted;
+    }
+    function isWritableEnded(stream) {
+      if (!isWritableNodeStream(stream)) return null;
+      if (stream.writableEnded === true) return true;
+      const w = stream._writableState;
+      if (w && w.errored) return false;
+      if (typeof (w && w.ended) !== "boolean") return null;
+      return w.ended;
+    }
+    function isReadableLike(stream) {
+      if (typeof (stream && stream.readable) !== "boolean") return null;
+      if (isDestroyed(stream)) return false;
+      return isReadableNodeStream(stream) && stream.readable && !isReadableFinished(stream);
+    }
+    function isWritableLike(stream) {
+      if (typeof (stream && stream.writable) !== "boolean") return null;
+      if (isDestroyed(stream)) return false;
+      return isWritableNodeStream(stream) && stream.writable && !isWritableEnded(stream);
+    }
+    function isBlobLike(b) {
+      return !!(b && typeof b.arrayBuffer === "function" && typeof b.size === "number" &&
+        typeof b.stream === "function" && !isNodeStream(b));
+    }
+    function destroyer(stream, err) {
+      if (stream && typeof stream.destroy === "function") stream.destroy(err);
+    }
+    function makeAbortError() {
+      return new (globalThis.DOMException ?? Error)("The operation was aborted", "AbortError");
+    }
+
+    // Port of internal/streams/from -- build a Readable (or Duplex subclass
+    // `RCtor`) that pulls from a sync/async iterable.
+    function streamFrom(RCtor, iterable, opts) {
+      let iterator;
+      if (typeof iterable === "string" || (BufferCtor.isBuffer && BufferCtor.isBuffer(iterable))) {
+        return new RCtor({ objectMode: true, ...opts, read() { this.push(iterable); this.push(null); } });
       }
-      if (source && typeof source.readable === "object" && typeof source.writable === "object") {
-        var d = new Duplex({
-          write(chunk, enc, cb) { source.writable.write(chunk); cb(); },
-          read() {},
-        });
-        if (source.readable && typeof source.readable.on === "function") {
-          source.readable.on("data", function(ch) { d.push(ch); });
-          source.readable.on("end", function() { d.push(null); });
+      let isAsync;
+      if (iterable && iterable[Symbol.asyncIterator]) { isAsync = true; iterator = iterable[Symbol.asyncIterator](); }
+      else if (iterable && iterable[Symbol.iterator]) { isAsync = false; iterator = iterable[Symbol.iterator](); }
+      else throw new codes.ERR_INVALID_ARG_TYPE("iterable", ["Iterable"], iterable);
+
+      const readable = new RCtor({ objectMode: true, highWaterMark: 1, ...opts });
+      let reading = false;
+      readable._read = function () { if (!reading) { reading = true; next(); } };
+      readable._destroy = function (error, cb) {
+        Promise.resolve(close(error)).then(() => process.nextTick(cb, error), (e) => process.nextTick(cb, e || error));
+      };
+      async function close(error) {
+        const hadError = (error !== undefined) && (error !== null);
+        const hasThrow = typeof iterator.throw === "function";
+        if (hadError && hasThrow) { const { value, done } = await iterator.throw(error); await value; if (done) return; }
+        if (typeof iterator.return === "function") { const { value } = await iterator.return(); await value; }
+      }
+      async function next() {
+        for (;;) {
+          try {
+            const { value, done } = isAsync ? await iterator.next() : iterator.next();
+            if (done) { readable.push(null); return; }
+            const res = (value && typeof value.then === "function") ? await value : value;
+            if (res === null) { reading = false; throw new codes.ERR_STREAM_NULL_VALUES(); }
+            if (readable.push(res)) continue;
+            reading = false;
+          } catch (err) { readable.destroy(err); }
+          break;
         }
-        return d;
       }
-      throw new TypeError("Duplex.from: unsupported source");
-    };
+      return readable;
+    }
+
+    function createDeferredPromise() {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    }
+    // Port of duplexify.js fromAsyncGen -- drives a user (async-)generator: the
+    // duplex's writes feed the generator's `source`, its yields are read out.
+    function fromAsyncGen(fn) {
+      let { promise, resolve } = createDeferredPromise();
+      const ac = new AbortController();
+      const signal = ac.signal;
+      const value = fn(async function* () {
+        while (true) {
+          const _promise = promise;
+          const { chunk, done, cb } = await _promise;
+          process.nextTick(cb);
+          if (done) return;
+          if (signal.aborted) throw makeAbortError();
+          ({ promise, resolve } = createDeferredPromise());
+          yield chunk;
+        }
+      }(), { signal });
+      return {
+        value,
+        write(chunk, encoding, cb) { const _resolve = resolve; resolve = null; _resolve({ chunk, done: false, cb }); },
+        final(cb) { const _resolve = resolve; resolve = null; _resolve({ done: true, cb }); },
+        destroy(err, cb) { ac.abort(); cb(err); },
+      };
+    }
+
+    // Port of duplexify.js _duplexify -- bridge a { readable, writable } pair of
+    // Node streams into a single Duplex.
+    function bridgeDuplex(pair) {
+      const r = pair.readable;
+      const w = pair.writable;
+      let readable = !!isReadableLike(r);
+      let writable = !!isWritableLike(w);
+      let ondrain, onfinish, onreadable, onclose, d;
+
+      function onfinished(err) {
+        const cb = onclose;
+        onclose = null;
+        if (cb) cb(err);
+        else if (err) d.destroy(err);
+      }
+
+      d = new Duplex({
+        readableObjectMode: !!(r && r.readableObjectMode),
+        writableObjectMode: !!(w && w.writableObjectMode),
+        readable,
+        writable,
+      });
+
+      if (writable) {
+        finished(w, {}, (err) => { writable = false; if (err) destroyer(r, err); onfinished(err); });
+        d._write = function (chunk, encoding, callback) {
+          if (w.write(chunk, encoding)) callback(); else ondrain = callback;
+        };
+        d._final = function (callback) { w.end(); onfinish = callback; };
+        w.on("drain", function () { if (ondrain) { const cb = ondrain; ondrain = null; cb(); } });
+        w.on("finish", function () { if (onfinish) { const cb = onfinish; onfinish = null; cb(); } });
+      }
+
+      if (readable) {
+        finished(r, {}, (err) => { readable = false; if (err) destroyer(r, err); onfinished(err); });
+        r.on("readable", function () { if (onreadable) { const cb = onreadable; onreadable = null; cb(); } });
+        r.on("end", function () { d.push(null); });
+        d._read = function () {
+          while (true) {
+            const buf = r.read();
+            if (buf === null) { onreadable = d._read; return; }
+            if (!d.push(buf)) return;
+          }
+        };
+      }
+
+      d._destroy = function (err, callback) {
+        if (!err && onclose != null) err = makeAbortError();
+        onreadable = null; ondrain = null; onfinish = null;
+        if (onclose == null) { destroyer(w, err); destroyer(r, err); callback(err); }
+        else { onclose = callback; destroyer(w, err); destroyer(r, err); }
+      };
+      return d;
+    }
+
+    // Port of duplexify.js -- the implementation behind `Duplex.from`. Branch
+    // order matters (Node-faithful): node Duplex, then bare Readable / Writable,
+    // bare web streams, function, Blob, iterable, { readable, writable } object,
+    // thenable. async-iterable is checked LAST so oam streams (which ARE async-
+    // iterable) hit their stream branch first.
+    function duplexify(body, name) {
+      if (isDuplexNodeStream(body)) return body;
+      if (isReadableNodeStream(body)) return bridgeDuplex({ readable: body });
+      if (isWritableNodeStream(body)) return bridgeDuplex({ writable: body });
+      if (isNodeStream(body)) return bridgeDuplex({ writable: false, readable: false });
+      if (isReadableStreamWeb(body)) return bridgeDuplex({ readable: Readable.fromWeb(body) });
+      if (isWritableStreamWeb(body)) return bridgeDuplex({ writable: Writable.fromWeb(body) });
+
+      if (typeof body === "function") {
+        const { value, write, final, destroy } = fromAsyncGen(body);
+        if (isDuplexNodeStream(value)) return value;
+        if (isIterable(value)) {
+          return streamFrom(Duplex, value, { objectMode: true, write, final, destroy });
+        }
+        const then = value && value.then;
+        if (typeof then === "function") {
+          let d;
+          const promise = then.call(value,
+            (val) => { if (val != null) throw new codes.ERR_INVALID_RETURN_VALUE("nully", "body", val); },
+            (err) => { destroyer(d, err); });
+          return (d = new Duplex({
+            objectMode: true, readable: false, write,
+            final(cb) { final(async () => { try { await promise; process.nextTick(cb, null); } catch (err) { process.nextTick(cb, err); } }); },
+            destroy,
+          }));
+        }
+        throw new codes.ERR_INVALID_RETURN_VALUE("Iterable, AsyncIterable or AsyncFunction", name, value);
+      }
+
+      if (isBlobLike(body)) return duplexify(body.arrayBuffer());
+
+      if (isIterable(body)) {
+        return streamFrom(Duplex, body, { objectMode: true, writable: false });
+      }
+
+      if (typeof (body && body.writable) === "object" || typeof (body && body.readable) === "object") {
+        const readable = body && body.readable ?
+          (isReadableNodeStream(body.readable) ? body.readable :
+            isReadableStreamWeb(body.readable) ? Readable.fromWeb(body.readable) :
+              duplexify(body.readable)) : undefined;
+        const writable = body && body.writable ?
+          (isWritableNodeStream(body.writable) ? body.writable :
+            isWritableStreamWeb(body.writable) ? Writable.fromWeb(body.writable) :
+              duplexify(body.writable)) : undefined;
+        return bridgeDuplex({ readable, writable });
+      }
+
+      const then2 = body && body.then;
+      if (typeof then2 === "function") {
+        let d;
+        then2.call(body,
+          (val) => { if (val != null) d.push(val); d.push(null); },
+          (err) => { destroyer(d, err); });
+        return (d = new Duplex({ objectMode: true, writable: false, read() {} }));
+      }
+
+      throw new codes.ERR_INVALID_ARG_TYPE(name,
+        ["Blob", "ReadableStream", "WritableStream", "Stream", "Iterable",
+          "AsyncIterable", "Function", "{ readable, writable } pair", "Promise"], body);
+    }
+
+    function makeReadableFrom(x) {
+      if (isNodeStream(x)) return x;
+      return streamFrom(Readable, x, { objectMode: true });
+    }
+    function makeAsyncIterable(val) {
+      // oam Readables are async-iterable, so a node readable already satisfies this.
+      if (isIterable(val)) return val;
+      if (isReadableNodeStream(val)) return val;
+      throw new codes.ERR_INVALID_ARG_TYPE("val", ["Readable", "Iterable", "AsyncIterable"], val);
+    }
+    // Wait for ONE side of a stream to finish (or error/close); fire cb once.
+    function trackSide(s, mode, cb) {
+      let settled = false;
+      function cleanup() {
+        s.removeListener("error", onErr);
+        s.removeListener("close", onClose);
+        s.removeListener("finish", onDone);
+        s.removeListener("end", onDone);
+      }
+      function settle(err) { if (settled) return; settled = true; cleanup(); cb(err); }
+      const onErr = (e) => settle(e);
+      const onClose = () => settle((s._readableState && s._readableState.errored) || (s._writableState && s._writableState.errored) || undefined);
+      const onDone = () => settle(undefined);
+      s.on("error", onErr);
+      s.on("close", onClose);
+      if (mode === "finish") s.on("finish", onDone);
+      else s.on("end", onDone);
+      if (mode === "finish" && s._writableState && s._writableState.finished) microtask(onDone);
+      if (mode === "end" && s._readableState && s._readableState.endEmitted) microtask(onDone);
+      return cleanup;
+    }
+    // Port of internal/streams/pipeline -- wires a chain of stages (node streams,
+    // (async-)generator functions, async functions, iterables, strings) and
+    // calls `callback(err)` once when the whole chain settles. Returns the tail.
+    function pipelineImpl(stages, callback) {
+      let error = null;
+      let value;
+      let pending = 0;
+      let finalCalled = false;
+      let building = true;
+      const cleanups = [];
+      const nodeStreams = [];
+
+      function maybeDone() {
+        if (finalCalled || building) return;
+        if (error || pending === 0) {
+          finalCalled = true;
+          for (const c of cleanups.splice(0)) { try { c(); } catch (_) {} }
+          if (error) {
+            for (const s of nodeStreams) {
+              if (s && typeof s.destroy === "function" && !isDestroyed(s)) {
+                try { s.destroy(error); } catch (_) {}
+              }
+            }
+          }
+          process.nextTick(callback, error, value);
+        }
+      }
+      function fail(err) { if (err && !error) error = err; maybeDone(); }
+      function complete() { if (pending > 0) pending--; maybeDone(); }
+      // Error listeners stay attached for the pipeline's lifetime: an internal
+      // stream may emit 'error' AFTER settling (an upstream error tears down a
+      // wrapped async-generator readable); removing early -> unhandled 'error'.
+      function watchErrors(s) {
+        nodeStreams.push(s);
+        s.on("error", (err) => fail(err));
+      }
+
+      let current;
+      let tailIsSink = false;
+      for (let i = 0; i < stages.length; i++) {
+        const stage = stages[i];
+        const reading = i < stages.length - 1;
+        if (i === 0) {
+          tailIsSink = false;
+          if (typeof stage === "function") {
+            current = stage({ signal: undefined });
+            if (!isIterable(current)) throw new codes.ERR_INVALID_RETURN_VALUE("Iterable, AsyncIterable or Stream", "source", current);
+            current = makeReadableFrom(current);
+            watchErrors(current);
+          } else if (isNodeStream(stage)) {
+            current = stage; watchErrors(current);
+          } else {
+            current = makeReadableFrom(stage); watchErrors(current);
+          }
+        } else if (typeof stage === "function") {
+          const result = stage(makeAsyncIterable(current), { signal: undefined });
+          if (reading) {
+            if (!isIterable(result, true)) throw new codes.ERR_INVALID_RETURN_VALUE("AsyncIterable", `transform[${i - 1}]`, result);
+            current = makeReadableFrom(result); watchErrors(current);
+            tailIsSink = false;
+          } else {
+            const pt = new PassThrough({ objectMode: true });
+            const then = result && result.then;
+            if (typeof then === "function") {
+              then.call(result,
+                (val) => { value = val; if (val != null) pt.write(val); pt.end(); },
+                (err) => { pt.destroy(err); });
+            } else if (isIterable(result, true)) {
+              const rs = makeReadableFrom(result); watchErrors(rs); rs.pipe(pt);
+            } else {
+              throw new codes.ERR_INVALID_RETURN_VALUE("AsyncIterable or Promise", "destination", result);
+            }
+            current = pt; watchErrors(pt);
+            tailIsSink = true;
+          }
+        } else if (isNodeStream(stage)) {
+          watchErrors(stage);
+          const src = isNodeStream(current) ? current : makeReadableFrom(current);
+          src.pipe(stage);
+          current = stage;
+          tailIsSink = !!(isWritableLike(stage) && !isReadableLike(stage));
+        } else {
+          current = makeReadableFrom(stage); watchErrors(current);
+          tailIsSink = false;
+        }
+      }
+
+      const tail = current;
+      const mode = (tailIsSink || !isReadableLike(tail)) ? "finish" : "end";
+      pending++;
+      const cl = trackSide(tail, mode, (err) => { if (err) fail(err); complete(); });
+      cleanups.push(() => { try { cl(); } catch (_) {} });
+
+      building = false;
+      maybeDone();
+      return tail;
+    }
+
+    // Port of internal/streams/compose -- combine stages into one Duplex using
+    // the first stage's writable side and the last stage's readable side.
+    function composeImpl(...streams) {
+      if (streams.length === 0) throw new codes.ERR_MISSING_ARGS("streams");
+      if (streams.length === 1) return duplexify(streams[0]);
+
+      const orgStreams = streams.slice();
+      if (typeof streams[0] === "function") streams[0] = duplexify(streams[0]);
+      if (typeof streams[streams.length - 1] === "function") {
+        const idx = streams.length - 1;
+        streams[idx] = duplexify(streams[idx]);
+      }
+
+      for (let n = 0; n < streams.length; ++n) {
+        if (!isNodeStream(streams[n]) && !isWebStream(streams[n])) continue;
+        if (n < streams.length - 1 &&
+          !(isReadableLike(streams[n]) || isReadableStreamWeb(streams[n]) || isTransformStreamWeb(streams[n]))) {
+          throw new codes.ERR_INVALID_ARG_VALUE(`streams[${n}]`, orgStreams[n], "must be readable");
+        }
+        if (n > 0 &&
+          !(isWritableLike(streams[n]) || isWritableStreamWeb(streams[n]) || isTransformStreamWeb(streams[n]))) {
+          throw new codes.ERR_INVALID_ARG_VALUE(`streams[${n}]`, orgStreams[n], "must be writable");
+        }
+      }
+
+      let ondrain, onfinish, onreadable, onclose, d;
+      function onfinished(err) {
+        const cb = onclose;
+        onclose = null;
+        if (cb) cb(err);
+        else if (err) d.destroy(err);
+        else if (!readable && !writable) d.destroy();
+      }
+
+      const head = streams[0];
+      const tail = pipelineImpl(streams, onfinished);
+
+      const writable = !!(isWritableLike(head) || isWritableStreamWeb(head) || isTransformStreamWeb(head));
+      const readable = !!(isReadableLike(tail) || isReadableStreamWeb(tail) || isTransformStreamWeb(tail));
+
+      d = new Duplex({
+        writableObjectMode: !!(head && head.writableObjectMode),
+        readableObjectMode: !!(tail && tail.readableObjectMode),
+        writable,
+        readable,
+      });
+
+      if (writable) {
+        if (isNodeStream(head)) {
+          d._write = function (chunk, encoding, callback) {
+            if (head.write(chunk, encoding)) callback(); else ondrain = callback;
+          };
+          d._final = function (callback) { head.end(); onfinish = callback; };
+          head.on("drain", function () { if (ondrain) { const cb = ondrain; ondrain = null; cb(); } });
+        }
+        const toRead = isTransformStreamWeb(tail) ? tail.readable : tail;
+        finished(toRead, {}, () => { if (onfinish) { const cb = onfinish; onfinish = null; cb(); } });
+      }
+
+      if (readable) {
+        if (isNodeStream(tail)) {
+          tail.on("readable", function () { if (onreadable) { const cb = onreadable; onreadable = null; cb(); } });
+          tail.on("end", function () { d.push(null); });
+          d._read = function () {
+            while (true) {
+              const buf = tail.read();
+              if (buf === null) { onreadable = d._read; return; }
+              if (!d.push(buf)) return;
+            }
+          };
+        }
+      }
+
+      d._destroy = function (err, callback) {
+        if (!err && onclose != null) err = makeAbortError();
+        onreadable = null; ondrain = null; onfinish = null;
+        if (isNodeStream(tail)) destroyer(tail, err);
+        if (onclose == null) callback(err);
+        else onclose = callback;
+      };
+
+      return d;
+    }
+
+    Duplex.from = duplexify;
     Duplex.fromWeb = function duplexFromWeb(pair) {
       var readable = pair.readable;
       var writable = pair.writable;
@@ -7559,25 +8112,18 @@
 
     function pipeline(...args) {
       const cb = typeof args[args.length - 1] === "function" ? args.pop() : () => {};
-      if (args.length < 2) {
-        throw new TypeError("pipeline requires at least a source and destination");
+      let streams = args;
+      if (streams.length === 1 && Array.isArray(streams[0])) streams = streams[0];
+      if (streams.length < 2) {
+        throw new codes.ERR_MISSING_ARGS("streams");
       }
       let settled = false;
-      const settle = (err) => {
+      const tail = pipelineImpl(streams, (err) => {
         if (settled) return;
         settled = true;
-        if (err) for (const s of args) s.destroy?.(err);
         cb(err ?? undefined);
-      };
-      for (const s of args) {
-        s.on?.("error", settle);
-      }
-      for (let i = 0; i < args.length - 1; i++) {
-        args[i].pipe(args[i + 1]);
-      }
-      const last = args[args.length - 1];
-      finished(last, (err) => settle(err));
-      return last;
+      });
+      return tail;
     }
 
     // require('stream') IS the legacy Stream constructor in Node (an
@@ -7664,27 +8210,7 @@
         else if (typeof stream.close === "function") stream.close();
         return stream;
       },
-      compose: (...streams) => {
-        if (streams.length === 0) throw new TypeError("stream.compose requires at least one stream");
-        if (streams.length === 1) return streams[0];
-        for (let i = 0; i < streams.length - 1; i++) {
-          streams[i].pipe(streams[i + 1]);
-        }
-        var head = streams[0];
-        var tail = streams[streams.length - 1];
-        var composed = new Duplex({
-          write(chunk, enc, cb) { head.write(chunk, enc, cb); },
-          read() {},
-          final(cb) { head.end(); cb(); },
-        });
-        tail.on("data", (chunk) => { if (!composed.push(chunk)) tail.pause(); });
-        tail.on("end", () => composed.push(null));
-        composed._read = () => tail.resume();
-        for (var si = 0; si < streams.length; si++) {
-          streams[si].on("error", (err) => composed.destroy(err));
-        }
-        return composed;
-      },
+      compose: composeImpl,
     });
     return Stream;
   };

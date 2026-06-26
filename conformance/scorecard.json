@@ -1,5 +1,5 @@
 {
-  "commit": "d58f2ef",
+  "commit": "1e51163",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -210,10 +210,14 @@
         {
           "case": "51-stream-pipe-dest-error-autodestroy.mjs",
           "status": "pass"
+        },
+        {
+          "case": "52-stream-compose-operator.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 51,
-      "total": 51
+      "pass": 52,
+      "total": 52
     },
     "surface": {
       "globals": {
