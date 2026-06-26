@@ -6326,6 +6326,7 @@
         ended: false,
         endEmitted: false,
         reading: false,
+        dataEmitted: false, // true once any chunk has been read/emitted (readableDidRead)
         destroyed: false,
         errored: null,
         encoding: options.encoding ?? null,
@@ -6403,6 +6404,21 @@
       }
       get readableHighWaterMark() {
         return this._rState.highWaterMark;
+      }
+      get readableEncoding() {
+        return this._rState.encoding ?? null;
+      }
+      get readableAborted() {
+        const s = this._rState;
+        return !!((s.destroyed || s.errored) && !s.endEmitted);
+      }
+      get readableDidRead() {
+        return this._rState.dataEmitted;
+      }
+      get errored() {
+        // Node exposes the instance `.errored` on both sides; a Duplex reads
+        // whichever side errored.
+        return this._rState?.errored ?? this._wState?.errored ?? null;
       }
 
       push(chunk, encoding) {
@@ -6516,6 +6532,7 @@
         }
         if (s.buffer.length === 0 && !s.ended) this._callRead();
         if (s.ended) this._emitEndIfDrained();
+        if (out !== null) s.dataEmitted = true;
         return out === null ? null : this._decode(out);
       }
 
@@ -6562,6 +6579,7 @@
           while (s.flowing && s.buffer.length > 0 && !s.destroyed) {
             const chunk = s.buffer.shift();
             s.length -= s.objectMode ? 1 : (chunk.length ?? 1);
+            s.dataEmitted = true;
             this.emit("data", this._decode(chunk));
           }
           if (s.flowing && !s.ended && s.buffer.length === 0) this._callRead();
@@ -7389,6 +7407,17 @@
       writableObjectMode: {
         get() {
           return this._wState.objectMode;
+        },
+      },
+      writableAborted: {
+        get() {
+          const s = this._wState;
+          return !!((s.destroyed || s.errored) && !s.finished);
+        },
+      },
+      errored: {
+        get() {
+          return this._wState?.errored ?? this._rState?.errored ?? null;
         },
       },
     };

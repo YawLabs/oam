@@ -1,5 +1,5 @@
 {
-  "commit": "1e51163",
+  "commit": "2536769",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
@@ -214,10 +214,14 @@
         {
           "case": "52-stream-compose-operator.mjs",
           "status": "pass"
+        },
+        {
+          "case": "53-stream-readable-writable-getters.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 52,
-      "total": 52
+      "pass": 53,
+      "total": 53
     },
     "surface": {
       "globals": {
