@@ -6361,6 +6361,7 @@
           const err = new codes.ERR_STREAM_PUSH_AFTER_EOF();
           s.errored = s.errored ?? err;
           microtask(() => {
+            if (s.errorEmitted) return; // a stream emits 'error' at most once
             s.errorEmitted = true;
             this.emit("error", err);
           });
@@ -6950,7 +6951,11 @@
           if (cb) microtask(() => cb(err));
           microtask(() => {
             s.errored = s.errored ?? err;
-            if (this.listenerCount("error") > 0) this.emit("error", err);
+            if (s.errorEmitted) return; // a stream emits 'error' at most once
+            if (this.listenerCount("error") > 0) {
+              s.errorEmitted = true;
+              this.emit("error", err);
+            }
           });
           return false;
         }
