@@ -6417,7 +6417,10 @@
 
       _decode(chunk) {
         const s = this._rState;
-        if (s.encoding && !s.objectMode && chunk instanceof Uint8Array) {
+        // Node decodes Buffer chunks under `encoding` regardless of objectMode
+        // (objectMode only governs whether empty decoded chunks are dropped);
+        // the Uint8Array guard leaves non-Buffer objectMode values untouched.
+        if (s.encoding && chunk instanceof Uint8Array) {
           return BufferCtor.prototype.toString.call(chunk, s.encoding);
         }
         return chunk;
@@ -7499,6 +7502,21 @@
             stream.destroy(signal.reason ?? new Error("This operation was aborted"));
           }, { once: true });
         }
+        return stream;
+      },
+      destroy: (stream, err) => {
+        const rs = stream._rState;
+        const ws = stream._wState;
+        if (rs?.destroyed || ws?.destroyed) return stream;
+        // Destroying an already-ended stream stays error-free (no synthetic
+        // AbortError); inject one only when destroying a still-live stream
+        // with no explicit error (Node's internal destroyer behaviour).
+        const finishedAlready = (!rs || rs.endEmitted) && (!ws || ws.finished);
+        if (!err && !finishedAlready) {
+          err = new (globalThis.DOMException ?? Error)("The operation was aborted", "AbortError");
+        }
+        if (typeof stream.destroy === "function") stream.destroy(err);
+        else if (typeof stream.close === "function") stream.close();
         return stream;
       },
       compose: (...streams) => {
