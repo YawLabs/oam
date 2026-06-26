@@ -6672,6 +6672,18 @@
           else microtask(() => this.emit("readable"));
           return false;
         }
+        // Non-objectMode: a non-null chunk must be a string/Buffer/Uint8Array;
+        // anything else errorOrDestroys with ERR_INVALID_ARG_TYPE (Node).
+        if (!s.objectMode && typeof chunk !== "string" && !(chunk instanceof Uint8Array)) {
+          const err = new codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
+          s.errored = s.errored ?? err;
+          microtask(() => {
+            if (s.errorEmitted) return;
+            s.errorEmitted = true;
+            this.emit("error", err);
+          });
+          return false;
+        }
         let data = chunk;
         if (!s.objectMode && typeof chunk === "string") {
           data = BufferCtor.from(chunk, encoding ?? "utf8");
@@ -6686,6 +6698,21 @@
 
       unshift(chunk) {
         const s = this._rState;
+        if (
+          !s.objectMode &&
+          chunk !== null &&
+          typeof chunk !== "string" &&
+          !(chunk instanceof Uint8Array)
+        ) {
+          const err = new codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
+          s.errored = s.errored ?? err;
+          microtask(() => {
+            if (s.errorEmitted) return;
+            s.errorEmitted = true;
+            this.emit("error", err);
+          });
+          return false;
+        }
         let data = chunk;
         if (!s.objectMode && typeof chunk === "string") {
           data = BufferCtor.from(chunk, "utf8");
@@ -6776,7 +6803,9 @@
 
       _emitEndIfDrained() {
         const s = this._rState;
-        if (!s.ended || s.endEmitted || s.buffer.length > 0) return;
+        // A destroyed stream (e.g. push(null) inside a 'close' handler) must
+        // never emit 'end' -- the autoDestroy path emits 'end' BEFORE destroy.
+        if (!s.ended || s.endEmitted || s.buffer.length > 0 || s.destroyed) return;
         s.endEmitted = true;
         microtask(() => {
           this.emit("end");
@@ -6830,7 +6859,13 @@
         if (type === "data") {
           if (this._rState.flowing !== false) this.resume();
         } else if (type === "readable") {
-          if (this._rState.buffer.length === 0) this._callRead();
+          // Defer the read kick (Node uses nextTick): a synchronous push()
+          // issued after the listener is added must be observed before any
+          // _read fires -- otherwise a default-_read stream spuriously errors
+          // before its own push() lands. _callRead no-ops once ended/destroyed.
+          microtask(() => {
+            if (this._rState.buffer.length === 0) this._callRead();
+          });
         }
         return this;
       }
@@ -7366,6 +7401,18 @@
     // nodejs.rejection handler on Readable.prototype).
     Readable.prototype[EventEmitter.captureRejectionSymbol] = function (err) {
       this.destroy(err);
+    };
+    // Symbol.asyncDispose (`await using r = ...`): abort-destroy a still-live
+    // readable and resolve once finished (Node v22).
+    Readable.prototype[Symbol.asyncDispose] = function () {
+      let error;
+      if (!this.destroyed) {
+        error = this.readableEnded ? null : streamOpAbortError();
+        this.destroy(error);
+      }
+      return new Promise((resolve, reject) =>
+        finished(this, (err) => (err && err !== error ? reject(err) : resolve(null))),
+      );
     };
 
     // ------------------------------------------------------------ Writable
