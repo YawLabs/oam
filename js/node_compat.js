@@ -5180,7 +5180,7 @@
                   this.push(null);
                   process.nextTick(() => this.emit("close"));
                 } else {
-                  const buf = new globalThis.Buffer(chunk.buffer, chunk.byteOffset, chunk.length);
+                  const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
                   totalRead += buf.length;
                   this.bytesRead = totalRead;
                   this.push(buf);
@@ -10504,7 +10504,7 @@
           this._bodyPushed = true;
           const body = natives.httpRequestBody(this._requestId);
           if (body.length > 0) {
-            this.push(new globalThis.Buffer(body.buffer, body.byteOffset, body.length));
+            this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
           }
           this.push(null);
         }
@@ -14624,7 +14624,7 @@
             if (data === undefined) {
               this._onReadEof();
             } else {
-              this.push(new globalThis.Buffer(data.buffer, data.byteOffset, data.length));
+              this.push(globalThis.Buffer.from(data.buffer, data.byteOffset, data.length));
             }
           },
           (err) => {
