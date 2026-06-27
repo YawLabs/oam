@@ -8457,7 +8457,18 @@
             if (called) return;
             called = true;
             if (err) return cb(err);
-            if (data !== undefined && data !== null) this.push(data);
+            if (data !== undefined && data !== null) {
+              if (this.push(data) === false) {
+                // Readable side is full: hold the write callback (Transform
+                // backpressure) and release it on the next _read (consumer
+                // drain). Without this, write() never sees backpressure for a
+                // pass-through (writable drains instantly) and the readable
+                // side grows unbounded -> OOM (test-stream-readable-pause-and-
+                // resume's `while (target.write(chunk))`).
+                this._transformPendingWriteCb = cb;
+                return;
+              }
+            }
             cb();
           };
           try {
@@ -8493,8 +8504,16 @@
         cb(null, chunk);
       }
 
-      // Transforms pull on demand: reading is driven by writes.
-      _read() {}
+      // Transforms pull on demand: reading is driven by writes. When the
+      // readable side drains (consumer pulled, room again), release a write
+      // callback held for backpressure so the writable side accepts more.
+      _read() {
+        const pending = this._transformPendingWriteCb;
+        if (pending) {
+          this._transformPendingWriteCb = null;
+          pending();
+        }
+      }
     }
 
     class PassThrough extends Transform {}
