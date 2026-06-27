@@ -8248,6 +8248,22 @@
       function watchErrors(s) {
         nodeStreams.push(s);
         s.on("error", (err) => fail(err));
+        // Node runs eos() on EVERY pipeline stream: ANY stream that 'close's
+        // before completing its role (a destroyed source/intermediate, not just
+        // the tail) fails the pipeline with ERR_STREAM_PREMATURE_CLOSE. oam
+        // previously only completion-tracked the tail, so a destroyed source
+        // (test-stream-pipeline-queued-end-in-destroy) went undetected.
+        s.on("close", () => {
+          if (finalCalled || building) return;
+          const rs = s._rState;
+          const ws = s._wState;
+          if ((rs && rs.errored) || (ws && ws.errored)) return; // error path handles it
+          const readableDone = !rs || rs.endEmitted;
+          const writableDone = !ws || ws.finished;
+          if (!(readableDone && writableDone)) {
+            fail(new codes.ERR_STREAM_PREMATURE_CLOSE());
+          }
+        });
       }
 
       let current;
