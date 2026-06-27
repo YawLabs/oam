@@ -4,7 +4,7 @@
   "ratchet": {
     "maxSkips": 0,
     "maxKnownIssues": 0,
-    "minPass": 222
+    "minPass": 225
   },
   "tests": {}
 }

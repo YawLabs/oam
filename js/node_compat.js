@@ -5736,7 +5736,7 @@
       chdir: (dir) => natives.chdir(String(dir)),
       nextTick(fn, ...args) {
         if (typeof fn !== "function") {
-          throw new TypeError('The "callback" argument must be of type function');
+          throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
         queueMicrotask(() => fn(...args));
       },
@@ -5977,9 +5977,22 @@
         fsRead: 0, fsWrite: 0, ipcSent: 0, ipcReceived: 0,
         signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
       }),
-      release: { name: "node" },
-      config: { variables: {} },
-      features: { inspector: false, ipv6: true, tls: true },
+      release: { name: "node", lts: "Jod" },
+      config: Object.freeze({ variables: Object.freeze({}) }),
+      features: {
+        inspector: false,
+        debug: false,
+        uv: true,
+        ipv6: true,
+        openssl_is_boringssl: false,
+        tls_alpn: true,
+        tls_sni: true,
+        tls_ocsp: true,
+        tls: true,
+        cached_builtins: true,
+        require_module: true,
+        typescript: "strip",
+      },
       allowedNodeEnvironmentFlags: new Set(),
       report: {
         getReport: () => ({}),
