@@ -5587,7 +5587,11 @@
     const EventEmitter = registry.get("events");
     const { Readable, Writable } = registry.get("stream");
     const { Buffer } = registry.get("buffer");
-    const process = new EventEmitter();
+    // Node's process is an instance of a `process`-named EventEmitter subclass
+    // (not a bare EventEmitter) -- gives it its own prototype layer, makes
+    // process.constructor.name === "process" (so a failed `delete process.x`
+    // says "#<process>"), and satisfies test-process-prototype's chain checks.
+    const process = new (class process extends EventEmitter {})();
 
     // Lazy env: natives.env() crosses the FFI boundary and copies every
     // environment variable into a JS object (50-200 vars on a typical dev
@@ -5724,11 +5728,12 @@
       pid: natives.pid,
       ppid: natives.ppid,
       title: "oam",
-      exitCode: undefined,
       exit(code) {
-        const c = code ?? process.exitCode ?? 0;
-        process.exitCode = c;
-        const numeric = typeof c === "number" ? c : 0;
+        // Route through the validating exitCode setter (coerces '2'->2, throws
+        // on invalid), then exit with the COERCED value -- reading c directly
+        // would send the raw string/undefined.
+        if (code !== undefined && code !== null) process.exitCode = code;
+        const numeric = typeof process.exitCode === "number" ? process.exitCode : 0;
         emitProcessExit(numeric);
         natives.exit(numeric);
       },
@@ -6150,6 +6155,42 @@
           }
           process.env[key] = val;
         }
+      },
+    });
+
+    // process.exitCode: a validating, non-configurable accessor (Node). Accepts
+    // an integer, an integer-valued string ('2' -> 2), or undefined/null
+    // (-> undefined, exits 0). A non-numeric string / non-number throws
+    // ERR_INVALID_ARG_TYPE; a non-integer number throws ERR_OUT_OF_RANGE.
+    // Non-configurable so `delete process.exitCode` throws (test-process-exit-
+    // code-validation).
+    let _exitCode = undefined;
+    Object.defineProperty(process, "exitCode", {
+      enumerable: true,
+      configurable: false,
+      get() {
+        return _exitCode;
+      },
+      set(value) {
+        if (value === undefined || value === null) {
+          _exitCode = undefined;
+          return;
+        }
+        if (typeof value === "string") {
+          const n = Number(value);
+          if (value.trim() !== "" && Number.isInteger(n)) {
+            _exitCode = n;
+            return;
+          }
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "number", value);
+        }
+        if (typeof value !== "number") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "number", value);
+        }
+        if (!Number.isInteger(value)) {
+          throw new codes.ERR_OUT_OF_RANGE("code", "an integer", value);
+        }
+        _exitCode = value;
       },
     });
     return process;
