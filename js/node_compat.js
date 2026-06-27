@@ -5805,6 +5805,17 @@
         }
         return undefined;
       },
+      assert(condition, message) {
+        // Deprecated (DEP0100): emit the warning once, then assert.
+        if (!process._assertDep0100Warned) {
+          process._assertDep0100Warned = true;
+          process.emitWarning(
+            "process.assert() is deprecated. Please use the `assert` module instead.",
+            { type: "DeprecationWarning", code: "DEP0100" },
+          );
+        }
+        if (!condition) throw new codes.ERR_ASSERTION(message);
+      },
       emitWarning(warning, typeOrOptions, codeArg, ctorArg) {
         // Normalize the (warning, type, code, ctor) / (warning, options)
         // overloads the way Node does.
