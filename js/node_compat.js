@@ -5891,16 +5891,66 @@
         });
       },
       cpuUsage: (prev) => {
+        if (prev) {
+          const valid = (n) => typeof n === "number" && n >= 0 && n <= Number.MAX_SAFE_INTEGER;
+          if (typeof prev !== "object" || prev === null) {
+            throw new codes.ERR_INVALID_ARG_TYPE("prevValue", "object", prev);
+          }
+          if (!valid(prev.user)) {
+            if (typeof prev.user !== "number") {
+              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.user", "number", prev.user);
+            }
+            throw applyNodeErrorShape(
+              new RangeError("The property 'prevValue.user' is invalid. Received " + String(prev.user)),
+              "ERR_INVALID_ARG_VALUE",
+            );
+          }
+          if (!valid(prev.system)) {
+            if (typeof prev.system !== "number") {
+              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.system", "number", prev.system);
+            }
+            throw applyNodeErrorShape(
+              new RangeError("The property 'prevValue.system' is invalid. Received " + String(prev.system)),
+              "ERR_INVALID_ARG_VALUE",
+            );
+          }
+        }
         var usage = natives.processCpuUsage();
         if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
         return usage;
       },
       kill: (pid, signal) => {
-        var sigMap = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1, SIGUSR1: 10, SIGUSR2: 12, SIGPIPE: 13 };
-        var sig = typeof signal === "string" ? (sigMap[signal] || 15) : (signal !== undefined ? signal : 15);
-        if (sig === 0) { natives.processKill(pid, 0); return true; }
-        natives.processKill(pid, sig);
+        if (pid != (pid | 0)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("pid", "number", pid);
+        }
+        const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
+        let err;
+        if (signal === (signal | 0)) {
+          err = process._kill(pid, signal);
+        } else {
+          const name = signal || "SIGTERM";
+          const n = SIGNALS[name];
+          if (n === undefined) throw new codes.ERR_UNKNOWN_SIGNAL(name);
+          err = process._kill(pid, n);
+        }
+        if (err) {
+          const NAME = { "-22": "EINVAL", "-1": "EPERM", "-3": "ESRCH" };
+          const nm = NAME[String(err)] || "UNKNOWN";
+          const e = new Error("kill " + nm);
+          e.code = nm;
+          e.errno = err;
+          e.syscall = "kill";
+          throw e;
+        }
         return true;
+      },
+      // Node-binding shape: 0 on success, negative libuv errno on failure.
+      // process.kill routes through this (monkeypatchable -- test-process-kill-pid
+      // replaces it to intercept pid/sig without actually signalling).
+      _kill: (pid, sig) => {
+        const VALID = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        if (sig !== 0 && !VALID.includes(sig)) return -22; // EINVAL before touching the sandbox
+        try { natives.processKill(pid, sig); return 0; } catch { return -1; }
       },
       umask(mask) {
         const prev = process._umask ?? 0;
@@ -5993,7 +6043,62 @@
         require_module: true,
         typescript: "strip",
       },
-      allowedNodeEnvironmentFlags: new Set(),
+      allowedNodeEnvironmentFlags: (() => {
+        // Node returns a frozen, immutable Set whose mutators no-op, whose
+        // size/iteration derive from an internal array (defeating raw
+        // Set.prototype.add/clear/delete probes), and whose has() normalises
+        // underscores->dashes and matches both dashed and un-dashed forms.
+        const flagsArray = [
+          "--allow-child-process", "--allow-fs-read", "--allow-fs-write", "--allow-worker",
+          "--conditions", "--cpu-prof", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
+          "--diagnostic-dir", "--disable-proto", "--dns-result-order", "--enable-source-maps",
+          "--experimental-vm-modules", "--force-context-aware", "--frozen-intrinsics",
+          "--heap-prof", "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
+          "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
+          "--import", "--input-type", "--insecure-http-parser", "--loader", "--max-http-header-size",
+          "--no-deprecation", "--no-experimental-fetch", "--no-warnings", "--openssl-config",
+          "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
+          "--preserve-symlinks", "--preserve-symlinks-main", "--prof-process", "--redirect-warnings",
+          "--report-dir", "--report-filename", "--report-on-fatalerror", "--report-on-signal",
+          "--report-signal", "--report-uncaught-exception", "--require", "--secure-heap",
+          "--stack-trace-limit", "--throw-deprecation", "--title", "--tls-cipher-list",
+          "--tls-keylog", "--tls-max-v1.2", "--tls-max-v1.3", "--tls-min-v1.0", "--tls-min-v1.1",
+          "--tls-min-v1.2", "--tls-min-v1.3", "--trace-deprecation", "--trace-event-categories",
+          "--trace-event-file-pattern", "--trace-exit", "--trace-sigint", "--trace-sync-io",
+          "--trace-tls", "--trace-uncaught", "--trace-warnings", "--track-heap-objects",
+          "--unhandled-rejections", "--use-bundled-ca", "--use-openssl-ca", "--v8-pool-size",
+          "--zero-fill-buffers", "-r", "-C",
+        ];
+        const nodeFlags = flagsArray.map((f) => f.replace(/^--?/, ""));
+        class NodeEnvironmentFlagsSet extends Set {
+          constructor(arr) {
+            super();
+            Object.defineProperty(this, "_array", { value: arr.slice() });
+            // Populate the backing set via the NATIVE add -- super(arr) would
+            // route through the overridden (no-op) add() below and leave it empty.
+            for (const x of arr) Set.prototype.add.call(this, x);
+          }
+          add() { return this; }
+          delete() { return false; }
+          clear() {}
+          get size() { return this._array.length; }
+          has(key) {
+            if (typeof key !== "string") return false;
+            key = key.replace(/_/g, "-");
+            if (/^--?/.test(key)) {
+              key = key.replace(/=.*$/, "");
+              return Set.prototype.has.call(this, key);
+            }
+            return nodeFlags.includes(key);
+          }
+          forEach(cb, thisArg) { this._array.forEach((v) => cb.call(thisArg, v, v, this)); }
+          entries() { return this._array.map((v) => [v, v])[Symbol.iterator](); }
+          values() { return this._array[Symbol.iterator](); }
+          keys() { return this._array[Symbol.iterator](); }
+          [Symbol.iterator]() { return this._array[Symbol.iterator](); }
+        }
+        return Object.freeze(new NodeEnvironmentFlagsSet(flagsArray));
+      })(),
       report: {
         getReport: () => ({}),
         writeReport: () => "",
