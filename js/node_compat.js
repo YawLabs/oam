@@ -8216,7 +8216,7 @@
     // Port of internal/streams/pipeline -- wires a chain of stages (node streams,
     // (async-)generator functions, async functions, iterables, strings) and
     // calls `callback(err)` once when the whole chain settles. Returns the tail.
-    function pipelineImpl(stages, callback) {
+    function pipelineImpl(stages, callback, drainTerminal) {
       let error = null;
       let value;
       let pending = 0;
@@ -8305,6 +8305,16 @@
       pending++;
       const cl = trackSide(tail, mode, (err) => { if (err) fail(err); complete(); });
       cleanups.push(() => { try { cl(); } catch (_) {} });
+
+      // Callback/promise form: a TERMINAL Duplex/Transform tail's readable side
+      // has no consumer, so its 'end' (mode above) would never fire and the
+      // pipeline would hang. Node discards the unconsumed terminal output --
+      // resume the tail to drain it so 'end' fires and completion lands.
+      // composeImpl does NOT pass drainTerminal: it reads the tail's readable
+      // side to build its Duplex, so that path must stay un-drained.
+      if (drainTerminal && !tailIsSink && isReadableLike(tail) && typeof tail.resume === "function") {
+        tail.resume();
+      }
 
       building = false;
       maybeDone();
@@ -8525,7 +8535,7 @@
         if (settled) return;
         settled = true;
         cb(err ?? undefined);
-      });
+      }, true); // callback/promise form: drain an unconsumed terminal tail
       return tail;
     }
 
