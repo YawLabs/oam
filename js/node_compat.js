@@ -9576,13 +9576,19 @@
       return pathname;
     }
 
-    function pathToFileURL(path) {
+    function pathToFileURL(path, options) {
       if (typeof path !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("path", "string", path);
       }
+      // options.windows forces win32/posix path semantics regardless of host
+      // (Node v22: pathToFileURL(path, { windows })). Default = host platform.
+      const win = options != null && typeof options === "object" && options.windows !== undefined
+        ? !!options.windows
+        : isWin;
       const pathModule = registry.get("path");
+      const pm = win ? pathModule.win32 : pathModule.posix;
       let p = path;
-      if (isWin) {
+      if (win) {
         // Reject a malformed UNC prefix (Node throws ERR_INVALID_ARG_VALUE for
         // a leading '\\' run with no server, or a missing share).
         if (/^\\\\\\/.test(p) || /^\\\\[^\\]+$/.test(p)) {
@@ -9592,27 +9598,34 @@
             "Missing UNC resource path",
           );
         }
-      }
-      if (isWin) {
         // \\?\ device paths: resolve the prefix away (Node parity);
         // \\?\UNC\server\share is the long form of \\server\share.
         if (p.startsWith("\\\\?\\UNC\\")) p = "\\\\" + p.slice(8);
         else if (p.startsWith("\\\\?\\")) p = p.slice(4);
       }
-      const trailingSep = /[\\/]$/.test(p) && p.length > 1;
-      p = pathModule.resolve(p); // relative paths anchor at cwd (Node parity)
-      p = p.replaceAll("\\", "/");
+      const trailingSep = (win ? /[\\/]$/ : /\/$/).test(p) && p.length > 1;
+      p = pm.resolve(p); // relative paths anchor at cwd (Node parity)
+      if (win) p = p.replaceAll("\\", "/"); // win: '\' is a separator
       if (trailingSep && !p.endsWith("/")) p += "/";
       // Percent-encode the URL-special characters paths may carry ('%'
       // FIRST â€” later substitutions insert literal % sequences).
-      const encoded = p
+      let encoded = p
         .replaceAll("%", "%25")
+        // C0 control chars (incl \b \t \n \r): the URL constructor STRIPS raw
+        // tab/newline, so pre-encode every 0x00-0x1F (Node's encodePathChars).
+        .replace(/[\x00-\x1f]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"))
         .replaceAll("#", "%23")
         .replaceAll("?", "%3F")
         .replaceAll(" ", "%20")
         .replaceAll("~", "%7E")
-        .replaceAll("^", "%5E");
-      if (isWin && encoded.startsWith("//")) {
+        .replaceAll("^", "%5E")
+        // [ ] | are left raw by the URL path parser; Node pre-encodes them.
+        .replaceAll("[", "%5B")
+        .replaceAll("]", "%5D")
+        .replaceAll("|", "%7C");
+      // posix: '\' is a literal path character, not a separator -> encode it.
+      if (!win) encoded = encoded.replaceAll("\\", "%5C");
+      if (win && encoded.startsWith("//")) {
         // UNC: \\server\share -> file://server/share
         return new globalThis.URL("file:" + encoded);
       }
