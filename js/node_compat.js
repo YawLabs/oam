@@ -4013,11 +4013,24 @@
       }
     }
 
+    let utilGetCallSiteWarned = false;
     return {
       format,
       formatWithOptions: (_opts, ...args) => format(...args),
       inspect,
       getCallSites,
+      // Deprecated singular alias (renamed to getCallSites): emit the
+      // ExperimentalWarning once, then delegate.
+      getCallSite(...args) {
+        if (!utilGetCallSiteWarned) {
+          utilGetCallSiteWarned = true;
+          globalThis.process.emitWarning(
+            "The `util.getCallSite` API has been renamed to `util.getCallSites()`.",
+            "ExperimentalWarning",
+          );
+        }
+        return getCallSites(...args);
+      },
       parseArgs,
       aborted: (signal, resource) => {
         return new Promise((resolve) => {
@@ -16740,7 +16753,10 @@
       },
     };
 
-    return {
+    // require('node:test') / `import test from 'node:test'`: the module IS the
+    // test function, with the other helpers attached as properties (Node
+    // semantics -- test-util-text-decoder does `require('node:test')(...)`).
+    Object.assign(test, {
       test,
       it,
       describe,
@@ -16751,7 +16767,8 @@
       afterEach,
       mock,
       default: test,
-    };
+    });
+    return test;
   };
 
   // ------------------------------------------------- runtime global setup
