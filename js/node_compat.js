@@ -5805,6 +5805,11 @@
         }
         return undefined;
       },
+      _rawDebug(...args) {
+        // Synchronous low-level stderr write, bypassing the writable stream
+        // (Node's process._rawDebug); util.format the args + trailing newline.
+        natives.stderrWrite(registry.get("util").format(...args) + "\n");
+      },
       assert(condition, message) {
         // Deprecated (DEP0100): emit the warning once, then assert.
         if (!process._assertDep0100Warned) {
@@ -14381,15 +14386,42 @@
     const { Readable, Writable } = registry.get("stream");
     const { Buffer } = registry.get("buffer");
 
+    // oam subcommands -- if a self-spawn's first arg is one of these (or a
+    // flag), it's already an oam-shaped invocation and must NOT be rewritten.
+    const OAM_SUBCOMMANDS = new Set([
+      "run", "test", "repl", "check", "daemon", "mcp", "serve",
+      "install", "trust", "compile", "self-update", "help",
+    ]);
+
     function normalizeArgs(command, args, options) {
       if (args != null && typeof args === "object" && !Array.isArray(args)) {
         options = args;
         args = [];
       }
+      let cmd = String(command);
+      let argv = (args || []).map(String);
+      const opts = options || {};
+      // Self-spawn parity: Node runs `node <script> [args]`, but oam's CLI needs
+      // the `run` subcommand. When the command resolves to oam's own execPath
+      // (not a shell invocation) and the first arg is a SCRIPT (not a flag, not
+      // an existing oam subcommand), rewrite `<execPath> <script> [args]` ->
+      // `<execPath> run <script> --no-check -- [args]`, matching fork()'s
+      // injection. Leaves `node --flag script` (leading flag) and already-
+      // `run`-shaped invocations untouched.
+      if (!opts.shell && argv.length > 0) {
+        const execPath = globalThis.process.execPath;
+        const sameBin =
+          cmd === execPath ||
+          cmd.replace(/\\/g, "/").split("/").pop() === execPath.replace(/\\/g, "/").split("/").pop();
+        const first = argv[0];
+        if (sameBin && !first.startsWith("-") && !OAM_SUBCOMMANDS.has(first)) {
+          argv = ["run", first, "--no-check", "--", ...argv.slice(1)];
+        }
+      }
       return {
-        command: String(command),
-        args: (args || []).map(String),
-        options: options || {},
+        command: cmd,
+        args: argv,
+        options: opts,
       };
     }
 
