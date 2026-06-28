@@ -3219,14 +3219,13 @@
   registry.factories.path = (natives) => {
     const win32 = makePathModule(true, natives);
     const posix = makePathModule(false, natives);
-    const mod = natives.platform === "win32" ? { ...win32 } : { ...posix };
     win32.win32 = win32;
     win32.posix = posix;
     posix.win32 = win32;
     posix.posix = posix;
-    mod.win32 = win32;
-    mod.posix = posix;
-    return mod;
+    // The default path module IS the platform's module object (same reference),
+    // so `require('path') === require('path').win32` on Windows (test-path).
+    return natives.platform === "win32" ? win32 : posix;
   };
   registry.factories["path/posix"] = () => registry.get("path").posix;
   registry.factories["path/win32"] = () => registry.get("path").win32;
@@ -12265,7 +12264,10 @@
     function parse(input, sep = "&", eq = "=", options = {}) {
       const out = Object.create(null);
       if (typeof input !== "string" || input.length === 0) return out;
-      const maxKeys = options.maxKeys ?? 1000;
+      // Node honors maxKeys only when it is a NUMBER (Infinity/NaN included);
+      // a non-number (e.g. the string 'Infinity') falls back to the 1000
+      // default. A number > 0 caps; <=0 / NaN means unlimited.
+      const maxKeys = typeof options.maxKeys === "number" ? options.maxKeys : 1000;
       const pieces = input.split(sep);
       const limit = maxKeys > 0 ? Math.min(pieces.length, maxKeys) : pieces.length;
       for (let i = 0; i < limit; i++) {
