@@ -3134,6 +3134,8 @@ pub(crate) fn load_addon<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     path: &std::path::Path,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let trace = std::env::var_os("OAM_NAPI_TRACE").is_some();
+    if trace { eprintln!("[napi] dlopen start {}", path.display()); }
     let library = match unsafe { libloading::Library::new(path) } {
         Ok(library) => library,
         Err(e) => {
@@ -3141,6 +3143,7 @@ pub(crate) fn load_addon<'s>(
             return None;
         }
     };
+    if trace { eprintln!("[napi] dlopen ok; looking up napi_register_module_v1"); }
     let register: libloading::Symbol<RegisterFn> =
         match unsafe { library.get(b"napi_register_module_v1") } {
             Ok(symbol) => symbol,
@@ -3175,7 +3178,9 @@ pub(crate) fn load_addon<'s>(
     unsafe {
         (*env).scope = scope as *mut v8::PinScope<'_, '_> as *mut c_void;
     }
+    if trace { eprintln!("[napi] symbol found; calling register()"); }
     let result = unsafe { register(env, from_local(exports_value)) };
+    if trace { eprintln!("[napi] register() returned"); }
     unsafe {
         (*env).scope = std::ptr::null_mut();
     }

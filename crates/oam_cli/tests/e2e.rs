@@ -30,6 +30,9 @@ fn oam(args: &[&str]) -> Output {
         .to_path_buf();
     std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
         .args(args)
+        // The e2e suite exercises oam's N-API alpha (napi_* tests load real
+        // .node addons), which is OFF by default in production -- opt in here.
+        .env("OAM_ENABLE_NATIVE_ADDONS", "1")
         .env("OAM_CACHE_DIR", cache)
         .env("OAM_DAEMON_IDLE_MS", "45000")
         .output()
