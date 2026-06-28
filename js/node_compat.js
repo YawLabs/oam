@@ -9637,14 +9637,16 @@
     // Non-string/non-object input throws ERR_INVALID_ARG_TYPE.
     function legacyFormat(urlObject, options) {
       if (typeof urlObject === "string") {
-        // Legacy url.format('') is '' (and a relative string with no scheme
-        // formats to itself); only a parseable absolute URL round-trips.
+        // Node's legacy url.format(string) parses with the LEGACY parser and
+        // formats with the LEGACY Url.format -- this round-trips slash-exactly
+        // (e.g. 'fred:///s' stays 'fred:///s'), unlike the WHATWG URL which
+        // normalizes. (The WHATWG-URL-instance path below is unchanged.)
         if (urlObject === "") return "";
-        try {
-          urlObject = new globalThis.URL(urlObject);
-        } catch {
-          return urlObject;
-        }
+        return urlParse(urlObject, false, false).format();
+      } else if (urlObject instanceof Url) {
+        // A legacy Url instance (e.g. a resolveObject result) formats via its
+        // own faithful method, not the plain-object hand-assembly below.
+        return urlObject.format();
       } else if (urlObject instanceof globalThis.URL) {
         // fall through to WHATWG serializer below
       } else if (urlObject === null || typeof urlObject !== "object") {
@@ -10169,13 +10171,15 @@
       }
 
       if (isRelAbs) {
+        // Take host/auth/hostname/port from the relative ONLY when it actually
+        // carries a host; otherwise the source's host+hostname are kept (a
+        // relative absolute PATH like '/p/a/t/h' must not null out the host).
         if (relative.host || relative.host === "") {
           if (result.host !== relative.host) result.auth = null;
           result.host = relative.host;
           result.port = relative.port;
+          result.hostname = relative.hostname;
         }
-        if (result.hostname !== null) result.hostname = relative.hostname;
-        else result.hostname = relative.hostname;
         result.search = relative.search;
         result.query = relative.query;
         srcPath = relPath;

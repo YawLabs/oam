@@ -55,8 +55,8 @@
       "unrunnable": 10
     },
     "url": {
-      "fail": 3,
-      "pass": 10,
+      "fail": 2,
+      "pass": 11,
       "skip": 0,
       "unrunnable": 1
     },
@@ -67,15 +67,15 @@
       "unrunnable": 10
     }
   },
-  "commit": "aeb27de",
+  "commit": "3cd39da",
   "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
-  "fail": 167,
+  "fail": 166,
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.6.0",
-  "pass": 236,
-  "passOverRunnable": "58.6%",
-  "passOverTotal": "49.6%",
+  "pass": 237,
+  "passOverRunnable": "58.8%",
+  "passOverTotal": "49.8%",
   "runnable": 419,
   "schema": "oam-node-suite/1",
   "skip": 16,
