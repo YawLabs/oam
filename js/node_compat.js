@@ -1614,6 +1614,12 @@
     const descriptor = Object.getOwnPropertyDescriptor(RealBuffer, name);
     if (descriptor) Object.defineProperty(CallableBuffer, name, descriptor);
   }
+  // Buffer.of: the inherited Uint8Array.of does `new this(len)` == new Buffer(n),
+  // which fires the DEP0005 deprecation. Node defines its own non-deprecating
+  // Buffer.of (test-buffer-of-no-deprecation asserts no 'warning' fires).
+  CallableBuffer.of = function of(...items) {
+    return RealBuffer.from(items);
+  };
   // `Buffer.name` should read "Buffer" (some libs assert it).
   Object.defineProperty(CallableBuffer, "name", { value: "Buffer", configurable: true });
 
