@@ -262,7 +262,7 @@
       if (c === 0x3d) break; // '=' ends the data
       if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) continue; // whitespace
       const v = c < 256 ? B64_LOOKUP[c] : -1;
-      if (v === -1) break; // junk terminates, per Node
+      if (v === -1) continue; // Node SKIPS junk (only '=' terminates), not break
       acc = (acc << 6) | v;
       bits += 6;
       if (bits >= 8) {
@@ -476,7 +476,7 @@
     return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + received;
   });
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
-    return name ? '"' + name + '" is outside the bounds of the buffer' : 'Attempt to access memory outside buffer bounds';
+    return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
   codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
     return 'Child closed before reply';
@@ -584,8 +584,10 @@
         return out;
       }
       case "ascii": {
+        // Node's ascii ENCODE writes the low 8 bits (charCode & 0xff), same as
+        // latin1 -- it is the DECODE side (toString) that masks to 7 bits.
         const out = new Uint8Array(str.length);
-        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0x7f;
+        for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
         return out;
       }
       case "utf16le": {
@@ -801,6 +803,60 @@
     }
   }
 
+  // Brand checks for ArrayBuffer / SharedArrayBuffer that, unlike `instanceof`,
+  // are NOT fooled by prototype tampering and DO recognize cross-realm buffers
+  // (Node uses the internal-slot brand). Each calls the prototype byteLength
+  // getter, which throws unless the receiver has the matching internal slot.
+  const _abByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+  // SharedArrayBuffer's byteLength getter is resolved LAZILY: this module is
+  // evaluated while building the V8 snapshot, where SharedArrayBuffer is not
+  // yet a global, so capturing it here would pin it to null forever and make
+  // every SAB look like a non-buffer. Resolve on first use (runtime), cache it.
+  let _sabByteLength;
+  let _sabResolved = false;
+  function sabByteLengthGetter() {
+    if (!_sabResolved) {
+      _sabResolved = true;
+      _sabByteLength =
+        typeof SharedArrayBuffer !== "undefined"
+          ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get
+          : null;
+    }
+    return _sabByteLength;
+  }
+  function isAnyArrayBuffer(v) {
+    if (typeof v !== "object" || v === null) return false;
+    try {
+      _abByteLength.call(v);
+      return true;
+    } catch {
+      /* not a real ArrayBuffer */
+    }
+    const sabGet = sabByteLengthGetter();
+    if (sabGet) {
+      try {
+        sabGet.call(v);
+        return true;
+      } catch {
+        /* not a real SharedArrayBuffer */
+      }
+    }
+    return false;
+  }
+
+  // Node's validateInteger: number-typed integer >= min (copyBytesFrom offsets).
+  function validateInteger(value, name, min) {
+    if (typeof value !== "number") {
+      throw argTypeOfError(name, "number", value);
+    }
+    if (!Number.isInteger(value)) {
+      throw codes.ERR_OUT_OF_RANGE(name, "an integer", fmtRange(value));
+    }
+    if (min !== undefined && value < min) {
+      throw codes.ERR_OUT_OF_RANGE(name, ">= " + min, fmtRange(value));
+    }
+  }
+
   class Buffer extends Uint8Array {
     static get [Symbol.species]() {
       return Buffer;
@@ -831,20 +887,88 @@
       return new Buffer(size);
     }
 
+    // Node >= 19: copy the raw BYTES of a TypedArray into a new Buffer (a true
+    // byte reinterpretation, unlike Buffer.from(typedArray) which copies the
+    // ELEMENTS mod 256). offset/length are in TypedArray ELEMENTS.
+    static copyBytesFrom(view, offset, length) {
+      if (!ArrayBuffer.isView(view) || view instanceof DataView) {
+        throw codes.ERR_INVALID_ARG_TYPE("view", "TypedArray", view);
+      }
+      const viewLength = view.length;
+      if (viewLength === 0) return Buffer.alloc(0);
+      if (offset !== undefined || length !== undefined) {
+        if (offset === undefined) {
+          offset = 0;
+        } else {
+          validateInteger(offset, "offset", 0);
+          if (offset >= viewLength) return Buffer.alloc(0);
+        }
+        let end;
+        if (length === undefined) {
+          end = viewLength;
+        } else {
+          validateInteger(length, "length", 0);
+          end = offset + length;
+        }
+        view = view.subarray(offset, end);
+      }
+      const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+      const buf = new Buffer(bytes.length);
+      buf.set(bytes);
+      return buf;
+    }
+
     static from(value, encodingOrOffset, length) {
       if (typeof value === "string") {
-        const bytes = bytesFromString(value, encodingOrOffset);
+        // Node fromString: a non-string (or empty-string) encoding silently
+        // defaults to utf8 (`Buffer.from('asd', 1)` is allowed); a non-empty
+        // unknown string encoding throws ERR_UNKNOWN_ENCODING.
+        let enc = encodingOrOffset;
+        if (typeof enc !== "string" || enc.length === 0) enc = undefined;
+        const bytes = bytesFromString(value, enc);
         return new Buffer(bytes.buffer, bytes.byteOffset, bytes.length);
       }
-      if (value instanceof ArrayBuffer || value instanceof SharedArrayBuffer) {
-        // Views the SAME memory, per Node.
-        return new Buffer(value, encodingOrOffset, length);
+      if (value instanceof Uint8Array) {
+        // Buffer / Uint8Array: COPIES its bytes, per Node (from(typedArray)
+        // copies; length === element count === byte count).
+        const buf = new Buffer(value.length);
+        buf.set(value);
+        return buf;
+      }
+      if (isAnyArrayBuffer(value)) {
+        // Views the SAME memory, per Node. Brand-checked (not instanceof) so
+        // a prototype-spoofed object is rejected and cross-realm buffers work.
+        // Coerce byteOffset/length exactly as Node's fromArrayBuffer does.
+        let off;
+        if (encodingOrOffset === undefined) {
+          off = 0;
+        } else {
+          off = +encodingOrOffset;
+          if (Number.isNaN(off)) off = 0;
+        }
+        const maxLength = value.byteLength - off;
+        if (maxLength < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+        let len;
+        if (length === undefined) {
+          len = maxLength;
+        } else {
+          len = +length;
+          if (len > 0) {
+            if (len > maxLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+          } else {
+            len = 0;
+          }
+        }
+        return new Buffer(value, off, len);
       }
       if (ArrayBuffer.isView(value)) {
-        // COPIES, per Node (from(typedArray) copies; from(arrayBuffer) views).
-        const src = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-        const buf = new Buffer(src.length);
-        buf.set(src);
+        // Any OTHER TypedArray (Uint16Array, Uint32Array, ...) is treated as an
+        // array-like of its ELEMENTS, each coerced mod 256 -- NOT a raw byte
+        // reinterpretation (that is Buffer.copyBytesFrom). A DataView has no
+        // numeric .length and yields an empty Buffer.
+        const n = typeof value.length === "number" ? value.length : 0;
+        const buf = new Buffer(n);
+        if (n > 0) buf.set(value);
         return buf;
       }
       if (Array.isArray(value)) {
@@ -872,9 +996,13 @@
           if (typeof coerced === "string") return Buffer.from(coerced, encodingOrOffset);
         }
       }
-      // Array-like (objects with a numeric .length): fromArrayLike. Functions
-      // have a numeric .length too but are NOT valid input -- Node rejects them.
-      if (value != null && typeof value === "object" && typeof value.length === "number") {
+      // Array-like (objects with a `.length`): fromArrayLike. Per Node, a
+      // NON-number length yields an empty Buffer; a number <= 0 yields empty;
+      // otherwise allocate (NaN -> 0, fractional truncates) and copy elements
+      // mod 256. Functions have a numeric .length but are typeof "function", so
+      // they never reach this object-only branch (Node rejects them).
+      if (value != null && typeof value === "object" && value.length !== undefined) {
+        if (typeof value.length !== "number" || value.length <= 0) return new Buffer(0);
         const len = value.length >>> 0;
         const buf = new Buffer(len);
         for (let i = 0; i < len; i++) buf[i] = value[i] & 0xff;
@@ -882,12 +1010,9 @@
       }
       // Node fromObject: an object whose `.buffer` is an (any) ArrayBuffer but
       // with no numeric length yields an empty Buffer (test-buffer-sharedarray
-      // buffer does Buffer.from({ buffer: sab }) and expects no throw).
-      if (
-        value != null && typeof value === "object" &&
-        (value.buffer instanceof ArrayBuffer ||
-          (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer))
-      ) {
+      // buffer does Buffer.from({ buffer: sab }) and expects no throw). Brand-
+      // checked so a cross-realm ArrayBuffer is recognized.
+      if (value != null && typeof value === "object" && isAnyArrayBuffer(value.buffer)) {
         return new Buffer(0);
       }
       throw argTypeFromError(value);
@@ -1085,21 +1210,32 @@
     }
 
     write(string, offset, length, encoding) {
-      // write(str), write(str, enc), write(str, offset, enc),
-      // write(str, offset, length, enc)
-      if (typeof offset === "string") {
+      // Node's argument dispatch (lib/buffer.js):
+      //   write(string)                          -> whole buffer, utf8
+      //   write(string, encoding)                -- ONLY when length is omitted
+      //   write(string, offset[, length][, encoding])
+      // A STRING in the `offset` slot is the encoding ONLY when `length` is
+      // absent; otherwise `offset` must be a number (a string there is an
+      // ERR_INVALID_ARG_TYPE, e.g. b.write('test', 'utf8', 0)).
+      if (offset === undefined) {
+        offset = 0;
+        length = this.length;
+      } else if (length === undefined && typeof offset === "string") {
         encoding = offset;
         offset = 0;
-        length = undefined;
-      } else if (typeof length === "string") {
-        encoding = length;
-        length = undefined;
-      }
-      offset = offset ?? 0;
-      // Validate offset/length bounds (Node throws ERR_OUT_OF_RANGE).
-      validateOffsetRange(offset, "offset", this.length);
-      if (length !== undefined) {
-        validateOffsetRange(length, "length", this.length);
+        length = this.length;
+      } else {
+        validateOffsetRange(offset, "offset", this.length);
+        const remaining = this.length - offset;
+        if (length === undefined) {
+          length = remaining;
+        } else if (typeof length === "string") {
+          encoding = length;
+          length = remaining;
+        } else {
+          validateOffsetRange(length, "length", this.length);
+          if (length > remaining) length = remaining;
+        }
       }
       const bytes = bytesFromString(String(string), encoding);
       let writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
@@ -1136,16 +1272,39 @@
           { code: "ERR_OUT_OF_RANGE" },
         );
       }
+      // Node value coercion: undefined/null -> 0; boolean -> 0/1; number -> &255.
+      if (value === undefined || value === null) {
+        Uint8Array.prototype.fill.call(this, 0, start, end);
+        return this;
+      }
+      if (typeof value === "boolean") value = +value;
       if (typeof value === "number") {
         Uint8Array.prototype.fill.call(this, value & 0xff, start, end);
         return this;
       }
-      const pattern =
-        typeof value === "string" ? bytesFromString(value, encoding) : Buffer.from(value);
-      if (pattern.length === 0) {
-        Uint8Array.prototype.fill.call(this, 0, start, end);
+      if (typeof value === "string") {
+        // Node validates the encoding here: a non-string encoding is an
+        // ERR_INVALID_ARG_TYPE, an unrecognized one is ERR_UNKNOWN_ENCODING.
+        const norm = normalizeEncoding(encoding);
+        if (norm === undefined) {
+          if (typeof encoding !== "string") throw argTypeOfError("encoding", "string", encoding);
+          throw codes.ERR_UNKNOWN_ENCODING(encoding);
+        }
+        if (value.length === 0) {
+          Uint8Array.prototype.fill.call(this, 0, start, end);
+          return this;
+        }
+        const pattern = bytesFromString(value, encoding);
+        // A non-empty string that decodes to zero bytes (bad/odd hex, a single
+        // base64 char) is an invalid fill value, per Node.
+        if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
+        for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
         return this;
       }
+      // Buffer / Uint8Array / array-like fill value: tile its bytes. An empty
+      // one is an invalid fill value, per Node.
+      const pattern = Buffer.from(value);
+      if (pattern.length === 0) throw codes.ERR_INVALID_ARG_VALUE("value", value);
       for (let i = start; i < end; i++) this[i] = pattern[(i - start) % pattern.length];
       return this;
     }
@@ -1271,15 +1430,81 @@
       return `<Buffer ${head}${extra}>`;
     }
 
-    // Node aliases buf.parent -> buf.buffer (legacy pre-Uint8Array name).
+    // Node aliases buf.parent -> buf.buffer (legacy pre-Uint8Array name). The
+    // getter must not throw when read off the prototype (Buffer.prototype.parent
+    // === undefined), so guard the receiver.
     get parent() {
-      return this.buffer;
+      return this instanceof Buffer ? this.buffer : undefined;
     }
 
-    // Node exposes buf.offset === buf.byteOffset.
+    // Node exposes buf.offset === buf.byteOffset (same prototype-read guard).
     get offset() {
-      return this.byteOffset;
+      return this instanceof Buffer ? this.byteOffset : undefined;
     }
+  }
+
+  // Node's Buffer.prototype.lastIndexOf is a plain function (not a class method),
+  // so it is constructable: `new buffer.Buffer.prototype.lastIndexOf(1, 'str')`
+  // reaches the receiver guard and throws ERR_INVALID_ARG_TYPE for "buffer"
+  // (see test-buffer-indexof). A class method is non-constructable and would
+  // instead throw "is not a constructor". Re-wrap as a named function expression
+  // so `new` works and the constructed instance reports name "lastIndexOf".
+  {
+    const classLastIndexOf = Buffer.prototype.lastIndexOf;
+    Buffer.prototype.lastIndexOf = function lastIndexOf(needle, byteOffset, encoding) {
+      return classLastIndexOf.call(this, needle, byteOffset, encoding);
+    };
+  }
+
+  // Node aliases Buffer.prototype.toLocaleString to the SAME function as
+  // toString (test-buffer-alloc asserts reference equality); otherwise it would
+  // inherit %TypedArray%.prototype.toLocaleString.
+  Buffer.prototype.toLocaleString = Buffer.prototype.toString;
+
+  // Node's per-encoding raw write helpers (asciiWrite/latin1Write/utf8Write,
+  // exposed on Buffer.prototype). offset/length are validated against the
+  // buffer bounds and throw ERR_BUFFER_OUT_OF_BOUNDS when out of range (a
+  // negative length, an offset past the end, ...) -- see test-buffer-write.
+  {
+    function rawEncWrite(buf, encoding, string, offset, length) {
+      if (offset === undefined) {
+        offset = 0;
+      } else {
+        offset = +offset;
+        if (Number.isNaN(offset)) offset = 0;
+      }
+      if (offset < 0 || offset > buf.length || Math.floor(offset) !== offset) {
+        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      }
+      const remaining = buf.length - offset;
+      if (length === undefined) {
+        length = remaining;
+      } else {
+        length = +length;
+        if (Number.isNaN(length)) length = 0;
+      }
+      if (length < 0 || Math.floor(length) !== length) {
+        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
+      }
+      if (length > remaining) length = remaining;
+      const bytes = bytesFromString(String(string), encoding);
+      let writable = Math.min(bytes.length, length);
+      // Never split a multi-byte UTF-8 sequence (1 byte/char for ascii/latin1).
+      if (writable < bytes.length && encoding === "utf8") {
+        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
+      }
+      buf.set(bytes.subarray(0, writable), offset);
+      return writable;
+    }
+    Buffer.prototype.asciiWrite = function asciiWrite(string, offset, length) {
+      return rawEncWrite(this, "ascii", string, offset, length);
+    };
+    Buffer.prototype.latin1Write = function latin1Write(string, offset, length) {
+      return rawEncWrite(this, "latin1", string, offset, length);
+    };
+    Buffer.prototype.utf8Write = function utf8Write(string, offset, length) {
+      return rawEncWrite(this, "utf8", string, offset, length);
+    };
   }
 
   // The numeric read/write family, generated over DataView. Each entry carries
@@ -3408,7 +3633,15 @@
         if (globalThis.Buffer && v instanceof globalThis.Buffer) return v.inspect();
         if (seen.has(v)) return "[Circular *1]";
         if (depth !== null && level > depth) {
-          return Array.isArray(v) ? "[Array]" : "[Object]";
+          if (Array.isArray(v)) return "[Array]";
+          // Node tags a depth-collapsed null-prototype object specially; an
+          // empty one still shows its braces ("[Object: null prototype] {}").
+          if (Object.getPrototypeOf(v) === null) {
+            return Reflect.ownKeys(v).length === 0
+              ? "[Object: null prototype] {}"
+              : "[Object: null prototype]";
+          }
+          return "[Object]";
         }
         seen.add(v);
         try {
