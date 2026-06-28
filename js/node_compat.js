@@ -17672,11 +17672,12 @@
     // ._destroyed -- and it is registered in a JS-side active-timer map that
     // backs process.getActiveResourcesInfo() / process._getActiveHandles().
     //
-    // Documented divergence: .unref() is best-effort. The Rust event loop
-    // exits when no live timers remain (it has no unref accounting), so an
-    // unref'd timer still keeps the loop alive and still fires. hasRef()
-    // faithfully reflects the ref flag, but "unref'd timer never fires"
-    // needs a runtime change and is out of scope.
+    // ref/unref are Node-faithful: .unref() calls the native timerUnref(id),
+    // which clears the timer's ref flag in the Rust TimerQueue. The event loop
+    // stays alive only for ref'd timers (and inflight ops), so an unref'd timer
+    // that is the sole remaining work does NOT fire and does NOT block exit --
+    // but an unref'd timer still fires while other work keeps the loop open.
+    // hasRef() reflects the JS-side _ref flag, kept in lockstep with native.
     {
       const bindToCurrentFrame = (fn) => {
         if (typeof fn !== "function") return fn;
@@ -17696,6 +17697,19 @@
       const nativeSetInterval = globalThis.setInterval;
       const nativeClearTimeout = globalThis.clearTimeout;
       const nativeClearInterval = globalThis.clearInterval;
+      // Native ref/unref flip the TimerQueue ref flag by id so an unref'd timer
+      // stops keeping the event loop alive. Tolerate their absence (older snap).
+      const nativeTimerRef = typeof natives.timerRef === "function" ? natives.timerRef : null;
+      const nativeTimerUnref =
+        typeof natives.timerUnref === "function" ? natives.timerUnref : null;
+      const applyNativeRef = (id, isRef) => {
+        if (!id) return;
+        if (isRef) {
+          if (nativeTimerRef) nativeTimerRef(id);
+        } else if (nativeTimerUnref) {
+          nativeTimerUnref(id);
+        }
+      };
 
       // Active-timer registry: numeric id -> Timeout/Immediate object. Backs
       // process.getActiveResourcesInfo() and the _getActive* introspection.
@@ -17744,14 +17758,19 @@
         const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
         this._id = native(wrapped, this._delay, ...this._args);
         this._destroyed = false;
+        // A fresh native timer is ref'd by default; re-apply an unref'd state so
+        // refresh()/re-schedule preserves the handle's ref flag (Node parity).
+        if (!this._ref) applyNativeRef(this._id, false);
         activeTimers.set(this._id, this);
       };
       Timeout.prototype.ref = function ref() {
         this._ref = true;
+        applyNativeRef(this._id, true);
         return this;
       };
       Timeout.prototype.unref = function unref() {
         this._ref = false;
+        applyNativeRef(this._id, false);
         return this;
       };
       Timeout.prototype.hasRef = function hasRef() {

@@ -634,10 +634,21 @@ impl crate::JsRuntime {
         }
 
         if load_cjs(tc, entry).is_none() {
-            return Err(vec![crate::modules::catch_to_diagnostic(
-                tc,
-                &entry.to_string_lossy(),
-            )]);
+            // A synchronous top-level throw in the CJS entry body leaves the
+            // exception pending in `tc`. Offer it to a process
+            // 'uncaughtException' listener (Node parity) before failing: a
+            // present listener that does not itself throw suppresses the fatal
+            // exit (handle_uncaught_throw returns None). Some(_) means no
+            // listener -- keep today's OAM-RT0001 behavior. catch_to_diagnostic
+            // (the old path) only carried the message text, losing the Error
+            // VALUE the handler needs to inspect err.stack.
+            if let Some(failure) =
+                crate::modules::handle_uncaught_throw(tc, &entry.to_string_lossy())
+            {
+                return Err(failure);
+            }
+            // Handled by a listener: fall through and pump the loop like a clean
+            // run (timers/ops the entry or the handler scheduled still run).
         }
         tc.perform_microtask_checkpoint();
         if let Some(failure) = crate::modules::drain_uncaught(tc) {

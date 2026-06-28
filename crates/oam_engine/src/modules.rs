@@ -389,7 +389,24 @@ impl JsRuntime {
                 None => Ok(()),
             },
             v8::PromiseState::Rejected => {
+                // A synchronous top-level throw (V8 rejects the module's
+                // evaluation promise) carries the thrown VALUE in result().
+                // Offer it to a process 'uncaughtException' listener before
+                // failing (Node parity). mark_as_handled first so V8 does not
+                // ALSO route this promise to the unhandled-rejection ledger.
+                promise.mark_as_handled();
                 let exception = promise.result(tc);
+                if emit_process_event(tc, "uncaughtException", &[exception]) {
+                    // A listener suppressed the fatal exit: continue like a
+                    // clean run -- drain microtasks the handler queued, pump any
+                    // pending timers/ops, then report unhandled rejections.
+                    tc.perform_microtask_checkpoint();
+                    pump_event_loop(tc, None)?;
+                    return match unhandled_rejection_failures(tc) {
+                        Some(failures) => Err(failures),
+                        None => Ok(()),
+                    };
+                }
                 let text = exception
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))
@@ -785,9 +802,20 @@ pub(crate) fn pump_event_loop(
         let next_deadline = tc
             .get_slot_mut::<crate::timers::TimerQueue>()
             .and_then(|queue| queue.next_deadline());
+        let has_ref_timers = tc
+            .get_slot::<crate::timers::TimerQueue>()
+            .is_some_and(|queue| queue.has_ref_timers());
         let has_inflight = tc
             .get_slot::<oam_core::CoreRuntime>()
             .is_some_and(|core| core.has_inflight());
+        // Node: only ref'd timers and inflight ops keep the loop alive. When
+        // the sole remaining work is unref'd timers, exit WITHOUT firing them.
+        // (An unref'd timer due BEFORE this point still fired above via pop_due,
+        // since `next_deadline` below still wakes us for it while other work
+        // keeps the loop open.)
+        if !has_ref_timers && !has_inflight {
+            break;
+        }
         match (next_deadline, has_inflight) {
             (None, false) => break,
             (deadline, true) => {

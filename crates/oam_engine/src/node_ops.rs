@@ -21,6 +21,7 @@ use crate::crypto_ops::{
     op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
+use crate::timers::{timer_ref, timer_unref};
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -120,6 +121,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
         ("setContinuationData", op_set_continuation_data),
+        // Timer ref/unref: flip the native TimerQueue ref flag so an unref'd
+        // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
+        ("timerRef", timer_ref),
+        ("timerUnref", timer_unref),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),

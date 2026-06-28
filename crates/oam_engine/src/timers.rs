@@ -20,6 +20,11 @@ pub(crate) struct TimerEntry {
     args: Vec<v8::Global<v8::Value>>,
     /// Some(period) for setInterval, None for setTimeout.
     interval: Option<Duration>,
+    /// Node ref/unref: a ref'd timer keeps the event loop alive; an unref'd
+    /// one does not (it still FIRES while other work keeps the loop open, but
+    /// when it is the sole remaining work the loop exits without running it).
+    /// New timers start ref'd, matching Node.
+    is_ref: bool,
 }
 
 pub(crate) struct TimerQueue {
@@ -29,6 +34,10 @@ pub(crate) struct TimerQueue {
     /// timers FIFO. Cancelled ids are skipped lazily (absent from `active`).
     heap: BinaryHeap<Reverse<(Instant, u64, u32)>>,
     active: HashMap<u32, TimerEntry>,
+    /// Count of live `active` timers that are ref'd. O(1) "does any ref'd
+    /// timer keep the loop alive?" check for the event loop's exit decision,
+    /// kept in sync by schedule / cancel / pop_due / set_ref.
+    ref_count: usize,
 }
 
 impl Default for TimerQueue {
@@ -38,6 +47,7 @@ impl Default for TimerQueue {
             seq: 0,
             heap: BinaryHeap::new(),
             active: HashMap::new(),
+            ref_count: 0,
         }
     }
 }
@@ -52,13 +62,19 @@ impl TimerQueue {
         self.seq += 1;
         self.heap
             .push(Reverse((Instant::now() + delay, self.seq, id)));
+        if entry.is_ref {
+            self.ref_count += 1;
+        }
         self.active.insert(id, entry);
         id
     }
 
     fn cancel(&mut self, id: u32) {
-        if self.active.remove(&id).is_none() {
+        let Some(entry) = self.active.remove(&id) else {
             return;
+        };
+        if entry.is_ref {
+            self.ref_count -= 1;
         }
         // The heap entry stays until its deadline reaches the front, so a
         // cancelled far-future timer (the ubiquitous set-then-clear-on-
@@ -101,14 +117,41 @@ impl TimerQueue {
             };
             let callback = entry.callback.clone();
             let args = entry.args.clone();
-            if let Some(period) = entry.interval {
+            let interval = entry.interval;
+            let is_ref = entry.is_ref;
+            if let Some(period) = interval {
                 self.seq += 1;
                 self.heap.push(Reverse((now + period, self.seq, id)));
             } else {
                 self.active.remove(&id);
+                if is_ref {
+                    self.ref_count -= 1;
+                }
             }
             return Some((callback, args));
         }
+    }
+
+    /// Flip a live timer's ref flag (Node's Timeout#ref / #unref). Unknown or
+    /// already-fired/cancelled ids are a no-op. Keeps `ref_count` in sync.
+    pub(crate) fn set_ref(&mut self, id: u32, value: bool) {
+        if let Some(entry) = self.active.get_mut(&id)
+            && entry.is_ref != value
+        {
+            entry.is_ref = value;
+            if value {
+                self.ref_count += 1;
+            } else {
+                self.ref_count -= 1;
+            }
+        }
+    }
+
+    /// Whether any live timer is ref'd. The event loop stays alive only for
+    /// ref'd timers (and inflight ops); when this is false and no ops remain,
+    /// the loop exits WITHOUT firing the remaining unref'd timers.
+    pub(crate) fn has_ref_timers(&self) -> bool {
+        self.ref_count > 0
     }
 }
 
@@ -172,6 +215,7 @@ fn schedule_from_args(
         callback,
         args: extra,
         interval: repeating.then_some(delay),
+        is_ref: true, // Node: timers start ref'd; JS calls timerUnref to clear it
     };
     let id = scope
         .get_slot_mut::<TimerQueue>()
@@ -205,6 +249,35 @@ fn clear_timer(
         && let Some(queue) = scope.get_slot_mut::<TimerQueue>()
     {
         queue.cancel(id);
+    }
+}
+
+/// `__oam.node.timerRef(id)` — Node's Timeout#ref. Marks a live timer as ref'd
+/// so it keeps the event loop alive. Backs the JS Timeout wrapper's .ref().
+pub(crate) fn timer_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(id) = args.get(0).uint32_value(scope)
+        && let Some(queue) = scope.get_slot_mut::<TimerQueue>()
+    {
+        queue.set_ref(id, true);
+    }
+}
+
+/// `__oam.node.timerUnref(id)` — Node's Timeout#unref. Marks a live timer as
+/// unref'd so it no longer keeps the event loop alive (it still fires while
+/// other work keeps the loop open). Backs the JS Timeout wrapper's .unref().
+pub(crate) fn timer_unref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(id) = args.get(0).uint32_value(scope)
+        && let Some(queue) = scope.get_slot_mut::<TimerQueue>()
+    {
+        queue.set_ref(id, false);
     }
 }
 
