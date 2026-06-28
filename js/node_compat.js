@@ -12259,7 +12259,77 @@
         });
       }
     };
-    const escape = (text) => encodeURIComponent(String(text));
+    // Node's querystring.escape: a custom UTF-8 percent-encoder (NOT
+    // encodeURIComponent) -- unreserved set is alphanum + !'()*-._~, and a
+    // high surrogate pairs with the FOLLOWING code unit (lone trailing
+    // surrogate -> ERR_INVALID_URI). Coercion is `+ ''` for non-objects so a
+    // Symbol throws TypeError (unlike String(symbol)).
+    const qsHexTable = [];
+    for (let i = 0; i < 256; i++) {
+      qsHexTable[i] = "%" + (i < 16 ? "0" : "") + i.toString(16).toUpperCase();
+    }
+    // 1 = leave unescaped. alphanum + ! ' ( ) * - . _ ~
+    const qsNoEscape = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0-15
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16-31
+      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 32-47 (! ' ( ) * - .)
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48-63 (0-9)
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64-79 (A-O)
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 80-95 (P-Z _)
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96-111 (a-o)
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 112-127 (p-z ~)
+    ]);
+    const qsInvalidUri = () => {
+      const e = new URIError("URI malformed");
+      e.code = "ERR_INVALID_URI";
+      return e;
+    };
+    const escape = (str) => {
+      if (typeof str !== "string") {
+        if (typeof str === "object" && str !== null) str = String(str);
+        else str += ""; // Symbol -> TypeError (matches Node), number -> "5"
+      }
+      const len = str.length;
+      if (len === 0) return "";
+      let out = "";
+      let lastPos = 0;
+      for (let i = 0; i < len; i++) {
+        let c = str.charCodeAt(i);
+        if (c < 0x80) {
+          if (qsNoEscape[c] === 1) continue;
+          if (lastPos < i) out += str.slice(lastPos, i);
+          lastPos = i + 1;
+          out += qsHexTable[c];
+          continue;
+        }
+        if (lastPos < i) out += str.slice(lastPos, i);
+        if (c < 0x800) {
+          lastPos = i + 1;
+          out += qsHexTable[0xc0 | (c >> 6)] + qsHexTable[0x80 | (c & 0x3f)];
+          continue;
+        }
+        if (c < 0xd800 || c >= 0xe000) {
+          lastPos = i + 1;
+          out += qsHexTable[0xe0 | (c >> 12)] +
+            qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
+            qsHexTable[0x80 | (c & 0x3f)];
+          continue;
+        }
+        // surrogate: pair with the next code unit
+        ++i;
+        if (i >= len) throw qsInvalidUri();
+        const c2 = str.charCodeAt(i) & 0x3ff;
+        lastPos = i + 1;
+        c = 0x10000 + (((c & 0x3ff) << 10) | c2);
+        out += qsHexTable[0xf0 | (c >> 18)] +
+          qsHexTable[0x80 | ((c >> 12) & 0x3f)] +
+          qsHexTable[0x80 | ((c >> 6) & 0x3f)] +
+          qsHexTable[0x80 | (c & 0x3f)];
+      }
+      if (lastPos === 0) return str;
+      if (lastPos < len) return out + str.slice(lastPos);
+      return out;
+    };
 
     function parse(input, sep = "&", eq = "=", options = {}) {
       const out = Object.create(null);
