@@ -880,12 +880,26 @@
         for (let i = 0; i < len; i++) buf[i] = value[i] & 0xff;
         return buf;
       }
+      // Node fromObject: an object whose `.buffer` is an (any) ArrayBuffer but
+      // with no numeric length yields an empty Buffer (test-buffer-sharedarray
+      // buffer does Buffer.from({ buffer: sab }) and expects no throw).
+      if (
+        value != null && typeof value === "object" &&
+        (value.buffer instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer))
+      ) {
+        return new Buffer(0);
+      }
       throw argTypeFromError(value);
     }
 
     static byteLength(value, encoding) {
       if (typeof value !== "string") {
-        if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+        if (
+          ArrayBuffer.isView(value) ||
+          value instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer)
+        ) {
           return value.byteLength;
         }
         throw applyNodeErrorShape(
