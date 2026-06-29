@@ -3908,6 +3908,22 @@
       }
     }
 
+    const TA_TAG_GETTER = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Object.getPrototypeOf(new Int8Array(0))),
+      Symbol.toStringTag,
+    ).get;
+    const taKind = (v) => {
+      try {
+        return TA_TAG_GETTER.call(v);
+      } catch {
+        return "DataView";
+      }
+    };
+    const origGetTime = Date.prototype.getTime;
+    const anyArrayBuffer = (v) =>
+      v instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
+
     function deepEqualImpl(a, b, strict, memo) {
       // Strict is SameValue (Object.is): NaN equals NaN, +0 does NOT
       // equal -0 â€” exactly Node's deepStrictEqual primitive rule.
@@ -3935,25 +3951,79 @@
           // fall through to the own-enumerable-key comparison below.
         }
       }
-      if (a instanceof Date) return b instanceof Date && a.getTime() === b.getTime();
-      if (a instanceof RegExp) {
-        return b instanceof RegExp && a.source === b.source && a.flags === b.flags;
+      // Type tag must match symmetrically. Node uses the un-spoofable internal
+      // class, so an object vs a Date/RegExp/Array/Error/arguments (or two
+      // typed arrays of different element kind) is never equal even when their
+      // own keys line up. The old code only branched on `a instanceof X`, which
+      // silently accepted a type-mismatched `b`.
+      if (Array.isArray(a) !== Array.isArray(b)) return false;
+      if (
+        (Object.prototype.toString.call(a) === "[object Arguments]") !==
+        (Object.prototype.toString.call(b) === "[object Arguments]")
+      ) {
+        return false;
+      }
+      if (a instanceof Date !== b instanceof Date) return false;
+      if (a instanceof RegExp !== b instanceof RegExp) return false;
+      if (a instanceof Error !== b instanceof Error) return false;
+      if (a instanceof Map !== b instanceof Map) return false;
+      if (a instanceof Set !== b instanceof Set) return false;
+      if (ArrayBuffer.isView(a) !== ArrayBuffer.isView(b)) return false;
+      if (anyArrayBuffer(a) !== anyArrayBuffer(b)) return false;
+      // WeakMap/WeakSet cannot be compared by content; only reference equality
+      // (already handled by the `a === b` check above) -- distinct => not equal.
+      if (a instanceof WeakMap || a instanceof WeakSet) return false;
+      if (a instanceof Date) {
+        // Read the internal [[DateValue]] via the original getTime so an
+        // overridden own `getTime` cannot fool the comparison; a non-Date
+        // receiver (a fake clone with Date.prototype) throws => not equal.
+        let ta, tb;
+        try {
+          ta = origGetTime.call(a);
+        } catch {
+          return false;
+        }
+        try {
+          tb = origGetTime.call(b);
+        } catch {
+          return false;
+        }
+        if (!Object.is(ta, tb)) return false;
+        // fall through to own-key comparison (extra props still count)
+      } else if (a instanceof RegExp) {
+        try {
+          if (
+            a.source !== b.source ||
+            a.flags !== b.flags ||
+            a.lastIndex !== b.lastIndex
+          ) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        // fall through to own-key comparison
       }
       if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
         if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b)) return false;
+        // Element kind must match (Int8 != Uint8 even with equal bytes). Read
+        // the true kind via the %TypedArray% toStringTag getter, which ignores
+        // own-toStringTag / prototype spoofing.
+        if (taKind(a) !== taKind(b)) return false;
         const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
         const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
         if (ua.length !== ub.length) return false;
         for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
-        // Bytes match -- but extra own enumerable (non-index) properties still
-        // count, so fall through to the key comparison below rather than
-        // returning early.
+        // Extra own enumerable (non-index) properties still count. Symbols are
+        // compared only in strict mode (loose deepEqual ignores symbol keys).
         const extraKeys = (o) =>
           [
             ...Object.keys(o).filter((k) => !/^\d+$/.test(k)),
-            ...Object.getOwnPropertySymbols(o).filter(
-              (s) => Object.getOwnPropertyDescriptor(o, s)?.enumerable,
-            ),
+            ...(strict
+              ? Object.getOwnPropertySymbols(o).filter(
+                  (s) => Object.getOwnPropertyDescriptor(o, s)?.enumerable,
+                )
+              : []),
           ];
         const ea = extraKeys(a);
         const eb = extraKeys(b);
@@ -3964,6 +4034,13 @@
         }
         return true;
       }
+      if (anyArrayBuffer(a)) {
+        if (a.byteLength !== b.byteLength) return false;
+        const ua = new Uint8Array(a);
+        const ub = new Uint8Array(b);
+        for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+        return true;
+      }
       memo = memo ?? new Map();
       const prior = memo.get(a);
       if (prior && prior.has(b)) return true;
@@ -3971,44 +4048,46 @@
       else memo.set(a, new Set([b]));
 
       if (Array.isArray(a)) {
-        if (!Array.isArray(b) || a.length !== b.length) return false;
-        for (let i = 0; i < a.length; i++) {
-          if (!deepEqualImpl(a[i], b[i], strict, memo)) return false;
-        }
-        return true;
+        if (a.length !== b.length) return false;
+        // Do NOT return here: fall through to the own-key comparison so extra
+        // own props, sparse holes (Object.keys skips them), and (strict only)
+        // symbol keys are all checked like Node. Index values are compared by
+        // the bottom key loop.
       }
       if (a instanceof Map) {
-        if (!(b instanceof Map) || a.size !== b.size) return false;
-        for (const [k, v] of a) {
-          if (b.has(k)) {
-            if (!deepEqualImpl(v, b.get(k), strict, memo)) return false;
-          } else {
-            let found = false;
-            for (const [bk, bv] of b) {
-              if (deepEqualImpl(k, bk, strict, memo) && deepEqualImpl(v, bv, strict, memo)) {
-                found = true;
-                break;
-              }
+        if (a.size !== b.size) return false;
+        const entries = [...b];
+        const used = new Array(entries.length).fill(false);
+        mapOuter: for (const [k, v] of a) {
+          for (let i = 0; i < entries.length; i++) {
+            if (used[i]) continue;
+            if (
+              deepEqualImpl(k, entries[i][0], strict, memo) &&
+              deepEqualImpl(v, entries[i][1], strict, memo)
+            ) {
+              used[i] = true;
+              continue mapOuter;
             }
-            if (!found) return false;
           }
+          return false;
         }
-        return true;
+        // fall through: own enumerable props on the Map object are compared too
       }
       if (a instanceof Set) {
-        if (!(b instanceof Set) || a.size !== b.size) return false;
-        for (const v of a) {
-          if (b.has(v)) continue;
-          let found = false;
-          for (const bv of b) {
-            if (deepEqualImpl(v, bv, strict, memo)) {
-              found = true;
-              break;
+        if (a.size !== b.size) return false;
+        const items = [...b];
+        const used = new Array(items.length).fill(false);
+        setOuter: for (const v of a) {
+          for (let i = 0; i < items.length; i++) {
+            if (used[i]) continue;
+            if (deepEqualImpl(v, items[i], strict, memo)) {
+              used[i] = true;
+              continue setOuter;
             }
           }
-          if (!found) return false;
+          return false;
         }
-        return true;
+        // fall through: own enumerable props on the Set object are compared too
       }
       if (a instanceof Error) {
         if (!(b instanceof Error) || a.name !== b.name || a.message !== b.message) {
@@ -4020,13 +4099,22 @@
         const bHasCause = "cause" in b;
         if (aHasCause !== bHasCause) return false;
         if (aHasCause && !deepEqualImpl(a.cause, b.cause, strict, memo)) return false;
+        // AggregateError carries a non-enumerable `errors` array that Node
+        // compares as part of deep equality.
+        if (Array.isArray(a.errors) || Array.isArray(b.errors)) {
+          if (!deepEqualImpl(a.errors, b.errors, strict, memo)) return false;
+        }
       }
       // Own ENUMERABLE keys, string + symbol (Node compares both; non-
       // enumerable symbols are ignored).
       const ownEnumerableKeys = (obj) => {
         const out = Object.keys(obj);
-        for (const s of Object.getOwnPropertySymbols(obj)) {
-          if (Object.getOwnPropertyDescriptor(obj, s)?.enumerable) out.push(s);
+        // Node compares symbol-keyed props only in STRICT mode; loose deepEqual
+        // ignores symbols entirely.
+        if (strict) {
+          for (const s of Object.getOwnPropertySymbols(obj)) {
+            if (Object.getOwnPropertyDescriptor(obj, s)?.enumerable) out.push(s);
+          }
         }
         return out;
       };
