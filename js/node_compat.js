@@ -3611,18 +3611,29 @@
 
   // ----------------------------------------------------------------- util
   registry.factories.util = (natives) => {
+    const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
+    const INSPECT_COLORS = { bold: [1, 22], italic: [3, 23], underline: [4, 24], inverse: [7, 27], white: [37, 39], grey: [90, 39], black: [30, 39], blue: [34, 39], cyan: [36, 39], green: [32, 39], magenta: [35, 39], red: [31, 39], yellow: [33, 39] };
     function inspect(value, options = {}) {
       const depth = options.depth === undefined ? 2 : options.depth;
       const seen = new Set();
+      const stylize = options.colors
+        ? (str, type) => {
+            const name = INSPECT_STYLES[type];
+            if (!name) return str;
+            const c = INSPECT_COLORS[name];
+            return `\u001b[${c[0]}m${str}\u001b[${c[1]}m`;
+          }
+        : (str) => str;
 
       function walk(v, level) {
-        if (v === null) return "null";
+        if (v === null) return stylize("null", "null");
         const t = typeof v;
-        if (t === "string") return level === 0 && options.bare ? v : `'${v}'`;
-        if (t === "number") return Object.is(v, -0) ? "-0" : String(v);
-        if (t === "boolean" || t === "undefined") return String(v);
-        if (t === "bigint") return `${v}n`;
-        if (t === "symbol") return v.toString();
+        if (t === "string") return stylize(level === 0 && options.bare ? v : `'${v}'`, "string");
+        if (t === "number") return stylize(Object.is(v, -0) ? "-0" : String(v), "number");
+        if (t === "boolean") return stylize(String(v), "boolean");
+        if (t === "undefined") return stylize("undefined", "undefined");
+        if (t === "bigint") return stylize(`${v}n`, "bigint");
+        if (t === "symbol") return stylize(v.toString(), "symbol");
         if (t === "function") {
           const name = v.name ? `: ${v.name}` : " (anonymous)";
           const kind = String(v).startsWith("class") ? "class" : "Function";
@@ -3654,6 +3665,13 @@
             parts.push(`${kt}: ${walk(v[k], level + 1)}`);
           }
           return `<Buffer ${parts.join(", ")}>`;
+        }
+        if ((typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer) || v instanceof ArrayBuffer) {
+          const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+          const bytes = new Uint8Array(v);
+          let hex = "";
+          for (let i = 0; i < bytes.length; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+          return `${label} { [Uint8Contents]: <${hex}>, [byteLength]: ${v.byteLength} }`;
         }
         if (seen.has(v)) return "[Circular *1]";
         if (depth !== null && level > depth) {
@@ -3780,9 +3798,9 @@
       }
       return (neg ? "-" : "") + out;
     }
-    let _fmtNumSep = false;
+    let _fmtOpts = {};
     function maybeSep(str) {
-      return _fmtNumSep ? numSep(str) : str;
+      return _fmtOpts.numericSeparator ? numSep(str) : str;
     }
 
     function formatValue(v) {
@@ -3791,14 +3809,15 @@
     }
 
     function format(f, ...args) {
-      _fmtNumSep = !!inspect.defaultOptions.numericSeparator;
+      _fmtOpts = inspect.defaultOptions;
       // util.format() with no arguments returns '' (Node parity).
       if (arguments.length === 0) return "";
       return formatBody(f, args);
     }
     function formatBody(f, args) {
+      const fmtInspect = (x) => (typeof x === "string" ? x : inspect(x, _fmtOpts));
       if (typeof f !== "string") {
-        return [f, ...args].map(formatValue).join(" ");
+        return [f, ...args].map(fmtInspect).join(" ");
       }
       // Node fast-path: a lone format string with NO substitution args is
       // returned verbatim ('%%' stays '%%').
@@ -3810,11 +3829,19 @@
         const arg = args[i++];
         switch (spec) {
           case "%s": {
-            if (typeof arg === "string") return arg;
-            // Node special-cases negative zero / bigint in %s.
             if (typeof arg === "number") return maybeSep(numToStr(arg));
             if (typeof arg === "bigint") return (maybeSep(String(arg)) + "n");
-            return inspect(arg, { bare: true });
+            // Node %s: only an object with a BUILT-IN toString (plain object /
+            // array) inspects at depth 0; everything else (primitives, functions,
+            // symbols, objects with a custom toString) is String()-coerced.
+            const isObj = arg !== null && typeof arg === "object";
+            let builtIn = false;
+            if (isObj) {
+              const ts = arg.toString;
+              builtIn = typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString;
+            }
+            if (!builtIn) return String(arg);
+            return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, bare: true });
           }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
@@ -3833,12 +3860,12 @@
             }
           case "%o":
           case "%O":
-            return inspect(arg);
+            return inspect(arg, _fmtOpts);
           default:
             return spec;
         }
       });
-      for (; i < args.length; i++) out += " " + formatValue(args[i]);
+      for (; i < args.length; i++) out += " " + fmtInspect(args[i]);
       return out;
     }
 
@@ -4421,9 +4448,10 @@
     return {
       format,
       formatWithOptions: (opts, ...args) => {
-        _fmtNumSep = !!(opts && opts.numericSeparator !== undefined
-          ? opts.numericSeparator
-          : inspect.defaultOptions.numericSeparator);
+        if (opts === null || typeof opts !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("inspectOptions", "object", opts);
+        }
+        _fmtOpts = { ...inspect.defaultOptions, ...opts };
         if (args.length === 0) return "";
         return formatBody(args[0], args.slice(1));
       },
