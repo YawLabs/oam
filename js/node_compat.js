@@ -3689,10 +3689,39 @@
         seen.add(v);
         try {
           if (Array.isArray(v)) {
+            // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
+            const aCtor = v.constructor && v.constructor.name;
+            const aPrefix = aCtor && aCtor !== "Array" ? `${aCtor}(${v.length}) ` : "";
             const max = 100;
-            const items = v.slice(0, max).map((item) => walk(item, level + 1));
+            const items = [];
+            let emptyRun = 0;
+            const flushEmpty = () => {
+              if (emptyRun > 0) {
+                items.push(`<${emptyRun} empty item${emptyRun === 1 ? "" : "s"}>`);
+                emptyRun = 0;
+              }
+            };
+            const limit = Math.min(v.length, max);
+            for (let idx = 0; idx < limit; idx++) {
+              // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
+              if (!Object.prototype.hasOwnProperty.call(v, idx)) { emptyRun++; continue; }
+              flushEmpty();
+              items.push(walk(v[idx], level + 1));
+            }
+            flushEmpty();
             if (v.length > max) items.push(`... ${v.length - max} more items`);
-            return items.length === 0 ? "[]" : `[ ${items.join(", ")} ]`;
+            // Trailing non-index own enumerable props (string + symbol).
+            for (const k of Reflect.ownKeys(v)) {
+              if (k === "length") continue;
+              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
+              const d = Object.getOwnPropertyDescriptor(v, k);
+              if (!d || !d.enumerable) continue;
+              const kt = typeof k === "symbol"
+                ? `[${k.toString()}]`
+                : /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
+              items.push(`${kt}: ${d.get ? "[Getter]" : walk(v[k], level + 1)}`);
+            }
+            return items.length === 0 ? `${aPrefix}[]` : `${aPrefix}[ ${items.join(", ")} ]`;
           }
           if (v instanceof Map) {
             const items = [];
@@ -3847,7 +3876,11 @@
             let builtIn = false;
             if (isObj) {
               const ts = arg.toString;
-              builtIn = typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString;
+              // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
+              // so it counts as built-in here.
+              const hasToPrim = typeof arg[Symbol.toPrimitive] === "function" && !(arg instanceof Date);
+              builtIn = !hasToPrim &&
+                (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || arg instanceof Date);
             }
             if (!builtIn) return String(arg);
             return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, bare: true });
