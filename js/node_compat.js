@@ -1968,7 +1968,10 @@
       } else {
         existing.push(entry);
       }
-      const count = this.listenerCount(type);
+      // Prototype method, not this.listenerCount -- an instance may override/delete it
+      // (test-stream-pipe-without-listenerCount sets it undefined); internal accounting
+      // must not depend on the instance method.
+      const count = EventEmitter.prototype.listenerCount.call(this, type);
       const max = this.getMaxListeners();
       if (max > 0 && count > max && !this._events[type].warned) {
         this._events[type].warned = true;
@@ -2294,7 +2297,7 @@
     EventEmitter.getEventListeners = getEventListeners;
     EventEmitter.setMaxListeners = setMaxListeners;
     EventEmitter.listenerCount = (emitter, type, listener) =>
-      emitter.listenerCount(type, listener);
+      EventEmitter.prototype.listenerCount.call(emitter, type, listener);
     EventEmitter.getMaxListeners = function getMaxListeners(emitterOrTarget) {
       if (typeof emitterOrTarget.getMaxListeners === "function") {
         return emitterOrTarget.getMaxListeners();
@@ -9160,7 +9163,7 @@
       }
       function onerror(er) {
         cleanup();
-        if (source.listenerCount("error") === 0) throw er;
+        if (EventEmitter.prototype.listenerCount.call(source, "error") === 0) throw er;
       }
       source.on("error", onerror);
       dest.on("error", onerror);
