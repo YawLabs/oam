@@ -1083,7 +1083,7 @@
     static compare(a, b) {
       validateUint8Array(a, "buf1");
       validateUint8Array(b, "buf2");
-      return a.compare(b);
+      return Buffer.prototype.compare.call(a, b);
     }
 
     toString(encoding, start, end) {
@@ -4517,7 +4517,7 @@
       log: function utilLog() {
         var d = new Date();
         var ts = d.getUTCDate() + " " + ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getUTCMonth()] + " " + ("0" + d.getUTCHours()).slice(-2) + ":" + ("0" + d.getUTCMinutes()).slice(-2) + ":" + ("0" + d.getUTCSeconds()).slice(-2);
-        console.log(ts + " - " + Array.prototype.join.call(arguments, " "));
+        globalThis.process.stdout.write(ts + " - " + format.apply(null, arguments) + "\n");
       },
       isRegExp: (v) => v instanceof RegExp,
       isDate: (v) => v instanceof Date,
@@ -6003,7 +6003,30 @@
         natives.exit(numeric);
       },
       cwd: () => natives.cwd(),
-      chdir: (dir) => natives.chdir(String(dir)),
+      chdir: (dir) => {
+        if (typeof dir !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("directory", "string", dir);
+        }
+        const oldCwd = natives.cwd();
+        try {
+          return natives.chdir(dir);
+        } catch (e) {
+          // Node shapes a failed chdir as "<code>: <desc>, chdir '<oldcwd>' -> '<dest>'"
+          // with err.path = the cwd at call time and err.dest = the target. oam's
+          // native error omits the old-cwd path and the dest arrow, so rebuild it.
+          const code = e.code || "ENOENT";
+          const desc = String(e.message || "")
+            .replace(/^[A-Z][A-Z0-9_]*:\s*/, "")
+            .replace(/,\s*chdir\b.*$/, "");
+          const err = new Error(`${code}: ${desc}, chdir '${oldCwd}' -> '${dir}'`);
+          err.code = code;
+          if (e.errno !== undefined) err.errno = e.errno;
+          err.syscall = "chdir";
+          err.path = oldCwd;
+          err.dest = dir;
+          throw err;
+        }
+      },
       nextTick(fn, ...args) {
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
@@ -6079,6 +6102,13 @@
         // Synchronous low-level stderr write, bypassing the writable stream
         // (Node's process._rawDebug); util.format the args + trailing newline.
         natives.stderrWrite(registry.get("util").format(...args) + "\n");
+      },
+      setSourceMapsEnabled(val) {
+        // oam has no source-map translation toggle yet; validate + no-op so the
+        // surface matches Node (the test only asserts the ERR_INVALID_ARG_TYPE throw).
+        if (typeof val !== "boolean") {
+          throw new codes.ERR_INVALID_ARG_TYPE("val", "boolean", val);
+        }
       },
       assert(condition, message) {
         // Deprecated (DEP0100): emit the warning once, then assert.
@@ -6205,6 +6235,38 @@
         if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
         return usage;
       },
+      threadCpuUsage: (prev) => {
+        if (prev !== undefined) {
+          if (typeof prev !== "object" || prev === null || Array.isArray(prev)) {
+            throw new codes.ERR_INVALID_ARG_TYPE("prevValue", "object", prev);
+          }
+          const valid = (n) => typeof n === "number" && n >= 0 && n <= Number.MAX_SAFE_INTEGER;
+          if (!valid(prev.user)) {
+            if (typeof prev.user !== "number") {
+              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.user", "number", prev.user);
+            }
+            throw applyNodeErrorShape(
+              new RangeError("The property 'prevValue.user' is invalid. Received " + String(prev.user)),
+              "ERR_INVALID_ARG_VALUE",
+            );
+          }
+          if (!valid(prev.system)) {
+            if (typeof prev.system !== "number") {
+              throw new codes.ERR_INVALID_ARG_TYPE("prevValue.system", "number", prev.system);
+            }
+            throw applyNodeErrorShape(
+              new RangeError("The property 'prevValue.system' is invalid. Received " + String(prev.system)),
+              "ERR_INVALID_ARG_VALUE",
+            );
+          }
+        }
+        // Main-thread approximation: thread CPU time ~= process CPU time. Enough
+        // for the finite/non-negative/monotonic asserts; a true per-thread clock
+        // needs a native binding.
+        const usage = natives.processCpuUsage();
+        if (prev) return { user: usage.user - prev.user, system: usage.system - prev.system };
+        return usage;
+      },
       kill: (pid, signal) => {
         if (pid != (pid | 0)) {
           throw new codes.ERR_INVALID_ARG_TYPE("pid", "number", pid);
@@ -6238,6 +6300,15 @@
         if (sig !== 0 && !VALID.includes(sig)) return -22; // EINVAL before touching the sandbox
         try { natives.processKill(pid, sig); return 0; } catch { return -1; }
       },
+      execve() {
+        // execve(2) replaces the current process image. oam has no implementation,
+        // and Node itself reports it unavailable on Windows. Surface the same coded
+        // TypeError so callers (and the conformance test) see ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+        throw applyNodeErrorShape(
+          new TypeError("process.execve is unavailable on the current platform"),
+          "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
+        );
+      },
       umask(mask) {
         const prev = process._umask ?? 0;
         if (mask === undefined) return prev;
@@ -6246,15 +6317,16 @@
           return prev;
         }
         if (typeof mask === "string") {
-          // Octal string ("0664"). Reject non-octal / out-of-range.
+          // Octal string ("0664"). Reject non-octal.
           if (!/^[0-7]+$/.test(mask)) {
             throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
           }
           const parsed = parseInt(mask, 8);
-          if (!Number.isFinite(parsed) || parsed > 0o777) {
+          if (!Number.isFinite(parsed) || parsed > 0xffffffff) {
             throw new codes.ERR_INVALID_ARG_VALUE("mask", mask, "must be a 32-bit unsigned integer or an octal string");
           }
-          process._umask = parsed;
+          // Node keeps only the low permission bits (mode > 0o777 still works).
+          process._umask = parsed & 0o777;
           return prev;
         }
         throw new codes.ERR_INVALID_ARG_TYPE("mask", ["number", "string"], mask);
@@ -6306,6 +6378,22 @@
       getgroups: () => [0],
       setgroups: () => {},
       initgroups: () => {},
+      setUncaughtExceptionCaptureCallback(fn) {
+        if (fn === null) { process._uncaughtCaptureCb = null; return; }
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("fn", ["Function", "null"], fn);
+        }
+        if (process._uncaughtCaptureCb) {
+          throw applyNodeErrorShape(
+            new Error("`setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
+            "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET",
+          );
+        }
+        process._uncaughtCaptureCb = fn;
+      },
+      hasUncaughtExceptionCaptureCallback() {
+        return !!process._uncaughtCaptureCb;
+      },
       resourceUsage: () => ({
         userCPUTime: 0, systemCPUTime: 0, maxRSS: 0,
         sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0,
@@ -7031,7 +7119,12 @@
       }
 
       _read(_size) {
-        this.destroy(new Error("The _read() method is not implemented"));
+        // Node's default _read destroys with ERR_METHOD_NOT_IMPLEMENTED (an Error
+        // subclass carrying a .code); a bare Error lacks the .code that the
+        // corpus's expectsError() matches on.
+        const err = new Error("The _read() method is not implemented");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        this.destroy(err);
       }
 
       // Node exposes the internal state object as `_readableState`; the corpus
@@ -7337,7 +7430,9 @@
       }
 
       setEncoding(encoding) {
-        this._rState.encoding = encoding;
+        // Node routes setEncoding through `new StringDecoder(encoding)`, whose
+        // encoding for null/undefined normalizes to the 'utf8' default.
+        this._rState.encoding = encoding == null ? "utf8" : encoding;
         return this;
       }
 
@@ -8964,6 +9059,11 @@
         cb = options;
         options = {};
       }
+      // A non-stream first argument (e.g. a plain {}) must throw ERR_INVALID_ARG_TYPE,
+      // not a downstream "stream.on is not a function" TypeError (test-stream-end-of-streams).
+      if (stream === null || typeof stream !== "object" || typeof stream.on !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("stream", "Stream", stream);
+      }
       const isReadable = typeof stream.on === "function" && stream._rState !== undefined;
       const isWritable = stream._wState !== undefined;
       let done = false;
@@ -9776,6 +9876,12 @@
         return this._href;
       }
     }
+
+    URL.revokeObjectURL = function revokeObjectURL() {
+      if (arguments.length === 0) {
+        throw new codes.ERR_MISSING_ARGS("id");
+      }
+    };
 
     globalThis.URL = URL;
     globalThis.URLSearchParams = URLSearchParams;
@@ -17919,7 +18025,7 @@
           const prev = natives.getContinuationData();
           natives.setContinuationData(frame);
           try {
-            return fn.apply(this, args);
+            return Reflect.apply(fn, this, args);
           } finally {
             natives.setContinuationData(prev);
           }
@@ -18051,9 +18157,20 @@
         if (typeof callback !== "function") throw makeTimerError("callback");
         return new Timeout(callback, "Timeout", true, delay, args);
       };
+      // Node's Immediate is a distinct class (immediate.constructor.name ===
+      // 'Immediate'); subclass Timeout so behavior/instanceof stay identical.
+      function Immediate(callback, args) {
+        Timeout.call(this, callback, "Immediate", false, 0, args);
+      }
+      Immediate.prototype = Object.create(Timeout.prototype);
+      Object.defineProperty(Immediate.prototype, "constructor", {
+        value: Immediate,
+        writable: true,
+        configurable: true,
+      });
       globalThis.setImmediate = function setImmediate(callback, ...args) {
         if (typeof callback !== "function") throw makeTimerError("callback");
-        return new Timeout(callback, "Immediate", false, 0, args);
+        return new Immediate(callback, args);
       };
       // Shared clear path -- captured natives, so it keeps working even after
       // a test deletes the globals (test-timers-api-refs).
