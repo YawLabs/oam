@@ -125,6 +125,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
         ("timerUnref", timer_unref),
+        // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
+        ("getConstructorName", op_get_constructor_name),
         // fs sync
         ("fsReadFileSync", op_fs_read_file_sync),
         ("fsReadFileUtf8Sync", op_fs_read_file_utf8_sync),
@@ -1632,6 +1634,25 @@ fn op_set_continuation_data(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     scope.set_continuation_preserved_embedder_data(args.get(0));
+}
+
+// V8's Object::GetConstructorName reads the constructor from the object's MAP,
+// which survives Object.setPrototypeOf(obj, null) -- so util.inspect can label a
+// null-prototype object "[Foo: null prototype]" the way Node does (impossible
+// from pure JS once the prototype chain is gone). Returns "" for non-objects.
+fn op_get_constructor_name(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(value) {
+        let name = obj.get_constructor_name();
+        rv.set(name.into());
+    } else {
+        let empty = v8::String::empty(scope);
+        rv.set(empty.into());
+    }
 }
 
 fn op_make_require(

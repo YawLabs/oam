@@ -3679,9 +3679,10 @@
           // Node tags a depth-collapsed null-prototype object specially; an
           // empty one still shows its braces ("[Object: null prototype] {}").
           if (Object.getPrototypeOf(v) === null) {
+            const cn = natives.getConstructorName(v) || "Object";
             return Reflect.ownKeys(v).length === 0
-              ? "[Object: null prototype] {}"
-              : "[Object: null prototype]";
+              ? `[${cn}: null prototype] {}`
+              : `[${cn}: null prototype]`;
           }
           return "[Object]";
         }
@@ -3715,8 +3716,16 @@
             const taLen = v.length ?? v.byteLength;
             return items.length === 0 ? `${name}(${taLen}) []` : `${name}(${taLen}) [ ${items} ]`;
           }
-          const ctor = v.constructor?.name;
-          const prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
+          let prefix;
+          if (Object.getPrototypeOf(v) === null) {
+            // V8 GetConstructorName recovers the original ctor ("Foo") even after
+            // the prototype was nulled (Node "[Foo: null prototype]").
+            const cn = natives.getConstructorName(v) || "Object";
+            prefix = `[${cn}: null prototype] `;
+          } else {
+            const ctor = v.constructor?.name;
+            prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
+          }
           const keys = Reflect.ownKeys(v).filter(
             (k) => Object.getOwnPropertyDescriptor(v, k)?.enumerable,
           );
