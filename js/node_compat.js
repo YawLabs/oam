@@ -3633,7 +3633,28 @@
         }
         if (v instanceof RegExp) return v.toString();
         if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
-        if (globalThis.Buffer && v instanceof globalThis.Buffer) return v.inspect();
+        if (globalThis.Buffer && v instanceof globalThis.Buffer) {
+          // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
+          // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
+          // is shown like any other property.
+          const bufMod = registry.get("buffer");
+          const max = bufMod.INSPECT_MAX_BYTES;
+          const shown = Math.min(v.length, max);
+          let hex = "";
+          for (let i = 0; i < shown; i++) hex += (i ? " " : "") + v[i].toString(16).padStart(2, "0");
+          if (v.length > max) {
+            const more = v.length - max;
+            hex += (hex ? " " : "") + `... ${more} more byte${more === 1 ? "" : "s"}`;
+          }
+          const parts = [];
+          if (hex) parts.push(hex);
+          for (const k of Object.keys(v)) {
+            if (String(k >>> 0) === k) continue; // skip array-index keys
+            const kt = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
+            parts.push(`${kt}: ${walk(v[k], level + 1)}`);
+          }
+          return `<Buffer ${parts.join(", ")}>`;
+        }
         if (seen.has(v)) return "[Circular *1]";
         if (depth !== null && level > depth) {
           if (Array.isArray(v)) return "[Array]";
@@ -3673,7 +3694,8 @@
           if (ArrayBuffer.isView(v)) {
             const name = v.constructor?.name ?? "TypedArray";
             const items = Array.from(v.subarray ? v.subarray(0, 50) : []).join(", ");
-            return `${name}(${v.length ?? v.byteLength}) [ ${items} ]`;
+            const taLen = v.length ?? v.byteLength;
+            return items.length === 0 ? `${name}(${taLen}) []` : `${name}(${taLen}) [ ${items} ]`;
           }
           const ctor = v.constructor?.name;
           const prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
