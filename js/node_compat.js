@@ -3750,14 +3750,53 @@
       return String(n);
     }
 
+    // Node's numericSeparator: group integer digits in 3s (from the right) and
+    // fractional digits in 3s (from the left) with '_'. Exponential / non-finite
+    // strings are left untouched. Gated by inspect.defaultOptions.numericSeparator.
+    function numSep(str) {
+      if (typeof str !== "string") return str;
+      let neg = false;
+      let body = str;
+      if (body[0] === "-") { neg = true; body = body.slice(1); }
+      const dot = body.indexOf(".");
+      const intPart = dot >= 0 ? body.slice(0, dot) : body;
+      const fracPart = dot >= 0 ? body.slice(dot + 1) : "";
+      // Only plain decimal digit runs are groupable (no e/E, NaN, Infinity).
+      const allDigits = (t) => t.length > 0 && [...t].every((c) => c >= "0" && c <= "9");
+      if (!allDigits(intPart) || (dot >= 0 && !allDigits(fracPart))) return str;
+      let gi = "";
+      for (let i = 0; i < intPart.length; i++) {
+        if (i > 0 && (intPart.length - i) % 3 === 0) gi += "_";
+        gi += intPart[i];
+      }
+      let out = gi;
+      if (dot >= 0) {
+        let gf = "";
+        for (let i = 0; i < fracPart.length; i++) {
+          if (i > 0 && i % 3 === 0) gf += "_";
+          gf += fracPart[i];
+        }
+        out += "." + gf;
+      }
+      return (neg ? "-" : "") + out;
+    }
+    let _fmtNumSep = false;
+    function maybeSep(str) {
+      return _fmtNumSep ? numSep(str) : str;
+    }
+
     function formatValue(v) {
       if (typeof v === "string") return v;
       return inspect(v);
     }
 
     function format(f, ...args) {
+      _fmtNumSep = !!inspect.defaultOptions.numericSeparator;
       // util.format() with no arguments returns '' (Node parity).
       if (arguments.length === 0) return "";
+      return formatBody(f, args);
+    }
+    function formatBody(f, args) {
       if (typeof f !== "string") {
         return [f, ...args].map(formatValue).join(" ");
       }
@@ -3773,19 +3812,19 @@
           case "%s": {
             if (typeof arg === "string") return arg;
             // Node special-cases negative zero / bigint in %s.
-            if (typeof arg === "number") return numToStr(arg);
-            if (typeof arg === "bigint") return `${arg}n`;
+            if (typeof arg === "number") return maybeSep(numToStr(arg));
+            if (typeof arg === "bigint") return (maybeSep(String(arg)) + "n");
             return inspect(arg, { bare: true });
           }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
-            return typeof arg === "bigint" ? `${arg}n` : numToStr(Number(arg));
+            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(Number(arg)));
           case "%i":
             if (typeof arg === "symbol") return "NaN";
-            return typeof arg === "bigint" ? `${arg}n` : numToStr(parseInt(arg, 10));
+            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(parseInt(arg, 10)));
           case "%f":
             if (typeof arg === "symbol") return "NaN";
-            return numToStr(parseFloat(arg));
+            return maybeSep(numToStr(parseFloat(arg)));
           case "%j":
             try {
               return JSON.stringify(arg);
@@ -4381,7 +4420,13 @@
     let utilGetCallSiteWarned = false;
     return {
       format,
-      formatWithOptions: (_opts, ...args) => format(...args),
+      formatWithOptions: (opts, ...args) => {
+        _fmtNumSep = !!(opts && opts.numericSeparator !== undefined
+          ? opts.numericSeparator
+          : inspect.defaultOptions.numericSeparator);
+        if (args.length === 0) return "";
+        return formatBody(args[0], args.slice(1));
+      },
       inspect,
       getCallSites,
       // Deprecated singular alias (renamed to getCallSites): emit the
