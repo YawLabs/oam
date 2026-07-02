@@ -100,7 +100,21 @@ impl Resolver {
     ///
     /// `node:` / `oam:` specifiers resolve to virtual builtin paths.
     /// `node:`-prefixed builtins not yet in wave 1 surface OAM-MOD0006.
+    ///
+    /// Successful file resolutions are realpath'd (Node's default
+    /// no-preserve-symlinks semantics): the module's identity is its real
+    /// location, which is what makes pnpm symlink/junction layouts resolve
+    /// transitive deps correctly.
     pub fn resolve_import(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+        self.resolve_import_inner(specifier, referrer)
+            .map(crate::pathutil::finalize_resolved)
+    }
+
+    fn resolve_import_inner(
+        &self,
+        specifier: &str,
+        referrer: &Path,
+    ) -> Result<PathBuf, Diagnostic> {
         // Shapes that are invalid as ESM specifiers everywhere — npm resolution
         // will never fix these, so they get their own diagnostic, not MOD0002.
         if specifier.is_empty() || specifier == "." || specifier == ".." || specifier.contains('\\')
@@ -114,6 +128,44 @@ impl Resolver {
                     referrer.display()
                 ),
             ));
+        }
+
+        // file: URLs are valid ESM specifiers (static and dynamic import):
+        // convert to a filesystem path and probe like any absolute import.
+        // Other URL schemes (data:, https:) are unsupported and fall through
+        // to the bare-specifier diagnostics below.
+        if specifier
+            .get(..5)
+            .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+        {
+            let raw = crate::pathutil::file_url_to_path(specifier).map_err(|why| {
+                Diagnostic::new(
+                    "OAM-MOD0002",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!(
+                        "cannot resolve '{specifier}' in {}: {why}",
+                        referrer.display()
+                    ),
+                )
+            })?;
+            let (found, candidates) = crate::probe_candidates(self, &raw);
+            return found.ok_or_else(|| {
+                Diagnostic::new(
+                    "OAM-MOD0001",
+                    Severity::Error,
+                    Origin::Resolve,
+                    format!(
+                        "cannot resolve '{specifier}' from {} (tried {})",
+                        referrer.display(),
+                        candidates
+                            .iter()
+                            .map(|c| c.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            });
         }
 
         let is_relative = specifier.starts_with("./") || specifier.starts_with("../");

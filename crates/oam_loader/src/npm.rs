@@ -432,7 +432,38 @@ pub(crate) fn resolve_bare(
 /// CJS probing (exact, .js, .json, directory main/index), and bare
 /// specifiers via the node_modules walk under require conditions. The
 /// engine converts the Diagnostic's message into the thrown JS Error.
+///
+/// Successful file resolutions are realpath'd (Node's default
+/// no-preserve-symlinks semantics) — see `resolve_import`.
 pub fn resolve_require(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+    resolve_require_inner(specifier, referrer).map(crate::pathutil::finalize_resolved)
+}
+
+fn resolve_require_inner(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+    // CJS treats bare '.' and '..' as relative directory requires (Node's
+    // _resolveLookupPaths: any request starting with '.' is relative, so
+    // '.' is the referrer's directory and '..' its parent, each resolved
+    // as a directory via package.json main / index). ajv ships
+    // `require("..")` in production code — this is not a corner case.
+    if specifier == "." || specifier == ".." {
+        let base = referrer.parent().unwrap_or_else(|| Path::new("."));
+        let raw = if specifier == "." {
+            base.to_path_buf()
+        } else {
+            base.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| base.join(".."))
+        };
+        return probe_require(&raw).ok_or_else(|| {
+            diag(
+                "OAM-MOD0001",
+                format!(
+                    "Cannot find module '{specifier}' required from {}",
+                    referrer.display()
+                ),
+            )
+        });
+    }
     if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/') {
         let base = referrer.parent().unwrap_or_else(|| Path::new("."));
         let raw = base.join(specifier);
@@ -1087,6 +1118,69 @@ mod tests {
             resolved.ends_with("node_modules/lodash/index.js"),
             "got {resolved:?}"
         );
+    }
+
+    #[test]
+    fn resolve_require_dot_and_dotdot_are_relative_directory_requires() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-dot-{}", std::process::id()));
+        // pkg/package.json main -> index.js; pkg/lib/child.js does require('..')
+        std::fs::create_dir_all(dir.join("pkg/lib")).unwrap();
+        std::fs::write(
+            dir.join("pkg/package.json"),
+            serde_json::to_string(&json!({ "name": "pkg", "main": "index.js" })).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("pkg/index.js"), "").unwrap();
+        std::fs::write(dir.join("pkg/lib/index.js"), "").unwrap();
+        let child = dir.join("pkg/lib/child.js");
+        std::fs::write(&child, "").unwrap();
+
+        let parent = resolve_require("..", &child).expect("require('..') resolves parent dir");
+        assert!(parent.ends_with("index.js"), "got {parent:?}");
+        assert!(
+            parent.parent().unwrap().ends_with("pkg"),
+            "'..' must land on the package dir's main, got {parent:?}"
+        );
+        let here = resolve_require(".", &child).expect("require('.') resolves own dir");
+        assert!(here.ends_with("index.js"), "got {here:?}");
+        assert!(
+            here.parent().unwrap().ends_with("lib"),
+            "'.' must land on the referrer's dir index, got {here:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_realpaths_symlinked_packages_pnpm_layout() {
+        // pnpm shape: node_modules/pkg-a -> .pnpm/pkg-a@1/node_modules/pkg-a,
+        // pkg-b only exists as a sibling inside the .pnpm dir. Resolving
+        // pkg-a must return its REAL path so pkg-a's own walk finds pkg-b.
+        let dir = std::env::temp_dir().join(format!("oam-npm-pnpm-{}", std::process::id()));
+        let store_a = dir.join(".pnpm/pkg-a@1/node_modules/pkg-a");
+        let store_b = dir.join(".pnpm/pkg-a@1/node_modules/pkg-b");
+        std::fs::create_dir_all(&store_a).unwrap();
+        std::fs::create_dir_all(&store_b).unwrap();
+        for (pkg, name) in [(&store_a, "pkg-a"), (&store_b, "pkg-b")] {
+            std::fs::write(
+                pkg.join("package.json"),
+                serde_json::to_string(&json!({ "name": name, "main": "index.js" })).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(pkg.join("index.js"), "").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        let link = dir.join("node_modules/pkg-a");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&store_a, &link).unwrap();
+        let entry = dir.join("entry.js");
+        std::fs::write(&entry, "").unwrap();
+
+        let a = resolve_require("pkg-a", &entry).expect("pkg-a resolves via the link");
+        let real_a = std::fs::canonicalize(store_a.join("index.js")).unwrap();
+        assert_eq!(a, real_a, "resolution must return the realpath");
+        // The transitive hop: from pkg-a's real location, pkg-b is a sibling.
+        let b = resolve_require("pkg-b", &a).expect("pkg-b resolves from pkg-a's realpath");
+        assert!(b.ends_with("pkg-b/index.js"), "got {b:?}");
     }
 
     #[test]

@@ -22,11 +22,22 @@ use oxc_allocator::Allocator;
 
 pub mod install;
 mod npm;
+mod pathutil;
 pub mod precompile;
 mod resolver;
 pub mod trust;
 mod tsconfig;
 pub use npm::{ModuleKind, module_kind, resolve_require};
+
+/// Whether `specifier` names a Node builtin (bare like `fs` or prefixed
+/// like `node:fs`) or an `oam:` runtime module. Engine-side surfaces
+/// (`require.resolve.paths` returns null for builtins) need the check
+/// without re-owning the builtin list.
+pub fn is_builtin_specifier(specifier: &str) -> bool {
+    specifier.starts_with("node:")
+        || specifier.starts_with("oam:")
+        || npm::is_node_builtin(specifier)
+}
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;

@@ -501,14 +501,127 @@ fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
 
 /// Build a `require` function bound to `filename` (each CJS module gets
 /// one; node:module's createRequire hands them to ESM callers too).
+/// Carries the Node require surface: `resolve` (with `resolve.paths`),
+/// plus `cache` / `extensions` stubs packages probe for existence.
 pub(crate) fn make_require<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     filename: &str,
 ) -> Option<v8::Local<'s, v8::Function>> {
     let data = v8::String::new(scope, filename)?;
-    v8::Function::builder(require_callback)
+    let require = v8::Function::builder(require_callback)
         .data(data.into())
-        .build(scope)
+        .build(scope)?;
+
+    let resolve = v8::Function::builder(require_resolve_callback)
+        .data(data.into())
+        .build(scope)?;
+    let paths = v8::Function::builder(require_resolve_paths_callback)
+        .data(data.into())
+        .build(scope)?;
+    let paths_key = v8::String::new(scope, "paths")?;
+    resolve.set(scope, paths_key.into(), paths.into());
+    let resolve_key = v8::String::new(scope, "resolve")?;
+    require.set(scope, resolve_key.into(), resolve.into());
+
+    // oam keys its CJS cache in Rust, so `require.cache` is a plain object:
+    // `delete require.cache[id]` idioms become no-ops instead of crashes.
+    // `extensions` is Node's own deprecated stub shape.
+    let cache = v8::Object::new(scope);
+    let cache_key = v8::String::new(scope, "cache")?;
+    require.set(scope, cache_key.into(), cache.into());
+    let extensions = v8::Object::new(scope);
+    let extensions_key = v8::String::new(scope, "extensions")?;
+    require.set(scope, extensions_key.into(), extensions.into());
+
+    Some(require)
+}
+
+/// `require.resolve(specifier)`: full require resolution without loading.
+/// Builtins return the specifier as written (Node: `require.resolve('fs')
+/// === 'fs'`, `require.resolve('node:fs') === 'node:fs'`).
+fn require_resolve_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(specifier) = args.get(0).to_string(scope) else {
+        let message = v8::String::new(scope, "require.resolve expects a specifier string").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let specifier = specifier.to_rust_string_lossy(scope);
+    let referrer = PathBuf::from(
+        args.data()
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default(),
+    );
+    match oam_loader::resolve_require(&specifier, &referrer) {
+        Ok(path) => {
+            let is_virtual = path
+                .to_str()
+                .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"));
+            let text = if is_virtual {
+                specifier
+            } else {
+                path.to_string_lossy().into_owned()
+            };
+            if let Some(s) = v8::String::new(scope, &text) {
+                rv.set(s.into());
+            }
+        }
+        Err(failure) => throw_error_with_code(scope, "MODULE_NOT_FOUND", &failure.message),
+    }
+}
+
+/// `require.resolve.paths(request)`: null for builtins, else the ancestor
+/// `node_modules` chain from the requiring file's directory (Node's lookup
+/// paths minus the legacy `$HOME/.node_modules` entries).
+fn require_resolve_paths_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(request) = args.get(0).to_string(scope) else {
+        let message = v8::String::new(scope, "require.resolve.paths expects a string").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let request = request.to_rust_string_lossy(scope);
+    if oam_loader::is_builtin_specifier(&request) {
+        rv.set(v8::null(scope).into());
+        return;
+    }
+    let referrer = PathBuf::from(
+        args.data()
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .unwrap_or_default(),
+    );
+    let mut lookup: Vec<String> = Vec::new();
+    if request.starts_with("./") || request.starts_with("../") || request == "." || request == ".."
+    {
+        // Relative requests search only the requiring directory.
+        if let Some(parent) = referrer.parent() {
+            lookup.push(parent.to_string_lossy().into_owned());
+        }
+    } else {
+        let mut dir = referrer.parent();
+        while let Some(d) = dir {
+            if d.file_name().is_none_or(|n| n != "node_modules") {
+                lookup.push(d.join("node_modules").to_string_lossy().into_owned());
+            }
+            dir = d.parent();
+        }
+    }
+    let elements: Vec<v8::Local<v8::Value>> = lookup
+        .iter()
+        .filter_map(|p| v8::String::new(scope, p).map(v8::Local::<v8::Value>::from))
+        .collect();
+    let array = v8::Array::new_with_elements(scope, &elements);
+    rv.set(array.into());
 }
 
 /// Instantiate (or fetch cached) the node builtin `name` via the snapshot
