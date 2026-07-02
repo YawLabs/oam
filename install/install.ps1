@@ -45,11 +45,31 @@ try {
   $binPath = Join-Path $tmp $asset
   $sumsPath = Join-Path $tmp 'SHA256SUMS'
 
+  # Authenticated fallback: while the repo is private, unauthenticated release
+  # URLs 404. If the direct download fails and the gh CLI is available
+  # (internal machines), fetch the same assets through the caller's GitHub auth.
+  function Get-ViaGh($pattern, $outFile) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+    $tag = $env:OAM_VERSION
+    if (-not $tag) {
+      try { $tag = (gh release view --repo $ownerRepo --json tagName -q .tagName) }
+      catch { return $false }
+      if (-not $tag) { return $false }
+    }
+    gh release download $tag --repo $ownerRepo --pattern $pattern --output $outFile --clobber
+    return (Test-Path $outFile)
+  }
+
   Say "downloading $asset from $base"
   try { Invoke-WebRequest -Uri "$base/$asset" -OutFile $binPath -UseBasicParsing }
-  catch { Die "download failed: $base/$asset" }
+  catch {
+    Say 'direct download failed; retrying via gh CLI (private repo needs auth)'
+    if (-not (Get-ViaGh $asset $binPath)) { Die "download failed: $base/$asset" }
+  }
   try { Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing }
-  catch { Die "could not fetch SHA256SUMS" }
+  catch {
+    if (-not (Get-ViaGh 'SHA256SUMS' $sumsPath)) { Die "could not fetch SHA256SUMS" }
+  }
 
   # Verify the checksum for our asset only (the manifest covers all targets).
   $line = Select-String -Path $sumsPath -Pattern (" $([regex]::Escape($asset))$") | Select-Object -First 1

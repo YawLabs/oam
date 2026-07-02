@@ -65,9 +65,27 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Authenticated fallback: while the repo is private, unauthenticated release
+# URLs 404. If the direct download fails and the gh CLI is available (internal
+# machines), fetch the same assets through the caller's GitHub auth.
+gh_dl() {
+  command -v gh >/dev/null 2>&1 || return 1
+  gh_tag="${OAM_VERSION:-}"
+  if [ -z "$gh_tag" ]; then
+    gh_tag="$(gh release view --repo "$OWNER_REPO" --json tagName -q .tagName 2>/dev/null)" || return 1
+  fi
+  gh release download "$gh_tag" --repo "$OWNER_REPO" --pattern "$1" \
+    --output "$2" --clobber 2>/dev/null
+}
+
 say "downloading ${asset} from ${base}"
-dl "${base}/${asset}" "${tmp}/${asset}" || die "download failed: ${base}/${asset}"
-dl "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" || die "could not fetch SHA256SUMS"
+if ! dl "${base}/${asset}" "${tmp}/${asset}"; then
+  say "direct download failed; retrying via gh CLI (private repo needs auth)"
+  gh_dl "${asset}" "${tmp}/${asset}" || die "download failed: ${base}/${asset}"
+fi
+if ! dl "${base}/SHA256SUMS" "${tmp}/SHA256SUMS"; then
+  gh_dl "SHA256SUMS" "${tmp}/SHA256SUMS" || die "could not fetch SHA256SUMS"
+fi
 
 # Verify the checksum for our asset only (the manifest covers all targets).
 expected="$(grep " ${asset}\$" "${tmp}/SHA256SUMS" | awk '{print $1}')"
