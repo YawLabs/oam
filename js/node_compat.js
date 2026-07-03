@@ -5431,7 +5431,7 @@
   /// Rust-side decode was utf8-only and silently wrong for the rest).
   function decodeRead(bytes, encoding) {
     const BufferCtor = globalThis.Buffer;
-    const buf = new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const buf = BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     return encoding ? buf.toString(encoding) : buf;
   }
 
@@ -5920,15 +5920,23 @@
       writeSync: (fd, data, offsetOrPosition, length, position) => {
         // Buffer form: (fd, buffer, offset, length, position).
         // String form: (fd, string, position, encoding).
+        let buf, pos;
         if (typeof data === "string") {
           const enc = typeof length === "string" ? length : "utf8";
-          const buf = globalThis.Buffer.from(data, enc);
-          return natives.fsWriteSync(fd, buf, typeof offsetOrPosition === "number" ? offsetOrPosition : null);
+          buf = globalThis.Buffer.from(data, enc);
+          pos = typeof offsetOrPosition === "number" ? offsetOrPosition : null;
+        } else {
+          const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
+          const len = typeof length === "number" ? length : (data.length - offset);
+          buf = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
+          pos = typeof position === "number" ? position : null;
         }
-        const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
-        const len = typeof length === "number" ? length : (data.length - offset);
-        const slice = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
-        return natives.fsWriteSync(fd, slice, typeof position === "number" ? position : null);
+        // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
+        // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
+        // instead of throwing EBADF (pino/sonic-boom sync mode writes here).
+        if (fd === 1) { natives.stdoutWrite(buf); return buf.length; }
+        if (fd === 2) { natives.stderrWrite(buf); return buf.length; }
+        return natives.fsWriteSync(fd, buf, pos);
       },
       opendirSync: function (path) {
         var dirPath = String(path);
@@ -6016,6 +6024,53 @@
         var err = null;
         try { natives.fsClose(fd); } catch (e) { err = e; }
         if (typeof cb === "function") queueMicrotask(function () { cb(err); });
+      },
+      // Async fd-based write. Node overloads:
+      //   fs.write(fd, buffer[, offset[, length[, position]]], cb)
+      //   fs.write(fd, buffer, options, cb)
+      //   fs.write(fd, string[, position[, encoding]], cb)
+      // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
+      // async destination writes here); other fds use the sync native op
+      // dispatched on a microtask to preserve the async callback contract.
+      write: function (fd, data) {
+        var rest = Array.prototype.slice.call(arguments, 2);
+        var cb = rest.length ? rest[rest.length - 1] : undefined;
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        var mid = rest.slice(0, rest.length - 1);
+        var buf, pos;
+        try {
+          if (typeof data === "string") {
+            pos = typeof mid[0] === "number" ? mid[0] : null;
+            var enc = typeof mid[1] === "string" ? mid[1] : (typeof mid[0] === "string" ? mid[0] : "utf8");
+            buf = globalThis.Buffer.from(data, enc);
+          } else {
+            var offset = 0, length, position = null;
+            if (mid[0] !== null && typeof mid[0] === "object" && !ArrayBuffer.isView(mid[0])) {
+              offset = mid[0].offset ?? 0;
+              length = mid[0].length ?? (data.length - offset);
+              position = typeof mid[0].position === "number" ? mid[0].position : null;
+            } else {
+              offset = typeof mid[0] === "number" ? mid[0] : 0;
+              length = typeof mid[1] === "number" ? mid[1] : (data.length - offset);
+              position = typeof mid[2] === "number" ? mid[2] : null;
+            }
+            buf = (offset !== 0 || length !== data.length) ? data.subarray(offset, offset + length) : data;
+            pos = position;
+          }
+        } catch (e) {
+          queueMicrotask(function () { cb(e); });
+          return;
+        }
+        var n;
+        try {
+          if (fd === 1) { natives.stdoutWrite(buf); n = buf.length; }
+          else if (fd === 2) { natives.stderrWrite(buf); n = buf.length; }
+          else { n = natives.fsWriteSync(fd, buf, typeof pos === "number" ? pos : null); }
+        } catch (e) {
+          queueMicrotask(function () { cb(e); });
+          return;
+        }
+        queueMicrotask(function () { cb(null, n, data); });
       },
       read: function (fd, buffer, offset, length, position, cb) {
         // Variants: (fd, buffer, offset, length, position, cb),
@@ -9422,7 +9477,22 @@
     // Readable` uses the lexical raw classes, so the hierarchy is unaffected.
     const callableCtor = (Cls) => {
       const proxy = new Proxy(Cls, {
-        apply: (_t, _thisArg, args) => Reflect.construct(Cls, args, Cls),
+        apply: (_t, thisArg, args) => {
+          // Old-style ES5 inheritance `SuperClass.call(this, ...)` (the
+          // util.inherits pattern light-my-request / readable-stream shims use):
+          // the caller's `this` is already a subclass instance that must be
+          // initialized IN PLACE. An ES6 class can't run its body against an
+          // existing object, so construct a throwaway and graft its own props on.
+          if (thisArg != null && thisArg !== globalThis && thisArg instanceof Cls) {
+            const tmp = Reflect.construct(Cls, args, Cls);
+            for (const key of Reflect.ownKeys(tmp)) {
+              Object.defineProperty(thisArg, key, Object.getOwnPropertyDescriptor(tmp, key));
+            }
+            return thisArg;
+          }
+          // Factory form `stream.Writable({...})` -> a fresh instance.
+          return Reflect.construct(Cls, args, Cls);
+        },
         construct: (_t, args, newTarget) =>
           Reflect.construct(Cls, args, newTarget === proxy ? Cls : newTarget),
       });
@@ -10995,7 +11065,16 @@
         pem = input;
       } else if (input && typeof input === "object") {
         if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
-          pem = new TextDecoder().decode(input.key);
+          if (input.format === "der") {
+            // DER bytes: wrap as PEM so the native layer (which parses PEM) and
+            // detectKeyType see real ASN.1, not the bytes mis-decoded as UTF-8 text.
+            var privLabel = input.type === "sec1" ? "EC PRIVATE KEY"
+              : input.type === "pkcs1" ? "RSA PRIVATE KEY"
+              : "PRIVATE KEY";
+            pem = derToPem(input.key, privLabel);
+          } else {
+            pem = new TextDecoder().decode(input.key);
+          }
         } else {
           pem = String(input.key);
         }
@@ -11019,8 +11098,8 @@
           }
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
-        if (!options || options.type === "pkcs8" || options.format === "pem") return pem;
-        return BufferCtor.from(pem);
+        if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
+        return pem;
       };
       return ko;
     }
@@ -11045,7 +11124,12 @@
         if (input instanceof KeyObject && input.type === "private") {
           pem = natives.cryptoExtractPublicPem(input._pem);
         } else if (input.key instanceof Uint8Array || BufferCtor.isBuffer(input.key)) {
-          pem = new TextDecoder().decode(input.key);
+          if (input.format === "der") {
+            var pubLabel = input.type === "pkcs1" ? "RSA PUBLIC KEY" : "PUBLIC KEY";
+            pem = derToPem(input.key, pubLabel);
+          } else {
+            pem = new TextDecoder().decode(input.key);
+          }
         } else {
           pem = String(input.key);
         }
@@ -11069,8 +11153,8 @@
           }
           throw new Error("JWK export not supported for key type: " + ko._keyType);
         }
-        if (!options || options.type === "spki" || options.format === "pem") return pem;
-        return BufferCtor.from(pem);
+        if (options && options.format === "der") return BufferCtor.from(pemToDer(pem));
+        return pem;
       };
       return ko;
     }
@@ -11114,7 +11198,7 @@
         if (padding === 6 && keyType === "rsa") {
           sig = asBuffer(natives.cryptoSignPss(this._algorithm, merged, pem, saltLength));
         } else {
-          sig = asBuffer(natives.cryptoSign(this._algorithm, merged, pem, keyType));
+          sig = asBuffer(natives.cryptoSign(this._algorithm == null ? "" : this._algorithm, merged, pem, keyType));
         }
         return outputEncoding ? sig.toString(outputEncoding) : sig;
       }
@@ -11165,7 +11249,7 @@
         if (padding === 6 && keyType === "rsa") {
           return natives.cryptoVerifyPss(this._algorithm, merged, pem, sigBuf, saltLength);
         }
-        return natives.cryptoVerify(this._algorithm, merged, pem, sigBuf, keyType);
+        return natives.cryptoVerify(this._algorithm == null ? "" : this._algorithm, merged, pem, sigBuf, keyType);
       }
       _transform(chunk, encoding, callback) {
         this.update(chunk, encoding);
@@ -11177,6 +11261,10 @@
     function createVerify(algorithm) { return new Verify(normalizeAlgo(algorithm)); }
 
     function normalizeAlgo(raw) {
+      // Ed25519/Ed448 pass a null algorithm to sign/verify (the digest is implied
+      // by the key). Node accepts crypto.sign(null, data, ed25519Key); guard so we
+      // never call .toUpperCase() on null.
+      if (raw === null || raw === undefined) return null;
       var s = raw.toUpperCase();
       if (s === "ED25519") return "ed25519";
       if (s === "RSA-SHA256" || s === "SHA256WITHRSA") return "SHA256";
@@ -11194,7 +11282,7 @@
     }
 
     const asBuffer = (bytes) =>
-      new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.length);
+      BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.length);
 
     class Hash {
       constructor(id) {
@@ -11884,6 +11972,14 @@
           };
         }
       }
+      // Ed25519 with no encoding options -> KeyObjects (Node parity). The relay
+      // token flow calls generateKeyPairSync('ed25519').privateKey.export({...}),
+      // which requires KeyObjects, not PEM strings. Scoped to ed25519 so the
+      // established RSA/EC string returns (and their e2e tests) stay unchanged.
+      if (type === 'ed25519') {
+        if (!(options && options.publicKeyEncoding)) pubOut = createPublicKey(result.publicKey);
+        if (!(options && options.privateKeyEncoding)) privOut = createPrivateKey(result.privateKey);
+      }
       return { publicKey: pubOut, privateKey: privOut };
     }
     function generateKeyPair(type, options, callback) {
@@ -12477,7 +12573,7 @@
           : ArrayBuffer.isView(data)
             ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
             : new Uint8Array(data);
-    const asBuffer = (bytes) => new BufferCtor(bytes.buffer, bytes.byteOffset, bytes.length);
+    const asBuffer = (bytes) => BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.length);
     const levelOf = (options) => options?.level ?? -1;
 
     const Z_NO_FLUSH = 0;
@@ -13101,12 +13197,17 @@
         // The http layer manages this stream's close lifecycle; opt out of
         // Readable autoDestroy to keep the prior single-close behavior.
         super({ autoDestroy: false });
+        // `meta` is the native accept record on the server path. Tolerate a
+        // missing/socket-shaped arg so `new http.IncomingMessage()` and the
+        // old-style `IncomingMessage.call(this, socket)` inheritance pattern
+        // do not throw (Node's IncomingMessage is constructible with no args).
+        meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
         this.httpVersion = "1.1";
         this.headers = {};
         this.rawHeaders = [];
-        for (const [name, value] of meta.headers) {
+        for (const [name, value] of meta.headers || []) {
           const key = name.toLowerCase();
           this.headers[key] = key in this.headers ? `${this.headers[key]}, ${value}` : value;
           this.rawHeaders.push(name, value);
@@ -13131,6 +13232,11 @@
       constructor(requestId) {
         super();
         this._requestId = requestId;
+        // Mock/inject mode: light-my-request et al construct this via
+        // `ServerResponse.call(this, req)` passing a request OBJECT, not the
+        // integer request id the native hyper layer hands us. In that mode
+        // write()/end()/flushHeaders() must NOT touch the native responder.
+        this._mock = typeof requestId !== "number";
         this._headers = new Map();
         this._streamId = null;
         this._ended = false;
@@ -13199,6 +13305,21 @@
           cb = encoding;
           encoding = undefined;
         }
+        if (this._mock) {
+          // Absorb into the assigned (usually null) socket; the mock consumer
+          // captures the real payload through its own write() override.
+          if (this._ended) return false;
+          this.headersSent = true;
+          if (this.socket && typeof this.socket.write === "function") {
+            try {
+              this.socket.write(this._toBytes(chunk, encoding));
+            } catch {
+              /* null socket swallows */
+            }
+          }
+          if (cb) queueMicrotask(cb);
+          return true;
+        }
         if (this._ended) return false;
         const bytes = this._toBytes(chunk, encoding);
         if (this._streamId === null) {
@@ -13231,6 +13352,15 @@
           cb = encoding;
           encoding = undefined;
         }
+        if (this._mock) {
+          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+          if (!this._ended) {
+            this._ended = true;
+            this.headersSent = true;
+          }
+          if (cb) queueMicrotask(cb);
+          return this;
+        }
         if (this._ended) return this;
         if (this._streamId === null) {
           // Single-shot: full body, hyper sets content-length.
@@ -13261,7 +13391,30 @@
         return this;
       }
       flushHeaders() {
+        if (this._mock) return;
         if (this._streamId === null && !this._ended) this.write(new Uint8Array(0));
+      }
+      assignSocket(socket) {
+        // Mock/inject consumers (light-my-request) hand us a throwaway Writable
+        // to absorb the base-class output; the real payload is captured by the
+        // consumer's own write() override. Flag mock mode so write()/end() skip
+        // the native hyper responder, and expose it as socket + connection.
+        this._mock = true;
+        this.socket = socket;
+        this.connection = socket;
+        if (socket) socket._httpMessage = this;
+      }
+      detachSocket() {
+        this.socket = null;
+        this.connection = null;
+      }
+      getHeaders() {
+        // ServerResponse stores headers in a Map; the inherited
+        // OutgoingMessage.getHeaders reads a plain object, so override to
+        // reflect what setHeader()/writeHead() actually recorded.
+        const out = {};
+        for (const [key, value] of this._headers) out[key] = value;
+        return out;
       }
     }
 
@@ -13273,6 +13426,15 @@
         this._port = null;
         this._host = null;
         this.listening = false;
+        // Node http.Server timeout knobs. The native hyper substrate owns the
+        // real per-connection lifecycle, so these are plain properties that
+        // libraries (e.g. fastify) read/write at boot; oam stores them but does
+        // not arm real per-socket timers off them (see setTimeout below).
+        this.timeout = 0;
+        this.keepAliveTimeout = 5000;
+        this.requestTimeout = 300000;
+        this.headersTimeout = 60000;
+        this.maxRequestsPerSocket = 0;
       }
       listen(port, host, callback) {
         if (typeof port === "object" && port !== null) {
@@ -13333,10 +13495,40 @@
         if (this._serverId !== null) {
           natives.httpClose(this._serverId);
           this.listening = false;
+          if (callback) this.once("close", callback);
+        } else if (callback) {
+          // Node fires close()'s callback with ERR_SERVER_NOT_RUNNING when the
+          // server was never listening. Without this, a fastify onClose hook
+          // (which always calls server.close) on a non-listening instance hangs
+          // because the "close" event is never emitted.
+          process.nextTick(() => {
+            callback(Object.assign(new Error("Server is not running."), {
+              code: "ERR_SERVER_NOT_RUNNING",
+            }));
+          });
         }
-        if (callback) this.once("close", callback);
         return this;
       }
+      // Node http.Server.setTimeout(msecs[, callback]): store the socket
+      // inactivity timeout and, if given, register callback as a "timeout"
+      // listener; return the server. Divergence: the native hyper layer owns
+      // connection sockets and never surfaces idle sockets to JS, so oam stores
+      // the value and wires the listener but never arms a real per-socket timer
+      // nor emits "timeout". Sufficient for fastify boot, which unconditionally
+      // calls server.setTimeout(connectionTimeout).
+      setTimeout(msecs, callback) {
+        this.timeout = msecs;
+        if (callback) this.on("timeout", callback);
+        return this;
+      }
+      // Node closeIdleConnections()/closeAllConnections() destroy idle / all
+      // open connections. oam's graceful server.close() already drains idle
+      // keep-alive connections in the native substrate (http_server.rs) and
+      // per-connection sockets are not reachable from JS, so these are no-ops
+      // that satisfy fastify's shutdown path (it feature-detects and calls them
+      // before server.close()).
+      closeIdleConnections() {}
+      closeAllConnections() {}
     }
 
     class ClientRequest extends EventEmitter {
@@ -13635,14 +13827,38 @@
     }
     Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
 
+    // Node's http constructors are old-style functions callable via
+    // `Super.call(this, ...)` (util.inherits). ES6 classes reject that, so wrap
+    // the public exports in a Proxy whose `apply` trap initializes the caller's
+    // `this` in place for the inheritance form (light-my-request's Response does
+    // `http.ServerResponse.call(this, req)`), while `construct` normalises
+    // new.target for a direct `new http.X()`. Internal server code references
+    // the raw lexical classes, so the native request/response path is unaffected.
+    const callableHttp = (Cls) => {
+      const proxy = new Proxy(Cls, {
+        apply: (_t, thisArg, args) => {
+          if (thisArg != null && thisArg !== globalThis && thisArg instanceof Cls) {
+            const tmp = Reflect.construct(Cls, args, Cls);
+            for (const key of Reflect.ownKeys(tmp)) {
+              Object.defineProperty(thisArg, key, Object.getOwnPropertyDescriptor(tmp, key));
+            }
+            return thisArg;
+          }
+          return Reflect.construct(Cls, args, Cls);
+        },
+        construct: (_t, args, newTarget) =>
+          Reflect.construct(Cls, args, newTarget === proxy ? Cls : newTarget),
+      });
+      return proxy;
+    };
     return {
       createServer: (options, handler) =>
         new Server(typeof options === "function" ? options : handler),
       Server,
-      IncomingMessage,
-      ServerResponse,
-      ClientRequest,
-      OutgoingMessage,
+      IncomingMessage: callableHttp(IncomingMessage),
+      ServerResponse: callableHttp(ServerResponse),
+      ClientRequest: callableHttp(ClientRequest),
+      OutgoingMessage: callableHttp(OutgoingMessage),
       request,
       get,
       globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
@@ -13737,6 +13953,44 @@
       return globalThis.Buffer.from(String(data));
     }
 
+    // Reshape oam's native connect failure into Node's exact error form. The
+    // native op rejects with an Error carrying only .code (ECONNREFUSED /
+    // ENOTFOUND / ETIMEDOUT / ...) and a raw OS message; Node additionally sets
+    // .errno (the negative libuv error number, platform-specific), .syscall,
+    // and either .address/.port (connect) or .hostname (getaddrinfo), with a
+    // "connect <CODE> <addr>:<port>" / "getaddrinfo <CODE> <host>" message.
+    function _netErrno(code) {
+      const plat = globalThis.process.platform;
+      const table =
+        plat === "win32"
+          ? { ECONNREFUSED: -4078, ECONNRESET: -4077, ECONNABORTED: -4079, ETIMEDOUT: -4039, EHOSTUNREACH: -4073, ENETUNREACH: -4062, EADDRINUSE: -4091, EADDRNOTAVAIL: -4090, ENOTCONN: -4053, EPIPE: -4047, EACCES: -4092, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
+          : plat === "darwin"
+            ? { ECONNREFUSED: -61, ECONNRESET: -54, ECONNABORTED: -53, ETIMEDOUT: -60, EHOSTUNREACH: -65, ENETUNREACH: -51, EADDRINUSE: -48, EADDRNOTAVAIL: -49, ENOTCONN: -57, EPIPE: -32, EACCES: -13, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
+            : { ECONNREFUSED: -111, ECONNRESET: -104, ECONNABORTED: -103, ETIMEDOUT: -110, EHOSTUNREACH: -113, ENETUNREACH: -101, EADDRINUSE: -98, EADDRNOTAVAIL: -99, ENOTCONN: -107, EPIPE: -32, EACCES: -13, ENOTFOUND: -3008, EAI_AGAIN: -3001 };
+      return table[code];
+    }
+    function _shapeConnectError(err, host, port) {
+      const code = err && err.code;
+      if (!code) return err;
+      const errno = _netErrno(code);
+      let e;
+      if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+        // DNS resolution failure: syscall=getaddrinfo, hostname (no addr/port).
+        e = new Error("getaddrinfo " + code + " " + host);
+        e.syscall = "getaddrinfo";
+        e.hostname = host;
+      } else {
+        // Connection failure: "connect <CODE> <address>:<port>".
+        e = new Error("connect " + code + " " + host + ":" + port);
+        e.syscall = "connect";
+        e.address = host;
+        e.port = port;
+      }
+      e.code = code;
+      if (errno !== undefined) e.errno = errno;
+      return e;
+    }
+
     class Socket extends EventEmitter {
       constructor(options) {
         super();
@@ -13756,6 +14010,16 @@
         this.bytesWritten = 0;
         this.bufferSize = 0;
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
+        // Node's net.Socket is a Duplex stream, so libraries read its stream
+        // state objects directly. ws's socketOnClose reads socket._readableState
+        // (.endEmitted / .length) and its bufferedAmount getter reads
+        // socket._writableState.length. Without these, socketOnClose throws a
+        // TypeError inside emit("close") BEFORE it reaches websocket.emitClose(),
+        // so the ws-level "close" never fires and peers leak. oam's socket is
+        // always in flowing mode (readLoop emits "data"), so the readable buffer
+        // length is always 0.
+        this._readableState = { endEmitted: false, length: 0 };
+        this._writableState = { length: 0, finished: false, errorEmitted: false, needDrain: false };
         this._paused = false;
         this._pipeHandler = null;
         this._timeoutMs = 0;
@@ -13804,7 +14068,7 @@
           },
           (err) => {
             this.connecting = false;
-            this.destroy(err);
+            this.destroy(_shapeConnectError(err, host, port));
           },
         );
         return this;
@@ -13877,6 +14141,7 @@
           }
           if (chunk === undefined) {
             this.readable = false;
+            this._readableState.endEmitted = true;
             this.emit("end");
             if (!this.allowHalfOpen) this.end();
             else if (!this.writable) this._doClose();

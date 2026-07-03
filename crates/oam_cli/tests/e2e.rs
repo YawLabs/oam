@@ -6693,10 +6693,10 @@ fn crypto_generate_keypair_ed25519() {
         r#"
 import crypto from 'node:crypto';
 
-// 1. generateKeyPairSync returns PEM strings
+// 1. generateKeyPairSync with no encoding returns KeyObjects (Node parity)
 const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-console.log('hasPub=' + (publicKey.includes('BEGIN PUBLIC KEY')));
-console.log('hasPriv=' + (privateKey.includes('BEGIN PRIVATE KEY')));
+console.log('hasPub=' + (publicKey.type === 'public' && publicKey.asymmetricKeyType === 'ed25519'));
+console.log('hasPriv=' + (privateKey.type === 'private' && privateKey.asymmetricKeyType === 'ed25519'));
 
 // 2. sign+verify roundtrip with generated keys
 const sign = crypto.createSign('ed25519');
@@ -6729,8 +6729,8 @@ console.log('derPrivBuf=' + Buffer.isBuffer(derPriv));
 // 6. async generateKeyPair
 crypto.generateKeyPair('ed25519', (err, pub2, priv2) => {
   console.log('asyncErr=' + (err === null));
-  console.log('asyncPub=' + (typeof pub2 === 'string' && pub2.includes('BEGIN PUBLIC KEY')));
-  console.log('asyncPriv=' + (typeof priv2 === 'string' && priv2.includes('BEGIN PRIVATE KEY')));
+  console.log('asyncPub=' + (pub2.type === 'public' && pub2.asymmetricKeyType === 'ed25519'));
+  console.log('asyncPriv=' + (priv2.type === 'private' && priv2.asymmetricKeyType === 'ed25519'));
 });
 "#,
     );

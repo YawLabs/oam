@@ -154,6 +154,11 @@ pub struct CoreRuntime {
     children: child::ChildRegistry,
     #[cfg(any(windows, unix))]
     raw_children: child_extra::RawChildRegistry,
+    // Generic opaque-handle allocator (HTTP body ids, sync file fds, ...).
+    // Starts at 3 so file descriptors returned by openSync never collide with
+    // the reserved stdio fds 0 (stdin) / 1 (stdout) / 2 (stderr): the fs write
+    // shim routes fd 1/2 to the stdout/stderr sinks, which is only correct if a
+    // real file can never be handed those numbers (Node reserves them too).
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -196,7 +201,7 @@ impl CoreRuntime {
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3)),
         })
     }
 
@@ -368,6 +373,36 @@ pub async fn stdin_read() -> OpOutcome {
 /// Shared by the async fs ops below and oam_engine's sync fs natives.
 pub fn node_error_code(error: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
+    // Windows winsock / getaddrinfo codes. std maps most WSA* codes to a
+    // matching ErrorKind, but some (notably WSAHOST_NOT_FOUND) land in
+    // Uncategorized and would fall through to EIO. libuv/Node map these WSA*
+    // codes to fixed errno strings; mirror that table-exactly here so the NET
+    // error surface reports ECONNREFUSED/ETIMEDOUT/ENOTFOUND/... instead of EIO
+    // (the sibling of the fs libuv-win table). Unix POSIX errno flows through
+    // the ErrorKind match below, which std maps reliably; this table is
+    // Windows-only and never matches fs raw_os_errors (small Win32 codes).
+    #[cfg(windows)]
+    {
+        let winsock = error.raw_os_error().and_then(|os| match os {
+            10013 => Some("EACCES"),        // WSAEACCES
+            10048 => Some("EADDRINUSE"),    // WSAEADDRINUSE
+            10049 => Some("EADDRNOTAVAIL"), // WSAEADDRNOTAVAIL
+            10051 => Some("ENETUNREACH"),   // WSAENETUNREACH
+            10053 => Some("ECONNABORTED"),  // WSAECONNABORTED
+            10054 => Some("ECONNRESET"),    // WSAECONNRESET
+            10057 => Some("ENOTCONN"),      // WSAENOTCONN
+            10060 => Some("ETIMEDOUT"),     // WSAETIMEDOUT
+            10061 => Some("ECONNREFUSED"),  // WSAECONNREFUSED
+            10065 => Some("EHOSTUNREACH"),  // WSAEHOSTUNREACH
+            11001 => Some("ENOTFOUND"),     // WSAHOST_NOT_FOUND (getaddrinfo)
+            11002 => Some("EAI_AGAIN"),     // WSATRY_AGAIN (getaddrinfo)
+            11004 => Some("ENOTFOUND"),     // WSANO_DATA (getaddrinfo)
+            _ => None,
+        });
+        if let Some(code) = winsock {
+            return code;
+        }
+    }
     match error.kind() {
         ErrorKind::NotFound => "ENOENT",
         ErrorKind::PermissionDenied => "EACCES",
@@ -381,6 +416,17 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
         ErrorKind::Unsupported => "ENOSYS",
         ErrorKind::BrokenPipe => "EPIPE",
         ErrorKind::WouldBlock => "EAGAIN",
+        // Network error kinds (std maps POSIX errno on Unix and the common
+        // winsock codes on Windows to these reliably; on Windows the winsock
+        // table above already caught them). Previously all fell through to EIO.
+        ErrorKind::ConnectionRefused => "ECONNREFUSED",
+        ErrorKind::ConnectionReset => "ECONNRESET",
+        ErrorKind::ConnectionAborted => "ECONNABORTED",
+        ErrorKind::NotConnected => "ENOTCONN",
+        ErrorKind::AddrInUse => "EADDRINUSE",
+        ErrorKind::AddrNotAvailable => "EADDRNOTAVAIL",
+        ErrorKind::HostUnreachable => "EHOSTUNREACH",
+        ErrorKind::NetworkUnreachable => "ENETUNREACH",
         _ => "EIO",
     }
 }

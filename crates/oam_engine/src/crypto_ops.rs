@@ -1065,7 +1065,12 @@ fn crypto_verify_ec(
 
 fn crypto_sign_ed25519(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
     let der = pem_to_der(key_pem)?;
-    let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(&der)
+    // Node/OpenSSL emit PKCS#8 v1 (RFC 5208: version 0, no public-key attribute).
+    // ring's from_pkcs8 requires the v2 (RFC 5958) template carrying the public
+    // key, so it rejects Node keys with "VersionNotSupported". from_pkcs8_maybe_unchecked
+    // accepts BOTH v1 and v2 -> Node cross-compat, while oam's own generate_pkcs8
+    // (v2) output still parses.
+    let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&der)
         .map_err(|e| format!("Ed25519 key parse: {e}"))?;
     Ok(key_pair.sign(data).as_ref().to_vec())
 }
