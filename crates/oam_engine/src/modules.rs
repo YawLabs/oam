@@ -381,7 +381,7 @@ impl JsRuntime {
         let promise = v8::Local::<v8::Promise>::try_from(value)
             .map_err(|_| rt_diag("OAM-RT0001", "module evaluation did not return a promise"))?;
 
-        pump_event_loop(tc, Some(promise))?;
+        pump_event_loop(tc, Some(promise), true)?;
 
         match promise.state() {
             v8::PromiseState::Fulfilled => match unhandled_rejection_failures(tc) {
@@ -401,7 +401,7 @@ impl JsRuntime {
                     // clean run -- drain microtasks the handler queued, pump any
                     // pending timers/ops, then report unhandled rejections.
                     tc.perform_microtask_checkpoint();
-                    pump_event_loop(tc, None)?;
+                    pump_event_loop(tc, None, true)?;
                     return match unhandled_rejection_failures(tc) {
                         Some(failures) => Err(failures),
                         None => Ok(()),
@@ -578,7 +578,7 @@ impl JsRuntime {
             // Settle a returned promise (the await wrapper, or any
             // promise the user typed) by pumping the loop.
             if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
-                if pump_event_loop(tc, Some(promise)).is_err() {
+                if pump_event_loop(tc, Some(promise), false).is_err() {
                     return Err((false, "event loop error while awaiting".to_string()));
                 }
                 match promise.state() {
@@ -686,7 +686,7 @@ impl JsRuntime {
         let promise = v8::Local::<v8::Promise>::try_from(result)
             .map_err(|_| rt_diag("OAM-TEST0003", "__oamTestRun did not return a promise"))?;
 
-        pump_event_loop(tc, Some(promise))?;
+        pump_event_loop(tc, Some(promise), false)?;
 
         match promise.state() {
             v8::PromiseState::Fulfilled => {
@@ -728,15 +728,28 @@ impl JsRuntime {
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
+    report_unhandled: bool,
 ) -> Result<(), Vec<Diagnostic>> {
     loop {
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
             break;
         }
-        // Fire 'unhandledRejection' for any rejection a listener can catch,
-        // promptly (Node fires after the prior turn's microtasks settled,
-        // not at end-of-run). No-listener rejections stay fatal.
-        flush_handled_rejections(tc);
+        // Surface rejections that survived the prior turn's microtask
+        // checkpoint, PROMPTLY -- Node reports an unhandled rejection after the
+        // microtask checkpoint of the turn it went unhandled, NOT at process
+        // exit. On the run/sidecar paths (report_unhandled) a no-listener
+        // rejection is fatal HERE, so a never-exiting loop (an MCP/http sidecar
+        // held open by a ref'd timer or inflight op) cannot swallow it forever;
+        // a listener still receives it promptly and the run continues. On the
+        // REPL / test-runner paths we only flush to listeners and leave
+        // no-listener rejections to the caller -- an interactive session must
+        // not die on a background rejection. unhandled_rejection_failures drains
+        // the ledger each turn, so the caller's post-loop end check is a no-op.
+        if !report_unhandled {
+            flush_handled_rejections(tc);
+        } else if let Some(failures) = unhandled_rejection_failures(tc) {
+            return Err(failures);
+        }
 
         // Dispatch any debugger commands that arrived since the last turn.
         // Clone the Rc out first so the isolate slot borrow is released

@@ -18,6 +18,7 @@ use std::sync::Once;
 
 mod cjs;
 mod code_cache;
+mod crash;
 mod crypto_ops;
 pub mod fork;
 mod inspector;
@@ -29,6 +30,7 @@ pub mod permissions;
 pub mod replay;
 mod timers;
 mod worker;
+pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 pub use replay::ReplayMode;
@@ -64,6 +66,50 @@ pub struct JsRuntime {
 /// Lives in an isolate slot because the reading native is zero-capture.
 pub(crate) struct ProcessArgv(pub Vec<String>);
 
+/// Parse `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
+///
+/// Node parity: this is oam's `--max-old-space-size` analogue. `Some(mb)`
+/// installs a cap; `None` (unset, empty, non-numeric, or `0`) leaves V8 at
+/// its default (no artificial cap). A very small value is honored as-is --
+/// it simply trips the OOM callback during startup, printing the clean
+/// banner rather than aborting raw.
+fn oam_max_heap_mb() -> Option<usize> {
+    let raw = std::env::var("OAM_MAX_HEAP_MB").ok()?;
+    let mb: usize = raw.trim().parse().ok()?;
+    if mb == 0 { None } else { Some(mb) }
+}
+
+/// V8 `NearHeapLimitCallback`: fires when the heap approaches the
+/// `OAM_MAX_HEAP_MB` cap. Prints a clean, ODIF-shaped fatal error and exits
+/// deterministically instead of letting V8 raise `FatalProcessOutOfMemory`
+/// (a raw abort / Windows crash dialog / core dump).
+///
+/// Zero-capture so it registers without a closure: the cap is recovered from
+/// the heap-limit V8 passes in. The banner goes to stderr (keeping an MCP
+/// sidecar's stdout protocol channel clean) and is always the pretty ODIF
+/// form -- never JSON -- because this runs inside the GC callback where the
+/// CLI's `--json` renderer is unreachable; Node's OOM message is likewise
+/// always plain text. Exit code 134 echoes Node's Unix OOM exit
+/// (128 + SIGABRT) as a recognizable "heap OOM" signal, delivered uniformly
+/// on every platform as a clean exit (no signal, no core dump). It never
+/// returns, so V8's fatal path is preempted entirely.
+unsafe extern "C" fn near_heap_limit_oom(
+    _data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    use std::io::Write as _;
+    let mb = current_heap_limit / (1024 * 1024);
+    let banner = format!(
+        "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap set by OAM_MAX_HEAP_MB\n"
+    );
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    let _ = lock.write_all(banner.as_bytes());
+    let _ = lock.flush();
+    std::process::exit(134);
+}
+
 impl JsRuntime {
     pub fn new() -> Self {
         Self::new_with_permissions(None)
@@ -93,12 +139,42 @@ impl JsRuntime {
 
     fn new_inner(opts: Option<permissions::PermissionsOptions>, with_fork_pool: bool) -> Self {
         init_platform();
-        let params = v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
+        // OAM_MAX_HEAP_MB: optional hard cap on the V8 heap (Node's
+        // --max-old-space-size analogue). Applied at isolate creation so
+        // EVERY isolate -- top-level, `oam serve` workers, and fork-prewarm
+        // threads -- inherits the cap; a runaway MCP sidecar can't grow the
+        // heap unbounded. Unset/0/invalid -> V8 default (no artificial cap).
+        let heap_cap_mb = oam_max_heap_mb();
+        let mut params =
+            v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
+        if let Some(mb) = heap_cap_mb {
+            // initial = 0 lets V8 grow from its small default; max is the hard
+            // ceiling. Saturate so an absurd MB value can't overflow usize.
+            let max_bytes = mb.saturating_mul(1024 * 1024);
+            params = params.heap_limits(0, max_bytes);
+            // configure_defaults_from_heap_size splits `max` across the young
+            // AND old generations, so the effective old-space ceiling (what the
+            // near-heap-limit callback trips on) ends up well above `mb` and a
+            // small cap never fires. Pin the old generation directly to the
+            // requested cap -- this is the knob Node's --max-old-space-size maps
+            // to -- so OAM_MAX_HEAP_MB=64 actually caps around 64 MB.
+            params = params.set_max_old_generation_size_in_bytes(max_bytes);
+        }
         let mut isolate = v8::Isolate::new(params);
+        if heap_cap_mb.is_some() {
+            // Preempt V8's FatalProcessOutOfMemory with a clean, deterministic
+            // exit + ODIF banner (see near_heap_limit_oom).
+            isolate.add_near_heap_limit_callback(near_heap_limit_oom, std::ptr::null_mut());
+        }
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.add_message_listener(modules::message_listener);
         isolate.set_host_initialize_import_meta_object_callback(modules::import_meta_callback);
         isolate.set_host_import_module_dynamically_callback(modules::dynamic_import_callback);
+        // Crash reporter: a V8 heap/process OOM is terminal (the isolate cannot
+        // continue), so print the shared banner + crash file, then abort. This
+        // is the ONLY crash-reporter path that aborts -- the panic hook only
+        // prints, so catch_unwind boundaries still recover.
+        isolate.set_oom_error_handler(crash::v8_oom_handler);
         isolate.set_slot(timers::TimerQueue::default());
         // CoreRuntime is NOT created here: execute_module / execute_cjs call
         // reset_run_slots() which builds a fresh CoreRuntime before any ops

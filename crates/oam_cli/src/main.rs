@@ -216,6 +216,15 @@ enum TrustAction {
 }
 
 fn main() -> ExitCode {
+    // Crash reporter FIRST: a structured stderr banner + a crash file under the
+    // oam cache dir on any Rust panic or V8 OOM (internal diagnostics, not
+    // public telemetry). Installed before anything can panic.
+    oam_engine::install_panic_hook();
+    // Internal self-test hook (undocumented, env-gated): exercises the crash
+    // path deterministically in CI without needing a JS-reachable panic.
+    if std::env::var("OAM_CRASH_SELFTEST").as_deref() == Ok("panic") {
+        panic!("oam crash-reporter self-test");
+    }
     if let Some((source, bytecode)) = extract_embedded() {
         return run_embedded(&source, bytecode, std::env::args().collect());
     }
@@ -1511,6 +1520,20 @@ fn run_file(
     } else {
         rt.execute_module(file, &CliHost)
     };
+    // On the fatal/uncaught path Node's process 'exit' handlers observe exit 1
+    // (an uncaught exception / unhandled rejection forces a non-zero exit). Set
+    // process.exitCode = 1 if the script left it unset, so the 'exit' listeners
+    // emit_process_exit runs next see 1 rather than 0. The process already
+    // returns ExitCode::FAILURE on this path, so this only fixes the code the
+    // 'exit' handlers observe (execute_script runs in a fresh scope, so a
+    // pending exception from the failed run does not disturb it).
+    if result.is_err() {
+        let _ = rt.execute_script(
+            "<fatal-exit-code>",
+            "(function () { var p = globalThis.process; \
+               if (p && typeof p.exitCode !== 'number') { p.exitCode = 1; } })();",
+        );
+    }
     // Node fires 'exit' on BOTH natural completion AND a fatal/uncaught error,
     // so emit before returning either way (process.on('exit') handlers must run
     // even when the program crashed). emit_process_exit is idempotent and runs
@@ -1687,6 +1710,16 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
     let result = rt.execute_cjs(&tmp_file);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    // Fatal path parity: Node's 'exit' handlers observe exit 1 on an
+    // uncaught/unhandled failure. Set process.exitCode = 1 if the script left it
+    // unset before emitting 'exit' (the process already exits FAILURE here).
+    if result.is_err() {
+        let _ = rt.execute_script(
+            "<fatal-exit-code>",
+            "(function () { var p = globalThis.process; \
+               if (p && typeof p.exitCode !== 'number') { p.exitCode = 1; } })();",
+        );
+    }
     // Fire 'exit' on both natural completion and a fatal error (Node parity).
     rt.emit_process_exit();
     match result {

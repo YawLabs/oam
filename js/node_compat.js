@@ -6217,6 +6217,75 @@
     });
     const stdoutIsTTY = natives.isTTY(1);
     const stderrIsTTY = natives.isTTY(2);
+    const stdinIsTTY = natives.isTTY(0);
+
+    // --- TTY surface (tty.WriteStream / tty.ReadStream) -----------------------
+    // columns/rows are LIVE getters over the native ttyGetWinSize op
+    // (GetConsoleScreenBufferInfo on Windows, TIOCGWINSZ ioctl on Unix) so they
+    // always reflect the real terminal. 'resize' fires via a lazy, UNREF'd poll
+    // that runs only while a 'resize' listener is attached -- mirrors Node
+    // starting/stopping its SIGWINCH watch on add/removeListener('resize'). The
+    // interval is unref'd so it never keeps the event loop alive (an unref'd
+    // interval still fires while the loop is otherwise alive but does not block
+    // exit -- both verified against node).
+    function decorateTtyWriteStream(stream, fd, isTTY) {
+      stream.fd = fd;
+      if (!isTTY) return stream; // non-TTY: plain Writable, no isTTY/columns (node parity)
+      stream.isTTY = true;
+      stream.hasColors = () => true;
+      const readSize = () => natives.ttyGetWinSize(fd);
+      Object.defineProperties(stream, {
+        columns: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[0] : undefined; } },
+        rows: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[1] : undefined; } },
+      });
+      stream.getWindowSize = () => { const s = readSize(); return s ? [s[0], s[1]] : [80, 24]; };
+      let poll = null, lastCols = -1, lastRows = -1;
+      const startPoll = () => {
+        if (poll) return;
+        const s = readSize();
+        if (s) { lastCols = s[0]; lastRows = s[1]; }
+        poll = setInterval(() => {
+          const cur = readSize();
+          if (!cur) return;
+          if (cur[0] !== lastCols || cur[1] !== lastRows) {
+            lastCols = cur[0]; lastRows = cur[1];
+            stream.emit("resize");
+          }
+        }, 250);
+        if (poll && typeof poll.unref === "function") poll.unref();
+      };
+      const stopPoll = () => {
+        if (poll && stream.listenerCount("resize") === 0) { clearInterval(poll); poll = null; }
+      };
+      stream.on("newListener", (ev) => { if (ev === "resize") startPoll(); });
+      stream.on("removeListener", (ev) => { if (ev === "resize") stopPoll(); });
+      return stream;
+    }
+
+    function decorateTtyReadStream(stream, fd, isTTY) {
+      stream.fd = fd;
+      if (!isTTY) return stream; // non-TTY stdin: no isTTY/setRawMode (node parity)
+      stream.isTTY = true;
+      stream.isRaw = false;
+      let exitHooked = false;
+      stream.setRawMode = function setRawMode(mode) {
+        const enable = !!mode;
+        // Native flips the console mode / termios. In raw mode line-buffering,
+        // echo and PROCESSED_INPUT/ISIG are OFF, so each keypress arrives as a
+        // stdin 'data' byte and Ctrl-C is delivered as 0x03 (no SIGINT) -- the
+        // signals-in item's console-ctrl handler naturally won't fire.
+        const okRaw = natives.ttySetRawMode(fd, enable);
+        if (okRaw) stream.isRaw = enable;
+        // Restore cooked mode on graceful exit so the shell isn't left raw
+        // (Node restores internally). Hard kills can't be covered.
+        if (enable && !exitHooked) {
+          exitHooked = true;
+          process.on("exit", () => { if (stream.isRaw) natives.ttySetRawMode(fd, false); });
+        }
+        return stream;
+      };
+      return stream;
+    }
 
     // argv is LAZY: the embedder declares it (entry path + script args)
     // after this module instantiates, so the first script-time access must
@@ -6354,15 +6423,15 @@
         },
         { rss: () => natives.processRss() },
       ),
-      stdout: Object.assign(new Writable({
+      stdout: decorateTtyWriteStream(new Writable({
         write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
         decodeStrings: false,
-      }), { fd: 1, isTTY: stdoutIsTTY, columns: stdoutIsTTY ? 80 : undefined, hasColors: () => stdoutIsTTY }),
-      stderr: Object.assign(new Writable({
+      }), 1, stdoutIsTTY),
+      stderr: decorateTtyWriteStream(new Writable({
         write(chunk, _enc, cb) { natives.stderrWrite(chunk); cb(); },
         decodeStrings: false,
-      }), { fd: 2, isTTY: stderrIsTTY, columns: stderrIsTTY ? 80 : undefined, hasColors: () => stderrIsTTY }),
-      stdin: Object.assign(new Readable({
+      }), 2, stderrIsTTY),
+      stdin: decorateTtyReadStream(new Readable({
         autoDestroy: false,
         read() {
           natives.stdinRead().then(
@@ -6373,7 +6442,7 @@
             () => this.push(null),
           );
         },
-      }), { fd: 0, isTTY: natives.isTTY(0) }),
+      }), 0, stdinIsTTY),
       getBuiltinModule(name) {
         var bare = String(name).replace(/^node:/, "");
         if (registry.factories[bare]) {

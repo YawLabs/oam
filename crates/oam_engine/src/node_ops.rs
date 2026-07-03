@@ -102,6 +102,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("stdoutWrite", op_stdout_write),
         ("stderrWrite", op_stderr_write),
         ("isTTY", op_is_tty),
+        // TTY raw-mode + window-size for interactive TUIs (process.stdin/stdout).
+        ("ttySetRawMode", op_tty_set_raw_mode),
+        ("ttyGetWinSize", op_tty_get_win_size),
         ("nowMs", op_now_ms),
         ("hrtimeNanos", op_hrtime_nanos),
         ("uptimeMs", op_uptime_ms),
@@ -675,6 +678,203 @@ fn op_is_tty(
         _ => false,
     };
     rv.set_bool(is_tty);
+}
+
+// ============================================================ tty raw-mode
+// process.stdin.setRawMode + stdout/stderr columns/rows. Windows uses inline
+// console FFI (matches os_release/mem_status style); Unix uses libc termios +
+// TIOCGWINSZ (cfg(unix) dep). Exactly one platform impl compiles per target;
+// both are exercised by the 4-platform CI (only Windows builds locally).
+
+#[cfg(windows)]
+static WIN_STDIN_ORIG_MODE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(unix)]
+static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn win_std_handle(fd: i32) -> isize {
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+    }
+    // (DWORD)-10 / -11 / -12 = STD_INPUT / STD_OUTPUT / STD_ERROR handle.
+    let id: u32 = match fd {
+        0 => 0xFFFF_FFF6,
+        1 => 0xFFFF_FFF5,
+        _ => 0xFFFF_FFF4,
+    };
+    unsafe { GetStdHandle(id) }
+}
+
+#[cfg(windows)]
+fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+    use std::sync::atomic::Ordering;
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    unsafe extern "system" {
+        fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: isize, mode: u32) -> i32;
+    }
+    let h = win_std_handle(fd);
+    if h == 0 || h == -1 {
+        return false;
+    }
+    unsafe {
+        let mut mode: u32 = 0;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return false;
+        }
+        if enable {
+            // Save the pre-raw mode once so setRawMode(false)/exit restores it.
+            let _ = WIN_STDIN_ORIG_MODE.compare_exchange(
+                u32::MAX,
+                mode,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            // Clearing PROCESSED_INPUT means Ctrl-C is NOT turned into a
+            // CTRL_C_EVENT: it arrives as a 0x03 data byte and the console
+            // ctrl handler (owned by the signals-in item) never fires -- this
+            // is Node's documented raw-mode behavior and the coordination point.
+            let raw = (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            SetConsoleMode(h, raw) != 0
+        } else {
+            let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
+            let restore = if orig == u32::MAX {
+                (mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+                    & !ENABLE_VIRTUAL_TERMINAL_INPUT
+            } else {
+                orig
+            };
+            SetConsoleMode(h, restore) != 0
+        }
+    }
+}
+
+#[cfg(windows)]
+fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+    #[allow(dead_code)]
+    #[repr(C)]
+    struct Csbi {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: SmallRect,
+        max_window: Coord,
+    }
+    unsafe extern "system" {
+        fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
+    }
+    let h = win_std_handle(fd);
+    if h == 0 || h == -1 {
+        return None;
+    }
+    unsafe {
+        let mut info: Csbi = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
+            return None;
+        }
+        let cols = info.window.right as i32 - info.window.left as i32 + 1;
+        let rows = info.window.bottom as i32 - info.window.top as i32 + 1;
+        if cols <= 0 || rows <= 0 {
+            return None;
+        }
+        Some((cols, rows))
+    }
+}
+
+#[cfg(unix)]
+fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+    unsafe {
+        if enable {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut term) != 0 {
+                return false;
+            }
+            // Save the pre-raw termios once so setRawMode(false)/exit restores it.
+            if let Ok(mut g) = UNIX_STDIN_ORIG_TERMIOS.lock()
+                && g.is_none()
+            {
+                *g = Some(term);
+            }
+            let mut raw_term = term;
+            // cfmakeraw == Node's raw mode (libuv uses it): clears
+            // ICANON|ECHO|ISIG|IEXTEN, ICRNL|IXON etc, sets CS8, VMIN=1/VTIME=0.
+            // With ISIG off, Ctrl-C arrives as a 0x03 data byte (no SIGINT) --
+            // the coordination point with the signals-in item.
+            libc::cfmakeraw(&mut raw_term);
+            libc::tcsetattr(fd, libc::TCSANOW, &raw_term) == 0
+        } else {
+            let orig = UNIX_STDIN_ORIG_TERMIOS.lock().ok().and_then(|g| *g);
+            match orig {
+                Some(o) => libc::tcsetattr(fd, libc::TCSANOW, &o) == 0,
+                None => true,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) != 0 {
+            return None;
+        }
+        if ws.ws_col == 0 {
+            return None;
+        }
+        Some((ws.ws_col as i32, ws.ws_row as i32))
+    }
+}
+
+fn op_tty_set_raw_mode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).int32_value(scope).unwrap_or(0);
+    let enable = args.get(1).boolean_value(scope);
+    rv.set_bool(tty_set_raw_mode(fd, enable));
+}
+
+fn op_tty_get_win_size(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).int32_value(scope).unwrap_or(1);
+    match tty_win_size(fd) {
+        Some((cols, rows)) => {
+            let c = v8::Integer::new(scope, cols);
+            let r = v8::Integer::new(scope, rows);
+            let arr = v8::Array::new(scope, 2);
+            arr.set_index(scope, 0, c.into());
+            arr.set_index(scope, 1, r.into());
+            rv.set(arr.into());
+        }
+        None => {
+            rv.set(v8::null(scope).into());
+        }
+    }
 }
 
 fn op_now_ms(

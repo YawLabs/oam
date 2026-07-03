@@ -6061,9 +6061,11 @@ console.log('isTTY:', process.stdin.isTTY);
         stdout.contains("first: hello world"),
         "first line: {stdout}"
     );
+    // Node returns `undefined` (not `false`) for a non-TTY stdin; the TTY
+    // stack made oam match, so a piped stdin prints `isTTY: undefined`.
     assert!(
-        stdout.contains("isTTY: false"),
-        "piped stdin not TTY: {stdout}"
+        stdout.contains("isTTY: undefined"),
+        "piped stdin not TTY (Node prints undefined): {stdout}"
     );
 }
 

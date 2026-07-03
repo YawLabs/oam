@@ -67,6 +67,13 @@ tokio-tungstenite = { workspace = true }
 [target.'cfg(all(target_arch = "aarch64", not(target_os = "windows")))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
 
+# TTY raw-mode (termios: tcgetattr/cfmakeraw/tcsetattr) + window size
+# (TIOCGWINSZ ioctl) backing process.stdin.setRawMode and stdout.columns/rows.
+# Windows uses inline extern "system" console FFI (no crate). Same libc "0.2"
+# that oam_core already depends on; cfg(unix) so the Windows build never pulls it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).
 v8 = { workspace = true }

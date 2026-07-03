@@ -123,8 +123,9 @@ fn relocate(fd: RawFd, base: RawFd) -> Result<RawFd, String> {
 }
 
 /// Map a Node signal name to this platform's signal number (libc constants are
-/// platform-correct, unlike hardcoded numbers which diverge on macOS).
-fn signal_number(name: &str) -> i32 {
+/// platform-correct, unlike hardcoded numbers which diverge on macOS). Shared
+/// with the main `child.rs` kill path (`pub(crate)`).
+pub(crate) fn signal_number(name: &str) -> i32 {
     match name {
         "SIGHUP" => libc::SIGHUP,
         "SIGINT" => libc::SIGINT,
@@ -141,8 +142,9 @@ fn signal_number(name: &str) -> i32 {
 }
 
 /// Reverse of `signal_number` for reporting a child that died of a signal we
-/// did not initiate. Falls back to `SIG<n>` for anything uncommon.
-fn signal_name(num: i32) -> String {
+/// did not initiate. Falls back to `SIG<n>` for anything uncommon. Shared with
+/// the main `child.rs` kill path (`pub(crate)`).
+pub(crate) fn signal_name(num: i32) -> String {
     let name = match num {
         x if x == libc::SIGHUP => "SIGHUP",
         x if x == libc::SIGINT => "SIGINT",

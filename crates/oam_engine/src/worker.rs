@@ -34,7 +34,7 @@ impl super::JsRuntime {
         if let Some(failure) = crate::modules::drain_uncaught(tc) {
             return Err(failure);
         }
-        crate::modules::pump_event_loop(tc, None)?;
+        crate::modules::pump_event_loop(tc, None, true)?;
         match crate::modules::unhandled_rejection_failures(tc) {
             Some(failures) => Err(failures),
             None => Ok(()),

@@ -368,15 +368,16 @@ pub fn child_kill(children: &ChildRegistry, handle: u64, signal: Option<String>)
 
 pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
     // Take the Child for the await but leave the registry entry in place so a
-    // concurrent child_kill can still reach the kill-notifier.
+    // concurrent child_kill can still reach the kill-notifier. `pid` rides along
+    // for the Unix kill path, which delivers the real POSIX signal by pid.
     let taken = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&handle) {
-            Some(cp) => cp.child.take().map(|c| (c, cp.kill.clone())),
+            Some(cp) => cp.child.take().map(|c| (c, cp.kill.clone(), cp.pid)),
             None => None,
         }
     };
-    let Some((mut child, kill)) = taken else {
+    let Some((mut child, kill, pid)) = taken else {
         return OpOutcome::Failed("unknown child handle".to_string());
     };
 
@@ -384,14 +385,20 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
     let status = tokio::select! {
         s = child.wait() => { killed = false; s }
         _ = kill.notified() => {
-            let _ = child.start_kill();
             killed = true;
+            // Read the signal child_kill recorded (stored under the lock BEFORE
+            // notify_one, so it is visible here) and deliver it for real.
+            let requested = {
+                let guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                guard.get(&handle).and_then(|cp| cp.kill_signal.clone())
+            };
+            deliver_kill(&mut child, pid, requested.as_deref());
             child.wait().await
         }
     };
 
-    // Drop the registry entry now that the wait is done, capturing the
-    // requested kill signal for the exit report.
+    // Drop the registry entry now that the wait is done, capturing the requested
+    // kill signal (used by the Windows exit report).
     let requested_signal = {
         let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
         let sig = guard.get(&handle).and_then(|cp| cp.kill_signal.clone());
@@ -401,21 +408,75 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
 
     match status {
         Ok(status) => {
-            // When we killed the child, report code:null + the requested signal
-            // (Node's convention for a signal-terminated child). start_kill is a
-            // hard kill cross-platform; we cannot deliver arbitrary signals
-            // without a platform dep, so we report the requested name.
-            let (code, signal) = if killed {
-                (
-                    None,
-                    Some(requested_signal.unwrap_or_else(|| "SIGTERM".to_string())),
-                )
-            } else {
-                (status.code(), None)
-            };
+            let (code, signal) = exit_report(&status, killed, requested_signal);
             let json = serde_json::json!({ "code": code, "signal": signal });
             OpOutcome::Json(json.to_string())
         }
         Err(e) => OpOutcome::Failed(format!("wait: {e}")),
+    }
+}
+
+/// Deliver a kill to `child`. On Unix this sends the caller's REQUESTED POSIX
+/// signal (default SIGTERM) via `libc::kill` on the pid, so a child can trap
+/// SIGTERM / SIGINT and shut down gracefully -- matching Node. `child.wait()`
+/// still reaps the exit afterward: tokio's SIGCHLD reaper observes the death
+/// regardless of which signal (or sender) caused it. On Windows there are no
+/// POSIX signals, so `start_kill()` (TerminateProcess) is the only mechanism;
+/// the requested signal name is surfaced by `exit_report` instead.
+#[cfg(unix)]
+fn deliver_kill(_child: &mut tokio::process::Child, pid: u32, signal: Option<&str>) {
+    let signum = signal
+        .map(crate::child_unix::signal_number)
+        .unwrap_or(libc::SIGTERM);
+    // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
+    unsafe { libc::kill(pid as libc::pid_t, signum) };
+}
+
+#[cfg(windows)]
+fn deliver_kill(child: &mut tokio::process::Child, _pid: u32, _signal: Option<&str>) {
+    // TerminateProcess -- the only kill Windows offers. exit_report maps the
+    // requested signal name onto the exit event.
+    let _ = child.start_kill();
+}
+
+/// Build the Node-shaped `(code, signal)` exit report from the child's ACTUAL
+/// exit status.
+///
+/// Unix: a signal-terminated child reports `code:null` + the real terminating
+/// signal, so a child that caught our SIGTERM and `exit(0)`ed reports
+/// `{code:0, signal:null}`, while one killed by the default action reports
+/// `{code:null, signal:SIGTERM}`. `killed` / `requested_signal` are unused --
+/// `WIFSIGNALED` is the source of truth.
+///
+/// Windows: the status carries no POSIX signal, so when WE initiated the kill
+/// report `code:null` + the requested name (Node's Windows convention);
+/// otherwise the exit code.
+#[cfg(unix)]
+fn exit_report(
+    status: &std::process::ExitStatus,
+    _killed: bool,
+    _requested_signal: Option<String>,
+) -> (Option<i32>, Option<String>) {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signum) = status.signal() {
+        (None, Some(crate::child_unix::signal_name(signum)))
+    } else {
+        (status.code(), None)
+    }
+}
+
+#[cfg(windows)]
+fn exit_report(
+    status: &std::process::ExitStatus,
+    killed: bool,
+    requested_signal: Option<String>,
+) -> (Option<i32>, Option<String>) {
+    if killed {
+        (
+            None,
+            Some(requested_signal.unwrap_or_else(|| "SIGTERM".to_string())),
+        )
+    } else {
+        (status.code(), None)
     }
 }
