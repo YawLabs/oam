@@ -265,8 +265,47 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
+/// Strip Windows verbatim (`\\?\`) prefixes that `std::fs::canonicalize`
+/// prepends, so a module identity never carries a form userland/JS never sees.
+/// No-op on non-Windows and on already-plain paths.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    path
+}
+
+/// The canonical identity of a module file: one key regardless of how the path
+/// was spelled. `std::fs::canonicalize` resolves symlinks, Windows 8.3 short
+/// names (`RUNNER~1`), and drive/case aliases — the SAME resolution the loader
+/// applies to imported paths (oam_loader `finalize_resolved`). This alignment
+/// is load-bearing: the entry file is spelled as the CLI argument (which may be
+/// a short-name temp path), while a cyclic re-import of that same file arrives
+/// through the resolver as its canonical long-name path. If the two produced
+/// different keys the module would be instantiated twice, breaking ESM cycle
+/// linkage (a TDZ "cannot access X before initialization"). Virtual builtins
+/// (`node:` / `oam:`) are not files — pass them through untouched. Canonicalize
+/// failures (file removed mid-run, races) fall back to the lexical form so a
+/// transient error never aborts the run.
 pub(crate) fn module_key(path: &Path) -> std::io::Result<PathBuf> {
-    Ok(normalize_lexically(&std::path::absolute(path)?))
+    if path
+        .to_str()
+        .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+    {
+        return Ok(path.to_path_buf());
+    }
+    let absolute = std::path::absolute(path)?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(real) => Ok(strip_verbatim(real)),
+        Err(_) => Ok(normalize_lexically(&absolute)),
+    }
 }
 
 fn rt_diag(code: &str, message: impl Into<String>) -> Vec<Diagnostic> {
