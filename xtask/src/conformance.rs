@@ -134,6 +134,30 @@ pub fn run(release: bool) -> Result<()> {
             let detail =
                 first_difference(&normalize(&oam_out.stdout), &normalize(&node_out.stdout));
             println!("  FAIL {name}");
+            // Print the divergence to stdout, not just the scorecard JSON: the
+            // scorecard is a CI artifact that isn't surfaced in the run log, so
+            // a platform-specific FAIL (e.g. a case that only diverges on Linux)
+            // was undiagnosable from `gh run view --log-failed`. Show exit codes,
+            // the first differing line (oam vs node), and oam's stderr head.
+            if !same_exit {
+                println!("    exit: oam={} node={}", oam_out.code, node_out.code);
+            }
+            if let Some(line) = detail.get("line").and_then(Value::as_u64) {
+                let oam_line = detail.get("oam").and_then(Value::as_str).unwrap_or("");
+                let node_line = detail.get("node").and_then(Value::as_str).unwrap_or("");
+                println!("    first diff at line {line}:");
+                println!("      oam:  {oam_line}");
+                println!("      node: {node_line}");
+            }
+            let stderr_head = oam_out
+                .stderr
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if !stderr_head.is_empty() {
+                println!("    oam stderr: {stderr_head}");
+            }
             diff_results.push(json!({
                 "case": name,
                 "status": "fail",
