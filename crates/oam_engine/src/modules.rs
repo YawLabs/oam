@@ -110,7 +110,7 @@ pub(crate) unsafe extern "C" fn message_listener(
 /// uncaughtException/unhandledRejection listener suppresses the default
 /// fatal exit). A throwing handler is treated as not-handled (fatal),
 /// with its own exception cleared so the original stands.
-fn emit_process_event(
+pub(crate) fn emit_process_event(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     event: &str,
     args: &[v8::Local<v8::Value>],
@@ -858,34 +858,57 @@ pub(crate) fn pump_event_loop(
                 }
             }
             (Some(deadline), false) => {
-                // In replay mode, skip the sleep -- timers appear due via the
+                // No inflight ops -- only ref-timers keep the loop alive. We
+                // wait to the timer deadline, but an inbound OS signal arrives
+                // as a channel completion (SIGNAL_OP_ID) that must wake us so
+                // process's 'SIGTERM'/'SIGINT' listeners fire PROMPTLY instead
+                // of being deferred until the next timer. recv_deadline doubles
+                // as the idle sleep AND the signal wakeup: it returns early
+                // with the completion, or None when the deadline is reached.
+                // In replay mode, skip the wait -- timers appear due via the
                 // advanced virtual clock above.
                 let replay_active = tc
                     .get_slot::<crate::replay::ReplayState>()
                     .is_some_and(|s| s.is_replay());
                 if !replay_active {
-                    let now = std::time::Instant::now();
-                    if deadline > now {
-                        let total = deadline - now;
-                        // When the inspector is attached, interleave the sleep
-                        // with polls so CDP messages aren't deferred until the
-                        // timer fires.
-                        let inspector = tc
-                            .get_slot::<crate::inspector::InspectorSlot>()
-                            .map(|slot| slot.0.clone());
-                        if let Some(shared) = inspector {
-                            const POLL_INTERVAL: std::time::Duration =
-                                std::time::Duration::from_millis(50);
-                            let mut remaining = total;
-                            while remaining > std::time::Duration::ZERO {
-                                let chunk = remaining.min(POLL_INTERVAL);
-                                std::thread::sleep(chunk);
-                                shared.poll();
-                                remaining =
-                                    deadline.saturating_duration_since(std::time::Instant::now());
+                    // When the inspector is attached, cap each wait at
+                    // POLL_INTERVAL so CDP messages aren't deferred until the
+                    // timer fires (the same interleave the old sleep used).
+                    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+                    let inspector = tc
+                        .get_slot::<crate::inspector::InspectorSlot>()
+                        .map(|slot| slot.0.clone());
+                    loop {
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let chunk_deadline = match &inspector {
+                            Some(_) => (now + POLL_INTERVAL).min(deadline),
+                            None => deadline,
+                        };
+                        let completion = tc
+                            .get_slot_mut::<oam_core::CoreRuntime>()
+                            .and_then(|core| core.recv_deadline(Some(chunk_deadline)));
+                        if let Some(completion) = completion {
+                            let completion = if let Some(state) =
+                                tc.get_slot_mut::<crate::replay::ReplayState>()
+                            {
+                                crate::replay::intercept_completion(state, completion)
+                            } else {
+                                completion
+                            };
+                            crate::ops::settle_completion(tc, completion);
+                            tc.perform_microtask_checkpoint();
+                            if let Some(failure) = drain_uncaught(tc) {
+                                return Err(failure);
                             }
-                        } else {
-                            std::thread::sleep(total);
+                            // A signal listener may have scheduled work or called
+                            // process.exit; re-evaluate the outer loop condition.
+                            break;
+                        }
+                        if let Some(shared) = &inspector {
+                            shared.poll();
                         }
                     }
                 }

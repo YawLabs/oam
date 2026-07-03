@@ -460,6 +460,17 @@ pub(crate) fn settle_completion(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     completion: OpCompletion,
 ) {
+    // Inbound OS signal: no parked resolver (it was never a spawn_op). Emit the
+    // named event on `process` so JS listeners fire; a present listener also
+    // means the OS default was already suppressed at install time. If nothing
+    // listens, emit is a benign no-op (a signal watcher can outlive its last
+    // listener by a turn on the remove path).
+    if completion.id == oam_core::SIGNAL_OP_ID {
+        if let OpOutcome::Signal(name) = completion.outcome {
+            crate::modules::emit_process_event(tc, &name, &[]);
+        }
+        return;
+    }
     let resolver = tc
         .get_slot_mut::<PendingOps>()
         .and_then(|pending| pending.0.remove(&completion.id));
@@ -532,6 +543,9 @@ pub(crate) fn settle_completion(
             }
             resolver.reject(tc, exception);
         }
+        // Handled by the SIGNAL_OP_ID early return above; a Signal outcome on a
+        // non-signal id would be a logic error — drop it rather than resolve.
+        OpOutcome::Signal(_) => {}
     }
 }
 

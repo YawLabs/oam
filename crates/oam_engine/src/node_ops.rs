@@ -128,6 +128,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
         ("timerUnref", timer_unref),
+        // Inbound OS signals: install/remove native delivery of a Node signal
+        // name (SIGTERM/SIGINT/SIGHUP/...). Gated JS-side on process
+        // listenerCount so start fires on the FIRST listener and stop on the
+        // LAST (js/node_compat.js newListener/removeListener wiring).
+        ("startSignal", op_start_signal),
+        ("stopSignal", op_stop_signal),
         // V8 Object::GetConstructorName -- used by util.inspect for null-proto labels.
         ("getConstructorName", op_get_constructor_name),
         // fs sync
@@ -955,6 +961,31 @@ fn op_username(
         .unwrap_or_default();
     if let Some(value) = v8::String::new(scope, &user) {
         rv.set(value.into());
+    }
+}
+
+// --------------------------------------------------------------- os signals
+// process.on('SIGTERM'|'SIGINT'|'SIGHUP', fn) delivery. The JS layer gates
+// these on listenerCount so startSignal fires for the first listener of a
+// signal and stopSignal for the last; start is idempotent core-side too.
+
+fn op_start_signal(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(name) = arg_string(scope, &args, 0) {
+        core_runtime_mut!(scope).start_signal(&name);
+    }
+}
+
+fn op_stop_signal(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if let Some(name) = arg_string(scope, &args, 0) {
+        core_runtime_mut!(scope).stop_signal(&name);
     }
 }
 

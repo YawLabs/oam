@@ -6329,6 +6329,40 @@
       process.emit("exit", code);
     }
 
+    // Inbound OS signals. process.on('SIGTERM'/'SIGINT'/...) must fire the
+    // listener on delivery and suppress the default terminate while a listener
+    // is attached (Node semantics; the k8s graceful-shutdown case). We arm the
+    // native watcher lazily on the FIRST listener and disarm on the LAST, via
+    // newListener/removeListener -- composing with events rather than
+    // overriding process.on (the worker branch installs its own on() override).
+    // newListener fires BEFORE the add (count 0 => first); removeListener fires
+    // AFTER the removal (count 0 => last). Windows accepts SIGTERM in the set
+    // but the OS never delivers it -- matches Node (listener allowed, no-op);
+    // only SIGINT/SIGBREAK/SIGHUP actually fire there.
+    const SIGNAL_NAMES = new Set(
+      natives.platform === "win32"
+        ? ["SIGINT", "SIGBREAK", "SIGHUP", "SIGTERM"]
+        : ["SIGINT", "SIGTERM", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGBREAK", "SIGQUIT"],
+    );
+    process.on("newListener", (type) => {
+      if (
+        SIGNAL_NAMES.has(type) &&
+        typeof natives.startSignal === "function" &&
+        process.listenerCount(type) === 0
+      ) {
+        natives.startSignal(type);
+      }
+    });
+    process.on("removeListener", (type) => {
+      if (
+        SIGNAL_NAMES.has(type) &&
+        typeof natives.stopSignal === "function" &&
+        process.listenerCount(type) === 0
+      ) {
+        natives.stopSignal(type);
+      }
+    });
+
     Object.assign(process, {
       env,
       execArgv: [],

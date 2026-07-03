@@ -265,6 +265,11 @@ impl ReplayState {
 /// completion unchanged. In replay mode: replace outcome with recorded one.
 /// In off mode: return unchanged (zero overhead -- no slot access on hot path).
 pub fn intercept_completion(state: &mut ReplayState, completion: OpCompletion) -> OpCompletion {
+    // OS signals are environmental, not part of the deterministic op stream:
+    // never record or replay them. Pass through untouched in every mode.
+    if completion.id == oam_core::SIGNAL_OP_ID {
+        return completion;
+    }
     if let Some(recorder) = &mut state.recorder {
         let outcome_json = serde_json::to_string(&completion.outcome).unwrap_or_default();
         let seq = recorder.next_seq();

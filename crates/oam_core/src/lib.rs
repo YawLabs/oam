@@ -24,6 +24,11 @@ pub mod cluster;
 pub mod dns;
 pub mod http_server;
 pub mod inspector;
+/// Inbound OS signal delivery (SIGTERM/SIGINT/SIGHUP). Unix uses
+/// tokio::signal::unix; Windows uses SetConsoleCtrlHandler. Both feed the op
+/// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine
+/// dispatches to process's JS listeners.
+pub mod signal;
 pub mod tcp;
 pub mod tls;
 pub mod udp;
@@ -51,6 +56,12 @@ pub use child_win as child_extra;
 
 pub type OpId = u64;
 
+/// Sentinel op id for inbound OS-signal completions. `next_id` starts at 1, so
+/// no real spawned op ever uses 0 — the engine's settle path uses this to
+/// recognize a signal (which has no parked PromiseResolver and was never
+/// counted in `inflight`) and route it to `process.emit(name)`.
+pub const SIGNAL_OP_ID: OpId = 0;
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -74,6 +85,11 @@ pub enum OpOutcome {
         code: String,
         message: String,
     },
+    /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
+    /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
+    /// maps it to `process.emit(name)` rather than resolving a promise. serde-
+    /// derived so it survives worker IPC, but workers never produce it.
+    Signal(String),
 }
 
 #[derive(Debug)]
@@ -141,6 +157,12 @@ pub struct CoreRuntime {
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
     inflight: usize,
+    /// Installed OS-signal watchers keyed by Node signal name (SIGTERM, ...).
+    /// Each value keeps a native handler alive; dropping it uninstalls (Unix
+    /// aborts the tokio recv task, Windows removes the name from the active
+    /// set). A signal watcher deliberately does NOT count toward `inflight` —
+    /// a bare listener must not pin the event loop (Node parity).
+    signals: HashMap<String, signal::SignalHandle>,
     bodies: BodyRegistry,
     files: FileRegistry,
     sync_files: SyncFileRegistry,
@@ -188,6 +210,7 @@ impl CoreRuntime {
             rx,
             next_id: 1,
             inflight: 0,
+            signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             sync_files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -315,7 +338,12 @@ impl CoreRuntime {
 
     pub fn try_recv(&mut self) -> Option<OpCompletion> {
         let completion = self.rx.try_recv().ok();
-        if completion.is_some() {
+        // A signal completion (SIGNAL_OP_ID) was never counted in `inflight`
+        // (a bare listener must not pin the loop), so it must not decrement —
+        // decrementing here would underflow when inflight == 0.
+        if let Some(ref c) = completion
+            && c.id != SIGNAL_OP_ID
+        {
             self.inflight -= 1;
         }
         completion
@@ -335,10 +363,38 @@ impl CoreRuntime {
             }
             None => self.rx.recv().ok(),
         };
-        if completion.is_some() {
+        // See try_recv: a SIGNAL_OP_ID completion was never counted, so must
+        // not decrement `inflight` (which would underflow at 0 — this is the
+        // path the no-inflight event-loop idle arm now waits on for signals).
+        if let Some(ref c) = completion
+            && c.id != SIGNAL_OP_ID
+        {
             self.inflight -= 1;
         }
         completion
+    }
+
+    /// Begin delivering OS signal `name` (SIGTERM, SIGINT, SIGHUP, ...) to the
+    /// op channel as OpCompletion{ id: SIGNAL_OP_ID, outcome: Signal(name) }.
+    /// Idempotent: a second call for an already-watched signal is a no-op.
+    /// Installing the native handler suppresses the OS default action while at
+    /// least one watcher is live (Unix: replaces SIG_DFL; Windows: the console
+    /// ctrl handler returns TRUE for the mapped event).
+    pub fn start_signal(&mut self, name: &str) {
+        if self.signals.contains_key(name) {
+            return;
+        }
+        let runtime = self.tokio.as_ref().expect("runtime alive");
+        if let Some(handle) = signal::start_signal(runtime, &self.tx, name) {
+            self.signals.insert(name.to_string(), handle);
+        }
+    }
+
+    /// Stop delivering OS signal `name`. Dropping the stored handle uninstalls
+    /// the watcher (Unix aborts the recv task; Windows removes the name from
+    /// the active set so its ctrl handler falls through to the OS default).
+    pub fn stop_signal(&mut self, name: &str) {
+        self.signals.remove(name);
     }
 }
 
