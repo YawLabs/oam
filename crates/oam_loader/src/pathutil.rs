@@ -193,12 +193,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn realpath_resolves_symlinked_package_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
+        // temp_dir + pid, matching the fixture idiom in npm.rs (no tempfile
+        // dep); the symlink is re-created fresh in case of a prior run.
+        let dir = std::env::temp_dir().join(format!("oam-pathutil-{}", std::process::id()));
+        let real = dir.join("real");
         std::fs::create_dir_all(&real).unwrap();
         let target = real.join("mod.js");
         std::fs::write(&target, "").unwrap();
-        let link_dir = dir.path().join("link");
+        let link_dir = dir.join("link");
+        let _ = std::fs::remove_file(&link_dir);
         std::os::unix::fs::symlink(&real, &link_dir).unwrap();
         let via_link = link_dir.join("mod.js");
         let finalized = finalize_resolved(via_link);
