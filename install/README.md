@@ -30,31 +30,33 @@ No admin/sudo. Re-running upgrades in place.
 
 ## Release assets (the naming contract)
 
-`release.yml` cuts a GitHub Release on every `v*` tag with one binary per
-target, plus a `SHA256SUMS` manifest. Asset names are exactly:
+`scripts/release-local.sh` cuts a GitHub Release for every pushed `v*` tag
+(GitHub-Actions-free: it builds locally and on the remote build hosts — see
+its header) with one binary per target, plus a `SHA256SUMS` manifest. Asset
+names are exactly:
 
 ```
 oam-x86_64-pc-windows-msvc.exe
-oam-aarch64-pc-windows-msvc.exe      (public-repo runners only, for now)
+oam-aarch64-pc-windows-msvc.exe
 oam-aarch64-apple-darwin
 oam-x86_64-apple-darwin
 oam-x86_64-unknown-linux-gnu
-oam-aarch64-unknown-linux-gnu        (public-repo runners only, for now)
+oam-aarch64-unknown-linux-gnu        (not yet shipped -- needs an ARM Linux build host)
 SHA256SUMS
 ```
 
 The installers and (forthcoming) `oam self-update` all consume these exact
-names. If you change a target triple, change it in `release.yml` and both
-install scripts together.
+names. If you change a target triple, change it in `scripts/release-local.sh`
+(+ `scripts/build-remote.sh`) and both install scripts together.
 
 ## Signing
 
 Binaries are shipped **unsigned + checksummed** (the @yawlabs distribution
 model: scoop/curl/brew fetches bypass Gatekeeper/SmartScreen quarantine, and
 the SHA256SUMS manifest is the integrity check). To add Apple notarization /
-Windows Authenticode later, insert a signing step in each `release.yml` build
-job (there's a documented seam) and supply the cert material as secrets; the
-installers don't change.
+Windows Authenticode later, insert a signing step in `scripts/release-local.sh`
+where each binary lands in the release dir (there's a documented seam) and
+supply the cert material locally; the installers don't change.
 
 ## Updating
 

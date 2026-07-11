@@ -2,13 +2,13 @@
 # Upload the locally-built win-arm64 oam binary to an existing GitHub Release
 # and patch SHA256SUMS to cover it.
 #
-# Why this exists: GitHub's hosted ARM runners (windows-11-arm,
-# ubuntu-24.04-arm) are public-repo-only, so while YawLabs/oam is private the
-# release workflow ships only the four core targets (see release.yml
-# build-arm). The dev box IS win-arm64; this script fills that gap until the
-# repo goes public — then build-arm takes over and this script retires.
+# Why this still exists: scripts/release-local.sh ships win-arm64 as a
+# first-class asset now (GitHub Actions was removed, b2f8e24), so a normal
+# release never needs this. It remains the patch-up path for an EXISTING
+# release: one cut with a skip flag, or a win-arm64 asset that needs
+# rebuilding without re-cutting the whole release.
 #
-# Usage (from the repo root, after pushing the tag):
+# Usage (from the repo root, with HEAD on the tag and the release already cut):
 #   scripts/release-upload-local-arm64.sh v0.6.1
 set -euo pipefail
 
@@ -32,6 +32,16 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
+# Local tag must match the remote tag -- otherwise this clobbers a good asset
+# with a binary built from a commit users' tag will never resolve to.
+remote_tag_obj="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null)" \
+  || { echo "error: tag ${TAG} is not on the remote -- push it first" >&2; exit 1; }
+local_tag_obj="$(git rev-parse "$TAG")"
+if [ "$remote_tag_obj" != "$local_tag_obj" ]; then
+  echo "error: remote tag ${TAG} (${remote_tag_obj}) != local tag (${local_tag_obj}) -- local and origin disagree" >&2
+  exit 1
+fi
+
 # The resident type-check daemon holds oam.exe open; kill before rebuild.
 taskkill //F //IM oam.exe 2>/dev/null || true
 cargo build --release -p oam_cli
@@ -40,16 +50,9 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 cp target/release/oam.exe "${tmp}/${ASSET}"
 
-# Wait for the release to exist (the tag push runs release.yml; the release
-# job cuts it at the end, ~15 min after push).
-for _ in $(seq 1 60); do
-  if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-    break
-  fi
-  echo "waiting for release ${TAG} to exist..."
-  sleep 30
-done
-gh release view "$TAG" --repo "$REPO" >/dev/null
+# The release must already exist -- this script patches, it does not cut.
+gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
+  || { echo "error: release ${TAG} does not exist on ${REPO} -- cut it first with scripts/release-local.sh ${TAG}" >&2; exit 1; }
 
 # Patch SHA256SUMS: drop any prior line for this asset, append ours. The
 # manifest is re-read from the release at this step boundary, never cached.
@@ -58,5 +61,11 @@ gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS \
 grep -v " ${ASSET}\$" "${tmp}/SHA256SUMS" > "${tmp}/SHA256SUMS.new" || true
 (cd "$tmp" && sha256sum "$ASSET" >> SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
 
-gh release upload "$TAG" --repo "$REPO" "${tmp}/${ASSET}" "${tmp}/SHA256SUMS" --clobber
+# Two calls, binary first. GitHub has no transactional multi-asset update,
+# so a stale-sums window exists either way -- but split calls make a partial
+# failure visible with exact remediation, and both are --clobber-idempotent.
+gh release upload "$TAG" --repo "$REPO" "${tmp}/${ASSET}" --clobber \
+  || { echo "error: binary upload failed -- release unchanged; re-run to retry" >&2; exit 1; }
+gh release upload "$TAG" --repo "$REPO" "${tmp}/SHA256SUMS" --clobber \
+  || { echo "error: SHA256SUMS upload failed AFTER the binary landed -- the live SHA256SUMS is now stale for ${ASSET}; re-run to converge" >&2; exit 1; }
 echo "uploaded ${ASSET} and patched SHA256SUMS on ${TAG}"

@@ -33,5 +33,6 @@ The TS wedge is a positioning bet, not a feature checklist; the *quality* of the
 The TS-optimization expansion is "raise the floor on what runs correctly" (M1/M2 work above) and "raise the ceiling on what runs fast" (M3 install path), not "invent a new type system at runtime."
 
 Cut order under constraint: AI-starter features -> own bundler (bless Rolldown) -> slip
-`oam install` past 1.0 -> macOS perf tuning. Never cut: Windows CI, the conformance
-dashboard, semver gates.
+`oam install` past 1.0 -> macOS perf tuning. Never cut: the Windows gate
+(`scripts/ci-local.sh` on the win-arm64 dev box + the win-x64 release leg), the
+conformance dashboard, semver gates.

@@ -12,11 +12,19 @@ small PRs are welcome, large changes should start as a discussion.
   read AI-POLICY.md first. Practical implications: keep PRs under the changeset limits, never
   modify a test in the same PR as the implementation it gates, and label agent-authored
   commits.
-- **`unsafe`** requires a `// SAFETY:` comment. CI enforces coverage.
-- **Windows is tier-1.** If your change can't pass windows-x64 + windows-arm64 CI, it doesn't
-  merge.
+- **`unsafe`** requires a `// SAFETY:` comment. The CI gate (`scripts/ci-local.sh`) audits the
+  per-crate count.
+- **Windows is tier-1.** If your change can't pass the CI gate on windows-arm64 (the daily dev
+  target), it doesn't merge; win-x64 is exercised by the emulated release leg
+  (`scripts/release-local.sh`).
 
 ## Dev setup
 
 Rust stable (pinned by `rust-toolchain.toml`). `cargo build --workspace`,
 `cargo test --workspace`, `cargo clippy --workspace`, `cargo fmt --check`.
+
+CI is script-driven, not GitHub Actions: `./scripts/ci-local.sh` runs the full gate
+(fmt, clippy `-D warnings`, build, tests, smoke, conformance, node-suite ratchet,
+unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
+build hosts via `scripts/release-local.sh` / `scripts/node-compat-measure.sh` /
+`scripts/bench-platforms.sh`.
