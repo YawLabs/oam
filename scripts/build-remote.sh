@@ -58,6 +58,8 @@ DISPATCH="${1:?dispatch: prep | gate | test | conformance | node-suite | build |
 # Non-interactive ssh does not source ~/.profile, and rustup installs into
 # ~/.cargo -- pull its env in explicitly so every dispatch finds cargo.
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+# tsgo lives in a user npm prefix (see remote_prep) -- same reasoning.
+export PATH="$HOME/.npm-oam/bin:$PATH"
 
 note(){ echo "[remote] $*"; }
 warn(){ echo "[remote] WARN: $*" >&2; }
@@ -124,10 +126,17 @@ remote_prep() {
   fi
 
   # tsgo for the `oam check` tests: ci.yml ran this continue-on-error, so
-  # best-effort here too (the tests skip-not-fail when tsgo is absent).
-  if command -v npm >/dev/null 2>&1; then
-    npm install -g @typescript/native-preview >/dev/null 2>&1 \
-      && note "tsgo installed" || warn "tsgo install failed (non-blocking; oam check tests will skip)"
+  # best-effort here too. A USER prefix, not npm's system prefix: stock
+  # Ubuntu has prefix=/usr and `npm install -g` EACCESes there (observed on
+  # the GCP builder -- the failure was silent and the oam-check e2e test
+  # then failed instead of skipping). PATH for it is exported at the top of
+  # this script so every later dispatch finds tsgo.
+  if command -v tsgo >/dev/null 2>&1; then
+    note "tsgo already on PATH"
+  elif command -v npm >/dev/null 2>&1; then
+    npm install -g --prefix "$HOME/.npm-oam" @typescript/native-preview >/dev/null 2>&1 \
+      && note "tsgo installed ($HOME/.npm-oam/bin)" \
+      || warn "tsgo install failed (non-blocking; oam-check e2e coverage degrades without it)"
   fi
   note "prep complete"
 }
