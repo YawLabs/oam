@@ -161,13 +161,22 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".into())
         );
     }
+    // Per-host pass floor when calibrated (pass counts differ by platform --
+    // the 270 floor measured on windows-aarch64 is not linux-x86_64's honest
+    // number); the global minPass covers hosts without an entry.
+    let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let min_pass = manifest
+        .min_pass_by_host
+        .get(&host)
+        .copied()
+        .or(manifest.min_pass);
     if let Some(msg) = ratchet_violation(
         manifest_skips,
         manifest.known_issues,
         pass,
         manifest.max_skips,
         manifest.max_known_issues,
-        manifest.min_pass,
+        min_pass,
     ) {
         bail!("{msg}");
     }
@@ -293,9 +302,15 @@ fn module_of(name: &str) -> String {
 
 /// manifest.json:
 /// {
-///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "minPass": K },
+///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "minPass": K,
+///                "minPassByHost": { "<os>-<arch>": K2, ... } },
 ///   "tests": { "parallel/test-x.js": { "skip": true, "reason": "...", "category": "known_issues" } }
 /// }
+///
+/// minPassByHost overrides minPass for a specific `{OS}-{ARCH}` host label
+/// (e.g. "linux-x86_64") -- pass counts are platform-specific, so each
+/// measured host ratchets independently; unmeasured hosts fall back to the
+/// global floor. Same rule as minPass: entries should only ever go UP.
 struct Manifest {
     /// path -> reason, for DISCRETIONARY skips -- the one denominator lever oam
     /// controls (auto-detected unrunnables are separate and not counted here).
@@ -309,6 +324,9 @@ struct Manifest {
     /// counterpart to the skip ceiling -- it should only ever be RAISED, so a
     /// node-compat regression that drops the pass count reddens CI. None = off.
     min_pass: Option<usize>,
+    /// per-host overrides of `min_pass`, keyed by the `{OS}-{ARCH}` host
+    /// label (matches the scorecard's `host` field).
+    min_pass_by_host: BTreeMap<String, usize>,
 }
 
 fn load_manifest(path: &Path) -> Manifest {
@@ -318,6 +336,7 @@ fn load_manifest(path: &Path) -> Manifest {
         max_skips: None,
         max_known_issues: None,
         min_pass: None,
+        min_pass_by_host: BTreeMap::new(),
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return m;
@@ -338,6 +357,13 @@ fn load_manifest(path: &Path) -> Manifest {
             .get("minPass")
             .and_then(|x| x.as_u64())
             .map(|x| x as usize);
+        if let Some(by_host) = r.get("minPassByHost").and_then(|x| x.as_object()) {
+            for (host, floor) in by_host {
+                if let Some(floor) = floor.as_u64() {
+                    m.min_pass_by_host.insert(host.clone(), floor as usize);
+                }
+            }
+        }
     }
     if let Some(tests) = v.get("tests").and_then(|t| t.as_object()) {
         for (k, cfg) in tests {
