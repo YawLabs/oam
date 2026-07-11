@@ -9,7 +9,20 @@ use super::OpOutcome;
 
 fn resolver() -> &'static TokioResolver {
     static RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
-    RESOLVER.get_or_init(|| TokioResolver::builder_tokio().unwrap().build().unwrap())
+    RESOLVER.get_or_init(|| {
+        let mut builder = TokioResolver::builder_tokio().unwrap();
+        // Node parity: c-ares always advertises EDNS0 (1232-byte UDP payloads,
+        // DNS flag day 2020). hickory's system-conf path mirrors glibc instead
+        // -- EDNS only with an `options edns0` line in resolv.conf -- and some
+        // forwarders (Tailscale MagicDNS) answer non-EDNS queries with
+        // oversized TC=1 datagrams that then fail to parse, so every large
+        // answer (TXT sets) errors where Node succeeds. try_tcp_on_error
+        // covers the same forwarder shape for answers past the EDNS size.
+        let opts = builder.options_mut();
+        opts.edns0 = true;
+        opts.try_tcp_on_error = true;
+        builder.build().unwrap()
+    })
 }
 
 pub async fn dns_lookup(hostname: String, family: i32, all: bool) -> OpOutcome {
