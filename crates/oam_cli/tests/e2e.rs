@@ -10712,10 +10712,12 @@ const port = server.address().port;
 const c = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false });
 let closed = false;
 c.on('data', () => {});
-c.on('close', () => { closed = true; });
+const closedP = new Promise((r) => c.on('close', () => { closed = true; r(); }));
 await new Promise((r) => c.on('secureConnect', r));
 c.destroy();
-await new Promise((r) => setTimeout(r, 100));
+let timer;
+await Promise.race([closedP, new Promise((r) => { timer = setTimeout(r, 10000); })]);
+clearTimeout(timer);
 console.log('closed=' + closed);
 server.close();
 "#
@@ -12809,10 +12811,11 @@ fn tls_create_server_basics() {
          console.log('server_class:', typeof tls.Server === 'function');\n\
          const server = tls.createServer();\n\
          console.log('server_created:', typeof server === 'object');\n\
-         let listening = false;\n\
-         server.on('listening', () => { listening = true; });\n\
+         const listened = new Promise((resolve) => server.once('listening', () => resolve(true)));\n\
          server.listen(0, '127.0.0.1');\n\
-         await new Promise(r => setTimeout(r, 100));\n\
+         let timer;\n\
+         const listening = await Promise.race([listened, new Promise((r) => { timer = setTimeout(() => r(false), 10000); })]);\n\
+         clearTimeout(timer);\n\
          console.log('server_listening:', listening);\n\
          console.log('has_address:', server.address() !== null);\n\
          server.close();",
