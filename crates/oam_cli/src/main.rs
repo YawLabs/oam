@@ -567,7 +567,25 @@ fn run_command(
                 }
             }
             Err(_) => {
-                if !json {
+                // Checker still running when the wait deadline hit (cold
+                // tsgo / daemon warming under load). Same contract as the
+                // unavailable case above: the json stream must say the check
+                // did not happen -- a silently empty stream reads as
+                // "typecheck ran clean" (this exact silence flaked the e2e
+                // suite under full-parallel load).
+                if json {
+                    render(
+                        &Diagnostic::new(
+                            "OAM-TS0005",
+                            Severity::Warning,
+                            Origin::Typecheck,
+                            "type check did not finish before the program exited (checker \
+                             warming); results are instant on the next run"
+                                .to_string(),
+                        ),
+                        json,
+                    );
+                } else {
                     eprintln!(
                         "oam run: type check still running (daemon warming); results are instant on the next run"
                     );
