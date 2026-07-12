@@ -1728,7 +1728,18 @@ pub mod ops {
         let Some(mut file) = file else {
             return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
         };
-        match file.write_all(&bytes).await {
+        // write_all on tokio::fs::File resolves once the bytes land in
+        // tokio's INTERNAL buffer; the write(2) runs later on the blocking
+        // pool (flushed on drop, unsynchronized). Node's contract is
+        // callback-after-syscall -- without the flush, WriteStream 'finish'
+        // races the kernel write and a finish-handler read sees a short
+        // file (conformance case 21 flaked exactly this way on Linux under
+        // load). flush() waits for the pool write to complete.
+        let written = match file.write_all(&bytes).await {
+            Ok(()) => file.flush().await,
+            Err(e) => Err(e),
+        };
+        match written {
             Ok(()) => {
                 reinsert_file(&files, handle, file);
                 OpOutcome::Done
