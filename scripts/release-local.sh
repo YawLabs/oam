@@ -125,8 +125,10 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
     esac
   done <<<"$dirty"
   if [ "$only_artifacts" = "1" ]; then
-    warn "$1: restoring gate-regenerated conformance artifacts (stamp refresh) to HEAD"
-    git checkout -- "${CONFORMANCE_ARTIFACTS[@]}"
+    warn "$1: discarding gate-regenerated conformance artifacts (reproducible via xtask at this commit)"
+    # HEAD explicitly (a bare `checkout --` restores from the INDEX and
+    # would leave a staged artifact change dirty behind the warn).
+    git checkout HEAD -- "${CONFORMANCE_ARTIFACTS[@]}"
   fi
   return 0
 }
