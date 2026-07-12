@@ -1,8 +1,8 @@
 {
-  "commit": "b2f8e24",
+  "commit": "5c1a370",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.6.1",
+  "oamVersion": "oam 0.7.0",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
