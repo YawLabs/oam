@@ -1547,14 +1547,20 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
         "import http from 'node:http';\n\
          // Graceful close: a request in flight when close() fires still\n\
          // completes (Node semantics), not connection-reset.\n\
+         let slowArrived;\n\
+         const slowArrivedP = new Promise((r) => { slowArrived = r; });\n\
          const server = http.createServer((req, res) => {\n\
-           if (req.url === '/slow') { setTimeout(() => res.end('slow-done'), 200); return; }\n\
+           if (req.url === '/slow') { slowArrived(); setTimeout(() => res.end('slow-done'), 200); return; }\n\
            res.end('ok'); // never reads the body\n\
          });\n\
          await new Promise((r) => server.listen(0, r));\n\
          const base = `http://127.0.0.1:${server.address().port}`;\n\
          const inflight = fetch(`${base}/slow`).then((r) => r.text());\n\
-         await new Promise((r) => setTimeout(r, 60));\n\
+         // Await the request ARRIVING at the handler (a fixed 60ms window\n\
+         // races parallel-suite load) so close() provably fires mid-flight.\n\
+         let t1;\n\
+         await Promise.race([slowArrivedP, new Promise((r) => { t1 = setTimeout(r, 10000); })]);\n\
+         clearTimeout(t1);\n\
          server.close();\n\
          let drained = '';\n\
          try { drained = await inflight; } catch (e) { drained = 'FAILED:' + e.constructor.name; }\n\
@@ -10027,8 +10033,15 @@ console.log('client_encrypted=' + client.encrypted);
 client.write('hello-tls-server');
 
 const chunks = [];
-client.on('data', (c) => chunks.push(c.toString()));
-await new Promise((resolve) => setTimeout(resolve, 200));
+let gotEcho;
+const gotEchoP = new Promise((resolve) => {{ gotEcho = resolve; }});
+client.on('data', (c) => {{
+  chunks.push(c.toString());
+  if (chunks.join('').includes('echo:hello-tls-server')) gotEcho();
+}});
+let timer;
+await Promise.race([gotEchoP, new Promise((resolve) => {{ timer = setTimeout(resolve, 10000); }})]);
+clearTimeout(timer);
 
 const received = chunks.join('');
 console.log('has_echo=' + received.includes('echo:hello-tls-server'));
@@ -10381,9 +10394,13 @@ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 let errored = false;
 let errCode = 'none';
+let sawError;
+const sawErrorP = new Promise((r) => { sawError = r; });
 const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, () => {});
-req.on('error', (e) => { errored = true; errCode = (e && e.code) || 'err'; });
-await new Promise((r) => setTimeout(r, 800));
+req.on('error', (e) => { errored = true; errCode = (e && e.code) || 'err'; sawError(); });
+let timer;
+await Promise.race([sawErrorP, new Promise((r) => { timer = setTimeout(r, 10000); })]);
+clearTimeout(timer);
 console.log('errored=' + errored);
 console.log('err_code=' + errCode);
 server.close();

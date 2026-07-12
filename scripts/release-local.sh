@@ -106,6 +106,31 @@ smoke() {
   ok "smoke ok ($bin)"
 }
 
+# The gate's conformance + node-suite steps REGENERATE these committed
+# artifacts with fresh commit/version stamps -- a prior (or this) run's gate
+# self-dirties the tree with them. When they are the ONLY dirty paths,
+# restore them to HEAD instead of failing: the content is machine-
+# regenerated, reproducible by re-running xtask at this commit, and
+# restoring keeps the tree the remote legs tar byte-identical to the tag.
+CONFORMANCE_ARTIFACTS=(CONFORMANCE.md CONFORMANCE-NODE.md conformance/scorecard.json conformance/node-suite-scorecard.json)
+restore_gate_artifacts() {  # restore_gate_artifacts <context>
+  local dirty line path only_artifacts=1
+  dirty="$(git status --porcelain)"
+  [ -n "$dirty" ] || return 0
+  while IFS= read -r line; do
+    path="${line:3}"
+    case "$path" in
+      CONFORMANCE.md | CONFORMANCE-NODE.md | conformance/scorecard.json | conformance/node-suite-scorecard.json) ;;
+      *) only_artifacts=0 ;;
+    esac
+  done <<<"$dirty"
+  if [ "$only_artifacts" = "1" ]; then
+    warn "$1: restoring gate-regenerated conformance artifacts (stamp refresh) to HEAD"
+    git checkout -- "${CONFORMANCE_ARTIFACTS[@]}"
+  fi
+  return 0
+}
+
 # --- preflight ----------------------------------------------------------------
 step "Preflight $TAG"
 command -v gh >/dev/null 2>&1 || fail "gh CLI not found"
@@ -117,6 +142,9 @@ head_sha="$(git rev-parse HEAD)"
 [ "$tag_sha" = "$head_sha" ] || fail "HEAD ($head_sha) is not the tag commit ($tag_sha) -- checkout the tag first"
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
 # remote legs tar the WORKING TREE, so an untracked file ships into builds.
+# Leftover gate-regenerated conformance stamps (e.g. from a failed prior
+# attempt) are auto-restored first; anything else dirty still fails.
+restore_gate_artifacts "preflight"
 [ -z "$(git status --porcelain)" ] \
   || fail "working tree is dirty (untracked files count -- the remote legs ship the working tree) -- release from a clean tree"
 
@@ -148,6 +176,10 @@ if [ "$SKIP_LOCAL_GATE" = "1" ]; then
 else
   step "Local CI gate (scripts/ci-local.sh)"
   bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
+  # The gate just refreshed the conformance stamps; restore them so the
+  # remote legs build from a tree byte-identical to the tag and the release
+  # ends with a clean tree (no post-release stamp-refresh commit needed).
+  restore_gate_artifacts "post-gate"
 fi
 
 # --- local Windows legs ---------------------------------------------------------
