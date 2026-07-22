@@ -12,10 +12,19 @@
 #   OAM_INSTALL_DIR   install location; default: $HOME/.oam/bin
 #   OAM_INSTALL_BASE  asset base URL; default: GitHub Releases
 #                     (oam.sh sets this to proxy downloads through the CDN)
+#   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
+#                     also accepted). Needed on headless hosts -- CI, Docker, a
+#                     fresh VM -- that have a token but no gh CLI. While the
+#                     repo is private, unauthenticated asset URLs return 404.
+#   OAM_GH_API        GitHub API base; default https://api.github.com
+#                     (set this for GitHub Enterprise)
 set -eu
 
 OWNER_REPO="YawLabs/oam"
 INSTALL_DIR="${OAM_INSTALL_DIR:-$HOME/.oam/bin}"
+GH_API="${OAM_GH_API:-https://api.github.com}"
+# gh CLI convention first, then the Actions-provided name.
+TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 say() { printf 'oam-install: %s\n' "$1"; }
 die() { printf 'oam-install: error: %s\n' "$1" >&2; exit 1; }
@@ -25,8 +34,22 @@ need uname
 # Prefer curl, fall back to wget.
 if command -v curl >/dev/null 2>&1; then
   dl() { curl -fsSL "$1" -o "$2"; }
+  dl_auth() {
+    curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: $3" "$1" -o "$2"
+  }
+  api_get() {
+    curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+      -H "Accept: application/vnd.github+json" "$1"
+  }
 elif command -v wget >/dev/null 2>&1; then
   dl() { wget -qO "$2" "$1"; }
+  dl_auth() {
+    wget -qO "$2" --header="Authorization: Bearer ${TOKEN}" --header="Accept: $3" "$1"
+  }
+  api_get() {
+    wget -qO- --header="Authorization: Bearer ${TOKEN}" \
+      --header="Accept: application/vnd.github+json" "$1"
+  }
 else
   die "need curl or wget to download"
 fi
@@ -65,6 +88,36 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Token fallback: works on headless hosts with no gh CLI (CI, Docker, a fresh
+# VM). A private-repo asset is NOT reachable via its browser_download_url even
+# with a token -- GitHub only serves the bytes from the assets endpoint with
+# Accept: application/octet-stream -- so resolve the numeric asset id first.
+rel_json=""
+token_dl() {
+  [ -n "$TOKEN" ] || return 1
+  if [ -z "$rel_json" ]; then
+    if [ -n "${OAM_VERSION:-}" ]; then
+      rel_url="${GH_API}/repos/${OWNER_REPO}/releases/tags/${OAM_VERSION}"
+    else
+      rel_url="${GH_API}/repos/${OWNER_REPO}/releases/latest"
+    fi
+    rel_json="$(api_get "$rel_url")" || return 1
+  fi
+  # Strip ALL whitespace first: the REST API pretty-prints (`"name": "x"`, one
+  # field per line) while `gh api` returns compact JSON, and a parser written
+  # against either shape alone breaks on the other. Safe here because we only
+  # ever match asset names (target triples -- no spaces) and read back digits.
+  # Then split on '{' so each object is one line: GitHub emits "id" before
+  # "name" within an asset, and the nested uploader object (which carries its
+  # own "id") starts a LATER segment, so the id on the matching line is the
+  # asset's own. `tr` rather than `sed s/../\n/` -- BSD sed rejects \n in a RHS.
+  asset_id="$(printf '%s' "$rel_json" | tr -d ' \n\r' | tr '{' '\n' \
+    | grep "\"name\":\"$1\"," | grep -o '"id":[0-9][0-9]*' | head -1 | cut -d: -f2)"
+  [ -n "$asset_id" ] || return 1
+  dl_auth "${GH_API}/repos/${OWNER_REPO}/releases/assets/${asset_id}" "$2" \
+    "application/octet-stream"
+}
+
 # Authenticated fallback: while the repo is private, unauthenticated release
 # URLs 404. If the direct download fails and the gh CLI is available (internal
 # machines), fetch the same assets through the caller's GitHub auth.
@@ -78,17 +131,26 @@ gh_dl() {
     --output "$2" --clobber 2>/dev/null
 }
 
+# Direct first (public releases + the oam.sh CDN), then token, then gh CLI.
+fetch_asset() {
+  dl "${base}/$1" "$2" && return 0
+  if [ -n "$TOKEN" ]; then
+    say "direct download failed; retrying with \$GH_TOKEN"
+    token_dl "$1" "$2" && return 0
+  fi
+  say "retrying via gh CLI (private repo needs auth)"
+  gh_dl "$1" "$2"
+}
+
 say "downloading ${asset} from ${base}"
-if ! dl "${base}/${asset}" "${tmp}/${asset}"; then
-  say "direct download failed; retrying via gh CLI (private repo needs auth)"
-  gh_dl "${asset}" "${tmp}/${asset}" || die "download failed: ${base}/${asset}"
-fi
-if ! dl "${base}/SHA256SUMS" "${tmp}/SHA256SUMS"; then
-  gh_dl "SHA256SUMS" "${tmp}/SHA256SUMS" || die "could not fetch SHA256SUMS"
-fi
+fetch_asset "${asset}" "${tmp}/${asset}" || die "download failed: ${asset} (private repo? set GH_TOKEN or install the gh CLI)"
+fetch_asset "SHA256SUMS" "${tmp}/SHA256SUMS" || die "could not fetch SHA256SUMS"
 
 # Verify the checksum for our asset only (the manifest covers all targets).
-expected="$(grep " ${asset}\$" "${tmp}/SHA256SUMS" | awk '{print $1}')"
+# Match field 2 exactly, stripping sha256sum's binary-mode "*" marker -- the
+# manifest is written as "<hash> *<asset>", so a plain `grep " <asset>$"` never
+# matches and every install would die with "no checksum for ...".
+expected="$(awk -v a="$asset" '{ f = $2; sub(/^\*/, "", f); if (f == a) { print $1; exit } }' "${tmp}/SHA256SUMS")"
 [ -n "$expected" ] || die "no checksum for ${asset} in SHA256SUMS"
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"

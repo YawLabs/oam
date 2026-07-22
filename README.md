@@ -39,6 +39,29 @@ oam test                # *.test.ts in fresh isolates, ODIF output for agents
 oam check               # tsgo type-check with a warm daemon
 ```
 
+## Installing
+
+```
+curl -fsSL https://oam.sh/install.sh | sh          # Linux / macOS
+irm https://oam.sh/install.ps1 | iex               # Windows
+```
+
+Both installers pick the binary for your OS/arch, verify it against the published
+`SHA256SUMS`, and install per-user (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no
+admin. Binaries are unsigned and checksummed. `oam self-update` re-runs the same installer.
+
+**While this repo is private, unauthenticated asset URLs 404.** Supply a GitHub token with
+repo access, or have the `gh` CLI installed and authenticated:
+
+```
+GH_TOKEN=ghp_... curl -fsSL https://oam.sh/install.sh | sh
+```
+
+`GITHUB_TOKEN` is accepted too. The token path uses the GitHub API directly, so it works on
+headless hosts (CI, containers, a fresh VM) that have a token but no `gh` CLI. Other knobs:
+`OAM_VERSION` pins a tag, `OAM_INSTALL_DIR` moves the target directory, `OAM_GH_API` points
+at a GitHub Enterprise host.
+
 ## Building
 
 Rust stable (see `rust-toolchain.toml`). All six tier-1 targets build from the same tree:
@@ -63,6 +86,16 @@ sidecar, inspector) lands per the roadmap; crates are created when their workstr
 ## Governance
 
 - License: [Apache-2.0](LICENSE), forever. Contributions under [DCO](CONTRIBUTING.md); no CLA.
+  Apache-2.0 rather than MIT (or an MIT/Apache dual) is deliberate: oam is a VM, and Apache's
+  §3 patent grant with defensive termination binds every user. A dual license would let a
+  patent aggressor elect the MIT arm and keep its rights — and it would buy nothing in return,
+  since several Apache-2.0-only crates (`ring`, `sync_wrapper`, `self_cell`) are statically
+  linked, so the shipped binary can never be GPLv2-compatible regardless.
+- Attribution: [NOTICE](NOTICE) carries the V8 engine's BSD-3-Clause notice (V8 arrives as a
+  prebuilt static library, so it appears nowhere in the cargo graph and no tool collects it).
+  [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) reproduces the notices for the ~380 Rust
+  crates linked into the binary; regenerate it with
+  `cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md` whenever dependencies change.
 - [GOVERNANCE.md](GOVERNANCE.md) — the oam Covenant, foundation triggers, succession.
 - [AI-POLICY.md](AI-POLICY.md) — oam is heavily AI-developed, with identical review gates for
   human and AI changes, enforced changeset limits, and published provenance. The mega-merge

@@ -1,0 +1,48 @@
+# cargo-about config -- drives THIRD_PARTY_LICENSES.md generation.
+#
+#   cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+#
+# oam ships statically-linked binaries, so every crate below is REDISTRIBUTED
+# and its notice must travel with the release assets. Regenerate whenever the
+# dependency graph changes.
+
+# Only the targets we actually ship (see the asset-naming contract in
+# install/install.sh). Keeping this list tight avoids pulling attribution for
+# crates that never reach a released binary.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+# Build-only dependencies (bindgen's clang-sys, the r-efi UEFI shim) are not
+# linked into the shipped binary and carry no redistribution obligation.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Every license appearing in the runtime graph. GPL-2.0-only and
+# LGPL-2.1-or-later are listed ONLY because self_cell and r-efi offer them as
+# one arm of a disjunction; `accepted` is order-sensitive, so the permissive
+# arms above them are what actually gets selected.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+# `Apache-2.0 WITH LLVM-exception` resolves via the accepted Apache-2.0 above --
+# LLVM-exception is an SPDX *exception*, not a license, and is rejected here.
+
+# ring is "Apache-2.0 AND ISC" -- conjunctive, so both notices are required and
+# both ids must be accepted above (they are).
+workarounds = ["ring"]

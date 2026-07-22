@@ -12,11 +12,21 @@
 #   OAM_INSTALL_DIR   install location; default: %LOCALAPPDATA%\oam\bin
 #   OAM_INSTALL_BASE  asset base URL; default: GitHub Releases
 #                     (oam.sh sets this to proxy downloads through the CDN)
+#   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
+#                     also accepted). Needed on headless hosts -- CI, a fresh
+#                     VM -- that have a token but no gh CLI. While the repo is
+#                     private, unauthenticated asset URLs return 404.
+#   OAM_GH_API        GitHub API base; default https://api.github.com
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ownerRepo = 'YawLabs/oam'
 $installDir = if ($env:OAM_INSTALL_DIR) { $env:OAM_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'oam\bin' }
+$ghApi = if ($env:OAM_GH_API) { $env:OAM_GH_API } else { 'https://api.github.com' }
+# gh CLI convention first, then the Actions-provided name.
+$token = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { '' }
+# Declared up front: StrictMode makes reading an unset variable a hard error.
+$script:relJson = $null
 
 function Say($m) { Write-Host "oam-install: $m" }
 function Die($m) { Write-Error "oam-install: error: $m"; exit 1 }
@@ -60,21 +70,54 @@ try {
     return (Test-Path $outFile)
   }
 
-  Say "downloading $asset from $base"
-  try { Invoke-WebRequest -Uri "$base/$asset" -OutFile $binPath -UseBasicParsing }
-  catch {
-    Say 'direct download failed; retrying via gh CLI (private repo needs auth)'
-    if (-not (Get-ViaGh $asset $binPath)) { Die "download failed: $base/$asset" }
-  }
-  try { Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing }
-  catch {
-    if (-not (Get-ViaGh 'SHA256SUMS' $sumsPath)) { Die "could not fetch SHA256SUMS" }
+  # Token fallback: works on headless hosts with no gh CLI. A private-repo asset
+  # is NOT reachable via its browser_download_url even with a token -- GitHub
+  # only serves the bytes from the assets endpoint with an octet-stream Accept
+  # -- so resolve the numeric asset id first.
+  function Get-ViaToken($assetName, $outFile) {
+    if (-not $token) { return $false }
+    try {
+      if (-not $script:relJson) {
+        $relUrl = if ($env:OAM_VERSION) { "$ghApi/repos/$ownerRepo/releases/tags/$($env:OAM_VERSION)" }
+                  else { "$ghApi/repos/$ownerRepo/releases/latest" }
+        $script:relJson = Invoke-RestMethod -Uri $relUrl -UseBasicParsing -Headers @{
+          Authorization = "Bearer $token"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'oam-install'
+        }
+      }
+      $a = $script:relJson.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+      if (-not $a) { return $false }
+      Invoke-WebRequest -Uri "$ghApi/repos/$ownerRepo/releases/assets/$($a.id)" -OutFile $outFile -UseBasicParsing -Headers @{
+        Authorization = "Bearer $token"; Accept = 'application/octet-stream'; 'User-Agent' = 'oam-install'
+      }
+      return (Test-Path $outFile)
+    } catch { return $false }
   }
 
+  # Direct first (public releases + the oam.sh CDN), then token, then gh CLI.
+  function Get-Asset($assetName, $outFile) {
+    try { Invoke-WebRequest -Uri "$base/$assetName" -OutFile $outFile -UseBasicParsing; return $true } catch { }
+    if ($token) {
+      Say 'direct download failed; retrying with $GH_TOKEN'
+      if (Get-ViaToken $assetName $outFile) { return $true }
+    }
+    Say 'retrying via gh CLI (private repo needs auth)'
+    return (Get-ViaGh $assetName $outFile)
+  }
+
+  Say "downloading $asset from $base"
+  if (-not (Get-Asset $asset $binPath)) { Die "download failed: $asset (private repo? set GH_TOKEN or install the gh CLI)" }
+  if (-not (Get-Asset 'SHA256SUMS' $sumsPath)) { Die 'could not fetch SHA256SUMS' }
+
   # Verify the checksum for our asset only (the manifest covers all targets).
-  $line = Select-String -Path $sumsPath -Pattern (" $([regex]::Escape($asset))$") | Select-Object -First 1
-  if (-not $line) { Die "no checksum for $asset in SHA256SUMS" }
-  $expected = ($line.Line -split '\s+')[0].ToLower()
+  # Match field 2 exactly, stripping sha256sum's binary-mode "*" marker -- the
+  # manifest is written as "<hash> *<asset>", so matching on " <asset>$" never
+  # succeeds and every install dies with "no checksum for ...".
+  $expected = $null
+  foreach ($l in (Get-Content $sumsPath)) {
+    $parts = $l -split '\s+'
+    if ($parts.Count -ge 2 -and ($parts[1] -replace '^\*', '') -eq $asset) { $expected = $parts[0].ToLower(); break }
+  }
+  if (-not $expected) { Die "no checksum for $asset in SHA256SUMS" }
   $actual = (Get-FileHash -Algorithm SHA256 -Path $binPath).Hash.ToLower()
   if ($expected -ne $actual) { Die "checksum mismatch for $asset (expected $expected, got $actual)" }
   Say 'checksum ok'
