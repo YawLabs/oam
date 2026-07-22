@@ -22,7 +22,7 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-8)
+#   ./scripts/ci-local.sh              # full gate (steps 1-9)
 #   ./scripts/ci-local.sh --fast       # skip conformance + node-suite (6-7)
 #   ./scripts/ci-local.sh --no-tests   # skip the cargo test run (4)
 #
@@ -62,14 +62,14 @@ ok()  { echo -e "${GRN}  [ok]${NC} $*"; }
 warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
 ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 
-say "1/8 Format (cargo fmt --check)"
+say "1/9 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
   ok "fmt clean"
 else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/8 Clippy (-D warnings)"
+say "2/9 Clippy (-D warnings)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 if cargo clippy --workspace --all-targets -- -D warnings; then
@@ -78,7 +78,7 @@ else
   ko "clippy warnings above"
 fi
 
-say "3/8 Build (cargo build --workspace)"
+say "3/9 Build (cargo build --workspace)"
 if cargo build --workspace; then
   ok "build ok"
 else
@@ -86,7 +86,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "4/8 Tests (cargo test --workspace)"
+  say "4/9 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -103,10 +103,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
   fi
   ok "tests passed"
 else
-  say "4/8 Tests SKIPPED (--no-tests)"
+  say "4/9 Tests SKIPPED (--no-tests)"
 fi
 
-say "5/8 Smoke (oam run)"
+say "5/9 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_DIR"' EXIT
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -124,7 +124,7 @@ else
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "6/8 Conformance (node-differential gate)"
+  say "6/9 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -132,17 +132,17 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "7/8 Node-suite (skip-ratchet + pass-floor gate)"
+  say "7/9 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 else
-  say "6/8 + 7/8 Conformance + node-suite SKIPPED (--fast)"
+  say "6/9 + 7/9 + 8/9 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "8/8 Unsafe budget (advisory)"
+say "9/9 Unsafe budget (advisory)"
 # Advisory for now; becomes a ratchet gate with the SAFETY-comment checker
 # (AI-POLICY.md gate 5). oam_engine is the quarantined FFI boundary.
 for crate in crates/*/; do
