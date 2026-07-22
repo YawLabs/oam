@@ -69,6 +69,26 @@ awk -v a="$ASSET" '{ f = $2; sub(/^\*/, "", f); if (f != a) print }' \
   "${tmp}/SHA256SUMS" > "${tmp}/SHA256SUMS.new"
 (cd "$tmp" && sha256sum "$ASSET" >> SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
 
+# Self-check the assembled manifest BEFORE anything is uploaded. A bad manifest
+# is worse than a failed upload: it publishes a release whose binary cannot be
+# verified, and the installers fail closed on a checksum mismatch.
+#
+# 1. Exactly one entry for this asset. The dedupe above is the only thing
+#    standing between a re-run and a duplicate pair, and installers take the
+#    FIRST match -- which on a duplicate is the STALE hash. This is the exact
+#    bug the old `grep -v " <asset>$"` pattern shipped.
+entries="$(awk -v a="$ASSET" '{ f = $2; sub(/^\*/, "", f); if (f == a) n++ } END { print n+0 }' "${tmp}/SHA256SUMS")"
+if [ "$entries" -ne 1 ]; then
+  echo "error: SHA256SUMS has ${entries} entries for ${ASSET} (expected exactly 1) -- refusing to upload a manifest installers would resolve to the wrong hash" >&2
+  exit 1
+fi
+
+# 2. The recorded hash actually matches the binary about to be uploaded.
+#    --ignore-missing: the manifest covers all six targets, only ours is here.
+(cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS >/dev/null) \
+  || { echo "error: SHA256SUMS does not verify against ${ASSET} -- refusing to upload" >&2; exit 1; }
+echo "  [ok] manifest self-check: 1 entry for ${ASSET}, hash verifies"
+
 # Two calls, binary first. GitHub has no transactional multi-asset update,
 # so a stale-sums window exists either way -- but split calls make a partial
 # failure visible with exact remediation, and both are --clobber-idempotent.
