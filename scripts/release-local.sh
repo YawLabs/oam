@@ -5,7 +5,8 @@
 # orchestrator scripts drive remote build hosts, then `gh release create`
 # publishes from this box.
 # =============================================================================
-# Cuts a GitHub Release for an existing, pushed v* tag with these assets
+# Cuts a GitHub Release for a v* tag (created or re-pointed at HEAD by the
+# preflight below -- see Usage) with these assets
 # (exactly the names install/install.sh, install/install.ps1, and
 # `oam self-update` consume):
 #
@@ -41,9 +42,16 @@
 #     -- the node-suite ratchet was node-compat.yml's ubuntu GATING job)
 #   - gate+test on the Mac (inside mac-release)
 #
-# Usage (tag must exist, be pushed, and HEAD must be on it):
-#   git tag v0.7.0 && git push origin v0.7.0
-#   ./scripts/release-local.sh v0.7.0
+# Usage -- the tag is managed for you. Bump Cargo.toml, commit, push, then:
+#   ./scripts/release-local.sh v0.8.0
+#
+# Preflight creates <tag> at HEAD, or RE-POINTS it to HEAD if it already exists
+# somewhere else (a stale tag from an abandoned attempt is the common case), and
+# pushes it. That is safe only while the tag is unpublished, so the
+# release-already-exists check runs FIRST and hard-fails: a tag whose release is
+# live must keep pointing at the commit its assets were built from, forever.
+# HEAD must already be on origin/main, since pushing the tag would otherwise
+# publish an unpushed local commit.
 #
 # Env knobs:
 #   OAM_SKIP_LOCAL_GATE=1   skip the local ci-local.sh run
@@ -68,7 +76,7 @@
 
 set -euo pipefail
 
-TAG="${1:?usage: release-local.sh <tag>   (e.g. v0.7.0; tag must exist and be pushed)}"
+TAG="${1:?usage: release-local.sh <tag>   (e.g. v0.8.0; created/re-pointed at HEAD for you)}"
 REPO="YawLabs/oam"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -86,7 +94,7 @@ SKIP_WIN_X64="${OAM_SKIP_WIN_X64:-0}"
 SKIP_MAC="${OAM_SKIP_MAC:-0}"
 SKIP_LINUX="${OAM_SKIP_LINUX:-0}"
 
-RELEASE_DIR="$(mktemp -d -t oam-release-$TAG-XXXXXX)"
+RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
 
 # smoke <oam-binary>: ci.yml's smoke assertion, run on every staged binary
 # this box can execute (win-arm64 native; win-x64 under the OS emulation).
@@ -138,14 +146,11 @@ step "Preflight $TAG"
 command -v gh >/dev/null 2>&1 || fail "gh CLI not found"
 gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth status' to inspect"
 
-# The release builds from the tag's commit, not whatever HEAD happens to be.
-tag_sha="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || fail "tag $TAG not found locally -- create and push it first"
-head_sha="$(git rev-parse HEAD)"
-[ "$tag_sha" = "$head_sha" ] || fail "HEAD ($head_sha) is not the tag commit ($tag_sha) -- checkout the tag first"
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
 # remote legs tar the WORKING TREE, so an untracked file ships into builds.
 # Leftover gate-regenerated conformance stamps (e.g. from a failed prior
 # attempt) are auto-restored first; anything else dirty still fails.
+# Checked BEFORE any tag work: never tag a tree we would refuse to build.
 restore_gate_artifacts "preflight"
 [ -z "$(git status --porcelain)" ] \
   || fail "working tree is dirty (untracked files count -- the remote legs ship the working tree) -- release from a clean tree"
@@ -156,17 +161,57 @@ crate_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 [ "v$crate_version" = "$TAG" ] \
   || fail "tag $TAG != workspace version $crate_version (Cargo.toml) -- bump the version first"
 
-# Fail on a missing or DIVERGED remote tag NOW, not after an hour of builds
-# (gh release create --verify-tag only catches missing, at the very end).
-# git rev-parse <tag> and the API's object.sha agree for both lightweight
-# (commit SHA) and annotated (tag-object SHA) tags.
-remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)" \
-  || fail "tag $TAG is not on the remote -- push it: git push origin $TAG"
-local_tag_obj="$(git rev-parse "$TAG")"
-[ "$remote_tag_obj" = "$local_tag_obj" ] \
-  || fail "remote tag $TAG ($remote_tag_obj) != local tag ($local_tag_obj) -- local and origin disagree on what $TAG points at"
+head_sha="$(git rev-parse HEAD)"
+
+# HEAD must already be on origin/main. This script creates the tag below, and
+# `git push origin <tag>` drags the tagged commit along with it -- so without
+# this an unpushed local commit could be published as a release.
+git fetch -q origin main 2>/dev/null || true
+git merge-base --is-ancestor "$head_sha" origin/main 2>/dev/null \
+  || fail "HEAD ($head_sha) is not on origin/main -- push your commits first"
+
+# A PUBLISHED tag is immutable: whatever the release assets were built from must
+# keep pointing there forever. So check for the release FIRST, before the tag
+# reconciliation below can move anything.
 gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
   && fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
+
+# Reconcile the tag to HEAD, creating or re-pointing as needed. Safe only
+# because the release-exists check above already proved this tag is unpublished;
+# moving a published tag would orphan the assets built from it.
+# `git rev-parse <tag>` and the API's object.sha agree for both lightweight
+# (commit SHA) and annotated (tag-object SHA) tags, so compare like with like.
+local_tag_obj="$(git rev-parse "$TAG" 2>/dev/null || true)"
+local_tag_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null || true)"
+remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)"
+
+if [ "$local_tag_commit" = "$head_sha" ] \
+   && [ -n "$remote_tag_obj" ] && [ "$remote_tag_obj" = "$local_tag_obj" ]; then
+  ok "tag $TAG already at HEAD and in sync with origin"
+else
+  if [ -z "$local_tag_commit" ] && [ -z "$remote_tag_obj" ]; then
+    ok "creating tag $TAG at HEAD ($head_sha)"
+  else
+    warn "re-pointing $TAG: ${local_tag_commit:-<absent>} -> $head_sha (unpublished, so safe to move)"
+  fi
+  if [ -n "$local_tag_obj" ]; then
+    git tag -d "$TAG" >/dev/null || fail "could not delete local tag $TAG"
+  fi
+  if [ -n "$remote_tag_obj" ]; then
+    git push -q origin ":refs/tags/$TAG" || fail "could not delete remote tag $TAG"
+  fi
+  git tag -a "$TAG" -m "$TAG" || fail "could not create tag $TAG"
+  git push -q origin "$TAG" || fail "could not push tag $TAG"
+  ok "tag $TAG now at $head_sha (local + origin)"
+fi
+
+# Re-read both sides from disk/remote rather than trusting what we just wrote.
+tag_sha="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || fail "tag $TAG missing after reconciliation"
+[ "$tag_sha" = "$head_sha" ] || fail "tag $TAG ($tag_sha) still is not HEAD ($head_sha)"
+remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)" \
+  || fail "tag $TAG is not on the remote after push"
+[ "$remote_tag_obj" = "$(git rev-parse "$TAG")" ] \
+  || fail "remote tag $TAG ($remote_tag_obj) != local tag -- origin disagrees after push"
 
 [ "$SKIP_MAC" = "1" ]   || [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
