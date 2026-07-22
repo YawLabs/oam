@@ -10,7 +10,7 @@ do not edit by hand, regenerate when the dependency graph changes.
 
 ## Summary
 
-- Apache License 2.0 -- 263 crate(s)
+- Apache License 2.0 -- 254 crate(s)
 - MIT License -- 79 crate(s)
 - Unicode License v3 -- 27 crate(s)
 - BSD 3-Clause "New" or "Revised" License -- 4 crate(s)
@@ -8444,15 +8444,6 @@ limitations under the License.
 
 Used by:
 
-- oam_cli 0.7.0
-- oam_core 0.7.0
-- oam_diagnostics 0.7.0
-- oam_engine 0.7.0
-- oam_loader 0.7.0
-- oam_mcp 0.7.0
-- oam_napi_test_addon 0.7.0
-- oam_ts 0.7.0
-- xtask 0.7.0
 - allocator-api2 0.2.21
 - anyhow 1.0.102
 - asn1-rs-impl 0.2.0

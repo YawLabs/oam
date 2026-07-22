@@ -138,6 +138,36 @@ if [ "$FAST" -eq 0 ]; then
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
+
+  say "8/9 Attribution (THIRD_PARTY_LICENSES drift)"
+  # Every released binary statically links ~380 crates, so their notices have to
+  # travel with it. Cargo.lock changes silently invalidate the checked-in file;
+  # this catches that.
+  #
+  # Generate to a TEMP file OUTSIDE the repo and diff -- never regenerate in
+  # place. The release preflight demands a porcelain-clean tree, so a gate that
+  # rewrites (or drops an untracked file next to) a tracked artifact mid-run
+  # makes the NEXT release fail its clean-tree check. That is exactly the
+  # self-dirtying trap the conformance stamps hit, and it needed a restore step
+  # in release-local.sh to dig out of.
+  if ! command -v cargo-about >/dev/null 2>&1; then
+    warn "cargo-about not installed -- attribution drift unchecked (cargo install cargo-about --locked --features cli)"
+  else
+    attr_tmp="$(mktemp)"
+    if cargo about generate about.hbs -o "$attr_tmp" >/dev/null 2>&1; then
+      if diff -q "$attr_tmp" THIRD_PARTY_LICENSES.md >/dev/null 2>&1; then
+        ok "THIRD_PARTY_LICENSES.md matches the dependency graph"
+      else
+        rm -f "$attr_tmp"
+        ko "THIRD_PARTY_LICENSES.md is stale -- regenerate with: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md"
+      fi
+    else
+      # Infrastructure failure (cargo-about fetches some license texts over the
+      # network) is not a compliance violation -- warn, do not fail the gate.
+      warn "cargo about generate failed (network?) -- attribution drift unchecked"
+    fi
+    rm -f "$attr_tmp"
+  fi
 else
   say "6/9 + 7/9 + 8/9 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi

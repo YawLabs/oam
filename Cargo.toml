@@ -14,6 +14,9 @@ members = [
 
 [workspace.package]
 version = "0.8.0"
+# Internal crates: oam ships BINARIES, nothing here goes to crates.io.
+# Also lets `cargo about` filter them out of THIRD_PARTY_LICENSES.md.
+publish = false
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Jeff <jeff@rad.fyi>"]

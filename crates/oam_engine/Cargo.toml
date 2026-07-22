@@ -2,6 +2,7 @@
 name = "oam_engine"
 description = "rusty_v8 glue: isolate lifecycle, snapshots, code cache. The only crate allowed to expose rusty_v8 types."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 

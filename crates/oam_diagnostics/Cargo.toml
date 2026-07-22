@@ -2,6 +2,7 @@
 name = "oam_diagnostics"
 description = "ODIF (oam Diagnostic Interchange Format): the one envelope for every diagnostic oam emits. JSON is the source of truth; pretty-printers are renderers."
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 

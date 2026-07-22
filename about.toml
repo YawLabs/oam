@@ -23,6 +23,11 @@ targets = [
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
+# oam's OWN crates are not third-party -- without this they get listed under
+# Apache-2.0 alongside real dependencies. Keyed off `publish = false`, which the
+# workspace sets for every internal crate.
+private = { ignore = true }
+
 # Every license appearing in the runtime graph. GPL-2.0-only and
 # LGPL-2.1-or-later are listed ONLY because self_cell and r-efi offer them as
 # one arm of a disjunction; `accepted` is order-sensitive, so the permissive
