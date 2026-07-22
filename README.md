@@ -54,8 +54,13 @@ admin. Binaries are unsigned and checksummed. `oam self-update` re-runs the same
 repo access, or have the `gh` CLI installed and authenticated:
 
 ```
-GH_TOKEN=ghp_... curl -fsSL https://oam.sh/install.sh | sh
+curl -fsSL https://oam.sh/install.sh | GH_TOKEN=ghp_... sh      # Linux / macOS
+$env:GH_TOKEN='ghp_...'; irm https://oam.sh/install.ps1 | iex   # Windows
 ```
+
+Note where the variable goes: in a pipeline, `GH_TOKEN=... curl ... | sh` sets it on **curl**,
+not on the `sh` that runs the script, so the installer never sees it. Put it on `sh` as above,
+or `export GH_TOKEN` first.
 
 `GITHUB_TOKEN` is accepted too. The token path uses the GitHub API directly, so it works on
 headless hosts (CI, containers, a fresh VM) that have a token but no `gh` CLI. Other knobs:

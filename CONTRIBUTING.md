@@ -25,6 +25,6 @@ Rust stable (pinned by `rust-toolchain.toml`). `cargo build --workspace`,
 
 CI is script-driven, not GitHub Actions: `./scripts/ci-local.sh` runs the full gate
 (fmt, clippy `-D warnings`, build, tests, smoke, conformance, node-suite ratchet,
-unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
+THIRD_PARTY_LICENSES drift, unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
 build hosts via `scripts/release-local.sh` / `scripts/node-compat-measure.sh` /
 `scripts/bench-platforms.sh`.

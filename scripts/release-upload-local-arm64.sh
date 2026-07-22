@@ -58,7 +58,15 @@ gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
 # manifest is re-read from the release at this step boundary, never cached.
 gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS \
   --output "${tmp}/SHA256SUMS" --clobber
-grep -v " ${ASSET}\$" "${tmp}/SHA256SUMS" > "${tmp}/SHA256SUMS.new" || true
+# Match field 2 exactly, stripping sha256sum's binary-mode "*" -- the manifest
+# is written as "<hash> *<asset>", so `grep -v " <asset>$"` drops NOTHING and a
+# re-run appends a SECOND line for this asset. Installers take the first match,
+# which would then be the stale hash, so the download fails checksum verify.
+# No `|| true`: awk exits 0 when nothing matches, so the only way this fails is
+# a genuinely unreadable manifest -- which must abort under `set -e` rather than
+# silently produce a SHA256SUMS containing just this one asset.
+awk -v a="$ASSET" '{ f = $2; sub(/^\*/, "", f); if (f != a) print }' \
+  "${tmp}/SHA256SUMS" > "${tmp}/SHA256SUMS.new"
 (cd "$tmp" && sha256sum "$ASSET" >> SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
 
 # Two calls, binary first. GitHub has no transactional multi-asset update,

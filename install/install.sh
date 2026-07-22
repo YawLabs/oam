@@ -32,23 +32,34 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
 
 need uname
 # Prefer curl, fall back to wget.
+# The token must never reach argv: /proc/<pid>/cmdline is world-readable on
+# Linux, so `-H "Authorization: Bearer ..."` leaks the secret to every local
+# user for the life of the request. curl reads directives from stdin via
+# `--config -`; wget has no stdin equivalent, so it gets a mode-600 rc file
+# (WGETRC), which is at least owner-only rather than world-readable.
 if command -v curl >/dev/null 2>&1; then
   dl() { curl -fsSL "$1" -o "$2"; }
   dl_auth() {
-    curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: $3" "$1" -o "$2"
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: %s"\n' "$TOKEN" "$3" \
+      | curl -fsSL --config - "$1" -o "$2"
   }
   api_get() {
-    curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
-      -H "Accept: application/vnd.github+json" "$1"
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' "$TOKEN" \
+      | curl -fsSL --config - "$1"
   }
 elif command -v wget >/dev/null 2>&1; then
   dl() { wget -qO "$2" "$1"; }
+  _wgetrc() {
+    _rc="${tmp:-${TMPDIR:-/tmp}}/oam-wgetrc.$$"
+    (umask 077; printf 'header = Authorization: Bearer %s\nheader = Accept: %s\n' "$TOKEN" "$1" > "$_rc")
+    echo "$_rc"
+  }
   dl_auth() {
-    wget -qO "$2" --header="Authorization: Bearer ${TOKEN}" --header="Accept: $3" "$1"
+    _rc="$(_wgetrc "$3")"; WGETRC="$_rc" wget -qO "$2" "$1"; _s=$?; rm -f "$_rc"; return $_s
   }
   api_get() {
-    wget -qO- --header="Authorization: Bearer ${TOKEN}" \
-      --header="Accept: application/vnd.github+json" "$1"
+    _rc="$(_wgetrc 'application/vnd.github+json')"
+    WGETRC="$_rc" wget -qO- "$1"; _s=$?; rm -f "$_rc"; return $_s
   }
 else
   die "need curl or wget to download"

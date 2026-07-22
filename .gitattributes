@@ -1,3 +1,9 @@
 * text=auto eol=lf
 *.png binary
 *.ico binary
+
+# Generated verbatim by `cargo about`, and it embeds upstream license texts that
+# contain CRLF. Under `text=auto eol=lf` git strips those CRs on commit, so the
+# stored file could never byte-match a fresh generate and ci-local.sh step 8
+# would fail on every run. Store it exactly as produced.
+THIRD_PARTY_LICENSES.md -text

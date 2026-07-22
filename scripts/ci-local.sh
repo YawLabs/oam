@@ -14,7 +14,9 @@
 #   7. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
 #                                            advisory, only a ratchet violation
 #                                            fails -- node-compat.yml parity)
-#   8. unsafe-mention count per crate       (ADVISORY, never fails)
+#   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
+#                                            is installed -- see below)
+#   9. unsafe-mention count per crate       (ADVISORY, never fails)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
 # gates a release on this script PLUS gate+test+conformance on the GCP Linux
@@ -23,8 +25,13 @@
 #
 # Usage:
 #   ./scripts/ci-local.sh              # full gate (steps 1-9)
-#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite (6-7)
+#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (6-8)
 #   ./scripts/ci-local.sh --no-tests   # skip the cargo test run (4)
+#
+# Env:
+#   OAM_SKIP_ATTRIBUTION=1   downgrade step 8 to a warning. Step 8 fails CLOSED,
+#                            so an offline box (cargo-about resolves some license
+#                            texts over the network) cannot push without this.
 #
 # Install as a pre-push hook (so you can't push without it passing). A
 # wrapper, NOT `ln -s`: MSYS/Git Bash `ln -s` silently COPIES the file, and
@@ -61,6 +68,15 @@ say() { echo -e "${CYA}=== $* ===${NC}"; }
 ok()  { echo -e "${GRN}  [ok]${NC} $*"; }
 warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
 ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
+
+# ONE EXIT trap for the whole script: a second `trap ... EXIT` silently REPLACES
+# the first, so every temp path registers here instead of installing its own.
+CLEANUP_PATHS=()
+cleanup() {
+  if [ ${#CLEANUP_PATHS[@]} -gt 0 ]; then rm -rf "${CLEANUP_PATHS[@]}"; fi
+  return 0
+}
+trap cleanup EXIT
 
 say "1/9 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
@@ -108,7 +124,7 @@ fi
 
 say "5/9 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
-trap 'rm -rf "$SMOKE_DIR"' EXIT
+CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
 # Guarded capture (a crash inside $() under set -e dies without a message)
 # + ci.yml's 5-min smoke ceiling where a timeout tool exists.
@@ -152,21 +168,31 @@ if [ "$FAST" -eq 0 ]; then
   # in release-local.sh to dig out of.
   if ! command -v cargo-about >/dev/null 2>&1; then
     warn "cargo-about not installed -- attribution drift unchecked (cargo install cargo-about --locked --features cli)"
+  elif [ "${OAM_SKIP_ATTRIBUTION:-}" = "1" ]; then
+    warn "OAM_SKIP_ATTRIBUTION=1 -- attribution drift unchecked"
   else
-    attr_tmp="$(mktemp)"
-    if cargo about generate about.hbs -o "$attr_tmp" >/dev/null 2>&1; then
-      if diff -q "$attr_tmp" THIRD_PARTY_LICENSES.md >/dev/null 2>&1; then
+    attr_tmp="$(mktemp)"; CLEANUP_PATHS+=("$attr_tmp")
+    attr_err="$(mktemp)"; CLEANUP_PATHS+=("$attr_err")
+    if cargo about generate about.hbs -o "$attr_tmp" 2>"$attr_err" >/dev/null; then
+      # Compare CR-insensitively. .gitattributes marks this file `-text` so the
+      # stored bytes match a fresh generate, but that only holds for checkouts
+      # made after that rule landed -- an older clone, or a stray core.autocrlf,
+      # would otherwise fail the gate over line endings that carry no meaning.
+      if diff -q <(tr -d '\r' <"$attr_tmp") <(tr -d '\r' <THIRD_PARTY_LICENSES.md) >/dev/null 2>&1; then
         ok "THIRD_PARTY_LICENSES.md matches the dependency graph"
       else
-        rm -f "$attr_tmp"
         ko "THIRD_PARTY_LICENSES.md is stale -- regenerate with: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md"
       fi
     else
-      # Infrastructure failure (cargo-about fetches some license texts over the
-      # network) is not a compliance violation -- warn, do not fail the gate.
-      warn "cargo about generate failed (network?) -- attribution drift unchecked"
+      # FAIL CLOSED. A non-zero exit is NOT necessarily infrastructure: an
+      # unaccepted or unresolvable license exits 1 too, and that is precisely
+      # the compliance violation this gate exists to catch (verified: dropping
+      # "ISC" from about.toml's accepted list -- which makes ring's conjunctive
+      # "Apache-2.0 AND ISC" unsatisfiable -- exits 1). Treating every non-zero
+      # as a warning would wave that through. Offline boxes use the env escape.
+      sed 's/^/      /' "$attr_err" >&2
+      ko "cargo about generate failed (see above) -- a rejected license fails here too; if this is only network, re-run or set OAM_SKIP_ATTRIBUTION=1"
     fi
-    rm -f "$attr_tmp"
   fi
 else
   say "6/9 + 7/9 + 8/9 Conformance + node-suite + attribution SKIPPED (--fast)"
