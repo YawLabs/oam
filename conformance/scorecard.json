@@ -1,8 +1,8 @@
 {
-  "commit": "5c1a370",
+  "commit": "241b618",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.7.0",
+  "oamVersion": "oam 0.8.0",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -222,10 +222,14 @@
         {
           "case": "54-stream-async-iterator-helpers.mjs",
           "status": "pass"
+        },
+        {
+          "case": "55-next-tick-fifo.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 54,
-      "total": 54
+      "pass": 55,
+      "total": 55
     },
     "surface": {
       "globals": {

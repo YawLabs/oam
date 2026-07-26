@@ -17,8 +17,16 @@
 // - process.env is a copy taken at first access of the process module;
 //   writes mutate the JS object only.
 // - process.exit() exits immediately (no 'exit' event flush), like Bun.
-// - process.nextTick is microtask-based: it interleaves with promise
-//   jobs instead of running strictly before them.
+// - process.nextTick is a FIFO queue drained in one microtask: a tick batch
+//   (including ticks appended mid-drain) runs FIFO and ahead of promise jobs
+//   queued after the batch started. Node-identical for ticks scheduled from
+//   SYNCHRONOUS macrotask code (timer/IO callbacks, CJS main). Residual: a
+//   tick scheduled from any promise-job context (.then/await continuations,
+//   ESM top-level module eval) drains at its scheduling position in the
+//   microtask queue, while Node exhausts the ENTIRE microtask queue before
+//   re-draining ticks -- already-queued promise jobs run first there. True
+//   fix = engine microtask-policy integration, deferred per
+//   docs/design/streams-port.md section 4.
 // - fs streams (createReadStream/...) throw with a wave-2 pointer.
 // - TextDecoder supports utf-8 only (fatal + ignoreBOM honored).
 "use strict";
@@ -6135,6 +6143,82 @@
     const EventEmitter = registry.get("events");
     const { Readable, Writable } = registry.get("stream");
     const { Buffer } = registry.get("buffer");
+
+    // process.nextTick: a real FIFO tick queue (slice 0 of the streams port,
+    // docs/design/streams-port.md section 4). The first nextTick of a burst
+    // schedules ONE drain microtask; the drain runs the queue to exhaustion,
+    // including entries appended mid-drain, so a tick batch stays FIFO and
+    // runs ahead of any promise job queued after the batch started. Each
+    // callback is bound to its scheduling ALS frame individually (via
+    // registry._bindToCurrentFrame, exported by the timers init) -- binding
+    // only the drain would leak the first scheduler's frame into every other
+    // callback in the batch. Node-identical for ticks scheduled from
+    // synchronous macrotask code; ticks scheduled from promise-job contexts
+    // drain at their scheduling position instead of after full microtask
+    // exhaustion (see the header divergence list).
+    let tickQueue = [];
+    let tickIndex = 0;
+    let tickScheduled = false;
+    // Schedule through the native queueMicrotask captured by the timers init,
+    // never the mutable globalThis binding: a user monkey-patch (fake-timers,
+    // sync polyfills, throwing shims) must not be able to wedge, defer, or
+    // synchronize the tick drain. Fallback covers ticks scheduled before the
+    // timers init runs.
+    const scheduleDrain = () =>
+      (registry._nativeQueueMicrotask || globalThis.queueMicrotask)(drainTickQueue);
+    const drainTickQueue = () => {
+      // The finally is load-bearing: EVERY exit -- normal completion, the
+      // fatal no-listener rethrow, or a throw from a user's uncaughtException/
+      // monitor handler itself -- must reset the queue state, or nextTick is
+      // permanently wedged (tickScheduled stuck true means no future drain is
+      // ever scheduled) while the process keeps running.
+      try {
+        while (tickIndex < tickQueue.length) {
+          const entry = tickQueue[tickIndex];
+          // Null the consumed slot so the closure + args are collectible
+          // mid-batch, and compact periodically so array length tracks the
+          // PENDING entries: a self-perpetuating tick chain must run at O(1)
+          // memory like Node's FixedQueue, not retain the batch's history.
+          tickQueue[tickIndex] = undefined;
+          tickIndex += 1;
+          if (tickIndex >= 1024) {
+            tickQueue = tickQueue.slice(tickIndex);
+            tickIndex = 0;
+          }
+          try {
+            entry[0](...entry[1]);
+          } catch (e) {
+            // Node's onGlobalUncaughtException order: monitor first; then the
+            // capture callback, which REPLACES 'uncaughtException' emission
+            // and is never fatal; then listeners (handled -> this same drain
+            // keeps going). Emitting inline here (rather than rethrowing to
+            // the engine ledger, which only delivers after the whole
+            // microtask checkpoint) is what keeps the handler AHEAD of later
+            // ticks. No consumer at all = fatal: rethrow, and Node-faithfully
+            // drop the remaining ticks (via the finally) rather than racing
+            // their side effects against process death. A throw from the
+            // handler itself also escapes here -- fatal in Node; the finally
+            // keeps nextTick functional if the engine survives the run.
+            if (process.listenerCount("uncaughtExceptionMonitor") > 0) {
+              process.emit("uncaughtExceptionMonitor", e);
+            }
+            if (process._uncaughtCaptureCb) {
+              process._uncaughtCaptureCb(e);
+              continue;
+            }
+            if (process.listenerCount("uncaughtException") > 0) {
+              process.emit("uncaughtException", e);
+              continue;
+            }
+            throw e;
+          }
+        }
+      } finally {
+        tickQueue = [];
+        tickIndex = 0;
+        tickScheduled = false;
+      }
+    };
     // Node's process is an instance of a `process`-named EventEmitter subclass
     // (not a bare EventEmitter) -- gives it its own prototype layer, makes
     // process.constructor.name === "process" (so a failed `delete process.x`
@@ -6417,7 +6501,12 @@
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
-        queueMicrotask(() => fn(...args));
+        const bind = registry._bindToCurrentFrame;
+        tickQueue.push([bind ? bind(fn) : fn, args]);
+        if (!tickScheduled) {
+          tickScheduled = true;
+          scheduleDrain();
+        }
       },
       hrtime: Object.assign(
         (prev) => {
@@ -18791,11 +18880,19 @@
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
+      // Exported for process.nextTick's per-entry ALS frame binding: each
+      // queued tick captures the frame of ITS nextTick() call, not the frame
+      // of whichever call scheduled the drain microtask.
+      registry._bindToCurrentFrame = bindToCurrentFrame;
 
       // queueMicrotask still just needs ALS frame-binding.
       {
         const native = globalThis.queueMicrotask;
         if (typeof native === "function") {
+          // process.nextTick's drain schedules through this captured native
+          // so user monkey-patches of globalThis.queueMicrotask can't wedge
+          // or synchronize the tick queue.
+          registry._nativeQueueMicrotask = native;
           const wrapped = function (fn) {
             return native(bindToCurrentFrame(fn));
           };

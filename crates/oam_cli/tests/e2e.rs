@@ -853,6 +853,112 @@ fn fs_sync_and_promises_roundtrip_with_error_codes() {
 }
 
 #[test]
+fn next_tick_fifo_batch_runs_ahead_of_later_microtasks() {
+    // Slice 0 of the streams port (docs/design/streams-port.md section 4):
+    // nextTick is a real FIFO queue drained in one microtask -- FIFO among
+    // ticks, ticks appended mid-drain join the same batch, and the batch runs
+    // ahead of promise jobs queued after it started. For ticks scheduled from
+    // SYNCHRONOUS macrotask code this is Node-identical (differential twin:
+    // conformance/cases/55-next-tick-fifo.mjs). The residual: ticks scheduled
+    // from promise-job contexts (.then/await continuations, ESM top-level as
+    // asserted here) drain at their scheduling position, while Node exhausts
+    // the whole microtask queue first -- so Node would print p0,m0 ahead of
+    // the batch below. oam's batch-first order is the documented divergence.
+    let stdout = run_ok(
+        "next_tick_fifo.ts",
+        "const order: string[] = [];\n\
+         process.nextTick(() => {\n\
+           order.push('t1');\n\
+           process.nextTick(() => order.push('t2'));\n\
+           Promise.resolve().then(() => order.push('p1'));\n\
+         });\n\
+         process.nextTick(() => order.push('t3'));\n\
+         Promise.resolve().then(() => order.push('p0'));\n\
+         queueMicrotask(() => order.push('m0'));\n\
+         setTimeout(() => console.log(order.join(',')), 0);",
+    );
+    assert_eq!(stdout, "t1,t3,t2,p0,m0,p1");
+}
+
+#[test]
+fn next_tick_binds_als_frame_per_callback() {
+    // Two ALS contexts scheduling ticks into the same drain batch: each
+    // callback must observe ITS scheduling frame (per-entry binding), not the
+    // frame of whichever nextTick call scheduled the drain microtask.
+    let stdout = run_ok(
+        "next_tick_als.ts",
+        "import { AsyncLocalStorage } from 'node:async_hooks';\n\
+         const als = new AsyncLocalStorage<string>();\n\
+         const out: string[] = [];\n\
+         als.run('A', () => process.nextTick(() => out.push('A=' + als.getStore())));\n\
+         als.run('B', () => process.nextTick(() => out.push('B=' + als.getStore())));\n\
+         setTimeout(() => console.log(out.join(',')), 0);",
+    );
+    assert_eq!(stdout, "A=A,B=B");
+}
+
+#[test]
+fn next_tick_queue_drains_past_handled_uncaught_exception() {
+    // Node semantics: a throwing tick surfaces as uncaughtException, and when
+    // a handler exists the REMAINING tick queue still drains.
+    let stdout = run_ok(
+        "next_tick_throw.ts",
+        "process.on('uncaughtException', (e: Error) => console.log('caught ' + e.message));\n\
+         process.nextTick(() => { throw new Error('boom'); });\n\
+         process.nextTick(() => console.log('after'));\n\
+         setTimeout(() => console.log('done'), 0);",
+    );
+    assert_eq!(stdout, "caught boom\nafter\ndone");
+}
+
+#[test]
+fn next_tick_capture_callback_replaces_uncaught_emission() {
+    // Node's onGlobalUncaughtException order: monitor, then the capture
+    // callback -- which REPLACES 'uncaughtException' emission and is never
+    // fatal -- then listeners. A throwing tick with a capture callback set
+    // must invoke it, keep draining, and exit 0 (Node-identical).
+    let stdout = run_ok(
+        "next_tick_capture.ts",
+        "process.setUncaughtExceptionCaptureCallback((e: Error) => console.log('captured ' + e.message));\n\
+         process.nextTick(() => { throw new Error('boom'); });\n\
+         process.nextTick(() => console.log('after'));\n\
+         setTimeout(() => console.log('done'), 0);",
+    );
+    assert_eq!(stdout, "captured boom\nafter\ndone");
+}
+
+#[test]
+fn next_tick_survives_throwing_uncaught_exception_handler() {
+    // A THROWING uncaughtException handler must not wedge the tick queue:
+    // the drain's finally resets state on every exit path, so nextTick keeps
+    // working afterwards. (Node treats a handler throw as immediately fatal;
+    // oam's engine ledger re-delivers and the run survives -- that divergence
+    // is documented engine-side. The invariant locked here is narrower and
+    // load-bearing for streams: the nextTick machinery itself stays alive.)
+    let file = write_temp(
+        "next_tick_handler_throw.ts",
+        "let first = true;\n\
+         process.on('uncaughtException', (e: Error) => {\n\
+           console.log('handler ' + e.message);\n\
+           if (first) { first = false; throw new Error('double'); }\n\
+         });\n\
+         process.nextTick(() => { throw new Error('boom'); });\n\
+         setTimeout(() => {\n\
+           process.nextTick(() => console.log('late tick ran'));\n\
+           setTimeout(() => console.log('done'), 5);\n\
+         }, 5);",
+    );
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("late tick ran"),
+        "nextTick must survive a throwing handler; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("done"), "stdout: {stdout}");
+}
+
+#[test]
 fn process_globals_and_scheduling() {
     let stdout = run_ok(
         "process_glob.ts",
