@@ -1,0 +1,52 @@
+Node.js streams vendor manifest
+===============================
+
+Upstream tag:    v22.22.2
+Commit:          2645dc73720b1b4f27c49f395d3c66025ce126cc
+Retrieved:       2026-07-25
+Source base:     https://raw.githubusercontent.com/nodejs/node/v22.22.2/lib/
+License:         MIT (Node.js contributors; Joyent headers retained in the
+                 6 files that carry them). Full text: THIRD_PARTY_LICENSES.md
+                 'Node.js' entry; binary-redistribution pointer in NOTICE.
+
+Every vendored file = an 8-line provenance banner + the byte-identical
+upstream body. sha256 below covers the PRISTINE body (strip the banner:
+first 8 lines). All files MUST come from the same tag -- utils/readable/
+writable/destroy share the kState bitfield layout; mixed-tag vendoring
+silently corrupts it (docs/design/streams-port.md section 2).
+
+Deliberately not vendored: lazy_transform.js (crypto extends Transform
+directly), stream/consumers.js (oam keeps its own), stream/web.js +
+internal/webstreams/adapters (bridged to js/streams.js; stub in slice 2).
+
+Re-vendor procedure (Node version bump):
+  1. Update TAG + COMMIT here (deref the annotated tag via the GitHub API).
+  2. For each file below: fetch source-base/<path>, verify sha256 of the
+     fetched body changes ONLY when upstream changed, re-prepend the banner
+     (update tag/commit/date), write.
+  3. Re-derive the primordials union + shim surface (slice-2 extraction
+     script) BEFORE running the suite -- new upstream code may widen it.
+  4. cargo run -p xtask -- node-suite && conformance; full ci-local before
+     commit. All files move together or not at all.
+
+path | pristine-bytes | pristine-sha256
+-----|----------------|----------------
+internal/streams/utils.js | 8930 | 76f2a40f2e1b799a575116036549bf5eca5f69b9038a77b1016eee823e51625f
+internal/streams/state.js | 1440 | 4b5e014feed92eab8832debc31090ec8a6024226fa147db37a448f89ad157c29
+internal/streams/legacy.js | 3251 | 70a71d232a01069fed22017640abfdb0e1a211f22635290ab3026e072821aa19
+internal/streams/from.js | 4321 | b8d613993e726b3691306ef3e2bc90ebcf38b46258e39f060a7f411635857b36
+internal/streams/destroy.js | 7355 | 74aaae64ff7e4553fbf981baffb1f1dab7748c1e3fedfbef59eb8ab9ed4ec22d
+internal/streams/end-of-stream.js | 8899 | 5c1a34db5c6b14e8b9c974c1332ffa3253448f974007238e21b0a2e7140d5abe
+internal/streams/add-abort-signal.js | 1734 | 094f9ecde85621459fc927d398c0ce3d08aa580c2fd99b9015629c10ed030edf
+internal/streams/readable.js | 51301 | c801fa2e228bb112318eda73ff9aa53860270d8a8e92789b1993b78d7773d93a
+internal/streams/writable.js | 33597 | 8ed9b030949448f68db50151b094be811177b6f7ba672bd06d7c5243f56e6453
+internal/streams/duplex.js | 6529 | ee9b204539763a6e7807056d9b6a77a156614fa39d3506fd6aacfc78a483df41
+internal/streams/transform.js | 7123 | af0424491c8b4de48df33f57955d2d501bbaed8d80393a45a0fae84c62459af9
+internal/streams/passthrough.js | 1762 | 52bed2d31129172fce7fb4d5dd1c0c45f59cc9185964cd6069c63ed4219163ec
+internal/streams/duplexify.js | 8087 | 28666d68d467e1e87f99b717f0e9a40a066a5e3db6ed842f0b58ef7f99542980
+internal/streams/duplexpair.js | 1373 | f0228c3ad03203552b38f47f33e917cb9c49dcbff7c2128d9afc4c3c5d302543
+internal/streams/pipeline.js | 12467 | 64377b5710dff0473ea89bec0cbce91ee0f9af3ac45a5586b7a339741a53df55
+internal/streams/compose.js | 5511 | 7c73eb1d9b4811b848a827713527e34de0409acc2bffe8284dd32ba3a729e56a
+internal/streams/operators.js | 9669 | 046bf72a2caedf54406454b0fa832485d886a12166a0c17801baf02098dd0d39
+stream.js | 5095 | 417273d2c2cce2e6fa969d517e028839deedd2086e16988bef9e10c16adaa47d
+stream/promises.js | 917 | 29606bc43e45922f0b39f633cad11d607afa2afcb35f3f1dcfe296219243031e

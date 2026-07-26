@@ -81,6 +81,19 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
+Node.js
+================================================================================
+
+oam vendors portions of Node.js (lib/stream.js, lib/stream/promises.js, and
+lib/internal/streams/*, at js/vendor/node-streams/), distributed under the MIT
+license. Copyright Node.js contributors; portions copyright Joyent, Inc. and
+other Node contributors (per-file headers retained in the vendored sources).
+The full MIT text is reproduced in THIRD_PARTY_LICENSES.md ("Node.js" section).
+Like V8's, this notice is hand-maintained: the vendored files are not a cargo
+dependency and cannot be collected by `cargo about`. The upstream tag, per-file
+checksums, and refresh procedure live in js/vendor/node-streams/UPSTREAM.
+
+================================================================================
 Rust dependencies
 ================================================================================
 
