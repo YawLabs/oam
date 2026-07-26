@@ -5739,9 +5739,10 @@
           let handle = null;
           let totalRead = 0;
           super({
-            // The fs ReadStream emits its own 'close' on EOF/destroy; opt out
-            // of Readable autoDestroy so 'close' isn't emitted twice.
-            autoDestroy: false,
+            // Node's fs.ReadStream flow: EOF -> push(null) -> 'end' ->
+            // autoDestroy -> destroy() -> _destroy -> 'close'. The stream
+            // machine owns 'close' (single emission); the read path only
+            // closes the fd early so EOF never holds it open.
             highWaterMark,
             encoding: opts.encoding ?? null,
             async read(size) {
@@ -5756,7 +5757,6 @@
                   await Promise.resolve(natives.fsClose(handle)).catch(() => {});
                   handle = null;
                   this.push(null);
-                  process.nextTick(() => this.emit("close"));
                   return;
                 }
                 const want = Math.min(size || highWaterMark, remaining);
@@ -5765,7 +5765,6 @@
                   await Promise.resolve(natives.fsClose(handle)).catch(() => {});
                   handle = null;
                   this.push(null);
-                  process.nextTick(() => this.emit("close"));
                 } else {
                   const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
                   totalRead += buf.length;
@@ -5795,9 +5794,8 @@
           let handle = null;
           let totalWritten = 0;
           super({
-            // The fs WriteStream emits its own 'close' in final(); opt out of
-            // Writable autoDestroy so 'close' isn't emitted twice.
-            autoDestroy: false,
+            // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
+            // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
             highWaterMark: opts.highWaterMark ?? 65536,
             async write(chunk, _encoding, cb) {
               try {
@@ -5823,7 +5821,6 @@
                 natives.fsClose(handle);
                 handle = null;
                 cb();
-                this.emit("close");
               } catch (e) {
                 cb(e);
               }
@@ -6144,7 +6141,12 @@
   // -------------------------------------------------------------- process
   registry.factories.process = (natives) => {
     const EventEmitter = registry.get("events");
-    const { Readable, Writable } = registry.get("stream");
+    // Streams are consumed LAZILY (stdio getters below), never at factory
+    // time: this factory runs inside installRuntimeGlobals BEFORE
+    // globalThis.process is assigned, and the vendored stream port's module
+    // bodies read process.platform at load time (state.js HWM default) --
+    // requiring the port here would see process === undefined and crash the
+    // runtime at startup. Node lazy-initializes stdio the same way.
     const { Buffer } = registry.get("buffer");
 
     // process.nextTick: a real FIFO tick queue (slice 0 of the streams port,
@@ -6549,26 +6551,10 @@
         },
         { rss: () => natives.processRss() },
       ),
-      stdout: decorateTtyWriteStream(new Writable({
-        write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
-        decodeStrings: false,
-      }), 1, stdoutIsTTY),
-      stderr: decorateTtyWriteStream(new Writable({
-        write(chunk, _enc, cb) { natives.stderrWrite(chunk); cb(); },
-        decodeStrings: false,
-      }), 2, stderrIsTTY),
-      stdin: decorateTtyReadStream(new Readable({
-        autoDestroy: false,
-        read() {
-          natives.stdinRead().then(
-            (chunk) => {
-              if (chunk === undefined || chunk === null || chunk.length === 0) this.push(null);
-              else this.push(Buffer.from(chunk));
-            },
-            () => this.push(null),
-          );
-        },
-      }), 0, stdinIsTTY),
+      // stdout/stderr/stdin are installed as lazy memoized getters after the
+      // object literal (see defineProperties below) -- constructing them here
+      // would require('stream') at factory time, re-entering the init cycle
+      // documented at the factory top.
       getBuiltinModule(name) {
         var bare = String(name).replace(/^node:/, "");
         if (registry.factories[bare]) {
@@ -6988,6 +6974,58 @@
         }
       },
     });
+
+    // Lazy stdio (Node does the same): memoized getters so the FIRST
+    // require('stream') happens on first stdio ACCESS, after
+    // installRuntimeGlobals has assigned globalThis.process -- never inside
+    // this factory (init-cycle documented at the factory top). The getters
+    // are replaceable data-property-style (set overrides), matching Node's
+    // configurable stdio accessors.
+    {
+      const lazyStdio = (name, build) => {
+        let cached;
+        Object.defineProperty(process, name, {
+          configurable: true,
+          enumerable: true,
+          get() {
+            if (cached === undefined) cached = build();
+            return cached;
+          },
+          set(v) {
+            cached = v;
+          },
+        });
+      };
+      lazyStdio("stdout", () => {
+        const { Writable } = registry.get("stream");
+        return decorateTtyWriteStream(new Writable({
+          write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
+          decodeStrings: false,
+        }), 1, stdoutIsTTY);
+      });
+      lazyStdio("stderr", () => {
+        const { Writable } = registry.get("stream");
+        return decorateTtyWriteStream(new Writable({
+          write(chunk, _enc, cb) { natives.stderrWrite(chunk); cb(); },
+          decodeStrings: false,
+        }), 2, stderrIsTTY);
+      });
+      lazyStdio("stdin", () => {
+        const { Readable } = registry.get("stream");
+        return decorateTtyReadStream(new Readable({
+          autoDestroy: false,
+          read() {
+            natives.stdinRead().then(
+              (chunk) => {
+                if (chunk === undefined || chunk === null || chunk.length === 0) this.push(null);
+                else this.push(Buffer.from(chunk));
+              },
+              () => this.push(null),
+            );
+          },
+        }), 0, stdinIsTTY);
+      });
+    }
 
     // process.exitCode: a validating, non-configurable accessor (Node). Accepts
     // an integer, an integer-valued string ('2' -> 2), or undefined/null
@@ -14213,8 +14251,24 @@
         // so the ws-level "close" never fires and peers leak. oam's socket is
         // always in flowing mode (readLoop emits "data"), so the readable buffer
         // length is always 0.
-        this._readableState = { endEmitted: false, length: 0 };
-        this._writableState = { length: 0, finished: false, errorEmitted: false, needDrain: false };
+        // Field set covers everything the VENDORED stream predicates read
+        // (utils/destroy/end-of-stream/pipeline: closed, closeEmitted,
+        // constructed, destroyed, ended, ending, errored, errorEmitted,
+        // finalCalled, finished, pendingcb, prefinished, readable/writable,
+        // reading, length) so pipeline()/finished() on a socket see a
+        // consistent not-yet-finished stream; lifecycle sites (destroy,
+        // _doClose, _readLoop EOF, end) mutate the load-bearing ones.
+        this._readableState = {
+          endEmitted: false, length: 0, closed: false, closeEmitted: false,
+          constructed: true, destroyed: false, ended: false, errored: null,
+          errorEmitted: false, readable: true, reading: false,
+        };
+        this._writableState = {
+          length: 0, finished: false, errorEmitted: false, needDrain: false,
+          closed: false, closeEmitted: false, constructed: true,
+          destroyed: false, ended: false, ending: false, errored: null,
+          finalCalled: false, pendingcb: 0, prefinished: false, writable: true,
+        };
         this._paused = false;
         this._pipeHandler = null;
         this._timeoutMs = 0;
@@ -14293,11 +14347,22 @@
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+        // Reentry guard (EOF auto-end + a user 'end' listener calling end()
+        // again would otherwise chain a SECOND 'finish' after 'close'). Node:
+        // end() after end() is a no-op that still fires the callback.
+        if (this._writableState.ended) {
+          if (cb) this.once("finish", cb);
+          return this;
+        }
         if (data !== undefined && data !== null) this.write(data, encoding);
         this.writable = false;
+        // state.writable stays untouched (side-existence marker; see destroy).
+        this._writableState.ending = true;
+        this._writableState.ended = true;
         this._chain = this._chain.then(() => {
           if (this._handle !== null) return natives.tcpShutdown(this._handle);
         }).then(() => {
+          this._writableState.finished = true;
           this.emit("finish");
           if (cb) cb();
           if (!this.readable) this._doClose();
@@ -14311,6 +14376,16 @@
         this.readable = false;
         this.writable = false;
         this.connecting = false;
+        const rs = this._readableState;
+        const ws = this._writableState;
+        rs.destroyed = ws.destroyed = true;
+        // Deliberately NOT flipping rs.readable / ws.writable: Node never
+        // mutates those state fields post-construction (they are
+        // side-existence markers isReadableNodeStream/isWritableNodeStream
+        // key off), and flipping them before emit('close') makes the
+        // vendored end-of-stream skip its premature-close detection --
+        // pipeline() would report success on a silently truncated transfer.
+        if (err) rs.errored = ws.errored = err;
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
           this._timeoutId = null;
@@ -14319,8 +14394,13 @@
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
         }
-        if (err) this.emit("error", err);
+        if (err) {
+          this.emit("error", err);
+          rs.errorEmitted = ws.errorEmitted = true;
+        }
+        rs.closed = ws.closed = true;
         this.emit("close", !!err);
+        rs.closeEmitted = ws.closeEmitted = true;
         return this;
       }
 
@@ -14336,10 +14416,25 @@
           }
           if (chunk === undefined) {
             this.readable = false;
+            // state.readable stays untouched (side-existence marker; see destroy).
+            this._readableState.ended = true;
             this._readableState.endEmitted = true;
             this.emit("end");
-            if (!this.allowHalfOpen) this.end();
-            else if (!this.writable) this._doClose();
+            if (!this.allowHalfOpen) {
+              if (this._writableState.ended) {
+                // end() already ran (the common write->end->echo->EOF shape);
+                // the reentry guard means calling it again would no-op, so
+                // route the close through the write chain -- it sequences
+                // AFTER the in-flight shutdown + 'finish'. Before the guard,
+                // this path re-ran end() and closed via its duplicate chain
+                // (which also double-emitted 'finish').
+                this._chain = this._chain.then(() => this._doClose());
+              } else {
+                this.end();
+              }
+            } else if (!this.writable) {
+              this._doClose();
+            }
             break;
           }
           this.bytesRead += chunk.length;
@@ -14359,7 +14454,12 @@
         }
         if (!this.destroyed) {
           this.destroyed = true;
+          const rs = this._readableState;
+          const ws = this._writableState;
+          rs.destroyed = ws.destroyed = true;
+          rs.closed = ws.closed = true;
           this.emit("close", false);
+          rs.closeEmitted = ws.closeEmitted = true;
         }
       }
 

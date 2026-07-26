@@ -4,7 +4,7 @@
   "ratchet": {
     "maxSkips": 0,
     "maxKnownIssues": 0,
-    "minPass": 270,
+    "minPass": 328,
     "minPassByHost": {
       "linux-x86_64": 267
     }

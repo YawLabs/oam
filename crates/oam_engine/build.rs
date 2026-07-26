@@ -221,11 +221,22 @@ fn main() {
             Some("stream/promises"),
         ),
         // seal.js: closes __oamVendor.define and freezes the registry -- MUST
-        // stay the last entry of the vendor block.
+        // stay the last define-emitting entry of the vendor block.
         (
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../js/vendor/oam-shims/seal.js"
+            ),
+            None,
+        ),
+        // register.js: swaps registry.factories.stream to the vendored port
+        // behind the OAM_LEGACY_STREAMS kill switch (slice 3). After seal
+        // (it only reassigns __oamNode factories), before everything that
+        // may consume streams.
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/register.js"
             ),
             None,
         ),

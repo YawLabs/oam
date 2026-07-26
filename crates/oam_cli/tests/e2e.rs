@@ -854,18 +854,16 @@ fn fs_sync_and_promises_roundtrip_with_error_codes() {
 
 #[test]
 fn vendored_streams_load_dark() {
-    // Streams-port slice 2 (docs/design/streams-port.md section 10): the
-    // vendored Node v22 streams load and RUN behind __oamVendor without
-    // being registered. require('node:stream') must still resolve to the
-    // legacy implementation (the factory flip is slice 3); the vendored
-    // module must be a distinct, working state machine -- the pipeline
-    // exercise below pulls utils/destroy/end-of-stream/readable/writable/
-    // duplex/transform through their real code paths on oam's primitives.
+    // Since the slice-3 flip, require('node:stream') IS the vendored port:
+    // the classes resolved via the registry and via __oamVendor must be the
+    // SAME objects (registration sanity). The pipeline exercise pulls utils/
+    // destroy/end-of-stream/readable/writable/duplex/transform through their
+    // real code paths on oam's primitives.
     let stdout = run_ok(
         "vendor_dark.ts",
-        "import { Readable as LegacyReadable } from 'node:stream';\n\
+        "import { Readable as RegistryReadable } from 'node:stream';\n\
          const V = (globalThis as any).__oamVendor.require('stream');\n\
-         console.log('distinct', V.Readable !== LegacyReadable);\n\
+         console.log('same', V.Readable === RegistryReadable);\n\
          const r = new V.Readable({ read() {} });\n\
          const chunks: string[] = [];\n\
          const w = new V.Writable({\n\
@@ -881,7 +879,56 @@ fn vendored_streams_load_dark() {
            console.log('hwm', V.getDefaultHighWaterMark(false) > 0);\n\
          });",
     );
-    assert_eq!(stdout, "distinct true\nregistry sealed\npiped ab\nhwm true");
+    assert_eq!(stdout, "same true\nregistry sealed\npiped ab\nhwm true");
+}
+
+#[test]
+fn legacy_streams_kill_switch_still_works() {
+    // OAM_LEGACY_STREAMS=1 is the flip's entire rollback story through
+    // slice 4 -- it must not rot silently. Asserts: the registry serves the
+    // LEGACY module (distinct from the vendored port), alias identity holds,
+    // fs streams emit exactly one 'close' in Node order, and stdout works.
+    // Delete this test in slice 5 together with the switch.
+    let script = write_temp(
+        "legacy_switch.ts",
+        "import { Readable as R } from 'node:stream';\n\
+         import * as fs from 'node:fs';\n\
+         const V = (globalThis as any).__oamVendor.require('stream');\n\
+         console.log('legacy-distinct', R !== V.Readable);\n\
+         const alias = process.getBuiltinModule('_stream_readable');\n\
+         console.log('alias', alias === R);\n\
+         const p = process.argv[2];\n\
+         const events: string[] = [];\n\
+         const ws = fs.createWriteStream(p);\n\
+         ws.on('finish', () => events.push('finish'));\n\
+         ws.on('close', () => {\n\
+           events.push('close');\n\
+           console.log('ws', events.join(','));\n\
+         });\n\
+         ws.end('data');",
+    );
+    let out_file = write_temp("legacy_switch_out/x.txt", "");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", script.to_str().unwrap(), "--no-check", "--"])
+        .arg(out_file.to_str().unwrap())
+        .env("OAM_LEGACY_STREAMS", "1")
+        .env(
+            "OAM_CACHE_DIR",
+            write_temp("legacy-switch-cache/.keep", "")
+                .parent()
+                .unwrap(),
+        )
+        .output()
+        .expect("oam binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("legacy-distinct true"), "stdout: {stdout}");
+    assert!(stdout.contains("alias true"), "stdout: {stdout}");
+    assert!(stdout.contains("ws finish,close"), "stdout: {stdout}");
 }
 
 #[test]
@@ -8307,7 +8354,10 @@ try { crypto.setFips(1); } catch(e) { console.log('setFips_err=true'); }
 
 // -- stream.getDefaultHighWaterMark / setDefaultHighWaterMark --
 console.log('hwm_obj=' + stream.getDefaultHighWaterMark(true));
-console.log('hwm_buf=' + stream.getDefaultHighWaterMark(false));
+// v22 byte HWM default is platform-dependent (state.js: 16KiB win32, 64KiB
+// elsewhere) -- normalize so the linux release leg passes too.
+const hwmExpected = process.platform === 'win32' ? 16384 : 65536;
+console.log('hwm_buf_ok=' + (stream.getDefaultHighWaterMark(false) === hwmExpected));
 try { stream.setDefaultHighWaterMark(false, -1); } catch(e) { console.log('hwm_invalid=true'); }
 
 // -- buffer.kStringMaxLength, SlowBuffer --
@@ -8342,7 +8392,7 @@ console.log('sb_len=' + sb.length);
         "secureHeap_used=0",
         "setFips_err=true",
         "hwm_obj=16",
-        "hwm_buf=16384",
+        "hwm_buf_ok=true",
         "hwm_invalid=true",
         "kStringMaxLength=536870888",
         "SlowBuffer_type=function",

@@ -106,17 +106,32 @@ pub fn run(release: bool) -> Result<()> {
                 .push(json!({ "case": name, "status": "skipped", "reason": "node absent" }));
             continue;
         };
+        // Hermetic color env: Node honors FORCE_COLOR/COLORTERM even when
+        // piped, so a terminal that force-enables color (Yaw sets
+        // FORCE_COLOR=3) makes every differential line "diverge" on invisible
+        // ANSI escapes. Strip the forcing vars and set NO_COLOR for BOTH
+        // sides so the diff never depends on the invoking terminal.
         let oam_out = run_with_timeout(
             Command::new(&oam)
                 .arg("run")
                 .arg(case)
                 .arg("--no-check")
                 .env("OAM_CACHE_DIR", &cache)
+                .env_remove("FORCE_COLOR")
+                .env_remove("COLORTERM")
+                .env_remove("CLICOLOR_FORCE")
+                .env("NO_COLOR", "1")
                 .current_dir(&repo),
             Duration::from_secs(60),
         )?;
         let node_out = run_with_timeout(
-            Command::new(node).arg(case).current_dir(&repo),
+            Command::new(node)
+                .arg(case)
+                .env_remove("FORCE_COLOR")
+                .env_remove("COLORTERM")
+                .env_remove("CLICOLOR_FORCE")
+                .env("NO_COLOR", "1")
+                .current_dir(&repo),
             Duration::from_secs(60),
         )?;
         if oam_out.timed_out || node_out.timed_out {
