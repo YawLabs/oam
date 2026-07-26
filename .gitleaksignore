@@ -1,0 +1,7 @@
+# Test-fixture private keys in the e2e suite (inline PEM material for the
+# crypto/TLS conformance tests -- same practice as Node's own test corpus).
+# Verified fixtures, not live credentials: full-history gitleaks pass 2026-07-25.
+486af085e73d8e306c04430ff5c364b1f640b23b:crates/oam_cli/tests/e2e.rs:private-key:8160
+486af085e73d8e306c04430ff5c364b1f640b23b:crates/oam_cli/tests/e2e.rs:private-key:8177
+9a6cdb1c102c365ae41c9862980966d75fd8988d:crates/oam_cli/tests/e2e.rs:private-key:5589
+283a468cd6e79ceeaf079e4ef81089c673bd6b6f:crates/oam_cli/tests/e2e.rs:private-key:8815

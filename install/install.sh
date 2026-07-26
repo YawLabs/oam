@@ -72,7 +72,10 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
-      aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+      # No aarch64-unknown-linux-gnu asset has shipped yet (needs a native ARM
+      # build host; V8 snapshot generation cannot cross-compile). Re-add the
+      # mapping when the release leg exists -- see install/README.md.
+      aarch64|arm64) die "no published oam binary for Linux $arch yet (aarch64-unknown-linux-gnu is unreleased; use an x86_64 host or build from source)" ;;
       *) die "unsupported Linux arch: $arch" ;;
     esac ;;
   Darwin)
