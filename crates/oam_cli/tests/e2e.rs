@@ -853,6 +853,34 @@ fn fs_sync_and_promises_roundtrip_with_error_codes() {
 }
 
 #[test]
+fn vendored_streams_load_dark() {
+    // Streams-port slice 2 (docs/design/streams-port.md section 10): the
+    // vendored Node v22 streams load and RUN behind __oamVendor without
+    // being registered. require('node:stream') must still resolve to the
+    // legacy implementation (the factory flip is slice 3); the vendored
+    // module must be a distinct, working state machine -- the pipeline
+    // exercise below pulls utils/destroy/end-of-stream/readable/writable/
+    // duplex/transform through their real code paths on oam's primitives.
+    let stdout = run_ok(
+        "vendor_dark.ts",
+        "import { Readable as LegacyReadable } from 'node:stream';\n\
+         const V = (globalThis as any).__oamVendor.require('stream');\n\
+         console.log('distinct', V.Readable !== LegacyReadable);\n\
+         const r = new V.Readable({ read() {} });\n\
+         const chunks: string[] = [];\n\
+         const w = new V.Writable({\n\
+           write(c: any, _e: any, cb: any) { chunks.push(String(c)); cb(); },\n\
+         });\n\
+         r.push('a'); r.push('b'); r.push(null);\n\
+         V.promises.pipeline(r, new V.PassThrough(), w).then(() => {\n\
+           console.log('piped', chunks.join(''));\n\
+           console.log('hwm', V.getDefaultHighWaterMark(false) > 0);\n\
+         });",
+    );
+    assert_eq!(stdout, "distinct true\npiped ab\nhwm true");
+}
+
+#[test]
 fn next_tick_fifo_batch_runs_ahead_of_later_microtasks() {
     // Slice 0 of the streams port (docs/design/streams-port.md section 4):
     // nextTick is a real FIFO queue drained in one microtask -- FIFO among

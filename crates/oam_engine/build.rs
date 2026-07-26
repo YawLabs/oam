@@ -31,30 +31,236 @@ fn main() {
     // then the test runner (registers the oam:test factory on that
     // registry, so it must come after node_compat), then the permissions
     // module (registers oam:permissions factory, also after node_compat).
-    let js_files = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/node_compat.js"),
+    //
+    // Entries with Some(specifier) are the vendored Node streams port
+    // (docs/design/streams-port.md section 3.2): their bodies are evaluated
+    // wrapped in `globalThis.__oamVendor.define(specifier, function (require,
+    // module, exports, process, primordials) { <verbatim body> })`, keyed on
+    // Node's own specifier strings so the upstream files run byte-identical
+    // (zero path rewrites). define() only STORES the factory at snapshot
+    // time; bodies execute at the first runtime require. The loader prelude
+    // must precede every define; vendored order past that is cosmetic (kept
+    // in dependency order for readability).
+    let js_files: &[(&str, Option<&str>)] = &[
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
+            None,
+        ),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/node_compat.js"),
+            None,
+        ),
+        // Vendored streams port: loader + primordials run as plain scripts...
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/loader-prelude.js"
+            ),
+            None,
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/primordials.js"
+            ),
+            None,
+        ),
+        // ...shims + upstream bodies are define()d under Node's specifiers.
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/errors.js"
+            ),
+            Some("internal/errors"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/validators.js"
+            ),
+            Some("internal/validators"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/util.js"
+            ),
+            Some("internal/util"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/utils.js"
+            ),
+            Some("internal/streams/utils"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/state.js"
+            ),
+            Some("internal/streams/state"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/legacy.js"
+            ),
+            Some("internal/streams/legacy"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/from.js"
+            ),
+            Some("internal/streams/from"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/destroy.js"
+            ),
+            Some("internal/streams/destroy"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/end-of-stream.js"
+            ),
+            Some("internal/streams/end-of-stream"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/add-abort-signal.js"
+            ),
+            Some("internal/streams/add-abort-signal"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/readable.js"
+            ),
+            Some("internal/streams/readable"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/writable.js"
+            ),
+            Some("internal/streams/writable"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/duplex.js"
+            ),
+            Some("internal/streams/duplex"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/transform.js"
+            ),
+            Some("internal/streams/transform"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/passthrough.js"
+            ),
+            Some("internal/streams/passthrough"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/duplexify.js"
+            ),
+            Some("internal/streams/duplexify"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/duplexpair.js"
+            ),
+            Some("internal/streams/duplexpair"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/pipeline.js"
+            ),
+            Some("internal/streams/pipeline"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/compose.js"
+            ),
+            Some("internal/streams/compose"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/internal/streams/operators.js"
+            ),
+            Some("internal/streams/operators"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/stream.js"
+            ),
+            Some("stream"),
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/node-streams/stream/promises.js"
+            ),
+            Some("stream/promises"),
+        ),
         // streams.js: TextDecoderStream needs node_compat's TextDecoder.
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/streams.js"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/test_runner.js"),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/streams.js"),
+            None,
+        ),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/test_runner.js"),
+            None,
+        ),
         // permissions.js: oam:permissions factory (after node_compat).
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/permissions.js"),
+            None,
+        ),
         // ai.js: oam:ai factory (SSE parser, streaming chat, tool-use loop).
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/ai.js"),
+        (concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/ai.js"), None),
         // mcp.js: oam:mcp factory (MCP server primitives, JSON-RPC, transports).
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/mcp.js"),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/mcp.js"),
+            None,
+        ),
         // undici.js: native undici-API shim (fetch/request/Agent/dispatchers)
         // shadowing the npm package; backed by oam's fetch.
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/undici.js"),
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/undici.js"),
+            None,
+        ),
     ];
     let sources: Vec<(String, String)> = js_files
         .iter()
-        .map(|path| {
+        .map(|(path, wrap)| {
             println!("cargo:rerun-if-changed={path}");
-            (
-                path.to_string(),
-                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}")),
-            )
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let text = match wrap {
+                Some(id) => format!(
+                    "globalThis.__oamVendor.define({id:?}, \
+                     function (require, module, exports, process, primordials) {{\n{text}\n}});"
+                ),
+                None => text,
+            };
+            (path.to_string(), text)
         })
         .collect();
 
