@@ -872,12 +872,58 @@ fn vendored_streams_load_dark() {
            write(c: any, _e: any, cb: any) { chunks.push(String(c)); cb(); },\n\
          });\n\
          r.push('a'); r.push('b'); r.push(null);\n\
+         let sealErr = 'unsealed';\n\
+         try { (globalThis as any).__oamVendor.define('x', () => {}); }\n\
+         catch (_e: any) { sealErr = 'sealed'; }\n\
+         console.log('registry', sealErr);\n\
          V.promises.pipeline(r, new V.PassThrough(), w).then(() => {\n\
            console.log('piped', chunks.join(''));\n\
            console.log('hwm', V.getDefaultHighWaterMark(false) > 0);\n\
          });",
     );
-    assert_eq!(stdout, "distinct true\npiped ab\nhwm true");
+    assert_eq!(stdout, "distinct true\nregistry sealed\npiped ab\nhwm true");
+}
+
+#[test]
+fn vendored_streams_abort_seam() {
+    // The abort path crosses four shim seams in sequence: validators.
+    // validateAbortSignal -> the abort_listener delegation (duck-typed per
+    // Node -- polyfilled signals must pass) -> Disposable[SymbolDispose]
+    // cleanup -> AbortError carrying { cause: signal.reason }. One probe
+    // pins all four.
+    let stdout = run_ok(
+        "vendor_abort.ts",
+        "const V = (globalThis as any).__oamVendor.require('stream');\n\
+         const duck = { aborted: false, addEventListener() {}, removeEventListener() {} };\n\
+         V.finished(new V.Readable({ read() {} }), { signal: duck }, () => {});\n\
+         console.log('duck-ok');\n\
+         const ac = new AbortController();\n\
+         const r = new V.Readable({ read() {} });\n\
+         const w = new V.Writable({ write(_c: any, _e: any, cb: any) { cb(); } });\n\
+         const reason = { why: 'test' };\n\
+         V.promises.pipeline(r, w, { signal: ac.signal }).catch((e: any) => {\n\
+           console.log(e.code, e.name, e.cause === reason);\n\
+         });\n\
+         ac.abort(reason);",
+    );
+    assert_eq!(stdout, "duck-ok\nABORT_ERR AbortError true");
+}
+
+#[test]
+fn vendored_stream_promises_first_entry_matches_node() {
+    // Deliberate Node byte-parity, wart included (verified against real
+    // v22.22.2): entering the registry via 'stream/promises' FIRST leaves
+    // stream.promises as the stale pre-reassignment exports object -- exactly
+    // Node's behavior for require('stream/promises') before require('stream').
+    // The legacy oam wiring derives promises FROM stream and lacks the wart;
+    // the slice-3 flip keeps Node's shape, and this test pins the choice.
+    let stdout = run_ok(
+        "vendor_promises_first.ts",
+        "const P = (globalThis as any).__oamVendor.require('stream/promises');\n\
+         const S = (globalThis as any).__oamVendor.require('stream');\n\
+         console.log(typeof P.pipeline, typeof S.promises.pipeline, P === S.promises);",
+    );
+    assert_eq!(stdout, "function undefined false");
 }
 
 #[test]

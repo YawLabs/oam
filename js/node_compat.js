@@ -2324,7 +2324,10 @@
       return EventEmitter.defaultMaxListeners;
     };
     EventEmitter.addAbortListener = function addAbortListener(signal, listener) {
-      if (typeof AbortSignal !== "function" || !(signal instanceof AbortSignal)) {
+      // Duck-typed like Node's validateAbortSignal ('aborted' in signal), NOT
+      // instanceof: polyfilled signals (abort-controller npm pkg) must pass,
+      // and the vendored streams' every {signal} entry point funnels here.
+      if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
         throw new codes.ERR_INVALID_ARG_TYPE("signal", "AbortSignal", signal);
       }
       if (typeof listener !== "function") {

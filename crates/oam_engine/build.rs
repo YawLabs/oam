@@ -220,6 +220,15 @@ fn main() {
             ),
             Some("stream/promises"),
         ),
+        // seal.js: closes __oamVendor.define and freezes the registry -- MUST
+        // stay the last entry of the vendor block.
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/vendor/oam-shims/seal.js"
+            ),
+            None,
+        ),
         // streams.js: TextDecoderStream needs node_compat's TextDecoder.
         (
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/streams.js"),
@@ -248,6 +257,53 @@ fn main() {
             None,
         ),
     ];
+    // Require-closure check: every require('...') string literal inside a
+    // wrapped vendored body must resolve at runtime -- to another define()d
+    // specifier, one of loader-prelude's inline shim ids, or a public builtin
+    // the __oamNode fallback serves. Without this, a re-vendor that adds a
+    // new upstream require (or a new file missing from the list above) builds
+    // green and fails only at first runtime require, with a misleading
+    // builtin-registry error.
+    let defined: std::collections::HashSet<&str> =
+        js_files.iter().filter_map(|(_, wrap)| *wrap).collect();
+    let prelude_inline = [
+        "internal/util/debuglog",
+        "internal/util/types",
+        "internal/buffer",
+        "internal/event_target",
+        "internal/abort_controller",
+        "internal/events/abort_listener",
+        "internal/blob",
+        "internal/assert",
+        "internal/webstreams/adapters",
+    ];
+    let public_fallback = ["events", "buffer", "string_decoder", "async_hooks"];
+    for (path, wrap) in js_files.iter() {
+        if wrap.is_none() {
+            continue;
+        }
+        let body = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        for quote in ['\'', '"'] {
+            let needle = format!("require({quote}");
+            let mut rest: &str = &body;
+            while let Some(pos) = rest.find(&needle) {
+                let after = &rest[pos + needle.len()..];
+                let Some(end) = after.find(quote) else { break };
+                let id = &after[..end];
+                if !(defined.contains(id)
+                    || prelude_inline.contains(&id)
+                    || public_fallback.contains(&id))
+                {
+                    panic!(
+                        "{path}: require({id:?}) has no vendor define, prelude shim, \
+                         or public fallback -- update js_files / loader-prelude"
+                    );
+                }
+                rest = &after[end..];
+            }
+        }
+    }
+
     let sources: Vec<(String, String)> = js_files
         .iter()
         .map(|(path, wrap)| {

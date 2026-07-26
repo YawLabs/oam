@@ -36,31 +36,40 @@ function determineSpecificType(value) {
 const argOrProp = (name) =>
   typeof name === "string" && name.includes(".") ? "property" : "argument";
 
+// Node's kTypes: these route to the "of type" bucket LOWERCASED -- including
+// the uppercase 'Function'/'Object' entries the validators throw with. The
+// class-name regex only applies to entries NOT in this set.
+const kTypes = new Set([
+  "string", "function", "number", "object",
+  "Function", "Object", "boolean", "bigint", "symbol",
+]);
+
+// Node's list joiner: "a", "a or b", "a, b, or c" (oxford comma at 3+).
+function formatList(list, conj = "or") {
+  if (list.length === 1) return list[0];
+  if (list.length === 2) return `${list[0]} ${conj} ${list[1]}`;
+  return `${list.slice(0, -1).join(", ")}, ${conj} ${list[list.length - 1]}`;
+}
+
 function invalidArgTypeMessage(name, expected, actual) {
   if (!Array.isArray(expected)) expected = [expected];
   const types = [];
   const instances = [];
   const other = [];
   for (const item of expected) {
-    // Node's convention: lowercase first char = a typeof-type, uppercase = a
-    // class name, anything else (quoted literals etc.) is "one of".
-    if (/^[a-z]/.test(item)) types.push(item);
+    if (kTypes.has(item)) types.push(item.toLowerCase());
     else if (/^[A-Z]/.test(item)) instances.push(item);
     else other.push(item);
   }
   const parts = [];
   if (types.length > 0) {
-    parts.push(
-      `of type ${types.length > 1 ? `${types.slice(0, -1).join(", ")} or ${types[types.length - 1]}` : types[0]}`,
-    );
+    parts.push(`${types.length > 1 ? "one of type" : "of type"} ${formatList(types)}`);
   }
   if (instances.length > 0) {
-    parts.push(
-      `an instance of ${instances.length > 1 ? `${instances.slice(0, -1).join(", ")} or ${instances[instances.length - 1]}` : instances[0]}`,
-    );
+    parts.push(`an instance of ${formatList(instances)}`);
   }
   if (other.length > 0) {
-    parts.push(`one of ${other.join(", ")}`);
+    parts.push(other.length > 1 ? `one of ${formatList(other)}` : other[0]);
   }
   return (
     `The "${name}" ${argOrProp(name)} must be ${parts.join(" or ")}. ` +

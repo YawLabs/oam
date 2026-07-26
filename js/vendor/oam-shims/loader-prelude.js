@@ -48,9 +48,21 @@
     return module.exports;
   };
 
+  // seal.js (the last entry of the vendor block in build.rs's js_files)
+  // closes define() at snapshot time and freezes the vendor object: after
+  // that, user code can neither shadow a public fallback id (define('events')
+  // would otherwise intercept the port's own dependency) nor swap out
+  // _primordials/require. The Maps stay live behind the closure -- require()
+  // keeps working normally.
+  let sealed = false;
   const vendor = {
     _primordials: null, // installed by primordials.js, the next script
     define(id, factory) {
+      if (sealed) {
+        throw new Error(
+          `__oamVendor.define: registry is sealed (snapshot-time defines only): ${id}`,
+        );
+      }
       if (factories.has(id)) {
         // Duplicate define is a build bug -- fail the snapshot build loudly.
         throw new Error(`__oamVendor.define: duplicate module id ${id}`);
@@ -58,6 +70,10 @@
       factories.set(id, factory);
     },
     require: vendorRequire,
+    _seal() {
+      sealed = true;
+      Object.freeze(vendor);
+    },
   };
 
   Object.defineProperty(globalThis, "__oamVendor", {
