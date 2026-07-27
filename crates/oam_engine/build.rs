@@ -229,10 +229,10 @@ fn main() {
             ),
             None,
         ),
-        // register.js: swaps registry.factories.stream to the vendored port
-        // behind the OAM_LEGACY_STREAMS kill switch (slice 3). After seal
-        // (it only reassigns __oamNode factories), before everything that
-        // may consume streams.
+        // register.js: installs the vendored Node v22 port as THE stream
+        // factories (slices 3+5; the legacy streams and OAM_LEGACY_STREAMS
+        // switch are gone). After seal (it only assigns __oamNode
+        // factories), before everything that may consume streams.
         (
             concat!(
                 env!("CARGO_MANIFEST_DIR"),

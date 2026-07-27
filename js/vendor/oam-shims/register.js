@@ -1,13 +1,11 @@
-// Streams-port slice 3 (docs/design/streams-port.md section 5.4): swap the
-// builtin registry's stream factories to the vendored Node v22 port. Runs at
-// snapshot time AFTER node_compat.js (the registry + legacy factories exist)
-// and after seal.js; it only REASSIGNS registry.factories entries -- no
+// Streams-port slices 3+5 (docs/design/streams-port.md sections 5.4, 5.6):
+// install the vendored Node v22 port as THE stream factories. Runs at
+// snapshot time AFTER node_compat.js (the registry exists; since slice 5 it
+// no longer carries any stream factory of its own) and after seal.js -- no
 // natives, no globals beyond the two registries, nothing executes until the
-// first runtime require('stream').
-//
-// Kill switch: OAM_LEGACY_STREAMS=1 (read from natives.env() at first
-// require, runtime-only) routes back to the legacy hand-rolled factory,
-// UNTOUCHED through slice 4; both it and this switch are deleted in slice 5.
+// first runtime require('stream'). The legacy hand-rolled streams and the
+// OAM_LEGACY_STREAMS kill switch were deleted in slice 5; the env var is
+// now silently ignored.
 //
 // stream/promises keeps Node byte-parity INCLUDING the promises-first wart
 // (require('stream/promises') before require('stream') leaves
@@ -16,28 +14,6 @@
 "use strict";
 (() => {
   const registry = globalThis.__oamNode;
-  const legacyStream = registry.factories.stream;
-  const legacyPromises = registry.factories["stream/promises"];
-
-  const useLegacy = (natives) => {
-    try {
-      const v = natives.env().OAM_LEGACY_STREAMS;
-      if (v === undefined || v === "" || v === "0") return false;
-      if (v !== "1") {
-        // A rollback lever must never near-miss silently: any other
-        // non-empty value still routes to legacy, with a note that the
-        // documented spelling is =1.
-        try {
-          natives.stderrWrite(
-            `oam: OAM_LEGACY_STREAMS=${v} treated as enabled (documented value: 1)\n`,
-          );
-        } catch (_e) { /* stderr unavailable -- still honor the intent */ }
-      }
-      return true;
-    } catch (_e) {
-      return false;
-    }
-  };
 
   // The vendored statics route to/fromWeb through internal/webstreams/
   // adapters, which is a throwing stub until the real adapter over
@@ -166,16 +142,13 @@
     };
   };
 
-  registry.factories.stream = (natives) => {
-    if (useLegacy(natives)) return legacyStream(natives);
+  registry.factories.stream = () => {
     const S = globalThis.__oamVendor.require("stream");
     attachWebBridges(S);
     return S;
   };
-  registry.factories["stream/promises"] = (natives) => {
-    if (useLegacy(natives)) return legacyPromises(natives);
-    return globalThis.__oamVendor.require("stream/promises");
-  };
+  registry.factories["stream/promises"] = () =>
+    globalThis.__oamVendor.require("stream/promises");
   // _stream_* aliases and stream/consumers derive via registry.get("stream")
   // and ride the swap automatically; stream/web stays on js/streams.js.
 })();

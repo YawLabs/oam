@@ -207,3 +207,50 @@ Net: ~+7.6k lines vendored+shim, ~-2.4k legacy deleted, ~+40 build.rs, small dif
 Follow-ups filed, not in scope: real webstream adapters over js/streams.js; http OutgoingMessage-family as real Writables; net.Socket as real Duplex; Rust nextTick engine integration (conditional on slice 5 triage); vendored `stream/consumers.js` swap.
 
 Known flip-introduced regression (slice 3, documented not hidden): `test-stream-compose-operator.js` moved pass->fail -- the throw-AFTER-source-drain block only (`compose(async function*(s){ for await(...){} throw boom })` + `assert.rejects(toArray())`): the boom escapes as an unhandled microtask rejection instead of rejecting toArray(). Throw-before-first-read, throw-mid-stream, and post-construction abort all pass. Class: the section-4 nextTick-in-promise-context residual; owned by the slice-5 triage (engine microtask-policy go/no-go). The differential case 52 covers throw-mid-stream only -- extend it with throw-after-drain WHEN the fix lands (adding it now would redden the gate).
+## 11. Slice 5 completion + failure triage report (2026-07-26)
+
+Slice 5 landed: the hand-rolled wave-1 streams (node_compat.js 7337-9840, 2,504
+lines: the `node:stream` factory, its `stream/promises` line, and the
+`callableCtor` Proxy) are deleted. `js/vendor/oam-shims/register.js` is now the
+SOLE definer of `registry.factories.stream` / `stream/promises`; the
+`_stream_*` aliases, `stream/web`, and `stream/consumers` factories in
+node_compat.js derive through `registry.get("stream")` unchanged. The
+`OAM_LEGACY_STREAMS` kill switch is gone -- the env var is silently ignored,
+pinned by e2e `legacy_streams_env_var_is_silently_ignored` (vendored identity
+holds under the var, nothing on stderr). The fs ReadStream lazy-open fallback
+(legacy-only; vendored Readable guarantees construct-before-read) is likewise
+deleted. callableCtor needed no replacement: Node's vendored constructors are
+function-style and natively support `new`, ES5 `Super.call(this)` grafting,
+and factory calls (crypto-extends-Transform + light-my-request e2e have been
+green on the port since slice 3).
+
+### Final stream-bucket triage (159/164, 97%)
+
+| test | class | owner |
+|---|---|---|
+| test-stream-compose-operator | nextTick-in-promise residual (section 4) | engine microtask-policy workstream |
+| test-stream-pipeline (2 blocks) | streaming request uploads + socket-level req.abort() | op-handle rework |
+| test-stream-readable-async-iterators | socket-level fetch abort | op-handle rework |
+| test-stream-pipeline-process | child_process shell spawn on Windows | child_process tranche |
+| test-stream-writable-samecb-singletick | async_hooks createHook TickObject events | async_hooks workstream |
+
+Also deferred from the slice-4 review: client disconnect BEFORE the first
+response write surfaces no events (needs a per-request native watch channel;
+http-lifecycle/op-handle tranche).
+
+### nextTick engine workstream: GO
+
+Recommendation: open the engine microtask-policy integration as its own design
+(host drains the JS nextTick array, `PerformMicrotaskCheckpoint`, loop until
+both empty -- the shape sketched in section 4). Evidence for GO rather than
+accept-and-document: (1) compose-operator throw-after-drain is a LIVE
+user-visible failure -- an async-generator error escapes as an unhandled
+rejection instead of rejecting the composed stream's consumer -- and its class
+is exactly the promise-context tick residual; (2) that failure mode (error
+loss in async-iterator composition) sits on oam's core MCP-host path
+(SSE/async-iterator pipelines), where an unhandled rejection is a process-
+policy event, not a recoverable error; (3) differential case 52's
+throw-after-drain extension is blocked on it, so the gap is currently
+untestable in the byte-parity harness. The cluster is small (one suite test),
+so the workstream is justified by failure MODE, not failure COUNT -- scope it
+as the section-4 sketch, sequenced after the public-flip Immediate items.

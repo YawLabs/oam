@@ -883,52 +883,39 @@ fn vendored_streams_load_dark() {
 }
 
 #[test]
-fn legacy_streams_kill_switch_still_works() {
-    // OAM_LEGACY_STREAMS=1 is the flip's entire rollback story through
-    // slice 4 -- it must not rot silently. Asserts: the registry serves the
-    // LEGACY module (distinct from the vendored port), alias identity holds,
-    // fs streams emit exactly one 'close' in Node order, and stdout works.
-    // Delete this test in slice 5 together with the switch.
+fn legacy_streams_env_var_is_silently_ignored() {
+    // Slice 5 deleted the legacy streams and the OAM_LEGACY_STREAMS kill
+    // switch. Deployments may still carry the env var; it must be a silent
+    // no-op -- the vendored port serves, alias identity holds, nothing is
+    // written to stderr about it.
     let script = write_temp(
-        "legacy_switch.ts",
+        "legacy_switch_gone.ts",
         "import { Readable as R } from 'node:stream';\n\
-         import * as fs from 'node:fs';\n\
          const V = (globalThis as any).__oamVendor.require('stream');\n\
-         console.log('legacy-distinct', R !== V.Readable);\n\
+         console.log('vendored', R === V.Readable);\n\
          const alias = process.getBuiltinModule('_stream_readable');\n\
-         console.log('alias', alias === R);\n\
-         const p = process.argv[2];\n\
-         const events: string[] = [];\n\
-         const ws = fs.createWriteStream(p);\n\
-         ws.on('finish', () => events.push('finish'));\n\
-         ws.on('close', () => {\n\
-           events.push('close');\n\
-           console.log('ws', events.join(','));\n\
-         });\n\
-         ws.end('data');",
+         console.log('alias', alias === R);",
     );
-    let out_file = write_temp("legacy_switch_out/x.txt", "");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(["run", script.to_str().unwrap(), "--no-check", "--"])
-        .arg(out_file.to_str().unwrap())
+        .args(["run", script.to_str().unwrap(), "--no-check"])
         .env("OAM_LEGACY_STREAMS", "1")
         .env(
             "OAM_CACHE_DIR",
-            write_temp("legacy-switch-cache/.keep", "")
+            write_temp("legacy-switch-gone-cache/.keep", "")
                 .parent()
                 .unwrap(),
         )
         .output()
         .expect("oam binary runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(stdout.contains("legacy-distinct true"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("vendored true"), "stdout: {stdout}");
     assert!(stdout.contains("alias true"), "stdout: {stdout}");
-    assert!(stdout.contains("ws finish,close"), "stdout: {stdout}");
+    assert!(
+        !stderr.contains("OAM_LEGACY_STREAMS"),
+        "stderr mentions the deleted switch: {stderr}"
+    );
 }
 
 #[test]
