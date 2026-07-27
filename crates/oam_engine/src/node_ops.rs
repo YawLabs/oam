@@ -205,6 +205,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpRespondStream", op_http_respond_stream),
         ("httpBodyPush", op_http_body_push),
         ("httpBodyEnd", op_http_body_end),
+        ("httpStreamClosed", op_http_stream_closed),
+        ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
         ("http2Serve", op_http2_serve),
@@ -1076,12 +1078,14 @@ fn op_http_respond_stream(
     let headers = arg_string(scope, &args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
-    match core_runtime!(scope)
+    // Exchange gone (aborted via httpAbort, or already answered) leaves rv
+    // undefined, NOT a throw -- Node's post-abort res.write() is a soft
+    // failure, and the JS layer maps this to a premature close.
+    if let Some(stream_id) = core_runtime!(scope)
         .http()
         .respond_stream(id, status, headers)
     {
-        Some(stream_id) => rv.set_double(stream_id as f64),
-        None => throw_type_error(scope, "request already responded or connection gone"),
+        rv.set_double(stream_id as f64);
     }
 }
 
@@ -1110,6 +1114,29 @@ fn op_http_body_end(
 ) {
     let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     core_runtime!(scope).http().end_stream(stream_id);
+}
+
+fn op_http_stream_closed(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let state = core_runtime!(scope).http();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_stream_closed(state, stream_id),
+    );
+}
+
+fn op_http_abort(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    rv.set_bool(core_runtime!(scope).http().abort_request(id));
 }
 
 fn op_http_close(

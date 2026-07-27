@@ -1936,8 +1936,21 @@
     // 'new'". A function constructor accepts both that call form AND native
     // `class X extends EventEmitter { super() }`.
     function EventEmitter(opts) {
-      this._events = { __proto__: null };
-      this._eventsCount = 0;
+      // Node v22 EventEmitter.init guard: the vendored streams pre-shape
+      // `_events` (readable.js:332, writable.js:404, duplex.js:76 -- hidden-
+      // class stability + Node's documented eventNames() ORDER) BEFORE
+      // calling this constructor. Only reset when unset or inherited from
+      // the prototype; a pre-shaped own object is preserved. _eventsCount
+      // still needs initializing on that path (streams set only _events).
+      if (
+        this._events === undefined ||
+        this._events === Object.getPrototypeOf(this)?._events
+      ) {
+        this._events = { __proto__: null };
+        this._eventsCount = 0;
+      } else {
+        this._eventsCount ??= 0;
+      }
       if (opts && opts.captureRejections) this[kCapture] = true;
     }
     EventEmitter.prototype[kCapture] = false;
@@ -5728,8 +5741,14 @@
     let _rwStreams;
     function rwStreams() {
       if (_rwStreams) return _rwStreams;
-      const { Readable, Writable } = registry.get("stream");
+      const { Readable, Writable, finished } = registry.get("stream");
       class ReadStream extends Readable {
+        // Node v22 ReadStream.prototype.close (lib/internal/fs/streams.js --
+        // outside the vendored internal/streams tree, so supplied here).
+        close(cb) {
+          if (typeof cb === "function") finished(this, cb);
+          this.destroy();
+        }
         constructor(path, options) {
           const opts = readOptions(options);
           const highWaterMark = opts.highWaterMark ?? 65536;
@@ -5743,11 +5762,32 @@
             // autoDestroy -> destroy() -> _destroy -> 'close'. The stream
             // machine owns 'close' (single emission); the read path only
             // closes the fd early so EOF never holds it open.
+            // autoClose:false (Node option) = keep the stream alive past
+            // EOF/error, mapped straight onto the machine's autoDestroy.
+            autoDestroy: opts.autoClose !== false,
             highWaterMark,
             encoding: opts.encoding ?? null,
+            // Eager open (Node's _construct phase): a bad path surfaces as
+            // 'error' + 'close' BEFORE any read -- finished()/pipeline() on
+            // an unopenable stream reject with the ENOENT instead of
+            // hanging on a lazily-failing first read.
+            construct(callback) {
+              Promise.resolve(natives.fsOpen(String(path), "r")).then(
+                (r) => {
+                  handle = r.handle;
+                  this.emit("open", handle);
+                  this.emit("ready");
+                  callback();
+                },
+                (e) => callback(e),
+              );
+            },
             async read(size) {
               try {
                 if (handle === null) {
+                  // Dead code under the vendored port (construct always ran
+                  // first); kept for the OAM_LEGACY_STREAMS machine, which
+                  // never implemented options.construct.
                   handle = (await natives.fsOpen(String(path), "r")).handle;
                   this.emit("open", handle);
                   this.emit("ready");
@@ -5788,6 +5828,14 @@
         }
       }
       class WriteStream extends Writable {
+        // Node v22 WriteStream.prototype.close === end-then-wait-for-close.
+        close(cb) {
+          if (typeof cb === "function") {
+            if (this.closed) process.nextTick(cb);
+            else this.on("close", cb);
+          }
+          this.end();
+        }
         constructor(path, options) {
           const opts = readOptions(options);
           const flags = opts.flags === "a" ? "a" : "w";
@@ -5796,6 +5844,7 @@
           super({
             // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
             // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
+            autoDestroy: opts.autoClose !== false,
             highWaterMark: opts.highWaterMark ?? 65536,
             async write(chunk, _encoding, cb) {
               try {
@@ -13445,9 +13494,23 @@
           this.headers[key] = key in this.headers ? `${this.headers[key]}, ${value}` : value;
           this.rawHeaders.push(name, value);
         }
-        this.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+        // An EventEmitter, not a bare object: handlers register error/close
+        // listeners on req.socket (test-stream-pipeline does), and Node's
+        // socket is an emitter even when oam never surfaces events on it.
+        this.socket = Object.assign(new EventEmitter(), {
+          remoteAddress: "127.0.0.1",
+          encrypted: false,
+        });
         this._requestId = meta.requestId;
         this._bodyPushed = false;
+        this.complete = false;
+        this.aborted = false;
+        // Server-request duck props: the vendored destroyer keys
+        // isServerRequest() off these to DETACH req.socket instead of
+        // tearing the transport down -- stream.destroy(req) must leave the
+        // paired response answerable (test-stream-destroy).
+        this._consuming = false;
+        this._dumped = false;
       }
       _read() {
         if (!this._bodyPushed) {
@@ -13456,8 +13519,33 @@
           if (body.length > 0) {
             this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
           }
+          this.complete = true;
           this.push(null);
         }
+      }
+      // Node's server dumps an unconsumed request when its response
+      // finishes: mark complete + drain so a later destroy() is routine
+      // teardown, not an abort.
+      _dump() {
+        if (this._dumped) return;
+        this._dumped = true;
+        this.complete = true;
+        this.resume();
+      }
+      _destroy(err, callback) {
+        if ((!this.readableEnded || !this.complete) && !this._dumped) {
+          this.aborted = true;
+          this.emit("aborted");
+        }
+        // Node tears the transport down only when the socket is still
+        // ATTACHED and the message aborted mid-stream (req.destroy());
+        // the module-level destroyer nulls req.socket first precisely so
+        // the paired response can still answer. The abort makes an
+        // unanswered exchange surface a connection error client-side.
+        if (this.socket && this.aborted && typeof this._requestId === "number") {
+          natives.httpAbort(this._requestId);
+        }
+        callback(err);
       }
     }
 
@@ -13473,10 +13561,25 @@
         this._headers = new Map();
         this._streamId = null;
         this._ended = false;
+        this._finished = false;
         this._chain = Promise.resolve(); // serializes streaming writes
         this.statusCode = 200;
         this.statusMessage = "";
         this.headersSent = false;
+        // Vendored end-of-stream duck-reads lifecycle flags off the response:
+        // isClosed() requires a boolean `closed`, and its onclose path treats
+        // closed-with-writableFinished=false as ERR_STREAM_PREMATURE_CLOSE.
+        this.closed = false;
+      }
+      get writableEnded() {
+        return this._ended;
+      }
+      get writableFinished() {
+        // Node's computed getter is already true in the synchronous window
+        // after end() returns (bytes handed off), BEFORE 'finish' emits --
+        // except when the response died unflushed (premature close beat the
+        // finish emission), where Node reports false.
+        return this._ended && !(this.closed && !this._finished);
       }
       setHeader(name, value) {
         this._headers.set(String(name).toLowerCase(), value);
@@ -13561,7 +13664,37 @@
             this._requestId,
             this.statusCode,
             this._headerPairsJson(),
-          );
+          ) ?? null;
+          if (this._streamId === null) {
+            // Exchange already gone (req.destroy() aborted it, or the
+            // request was answered elsewhere): Node's post-abort write is
+            // a soft failure, never a synchronous throw. Surface the
+            // premature close once and error the callback async.
+            if (!this.closed) {
+              this.closed = true;
+              queueMicrotask(() => this.emit("close"));
+            }
+            if (cb) {
+              const err = Object.assign(
+                new Error("Cannot call write after a stream was destroyed"),
+                { code: "ERR_STREAM_DESTROYED" },
+              );
+              queueMicrotask(() => cb(err));
+            }
+            return false;
+          }
+          // Watch for hyper dropping the response body: on the client
+          // tearing the connection down mid-stream, an unfinished response
+          // surfaces Node's 'close'-without-'finish' shape (eos/pipeline
+          // map it to ERR_STREAM_PREMATURE_CLOSE). Normal completion
+          // resolves the watcher too -- the _finished guard no-ops it.
+          const watchedId = this._streamId;
+          natives.httpStreamClosed(watchedId).then(() => {
+            if (this._finished || this.closed) return;
+            this.closed = true;
+            natives.httpBodyEnd(watchedId);
+            this.emit("close");
+          }, () => {});
         }
         // SERIALIZE: each push chains on the previous one. Independent
         // unawaited ops raced (chunks reordered, dropped, and end() pulled
@@ -13590,8 +13723,17 @@
           if (!this._ended) {
             this._ended = true;
             this.headersSent = true;
+            // Node with assignSocket emits 'finish' then runs the end
+            // callback and NEVER emits 'close' here -- close belongs to the
+            // assigned socket's teardown, which mock consumers own.
+            queueMicrotask(() => {
+              this._finished = true;
+              this.emit("finish");
+              cb?.();
+            });
+          } else if (cb) {
+            queueMicrotask(cb);
           }
-          if (cb) queueMicrotask(cb);
           return this;
         }
         if (this._ended) return this;
@@ -13606,8 +13748,16 @@
             this._toBytes(chunk, encoding),
           );
           queueMicrotask(() => {
+            if (this.closed) {
+              cb?.();
+              return;
+            }
+            this._finished = true;
+            this._dumpReq();
             this.emit("finish");
             cb?.();
+            this.closed = true;
+            this.emit("close");
           });
         } else {
           // A trailing chunk joins the same serialized chain; the stream
@@ -13616,12 +13766,30 @@
           this._ended = true;
           const streamId = this._streamId;
           this._chain = this._chain.then(() => {
+            if (this.closed) {
+              // The httpStreamClosed watcher already surfaced a premature
+              // 'close' (client abort mid-stream): never follow it with a
+              // spurious 'finish' or a second 'close'.
+              cb?.();
+              return;
+            }
             natives.httpBodyEnd(streamId);
+            this._finished = true;
+            this._dumpReq();
             this.emit("finish");
             cb?.();
+            this.closed = true;
+            this.emit("close");
           });
         }
         return this;
+      }
+      // Node's resOnFinish dumps an unconsumed request when the response
+      // finishes, so a later req.destroy() reads as routine teardown, not a
+      // client abort (aborted stays false, no 'aborted' event).
+      _dumpReq() {
+        const req = this.req;
+        if (req && typeof req._dump === "function") req._dump();
       }
       flushHeaders() {
         if (this._mock) return;
@@ -13670,6 +13838,11 @@
         this.maxRequestsPerSocket = 0;
       }
       listen(port, host, callback) {
+        if (typeof port === "function") {
+          // listen(cb) -- ephemeral port, Node accepts callback-first.
+          callback = port;
+          port = undefined;
+        }
         if (typeof port === "object" && port !== null) {
           // listen({ port, host }, cb)
           callback = host;
@@ -13709,6 +13882,10 @@
                 } else {
                   const req = new IncomingMessage(meta);
                   const res = new ServerResponse(meta.requestId);
+                  // Node exposes the pair on each other; res end() uses
+                  // req via _dumpReq() (resOnFinish parity).
+                  req.res = res;
+                  res.req = req;
                   this.emit("request", req, res);
                 }
               }
@@ -13869,7 +14046,29 @@
         }
         globalThis.fetch(self._url, fetchOpts).then(function (resp) {
           if (self._aborted) return;
-          var res = new Readable({ read: function () {} });
+          // Stream the body through a reader instead of draining
+          // arrayBuffer(): chunks surface as the server flushes them, and
+          // res.destroy() cancels the native body handle so an endless
+          // response cannot pin the event loop (Node socket-destroy
+          // semantics; test-stream-pipeline destroys mid-stream).
+          var reader = resp.body.getReader();
+          var res = new Readable({
+            read: function () {
+              reader.read().then(function (r) {
+                if (r.done) {
+                  res.push(null);
+                  process.nextTick(function() { self.emit("close"); });
+                } else {
+                  res.push(globalThis.Buffer.from(r.value));
+                }
+              }, function (err) {
+                res.destroy(err);
+              });
+            },
+            destroy: function (err, cb) {
+              reader.cancel().then(function () { cb(err); }, function () { cb(err); });
+            },
+          });
           res.statusCode = resp.status;
           res.statusMessage = resp.statusText || "";
           res.httpVersion = "1.1";
@@ -13881,13 +14080,22 @@
             res.rawHeaders.push(name, value);
           });
           self.emit("response", res);
-          resp.arrayBuffer().then(function (ab) {
-            if (ab.byteLength > 0) res.push(globalThis.Buffer.from(ab));
-            res.push(null);
-            process.nextTick(function() { self.emit("close"); });
-          }, function (err) { res.destroy(err); });
         }, function (err) {
-          self.emit("error", typeof err === "string" ? new Error(err) : err);
+          // Map transport failures to Node-shaped codes: retry logic keys
+          // on err.code, and reqwest's strings carry none.
+          var msg = typeof err === "string" ? err : (err && err.message) || String(err);
+          var mapped;
+          if (/connection refused|ECONNREFUSED/i.test(msg)) {
+            mapped = Object.assign(new Error("connect ECONNREFUSED"), {
+              code: "ECONNREFUSED",
+              syscall: "connect",
+            });
+          } else if (/error sending request|connection reset|connection closed|IncompleteMessage/i.test(msg)) {
+            mapped = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+          } else {
+            mapped = err instanceof Error ? err : new Error(msg);
+          }
+          self.emit("error", mapped);
         });
       }
       _doUpgradeRequest(bodyData) {
@@ -14087,7 +14295,7 @@
     return {
       createServer: (options, handler) =>
         new Server(typeof options === "function" ? options : handler),
-      Server,
+      Server: callableHttp(Server),
       IncomingMessage: callableHttp(IncomingMessage),
       ServerResponse: callableHttp(ServerResponse),
       ClientRequest: callableHttp(ClientRequest),
@@ -14273,9 +14481,13 @@
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
+        // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
+        // CONNECTION for callbacks queued on a dead socket (Node parity).
+        this._everConnected = false;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
+          this._everConnected = true;
           if (options._remoteAddr) {
             this.remoteAddress = options._remoteAddr.address;
             this.remotePort = options._remoteAddr.port;
@@ -14298,10 +14510,18 @@
         }
         if (cb) this.once("connect", cb);
         this.connecting = true;
-        natives.tcpConnect(host, port).then(
+        const pending = natives.tcpConnect(host, port).then(
           (result) => {
+            if (this.destroyed) {
+              // destroy() raced the connect: close the just-established
+              // native handle instead of reviving a dead socket (no
+              // 'connect' after 'close', no leaked TCP connection).
+              try { natives.tcpClose(result.handle); } catch (_) { /* noop */ }
+              return;
+            }
             this._handle = result.handle;
             this.connecting = false;
+            this._everConnected = true;
             if (result.remoteAddr) {
               this.remoteAddress = result.remoteAddr.address;
               this.remotePort = result.remoteAddr.port;
@@ -14320,11 +14540,23 @@
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
+        // Node queues writes (and the end() FIN) issued before the
+        // connection exists; gate the write chain on the pending connect so
+        // an immediate end() shuts the socket down instead of silently
+        // skipping tcpShutdown on a null handle.
+        this._chain = this._chain.then(() => pending);
         return this;
       }
 
       write(data, encoding, cb) {
         if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+        // Node's C++ StreamBase typecheck: a string with the pseudo-encoding
+        // 'buffer' is rejected synchronously (test-stream-base-typechecking).
+        if (encoding === "buffer" && typeof data === "string") {
+          const err = new TypeError("Second argument must be a buffer");
+          err.code = "ERR_INVALID_ARG_TYPE";
+          throw err;
+        }
         if (this.destroyed || !this.writable) {
           const err = new Error("This socket has been ended");
           if (cb) cb(err);
@@ -14335,7 +14567,23 @@
         const bytes = toBytes(data, encoding);
         this.bytesWritten += bytes.length;
         this._chain = this._chain.then(() => {
-          if (this.destroyed) return;
+          if (this.destroyed) {
+            // Node invokes queued write callbacks with the socket-closed
+            // error (NOT the connect error -- that went to 'error') --
+            // silently dropping them hangs promisified writes forever.
+            if (cb) {
+              const err = Object.assign(
+                new Error(this._everConnected
+                  ? "Socket is closed"
+                  : "Socket closed before the connection was established"),
+                { code: this._everConnected
+                  ? "ERR_SOCKET_CLOSED"
+                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
+              );
+              process.nextTick(() => cb(err));
+            }
+            return;
+          }
           return natives.tcpWrite(this._handle, bytes).then(
             () => { if (cb) cb(); },
             (err) => { if (cb) cb(err); else this.emit("error", err); },
@@ -14362,6 +14610,21 @@
         this._chain = this._chain.then(() => {
           if (this._handle !== null) return natives.tcpShutdown(this._handle);
         }).then(() => {
+          if (this.destroyed || this._writableState.errored) {
+            // Never report success on a socket that died first: Node skips
+            // 'finish' entirely and hands the end callback the error.
+            if (cb) {
+              cb(this._writableState.errored ?? Object.assign(
+                new Error(this._everConnected
+                  ? "Socket is closed"
+                  : "Socket closed before the connection was established"),
+                { code: this._everConnected
+                  ? "ERR_SOCKET_CLOSED"
+                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
+              ));
+            }
+            return;
+          }
           this._writableState.finished = true;
           this.emit("finish");
           if (cb) cb();

@@ -285,26 +285,36 @@ fn op_fetch_body_read(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let bodies = core_runtime!(scope).bodies();
+    let cancelled = core_runtime!(scope).cancelled_bodies();
     spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fetch_body_read(bodies, handle),
+        oam_core::ops::fetch_body_read(bodies, cancelled, handle),
     );
 }
 
 /// Synchronous: drop the stored response (connection closes). Safe to call
-/// on an already-drained handle.
+/// on an already-drained handle. A handle absent from the registry may have
+/// a read IN FLIGHT (remove-await-reinsert); tombstone it so the returning
+/// read drops the response instead of reviving it.
 fn op_fetch_body_cancel(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let bodies = core_runtime!(scope).bodies();
-    bodies
+    let removed = core_runtime!(scope)
+        .bodies()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&handle);
+    if removed.is_none() {
+        core_runtime!(scope)
+            .cancelled_bodies()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle);
+    }
 }
 
 fn op_ws_connect(

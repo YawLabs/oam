@@ -28,6 +28,18 @@
       this._pullAgain = false;
       this._source = source;
       this._highWaterMark = strategy.highWaterMark ?? 1;
+      // Queue accounting goes through strategy.size (ByteLengthQueuingStrategy
+      // budgets BYTES); a parallel size ledger avoids re-invoking a possibly
+      // impure size() at dequeue. No strategy.size = count semantics (1/chunk).
+      const sizeFn = strategy.size;
+      this._sizeFn = typeof sizeFn === "function"
+        ? (chunk) => {
+            const n = Number(sizeFn(chunk));
+            return Number.isFinite(n) && n >= 0 ? n : 1;
+          }
+        : () => 1;
+      this._queueSizes = [];
+      this._queueTotalSize = 0;
       this._cancelled = false;
 
       const stream = this;
@@ -39,7 +51,10 @@
           if (stream._waiters.length > 0) {
             stream._waiters.shift().resolve({ value: chunk, done: false });
           } else {
+            const size = stream._sizeFn(chunk);
             stream._queue.push(chunk);
+            stream._queueSizes.push(size);
+            stream._queueTotalSize += size;
           }
         },
         close() {
@@ -55,6 +70,8 @@
           stream._state = "errored";
           stream._error = reason;
           stream._queue = [];
+          stream._queueSizes = [];
+          stream._queueTotalSize = 0;
           while (stream._waiters.length > 0) {
             stream._waiters.shift().reject(reason);
           }
@@ -63,7 +80,7 @@
         get desiredSize() {
           if (stream._state === "errored") return null;
           if (stream._state === "closed") return 0;
-          return stream._highWaterMark - stream._queue.length;
+          return stream._highWaterMark - stream._queueTotalSize;
         },
       };
 
@@ -82,8 +99,8 @@
         this._pullAgain = true;
         return;
       }
-      // Pull when a reader is waiting or the queue is under the HWM.
-      if (this._waiters.length === 0 && this._queue.length >= this._highWaterMark) {
+      // Pull when a reader is waiting or the queued total is under the HWM.
+      if (this._waiters.length === 0 && this._queueTotalSize >= this._highWaterMark) {
         return;
       }
       this._pulling = true;
@@ -132,6 +149,7 @@
           }
           if (stream._queue.length > 0) {
             const value = stream._queue.shift();
+            stream._queueTotalSize -= stream._queueSizes.shift();
             stream._maybePull();
             return Promise.resolve({ value, done: false });
           }
@@ -167,6 +185,8 @@
       if (this._cancelled || this._state === "closed") return Promise.resolve();
       this._cancelled = true;
       this._queue = [];
+      this._queueSizes = [];
+      this._queueTotalSize = 0;
       this._controller.close();
       return Promise.resolve()
         .then(() => this._source.cancel?.(reason))
@@ -458,9 +478,38 @@
     }
   }
 
+  // WHATWG queuing strategies (Node globals since v18). Spec-minimal: the
+  // stream machinery here is count-based and does not consult size() (see
+  // the header note), but the classes must exist and carry the documented
+  // shape -- vendored stream tests construct them directly.
+  class CountQueuingStrategy {
+    constructor(init) {
+      if (init === null || typeof init !== "object") {
+        throw new TypeError("init must be an object");
+      }
+      this.highWaterMark = Number(init.highWaterMark);
+    }
+    size() {
+      return 1;
+    }
+  }
+  class ByteLengthQueuingStrategy {
+    constructor(init) {
+      if (init === null || typeof init !== "object") {
+        throw new TypeError("init must be an object");
+      }
+      this.highWaterMark = Number(init.highWaterMark);
+    }
+    size(chunk) {
+      return chunk.byteLength;
+    }
+  }
+
   globalThis.ReadableStream = ReadableStream;
   globalThis.WritableStream = WritableStream;
   globalThis.TransformStream = TransformStream;
   globalThis.TextDecoderStream = TextDecoderStream;
   globalThis.TextEncoderStream = TextEncoderStream;
+  globalThis.CountQueuingStrategy = CountQueuingStrategy;
+  globalThis.ByteLengthQueuingStrategy = ByteLengthQueuingStrategy;
 })();

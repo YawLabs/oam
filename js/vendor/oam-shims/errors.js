@@ -36,6 +36,21 @@ function determineSpecificType(value) {
 const argOrProp = (name) =>
   typeof name === "string" && name.includes(".") ? "property" : "argument";
 
+// inspect-lite for ERR_INVALID_ARG_VALUE: v22 renders the RAW value there
+// (NaN -> "NaN", -0 -> "-0"), unlike ERR_INVALID_ARG_TYPE's
+// "type number (...)" shape. Objects fall back to String() -- within the
+// shim's stated close-not-byte-exact policy.
+function inspectValue(value) {
+  if (typeof value === "string") return `'${value}'`;
+  if (typeof value === "bigint") return `${value}n`;
+  if (typeof value === "symbol") return value.toString();
+  if (typeof value === "function") {
+    return value.name ? `[Function: ${value.name}]` : "[Function (anonymous)]";
+  }
+  if (Object.is(value, -0)) return "-0";
+  return String(value);
+}
+
 // Node's kTypes: these route to the "of type" bucket LOWERCASED -- including
 // the uppercase 'Function'/'Object' entries the validators throw with. The
 // class-name regex only applies to entries NOT in this set.
@@ -97,8 +112,11 @@ const codes = {
   ERR_INVALID_ARG_VALUE: makeCode(
     TypeError,
     "ERR_INVALID_ARG_VALUE",
-    (name, value, reason = "is invalid") =>
-      `The ${argOrProp(name)} '${name}' ${reason}. Received ${determineSpecificType(value)}`,
+    (name, value, reason = "is invalid") => {
+      let inspected = inspectValue(value);
+      if (inspected.length > 128) inspected = `${inspected.slice(0, 128)}...`;
+      return `The ${argOrProp(name)} '${name}' ${reason}. Received ${inspected}`;
+    },
   ),
   ERR_INVALID_RETURN_VALUE: makeCode(
     TypeError,
@@ -146,7 +164,17 @@ const codes = {
   ERR_UNKNOWN_ENCODING: makeCode(
     TypeError,
     "ERR_UNKNOWN_ENCODING",
-    (enc) => `Unknown encoding: ${enc}`,
+    // v22 formats the encoding with util.format's %s ({} -> '{}', not
+    // '[object Object]'). Delegate to the registry's util at CONSTRUCTION
+    // time (runtime-only; same call-time pattern as the loader's public
+    // fallback) with a template-literal fallback if util is unreachable.
+    (enc) => {
+      try {
+        return globalThis.__oamNode.get("util").format("Unknown encoding: %s", enc);
+      } catch (_e) {
+        return `Unknown encoding: ${enc}`;
+      }
+    },
   ),
 };
 

@@ -104,6 +104,13 @@ pub struct OpCompletion {
 /// await. Single-reader discipline is guaranteed by ReadableStream's lock.
 pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Response>>>;
 
+/// Cancel tombstones for the remove-await-reinsert race: fetchBodyCancel on
+/// a handle whose read is IN FLIGHT (absent from the registry) records the
+/// handle here; the returning read sees it and drops the response instead of
+/// reinserting -- otherwise a cancelled body silently revives and holds its
+/// connection open for the rest of the run.
+pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+
 /// Open file handles for fs streams -- same remove-await-reinsert
 /// discipline as BodyRegistry (node:stream's write queue serializes
 /// access per handle). The `closed` set is the generation guard: a chunk
@@ -164,6 +171,7 @@ pub struct CoreRuntime {
     /// a bare listener must not pin the event loop (Node parity).
     signals: HashMap<String, signal::SignalHandle>,
     bodies: BodyRegistry,
+    cancelled_bodies: CancelledBodies,
     files: FileRegistry,
     sync_files: SyncFileRegistry,
     zlib_streams: ZlibRegistry,
@@ -212,6 +220,9 @@ impl CoreRuntime {
             inflight: 0,
             signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cancelled_bodies: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             sync_files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -237,6 +248,11 @@ impl CoreRuntime {
     /// so per-run resets drop any unread bodies.
     pub fn bodies(&self) -> BodyRegistry {
         self.bodies.clone()
+    }
+
+    /// Cancel tombstones paired with `bodies()` (see CancelledBodies).
+    pub fn cancelled_bodies(&self) -> CancelledBodies {
+        self.cancelled_bodies.clone()
     }
 
     /// Allocator handle for new streaming bodies AND file handles (one id
@@ -1750,8 +1766,14 @@ pub mod ops {
 
     /// Read one chunk from a streaming body. Bytes = a chunk, Done = EOF
     /// (handle dropped). Remove-await-reinsert keeps the lock short; the
-    /// JS ReadableStream lock guarantees a single reader per handle.
-    pub async fn fetch_body_read(bodies: super::BodyRegistry, handle: u64) -> OpOutcome {
+    /// JS ReadableStream lock guarantees a single reader per handle. A
+    /// cancel that landed while the read was in flight (tombstone in
+    /// `cancelled`) drops the response instead of reinserting it.
+    pub async fn fetch_body_read(
+        bodies: super::BodyRegistry,
+        cancelled: super::CancelledBodies,
+        handle: u64,
+    ) -> OpOutcome {
         let response = bodies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1759,12 +1781,33 @@ pub mod ops {
         let Some(mut response) = response else {
             return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
         };
-        match response.chunk().await {
+        let result = response.chunk().await;
+        let was_cancelled = cancelled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle);
+        if was_cancelled {
+            // Drop the response (closes the connection); report EOF -- the
+            // JS stream is already cancelled and discards the outcome.
+            return OpOutcome::Done;
+        }
+        match result {
             Ok(Some(bytes)) => {
                 bodies
                     .lock()
                     .expect("body registry lock")
                     .insert(handle, response);
+                // Double-check AFTER reinserting: a cancel can land between
+                // the tombstone check above and the insert (tombstone-miss,
+                // registry-miss) -- without this, the cancelled body revives
+                // in the registry and holds its connection for the run.
+                if cancelled
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&handle)
+                {
+                    bodies.lock().expect("body registry lock").remove(&handle);
+                }
                 OpOutcome::Bytes(bytes.to_vec())
             }
             Ok(None) => OpOutcome::Done,

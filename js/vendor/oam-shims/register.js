@@ -50,6 +50,7 @@
     Readable.fromWeb = function fromWeb(webStream, options = {}) {
       const reader = webStream.getReader();
       return new Readable({
+        ...options,
         objectMode: options.objectMode === true,
         async read() {
           try {
@@ -132,10 +133,14 @@
       });
     };
 
-    Duplex.fromWeb = function fromWeb(pair) {
+    Duplex.fromWeb = function fromWeb(pair, options = {}) {
       const reader = pair.readable.getReader();
       const writer = pair.writable.getWriter();
       return new Duplex({
+        // Options spread FIRST so the bridge's handlers can't be clobbered;
+        // forwards objectMode/encoding/highWaterMark/signal like Node's
+        // adapter (test-stream-duplex exercises encoding + objectMode).
+        ...options,
         async read() {
           try {
             const r = await reader.read();

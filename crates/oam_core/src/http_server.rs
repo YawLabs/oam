@@ -70,7 +70,14 @@ pub struct IncomingRequest {
 
 pub enum ResponseBody {
     Full(Vec<u8>),
-    Stream(mpsc::Receiver<Vec<u8>>),
+    /// Chunk channel plus a drop-signal: the oneshot sender rides inside
+    /// ChannelBody, so dropping the body (finished OR connection lost)
+    /// resolves the paired stream_watch receiver.
+    Stream(mpsc::Receiver<Vec<u8>>, oneshot::Sender<()>),
+    /// JS destroyed the request without responding (req.destroy()): the
+    /// connection is torn down instead of synthesizing a response, so the
+    /// client observes a connection error (Node's socket-destroy semantics).
+    Abort,
 }
 
 pub struct ResponseSpec {
@@ -100,6 +107,10 @@ pub struct HttpState {
     bodies: Mutex<HashMap<u64, Vec<u8>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
     streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    /// response-stream id -> resolves when hyper drops the response body
+    /// (normal completion OR connection loss). httpStreamClosed takes the
+    /// receiver; JS tells the two cases apart via its own finished flag.
+    stream_watch: Mutex<HashMap<u64, oneshot::Receiver<()>>>,
     /// Retained request-body bytes across all in-flight requests; reserved
     /// when a body is buffered, refunded when the request finishes.
     body_bytes: AtomicUsize,
@@ -155,19 +166,50 @@ impl HttpState {
             .expect("http pending lock")
             .remove(&id)?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
         self.streams
             .lock()
             .expect("http streams lock")
             .insert(stream_id, tx);
+        self.stream_watch
+            .lock()
+            .expect("http stream_watch lock")
+            .insert(stream_id, closed_rx);
         let ok = responder
             .send(ResponseSpec {
                 status,
                 headers,
-                body: ResponseBody::Stream(rx),
+                body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
-        if ok { Some(stream_id) } else { None }
+        if ok {
+            Some(stream_id)
+        } else {
+            self.end_stream(stream_id);
+            None
+        }
+    }
+
+    /// req.destroy() before a response was sent: hand hyper an Abort spec so
+    /// the connection is dropped without a response. Returns false when the
+    /// exchange already responded (or never existed) -- a harmless no-op.
+    pub fn abort_request(&self, id: u64) -> bool {
+        let Some(responder) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        else {
+            return false;
+        };
+        responder
+            .send(ResponseSpec {
+                status: 0,
+                headers: Vec::new(),
+                body: ResponseBody::Abort,
+            })
+            .is_ok()
     }
 
     pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Vec<u8>>> {
@@ -184,6 +226,12 @@ impl HttpState {
             .lock()
             .expect("http streams lock")
             .remove(&stream_id);
+        // Reap the watch entry if no httpStreamClosed op ever took it (the
+        // oam.serve path and pre-watcher callers never do).
+        self.stream_watch
+            .lock()
+            .expect("http stream_watch lock")
+            .remove(&stream_id);
     }
 
     pub fn close_server(&self, server_id: u64) {
@@ -199,9 +247,12 @@ impl HttpState {
     }
 }
 
-/// hyper Body over the JS-pushed chunk channel.
+/// hyper Body over the JS-pushed chunk channel. `_closed_tx` is never sent
+/// on: its DROP (body finished or connection torn down) is the signal the
+/// paired stream_watch receiver resolves on.
 struct ChannelBody {
     rx: mpsc::Receiver<Vec<u8>>,
+    _closed_tx: oneshot::Sender<()>,
 }
 
 impl hyper::body::Body for ChannelBody {
@@ -231,7 +282,14 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
-        ResponseBody::Stream(rx) => ChannelBody { rx }.boxed(),
+        ResponseBody::Stream(rx, closed_tx) => ChannelBody {
+            rx,
+            _closed_tx: closed_tx,
+        }
+        .boxed(),
+        // Intercepted in handle_request (returns Err(RequestAborted) before
+        // building a response); never reaches the spec-to-response path.
+        ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
     builder.body(body).unwrap_or_else(|_| {
         hyper::Response::builder()
@@ -512,11 +570,26 @@ async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, (
     if over_cap { Err(()) } else { Ok(buf.freeze()) }
 }
 
+/// Service-level error returned only for ResponseBody::Abort: hyper drops
+/// the connection without writing a response, so the client sees a reset --
+/// Node's req.destroy() semantics. Every other path still answers with a
+/// synthesized status.
+#[derive(Debug)]
+struct RequestAborted;
+
+impl std::fmt::Display for RequestAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request aborted by handler")
+    }
+}
+
+impl std::error::Error for RequestAborted {}
+
 async fn handle_request(
     state: Arc<HttpState>,
     queue: mpsc::Sender<IncomingRequest>,
     req: hyper::Request<hyper::body::Incoming>,
-) -> Result<hyper::Response<BoxedBody>, std::convert::Infallible> {
+) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     let (parts, body) = req.into_parts();
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
     // drain up to DRAIN_BUDGET additional bytes before returning 413.
@@ -596,6 +669,10 @@ async fn handle_request(
     }
 
     match rx.await {
+        Ok(ResponseSpec {
+            body: ResponseBody::Abort,
+            ..
+        }) => Err(RequestAborted),
         Ok(spec) => Ok(spec_to_response(spec)),
         Err(_) => Ok(hyper::Response::builder()
             .status(500)
@@ -896,6 +973,27 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
 /// without a reset the OS has noticed yet), hyper stops draining the body,
 /// the channel fills, and `send` would park forever — wedging the JS pump.
 /// The timeout ends the stream so the pump always makes progress.
+/// Resolves when hyper drops the response body for `stream_id` -- normal
+/// completion after end_stream, OR the client tearing the connection down
+/// mid-stream. JS distinguishes the cases by whether it already finished
+/// the response; the unfinished case surfaces Node's 'close'-without-
+/// 'finish' shape on the ServerResponse.
+pub async fn http_stream_closed(state: Arc<HttpState>, stream_id: u64) -> super::OpOutcome {
+    let watch = state
+        .stream_watch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&stream_id);
+    let Some(rx) = watch else {
+        // Stream already ended (or never existed): closed by definition.
+        return super::OpOutcome::Done;
+    };
+    // Err(RecvError) IS the signal: the sender rides inside ChannelBody and
+    // is dropped, never sent on.
+    let _ = rx.await;
+    super::OpOutcome::Done
+}
+
 pub async fn http_body_push(
     state: Arc<HttpState>,
     stream_id: u64,
