@@ -235,9 +235,15 @@ fn main() -> ExitCode {
     // shape). Suite children spawn process.execPath with these shapes --
     // the compat surface that unblocks spawnPromisified-shaped tests.
     {
-        let raw: Vec<String> = std::env::args().collect();
+        // NOTE: NODE_OPTIONS is deliberately NOT parsed. Node gates it behind
+        // an allowlist of permitted options; feeding it through this loop
+        // unfiltered let an unrecognized token reach clap (bricking every
+        // subcommand) and let `-e`/`--eval` in the environment inject code or
+        // replace the entry point. Adding it needs the allowlist first.
+        let argv: Vec<String> = std::env::args().collect();
+        let raw: Vec<String> = argv.clone();
         let mut i = 1;
-        let mut pending_deprecation = false;
+        let mut flags = NodeFlags::default();
         // Node accepts eval flags in any order and in several spellings:
         // `-e code`, `--eval code`, `--eval=code`, `-p code`, `-pe code`
         // (bundled: print + eval), and `-p -e code`. print and eval compose;
@@ -249,8 +255,42 @@ fn main() -> ExitCode {
         while i < raw.len() {
             let arg = raw[i].as_str();
             if arg == "--pending-deprecation" {
-                pending_deprecation = true;
+                flags.pending_deprecation = true;
                 i += 1;
+            } else if arg == "--no-warnings" {
+                flags.no_warnings = true;
+                i += 1;
+            } else if arg == "--no-deprecation" {
+                flags.no_deprecation = true;
+                i += 1;
+            } else if let Some(v) = arg.strip_prefix("--disable-warning=") {
+                flags.disabled_warnings.push(v.to_string());
+                i += 1;
+            } else if arg == "--disable-warning" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.disabled_warnings.push(v.clone());
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --disable-warning requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
+            } else if let Some(v) = arg.strip_prefix("--redirect-warnings=") {
+                flags.redirect_warnings = Some(v.to_string());
+                i += 1;
+            } else if arg == "--redirect-warnings" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.redirect_warnings = Some(v.clone());
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --redirect-warnings requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
             } else if let Some(v) = arg.strip_prefix("--eval=") {
                 saw_eval_flag = true;
                 eval_source = Some(v.to_string());
@@ -294,7 +334,7 @@ fn main() -> ExitCode {
             }
         }
         if let Some(source) = eval_source {
-            return run_eval(&source, print, &raw[i..], pending_deprecation);
+            return run_eval(&source, print, &raw[i..], &flags);
         }
         if saw_eval_flag {
             // Node: `-e` with no code exits 9; bare `-p` reads stdin, which
@@ -305,21 +345,20 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(9);
         }
+        let saw_node_flag = i > 1;
         if i < raw.len() {
             let flag = raw[i].as_str();
             // Bare-script node shape, only when a node flag preceded it AND
             // the argument is an existing file (plain `oam <file>` stays a
-            // clap error pointing at `oam run`). Combining node flags with
-            // oam subcommands (`oam --pending-deprecation run x`) is
-            // unsupported -- clap reports the unknown flag.
-            if pending_deprecation && !flag.starts_with('-') && Path::new(flag).is_file() {
+            // clap error pointing at `oam run`).
+            if saw_node_flag && !flag.starts_with('-') && Path::new(flag).is_file() {
                 let file = PathBuf::from(flag);
                 return match run_file_with_flags(
                     &file,
                     &raw[i + 1..],
                     None,
                     oam_engine::ReplayMode::Off,
-                    pending_deprecation,
+                    &flags,
                 ) {
                     Ok(code) => ExitCode::from(code),
                     Err((diagnostics, code)) => {
@@ -331,9 +370,29 @@ fn main() -> ExitCode {
                 };
             }
         }
+        // Node flags followed by an oam SUBCOMMAND (`oam --no-warnings run
+        // x.js`) -- the shape child_process.fork emits as
+        // [...execArgv, "run", file]. Hand clap the argv with the node
+        // flags stripped, and stash them for the run to install; without
+        // this, ANY fork({execArgv}) dies with a clap "unexpected argument".
+        if saw_node_flag {
+            NODE_FLAGS.set(flags.clone()).ok();
+            let filtered: Vec<String> = std::iter::once(argv[0].clone())
+                .chain(raw[i..].iter().cloned())
+                .collect();
+            let cli = Cli::parse_from(filtered);
+            return dispatch(cli);
+        }
     }
 
-    let cli = Cli::parse();
+    dispatch(Cli::parse())
+}
+
+/// Node process-level flags parsed before the subcommand, stashed for the
+/// run paths to install (set at most once, before dispatch).
+static NODE_FLAGS: std::sync::OnceLock<NodeFlags> = std::sync::OnceLock::new();
+
+fn dispatch(cli: Cli) -> ExitCode {
     let Some(command) = &cli.command else {
         return repl_command();
     };
@@ -958,9 +1017,15 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         // The test runner emits no 'beforeExit' at the module-eval drain --
         // Node --test emits only after the tests have run.
         rt.suppress_before_exit();
+        // Node flags parsed before the subcommand apply to test runtimes too
+        // (`oam --no-warnings test x.test.js`); each file gets a fresh
+        // isolate, so install per runtime.
+        if let Some(flags) = NODE_FLAGS.get() {
+            flags.install(&mut rt);
+        }
 
         let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
-            rt.execute_cjs(file)
+            rt.execute_cjs(file, &CliHost)
         } else {
             rt.execute_module(file, &CliHost)
         };
@@ -1596,7 +1661,10 @@ fn run_file(
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
 ) -> Result<u8, (Vec<Diagnostic>, u8)> {
-    run_file_with_flags(file, script_args, inspect, replay_mode, false)
+    // Flags parsed before the subcommand (fork's [...execArgv, "run", file]
+    // shape) were stashed by main; a direct `oam run` has none.
+    let flags = NODE_FLAGS.get().cloned().unwrap_or_default();
+    run_file_with_flags(file, script_args, inspect, replay_mode, &flags)
 }
 
 fn run_file_with_flags(
@@ -1604,7 +1672,7 @@ fn run_file_with_flags(
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
-    pending_deprecation: bool,
+    flags: &NodeFlags,
 ) -> Result<u8, (Vec<Diagnostic>, u8)> {
     if let Some("json") = file.extension().and_then(|e| e.to_str()) {
         return Err(err_exit(vec![Diagnostic::new(
@@ -1655,14 +1723,19 @@ fn run_file_with_flags(
         }
     }
 
-    set_pending_deprecation(&mut rt, pending_deprecation);
+    flags.install(&mut rt);
+    let exec_argv = flags.exec_argv();
+    if !exec_argv.is_empty() {
+        let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
+        let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
+    }
 
     // Entry routing follows module kind: .cjs (or "type": "commonjs"
     // project .js) runs as a CJS program through interop; everything else
     // is the ESM graph. See oam_loader::module_kind for the typeless
     // default divergence.
     let result = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
-        rt.execute_cjs(file)
+        rt.execute_cjs(file, &CliHost)
     } else {
         rt.execute_module(file, &CliHost)
     };
@@ -1795,20 +1868,74 @@ fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
 /// process.argv = [exe, ...extra] (node omits a script-path slot for eval).
 /// Falls back to a temp dir when the CWD is not writable (read-only mount,
 /// sandbox) -- require() resolution then roots at that temp dir.
-/// Install the pending-deprecation switch. Honors node's
-/// NODE_PENDING_DEPRECATION env var as well as the CLI flag, and defines the
-/// marker NON-ENUMERABLE: node's own test/common leaked-globals check walks
-/// enumerable globals and would flag it.
-fn set_pending_deprecation(rt: &mut oam_engine::JsRuntime, flag: bool) {
-    let env_on = std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
-    if !flag && !env_on {
-        return;
+/// Node process-level flags accepted before any oam subcommand (also read
+/// from NODE_OPTIONS). They reach JS as non-enumerable globals -- node's own
+/// test/common leaked-globals check walks enumerable globals.
+#[derive(Default, Clone)]
+struct NodeFlags {
+    pending_deprecation: bool,
+    no_warnings: bool,
+    no_deprecation: bool,
+    disabled_warnings: Vec<String>,
+    redirect_warnings: Option<String>,
+}
+
+impl NodeFlags {
+    fn install(&self, rt: &mut oam_engine::JsRuntime) {
+        let pending = self.pending_deprecation
+            || std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
+        let def = |name: &str, value: String| {
+            format!(
+                "Object.defineProperty(globalThis, '{name}', \
+                   {{ value: {value}, writable: false, enumerable: false, configurable: false }});"
+            )
+        };
+        let mut js = String::new();
+        if pending {
+            js.push_str(&def("__oamPendingDeprecation", "true".into()));
+        }
+        if self.no_warnings {
+            js.push_str(&def("__oamNoWarnings", "true".into()));
+        }
+        if self.no_deprecation {
+            js.push_str(&def("__oamNoDeprecation", "true".into()));
+            js.push_str("globalThis.process.noDeprecation = true;");
+        }
+        if !self.disabled_warnings.is_empty() {
+            let list =
+                serde_json::to_string(&self.disabled_warnings).unwrap_or_else(|_| "[]".into());
+            js.push_str(&def("__oamDisabledWarnings", list));
+        }
+        if let Some(path) = &self.redirect_warnings {
+            let p = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
+            js.push_str(&def("__oamRedirectWarnings", p));
+        }
+        if !js.is_empty() {
+            let _ = rt.execute_script("<flags>", &js);
+        }
     }
-    let _ = rt.execute_script(
-        "<flags>",
-        "Object.defineProperty(globalThis, '__oamPendingDeprecation', \
-           { value: true, writable: false, enumerable: false, configurable: false });",
-    );
+
+    /// The subset node reflects in process.execArgv (NODE_OPTIONS tokens are
+    /// excluded there, so callers pass only argv-sourced flags).
+    fn exec_argv(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.pending_deprecation {
+            out.push("--pending-deprecation".into());
+        }
+        if self.no_warnings {
+            out.push("--no-warnings".into());
+        }
+        if self.no_deprecation {
+            out.push("--no-deprecation".into());
+        }
+        for w in &self.disabled_warnings {
+            out.push(format!("--disable-warning={w}"));
+        }
+        if let Some(p) = &self.redirect_warnings {
+            out.push(format!("--redirect-warnings={p}"));
+        }
+        out
+    }
 }
 
 /// Remove the eval source file (and its temp dir, when the CWD was not
@@ -1826,12 +1953,7 @@ fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
     }
 }
 
-fn run_eval(
-    source: &str,
-    print: bool,
-    extra_args: &[String],
-    pending_deprecation: bool,
-) -> ExitCode {
+fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags) -> ExitCode {
     // Node's eval module resolves from CWD; oam executes a real file, so
     // place it in the CWD (unique name, cleaned up below).
     let cwd_candidate = std::env::current_dir()
@@ -1882,15 +2004,14 @@ fn run_eval(
     let _ = rt.execute_script("<eval-prelude>", EVAL_PRELUDE);
     // execArgv carries the node flags (suite children re-spawn with
     // [...process.execArgv, ...]); the eval source itself is not included.
-    if pending_deprecation {
-        let _ = rt.execute_script(
-            "<flags>",
-            "globalThis.process.execArgv = ['--pending-deprecation'];",
-        );
+    flags.install(&mut rt);
+    let exec_argv = flags.exec_argv();
+    if !exec_argv.is_empty() {
+        let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
+        let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
     }
-    set_pending_deprecation(&mut rt, pending_deprecation);
 
-    let result = rt.execute_cjs(&tmp_file);
+    let result = rt.execute_cjs(&tmp_file, &CliHost);
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
     // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
     // fatal forces 1 + honors exit-handler mutations.
@@ -2008,7 +2129,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     argv.extend(script_args);
     rt.set_process_argv(argv);
 
-    let result = rt.execute_cjs(&tmp_file);
+    let result = rt.execute_cjs(&tmp_file, &CliHost);
     let _ = std::fs::remove_dir_all(&tmp_dir);
     // Same fatal-path shape as run_file: sub-codes 6/7 skip the 'exit'
     // event entirely and are not handler-overridable; a regular fatal

@@ -724,8 +724,17 @@ fn facade_with_prelude(
 /// loop (timers/ops keep the process alive, Node semantics) and fail on
 /// unhandled rejections, exactly like the ESM path.
 impl crate::JsRuntime {
-    pub fn execute_cjs(&mut self, entry: &Path) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
+    pub fn execute_cjs(
+        &mut self,
+        entry: &Path,
+        host: &dyn crate::ModuleHost,
+    ) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
         self.reset_run_slots()?;
+        // A CJS entry may still `import()`; park the host so
+        // dynamic_import_callback can resolve it (the ESM path does the
+        // same in execute_module). Without this, import() from a CJS entry
+        // rejects with "not wired up on this entry path".
+        self.park_active_host(host);
 
         // --inspect-brk on a CJS entry: cloned out before the &mut isolate
         // borrow. (The ESM path lives in execute_module.)

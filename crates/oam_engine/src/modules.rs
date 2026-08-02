@@ -385,6 +385,21 @@ impl JsRuntime {
         self.isolate.set_slot(ActiveHost(None));
     }
 
+    /// Park the host pointer for `dynamic_import_callback`, so `import()`
+    /// works from BOTH entry paths (ESM and CJS -- a CJS entry that awaits
+    /// an `import()` is ordinary code, not an error). Call right after
+    /// `reset_run_slots`, which clears the slot.
+    ///
+    /// SAFETY: `host` outlives the whole `execute_*` call, and the callback
+    /// only fires synchronously during that evaluation; the slot is reset to
+    /// None by reset_run_slots / tick() / repl_eval() so no later turn can
+    /// read a stale pointer. The single `unsafe` for this lives here.
+    pub(crate) fn park_active_host(&mut self, host: &dyn ModuleHost) {
+        let host_ptr: *const (dyn ModuleHost + 'static) =
+            unsafe { std::mem::transmute(host as *const dyn ModuleHost) };
+        self.isolate.set_slot(ActiveHost(Some(host_ptr)));
+    }
+
     pub(crate) fn reset_run_slots(&mut self) -> Result<(), Vec<Diagnostic>> {
         // Clear any host pointer parked by a prior execute_module on this same
         // JsRuntime. execute_cjs and execute_worker both call reset_run_slots
@@ -424,13 +439,7 @@ impl JsRuntime {
         })?;
         self.reset_run_slots()?;
 
-        // Park the host pointer for dynamic_import_callback. SAFETY: `host`
-        // outlives this whole call, and the callback only fires synchronously
-        // during the evaluation below; the slot is reset to None by tick() /
-        // repl_eval() so no later turn can read a stale pointer.
-        let host_ptr: *const (dyn ModuleHost + 'static) =
-            unsafe { std::mem::transmute(host as *const dyn ModuleHost) };
-        self.isolate.set_slot(ActiveHost(Some(host_ptr)));
+        self.park_active_host(host);
 
         // --inspect-brk: cloned out so it owns its ref independently of the
         // upcoming &mut self.isolate borrow.

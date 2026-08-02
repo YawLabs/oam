@@ -325,6 +325,10 @@
     return NodeError;
   }
 
+  // Builtins node exposes ONLY under the 'node:' prefix (bare require/
+  // getBuiltinModule of these returns undefined).
+  const PREFIX_ONLY_BUILTINS = new Set(["test", "test/reporters", "sea", "sqlite"]);
+
   var codes = {};
 
   // Faithful port of Node's internal `lib/internal/errors.js`
@@ -1913,6 +1917,23 @@
   const registry = {
     factories: { __proto__: null },
     cache: new Map(),
+    // Active-resource introspection tables (process.getActiveResourcesInfo /
+    // process._getActiveHandles / process._getActiveRequests). Declared here
+    // rather than inside a module factory because producers (net, fs) and the
+    // consumer (process) are built independently and in either order.
+    //   _activeHandles:  handle object -> libuv-ish type tag ("TCPServerWrap",
+    //                    "TCPSocketWrap"). Node's _getActiveHandles() returns
+    //                    the JS wrappers (net.Server / net.Socket), never
+    //                    timers -- probe: a pending setTimeout yields [].
+    //   _activeRequests: in-flight request tokens ({ type }) for the fs
+    //                    CALLBACK layer ("FSReqCallback"). Only the callback
+    //                    layer is instrumented: node tags fs/promises work
+    //                    "FSReqPromise" and oam's promise forms are the layer
+    //                    the callback forms delegate to, so instrumenting both
+    //                    would double-count every fs.open()/fs.readFile().
+    //   _activeTimers:   installed by the timers block (id -> Timeout handle).
+    _activeHandles: new Map(),
+    _activeRequests: new Set(),
     get(name) {
       if (registry.cache.has(name)) return registry.cache.get(name);
       const factory = registry.factories[name];
@@ -6361,6 +6382,21 @@
   registry.factories.fs = (natives) => {
     const promises = registry.get("fs/promises");
 
+    // Active-request tracking for process._getActiveRequests() /
+    // process.getActiveResourcesInfo(). Node's callback-form fs ops each hold a
+    // live FSReqCallback from the call until the callback is dispatched;
+    // test-process-getactiverequests fires 12 fs.open()s and asserts the count
+    // SYNCHRONOUSLY, so the token has to be added on the call, not on settle.
+    // Only this CALLBACK layer is instrumented -- the promise forms it
+    // delegates to are node's separately-tagged FSReqPromise, and counting
+    // both would report 24 where the tests expect 12.
+    const fsReqStart = () => {
+      const token = { type: "FSReqCallback" };
+      registry._activeRequests.add(token);
+      return token;
+    };
+    const fsReqEnd = (token) => registry._activeRequests.delete(token);
+
     // Callback forms delegate to the promise forms (Node-style (err, value)).
     function callbackify1(promiseFn) {
       return (...args) => {
@@ -6368,9 +6404,21 @@
         if (typeof cb !== "function") {
           throw new TypeError("Callback must be a function");
         }
-        promiseFn(...args).then(
-          (value) => queueMicrotask(() => cb(null, value)),
-          (err) => queueMicrotask(() => cb(err)),
+        const token = fsReqStart();
+        // Several promise forms are plain (non-async) arrows, so argument
+        // validation throws SYNCHRONOUSLY -- the token must drop before the
+        // throw escapes or it is stranded in the Set forever (the Set is
+        // strong and this is the only other removal path).
+        let p;
+        try {
+          p = promiseFn(...args);
+        } catch (e) {
+          fsReqEnd(token);
+          throw e;
+        }
+        p.then(
+          (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
+          (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
       };
     }
@@ -6793,9 +6841,19 @@
         else if (typeof mode === "function") { cb = mode; }
         if (typeof cb !== "function") throw new TypeError("Callback must be a function");
         var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
-        Promise.resolve(natives.fsOpen(String(path), String(flagStr))).then(
-          function (info) { queueMicrotask(function () { cb(null, info.handle); }); },
-          function (err) { queueMicrotask(function () { cb(err); }); },
+        var token = fsReqStart();
+        // String(path) can throw (a poisoned toString) -- drop the token
+        // before the throw escapes, or it is stranded forever.
+        var p;
+        try {
+          p = Promise.resolve(natives.fsOpen(String(path), String(flagStr)));
+        } catch (e) {
+          fsReqEnd(token);
+          throw e;
+        }
+        p.then(
+          function (info) { fsReqEnd(token); queueMicrotask(function () { cb(null, info.handle); }); },
+          function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
         );
       },
       close: function (fd, cb) {
@@ -7104,6 +7162,11 @@
     // process.constructor.name === "process" (so a failed `delete process.x`
     // says "#<process>"), and satisfies test-process-prototype's chain checks.
     const process = new (class process extends EventEmitter {})();
+
+    // NODE_REDIRECT_WARNINGS destination, resolved lazily on the first warning
+    // and cached: undefined = not looked up yet, null = unset/empty (write to
+    // stderr), string = append warnings to that path. See emitWarning.
+    let redirectWarningsPath;
 
     // Lazy env: natives.env() crosses the FFI boundary and copies every
     // environment variable into a JS object (50-200 vars on a typical dev
@@ -7470,17 +7533,64 @@
       // object literal (see defineProperties below) -- constructing them here
       // would require('stream') at factory time, re-entering the init cycle
       // documented at the factory top.
-      getBuiltinModule(name) {
-        var bare = String(name).replace(/^node:/, "");
-        if (registry.factories[bare]) {
-          return registry.get(bare);
+      // Legacy process.binding: node v22 still ships it (deprecated but
+      // present) and real packages feature-detect through it. Only the
+      // 'util' binding is modeled -- its 16 type predicates, taken BY
+      // IDENTITY off util.types (probe-verified: all 16 are ===).
+      // Resolved lazily to avoid the process<->util factory cycle.
+      binding(module) {
+        // Node contract (probe-verified against v22.22.2): String()-coerce
+        // the argument FIRST (a Symbol therefore throws the coercion
+        // TypeError, and node's own message interpolates it the same way);
+        // an unknown module is a plain Error with code UNDEFINED (node
+        // reserves ERR_UNKNOWN_BUILTIN_MODULE for the require() side); and
+        // the returned object is FRESH per call, not memoized -- no cache
+        // property is stored on process.
+        const name = String(module);
+        if (name !== "util") {
+          throw new Error(`No such module: ${name}`);
         }
+        const types = registry.get("util").types;
+        const out = {};
+        for (const k of [
+          "isAnyArrayBuffer", "isArrayBuffer", "isArrayBufferView", "isAsyncFunction",
+          "isDataView", "isDate", "isExternal", "isMap", "isMapIterator",
+          "isNativeError", "isPromise", "isRegExp", "isSet", "isSetIterator",
+          "isTypedArray", "isUint8Array",
+        ]) {
+          if (typeof types[k] === "function") out[k] = types[k];
+        }
+        return out;
+      },
+      getBuiltinModule(id) {
+        // Node contract (probe-verified against v22.22.2): non-string ids
+        // are ERR_INVALID_ARG_TYPE (no String() coercion); 'internal/*' is
+        // never exposed with or without the prefix; unknown ids return
+        // undefined; sub-path builtins ('timers/promises') resolve.
+        if (typeof id !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("id", "string", id);
+        }
+        var prefixed = id.startsWith("node:");
+        var bare = prefixed ? id.slice(5) : id;
+        if (bare.startsWith("internal/")) return undefined;
+        // Prefix-only builtins: node exposes these ONLY as 'node:x' -- bare
+        // 'test' / 'sea' / 'sqlite' / 'test/reporters' are undefined
+        // (probe-verified against v22.22.2).
+        if (!prefixed && PREFIX_ONLY_BUILTINS.has(bare)) return undefined;
+        if (registry.factories[bare]) return registry.get(bare);
         return undefined;
       },
       _rawDebug(...args) {
         // Synchronous low-level stderr write, bypassing the writable stream
         // (Node's process._rawDebug); util.format the args + trailing newline.
-        natives.stderrWrite(registry.get("util").format(...args) + "\n");
+        let text = registry.get("util").format(...args) + "\n";
+        // Node's RawDebug fprintf()s to a CRT stream that is in TEXT mode on
+        // Windows, so EVERY LF in the payload becomes CRLF -- including ones
+        // inside the formatted message, not just the trailing one.
+        // (Probe-verified: node's _rawDebug lines are CRLF while its
+        // console.error lines stay LF, so the translation is scoped HERE.)
+        if (natives.platform === "win32") text = text.replace(/\n/g, "\r\n");
+        natives.stderrWrite(text);
       },
       setSourceMapsEnabled(val) {
         // oam has no source-map translation toggle yet; validate + no-op so the
@@ -7582,6 +7692,46 @@
           const code = warningObj.code ? `[${warningObj.code}] ` : "";
           let line = `(node:${process.pid}) ${code}${warningObj.name}: ${warningObj.message}\n`;
           if (typeof warningObj.detail === "string") line += `${warningObj.detail}\n`;
+          // NODE_REDIRECT_WARNINGS: append the formatted warning to the named
+          // file instead of stderr. Read from natives.env() (the real OS
+          // environment) and cached, NOT process.env: node snapshots the
+          // variable at startup, so a runtime `process.env.NODE_REDIRECT_
+          // WARNINGS = ...` is ignored (probe-verified -- the warning still
+          // goes to stderr). Relative paths resolve against cwd; 'a' appends
+          // across runs. Node silently falls back to stderr on ANY write
+          // failure (probe: a path under a missing directory prints to stderr
+          // and still exits 0), so every throw here routes to stderrWrite.
+          // Suppression flags (--no-warnings / --no-deprecation /
+          // --disable-warning=<name|code>, installed by the CLI as
+          // non-enumerable globals). Node still EMITS the 'warning' event
+          // under all of them -- only this default stderr writer is gated.
+          if (globalThis.__oamNoWarnings) return;
+          if (globalThis.__oamNoDeprecation && warningObj.name === "DeprecationWarning") return;
+          const disabled = globalThis.__oamDisabledWarnings;
+          if (
+            Array.isArray(disabled) &&
+            (disabled.includes(warningObj.name) ||
+              (warningObj.code && disabled.includes(warningObj.code)))
+          ) {
+            return;
+          }
+          if (redirectWarningsPath === undefined) {
+            // --redirect-warnings=<path> takes precedence over the env var
+            // (probe-verified); both are snapshotted, not re-read.
+            let v = globalThis.__oamRedirectWarnings;
+            if (typeof v !== "string" || v === "") {
+              try { v = natives.env().NODE_REDIRECT_WARNINGS; } catch (_) { v = undefined; }
+            }
+            redirectWarningsPath = typeof v === "string" && v !== "" ? v : null;
+          }
+          if (redirectWarningsPath !== null) {
+            try {
+              registry.get("fs").appendFileSync(redirectWarningsPath, line, "utf8");
+              return;
+            } catch (_) {
+              // fall through to stderr, exactly as node does
+            }
+          }
           natives.stderrWrite(line);
         });
       },
@@ -7710,13 +7860,25 @@
         }
         throw new codes.ERR_INVALID_ARG_TYPE("mask", ["number", "string"], mask);
       },
-      // Best-effort active-resource introspection. Backed by the JS-side
-      // active-timer registry installed in installRuntimeGlobals -- it tracks
-      // setTimeout/setInterval/setImmediate handles (the kinds the corpus
-      // asserts on). Sockets / fs requests are not tracked (no native handle
-      // table), so handle/request lists cover timers only.
+      // Active-resource introspection, backed by three JS-side tables:
+      // registry._activeRequests (fs callback ops), registry._activeHandles
+      // (net sockets/servers) and registry._activeTimers (the timer registry
+      // installed in installRuntimeGlobals).
+      //
+      // Ordering matches node (probed on v22.22.2): requests, then handles,
+      // then timers -- e.g. a pending connect + listening server + timer
+      // yields ["GetAddrInfoReqWrap","TCPServerWrap","TCPSocketWrap","Timeout"].
       getActiveResourcesInfo() {
         const out = [];
+        const reqs = registry._activeRequests;
+        if (reqs) for (const r of reqs) out.push(r.type);
+        const handles = registry._activeHandles;
+        if (handles) {
+          for (const [h, type] of handles) {
+            if (h._handleRefed === false) continue; // unref'd: node omits it
+            out.push(type);
+          }
+        }
         const reg = registry._activeTimers;
         if (reg) {
           for (const t of reg.values()) {
@@ -7725,14 +7887,25 @@
         }
         return out;
       },
+      // Node's _getActiveHandles() returns libuv HANDLES only -- timers are
+      // requests-of-a-different-kind and are deliberately absent (probe: with
+      // a pending setTimeout, node returns []).
       _getActiveHandles() {
         const out = [];
-        const reg = registry._activeTimers;
-        if (reg) for (const t of reg.values()) out.push(t);
+        const handles = registry._activeHandles;
+        if (handles) {
+          for (const h of handles.keys()) {
+            if (h._handleRefed === false) continue; // unref'd: node omits it
+            out.push(h);
+          }
+        }
         return out;
       },
       _getActiveRequests() {
-        return [];
+        const out = [];
+        const reqs = registry._activeRequests;
+        if (reqs) for (const r of reqs) out.push(r);
+        return out;
       },
       ref(handle) {
         if (handle == null) return;
@@ -8003,7 +8176,13 @@
       "diagnostics_channel",
       "dns",
       "dns/promises",
-      "internal/errors",
+      // NOTE: 'internal/errors' is deliberately NOT listed. node's
+      // builtinModules contains zero 'internal/*' entries, and consumers --
+      // including node's own test-process-get-builtin -- require() every
+      // listed name. oam advertised it here while `require('internal/
+      // errors')` has always thrown (verified pre-change), so listing it
+      // was purely a false advertisement. The vendored-streams loader
+      // reaches its own internal shim directly, not through this list.
       "domain",
       "events",
       "fs",
@@ -12930,6 +13109,10 @@
           this._handle = options._handle;
           this.connecting = false;
           this._everConnected = true;
+          // Pre-connected socket (server accept, HTTP/WS upgrade): node has a
+          // live TCPSocketWrap the moment the wrapper exists, so it shows up in
+          // _getActiveHandles()/getActiveResourcesInfo() immediately.
+          registry._activeHandles.set(this, "TCPSocketWrap");
           if (options._remoteAddr) {
             this.remoteAddress = options._remoteAddr.address;
             this.remotePort = options._remoteAddr.port;
@@ -12952,6 +13135,14 @@
         }
         if (cb) this.once("connect", cb);
         this.connecting = true;
+        // Node registers the TCPSocketWrap synchronously inside connect(), well
+        // before the connection is established (probe: _getActiveHandles()
+        // contains the Socket on the line after net.connect() returns).
+        // Guard: a socket that is ALREADY destroyed must not be re-registered
+        // -- oam's connect() does not reset `destroyed`, so destroy() and
+        // _doClose() both early-return and the entry would be pinned in this
+        // strong Map for the process lifetime (one per socket).
+        if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
         const pending = natives.tcpConnect(host, port).then(
           (result) => {
             if (this.destroyed) {
@@ -13081,6 +13272,7 @@
         this.readable = false;
         this.writable = false;
         this.connecting = false;
+        registry._activeHandles.delete(this);
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;
@@ -13153,6 +13345,7 @@
       }
 
       _doClose() {
+        registry._activeHandles.delete(this);
         if (this._handle !== null) {
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
@@ -13190,8 +13383,12 @@
       }
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
-      ref() { return this; }
-      unref() { return this; }
+      // Node excludes UNREF'd handles from _getActiveHandles() and
+      // getActiveResourcesInfo() (probe-verified: server.unref() removes it
+      // from both). The flag is read by those views; it does not yet affect
+      // oam's loop-liveness, which is native-op driven.
+      ref() { this._handleRefed = true; return this; }
+      unref() { this._handleRefed = false; return this; }
       address() {
         return { address: this.localAddress, port: this.localPort, family: this.remoteFamily || "IPv4" };
       }
@@ -13254,6 +13451,14 @@
           if (typeof args[idx] === "function") { cb = args[idx]; }
         }
         if (typeof cb === "function") this.once("listening", cb);
+        // Node binds (and so creates the TCPServerWrap) synchronously inside
+        // listen(); createServer() alone registers nothing. Probed: after
+        // createServer() _getActiveHandles() is [], on the line after
+        // listen(0) it is [Server] / ["TCPServerWrap"].
+        registry._activeHandles.set(this, "TCPServerWrap");
+        // Supersede any in-flight accept loop from a previous listen() so
+        // its tail cannot unregister this fresh registration.
+        this._listenGeneration = (this._listenGeneration || 0) + 1;
         const hostname = host || "0.0.0.0";
         natives.tcpListen(hostname, port || 0).then(
           (bound) => {
@@ -13264,12 +13469,22 @@
             this.emit("listening");
             this._acceptLoop();
           },
-          (err) => this.emit("error", err),
+          (err) => {
+            // Bind failed -- there is no live handle to introspect.
+            registry._activeHandles.delete(this);
+            this.emit("error", err);
+          },
         );
         return this;
       }
 
       async _acceptLoop() {
+        // Generation token: close()+listen() in the same tick leaves this
+        // (stale) loop still awaiting. Without the check its tail would
+        // delete the registration the FRESH listen() just made, hiding a
+        // live server from _getActiveHandles()/getActiveResourcesInfo().
+        // listen() owns the counter; the loop only snapshots it.
+        const generation = this._listenGeneration;
         for (;;) {
           let accepted;
           try {
@@ -13279,6 +13494,7 @@
             break;
           }
           if (accepted === undefined) break;
+          if (generation !== this._listenGeneration) return; // superseded
           const socket = new Socket({
             _handle: accepted.handle,
             _remoteAddr: accepted.remoteAddr,
@@ -13286,6 +13502,8 @@
           socket._readLoop();
           this.emit("connection", socket);
         }
+        if (generation !== this._listenGeneration) return; // superseded
+        registry._activeHandles.delete(this);
         this.emit("close");
       }
 
@@ -13296,6 +13514,7 @@
       }
 
       close(cb) {
+        registry._activeHandles.delete(this);
         if (this._serverId !== null) {
           natives.tcpServerClose(this._serverId);
           this.listening = false;
@@ -13305,8 +13524,9 @@
       }
 
       getConnections(cb) { if (cb) cb(null, 0); return this; }
-      ref() { return this; }
-      unref() { return this; }
+      // Same unref semantics as Socket (see the note there).
+      ref() { this._handleRefed = true; return this; }
+      unref() { this._handleRefed = false; return this; }
     }
 
     function createConnection(options, cb) {
@@ -17752,6 +17972,13 @@
           // one-shot marked destroyed and dropped from the active set.
           const firedId = self._id;
           const dom = self._domain;
+          // Node DEQUEUES an Immediate before running it: the immediate queue
+          // entry is popped, then the callback runs, so a callback observing
+          // process.getActiveResourcesInfo() never sees its OWN Immediate.
+          // (Probed on v22.22.2: with 3 pending immediates, callback #1 sees 2
+          // "Immediate" entries, #2 sees 1, #3 sees 0.) A Timeout is the
+          // opposite -- it stays active for the duration of its own callback.
+          if (self._kind === "Immediate") activeTimers.delete(firedId);
           try {
             // Node's domain wrap: enter before the callback, exit ONLY on
             // the success path. A throw unwinds with the domain still
