@@ -289,6 +289,15 @@ impl JsRuntime {
         self.isolate.set_slot(replay::ReplayState::from_mode(mode));
     }
 
+    /// Suppress 'beforeExit' emission for this runtime. The `oam test` path
+    /// calls this before evaluating the test file: its module-eval pump
+    /// shares the run path's drain seam, and emitting there would fire
+    /// beforeExit after registration but BEFORE the tests execute
+    /// (Node --test emits only after the tests).
+    pub fn suppress_before_exit(&mut self) {
+        self.isolate.set_slot(modules::SuppressBeforeExit);
+    }
+
     /// Install JS-side monkey-patches for `Math.random`, `Date.now`, and
     /// `performance.now` that route through the record/replay native ops. Must
     /// be called AFTER `set_replay_mode` and BEFORE executing any user code.

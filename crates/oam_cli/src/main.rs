@@ -532,11 +532,14 @@ fn run_command(
 
     let exit = match run_file(file, script_args, inspect, replay_mode) {
         Ok(code) => ExitCode::from(code),
-        Err(diagnostics) => {
+        Err((diagnostics, code)) => {
             for d in &diagnostics {
                 render(d, json);
             }
-            ExitCode::FAILURE
+            // The fatal path's exit code honors 'exit'-handler mutations of
+            // process.exitCode (Node parity); never 0 -- a fatal stays fatal
+            // unless a handler explicitly reset it, which run_file reports.
+            ExitCode::from(code)
         }
     };
 
@@ -848,6 +851,9 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
             .to_string_lossy()
             .into_owned();
         rt.set_process_argv(vec![exe, script]);
+        // The test runner emits no 'beforeExit' at the module-eval drain --
+        // Node --test emits only after the tests have run.
+        rt.suppress_before_exit();
 
         let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
             rt.execute_cjs(file)
@@ -1300,11 +1306,11 @@ fn serve_with_workers(
     let _ = std::fs::remove_dir_all(&dir);
     match result {
         Ok(code) => ExitCode::from(code),
-        Err(diagnostics) => {
+        Err((diagnostics, code)) => {
             for d in &diagnostics {
                 render(d, json);
             }
-            ExitCode::FAILURE
+            ExitCode::from(code)
         }
     }
 }
@@ -1485,9 +1491,9 @@ fn run_file(
     script_args: &[String],
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
-) -> Result<u8, Vec<Diagnostic>> {
+) -> Result<u8, (Vec<Diagnostic>, u8)> {
     if let Some("json") = file.extension().and_then(|e| e.to_str()) {
-        return Err(vec![Diagnostic::new(
+        return Err(err_exit(vec![Diagnostic::new(
             "OAM-MOD0003",
             Severity::Error,
             Origin::Resolve,
@@ -1495,7 +1501,7 @@ fn run_file(
                 "a .json file is not a program — import it from a script instead: {}",
                 file.display()
             ),
-        )]);
+        )]));
     }
     let mut rt = oam_engine::JsRuntime::new();
     // process.argv: [exe, absolute script path, ...script args] — Node's
@@ -1525,12 +1531,12 @@ fn run_file(
                 eprintln!("For help, see: https://oam.sh/docs/inspector");
             }
             Err(e) => {
-                return Err(vec![Diagnostic::new(
+                return Err(err_exit(vec![Diagnostic::new(
                     "OAM-RT0004",
                     Severity::Error,
                     Origin::Runtime,
                     format!("could not start inspector on {addr}: {e}"),
-                )]);
+                )]));
             }
         }
     }
@@ -1544,26 +1550,45 @@ fn run_file(
     } else {
         rt.execute_module(file, &CliHost)
     };
-    // On the fatal/uncaught path Node's process 'exit' handlers observe exit 1
-    // (an uncaught exception / unhandled rejection forces a non-zero exit). Set
-    // process.exitCode = 1 if the script left it unset, so the 'exit' listeners
-    // emit_process_exit runs next see 1 rather than 0. The process already
-    // returns ExitCode::FAILURE on this path, so this only fixes the code the
-    // 'exit' handlers observe (execute_script runs in a fresh scope, so a
-    // pending exception from the failed run does not disturb it).
-    if result.is_err() {
-        let _ = rt.execute_script(
-            "<fatal-exit-code>",
-            "(function () { var p = globalThis.process; \
-               if (p && typeof p.exitCode !== 'number') { p.exitCode = 1; } })();",
-        );
+    match result {
+        Ok(()) => {
+            rt.emit_process_exit();
+            // Node's EmitExit RE-READS process.exitCode after the 'exit'
+            // handlers ran: a handler mutation decides the final code.
+            Ok(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+        }
+        Err(diagnostics) => {
+            // Fatal sub-codes (6 = _fatalException monkeypatched away,
+            // 7 = throwing uncaughtException handler): Node exits WITHOUT
+            // emitting 'exit', and the code is not handler-overridable.
+            let sub_code = rt
+                .execute_script(
+                    "<fatal-sub-code>",
+                    "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                )
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok());
+            if let Some(code) = sub_code {
+                return Err((diagnostics, code));
+            }
+            // Regular fatal: Node forces process.exitCode = 1 at
+            // TriggerUncaughtException (UNCONDITIONALLY -- an earlier script
+            // assignment loses), emits 'exit', then re-reads: a handler
+            // mutating exitCode (98, or back to 0) decides the final code.
+            let _ = rt.execute_script(
+                "<fatal-exit-code>",
+                "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+            );
+            rt.emit_process_exit();
+            let final_code = rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8;
+            Err((diagnostics, final_code))
+        }
     }
-    // Node fires 'exit' on BOTH natural completion AND a fatal/uncaught error,
-    // so emit before returning either way (process.on('exit') handlers must run
-    // even when the program crashed). emit_process_exit is idempotent and runs
-    // in a fresh scope, so a pending exception from the failed run is fine.
-    rt.emit_process_exit();
-    result.map(|()| rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+}
+
+/// Pre-engine failure: diagnostics with Node's generic fatal exit code 1.
+fn err_exit(diagnostics: Vec<Diagnostic>) -> (Vec<Diagnostic>, u8) {
+    (diagnostics, 1)
 }
 
 // -- oam compile: embed a pre-bundled JS file into a standalone binary --
@@ -1734,25 +1759,34 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
     let result = rt.execute_cjs(&tmp_file);
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    // Fatal path parity: Node's 'exit' handlers observe exit 1 on an
-    // uncaught/unhandled failure. Set process.exitCode = 1 if the script left it
-    // unset before emitting 'exit' (the process already exits FAILURE here).
-    if result.is_err() {
-        let _ = rt.execute_script(
-            "<fatal-exit-code>",
-            "(function () { var p = globalThis.process; \
-               if (p && typeof p.exitCode !== 'number') { p.exitCode = 1; } })();",
-        );
-    }
-    // Fire 'exit' on both natural completion and a fatal error (Node parity).
-    rt.emit_process_exit();
+    // Same fatal-path shape as run_file: sub-codes 6/7 skip the 'exit'
+    // event entirely and are not handler-overridable; a regular fatal
+    // forces exitCode = 1, emits 'exit', then honors handler mutations.
     match result {
-        Ok(()) => ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8),
+        Ok(()) => {
+            rt.emit_process_exit();
+            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+        }
         Err(diagnostics) => {
             for d in &diagnostics {
                 render(d, false);
             }
-            ExitCode::FAILURE
+            let sub_code = rt
+                .execute_script(
+                    "<fatal-sub-code>",
+                    "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                )
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok());
+            if let Some(code) = sub_code {
+                return ExitCode::from(code);
+            }
+            let _ = rt.execute_script(
+                "<fatal-exit-code>",
+                "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+            );
+            rt.emit_process_exit();
+            ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
         }
     }
 }

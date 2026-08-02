@@ -6343,6 +6343,103 @@
     // other callback in the batch.
     let tickQueue = [];
     let tickIndex = 0;
+    // Canonical uncaught dispatcher -- Node's onGlobalUncaughtException
+    // ladder with the origin second argument: monitor (always, informational),
+    // then the capture callback (REPLACES emission, never fatal), then
+    // 'uncaughtException' listeners. Returns true when something consumed the
+    // error (the run survives), false when it is fatal. Shared by the tick
+    // drain, the queueMicrotask wrapper, and the ENGINE's uncaught paths
+    // (via the __oamDispatchUncaught global).
+    const dispatchUncaught = (err, origin) => {
+      origin = origin || "uncaughtException";
+      // A throw that already escaped a handler INSIDE this ladder (marked
+      // below) must not re-enter it: Node treats a throwing
+      // uncaughtException/monitor handler as immediately fatal, exit 7 --
+      // never re-emitting the monitor or re-invoking listeners.
+      if (
+        err !== null && (typeof err === "object" || typeof err === "function") &&
+        err.__oamHandlerThrow
+      ) {
+        process.__oamFatalCode = 7;
+        return false;
+      }
+      // Node's TriggerUncaughtException refuses to run when
+      // process._fatalException was monkeypatched to a non-function:
+      // exit code 6 (kInvalidFatalExceptionMonkeyPatching). oam's ladder
+      // replaces _fatalException's BODY, but the patch check is API surface
+      // (a patched FUNCTION is not invoked -- accepted divergence, no
+      // corpus coverage).
+      if (typeof process._fatalException !== "function") {
+        process.__oamFatalCode = 6;
+        return false;
+      }
+      try {
+        // Monitor first, ALWAYS -- including for domain-handled errors
+        // (probe-verified: node emits uncaughtExceptionMonitor before the
+        // domain machinery runs).
+        process.emit("uncaughtExceptionMonitor", err, origin);
+        // Active domain next. _errorHandler (a) returns true when a domain
+        // 'error' listener consumed it, (b) rethrows THE SAME err when the
+        // domain has no listener (fall through to the ladder, with the
+        // process-level domain clear node performs there), (c) lets a
+        // throwing 'error' LISTENER's own exception propagate -- e2 !== err,
+        // escalate: node dies exit 7 on a throwing domain handler.
+        const dom = process.domain;
+        if (dom && typeof dom._errorHandler === "function") {
+          try {
+            dom._errorHandler(err);
+            // Domain consumed it: node's domainUncaughtExceptionClear runs
+            // on this process-level path (later callbacks see null).
+            if (typeof registry._domainUncaughtClear === "function") {
+              registry._domainUncaughtClear();
+            }
+            return true;
+          } catch (e2) {
+            if (e2 !== err) throw e2; // domain 'error' listener threw: fatal
+            if (typeof registry._domainUncaughtClear === "function") {
+              registry._domainUncaughtClear();
+            }
+            // fall through to the ladder with the original error, untagged
+          }
+        }
+        // With the domain module in use, node's uncaught path always runs
+        // domainUncaughtExceptionClear before the listeners: they observe
+        // process.domain === null (not the unwound undefined) even when the
+        // throwing domain was already exited by sync containment.
+        if (typeof registry._domainUncaughtClear === "function") {
+          registry._domainUncaughtClear();
+        }
+        if (process._uncaughtCaptureCb) {
+          process._uncaughtCaptureCb(err);
+          return true;
+        }
+        if (process.listenerCount("uncaughtException") > 0) {
+          process.emit("uncaughtException", err, origin);
+          return true;
+        }
+        return false;
+      } catch (e2) {
+        // A handler inside the ladder threw. Mark the escaping error so a
+        // ledger re-dispatch recognizes it as handler-throw (fatal 7)
+        // instead of re-running the ladder. Primitive throws can't carry
+        // the mark -- they take the legacy re-dispatch path.
+        if (e2 !== null && (typeof e2 === "object" || typeof e2 === "function")) {
+          try {
+            Object.defineProperty(e2, "__oamHandlerThrow", {
+              value: true, writable: false, configurable: false, enumerable: false,
+            });
+          } catch { /* frozen -- best effort */ }
+        }
+        throw e2;
+      }
+    };
+    Object.defineProperty(globalThis, "__oamDispatchUncaught", {
+      value: dispatchUncaught,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+
     const drainTickQueue = () => {
       // The finally is load-bearing: EVERY exit -- normal completion, the
       // fatal no-listener rethrow, or a throw from a user's uncaughtException/
@@ -6363,7 +6460,13 @@
             tickIndex = 0;
           }
           try {
+            // Domain wrap, Node shape: enter before, exit ONLY on success --
+            // a throw unwinds with the domain entered so dispatchUncaught
+            // (in the catch below) routes it to the domain's error handler.
+            const tickDom = entry[2];
+            if (tickDom) tickDom.enter();
             entry[0](...entry[1]);
+            if (tickDom) tickDom.exit();
           } catch (e) {
             // Node's onGlobalUncaughtException order: monitor first; then the
             // capture callback, which REPLACES 'uncaughtException' emission
@@ -6376,17 +6479,7 @@
             // their side effects against process death. A throw from the
             // handler itself also escapes here -- fatal in Node; the finally
             // keeps nextTick functional if the engine survives the run.
-            if (process.listenerCount("uncaughtExceptionMonitor") > 0) {
-              process.emit("uncaughtExceptionMonitor", e);
-            }
-            if (process._uncaughtCaptureCb) {
-              process._uncaughtCaptureCb(e);
-              continue;
-            }
-            if (process.listenerCount("uncaughtException") > 0) {
-              process.emit("uncaughtException", e);
-              continue;
-            }
+            if (dispatchUncaught(e, "uncaughtException")) continue;
             throw e;
           }
         }
@@ -6613,6 +6706,24 @@
       process.emit("exit", code);
     }
 
+    // 'beforeExit': emitted by the ENGINE at natural event-loop drain (main
+    // entry paths only -- not REPL/test-runner/worker pumps) with the
+    // prospective exit code. Never after explicit process.exit() (the
+    // _exiting guard). The engine re-enters the loop when the handler
+    // scheduled new ref'd work, re-emitting on each subsequent drain --
+    // Node's EmitBeforeExit shape. Locked-down global like __oamDrainTicks.
+    Object.defineProperty(globalThis, "__oamEmitBeforeExit", {
+      value: function emitBeforeExit() {
+        if (process._exiting) return false;
+        const code = typeof process.exitCode === "number" ? process.exitCode : 0;
+        process.emit("beforeExit", code);
+        return true;
+      },
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+
     // Inbound OS signals. process.on('SIGTERM'/'SIGINT'/...) must fire the
     // listener on delivery and suppress the default terminate while a listener
     // is attached (Node semantics; the k8s graceful-shutdown case). We arm the
@@ -6670,7 +6781,28 @@
         if (code !== undefined && code !== null) process.exitCode = code;
         const numeric = typeof process.exitCode === "number" ? process.exitCode : 0;
         emitProcessExit(numeric);
-        natives.exit(numeric);
+        // Node RE-READS process.exitCode after the 'exit' emission: an exit
+        // handler mutating it wins over the exit(code) argument.
+        const finalCode = typeof process.exitCode === "number" ? process.exitCode : numeric;
+        // Route through the writable reallyExit hook (Node per_thread.js):
+        // a monkey-patched reallyExit returning makes exit() a no-op and the
+        // run continues (test-process-really-exit). Read at CALL time.
+        process.reallyExit(finalCode);
+        // Survived (patched reallyExit returned): node keeps emitting
+        // beforeExit/'exit' on later drains -- re-arm the once-guard.
+        process._exiting = false;
+      },
+      // Default hard-exit hook behind process.exit -- plain writable
+      // property, patchable like Node's.
+      reallyExit(code) {
+        natives.exit(code | 0);
+      },
+      // Node bootstrap installs _fatalException; the canonical dispatcher
+      // checks it is still a function before running the uncaught ladder
+      // (undefined -> exit 6, matching TriggerUncaughtException).
+      _fatalException(err) {
+        const dispatch = globalThis.__oamDispatchUncaught;
+        return typeof dispatch === "function" ? dispatch(err, "uncaughtException") : false;
       },
       cwd: () => natives.cwd(),
       chdir: (dir) => {
@@ -6704,7 +6836,10 @@
         const bind = registry._bindToCurrentFrame;
         // Just enqueue: the HOST drains at every tick point (see
         // __oamDrainTicks above) -- no microtask trampoline.
-        tickQueue.push([bind ? bind(fn) : fn, args]);
+        // entry[2]: domain captured at schedule time (undefined until
+        // require('domain') installs process.domain) -- the drain enters it
+        // around the callback so throws route to the domain, like timers.
+        tickQueue.push([bind ? bind(fn) : fn, args, process.domain || null]);
       },
       hrtime: Object.assign(
         (prev) => {
@@ -7044,6 +7179,14 @@
         if (fn === null) { process._uncaughtCaptureCb = null; return; }
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("fn", ["Function", "null"], fn);
+        }
+        // Node forbids the capture callback once the domain module is in
+        // use (they own the same fatal seam).
+        if (registry._domainLoaded) {
+          throw applyNodeErrorShape(
+            new Error("The `domain` module is in use, which is mutually exclusive with calling process.setUncaughtExceptionCaptureCallback()"),
+            "ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE",
+          );
         }
         if (process._uncaughtCaptureCb) {
           throw applyNodeErrorShape(
@@ -10993,14 +11136,24 @@
 
   // ------------------------------------------------- node:timers/promises
   registry.factories["timers/promises"] = () => {
+    // Node's internal AbortError shape: a real Error SUBCLASS (constructor
+    // name 'AbortError') with code ABORT_ERR, signal.reason carried as
+    // cause. timers/promises rejects with THIS, never with signal.reason.
+    class AbortError extends Error {
+      constructor(message = "The operation was aborted", options = undefined) {
+        super(message, options);
+        this.code = "ABORT_ERR";
+        this.name = "AbortError";
+      }
+    }
+    function makeAbortError(cause) {
+      return cause !== undefined ? new AbortError(undefined, { cause }) : new AbortError();
+    }
     function promisedTimeout(delay, value, options = {}) {
       const signal = options.signal;
       // Already-aborted: reject immediately, never schedule (Node).
       if (signal?.aborted) {
-        return Promise.reject(
-          signal.reason ??
-            new globalThis.DOMException("The operation was aborted", "AbortError"),
-        );
+        return Promise.reject(makeAbortError(signal.reason));
       }
       return new Promise((resolve, reject) => {
         const id = globalThis.setTimeout(() => resolve(value), delay ?? 1);
@@ -11008,10 +11161,7 @@
           "abort",
           () => {
             globalThis.clearTimeout(id);
-            reject(
-              signal.reason ??
-                new globalThis.DOMException("The operation was aborted", "AbortError"),
-            );
+            reject(makeAbortError(signal.reason));
           },
           { once: true },
         );
@@ -11068,14 +11218,27 @@
         }
       }
     }
+    // Web-standard Scheduler: an instance of an un-constructible class
+    // (new scheduler.constructor() must throw ERR_ILLEGAL_CONSTRUCTOR).
+    // wait/yield live on the PROTOTYPE like node's class methods.
+    class Scheduler {
+      constructor() {
+        throw applyNodeErrorShape(new TypeError("Illegal constructor"), "ERR_ILLEGAL_CONSTRUCTOR");
+      }
+      wait(delay, options) {
+        return promisedTimeout(delay, undefined, options);
+      }
+      yield() {
+        return promisedImmediate(undefined);
+      }
+    }
+    const scheduler = Object.create(Scheduler.prototype);
+
     return {
       setTimeout: promisedTimeout,
       setImmediate: promisedImmediate,
       setInterval: intervalIterator,
-      scheduler: {
-        wait: (delay) => promisedTimeout(delay, undefined),
-        yield: () => promisedImmediate(undefined),
-      },
+      scheduler,
     };
   };
 
@@ -12691,6 +12854,16 @@
     }
     function enroll(item, msecs) {
       validateMsecs(msecs, "msecs");
+      // TIMEOUT_MAX overflow on the enroll path: node v22 TRUNCATES to
+      // 2147483647 (unlike the Timeout ctor's set-to-1) with its own text.
+      if (msecs > 2147483647) {
+        process.emitWarning(
+          msecs + " does not fit into a 32-bit signed integer." +
+            "\nTimer duration was truncated to 2147483647.",
+          "TimeoutOverflowWarning",
+        );
+        msecs = 2147483647;
+      }
       if (item._idleNext) unenroll(item);
       item._idleTimeout = msecs;
       item._idleNext = null;
@@ -12712,6 +12885,13 @@
       _insert(item, true);
     }
     function _insert(item, unrefed) {
+      // A real Timeout/Immediate handle re-arms through its own machinery --
+      // scheduling a SECOND plain setTimeout here would double-fire the
+      // callback (the handle's _onTimeout field is now populated).
+      if (item && item._kind && typeof item.refresh === "function") {
+        item.refresh();
+        return;
+      }
       const msecs = item._idleTimeout;
       if (typeof msecs !== "number" || msecs < 0) return;
       item._idleStart = Math.trunc(globalThis.performance?.now?.() ?? Date.now());
@@ -12730,6 +12910,20 @@
       item._idleTimerId = t;
     }
 
+    // Node ships these behind util.deprecate: one DeprecationWarning per
+    // function per process, BEFORE the call proceeds (the max-duration
+    // warning test counts them via process.on('warning')).
+    function deprecatedOnce(fn, msg, code) {
+      let warned = false;
+      return function (...a) {
+        if (!warned) {
+          warned = true;
+          process.emitWarning(msg, "DeprecationWarning", code);
+        }
+        return fn.apply(this, a);
+      };
+    }
+
     return {
       setTimeout: (fn, ms, ...args) => _setTimeout(fn, ms, ...args),
       clearTimeout: (id) => _clearTimeout(id),
@@ -12737,10 +12931,10 @@
       clearInterval: (id) => _clearInterval(id),
       setImmediate: (fn, ...args) => _setImmediate(fn, ...args),
       clearImmediate: (id) => _clearImmediate(id),
-      enroll,
-      unenroll,
-      active,
-      _unrefActive,
+      enroll: deprecatedOnce(enroll, "timers.enroll() is deprecated. Please use setTimeout instead.", "DEP0095"),
+      unenroll: deprecatedOnce(unenroll, "timers.unenroll() is deprecated. Please use clearTimeout instead.", "DEP0096"),
+      active: deprecatedOnce(active, "timers.active() is deprecated. Please use timeout.refresh() instead.", "DEP0126"),
+      _unrefActive: deprecatedOnce(_unrefActive, "timers._unrefActive() is deprecated. Please use timeout.refresh() instead.", "DEP0127"),
       get promises() {
         return registry.get("timers/promises");
       },
@@ -14055,42 +14249,114 @@
   // without actual uncaught-exception routing.
   registry.factories.domain = () => {
     const EventEmitter = registry.get("events");
+    // Node domain state (differentially probed against real v22.22.2):
+    // process.domain starts null on require('domain'); an EMPTIED stack via
+    // exit() leaves it undefined (stack[len-1] of []); after a domain
+    // CATCHES an error, domainUncaughtExceptionClear resets it to null --
+    // so error handlers observe undefined and later timers observe null.
+    const stack = [];
+    const _domain = [null];
+    Object.defineProperty(process, "domain", {
+      get: () => _domain[0],
+      set: (v) => { _domain[0] = v; },
+      enumerable: true,
+      configurable: true,
+    });
+    function tagError(er, d) {
+      if (er && (typeof er === "object" || typeof er === "function")) {
+        // Best-effort: a frozen error passes through untagged rather than
+        // being replaced by a defineProperty TypeError.
+        try {
+          Object.defineProperty(er, "domain", {
+            value: d, writable: true, configurable: true, enumerable: false,
+          });
+          er.domainThrown = true;
+        } catch { /* frozen/sealed error */ }
+      }
+      return er;
+    }
+    // Process-level uncaught path clear (node's domainUncaughtExceptionClear):
+    // consumed by __oamDispatchUncaught ONLY -- sync bind/intercept handling
+    // must NOT clear unrelated domains (they keep executing).
+    registry._domainUncaughtClear = () => {
+      stack.length = 0;
+      _domain[0] = null;
+    };
+    registry._domainLoaded = true;
     class Domain extends EventEmitter {
       constructor() {
         super();
         this.members = [];
       }
-      enter() {}
-      exit() {}
+      enter() {
+        stack.push(this);
+        _domain[0] = this;
+      }
+      exit() {
+        const idx = stack.lastIndexOf(this);
+        if (idx === -1) return;
+        stack.splice(idx);
+        _domain[0] = stack.length ? stack[stack.length - 1] : undefined;
+      }
       add(obj) { this.members.push(obj); return this; }
       remove(obj) {
         const i = this.members.indexOf(obj);
         if (i >= 0) this.members.splice(i, 1);
         return this;
       }
+      _errorHandler(er, viaThrow) {
+        // Handlers run OUTSIDE the domain's context: unwind this domain
+        // fully first (empties to undefined when it was the only one).
+        while (_domain[0] === this) this.exit();
+        if (this.listenerCount("error") > 0) {
+          // Tag only when a listener will observe it -- an error that falls
+          // through to the regular uncaught ladder stays untagged (node).
+          tagError(er, this);
+          // A throwing 'error' listener propagates from emit -- the process-
+          // level dispatcher escalates that to fatal exit 7 (node parity).
+          this.emit("error", er);
+          // THROW-driven handling maps to node's fatal path, which runs
+          // domainUncaughtExceptionClear on a caught error (later callbacks
+          // see process.domain === null). Callback-DELIVERED errors
+          // (intercept's err argument) never reach the fatal path in node
+          // and must not evict unrelated domains.
+          if (viaThrow) registry._domainUncaughtClear();
+          return true;
+        }
+        // No listener: rethrow the ORIGINAL, untagged. The global clear on
+        // this path is the process-level dispatcher's job.
+        throw er;
+      }
       bind(fn) {
         const d = this;
         return function (...args) {
-          try { return fn.apply(this, args); }
-          catch (e) { d.emit("error", e); }
+          d.enter();
+          try { const r = fn.apply(this, args); d.exit(); return r; }
+          catch (e) { d._errorHandler(e, true); }
         };
       }
       intercept(fn) {
         const d = this;
         return function (err, ...args) {
-          if (err) { d.emit("error", err); return; }
-          try { fn.apply(this, args); }
-          catch (e) { d.emit("error", e); }
+          // Callback-delivered error: no fatal path, no global clear.
+          if (err) { d._errorHandler(err, false); return; }
+          d.enter();
+          try { const r = fn.apply(this, args); d.exit(); return r; }
+          catch (e) { d._errorHandler(e, true); }
         };
       }
       run(fn, ...args) {
-        try { return fn.apply(this, args); }
-        catch (e) { this.emit("error", e); }
+        this.enter();
+        try { const r = fn.apply(this, args); this.exit(); return r; }
+        catch (e) { this._errorHandler(e, true); }
       }
     }
     function create() { return new Domain(); }
-    const active = null;
-    return { Domain, create, active };
+    return {
+      Domain,
+      create,
+      get active() { return _domain[0]; },
+    };
   };
 
   // ---------------------------------------------------------------- repl
@@ -16772,11 +17038,30 @@
       // `repeat` true for setInterval.
       function Timeout(callback, kind, repeat, delay, args) {
         if (typeof callback !== "function") throw makeTimerError("callback");
+        // Node clamps delays over TIMEOUT_MAX (2^31-1) to 1 with a
+        // TimeoutOverflowWarning (getTimerDuration).
+        if (typeof delay === "number" && delay > 2147483647) {
+          process.emitWarning(
+            delay + " does not fit into a 32-bit signed integer." +
+              "\nTimeout duration was set to 1.",
+            "TimeoutOverflowWarning",
+          );
+          delay = 1;
+        }
         this._kind = kind;
         this._repeat = repeat;
         this._delay = delay;
         this._args = args;
         this._origCallback = callback;
+        // Node's legacy handle field: user code clears timers by nulling it
+        // (timers.unenroll / test-timers-unenroll-unref-interval); the fire
+        // closure re-checks it on every fire.
+        this._onTimeout = callback;
+        // Domain capture at SCHEDULE time (Node async_wrap parity): a timer
+        // created inside domain.run() fires inside that domain, and a throw
+        // routes to the domain's error handler, not uncaughtException.
+        // process.domain is undefined until require('domain') installs it.
+        this._domain = (typeof process !== "undefined" && process.domain) || null;
         this._ref = true;
         this._destroyed = false;
         this._idleTimeout = repeat ? delay : delay;
@@ -16785,8 +17070,28 @@
       }
       Timeout.prototype._schedule = function _schedule() {
         const self = this;
-        const bound = bindToCurrentFrame(this._origCallback);
+        // Repeat-ness is re-evaluated on EVERY fire (Node's listOnTimeout):
+        // mutating t._repeat converts a timeout into an interval and back.
+        // Capture how this schedule was armed to detect the conversion.
+        const scheduledAsRepeat = !!this._repeat;
+        // Frame-bind a trampoline, not the ctor callback: Node invokes the
+        // CURRENT _onTimeout on each fire (user code can swap it), while the
+        // ALS frame is still captured at schedule time. Reflect.apply, not
+        // .apply -- node tolerates callbacks whose own call/apply props are
+        // poisoned (test-timers-user-call).
+        const bound = bindToCurrentFrame(function (...a) {
+          return Reflect.apply(self._onTimeout, this, a);
+        });
         const wrapped = function () {
+          // Node consults the handle's legacy fields before every fire: a
+          // cleared/unenrolled handle (falsy _onTimeout or _idleTimeout -1)
+          // is skipped and dropped even if the native timer already fired.
+          if (!self._onTimeout || self._idleTimeout === -1) {
+            (scheduledAsRepeat ? nativeClearInterval : nativeClearTimeout)(self._id);
+            activeTimers.delete(self._id);
+            self._destroyed = true;
+            return;
+          }
           // Node invokes the callback with the handle as `this`, and keeps a
           // one-shot's _destroyed === false DURING the callback so an in-callback
           // self.refresh() can re-arm it (self-rescheduling heartbeat/poll loops).
@@ -16794,12 +17099,42 @@
           // rescheduled in the meantime (the _id is unchanged) -- is a spent
           // one-shot marked destroyed and dropped from the active set.
           const firedId = self._id;
+          const dom = self._domain;
           try {
-            return bound.apply(self, self._args);
+            // Node's domain wrap: enter before the callback, exit ONLY on
+            // the success path. A throw unwinds with the domain still
+            // entered, so the fatal dispatcher (__oamDispatchUncaught) sees
+            // process.domain === the throwing callback's domain and routes
+            // there -- and the engine's handled-throw tick-deferral applies
+            // to domain-handled throws too (Node ordering).
+            if (dom) dom.enter();
+            const r = bound.apply(self, self._args);
+            if (dom) dom.exit();
+            return r;
           } finally {
-            if (!self._repeat && self._id === firedId) {
-              self._destroyed = true;
-              activeTimers.delete(self._id);
+            if (self._id === firedId) {
+              if (!scheduledAsRepeat) {
+                if (self._kind !== "Immediate" && self._repeat && self._idleTimeout !== -1 && self._onTimeout) {
+                  // timeout -> interval conversion: Node re-inserts with
+                  // _repeat as the new duration. Immediates are excluded --
+                  // setting ._repeat on a fired setImmediate must not arm
+                  // an endless interval.
+                  nativeClearTimeout(self._id);
+                  activeTimers.delete(self._id);
+                  self._delay = self._idleTimeout = self._repeat;
+                  self._schedule();
+                } else {
+                  self._destroyed = true;
+                  activeTimers.delete(self._id);
+                }
+              } else if (!self._repeat || self._idleTimeout === -1 || !self._onTimeout) {
+                // Interval stopped from inside its own callback (cleared,
+                // unenrolled, or _repeat nulled): the native interval would
+                // re-arm -- cancel it now like Node's re-insert model.
+                nativeClearInterval(self._id);
+                activeTimers.delete(self._id);
+                self._destroyed = true;
+              }
             }
           }
         };
@@ -16925,21 +17260,12 @@
               } catch (e) {
                 // Node delivers a microtask throw to uncaughtException
                 // BETWEEN sibling microtasks, not after the checkpoint --
-                // same ladder as the nextTick drain. No consumer = rethrow
-                // into the engine ledger (fatal path unchanged).
-                const proc = globalThis.process;
-                if (proc) {
-                  if (proc.listenerCount("uncaughtExceptionMonitor") > 0) {
-                    proc.emit("uncaughtExceptionMonitor", e);
-                  }
-                  if (proc._uncaughtCaptureCb) {
-                    proc._uncaughtCaptureCb(e);
-                    return;
-                  }
-                  if (proc.listenerCount("uncaughtException") > 0) {
-                    proc.emit("uncaughtException", e);
-                    return;
-                  }
+                // the same canonical ladder as the nextTick drain (monitor +
+                // origin arg included). No consumer = rethrow into the
+                // engine ledger (fatal path unchanged).
+                const dispatch = globalThis.__oamDispatchUncaught;
+                if (typeof dispatch === "function" && dispatch(e, "uncaughtException")) {
+                  return;
                 }
                 throw e;
               }

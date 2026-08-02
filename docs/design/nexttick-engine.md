@@ -113,9 +113,12 @@ loop is allowed to end -- Node's exit semantics.
    interleaving with microtasks. Fixed to pullAgain-only; the deferred
    enqueue resolves the pending waiter directly.
 3. A fatal throw escaping the JS drain routes through the UncaughtLedger
-   (not a direct diagnostic), preserving oam's documented divergence: a
-   THROWING uncaughtException handler re-delivers and the run survives
-   (pinned by e2e next_tick_survives_throwing_uncaught_exception_handler).
+   (not a direct diagnostic). The divergence this originally preserved -- a
+   THROWING uncaughtException handler re-delivering with the run surviving --
+   was FIXED by the process-lifecycle tranche (2026-08-02): the escaping
+   error is marked (__oamHandlerThrow) so the ledger re-dispatch goes
+   straight to Node's fatal exit 7 instead of re-running the ladder (pinned
+   by e2e throwing_uncaught_exception_handler_is_fatal_exit_7).
 
 Shipped numbers: suite 338 -> 339/402 (84.3%), stream bucket 159 -> 160/164
 (98%, compose-operator flipped), ratchet 336 -> 337, differential 55/55 with

@@ -201,6 +201,48 @@ pub(crate) fn flush_handled_rejections(
     }
 }
 
+/// Route an uncaught exception through the JS canonical dispatcher
+/// (`__oamDispatchUncaught`: uncaughtExceptionMonitor -> capture callback ->
+/// 'uncaughtException' listeners, all with Node's origin second argument).
+/// Returns true when JS consumed the error and the run survives. Falls back
+/// to a bare 'uncaughtException' emit when the dispatcher global is
+/// unavailable (early boot, stripped globals).
+pub(crate) fn dispatch_uncaught(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<v8::Value>,
+) -> bool {
+    let lookup = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamDispatchUncaught")?;
+        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+    })();
+    let Some(dispatch) = lookup else {
+        return emit_process_event(tc, "uncaughtException", &[exception]);
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    match dispatch.call(tc, recv, &[exception]) {
+        Some(result) => result.is_true(),
+        None => {
+            tc.reset(); // handler threw: clear it, the original stays fatal
+            // Node exits 7 when the uncaughtException handler itself throws
+            // (kExceptionInFatalExceptionHandler). Stamp the sub-code for the
+            // CLI's fatal path; 'exit' handlers can still mutate it after.
+            let _ = (|| {
+                let context = tc.get_current_context();
+                let global = context.global(tc);
+                let process_key = v8::String::new(tc, "process")?;
+                let process =
+                    v8::Local::<v8::Object>::try_from(global.get(tc, process_key.into())?).ok()?;
+                let key = v8::String::new(tc, "__oamFatalCode")?;
+                let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
+                process.set(tc, key.into(), seven)
+            })();
+            false
+        }
+    }
+}
+
 /// A callback threw directly (timer/op settle). Offer it to a process
 /// 'uncaughtException' listener; None = handled (continue), Some = fatal.
 pub(crate) fn handle_uncaught_throw(
@@ -217,7 +259,7 @@ pub(crate) fn handle_uncaught_throw(
     tc.reset();
 
     let local = v8::Local::new(tc, &value);
-    if emit_process_event(tc, "uncaughtException", &[local]) {
+    if dispatch_uncaught(tc, local) {
         return None;
     }
     Some(vec![Diagnostic::new(
@@ -249,7 +291,7 @@ pub(crate) fn drain_uncaught(
         }
         for (value, text) in captured {
             let local = v8::Local::new(tc, &value);
-            if emit_process_event(tc, "uncaughtException", &[local]) {
+            if dispatch_uncaught(tc, local) {
                 continue; // a listener handled it
             }
             fatal.push(Diagnostic::new(
@@ -877,11 +919,64 @@ pub(crate) fn has_pending_ticks(
     has.call(tc, recv, &[]).is_some_and(|v| v.is_true())
 }
 
+/// Marker slot: suppress 'beforeExit' emission for this runtime. Set by the
+/// CLI's `oam test` path -- its module-eval pump would otherwise emit at the
+/// registration drain, BEFORE the tests run (Node --test emits after).
+pub struct SuppressBeforeExit;
+
+/// Emit 'beforeExit' via the `__oamEmitBeforeExit` hook. Returns
+/// Ok((emitted, handled_throw)):
+/// - emitted: the hook ran (process not already exiting via process.exit);
+///   the caller re-enters the loop to pick up handler-scheduled work.
+/// - handled_throw: the handler threw and an uncaughtException listener
+///   consumed it -- Node counts that as loop activity and RE-EMITS at the
+///   next drain, so the caller must not latch its once-per-drain guard.
+///
+/// An unhandled handler throw is a fatal Err, like a timer callback.
+fn emit_before_exit(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Result<(bool, bool), Vec<Diagnostic>> {
+    if tc.get_slot::<SuppressBeforeExit>().is_some() {
+        return Ok((false, false));
+    }
+    let lookup = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamEmitBeforeExit")?;
+        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+    })();
+    let Some(hook) = lookup else {
+        return Ok((false, false));
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    let (emitted, handled_throw) = match hook.call(tc, recv, &[]) {
+        Some(result) => (result.is_true(), false),
+        None => {
+            if let Some(failure) = handle_uncaught_throw(tc, "beforeExit") {
+                return Err(failure);
+            }
+            (true, true) // handler threw, a listener consumed it
+        }
+    };
+    if let Some(failure) = run_ticks_and_microtasks(tc) {
+        return Err(failure);
+    }
+    if let Some(failure) = drain_uncaught(tc) {
+        return Err(failure);
+    }
+    Ok((emitted, handled_throw))
+}
+
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
     report_unhandled: bool,
 ) -> Result<(), Vec<Diagnostic>> {
+    // Once-per-drain 'beforeExit' guard (Node SpinEventLoop parity): set when
+    // the hook fires at a drain, reset whenever the loop makes progress, so
+    // handler-scheduled work re-arms the NEXT drain's emission while a
+    // handler that schedules nothing exits after a single emission.
+    let mut before_exit_emitted = false;
     loop {
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
             break;
@@ -939,16 +1034,24 @@ pub(crate) fn pump_event_loop(
             let callback = v8::Local::new(tc, &callback);
             let args: Vec<v8::Local<v8::Value>> =
                 extra.iter().map(|g| v8::Local::new(tc, g)).collect();
-            if callback.call(tc, recv, &args).is_none()
-                && let Some(failure) = handle_uncaught_throw(tc, "timer callback")
-            {
-                return Err(failure);
+            let mut threw_handled = false;
+            if callback.call(tc, recv, &args).is_none() {
+                if let Some(failure) = handle_uncaught_throw(tc, "timer callback") {
+                    return Err(failure);
+                }
+                threw_handled = true;
             }
-            if let Some(failure) = run_ticks_and_microtasks(tc) {
-                return Err(failure);
-            }
-            if let Some(failure) = drain_uncaught(tc) {
-                return Err(failure);
+            // Node ordering: ticks queued by a THROWING (but handled)
+            // callback do not drain now -- they run after the next
+            // successful callback / at queue exhaustion
+            // (test-timers-immediate-queue-throw asserts stage 1 first).
+            if !threw_handled {
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
             }
             progressed = true;
         }
@@ -972,6 +1075,7 @@ pub(crate) fn pump_event_loop(
             progressed = true;
         }
         if progressed {
+            before_exit_emitted = false;
             continue;
         }
 
@@ -1011,6 +1115,24 @@ pub(crate) fn pump_event_loop(
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
+            // Natural drain: emit 'beforeExit' (main/sidecar/worker paths --
+            // report_unhandled; never REPL/test-runner pumps) and re-enter
+            // the loop so handler-scheduled work runs. The hook returns
+            // false after explicit process.exit() (process._exiting).
+            if report_unhandled && !before_exit_emitted {
+                match emit_before_exit(tc) {
+                    Err(failure) => return Err(failure),
+                    Ok((true, handled_throw)) => {
+                        // A handled handler-throw counts as loop activity in
+                        // Node: leave the guard unlatched so the next drain
+                        // re-emits (always-throw-with-listener is a legit
+                        // infinite program).
+                        before_exit_emitted = !handled_throw;
+                        continue;
+                    }
+                    Ok((false, _)) => {}
+                }
+            }
             break;
         }
         match (next_deadline, has_inflight) {
@@ -1041,6 +1163,10 @@ pub(crate) fn pump_event_loop(
                     if let Some(failure) = drain_uncaught(tc) {
                         return Err(failure);
                     }
+                    // A settled completion is loop progress: re-arm the
+                    // once-per-drain 'beforeExit' guard (work scheduled from
+                    // a beforeExit handler settles HERE, not via try_recv).
+                    before_exit_emitted = false;
                 }
             }
             (Some(deadline), false) => {
@@ -1093,6 +1219,10 @@ pub(crate) fn pump_event_loop(
                             }
                             // A signal listener may have scheduled work or called
                             // process.exit; re-evaluate the outer loop condition.
+                            // Its callback was loop progress: re-arm the
+                            // once-per-drain beforeExit guard like the other
+                            // settle sites.
+                            before_exit_emitted = false;
                             break;
                         }
                         if let Some(shared) = &inspector {

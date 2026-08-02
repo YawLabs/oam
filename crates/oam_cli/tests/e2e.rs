@@ -1036,34 +1036,36 @@ fn next_tick_capture_callback_replaces_uncaught_emission() {
 }
 
 #[test]
-fn next_tick_survives_throwing_uncaught_exception_handler() {
-    // A THROWING uncaughtException handler must not wedge the tick queue:
-    // the drain's finally resets state on every exit path, so nextTick keeps
-    // working afterwards. (Node treats a handler throw as immediately fatal;
-    // oam's engine ledger re-delivers and the run survives -- that divergence
-    // is documented engine-side. The invariant locked here is narrower and
-    // load-bearing for streams: the nextTick machinery itself stays alive.)
+fn throwing_uncaught_exception_handler_is_fatal_exit_7() {
+    // Node parity (formerly a documented divergence, fixed by the lifecycle
+    // tranche): a THROWING uncaughtException handler is immediately fatal --
+    // the handler's error is NOT re-delivered to the ladder, later
+    // ticks/timers never run, and the process exits with Node's code 7
+    // (kExceptionInFatalExceptionHandler). A NON-throwing handler keeping
+    // the run alive with working nextTick is covered by
+    // test-timers-immediate-queue-throw in the vendored suite.
     let file = write_temp(
         "next_tick_handler_throw.ts",
-        "let first = true;\n\
-         process.on('uncaughtException', (e: Error) => {\n\
+        "process.on('uncaughtException', (e: Error) => {\n\
            console.log('handler ' + e.message);\n\
-           if (first) { first = false; throw new Error('double'); }\n\
+           throw new Error('double');\n\
          });\n\
          process.nextTick(() => { throw new Error('boom'); });\n\
-         setTimeout(() => {\n\
-           process.nextTick(() => console.log('late tick ran'));\n\
-           setTimeout(() => console.log('done'), 5);\n\
-         }, 5);",
+         setTimeout(() => console.log('late timer ran'), 5);",
     );
     let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("late tick ran"),
-        "nextTick must survive a throwing handler; stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "handler throw must exit 7; stdout: {stdout}\nstderr: {stderr}"
     );
-    assert!(stdout.contains("done"), "stdout: {stdout}");
+    assert!(stdout.contains("handler boom"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("late timer ran"),
+        "run must die at the handler throw; stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -1433,7 +1435,8 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
             // REPL inspects the handle. Node's REPL prints a Timeout object
             // here too; the field set is oam's.
             "Timeout { _kind: 'Timeout', _repeat: false, _delay: 40, _args: [], \
-             _origCallback: [Function (anonymous)], _ref: true, _destroyed: false, \
+             _origCallback: [Function (anonymous)], _onTimeout: [Function (anonymous)], \
+             _domain: null, _ref: true, _destroyed: false, \
              _idleTimeout: 40, _id: 1 }",
             "background fired", // fired while AWAITING the next line — live loop
             "'timer-live'",
