@@ -460,8 +460,10 @@
   codes.ERR_CONSTRUCT_CALL_REQUIRED = E("ERR_CONSTRUCT_CALL_REQUIRED", TypeError, function(name) {
     return 'Class constructor ' + name + ' cannot be invoked without `new`';
   });
-  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input) {
-    return 'Invalid URL: ' + input;
+  // Node v22 shape: message is exactly "Invalid URL"; the offending string
+  // rides on err.input (set by the throw sites), not in the message.
+  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function() {
+    return 'Invalid URL';
   });
   codes.ERR_INVALID_URL_SCHEME = E("ERR_INVALID_URL_SCHEME", TypeError, function(expected) {
     return 'The URL must be of scheme ' + expected;
@@ -1805,8 +1807,26 @@
   // subarray/slice construction stays on the raw path.
   const RealBuffer = Buffer;
   let buffer_dep0005_warned = false;
+  // Node suppresses DEP0005 when the CALLER sits inside node_modules
+  // (isInsideNodeModules: the innermost stack frame with a real user
+  // filename decides). Snapshot frames render as <anonymous> and eval
+  // wrappers as [eval] -- both skipped. --pending-deprecation overrides.
+  function isCallerInsideNodeModules() {
+    try {
+      const lines = (new Error().stack || "").split("\n");
+      for (let i = 1; i < lines.length; i++) {
+        const m = /\(([^)]+):\d+:\d+\)/.exec(lines[i]) || / at ([^( ][^ ]*):\d+:\d+/.exec(lines[i]);
+        const file = m && (m[1] || m[2]);
+        if (!file || file === "<anonymous>" || file === "[eval]" || file.startsWith("node:")) continue;
+        return /[\\/]node_modules[\\/]/.test(file);
+      }
+    } catch { /* fall through: treat as app code */ }
+    return false;
+  }
   function emitBufferCtorDeprecation() {
     if (buffer_dep0005_warned) return;
+    // Suppression does NOT latch: a later call from app code still warns.
+    if (!globalThis.__oamPendingDeprecation && isCallerInsideNodeModules()) return;
     buffer_dep0005_warned = true;
     // Node emits DEP0005 once. Route through process.emitWarning if the process
     // factory is already realized; never throw if it isn't (Buffer is top-level,
@@ -3646,9 +3666,86 @@
   registry.factories.util = (natives) => {
     const INSPECT_STYLES = { special: "cyan", number: "yellow", bigint: "yellow", boolean: "yellow", undefined: "grey", null: "bold", string: "green", symbol: "green", date: "magenta", regexp: "red", module: "underline" };
     const INSPECT_COLORS = { bold: [1, 22], italic: [3, 23], underline: [4, 24], inverse: [7, 27], white: [37, 39], grey: [90, 39], black: [30, 39], blue: [34, 39], cyan: [36, 39], green: [32, 39], magenta: [35, 39], red: [31, 39], yellow: [33, 39] };
+    // Snapshot of capitalized global names (Node inspect's `builtInObjects`):
+    // the showHidden prototype-property walk stops at these built-in layers.
+    const builtInObjects = new Set(
+      Object.getOwnPropertyNames(globalThis).filter((e) => /^[A-Z][a-zA-Z0-9]+$/.test(e)),
+    );
+    // Node inspect `meta` table: escapes for C0 controls, the single quote,
+    // the backslash, DEL, and the C1 range (0x80-0x9F). BS is the backslash
+    // character; built via fromCharCode so the table reads unambiguously.
+    const INSPECT_BS = String.fromCharCode(92);
+    const strEscapeMeta = (() => {
+      const hex = (i) => `${INSPECT_BS}x${i.toString(16).toUpperCase().padStart(2, "0")}`;
+      const m = [];
+      for (let i = 0; i < 32; i++) m.push(hex(i));
+      m[8] = INSPECT_BS + "b";
+      m[9] = INSPECT_BS + "t";
+      m[10] = INSPECT_BS + "n";
+      m[12] = INSPECT_BS + "f";
+      m[13] = INSPECT_BS + "r";
+      for (let i = 32; i < 127; i++) m.push("");
+      m[39] = INSPECT_BS + "'";
+      m[92] = INSPECT_BS + INSPECT_BS;
+      m.push(hex(127));
+      for (let i = 128; i < 160; i++) m.push(hex(i));
+      return m;
+    })();
+    // Node strEscape: choose the quote style (' -> " -> `), escape control
+    // chars / backslash / the active quote, and backslash-u-escape lone
+    // surrogates.
+    function strEscape(str) {
+      let quoteCode = 39;
+      let quoteChar = "'";
+      if (str.includes("'")) {
+        if (!str.includes('"')) {
+          quoteCode = -1;
+          quoteChar = '"';
+        } else if (!str.includes("`") && !str.includes("${")) {
+          quoteCode = -2;
+          quoteChar = "`";
+        }
+      }
+      let result = "";
+      let last = 0;
+      for (let i = 0; i < str.length; i++) {
+        const point = str.charCodeAt(i);
+        if (point === quoteCode || point === 92 || point < 32 || (point > 126 && point < 160)) {
+          result += str.slice(last, i) + strEscapeMeta[point];
+          last = i + 1;
+        } else if (point >= 0xd800 && point <= 0xdfff) {
+          // Paired surrogates pass through; lone ones get escaped.
+          if (point <= 0xdbff && i + 1 < str.length) {
+            const next = str.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+              i++;
+              continue;
+            }
+          }
+          result += `${str.slice(last, i)}${INSPECT_BS}u${point.toString(16)}`;
+          last = i + 1;
+        }
+      }
+      result += str.slice(last);
+      return quoteChar + result + quoteChar;
+    }
     function inspect(value, options = {}) {
-      const depth = options.depth === undefined ? 2 : options.depth;
-      const seen = new Set();
+      // `depth` is mutable: the Node output-budget clamp sets it to -1 when a
+      // pathological object accumulates ~2^27 chars at one indentation level.
+      let depth = options.depth === undefined ? 2 : options.depth;
+      const showHidden = options.showHidden === undefined ? false : !!options.showHidden;
+      const getters = options.getters === undefined ? false : options.getters;
+      const breakLength = options.breakLength === undefined ? 80 : options.breakLength;
+      const compact = options.compact === undefined ? 3 : options.compact;
+      const maxArrayLength =
+        options.maxArrayLength === null ? Infinity : options.maxArrayLength === undefined ? 100 : options.maxArrayLength;
+      const maxStringLength =
+        options.maxStringLength === null ? Infinity : options.maxStringLength === undefined ? 10000 : options.maxStringLength;
+      const seen = [];
+      // object -> ref id; minted the first time a revisit is detected
+      // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
+      const circular = new Map();
+      const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
       const stylize = options.colors
         ? (str, type) => {
             const name = INSPECT_STYLES[type];
@@ -3657,26 +3754,469 @@
             return `\u001b[${c[0]}m${str}\u001b[${c[1]}m`;
           }
         : (str) => str;
+      const ansiRe = /\u001b\[\d{1,3}m/g;
+      const width = (s) => (options.colors ? s.replace(ansiRe, "").length : s.length);
+      // Node keyStrRegExp -- note: no `$`, so `$foo` keys are quoted.
+      const identKeyRe = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
+
+      function markCircular(v) {
+        let id = circular.get(v);
+        if (id === undefined) {
+          id = circular.size + 1;
+          circular.set(v, id);
+        }
+        return stylize(`[Circular *${id}]`, "special");
+      }
+      function refPrefix(v, base) {
+        const id = circular.get(v);
+        if (id === undefined) return base;
+        const ref = stylize(`<ref *${id}>`, "special");
+        return base === "" ? ref : `${ref} ${base}`;
+      }
+      function safeCtorName(v) {
+        // Node getConstructorName core: own-descriptor walk up the prototype
+        // chain; never invokes accessors (a throwing `constructor` getter must
+        // not detonate the render).
+        let obj = v;
+        while (obj) {
+          const d = Object.getOwnPropertyDescriptor(obj, "constructor");
+          if (d !== undefined && typeof d.value === "function" && d.value.name !== "") {
+            try {
+              if (v instanceof d.value) return String(d.value.name);
+            } catch {
+              // Symbol.hasInstance shenanigans -- keep walking.
+            }
+          }
+          obj = Object.getPrototypeOf(obj);
+        }
+        return undefined;
+      }
+      function getKeys(v, hidden) {
+        const symbols = Object.getOwnPropertySymbols(v);
+        let keys;
+        if (hidden) {
+          keys = Object.getOwnPropertyNames(v);
+          if (symbols.length !== 0) keys.push(...symbols);
+        } else {
+          try {
+            keys = Object.keys(v);
+          } catch {
+            keys = Object.getOwnPropertyNames(v);
+          }
+          if (symbols.length !== 0) {
+            keys.push(...symbols.filter((k) => Object.prototype.propertyIsEnumerable.call(v, k)));
+          }
+        }
+        return keys;
+      }
+      function formatString(s) {
+        let trailer = "";
+        if (s.length > maxStringLength) {
+          const remaining = s.length - maxStringLength;
+          s = s.slice(0, maxStringLength);
+          trailer = `... ${remaining} more character${remaining > 1 ? "s" : ""}`;
+        }
+        if (compact !== true && s.length > 16 && s.length > breakLength - ictx.indentationLvl - 4) {
+          // Node splits multi-line strings at their newlines and joins the
+          // quoted chunks with " +".
+          return (
+            s
+              .split(/(?<=\n)/)
+              .map((line) => stylize(strEscape(line), "string"))
+              .join(` +\n${" ".repeat(ictx.indentationLvl + 2)}`) + trailer
+          );
+        }
+        return stylize(strEscape(s), "string") + trailer;
+      }
+      function isBelowBreakLength(output, start, base) {
+        // Port of Node isBelowBreakLength (entry count approximates the ", "
+        // separators; colors are stripped before measuring).
+        let totalLength = output.length + start;
+        if (totalLength + output.length > breakLength) return false;
+        for (let i = 0; i < output.length; i++) {
+          totalLength += width(output[i]);
+          if (totalLength > breakLength) return false;
+        }
+        return base === "" || !base.includes("\n");
+      }
+      function groupArrayElements(output, value) {
+        // Port of Node groupArrayElements: column-pack short array entries.
+        let totalLength = 0;
+        let maxLength = 0;
+        let i = 0;
+        let outputLength = output.length;
+        if (maxArrayLength < output.length) {
+          // Ignore the "... n more items" tail.
+          outputLength--;
+        }
+        const separatorSpace = 2; // " " + ","
+        const dataLen = new Array(outputLength);
+        for (; i < outputLength; i++) {
+          const len = width(output[i]);
+          dataLen[i] = len;
+          totalLength += len + separatorSpace;
+          if (maxLength < len) maxLength = len;
+        }
+        const actualMax = maxLength + separatorSpace;
+        if (
+          actualMax * 3 + ictx.indentationLvl < breakLength &&
+          (totalLength / actualMax > 5 || maxLength <= 6)
+        ) {
+          const approxCharHeights = 2.5;
+          const averageBias = Math.sqrt(actualMax - totalLength / output.length);
+          const biasedMax = Math.max(actualMax - 3 - averageBias, 1);
+          const columns = Math.min(
+            Math.round(Math.sqrt(approxCharHeights * biasedMax * outputLength) / biasedMax),
+            Math.floor((breakLength - ictx.indentationLvl) / actualMax),
+            compact * 4,
+            15,
+          );
+          if (columns <= 1) return output;
+          const tmp = [];
+          const maxLineLength = [];
+          for (let c = 0; c < columns; c++) {
+            let lineMaxLength = 0;
+            for (let j = c; j < output.length; j += columns) {
+              if (dataLen[j] > lineMaxLength) lineMaxLength = dataLen[j];
+            }
+            maxLineLength[c] = lineMaxLength + separatorSpace;
+          }
+          let padStart = true;
+          if (value !== undefined) {
+            for (let j = 0; j < output.length; j++) {
+              if (typeof value[j] !== "number" && typeof value[j] !== "bigint") {
+                padStart = false;
+                break;
+              }
+            }
+          }
+          for (let row = 0; row < outputLength; row += columns) {
+            const max = Math.min(row + columns, outputLength);
+            let str = "";
+            let j = row;
+            for (; j < max - 1; j++) {
+              const padding = maxLineLength[j - row] + output[j].length - dataLen[j];
+              const cell = `${output[j]}, `;
+              str += padStart ? cell.padStart(padding, " ") : cell.padEnd(padding, " ");
+            }
+            if (padStart) {
+              const padding = maxLineLength[j - row] + output[j].length - dataLen[j] - separatorSpace;
+              str += output[j].padStart(padding, " ");
+            } else {
+              str += output[j];
+            }
+            tmp.push(str);
+          }
+          if (maxArrayLength < output.length) tmp.push(output[outputLength]);
+          output = tmp;
+        }
+        return output;
+      }
+      function reduceToSingleString(output, base, braces, level, arrayish, value) {
+        // Port of Node reduceToSingleString. `level` is the post-increment
+        // recurse count (owner level + 1), matching ictx.currentDepth.
+        if (compact !== true) {
+          if (typeof compact === "number" && compact >= 1) {
+            const entries = output.length;
+            if (arrayish && entries > 6) output = groupArrayElements(output, value);
+            if (ictx.currentDepth - level < compact && entries === output.length) {
+              const start = output.length + ictx.indentationLvl + braces[0].length + base.length + 10;
+              if (isBelowBreakLength(output, start, base)) {
+                const joined = output.join(", ");
+                if (!joined.includes("\n")) {
+                  return `${base ? `${base} ` : ""}${braces[0]} ${joined} ${braces[1]}`;
+                }
+              }
+            }
+          }
+          const indentation = `\n${" ".repeat(ictx.indentationLvl)}`;
+          return `${base ? `${base} ` : ""}${braces[0]}${indentation}  ${output.join(`,${indentation}  `)}${indentation}${braces[1]}`;
+        }
+        // compact === true
+        if (isBelowBreakLength(output, 0, base)) {
+          return `${braces[0]}${base ? ` ${base}` : ""} ${output.join(", ")} ${braces[1]}`;
+        }
+        const indentation = " ".repeat(ictx.indentationLvl);
+        const ln =
+          base === "" && braces[0].length === 1 ? " " : `${base ? ` ${base}` : ""}\n${indentation}  `;
+        return `${braces[0]}${ln}${output.join(`,\n${indentation}  `)} ${braces[1]}`;
+      }
+      function reduce(output, base, braces, level, arrayish, value) {
+        const res = reduceToSingleString(output, base, braces, level, arrayish, value);
+        // Node's output budget: clamp depth once ~2^27 chars accumulate at one
+        // indentation level so huge objects cannot OOM the isolate.
+        const budget = ictx.budget[ictx.indentationLvl] || 0;
+        const newLength = budget + res.length;
+        ictx.budget[ictx.indentationLvl] = newLength;
+        if (newLength > 2 ** 27) depth = -1;
+        return res;
+      }
+      function collapsed(v) {
+        // Depth-limit collapse text (Node getCtxStyle bracket form).
+        if (Object.getPrototypeOf(v) === null) {
+          const cn = natives.getConstructorName(v) || "Object";
+          return Reflect.ownKeys(v).length === 0
+            ? `[${cn}: null prototype] {}`
+            : `[${cn}: null prototype]`;
+        }
+        const cn = safeCtorName(v);
+        if (Array.isArray(v)) return stylize(cn && cn !== "Array" ? `[${cn}]` : "[Array]", "special");
+        return stylize(cn && cn !== "Object" ? `[${cn}]` : "[Object]", "special");
+      }
+      function formatGetterPrimitive(tmp) {
+        // Node formatPrimitive reached from a getter invocation. Anything that
+        // is not a listed primitive falls into Symbol.prototype.toString and
+        // throws -- exactly like Node (the caller's catch renders it).
+        if (typeof tmp === "string") return formatString(tmp);
+        if (typeof tmp === "number") return stylize(Object.is(tmp, -0) ? "-0" : String(tmp), "number");
+        if (typeof tmp === "bigint") return stylize(`${tmp}n`, "bigint");
+        if (typeof tmp === "boolean") return stylize(String(tmp), "boolean");
+        if (typeof tmp === "undefined") return stylize("undefined", "undefined");
+        return stylize(Symbol.prototype.toString.call(tmp), "symbol");
+      }
+      function formatProperty(owner, key, desc, level, arrayElem, receiver) {
+        // Port of Node formatProperty. `level` is the level the value walks at
+        // (owner+1 for own props, owner level for prototype props).
+        let str;
+        desc = desc || Object.getOwnPropertyDescriptor(owner, key) || { value: owner[key], enumerable: true };
+        if (desc.value !== undefined) {
+          ictx.indentationLvl += 2;
+          str = walk(desc.value, level);
+          ictx.indentationLvl -= 2;
+        } else if (desc.get !== undefined) {
+          const label = desc.set !== undefined ? "Getter/Setter" : "Getter";
+          const wantInvoke =
+            getters === true ||
+            (getters === "get" && desc.set === undefined) ||
+            (getters === "set" && desc.set !== undefined);
+          if (getters && wantInvoke) {
+            try {
+              const tmp = desc.get.call(receiver);
+              ictx.indentationLvl += 2;
+              if (tmp === null) {
+                str = `${stylize(`[${label}:`, "special")} ${stylize("null", "null")}${stylize("]", "special")}`;
+              } else if (typeof tmp === "object") {
+                str = `${stylize(`[${label}]`, "special")} ${walk(tmp, level)}`;
+              } else {
+                const primitive = formatGetterPrimitive(tmp);
+                str = `${stylize(`[${label}:`, "special")} ${primitive}${stylize("]", "special")}`;
+              }
+              ictx.indentationLvl -= 2;
+            } catch (err) {
+              str = `${stylize(`[${label}:`, "special")} <Inspection threw (${err.message})>${stylize("]", "special")}`;
+            }
+          } else {
+            str = stylize(`[${label}]`, "special");
+          }
+        } else if (desc.set !== undefined) {
+          str = stylize("[Setter]", "special");
+        } else {
+          str = stylize("undefined", "undefined");
+        }
+        if (arrayElem) return str;
+        let name;
+        if (typeof key === "symbol") {
+          name = `[${stylize(key.toString(), "symbol")}]`;
+        } else if (key === "__proto__") {
+          name = "['__proto__']";
+        } else if (desc.enumerable === false) {
+          name = `[${key}]`;
+        } else if (identKeyRe.test(key)) {
+          name = key;
+        } else {
+          name = stylize(strEscape(key), "string");
+        }
+        return `${name}: ${str}`;
+      }
+      function addProtoProps(main, obj, level, out) {
+        // Port of Node addPrototypeProperties: pull non-function properties
+        // (accessors and data) from up to three user prototype layers.
+        let layer = 0;
+        let keys = null;
+        let keySet = null;
+        do {
+          if (layer !== 0 || main === obj) {
+            obj = Object.getPrototypeOf(obj);
+            if (obj === null) return;
+            const d = Object.getOwnPropertyDescriptor(obj, "constructor");
+            if (d !== undefined && typeof d.value === "function" && builtInObjects.has(d.value.name)) {
+              return;
+            }
+          }
+          if (layer === 0) {
+            keySet = new Set();
+          } else {
+            for (const k of keys) keySet.add(k);
+          }
+          keys = Reflect.ownKeys(obj);
+          seen.push(main);
+          for (const key of keys) {
+            if (
+              key === "constructor" ||
+              Object.prototype.hasOwnProperty.call(main, key) ||
+              (layer !== 0 && keySet.has(key))
+            ) {
+              continue;
+            }
+            const desc = Object.getOwnPropertyDescriptor(obj, key);
+            if (typeof desc.value === "function") continue;
+            const entry = formatProperty(obj, key, desc, level, false, main);
+            if (options.colors) out.push(`\u001b[2m${entry}\u001b[22m`);
+            else out.push(entry);
+          }
+          seen.pop();
+        } while (++layer !== 3);
+      }
+      function protoPropsFor(v, level) {
+        if (!showHidden || (depth !== null && level > depth)) return undefined;
+        // Node getConstructorName side effect: locate the constructor layer,
+        // then collect prototype properties unless it is a direct built-in.
+        const out = [];
+        let obj = v;
+        let firstProto;
+        while (obj) {
+          const d = Object.getOwnPropertyDescriptor(obj, "constructor");
+          if (d !== undefined && typeof d.value === "function" && d.value.name !== "") {
+            let isInst = false;
+            try {
+              isInst = v instanceof d.value;
+            } catch {
+              // Keep walking.
+            }
+            if (isInst) {
+              if (firstProto !== obj || !builtInObjects.has(d.value.name)) {
+                addProtoProps(v, firstProto || v, level, out);
+              }
+              break;
+            }
+          }
+          obj = Object.getPrototypeOf(obj);
+          if (firstProto === undefined) firstProto = obj;
+        }
+        return out.length > 0 ? out : undefined;
+      }
+      function entriesTail(v, keys, base, level) {
+        seen.push(v);
+        ictx.currentDepth = level + 1;
+        const items = [];
+        try {
+          for (const k of keys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+        } finally {
+          seen.pop();
+        }
+        return reduce(items, refPrefix(v, base), ["{", "}"], level + 1, false, v);
+      }
+      function formatFunction(v, level) {
+        let sig = "";
+        try {
+          sig = Function.prototype.toString.call(v);
+        } catch {
+          // Exotic callables: fall through to the [Function ...] base.
+        }
+        let base = null;
+        if (sig.startsWith("class") && sig.endsWith("}")) {
+          const body = sig.slice(5, -1);
+          const braceIdx = body.indexOf("{");
+          if (braceIdx !== -1 && !body.slice(0, braceIdx).includes("(")) {
+            const hasName = Object.prototype.hasOwnProperty.call(v, "name");
+            const name = (hasName && v.name) || "(anonymous)";
+            let text = `class ${name}`;
+            const superCls = Object.getPrototypeOf(v);
+            if (superCls && superCls.name) text += ` extends ${superCls.name}`;
+            base = `[${text}]`;
+          }
+        }
+        if (base === null) {
+          let type = "Function";
+          try {
+            const proto = Object.getPrototypeOf(v);
+            const d = proto && Object.getOwnPropertyDescriptor(proto, "constructor");
+            const pcn = d && typeof d.value === "function" ? d.value.name : undefined;
+            if (pcn === "AsyncFunction" || pcn === "GeneratorFunction" || pcn === "AsyncGeneratorFunction") {
+              type = pcn;
+            }
+          } catch {
+            // Function base stays plain.
+          }
+          base = v.name ? `[${type}: ${v.name}]` : `[${type} (anonymous)]`;
+        }
+        const keys = getKeys(v, showHidden);
+        if (keys.length === 0) return stylize(base, "special");
+        if (depth !== null && level > depth) return stylize("[Function]", "special");
+        return entriesTail(v, keys, base, level);
+      }
 
       function walk(v, level) {
         if (v === null) return stylize("null", "null");
         const t = typeof v;
-        if (t === "string") return stylize(level === 0 && options.bare ? v : `'${v}'`, "string");
+        if (t === "string") {
+          return level === 0 && options.bare ? stylize(v, "string") : formatString(v);
+        }
         if (t === "number") return stylize(Object.is(v, -0) ? "-0" : String(v), "number");
         if (t === "boolean") return stylize(String(v), "boolean");
         if (t === "undefined") return stylize("undefined", "undefined");
         if (t === "bigint") return stylize(`${v}n`, "bigint");
         if (t === "symbol") return stylize(v.toString(), "symbol");
-        if (t === "function") {
-          const name = v.name ? `: ${v.name}` : " (anonymous)";
-          const kind = String(v).startsWith("class") ? "class" : "Function";
-          return `[${kind}${name}]`;
-        }
+        // ---------------- object-like values from here on ----------------
+        if (seen.includes(v)) return markCircular(v);
+        if (t === "function") return formatFunction(v, level);
         if (v instanceof Date) {
-          return Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+          const base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+          const keys = getKeys(v, showHidden);
+          if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
+          return entriesTail(v, keys, stylize(base, "date"), level);
         }
-        if (v instanceof RegExp) return v.toString();
-        if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
+        if (v instanceof RegExp) {
+          const base = stylize(v.toString(), "regexp");
+          const keys = getKeys(v, showHidden);
+          if (keys.length === 0 || (depth !== null && level > depth)) return base;
+          return entriesTail(v, keys, base, level);
+        }
+        if (v instanceof Error) {
+          let base;
+          try {
+            base = v.stack ? String(v.stack) : Error.prototype.toString.call(v);
+          } catch {
+            base = "[Error]";
+          }
+          let msg;
+          try {
+            msg = v.message;
+          } catch {
+            msg = undefined;
+          }
+          // Node wraps the render in brackets when the stack carries no
+          // call-frame lines (searching past the message).
+          let pos = (msg && base.indexOf(msg)) || -1;
+          if (pos !== -1) pos += msg.length;
+          if (base.indexOf("\n    at", pos) === -1) base = `[${base}]`;
+          // Nested errors get their stack lines indented (Node formatError).
+          if (ictx.indentationLvl !== 0) {
+            base = base.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+          }
+          let keys = getKeys(v, showHidden);
+          if (!showHidden && keys.length !== 0) {
+            // Node removeDuplicateErrorKeys: hide stack/message/name entries
+            // already mirrored in the stack render.
+            keys = keys.filter((k) => {
+              if (k === "stack") return false;
+              if (k === "message" || k === "name") {
+                try {
+                  const val = v[k];
+                  return typeof val === "string" && !base.includes(val);
+                } catch {
+                  return true;
+                }
+              }
+              return true;
+            });
+          }
+          if (keys.length === 0) return base;
+          if (depth !== null && level > depth) {
+            return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
+          }
+          return entriesTail(v, keys, base, level);
+        }
         if (globalThis.Buffer && v instanceof globalThis.Buffer) {
           // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
           // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
@@ -3706,27 +4246,27 @@
           for (let i = 0; i < bytes.length; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
           return `${label} { [Uint8Contents]: <${hex}>, [byteLength]: ${v.byteLength} }`;
         }
-        if (seen.has(v)) return "[Circular *1]";
-        if (depth !== null && level > depth) {
-          if (Array.isArray(v)) return "[Array]";
-          // Node tags a depth-collapsed null-prototype object specially; an
-          // empty one still shows its braces ("[Object: null prototype] {}").
-          if (Object.getPrototypeOf(v) === null) {
-            const cn = natives.getConstructorName(v) || "Object";
-            return Reflect.ownKeys(v).length === 0
-              ? `[${cn}: null prototype] {}`
-              : `[${cn}: null prototype]`;
+        if (Array.isArray(v)) {
+          // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
+          const cn = safeCtorName(v);
+          const prefix = cn && cn !== "Array" ? `${cn}(${v.length}) ` : "";
+          // Non-index own keys; showHidden adds non-enumerables ([length]).
+          const extraKeys = [];
+          for (const k of Reflect.ownKeys(v)) {
+            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
+            if (!showHidden) {
+              const d = Object.getOwnPropertyDescriptor(v, k);
+              if (!d || !d.enumerable) continue;
+            }
+            extraKeys.push(k);
           }
-          return "[Object]";
-        }
-        seen.add(v);
-        try {
-          if (Array.isArray(v)) {
-            // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
-            const aCtor = v.constructor && v.constructor.name;
-            const aPrefix = aCtor && aCtor !== "Array" ? `${aCtor}(${v.length}) ` : "";
-            const max = 100;
-            const items = [];
+          const protoProps = protoPropsFor(v, level);
+          if (v.length === 0 && extraKeys.length === 0 && protoProps === undefined) return `${prefix}[]`;
+          if (depth !== null && level > depth) return collapsed(v);
+          seen.push(v);
+          ictx.currentDepth = level + 1;
+          const items = [];
+          try {
             let emptyRun = 0;
             const flushEmpty = () => {
               if (emptyRun > 0) {
@@ -3734,81 +4274,100 @@
                 emptyRun = 0;
               }
             };
-            const limit = Math.min(v.length, max);
+            const limit = Math.min(v.length, maxArrayLength);
             for (let idx = 0; idx < limit; idx++) {
               // A hole (sparse) is rendered as a coalesced "<N empty items>" run.
-              if (!Object.prototype.hasOwnProperty.call(v, idx)) { emptyRun++; continue; }
+              const d = Object.getOwnPropertyDescriptor(v, idx);
+              if (d === undefined) {
+                emptyRun++;
+                continue;
+              }
               flushEmpty();
-              items.push(walk(v[idx], level + 1));
+              items.push(formatProperty(v, idx, d, level + 1, true, v));
             }
             flushEmpty();
-            if (v.length > max) items.push(`... ${v.length - max} more items`);
-            // Trailing non-index own enumerable props (string + symbol).
-            for (const k of Reflect.ownKeys(v)) {
-              if (k === "length") continue;
-              if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < v.length) continue;
-              const d = Object.getOwnPropertyDescriptor(v, k);
-              if (!d || !d.enumerable) continue;
-              const kt = typeof k === "symbol"
-                ? `[${k.toString()}]`
-                : /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : `'${k}'`;
-              items.push(`${kt}: ${d.get ? "[Getter]" : walk(v[k], level + 1)}`);
+            if (v.length > limit) {
+              const remaining = v.length - limit;
+              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
             }
-            return items.length === 0 ? `${aPrefix}[]` : `${aPrefix}[ ${items.join(", ")} ]`;
+            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+            if (protoProps !== undefined) items.push(...protoProps);
+          } finally {
+            seen.pop();
           }
-          if (v instanceof Map) {
-            const items = [];
+          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v);
+        }
+        if (v instanceof Map) {
+          const cn = safeCtorName(v);
+          const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
+          if (v.size === 0) return `${prefix}{}`;
+          if (depth !== null && level > depth) return collapsed(v);
+          seen.push(v);
+          ictx.currentDepth = level + 1;
+          const items = [];
+          ictx.indentationLvl += 2;
+          try {
             for (const [k, val] of v) {
               items.push(`${walk(k, level + 1)} => ${walk(val, level + 1)}`);
-              if (items.length >= 100) break;
             }
-            return `Map(${v.size}) { ${items.join(", ")} }`;
+          } finally {
+            ictx.indentationLvl -= 2;
+            seen.pop();
           }
-          if (v instanceof Set) {
-            const items = [];
-            for (const val of v) {
-              items.push(walk(val, level + 1));
-              if (items.length >= 100) break;
-            }
-            return `Set(${v.size}) { ${items.join(", ")} }`;
-          }
-          if (ArrayBuffer.isView(v)) {
-            const name = v.constructor?.name ?? "TypedArray";
-            const items = Array.from(v.subarray ? v.subarray(0, 50) : []).join(", ");
-            const taLen = v.length ?? v.byteLength;
-            return items.length === 0 ? `${name}(${taLen}) []` : `${name}(${taLen}) [ ${items} ]`;
-          }
-          let prefix;
-          if (Object.getPrototypeOf(v) === null) {
-            // V8 GetConstructorName recovers the original ctor ("Foo") even after
-            // the prototype was nulled (Node "[Foo: null prototype]").
-            const cn = natives.getConstructorName(v) || "Object";
-            prefix = `[${cn}: null prototype] `;
-          } else {
-            const ctor = v.constructor?.name;
-            prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
-          }
-          const keys = Reflect.ownKeys(v).filter(
-            (k) => Object.getOwnPropertyDescriptor(v, k)?.enumerable,
-          );
-          if (keys.length === 0) return `${prefix}{}`;
-          const items = keys.slice(0, 200).map((k) => {
-            const keyText =
-              typeof k === "symbol"
-                ? `[${k.toString()}]`
-                : /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)
-                  ? k
-                  : `'${k}'`;
-            const desc = Object.getOwnPropertyDescriptor(v, k);
-            const valText = desc.get
-              ? "[Getter]"
-              : walk(v[k], level + 1);
-            return `${keyText}: ${valText}`;
-          });
-          return `${prefix}{ ${items.join(", ")} }`;
-        } finally {
-          seen.delete(v);
+          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
         }
+        if (v instanceof Set) {
+          const cn = safeCtorName(v);
+          const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
+          if (v.size === 0) return `${prefix}{}`;
+          if (depth !== null && level > depth) return collapsed(v);
+          seen.push(v);
+          ictx.currentDepth = level + 1;
+          const items = [];
+          ictx.indentationLvl += 2;
+          try {
+            for (const val of v) items.push(walk(val, level + 1));
+          } finally {
+            ictx.indentationLvl -= 2;
+            seen.pop();
+          }
+          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        }
+        if (ArrayBuffer.isView(v)) {
+          if (depth !== null && level > depth) return collapsed(v);
+          const name = v.constructor?.name ?? "TypedArray";
+          const items = Array.from(v.subarray ? v.subarray(0, 50) : []).join(", ");
+          const taLen = v.length ?? v.byteLength;
+          return items.length === 0 ? `${name}(${taLen}) []` : `${name}(${taLen}) [ ${items} ]`;
+        }
+        // Plain objects, class instances, null-prototype objects, and the
+        // remaining object-shaped values (WeakMap/WeakSet/Promise/boxed).
+        let prefix;
+        let nullProto = false;
+        if (Object.getPrototypeOf(v) === null) {
+          // V8 GetConstructorName recovers the original ctor ("Foo") even after
+          // the prototype was nulled (Node "[Foo: null prototype]").
+          const cn = natives.getConstructorName(v) || "Object";
+          prefix = `[${cn}: null prototype] `;
+          nullProto = true;
+        } else {
+          const ctor = safeCtorName(v);
+          prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
+        }
+        const keys = getKeys(v, showHidden);
+        const protoProps = nullProto ? undefined : protoPropsFor(v, level);
+        if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
+        if (depth !== null && level > depth) return collapsed(v);
+        seen.push(v);
+        ictx.currentDepth = level + 1;
+        const items = [];
+        try {
+          for (const k of keys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+          if (protoProps !== undefined) items.push(...protoProps);
+        } finally {
+          seen.pop();
+        }
+        return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
       }
       return walk(value, 0);
     }
@@ -3879,6 +4438,32 @@
       return inspect(v);
     }
 
+    // Node tryStringify: %j narrows its catch to circular-structure
+    // TypeErrors (matched by first message line against a probe) and
+    // rethrows everything else (e.g. a throwing toJSON, BigInt).
+    let circularErrorMessage;
+    const firstErrorLine = (err) =>
+      err && err.message !== undefined ? String(err.message).split("\n", 1)[0] : "";
+    function tryStringify(arg) {
+      try {
+        return JSON.stringify(arg);
+      } catch (err) {
+        if (circularErrorMessage === undefined) {
+          try {
+            const a = {};
+            a.a = a;
+            JSON.stringify(a);
+          } catch (circularError) {
+            circularErrorMessage = firstErrorLine(circularError);
+          }
+        }
+        if (err && err.name === "TypeError" && firstErrorLine(err) === circularErrorMessage) {
+          return "[Circular]";
+        }
+        throw err;
+      }
+    }
+
     function format(f, ...args) {
       _fmtOpts = inspect.defaultOptions;
       // util.format() with no arguments returns '' (Node parity).
@@ -3894,7 +4479,7 @@
       // returned verbatim ('%%' stays '%%').
       if (args.length === 0) return f;
       let i = 0;
-      let out = f.replace(/%[sdifjoO%]/g, (spec) => {
+      let out = f.replace(/%[sdifjoOc%]/g, (spec) => {
         if (spec === "%%") return "%";
         if (i >= args.length) return spec;
         const arg = args[i++];
@@ -3916,7 +4501,7 @@
                 (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || arg instanceof Date);
             }
             if (!builtIn) return String(arg);
-            return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, bare: true });
+            return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, compact: 3, bare: true });
           }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
@@ -3928,14 +4513,16 @@
             if (typeof arg === "symbol") return "NaN";
             return maybeSep(numToStr(parseFloat(arg)));
           case "%j":
-            try {
-              return JSON.stringify(arg);
-            } catch {
-              return "[Circular]";
-            }
+            return tryStringify(arg);
           case "%o":
+            // Node %o: showHidden + showProxy at depth 4 regardless of the
+            // surrounding inspect options.
+            return inspect(arg, { ..._fmtOpts, showHidden: true, showProxy: true, depth: 4 });
           case "%O":
             return inspect(arg, _fmtOpts);
+          case "%c":
+            // console.spec %c (CSS directive): consumes the arg, renders nothing.
+            return "";
           default:
             return spec;
         }
@@ -7292,13 +7879,9 @@
       loadEnvFile: function loadEnvFile(path) {
         var fs = registry.get("fs");
         var envPath = path || ".env";
-        var text;
-        try { text = fs.readFileSync(envPath, "utf8"); }
-        catch (e) {
-          var err = new Error("Cannot find env file: " + envPath);
-          err.code = "ERR_ENV_FILE_NOT_FOUND";
-          throw err;
-        }
+        // A missing file throws the plain fs ENOENT system error, not a
+        // wrapped ERR_ENV_FILE_NOT_FOUND (probe-verified against node v22).
+        var text = fs.readFileSync(envPath, "utf8");
         // Same dotenv parser as util.parseEnv (Node routes both through
         // node_dotenv.cc). Real env vars win: node v22 loadEnvFile does NOT
         // overwrite keys already present (probe-verified). Presence check
@@ -8662,10 +9245,48 @@
         if (typeof this.hostname !== "string") this.hostname = "";
         const hostname = this.hostname;
         const ipv6Hostname = isIpv6Hostname(hostname);
+        // Host validation, matched to the LIVE node v22.22.2 binary
+        // (battery-probed; the published lib/url.js diverges, same story as
+        // node_dotenv.cc). Rules:
+        // 1. A bracket in a NON-ipv6 hostname is a hard ERR_INVALID_URL
+        //    (spoofing: could make a non-ipv6 host read as ipv6) -- checked
+        //    BEFORE truncation, or the evidence is gone ('a[b].com' throws).
+        // 2. A well-formed ipv6 [..] hostname throws if forbidden chars sit
+        //    inside the brackets ('[127.0.0.1 c8763]' throws, '[]' is fine).
+        // 3. Everything else truncates LENIENTLY at the first invalid char,
+        //    remainder to path ('evil.com:.example.com' -> path
+        //    '/:.example.com'), with a strict post-truncation backstop.
+        const throwInvalidUrl = () => {
+          const e = new codes.ERR_INVALID_URL();
+          e.input = url;
+          throw e;
+        };
+        if (!ipv6Hostname) {
+          if (/[[\]]/.test(this.hostname)) throwInvalidUrl();
+          let cut = -1;
+          for (let i = 0; i < this.hostname.length; i++) {
+            const c = this.hostname.charCodeAt(i);
+            const valid = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+              (c >= 48 && c <= 57) || c === 46 || c === 45 || c === 43 ||
+              c === 95 || c > 127;
+            if (!valid) { cut = i; break; }
+          }
+          if (cut !== -1) {
+            rest = "/" + this.hostname.slice(cut) + rest;
+            this.hostname = this.hostname.slice(0, cut);
+          }
+        }
         if (this.hostname.length > hostnameMaxLen) {
           this.hostname = "";
         } else {
           this.hostname = this.hostname.toLowerCase();
+        }
+        if (this.hostname !== "") {
+          if (ipv6Hostname) {
+            if (/[\0\t\n\r #%/<>?@\\^|]/.test(this.hostname)) throwInvalidUrl();
+          } else if (/[\0\t\n\r #%/:<>?@[\\\]^|]/.test(this.hostname)) {
+            throwInvalidUrl();
+          }
         }
         const pp = this.port ? ":" + this.port : "";
         const h = this.hostname || "";
@@ -9001,10 +9622,26 @@
       return result;
     };
 
+    let dep0170Warned = false;
     function urlParse(url, parseQueryString, slashesDenoteHost) {
       if (url instanceof Url) return url;
       const u = new Url();
       u.parse(url, parseQueryString, slashesDenoteHost);
+      // DEP0170: the legacy parser accepted a string WHATWG rejects.
+      // Warn once per process (node dedupes deprecation warnings by code).
+      if (
+        !dep0170Warned &&
+        typeof url === "string" &&
+        typeof globalThis.URL?.canParse === "function" &&
+        !globalThis.URL.canParse(url)
+      ) {
+        dep0170Warned = true;
+        process.emitWarning(
+          `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
+          "DeprecationWarning",
+          "DEP0170",
+        );
+      }
       return u;
     }
     function urlResolve(source, relative) {
@@ -13724,14 +14361,29 @@
       _compile() {
         if (this._fn) return this._fn;
         const code = this._code;
+        // sourceURL stamps the script's filename into V8 stack frames --
+        // the closest pure-JS equivalent of a real ScriptOrigin. Node code
+        // keys behavior off vm frame filenames (e.g. the Buffer DEP0005
+        // node_modules suppression walks the stack).
+        //
+        // The filename is spliced into compiled source, so it MUST NOT be
+        // able to terminate the comment or inject code: strip every
+        // ECMAScript LineTerminator (LF, CR, U+2028, U+2029). V8 also
+        // rejects a magic comment whose value contains whitespace, which
+        // would silently void the stamp -- percent-encode those instead
+        // (frame text stays readable and the node_modules check still
+        // matches).
+        const tag = `\n//# sourceURL=${String(this._filename)
+          .replace(/[\n\r\u2028\u2029]/g, "")
+          .replace(/\s/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0"))}`;
         // Try expression form first so that 'x + 1' works without explicit
         // return.  Fall back to statement form on SyntaxError.
         try {
           // eslint-disable-next-line no-new-func
-          this._fn = new Function(`with(this){return(${code})}`);
+          this._fn = new Function(`with(this){return(${code})}${tag}`);
         } catch (_e) {
           // eslint-disable-next-line no-new-func
-          this._fn = new Function(`with(this){${code}}`);
+          this._fn = new Function(`with(this){${code}}${tag}`);
         }
         return this._fn;
       }

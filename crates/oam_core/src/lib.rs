@@ -474,6 +474,15 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
         if let Some(code) = winsock {
             return code;
         }
+        // Invalid-filename classes: Windows rejects paths with characters
+        // like '"' as ERROR_INVALID_NAME, which std leaves Uncategorized
+        // (-> EIO). libuv maps these to ENOENT. Deliberately EXCLUDES 267
+        // ERROR_DIRECTORY -- std decodes that to ErrorKind::NotADirectory,
+        // which the match below turns into ENOTDIR (node's code for
+        // readdir-on-a-file); mapping it here would regress that.
+        if let Some(123 | 161 | 206) = error.raw_os_error() {
+            return "ENOENT";
+        }
     }
     match error.kind() {
         ErrorKind::NotFound => "ENOENT",

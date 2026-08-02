@@ -3,6 +3,11 @@
 *.pdb
 .DS_Store
 node_modules/
+# ...except vendored Node test fixtures: the corpus ships packages under a
+# literal node_modules/ dir (warning_node_modules asserts DEP0005 is
+# suppressed for callers inside one), and those files MUST be committed.
+!conformance/vendor/node/test/fixtures/**/node_modules/
+!conformance/vendor/node/test/fixtures/**/node_modules/**
 /tests/wpt/checkout/
 /bench/results/local/
 /bench/sdk-fixtures/

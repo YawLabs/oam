@@ -229,6 +229,110 @@ fn main() -> ExitCode {
         return run_embedded(&source, bytecode, std::env::args().collect());
     }
 
+    // Node-style top-level flags, intercepted before clap (they are not
+    // subcommands): `oam [-flags] -e <code>` / `--eval`, `-p` / `--print`,
+    // and `oam --pending-deprecation <script>` (bare-script, node argv
+    // shape). Suite children spawn process.execPath with these shapes --
+    // the compat surface that unblocks spawnPromisified-shaped tests.
+    {
+        let raw: Vec<String> = std::env::args().collect();
+        let mut i = 1;
+        let mut pending_deprecation = false;
+        // Node accepts eval flags in any order and in several spellings:
+        // `-e code`, `--eval code`, `--eval=code`, `-p code`, `-pe code`
+        // (bundled: print + eval), and `-p -e code`. print and eval compose;
+        // a later source wins. Leading node-level flags may precede them.
+        let mut print = false;
+        let mut eval_source: Option<String> = None;
+        let mut saw_eval_flag = false;
+        let mut bad_flag: Option<&str> = None;
+        while i < raw.len() {
+            let arg = raw[i].as_str();
+            if arg == "--pending-deprecation" {
+                pending_deprecation = true;
+                i += 1;
+            } else if let Some(v) = arg.strip_prefix("--eval=") {
+                saw_eval_flag = true;
+                eval_source = Some(v.to_string());
+                i += 1;
+            } else if let Some(v) = arg.strip_prefix("--print=") {
+                saw_eval_flag = true;
+                print = true;
+                eval_source = Some(v.to_string());
+                i += 1;
+            } else if matches!(arg, "-e" | "--eval" | "-p" | "--print" | "-pe" | "-ep") {
+                saw_eval_flag = true;
+                if arg != "-e" && arg != "--eval" {
+                    print = true;
+                }
+                // -p alone may still be followed by -e; a source consumes.
+                if matches!(arg, "-e" | "--eval" | "-pe" | "-ep") || raw.len() > i + 1 {
+                    match raw.get(i + 1) {
+                        Some(next)
+                            if !matches!(
+                                next.as_str(),
+                                "-e" | "--eval" | "-p" | "--print" | "-pe" | "-ep"
+                            ) =>
+                        {
+                            eval_source = Some(next.clone());
+                            i += 2;
+                        }
+                        Some(_) => i += 1, // another eval flag follows
+                        None => {
+                            bad_flag = Some(if print { "-p" } else { "-e" });
+                            i += 1;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+                if eval_source.is_some() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if let Some(source) = eval_source {
+            return run_eval(&source, print, &raw[i..], pending_deprecation);
+        }
+        if saw_eval_flag {
+            // Node: `-e` with no code exits 9; bare `-p` reads stdin, which
+            // oam does not implement -- report rather than silently hang.
+            let f = bad_flag.unwrap_or("-e");
+            eprintln!(
+                "oam: {f} requires an argument (reading the program from stdin is not supported)"
+            );
+            return ExitCode::from(9);
+        }
+        if i < raw.len() {
+            let flag = raw[i].as_str();
+            // Bare-script node shape, only when a node flag preceded it AND
+            // the argument is an existing file (plain `oam <file>` stays a
+            // clap error pointing at `oam run`). Combining node flags with
+            // oam subcommands (`oam --pending-deprecation run x`) is
+            // unsupported -- clap reports the unknown flag.
+            if pending_deprecation && !flag.starts_with('-') && Path::new(flag).is_file() {
+                let file = PathBuf::from(flag);
+                return match run_file_with_flags(
+                    &file,
+                    &raw[i + 1..],
+                    None,
+                    oam_engine::ReplayMode::Off,
+                    pending_deprecation,
+                ) {
+                    Ok(code) => ExitCode::from(code),
+                    Err((diagnostics, code)) => {
+                        for d in &diagnostics {
+                            render(d, false);
+                        }
+                        ExitCode::from(code)
+                    }
+                };
+            }
+        }
+    }
+
     let cli = Cli::parse();
     let Some(command) = &cli.command else {
         return repl_command();
@@ -1492,6 +1596,16 @@ fn run_file(
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
 ) -> Result<u8, (Vec<Diagnostic>, u8)> {
+    run_file_with_flags(file, script_args, inspect, replay_mode, false)
+}
+
+fn run_file_with_flags(
+    file: &Path,
+    script_args: &[String],
+    inspect: Option<(std::net::SocketAddr, bool)>,
+    replay_mode: oam_engine::ReplayMode,
+    pending_deprecation: bool,
+) -> Result<u8, (Vec<Diagnostic>, u8)> {
     if let Some("json") = file.extension().and_then(|e| e.to_str()) {
         return Err(err_exit(vec![Diagnostic::new(
             "OAM-MOD0003",
@@ -1540,6 +1654,8 @@ fn run_file(
             }
         }
     }
+
+    set_pending_deprecation(&mut rt, pending_deprecation);
 
     // Entry routing follows module kind: .cjs (or "type": "commonjs"
     // project .js) runs as a CJS program through interop; everything else
@@ -1672,6 +1788,141 @@ fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
 /// Execute embedded JS source as a CJS script (the typical output of
 /// esbuild/rollup --format=cjs). Supports `--inspect` / `--inspect-brk`
 /// flags for debugging the compiled binary.
+/// `oam -e <code>` / `oam -p <code>`: evaluate a string as a CJS program,
+/// Node-shaped. The source runs from a file named `[eval]` inside the CWD
+/// so require() resolves relative paths and node_modules from the CWD the
+/// way node's eval does; -p prints the completion value via console.log.
+/// process.argv = [exe, ...extra] (node omits a script-path slot for eval).
+/// Falls back to a temp dir when the CWD is not writable (read-only mount,
+/// sandbox) -- require() resolution then roots at that temp dir.
+/// Install the pending-deprecation switch. Honors node's
+/// NODE_PENDING_DEPRECATION env var as well as the CLI flag, and defines the
+/// marker NON-ENUMERABLE: node's own test/common leaked-globals check walks
+/// enumerable globals and would flag it.
+fn set_pending_deprecation(rt: &mut oam_engine::JsRuntime, flag: bool) {
+    let env_on = std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
+    if !flag && !env_on {
+        return;
+    }
+    let _ = rt.execute_script(
+        "<flags>",
+        "Object.defineProperty(globalThis, '__oamPendingDeprecation', \
+           { value: true, writable: false, enumerable: false, configurable: false });",
+    );
+}
+
+/// Remove the eval source file (and its temp dir, when the CWD was not
+/// writable). Best-effort: a `process.exit()` inside the eval terminates the
+/// process before this runs, so the CWD file name carries the pid and a
+/// stale-file sweep is not attempted.
+fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
+    match tmp_dir {
+        Some(dir) => {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        None => {
+            let _ = std::fs::remove_file(tmp_file);
+        }
+    }
+}
+
+fn run_eval(
+    source: &str,
+    print: bool,
+    extra_args: &[String],
+    pending_deprecation: bool,
+) -> ExitCode {
+    // Node's eval module resolves from CWD; oam executes a real file, so
+    // place it in the CWD (unique name, cleaned up below).
+    let cwd_candidate = std::env::current_dir()
+        .ok()
+        .map(|d| d.join(format!(".oam-eval-{}.cjs", std::process::id())));
+    let (tmp_dir, tmp_file) = match cwd_candidate {
+        Some(p) if std::fs::write(&p, "").is_ok() => (None, p),
+        _ => {
+            let dir = std::env::temp_dir().join(format!("oam-eval-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create eval temp dir");
+            let file = dir.join("__oam_eval.cjs");
+            (Some(dir), file)
+        }
+    };
+    // -p evaluates through INDIRECT eval, which yields the completion value
+    // of a statement list the way node's script evaluation does
+    // (`-p "a(); b"` prints b). A plain expression works identically. The
+    // user source stays the FIRST thing in the file so a leading
+    // 'use strict' keeps its directive-prologue position and line numbers
+    // are not shifted; the builtin-globals prelude runs separately, before
+    // this file (see EVAL_PRELUDE at the call site).
+    let body = if print {
+        format!(
+            "console.log((0, eval)({}));\n",
+            serde_json::to_string(source).expect("encode eval source")
+        )
+    } else {
+        source.to_string()
+    };
+    std::fs::write(&tmp_file, body).expect("write eval source to temp");
+
+    let mut rt = oam_engine::JsRuntime::new();
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "oam".to_string());
+    let mut argv = vec![exe];
+    argv.extend(extra_args.iter().cloned());
+    rt.set_process_argv(argv);
+    // Node's eval context exposes builtin modules as lazy globals
+    // (addBuiltinLibsToObject): `oam -e "url.parse(...)"` works bare, and
+    // assignment overrides the getter. Sub-path builtins (timers/promises),
+    // '_'-prefixed legacy aliases, and existing globals are skipped. Runs
+    // as its own script so the user source keeps prologue position.
+    // Sourced from the builtin registry, NOT require(): this runs as a bare
+    // script (no CJS scope), and it must run before the user source so the
+    // globals exist without displacing the source's directive prologue.
+    const EVAL_PRELUDE: &str = "(function () {\n  var reg = globalThis.__oamNode;\n  if (!reg || !reg.factories || typeof reg.get !== 'function') return;\n  var names = Object.keys(reg.factories);\n  for (var i = 0; i < names.length; i++) (function (n) {\n    if (n.indexOf('/') !== -1 || n.charAt(0) === '_' || n === 'module' || n in globalThis) return;\n    Object.defineProperty(globalThis, n, {\n      configurable: true, enumerable: false,\n      get: function () {\n        var v = reg.get(n);\n        Object.defineProperty(globalThis, n, { configurable: true, enumerable: false, writable: true, value: v });\n        return v;\n      },\n      set: function (v) {\n        Object.defineProperty(globalThis, n, { configurable: true, enumerable: false, writable: true, value: v });\n      },\n    });\n  })(names[i]);\n})();\n";
+    let _ = rt.execute_script("<eval-prelude>", EVAL_PRELUDE);
+    // execArgv carries the node flags (suite children re-spawn with
+    // [...process.execArgv, ...]); the eval source itself is not included.
+    if pending_deprecation {
+        let _ = rt.execute_script(
+            "<flags>",
+            "globalThis.process.execArgv = ['--pending-deprecation'];",
+        );
+    }
+    set_pending_deprecation(&mut rt, pending_deprecation);
+
+    let result = rt.execute_cjs(&tmp_file);
+    cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
+    // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
+    // fatal forces 1 + honors exit-handler mutations.
+    match result {
+        Ok(()) => {
+            rt.emit_process_exit();
+            ExitCode::from(rt.process_exit_code().unwrap_or(0).clamp(0, 255) as u8)
+        }
+        Err(diagnostics) => {
+            for d in &diagnostics {
+                render(d, false);
+            }
+            let sub_code = rt
+                .execute_script(
+                    "<fatal-sub-code>",
+                    "String((globalThis.process && globalThis.process.__oamFatalCode) || '')",
+                )
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok());
+            if let Some(code) = sub_code {
+                return ExitCode::from(code);
+            }
+            let _ = rt.execute_script(
+                "<fatal-exit-code>",
+                "(function () { var p = globalThis.process; if (p) { p.exitCode = 1; } })();",
+            );
+            rt.emit_process_exit();
+            ExitCode::from(rt.process_exit_code().unwrap_or(1).clamp(0, 255) as u8)
+        }
+    }
+}
+
 fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> ExitCode {
     // Parse --inspect / --inspect-brk from raw args (we bypass clap for
     // embedded binaries so the user's positional args pass through).

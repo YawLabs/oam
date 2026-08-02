@@ -1433,11 +1433,26 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
             // setTimeout now returns Node's Timeout OBJECT (with
             // ref/unref/hasRef/Symbol.dispose), not a bare numeric id, so the
             // REPL inspects the handle. Node's REPL prints a Timeout object
-            // here too; the field set is oam's.
-            "Timeout { _kind: 'Timeout', _repeat: false, _delay: 40, _args: [], \
-             _origCallback: [Function (anonymous)], _onTimeout: [Function (anonymous)], \
-             _domain: null, _ref: true, _destroyed: false, \
-             _idleTimeout: 40, _id: 1 }",
+            // here too; the field set is oam's. util.inspect now carries
+            // Node's reduceToSingleString layout, and this object exceeds
+            // breakLength (80), so it renders one property per line exactly
+            // like node v22.22.2 does for the same field set (probe:
+            // inspecting an object with these keys/values under node prints
+            // the identical multiline shape). The REPL harness trims each
+            // line, so the pinned entries are indent-free.
+            "Timeout {",
+            "_kind: 'Timeout',",
+            "_repeat: false,",
+            "_delay: 40,",
+            "_args: [],",
+            "_origCallback: [Function (anonymous)],",
+            "_onTimeout: [Function (anonymous)],",
+            "_domain: null,",
+            "_ref: true,",
+            "_destroyed: false,",
+            "_idleTimeout: 40,",
+            "_id: 1",
+            "}",
             "background fired", // fired while AWAITING the next line — live loop
             "'timer-live'",
         ],
@@ -7602,10 +7617,12 @@ console.log('report_type=' + typeof process.report);
 console.log('report_getReport=' + typeof process.report.getReport);
 console.log('report_obj=' + (typeof process.report.getReport() === 'object'));
 
-// Missing .env throws
+// Missing .env throws the plain fs ENOENT system error, matching node
+// v22.22.2 (probe: node's process.loadEnvFile('nonexistent.env') throws
+// code 'ENOENT', not a wrapped ERR_ENV_FILE_NOT_FOUND).
 let threw = false;
 try { process.loadEnvFile('nonexistent.env'); }
-catch (e) { threw = e.code === 'ERR_ENV_FILE_NOT_FOUND'; }
+catch (e) { threw = e.code === 'ENOENT'; }
 console.log('missing_throws=' + threw);
 
 // util.getSystemErrorName
