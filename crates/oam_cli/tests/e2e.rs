@@ -8866,15 +8866,18 @@ console.log('cert_verifySpkac=' + cert.verifySpkac());
 console.log('cert_static_verify=' + crypto.Certificate.verifySpkac());
 console.log('cert_exportChallenge_len=' + crypto.Certificate.exportChallenge().length);
 
-// -- process.getuid/getgid --
-console.log('getuid=' + process.getuid());
-console.log('getgid=' + process.getgid());
-console.log('geteuid=' + process.geteuid());
-console.log('getegid=' + process.getegid());
-console.log('getgroups=' + JSON.stringify(process.getgroups()));
-process.setuid(0);
-process.setgid(0);
-console.log('setuid_setgid=ok');
+// -- process POSIX identity API: functions on POSIX, absent on Windows (Node parity) --
+const idFns = ['getuid','getgid','geteuid','getegid','setuid','setgid','seteuid','setegid','getgroups','setgroups','initgroups'];
+const win = process.platform === 'win32';
+const badId = idFns.filter((f) => win ? process[f] !== undefined : typeof process[f] !== 'function');
+console.log('posix_identity=' + (badId.length === 0 ? 'ok' : 'BAD:' + badId.join(',')));
+if (win) {
+  console.log('posix_identity_calls=ok');
+} else {
+  process.setuid(0);
+  process.setgid(0);
+  console.log('posix_identity_calls=' + (typeof process.getuid() === 'number' && Array.isArray(process.getgroups()) ? 'ok' : 'BAD'));
+}
 "#,
     );
     let out = oam(&["run", file.to_str().unwrap()]);
@@ -8912,12 +8915,8 @@ console.log('setuid_setgid=ok');
         "cert_verifySpkac=false",
         "cert_static_verify=false",
         "cert_exportChallenge_len=0",
-        "getuid=0",
-        "getgid=0",
-        "geteuid=0",
-        "getegid=0",
-        "getgroups=[0]",
-        "setuid_setgid=ok",
+        "posix_identity=ok",
+        "posix_identity_calls=ok",
     ];
     let lines: Vec<&str> = stdout.trim().lines().collect();
     for (i, exp) in expected.iter().enumerate() {

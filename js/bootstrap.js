@@ -58,9 +58,14 @@
       if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
       // useCapture (boolean true) is a no-op in this non-DOM EventTarget; once only comes from options.once
       const once = options === true ? false : options?.once === true;
+      // Node-internal resist flag (events.addAbortListener, vendored stream
+      // operators): a resist-marked listener still fires after another
+      // listener called stopImmediatePropagation().
+      const resist = options !== true && options != null &&
+        options[Symbol.for("oam.kResistStopPropagation")] === true;
       const list = this._listeners.get(type) ?? [];
       if (!list.some((e) => e.fn === listener)) {
-        list.push({ fn: listener, once });
+        list.push({ fn: listener, once, resist });
         this._listeners.set(type, list);
       }
     }
@@ -73,10 +78,12 @@
       event.currentTarget = this;
       const list = (this._listeners.get(event.type) ?? []).slice();
       for (const entry of list) {
+        // Resist-marked listeners (Node's kResistStopPropagation) still run
+        // after stopImmediatePropagation; everything else is skipped.
+        if (event._stopImmediate && !entry.resist) continue;
         if (entry.once) this.removeEventListener(event.type, entry.fn);
         const handler = typeof entry.fn === "function" ? entry.fn : entry.fn.handleEvent;
         handler.call(this, event);
-        if (event._stopImmediate) break;
       }
       return !event.defaultPrevented;
     }
@@ -229,32 +236,67 @@
   globalThis.Response = Response;
 
   // ------------------------------------------------------------ structuredClone
-  // Deep-clone primitive and JSON-structured values. Does not support
-  // transferables (ArrayBuffer transfer) in this pure-JS wave; that lands
-  // with the native structured-clone op. Handles circular references via a
-  // WeakMap memo.
+  // Deep-clone primitive and JSON-structured values. ArrayBuffer transfer:
+  // spec order is serialize-then-detach, so the clone COPIES each transfer
+  // buffer while it is still readable (memo pre-seed) and detaches the
+  // sources only after the whole clone succeeds -- a moved buffer and a
+  // copied-then-detached one are indistinguishable to the caller, and a
+  // failed clone leaves every source intact. Views share their (cloned or
+  // transferred) backing buffer via the memo, like the spec's serializer.
+  // Other transferable kinds (MessagePort etc.) still throw DataCloneError
+  // in this pure-JS wave. Circular references handled via a WeakMap memo.
   if (typeof globalThis.structuredClone !== "function") {
     globalThis.structuredClone = function structuredClone(value, options) {
-      if (options && options.transfer && options.transfer.length > 0) {
-        throw new DOMException(
-          "structuredClone: transferable objects are not supported in oam wave-1",
-          "DataCloneError",
-        );
-      }
-      // Fast path: primitives and null clone as-is.
-      if (value === null || typeof value !== "object" && typeof value !== "function") return value;
       const memo = new WeakMap();
+      let transfers = null;
+      if (options && options.transfer !== undefined) {
+        // Array.from first: a Set (or any iterable) transfer list must work,
+        // not silently no-op on a missing .length.
+        transfers = Array.from(options.transfer);
+        const seen = new Set();
+        for (const t of transfers) {
+          if (t === null || typeof t !== "object") {
+            // WebIDL sequence<object>: non-object entries are a TypeError,
+            // before any transferability classification.
+            throw new TypeError("Value in the transfer list is not an object");
+          }
+          if (!(t instanceof ArrayBuffer)) {
+            throw new DOMException(
+              "structuredClone: only ArrayBuffer transferables are supported in oam wave-1",
+              "DataCloneError",
+            );
+          }
+          if (seen.has(t)) {
+            throw new DOMException("Duplicate transferable in the transfer list", "DataCloneError");
+          }
+          seen.add(t);
+          if (t.detached) {
+            throw new DOMException("Cannot transfer a detached ArrayBuffer", "DataCloneError");
+          }
+        }
+        // Copy while readable; sources detach only after the clone succeeds.
+        for (const t of transfers) memo.set(t, t.slice(0));
+      }
       function cloneInner(v) {
         if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
         if (memo.has(v)) return memo.get(v);
         if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
         if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
+          if (v.detached) {
+            throw new DOMException("Cannot clone a detached ArrayBuffer", "DataCloneError");
+          }
           const c = v.slice(0); memo.set(v, c); return c;
         }
         if (ArrayBuffer.isView(v)) {
-          const buf = v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
-          const c = new v.constructor(buf); memo.set(v, c); return c;
+          // Clone the WHOLE backing buffer through the memo so views over
+          // the same (or a transferred) buffer share one clone, preserving
+          // out.view.buffer === out.buf identity like node/the spec.
+          const buf = cloneInner(v.buffer);
+          const c = v instanceof DataView
+            ? new DataView(buf, v.byteOffset, v.byteLength)
+            : new v.constructor(buf, v.byteOffset, v.length);
+          memo.set(v, c); return c;
         }
         if (v instanceof Map) {
           const c = new Map(); memo.set(v, c);
@@ -277,7 +319,13 @@
         for (const key of Object.keys(v)) c[key] = cloneInner(v[key]);
         return c;
       }
-      return cloneInner(value);
+      // Serialize first (primitives pass through); only on success detach
+      // the transfer-list sources. A throw above leaves them intact.
+      const out = (value === null || (typeof value !== "object" && typeof value !== "function"))
+        ? value
+        : cloneInner(value);
+      if (transfers) for (const t of transfers) t.transfer();
+      return out;
     };
   }
 

@@ -118,12 +118,14 @@
   });
 
   d("internal/event_target", (require, module) => {
-    // Marker symbols consumed via listener-option objects; fresh symbols
-    // keep the shapes intact (the weak-listener optimization they gate in
-    // Node core does not exist here).
+    // Marker symbols consumed via listener-option objects. kWeak stays a
+    // fresh symbol (the weak-listener optimization it gates in Node core
+    // does not exist here); kResistStopPropagation is the SHARED registered
+    // symbol the bootstrap EventTarget honors, so vendored stream operators'
+    // resist-flagged abort listeners survive stopImmediatePropagation().
     module.exports = {
       kWeakHandler: Symbol("kWeak"),
-      kResistStopPropagation: Symbol("kResistStopPropagation"),
+      kResistStopPropagation: Symbol.for("oam.kResistStopPropagation"),
     };
   });
 

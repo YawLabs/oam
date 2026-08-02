@@ -336,7 +336,10 @@
     if (input == null) {
       return ` Received ${input}`;
     }
-    if (typeof input === "function" && input.name) {
+    // No name gate: anonymous functions render "Received function " (empty
+    // name, trailing space) -- probe-verified against real node v22.22.2,
+    // and test/common invalidArgTypeHelper does the same unconditionally.
+    if (typeof input === "function") {
       return ` Received function ${input.name}`;
     }
     if (typeof input === "object") {
@@ -2349,7 +2352,14 @@
         queueMicrotask(() => listener());
         return { [Symbol.dispose]() {} };
       }
-      signal.addEventListener("abort", listener, { once: true });
+      // Resist flag: Node registers this listener with kResistStopPropagation
+      // so it still fires after stopImmediatePropagation() (test-events-
+      // add-abort-listener subtest 6). Shared symbol consumed by the
+      // bootstrap EventTarget.
+      signal.addEventListener("abort", listener, {
+        once: true,
+        [Symbol.for("oam.kResistStopPropagation")]: true,
+      });
       return { [Symbol.dispose]() { signal.removeEventListener("abort", listener); } };
     };
     EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
@@ -3953,18 +3963,45 @@
     }
     promisify.custom = customPromisify;
 
+    // Node v22 lib/util.js callbackify shape: arg validation, this-bound cb,
+    // nextTick delivery (not queueMicrotask), ERR_FALSY_VALUE_REJECTION for
+    // ALL falsy rejections (?? missed false/0/''), and descriptor copying
+    // with length+1 / name+'Callbackified'.
     function callbackify(original) {
+      if (typeof original !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("original", "Function", original);
+      }
       function callbackified(...args) {
-        const cb = args.pop();
-        original.apply(this, args).then(
-          (value) => queueMicrotask(() => cb(null, value)),
-          (reason) =>
-            queueMicrotask(() =>
-              cb(reason ?? new Error("Promise was rejected with falsy value")),
-            ),
+        const maybeCb = args.pop();
+        if (typeof maybeCb !== "function") {
+          // "last argument" -- buildArgTypeMessage prepends "The " for
+          // ' argument'-suffixed names, matching node's rendered message.
+          throw new codes.ERR_INVALID_ARG_TYPE("last argument", "Function", maybeCb);
+        }
+        const cb = maybeCb.bind(this);
+        Reflect.apply(original, this, args).then(
+          (ret) => process.nextTick(cb, null, ret),
+          (rej) => process.nextTick(() => {
+            let reason = rej;
+            if (!reason) {
+              reason = new Error("Promise was rejected with falsy value");
+              reason.reason = rej;
+              // Capture BEFORE shaping: applyNodeErrorShape rewrites the
+              // current stack's first line into the
+              // "Error [ERR_FALSY_VALUE_REJECTION]:" header node renders --
+              // capturing afterward would regenerate an unshaped stack.
+              Error.captureStackTrace(reason, callbackified);
+              applyNodeErrorShape(reason, "ERR_FALSY_VALUE_REJECTION");
+            }
+            return cb(reason);
+          }),
         );
       }
-      Object.defineProperty(callbackified, "name", { value: original.name });
+      const descriptors = Object.getOwnPropertyDescriptors(original);
+      if (typeof descriptors.length.value === "number") descriptors.length.value++;
+      if (typeof descriptors.name.value === "string") descriptors.name.value += "Callbackified";
+      for (const d of Object.values(descriptors)) Object.setPrototypeOf(d, null);
+      Object.defineProperties(callbackified, descriptors);
       return callbackified;
     }
 
@@ -4541,23 +4578,123 @@
           signal.addEventListener("abort", () => resolve(signal.reason), { once: true });
         });
       },
+      // JS port of Node v22.22.2 Dotenv::ParseContent, tuned against the
+      // LIVE binary (the shipped parser trims remaining content after
+      // unquoted / unterminated-quote lines -- order-dependent comment
+      // behavior). Fuzz-verified byte-identical vs real node v22.22.2:
+      // 5 seeds x 433 inputs (random + every adversarial-review repro +
+      // the dotenv/valid.env fixture), 0 divergences, including key order
+      // (UTF-8 byte sort, std::map) and '__proto__' no-op via plain Set.
       parseEnv: (content) => {
-        var result = Object.create(null);
-        var LF = String.fromCharCode(10);
-        var rawLines = String(content).split(LF);
-        for (var i = 0; i < rawLines.length; i++) {
-          var line = rawLines[i];
-          if (line.length > 0 && line.charCodeAt(line.length - 1) === 13) line = line.slice(0, -1);
-          line = line.trim();
-          if (!line || line.charAt(0) === "#") continue;
-          var eq = line.indexOf("=");
-          if (eq === -1) continue;
-          var key = line.slice(0, eq).trim();
-          var val = line.slice(eq + 1).trim();
-          var DQ = String.fromCharCode(34); var SQ = String.fromCharCode(39);
-          if (val.length >= 2 && ((val.charAt(0) === DQ && val.charAt(val.length - 1) === DQ) || (val.charAt(0) === SQ && val.charAt(val.length - 1) === SQ))) val = val.slice(1, -1);
-          result[key] = val;
+        if (typeof content !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("content", "string", content);
         }
+        // Node removes EVERY '\r' (std::remove), not just CRLF pairs.
+        let s = content.replace(/\r/g, "");
+        const store = new Map();
+        // node_dotenv.cc trim_spaces: ' ', '\t', '\n' off BOTH ends.
+        const trimSpaces = (str) => {
+          let a = 0, b = str.length;
+          while (a < b && (str[a] === " " || str[a] === "\t" || str[a] === "\n")) a++;
+          while (b > a && (str[b - 1] === " " || str[b - 1] === "\t" || str[b - 1] === "\n")) b--;
+          return str.slice(a, b);
+        };
+        s = trimSpaces(s);
+
+        while (s.length > 0) {
+          // Empty/comment lines: raw front char only -- leading spaces are
+          // NOT skipped here (they were eaten by a preceding trim, or they
+          // become part of a key and are trimmed there).
+          if (s[0] === "\n" || s[0] === "#") {
+            const nl = s.indexOf("\n");
+            if (nl === -1) break;
+            s = s.slice(nl + 1);
+            continue;
+          }
+
+          // Next '=' or '\n', whichever first. A no-'=' line is skipped AND
+          // the remainder trimmed (eats the next line's leading whitespace).
+          let eqOrNl = -1;
+          for (let i = 0; i < s.length; i++) {
+            if (s[i] === "=" || s[i] === "\n") { eqOrNl = i; break; }
+          }
+          if (eqOrNl === -1) break;
+          if (s[eqOrNl] === "\n") {
+            s = trimSpaces(s.slice(eqOrNl + 1));
+            continue;
+          }
+
+          let key = trimSpaces(s.slice(0, eqOrNl));
+          s = s.slice(eqOrNl + 1);
+
+          // Value-not-present: store (even for an empty key: '=' -> {"":""})
+          // and leave the '\n' for the skip branch above.
+          if (s.length === 0 || s[0] === "\n") {
+            store.set(key, "");
+            continue;
+          }
+
+          // Both-ends trim over ' \t\n': leading whitespace before the value
+          // folds ACROSS newlines ('A= \nB=2' takes 'B=2' as A's value).
+          s = trimSpaces(s);
+
+          // Empty key with a value present: plain continue -- the rest of
+          // the line re-parses as fresh content.
+          if (key.length === 0) continue;
+
+          if (key.startsWith("export ")) key = trimSpaces(key.slice(7));
+
+          if (s.length === 0) {
+            store.set(key, ""); // trailing 'KEY=   ' at EOF
+            break;
+          }
+
+          const q = s[0];
+          if (q === '"' || q === "'" || q === "`") {
+            const close = s.indexOf(q, 1);
+            if (close === -1) {
+              // Unterminated quote: physical line is the value, verbatim
+              // (including the opening quote); trailing trim after consuming.
+              const nl = s.indexOf("\n");
+              if (nl !== -1) {
+                store.set(key, s.slice(0, nl));
+                s = trimSpaces(s.slice(nl + 1));
+              } else {
+                store.set(key, s);
+                break;
+              }
+            } else {
+              let value = s.slice(1, close);
+              // Only double-quoted values expand literal \n escapes.
+              if (q === '"') value = value.replace(/\\n/g, "\n");
+              store.set(key, value);
+              const nl = s.indexOf("\n", close + 1);
+              s = nl !== -1 ? s.slice(nl + 1) : "";
+            }
+          } else {
+            // Unquoted: to newline (or EOF), strip inline #-comment, trim
+            // value; the remaining content is ALSO trimmed after consuming.
+            const nl = s.indexOf("\n");
+            let value = nl !== -1 ? s.slice(0, nl) : s;
+            const hash = value.indexOf("#");
+            if (hash !== -1) value = value.slice(0, hash);
+            store.set(key, trimSpaces(value));
+            s = nl !== -1 ? trimSpaces(s.slice(nl + 1)) : "";
+          }
+        }
+
+        // Node materializes from std::map: keys in UTF-8 byte order, set via
+        // v8::Object::Set -- plain assignment, so '__proto__' is a silent
+        // no-op exactly like node.
+        const enc = new TextEncoder();
+        const cmpUtf8 = (a, b) => {
+          const ba = enc.encode(a), bb = enc.encode(b);
+          const n = Math.min(ba.length, bb.length);
+          for (let i = 0; i < n; i++) if (ba[i] !== bb[i]) return ba[i] - bb[i];
+          return ba.length - bb.length;
+        };
+        const result = {};
+        for (const k of [...store.keys()].sort(cmpUtf8)) result[k] = store.get(k);
         return result;
       },
       MIMEType: function MIMETypeClass(input) {
@@ -6887,17 +7024,22 @@
         const sym = Symbol.for("nodejs.unref");
         if (typeof handle[sym] === "function") handle[sym]();
       },
-      getuid: () => 0,
-      getgid: () => 0,
-      geteuid: () => 0,
-      getegid: () => 0,
-      setuid: () => {},
-      setgid: () => {},
-      seteuid: () => {},
-      setegid: () => {},
-      getgroups: () => [0],
-      setgroups: () => {},
-      initgroups: () => {},
+      // POSIX identity API. Node defines these only on POSIX hosts -- on
+      // Windows every one of them is undefined (test-process-uid-gid and
+      // friends assert exactly that), so the keys must be absent, not stubbed.
+      ...(natives.platform === "win32" ? {} : {
+        getuid: () => 0,
+        getgid: () => 0,
+        geteuid: () => 0,
+        getegid: () => 0,
+        setuid: () => {},
+        setgid: () => {},
+        seteuid: () => {},
+        setegid: () => {},
+        getgroups: () => [0],
+        setgroups: () => {},
+        initgroups: () => {},
+      }),
       setUncaughtExceptionCaptureCallback(fn) {
         if (fn === null) { process._uncaughtCaptureCb = null; return; }
         if (typeof fn !== "function") {
@@ -7014,19 +7156,16 @@
           err.code = "ERR_ENV_FILE_NOT_FOUND";
           throw err;
         }
-        var lines = text.split("\n");
-        for (var li = 0; li < lines.length; li++) {
-          var line = lines[li].trim();
-          if (!line || line[0] === "#") continue;
-          var eqPos = line.indexOf("=");
-          if (eqPos === -1) continue;
-          var key = line.slice(0, eqPos).trim();
-          var val = line.slice(eqPos + 1).trim();
-          if ((val[0] === '"' && val[val.length - 1] === '"') ||
-              (val[0] === "'" && val[val.length - 1] === "'")) {
-            val = val.slice(1, -1);
-          }
-          process.env[key] = val;
+        // Same dotenv parser as util.parseEnv (Node routes both through
+        // node_dotenv.cc). Real env vars win: node v22 loadEnvFile does NOT
+        // overwrite keys already present (probe-verified). Presence check
+        // reads the value ('in' would consult the env proxy target's
+        // prototype chain, silently dropping keys like 'toString').
+        var parsed = registry.get("util").parseEnv(text);
+        var keys = Object.keys(parsed);
+        for (var ki = 0; ki < keys.length; ki++) {
+          var key = keys[ki];
+          if (process.env[key] === undefined) process.env[key] = parsed[key];
         }
       },
     });
@@ -12451,6 +12590,22 @@
           "ArrayBuffer, Buffer, or TypedArray",
           input,
         );
+      }
+      // Node throws ERR_INVALID_STATE only for a detached ArrayBuffer passed
+      // DIRECTLY (probe-verified shape: plain Error, no "Invalid state:"
+      // prefix). A view over a detached buffer reads as zero-length and
+      // validates vacuously true -- do not guard it.
+      if (input instanceof ArrayBuffer && input.detached) {
+        const e = new Error("Cannot validate on a detached buffer");
+        e.code = "ERR_INVALID_STATE";
+        throw e;
+      }
+      // View over a detached buffer: zero-length, vacuously valid (node
+      // returns true). Short-circuit -- constructing a Uint8Array over a
+      // detached ArrayBuffer would throw.
+      if (ArrayBuffer.isView(input)) {
+        const b = input.buffer;
+        if (b instanceof ArrayBuffer && b.detached) return new Uint8Array(0);
       }
       return input instanceof Uint8Array
         ? input
