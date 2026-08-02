@@ -763,7 +763,9 @@ impl crate::JsRuntime {
             // Handled by a listener: fall through and pump the loop like a clean
             // run (timers/ops the entry or the handler scheduled still run).
         }
-        tc.perform_microtask_checkpoint();
+        if let Some(failure) = crate::modules::run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
         if let Some(failure) = crate::modules::drain_uncaught(tc) {
             return Err(failure);
         }

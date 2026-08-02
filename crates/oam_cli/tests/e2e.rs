@@ -1067,6 +1067,41 @@ fn next_tick_survives_throwing_uncaught_exception_handler() {
 }
 
 #[test]
+fn next_tick_runs_ahead_of_already_queued_promise_jobs() {
+    // Host-driven tick points (docs/design/nexttick-engine.md): a tick
+    // scheduled AFTER a promise job still runs before it -- the former
+    // slice-0 residual #1. Verified byte-identical with node v22.22.2.
+    let stdout = run_ok(
+        "next_tick_ahead.ts",
+        "const order: string[] = [];\n\
+         Promise.resolve().then(() => order.push('p-before'));\n\
+         process.nextTick(() => order.push('tick'));\n\
+         Promise.resolve().then(() => order.push('p-after'));\n\
+         setTimeout(() => console.log(order.join(',')), 5);",
+    );
+    assert_eq!(stdout.trim(), "tick,p-before,p-after");
+}
+
+#[test]
+fn next_tick_from_promise_context_runs_after_microtask_exhaustion() {
+    // Former slice-0 residual #2: a tick scheduled FROM a promise job runs
+    // after the ENTIRE microtask queue exhausts (Node's
+    // processTicksAndRejections loop), not at its scheduling position.
+    // Verified byte-identical with node v22.22.2.
+    let stdout = run_ok(
+        "next_tick_promise_ctx.ts",
+        "const order: string[] = [];\n\
+         Promise.resolve().then(() => {\n\
+           process.nextTick(() => order.push('tick-from-promise'));\n\
+           order.push('p1');\n\
+         }).then(() => order.push('p2'));\n\
+         Promise.resolve().then(() => order.push('p3'));\n\
+         setTimeout(() => console.log(order.join(',')), 5);",
+    );
+    assert_eq!(stdout.trim(), "p1,p3,p2,tick-from-promise");
+}
+
+#[test]
 fn process_globals_and_scheduling() {
     let stdout = run_ok(
         "process_glob.ts",

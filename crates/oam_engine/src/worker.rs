@@ -30,7 +30,9 @@ impl super::JsRuntime {
                 &entry.to_string_lossy(),
             )]);
         }
-        tc.perform_microtask_checkpoint();
+        if let Some(failure) = crate::modules::run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
         if let Some(failure) = crate::modules::drain_uncaught(tc) {
             return Err(failure);
         }

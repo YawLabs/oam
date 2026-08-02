@@ -109,10 +109,14 @@
         .then(
           () => {
             this._pulling = false;
-            if (
-              this._pullAgain ||
-              (this._state === "readable" && this._waiters.length > 0)
-            ) {
+            // WHATWG re-pull: ONLY when something re-requested during the
+            // pull (_pullAgain). Re-pulling on a still-pending waiter spins
+            // forever on a source that defers its enqueue past the microtask
+            // queue (e.g. into process.nextTick): each pull schedules more
+            // deferred work while the waiter never clears -- unbounded under
+            // host-driven tick points. The deferred enqueue resolves the
+            // waiter directly; no re-pull is needed for it.
+            if (this._pullAgain) {
               this._pullAgain = false;
               this._maybePull();
             }

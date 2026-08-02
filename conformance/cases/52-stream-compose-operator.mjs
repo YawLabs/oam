@@ -27,6 +27,17 @@ async function run() {
     try { await s.toArray(); out.push("throw:none"); }
     catch (e) { out.push("throw:" + e.message); }
   }
+  // 3b. throw AFTER the source fully drained -> still rejects toArray()
+  // (the tick scheduled from the async-generator's promise context must run
+  // after full microtask exhaustion; docs/design/nexttick-engine.md).
+  {
+    const s = Readable.from(["x", "y"]).compose(async function* (src) {
+      for await (const c of src) yield c;
+      throw new Error("after-drain");
+    });
+    try { await s.toArray(); out.push("drain-throw:none"); }
+    catch (e) { out.push("drain-throw:" + e.message); }
+  }
   // 4. compose with already-aborted signal -> AbortError on composed stream
   {
     const ac = new AbortController();

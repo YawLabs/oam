@@ -17,16 +17,12 @@
 // - process.env is a copy taken at first access of the process module;
 //   writes mutate the JS object only.
 // - process.exit() exits immediately (no 'exit' event flush), like Bun.
-// - process.nextTick is a FIFO queue drained in one microtask: a tick batch
-//   (including ticks appended mid-drain) runs FIFO and ahead of promise jobs
-//   queued after the batch started. Node-identical for ticks scheduled from
-//   SYNCHRONOUS macrotask code (timer/IO callbacks, CJS main). Residual: a
-//   tick scheduled from any promise-job context (.then/await continuations,
-//   ESM top-level module eval) drains at its scheduling position in the
-//   microtask queue, while Node exhausts the ENTIRE microtask queue before
-//   re-draining ticks -- already-queued promise jobs run first there. True
-//   fix = engine microtask-policy integration, deferred per
-//   docs/design/streams-port.md section 4.
+// - process.nextTick is a FIFO queue drained BY THE HOST at every tick
+//   point (drain -> microtask checkpoint, looped until both empty -- Node's
+//   processTicksAndRejections; docs/design/nexttick-engine.md). Ticks run
+//   ahead of already-queued promise jobs, and ticks scheduled from
+//   promise-job contexts run after full microtask exhaustion,
+//   Node-identical in both directions.
 // - node:stream is NOT defined here: js/vendor/oam-shims/register.js
 //   installs the vendored Node v22 port (docs/design/streams-port.md); the
 //   hand-rolled wave-1 streams were deleted in slice 5. fs/net/http streams
@@ -6199,34 +6195,23 @@
     // runtime at startup. Node lazy-initializes stdio the same way.
     const { Buffer } = registry.get("buffer");
 
-    // process.nextTick: a real FIFO tick queue (slice 0 of the streams port,
-    // docs/design/streams-port.md section 4). The first nextTick of a burst
-    // schedules ONE drain microtask; the drain runs the queue to exhaustion,
-    // including entries appended mid-drain, so a tick batch stays FIFO and
-    // runs ahead of any promise job queued after the batch started. Each
-    // callback is bound to its scheduling ALS frame individually (via
+    // process.nextTick: a real FIFO tick queue (streams-port slice 0), now
+    // HOST-DRAINED (docs/design/nexttick-engine.md): the engine loops
+    // drain -> microtask checkpoint at every tick point, Node's
+    // processTicksAndRejections shape. The drain runs the queue to
+    // exhaustion, including entries appended mid-drain. Each callback is
+    // bound to its scheduling ALS frame individually (via
     // registry._bindToCurrentFrame, exported by the timers init) -- binding
-    // only the drain would leak the first scheduler's frame into every other
-    // callback in the batch. Node-identical for ticks scheduled from
-    // synchronous macrotask code; ticks scheduled from promise-job contexts
-    // drain at their scheduling position instead of after full microtask
-    // exhaustion (see the header divergence list).
+    // only the drain would leak the first scheduler's frame into every
+    // other callback in the batch.
     let tickQueue = [];
     let tickIndex = 0;
-    let tickScheduled = false;
-    // Schedule through the native queueMicrotask captured by the timers init,
-    // never the mutable globalThis binding: a user monkey-patch (fake-timers,
-    // sync polyfills, throwing shims) must not be able to wedge, defer, or
-    // synchronize the tick drain. Fallback covers ticks scheduled before the
-    // timers init runs.
-    const scheduleDrain = () =>
-      (registry._nativeQueueMicrotask || globalThis.queueMicrotask)(drainTickQueue);
     const drainTickQueue = () => {
       // The finally is load-bearing: EVERY exit -- normal completion, the
       // fatal no-listener rethrow, or a throw from a user's uncaughtException/
-      // monitor handler itself -- must reset the queue state, or nextTick is
-      // permanently wedged (tickScheduled stuck true means no future drain is
-      // ever scheduled) while the process keeps running.
+      // monitor handler itself -- must reset the queue state so a later
+      // host drain starts from a consistent queue while the process keeps
+      // running.
       try {
         while (tickIndex < tickQueue.length) {
           const entry = tickQueue[tickIndex];
@@ -6271,9 +6256,32 @@
       } finally {
         tickQueue = [];
         tickIndex = 0;
-        tickScheduled = false;
       }
     };
+    // Host-driven tick points (docs/design/nexttick-engine.md): the engine
+    // calls __oamDrainTicks BEFORE each microtask checkpoint and loops
+    // drain -> checkpoint while __oamHasTicks reports work, reproducing
+    // Node's processTicksAndRejections. Nothing schedules the drain as a
+    // microtask anymore -- ticks run ahead of already-queued promise jobs,
+    // and ticks scheduled FROM promise jobs run after full microtask
+    // exhaustion, both Node-identical.
+    // Non-enumerable: Node's test/common leak check walks enumerable
+    // globals, and these are host plumbing, not API surface. Non-writable +
+    // non-configurable: a global-scrubbing test harness deleting them would
+    // otherwise strand queued ticks (the host also guards: no drain fn =
+    // stop looping, never spin).
+    Object.defineProperty(globalThis, "__oamDrainTicks", {
+      value: drainTickQueue,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+    Object.defineProperty(globalThis, "__oamHasTicks", {
+      value: () => tickIndex < tickQueue.length,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
     // Node's process is an instance of a `process`-named EventEmitter subclass
     // (not a bare EventEmitter) -- gives it its own prototype layer, makes
     // process.constructor.name === "process" (so a failed `delete process.x`
@@ -6557,11 +6565,9 @@
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
         const bind = registry._bindToCurrentFrame;
+        // Just enqueue: the HOST drains at every tick point (see
+        // __oamDrainTicks above) -- no microtask trampoline.
         tickQueue.push([bind ? bind(fn) : fn, args]);
-        if (!tickScheduled) {
-          tickScheduled = true;
-          scheduleDrain();
-        }
       },
       hrtime: Object.assign(
         (prev) => {
@@ -16752,12 +16758,37 @@
       {
         const native = globalThis.queueMicrotask;
         if (typeof native === "function") {
-          // process.nextTick's drain schedules through this captured native
-          // so user monkey-patches of globalThis.queueMicrotask can't wedge
-          // or synchronize the tick queue.
+          // Captured native kept for internal schedulers that must not ride
+          // a user monkey-patch of globalThis.queueMicrotask. (nextTick no
+          // longer schedules microtasks at all -- the host drains it.)
           registry._nativeQueueMicrotask = native;
           const wrapped = function (fn) {
-            return native(bindToCurrentFrame(fn));
+            const bound = bindToCurrentFrame(fn);
+            return native(function () {
+              try {
+                return bound();
+              } catch (e) {
+                // Node delivers a microtask throw to uncaughtException
+                // BETWEEN sibling microtasks, not after the checkpoint --
+                // same ladder as the nextTick drain. No consumer = rethrow
+                // into the engine ledger (fatal path unchanged).
+                const proc = globalThis.process;
+                if (proc) {
+                  if (proc.listenerCount("uncaughtExceptionMonitor") > 0) {
+                    proc.emit("uncaughtExceptionMonitor", e);
+                  }
+                  if (proc._uncaughtCaptureCb) {
+                    proc._uncaughtCaptureCb(e);
+                    return;
+                  }
+                  if (proc.listenerCount("uncaughtException") > 0) {
+                    proc.emit("uncaughtException", e);
+                    return;
+                  }
+                }
+                throw e;
+              }
+            });
           };
           Object.defineProperty(wrapped, "name", { value: "queueMicrotask" });
           globalThis.queueMicrotask = wrapped;

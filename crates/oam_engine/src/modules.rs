@@ -183,6 +183,7 @@ pub(crate) fn flush_handled_rejections(
         .get_slot_mut::<RejectionLedger>()
         .map(|ledger| ledger.unhandled.drain(..).map(|(p, r, _)| (p, r)).collect())
         .unwrap_or_default();
+    let ran_listener = !drained.is_empty();
     for (promise, reason) in drained {
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
@@ -191,6 +192,12 @@ pub(crate) fn flush_handled_rejections(
             "unhandledRejection",
             &[reason_local, promise_local.into()],
         );
+    }
+    // Explicit microtask policy: nothing flushes what the listener queued
+    // (an async listener's continuation!) unless we do it here. A fatal
+    // tick throw lands on the UncaughtLedger for the pump's next drain.
+    if ran_listener {
+        let _ = run_ticks_and_microtasks(tc);
     }
 }
 
@@ -227,25 +234,34 @@ pub(crate) fn handle_uncaught_throw(
 pub(crate) fn drain_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
-    let captured: Vec<(v8::Global<v8::Value>, String)> = tc
-        .get_slot_mut::<UncaughtLedger>()
-        .map(|ledger| ledger.entries.drain(..).collect())
-        .unwrap_or_default();
-    if captured.is_empty() {
-        return None;
-    }
     let mut fatal = Vec::new();
-    for (value, text) in captured {
-        let local = v8::Local::new(tc, &value);
-        if emit_process_event(tc, "uncaughtException", &[local]) {
-            continue; // a listener handled it
+    // Loop: a listener may queue microtasks/ticks (flushed below under the
+    // explicit policy) whose throws land NEW ledger entries; quiesce before
+    // returning. Terminates because each pass drains the ledger and only
+    // fresh throws refill it.
+    loop {
+        let captured: Vec<(v8::Global<v8::Value>, String)> = tc
+            .get_slot_mut::<UncaughtLedger>()
+            .map(|ledger| ledger.entries.drain(..).collect())
+            .unwrap_or_default();
+        if captured.is_empty() {
+            break;
         }
-        fatal.push(Diagnostic::new(
-            "OAM-RT0001",
-            Severity::Error,
-            Origin::Runtime,
-            format!("Uncaught (in microtask) {text}"),
-        ));
+        for (value, text) in captured {
+            let local = v8::Local::new(tc, &value);
+            if emit_process_event(tc, "uncaughtException", &[local]) {
+                continue; // a listener handled it
+            }
+            fatal.push(Diagnostic::new(
+                "OAM-RT0001",
+                Severity::Error,
+                Origin::Runtime,
+                format!("Uncaught (in microtask) {text}"),
+            ));
+        }
+        // Flush what the listeners queued -- explicit policy means nothing
+        // else will until the next macrotask boundary.
+        let _ = run_ticks_and_microtasks(tc);
     }
     if fatal.is_empty() { None } else { Some(fatal) }
 }
@@ -412,7 +428,9 @@ impl JsRuntime {
         let Some(value) = module.evaluate(tc) else {
             return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
         };
-        tc.perform_microtask_checkpoint();
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
         }
@@ -437,9 +455,15 @@ impl JsRuntime {
                 let exception = promise.result(tc);
                 if emit_process_event(tc, "uncaughtException", &[exception]) {
                     // A listener suppressed the fatal exit: continue like a
-                    // clean run -- drain microtasks the handler queued, pump any
+                    // clean run -- drain ticks + microtasks the handler
+                    // queued (delivering any fresh throws), pump any
                     // pending timers/ops, then report unhandled rejections.
-                    tc.perform_microtask_checkpoint();
+                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                        return Err(failure);
+                    }
+                    if let Some(failure) = drain_uncaught(tc) {
+                        return Err(failure);
+                    }
                     pump_event_loop(tc, None, true)?;
                     return match unhandled_rejection_failures(tc) {
                         Some(failures) => Err(failures),
@@ -504,7 +528,9 @@ impl JsRuntime {
                         return Err(failure);
                     }
                 }
-                tc.perform_microtask_checkpoint();
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
                 progressed = true;
             }
             if let Some(completion) = tc
@@ -518,7 +544,9 @@ impl JsRuntime {
                         completion
                     };
                 crate::ops::settle_completion(tc, completion);
-                tc.perform_microtask_checkpoint();
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
                 progressed = true;
             }
             if let Some(failure) = drain_uncaught(tc) {
@@ -556,7 +584,9 @@ impl JsRuntime {
                         completion
                     };
                 crate::ops::settle_completion(tc, completion);
-                tc.perform_microtask_checkpoint();
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
             } else if next_timer.is_none_or(|t| t >= deadline) {
                 return Ok(());
             }
@@ -604,7 +634,14 @@ impl JsRuntime {
                     .unwrap_or_else(|| "uncaught exception".to_string());
                 return Err((false, format!("Uncaught {message}")));
             };
-            tc.perform_microtask_checkpoint();
+            if let Some(failures) = run_ticks_and_microtasks(tc) {
+                let text = failures
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err((false, text));
+            }
             if let Some(entries) = drain_uncaught(tc) {
                 let text = entries
                     .iter()
@@ -718,7 +755,9 @@ impl JsRuntime {
         let Some(result) = runner.call(tc, recv, &[arg]) else {
             return Err(vec![catch_to_diagnostic(tc, "__oamTestRun")]);
         };
-        tc.perform_microtask_checkpoint();
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
         if let Some(failure) = drain_uncaught(tc) {
             return Err(failure);
         }
@@ -764,6 +803,80 @@ impl JsRuntime {
 /// busy-wait). Exit when nothing remains; the process stays alive for
 /// pending timers/ops after the entry settles — Node semantics. A rejected
 /// entry promise breaks early (the caller reports it).
+/// Node's processTicksAndRejections, host-owned (docs/design/
+/// nexttick-engine.md): drain the JS nextTick queue, run a microtask
+/// checkpoint, and loop while the checkpoint scheduled more ticks. This
+/// replaces every bare perform_microtask_checkpoint that follows JS
+/// execution, so ticks run ahead of already-queued promise jobs AND ticks
+/// scheduled from promise jobs run after full microtask exhaustion. Absent
+/// globals (the process factory has not materialized yet) mean no ticks can
+/// exist -- the loop degrades to one plain checkpoint.
+pub(crate) fn run_ticks_and_microtasks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<Vec<Diagnostic>> {
+    loop {
+        let drain = (|| {
+            let context = tc.get_current_context();
+            let global = context.global(tc);
+            let key = v8::String::new(tc, "__oamDrainTicks")?;
+            v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+        })();
+        let have_drain = drain.is_some();
+        if let Some(drain) = drain {
+            let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+            if drain.call(tc, recv, &[]).is_none() {
+                // The JS drain already ran Node's monitor/capture/listener
+                // ladder; a throw only escapes for the fatal shapes (no
+                // consumer, or the handler itself threw). Route it through
+                // the uncaught LEDGER: drain_uncaught re-delivers to
+                // uncaughtException (the documented oam divergence -- a
+                // throwing handler re-delivers and the run survives) and
+                // reports fatal only when no listener handles it. The
+                // drain's finally already reset the queue, so looping on is
+                // safe.
+                let exception = tc.exception();
+                let text = crate::exception_to_error(tc, "process.nextTick").to_string();
+                if let Some(exception) = exception {
+                    let value = v8::Global::new(tc, exception);
+                    tc.reset();
+                    if let Some(ledger) = tc.get_slot_mut::<UncaughtLedger>() {
+                        ledger.entries.push((value, text));
+                    }
+                } else {
+                    tc.reset();
+                }
+            }
+        }
+        tc.perform_microtask_checkpoint();
+        if !has_pending_ticks(tc) {
+            return None;
+        }
+        if !have_drain {
+            // __oamHasTicks reports work but no drain fn resolved (globals
+            // tampered/absent): looping would spin forever without running
+            // any JS. Bail; the queue drains if the drain fn reappears.
+            return None;
+        }
+    }
+}
+
+/// True when the JS nextTick queue has entries (absent globals = empty).
+pub(crate) fn has_pending_ticks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> bool {
+    let lookup = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamHasTicks")?;
+        v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+    })();
+    let Some(has) = lookup else {
+        return false;
+    };
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    has.call(tc, recv, &[]).is_some_and(|v| v.is_true())
+}
+
 pub(crate) fn pump_event_loop(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     entry_promise: Option<v8::Local<'_, v8::Promise>>,
@@ -798,6 +911,13 @@ pub(crate) fn pump_event_loop(
             .map(|slot| slot.0.clone());
         if let Some(shared) = inspector {
             shared.poll();
+            // CDP dispatch can run arbitrary JS (Runtime.evaluate); under
+            // the explicit microtask policy nothing else flushes what it
+            // queued -- a DevTools `await` would wedge until the debuggee's
+            // next event.
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
         }
 
         let mut progressed = false;
@@ -824,7 +944,9 @@ pub(crate) fn pump_event_loop(
             {
                 return Err(failure);
             }
-            tc.perform_microtask_checkpoint();
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
@@ -841,7 +963,9 @@ pub(crate) fn pump_event_loop(
                 completion
             };
             crate::ops::settle_completion(tc, completion);
-            tc.perform_microtask_checkpoint();
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
@@ -860,12 +984,33 @@ pub(crate) fn pump_event_loop(
         let has_inflight = tc
             .get_slot::<oam_core::CoreRuntime>()
             .is_some_and(|core| core.has_inflight());
+        // Belt-and-suspenders (docs/design/nexttick-engine.md): every
+        // JS-running site drains through run_ticks_and_microtasks, so a
+        // stranded tick here means a missed seam -- run it rather than
+        // exiting or sleeping with work queued (Node never does either).
+        // The drain routes fatal throws to the UncaughtLedger; deliver them
+        // NOW or the `continue` -> `break` path would exit 0 on a fatal.
+        if has_pending_ticks(tc) {
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
+            continue;
+        }
         // Node: only ref'd timers and inflight ops keep the loop alive. When
         // the sole remaining work is unref'd timers, exit WITHOUT firing them.
         // (An unref'd timer due BEFORE this point still fired above via pop_due,
         // since `next_deadline` below still wakes us for it while other work
         // keeps the loop open.)
         if !has_ref_timers && !has_inflight {
+            // Exit backstop: a fatal parked on the UncaughtLedger by any
+            // seam that has no follow-up drain must fail the run, not
+            // vanish into a clean exit.
+            if let Some(failure) = drain_uncaught(tc) {
+                return Err(failure);
+            }
             break;
         }
         match (next_deadline, has_inflight) {
@@ -890,7 +1035,9 @@ pub(crate) fn pump_event_loop(
                             completion
                         };
                     crate::ops::settle_completion(tc, completion);
-                    tc.perform_microtask_checkpoint();
+                    if let Some(failure) = run_ticks_and_microtasks(tc) {
+                        return Err(failure);
+                    }
                     if let Some(failure) = drain_uncaught(tc) {
                         return Err(failure);
                     }
@@ -938,7 +1085,9 @@ pub(crate) fn pump_event_loop(
                                 completion
                             };
                             crate::ops::settle_completion(tc, completion);
-                            tc.perform_microtask_checkpoint();
+                            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                                return Err(failure);
+                            }
                             if let Some(failure) = drain_uncaught(tc) {
                                 return Err(failure);
                             }
@@ -948,6 +1097,11 @@ pub(crate) fn pump_event_loop(
                         }
                         if let Some(shared) = &inspector {
                             shared.poll();
+                            // Same flush as the top-of-loop poll: CDP
+                            // dispatch may have run JS mid-idle-wait.
+                            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                                return Err(failure);
+                            }
                         }
                     }
                 }
@@ -987,6 +1141,9 @@ pub(crate) fn unhandled_rejection_failures(
             format!("unhandled promise rejection: {message}"),
         ));
     }
+    // Flush what the listeners queued (async listener continuations) --
+    // explicit policy means no one else will until the next macrotask.
+    let _ = run_ticks_and_microtasks(tc);
     if fatal.is_empty() { None } else { Some(fatal) }
 }
 
@@ -1048,7 +1205,9 @@ fn load_module_graph(
             let Some(exports) = crate::cjs::load_cjs(tc, &path) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
             };
-            tc.perform_microtask_checkpoint();
+            if let Some(failure) = run_ticks_and_microtasks(tc) {
+                return Err(failure);
+            }
             if let Some(failure) = drain_uncaught(tc) {
                 return Err(failure);
             }
@@ -1584,6 +1743,12 @@ fn dyn_import_load(
             None => DynResult::Error(format!("oam: dynamic import('{spec}'): evaluation failed")),
         };
     };
+    // Bare checkpoint, NO tick drain: this hook fires synchronously with
+    // the importer's JS frame still on the stack, and Node never runs
+    // process.nextTick callbacks mid-statement. Ticks scheduled by the
+    // imported module wait for the caller's next real tick point. (The
+    // mid-hook microtask flush itself is a documented pre-existing
+    // divergence the sync-graph fast path depends on.)
     tc.perform_microtask_checkpoint();
 
     // evaluate() yields the module's top-level-await promise.
@@ -1623,6 +1788,8 @@ fn dyn_import_load(
                 did_something = false;
                 let (cycle_flushed, cycle_skipped) = flush_cycle_imports(tc);
                 if cycle_flushed > 0 {
+                    // Bare checkpoint, no tick drain: still inside the
+                    // dynamic-import host hook (importer JS on the stack).
                     tc.perform_microtask_checkpoint();
                     did_something = true;
                 } else if cycle_skipped > 0 {
@@ -1633,6 +1800,7 @@ fn dyn_import_load(
                 }
                 let tla_flushed = flush_tla_imports(tc);
                 if tla_flushed > 0 {
+                    // Bare checkpoint, no tick drain (see above).
                     tc.perform_microtask_checkpoint();
                     did_something = true;
                 }

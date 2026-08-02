@@ -161,6 +161,13 @@ impl JsRuntime {
             params = params.set_max_old_generation_size_in_bytes(max_bytes);
         }
         let mut isolate = v8::Isolate::new(params);
+        // EXPLICIT microtask policy (docs/design/nexttick-engine.md): under
+        // the default auto policy V8 flushes the microtask queue itself
+        // whenever the API call depth reaches zero -- BEFORE the host can
+        // drain process.nextTick -- so already-queued promise jobs would run
+        // ahead of ticks. The engine owns every checkpoint via
+        // modules::run_ticks_and_microtasks (Node's tick-point loop).
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         if heap_cap_mb.is_some() {
             // Preempt V8's FatalProcessOutOfMemory with a clean, deterministic
             // exit + ODIF banner (see near_heap_limit_oom).
@@ -416,7 +423,14 @@ impl JsRuntime {
                 .to_string(tc)
                 .map(|s| s.to_rust_string_lossy(tc))
                 .unwrap_or_default();
-            tc.perform_microtask_checkpoint();
+            if let Some(failures) = crate::modules::run_ticks_and_microtasks(tc) {
+                let text = failures
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(anyhow!("{text}"));
+            }
             if tc.has_caught() {
                 return Err(exception_to_error(tc, name));
             }
