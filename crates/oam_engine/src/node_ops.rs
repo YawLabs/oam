@@ -1123,7 +1123,11 @@ fn op_http_stream_closed(
 ) {
     let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let state = core_runtime!(scope).http();
-    crate::ops::spawn_op(
+    // UNREF'd: this is a passive watcher for "the client went away", which
+    // may never happen. hyper only notices a vanished peer when it next
+    // tries to write, so a server that stops writing would otherwise leave
+    // this op pending forever and pin the event loop open.
+    crate::ops::spawn_op_unref(
         scope,
         &mut rv,
         oam_core::http_server::http_stream_closed(state, stream_id),
@@ -2910,16 +2914,26 @@ fn op_fs_fstat_sync(
 
 // ------------------------------------------------- permission helpers / query
 
-/// Throw an `Error` with `.code = "ERR_PERMISSION_DENIED"` and return.
-/// The message is the full Deno-shaped description from `Permissions`.
-fn throw_permission_denied(scope: &mut v8::PinScope<'_, '_>, message: &str) {
-    let msg_v8 = v8::String::new(scope, message)
-        .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
+/// Throw Node's `ERR_ACCESS_DENIED`: message "Access to this API has been
+/// restricted", plus the `permission` and `resource` own properties Node
+/// attaches (and its fatal reporter prints).
+pub(crate) fn throw_permission_denied(
+    scope: &mut v8::PinScope<'_, '_>,
+    denial: &crate::permissions::PermissionDenial,
+) {
+    let msg_v8 = v8::String::new(scope, &denial.to_string())
+        .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-        let key = v8::String::new(scope, "code").unwrap();
-        if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
-            obj.set(scope, key.into(), code.into());
+        for (key, value) in [
+            ("code", "ERR_ACCESS_DENIED"),
+            ("permission", denial.permission),
+            ("resource", denial.resource.as_str()),
+        ] {
+            if let (Some(k), Some(v)) = (v8::String::new(scope, key), v8::String::new(scope, value))
+            {
+                obj.set(scope, k.into(), v.into());
+            }
         }
     }
     scope.throw_exception(exception);
@@ -2940,8 +2954,8 @@ fn get_permissions(
 /// if !check_read_perm(scope, &path) { return; }
 /// ```
 fn check_read_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
-    if let Err(msg) = get_permissions(scope).check_read(path) {
-        throw_permission_denied(scope, &msg);
+    if let Err(denial) = get_permissions(scope).check_read(path) {
+        throw_permission_denied(scope, &denial);
         false
     } else {
         true
@@ -2950,8 +2964,8 @@ fn check_read_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
 
 /// Check `write` permission for `path`.
 fn check_write_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
-    if let Err(msg) = get_permissions(scope).check_write(path) {
-        throw_permission_denied(scope, &msg);
+    if let Err(denial) = get_permissions(scope).check_write(path) {
+        throw_permission_denied(scope, &denial);
         false
     } else {
         true
@@ -2960,8 +2974,8 @@ fn check_write_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
 
 /// Check `net` permission for `host`.
 fn check_net_perm(scope: &mut v8::PinScope<'_, '_>, host: &str) -> bool {
-    if let Err(msg) = get_permissions(scope).check_net(host) {
-        throw_permission_denied(scope, &msg);
+    if let Err(denial) = get_permissions(scope).check_net(host) {
+        throw_permission_denied(scope, &denial);
         false
     } else {
         true

@@ -371,6 +371,10 @@ fn explain_code(code: &str) -> String {
             "A promise rejected with no handler attached (Node's ERR_UNHANDLED_REJECTION equivalent). Attach .catch() or await it in a try/catch.",
         ),
         (
+            "OAM-RT0005",
+            "Uncaught runtime exception, reported in Node's format: source frame, stack, then the error's own properties. The stack's first frame is the throw site.",
+        ),
+        (
             "OAM-TS0000",
             "tsgo (the TypeScript 7 native compiler) is not installed or not on PATH. Install: npm i -g @typescript/native-preview, or set OAM_TSGO.",
         ),

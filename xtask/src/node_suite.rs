@@ -92,7 +92,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
         } else if let Some(flags) = read_flags_header(test) {
             Outcome::Unrunnable(format!("// Flags:{flags}"))
         } else {
-            run_test(&oam, test, &repo, &cache)
+            run_test(&oam, test, &vendor, &cache)
         };
 
         let slot = by_module.entry(module).or_insert([0; 4]);
@@ -223,7 +223,12 @@ fn ratchet_violation(
 
 /// Run one test, with a 3x flaky rerun: a Pass on any attempt wins; otherwise
 /// the last Fail/Skip stands.
-fn run_test(oam: &Path, test: &Path, repo: &Path, cache: &Path) -> Outcome {
+///
+/// `cwd` is the VENDOR root, not the oam repo: Node runs its suite from the
+/// Node repo root, and the vendored tree is our stand-in for it (same
+/// `test/`, `lib/`, package.json layout). A handful of tests read
+/// `process.cwd()` directly.
+fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path) -> Outcome {
     let mut last = Outcome::Fail("no attempt".to_string());
     for _ in 0..3 {
         let out = match run_with_timeout(
@@ -232,7 +237,7 @@ fn run_test(oam: &Path, test: &Path, repo: &Path, cache: &Path) -> Outcome {
                 .arg(test)
                 .arg("--no-check")
                 .env("OAM_CACHE_DIR", cache)
-                .current_dir(repo),
+                .current_dir(cwd),
             Duration::from_secs(60),
         ) {
             Ok(c) => c,

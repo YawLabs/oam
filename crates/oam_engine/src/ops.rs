@@ -173,6 +173,28 @@ pub(crate) fn spawn_op(
     rv.set(promise.into());
 }
 
+/// Like `spawn_op`, but the op does NOT keep the event loop alive. For
+/// passive watchers whose trigger may never arrive.
+pub(crate) fn spawn_op_unref(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    op: impl Future<Output = OpOutcome> + Send + 'static,
+) {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        let message = v8::String::new(scope, "failed to create promise").unwrap();
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver = v8::Global::new(scope, resolver);
+
+    let id = core_runtime_mut!(scope).spawn_op_unref(op);
+    pending_ops_mut!(scope).park(id, resolver);
+
+    rv.set(promise.into());
+}
+
 fn op_sleep(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -200,22 +222,13 @@ fn op_read_text_file(
     };
     let path = path.to_rust_string_lossy(scope);
     // Permission gate: read access for this path.
-    if let Err(msg) = scope
+    if let Err(denial) = scope
         .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
         .cloned()
         .unwrap_or_default()
         .check_read(&path)
     {
-        let msg_v8 = v8::String::new(scope, &msg)
-            .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
-        let exception = v8::Exception::error(scope, msg_v8);
-        if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-            let key = v8::String::new(scope, "code").unwrap();
-            if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
-                obj.set(scope, key.into(), code.into());
-            }
-        }
-        scope.throw_exception(exception);
+        crate::node_ops::throw_permission_denied(scope, &denial);
         return;
     }
     spawn_op(scope, &mut rv, oam_core::ops::read_text_file(path));
@@ -248,22 +261,13 @@ fn op_fetch(
             .ok()
             .map(|u| u.hostname().to_string())
             .unwrap_or_default();
-        if let Err(msg) = scope
+        if let Err(denial) = scope
             .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
             .cloned()
             .unwrap_or_default()
             .check_net(&host)
         {
-            let msg_v8 = v8::String::new(scope, &msg)
-                .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
-            let exception = v8::Exception::error(scope, msg_v8);
-            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let key = v8::String::new(scope, "code").unwrap();
-                if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
-                    obj.set(scope, key.into(), code.into());
-                }
-            }
-            scope.throw_exception(exception);
+            crate::node_ops::throw_permission_denied(scope, &denial);
             return;
         }
     }
@@ -286,10 +290,11 @@ fn op_fetch_body_read(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let bodies = core_runtime!(scope).bodies();
     let cancelled = core_runtime!(scope).cancelled_bodies();
+    let cancel_signal = core_runtime!(scope).body_cancel_signal();
     spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fetch_body_read(bodies, cancelled, handle),
+        oam_core::ops::fetch_body_read(bodies, cancelled, cancel_signal, handle),
     );
 }
 
@@ -314,6 +319,9 @@ fn op_fetch_body_cancel(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(handle);
+        // Wake the parked read so the cancel takes effect even when the peer
+        // has simply stopped sending (chunk() would never resolve).
+        core_runtime!(scope).body_cancel_signal().notify_waiters();
     }
 }
 
@@ -354,22 +362,13 @@ fn op_ws_connect(
             .ok()
             .map(|u| u.hostname().to_string())
             .unwrap_or_default();
-        if let Err(msg) = scope
+        if let Err(denial) = scope
             .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
             .cloned()
             .unwrap_or_default()
             .check_net(&host)
         {
-            let msg_v8 = v8::String::new(scope, &msg)
-                .unwrap_or_else(|| v8::String::new(scope, "ERR_PERMISSION_DENIED").unwrap());
-            let exception = v8::Exception::error(scope, msg_v8);
-            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let key = v8::String::new(scope, "code").unwrap();
-                if let Some(code) = v8::String::new(scope, "ERR_PERMISSION_DENIED") {
-                    obj.set(scope, key.into(), code.into());
-                }
-            }
-            scope.throw_exception(exception);
+            crate::node_ops::throw_permission_denied(scope, &denial);
             return;
         }
     }

@@ -165,8 +165,17 @@ fn runtime_exceptions_emit_odif_jsonl() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let parsed: serde_json::Value =
         serde_json::from_str(stderr.lines().next().unwrap()).expect("stderr is JSONL");
-    assert_eq!(parsed["code"], "OAM-RT0001");
-    assert!(parsed["message"].as_str().unwrap().contains("kaboom"));
+    assert_eq!(parsed["code"], "OAM-RT0005");
+    // The message IS Node's fatal report: source frame, then the stack.
+    let message = parsed["message"].as_str().unwrap();
+    assert!(message.contains("kaboom"), "message: {message}");
+    assert!(
+        message.contains(
+            "Error: kaboom
+    at "
+        ),
+        "message: {message}"
+    );
 }
 
 #[test]
@@ -1933,7 +1942,7 @@ fn process_error_events_catch_and_survive() {
     );
     assert_eq!(lines[1], "survived");
 
-    // No listener -> async throw is still fatal (exit 1, OAM-RT0001).
+    // No listener -> async throw is still fatal (exit 1, OAM-RT0005).
     let main = write_temp(
         "proc_fatal.mjs",
         "setTimeout(() => { throw new Error('still-fatal'); }, 5);",
@@ -1941,7 +1950,7 @@ fn process_error_events_catch_and_survive() {
     let out = oam(&["run", main.to_str().unwrap(), "--json"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("OAM-RT0001"),
+        String::from_utf8_lossy(&out.stderr).contains("OAM-RT0005"),
         "no-listener throw stays fatal"
     );
 
@@ -3842,7 +3851,7 @@ fn json_modules_from_packages_bom_and_failure_modes() {
 fn cts_is_a_clear_diagnostic() {
     // .cts is now executable: oxc strips TS, the CJS path runs the
     // resulting JS. A .cts file with an `export` (ESM syntax) inside a
-    // CJS body surfaces as OAM-RT0001 at parse time inside the compiled
+    // CJS body surfaces as OAM-RT0005 at parse time inside the compiled
     // function — the test asserts the diagnostic is structured, not that
     // .cts is rejected at the resolver.
     let file = write_temp("legacy.cts", "export const a: number = 1;");
@@ -3850,7 +3859,7 @@ fn cts_is_a_clear_diagnostic() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("OAM-RT0001") && stderr.contains("Unexpected token 'export'"),
+        stderr.contains("OAM-RT0005") && stderr.contains("Unexpected token 'export'"),
         "stderr: {stderr}"
     );
 }
@@ -3949,7 +3958,7 @@ fn exception_in_timer_callback_fails_run() {
     let out = oam(&["run", main.to_str().unwrap(), "--json"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-RT0001"), "stderr: {stderr}");
+    assert!(stderr.contains("OAM-RT0005"), "stderr: {stderr}");
     assert!(stderr.contains("timer kaboom"), "stderr: {stderr}");
 }
 

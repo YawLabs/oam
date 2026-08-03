@@ -1037,3 +1037,40 @@
   }
   globalThis.WebSocket = WebSocket;
 })();
+
+// Node reports an uncaught exception as util.inspect(err): the stack, then a
+// block of any extra own properties (code/errno/syscall/permission/...). The
+// Rust fatal path only holds V8's one-line message summary, so it calls this
+// to build the body. Lookups are at CALL time -- this file is snapshotted
+// before any of it exists.
+(() => {
+  // Non-enumerable: Node's test harness fails any test that leaks a new
+  // enumerable global, and this is runtime plumbing, not API.
+  function __oamFormatFatal(err) {
+    try {
+      const reg = globalThis.__oamNode;
+      const util = reg && typeof reg.get === "function" ? reg.get("util") : null;
+      if (util && typeof util.inspect === "function") {
+        return util.inspect(err, { colors: false, depth: 2 });
+      }
+    } catch {
+      // fall through to the stack
+    }
+    try {
+      if (err instanceof Error && typeof err.stack === "string") return err.stack;
+    } catch {
+      // a thrown Proxy can trap `stack`
+    }
+    try {
+      return String(err);
+    } catch {
+      return "<unprintable exception>";
+    }
+  }
+  Object.defineProperty(globalThis, "__oamFormatFatal", {
+    value: __oamFormatFatal,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+})();

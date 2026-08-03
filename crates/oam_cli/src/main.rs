@@ -257,6 +257,44 @@ fn main() -> ExitCode {
             if arg == "--pending-deprecation" {
                 flags.pending_deprecation = true;
                 i += 1;
+            } else if let Some(v) = arg.strip_prefix("--input-type=") {
+                flags.input_type = Some(v.to_string());
+                i += 1;
+            } else if arg == "--input-type" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.input_type = Some(v.clone());
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --input-type requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
+            } else if let Some(v) = arg.strip_prefix("--env-file=") {
+                flags.env_files.push((v.to_string(), true));
+                i += 1;
+            } else if let Some(v) = arg.strip_prefix("--env-file-if-exists=") {
+                flags.env_files.push((v.to_string(), false));
+                i += 1;
+            } else if matches!(arg, "--env-file" | "--env-file-if-exists") {
+                let required = arg == "--env-file";
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.env_files.push((v.clone(), required));
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: {arg} requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
+            } else if arg == "--permission" {
+                flags.permission = true;
+                i += 1;
+            } else if arg == "--expose-gc" {
+                flags.expose_gc = true;
+                i += 1;
             } else if arg == "--no-warnings" {
                 flags.no_warnings = true;
                 i += 1;
@@ -326,12 +364,14 @@ fn main() -> ExitCode {
                 } else {
                     i += 1;
                 }
-                if eval_source.is_some() {
-                    break;
-                }
             } else {
                 break;
             }
+        }
+        // V8 flags must be set before V8::initialize, i.e. before any
+        // JsRuntime is constructed.
+        if flags.expose_gc {
+            oam_engine::init_platform_with_flags(&["--expose-gc"]);
         }
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
@@ -1040,6 +1080,9 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         // isolate, so install per runtime.
         if let Some(flags) = NODE_FLAGS.get() {
             flags.install(&mut rt);
+            if flags.apply_env_files(&mut rt).is_err() {
+                return ExitCode::from(9);
+            }
         }
 
         let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
@@ -1173,6 +1216,11 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
 fn render(d: &Diagnostic, json: bool) {
     if json {
         eprintln!("{}", d.to_jsonl());
+    } else if d.code == "OAM-RT0005" {
+        // An uncaught user exception is reported in Node's format (source
+        // frame + stack + own properties). Wrapping it in `error[CODE]:`
+        // would bury the stack and break the `^Error:` line tools grep for.
+        eprint!("{}", d.message);
     } else {
         let loc = d
             .spans
@@ -1696,7 +1744,7 @@ fn run_file_with_flags(
             ),
         )]));
     }
-    let mut rt = oam_engine::JsRuntime::new();
+    let mut rt = oam_engine::JsRuntime::new_with_permissions(flags.permissions());
     // process.argv: [exe, absolute script path, ...script args] — Node's
     // shape. Script args arrive after `--` (cargo-run convention).
     let exe = std::env::current_exe()
@@ -1735,6 +1783,9 @@ fn run_file_with_flags(
     }
 
     flags.install(&mut rt);
+    if let Err(code) = flags.apply_env_files(&mut rt) {
+        return Err((Vec::new(), code));
+    }
     let exec_argv = flags.exec_argv();
     if !exec_argv.is_empty() {
         let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
@@ -1885,6 +1936,15 @@ fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
 #[derive(Default, Clone)]
 struct NodeFlags {
     pending_deprecation: bool,
+    expose_gc: bool,
+    permission: bool,
+    /// `--env-file=P` (required) and `--env-file-if-exists=P` (optional), in
+    /// command-line order -- Node applies them left to right, later files
+    /// winning.
+    env_files: Vec<(String, bool)>,
+    /// `--input-type=commonjs|module`: how `--eval` source is interpreted.
+    /// oam runs eval from a real file, so this picks the extension.
+    input_type: Option<String>,
     no_warnings: bool,
     no_deprecation: bool,
     disabled_warnings: Vec<String>,
@@ -1926,12 +1986,57 @@ impl NodeFlags {
         }
     }
 
+    /// Apply `--env-file` before the program runs. Node parses these in C++
+    /// (node_dotenv.cc); oam reuses the same parser userland gets via
+    /// `process.loadEnvFile` so the two can never drift. Err = exit code 9,
+    /// matching Node's abort on a missing required file.
+    fn apply_env_files(&self, rt: &mut oam_engine::JsRuntime) -> Result<(), u8> {
+        for (path, required) in &self.env_files {
+            let literal = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
+            let script = format!("globalThis.process.loadEnvFile({literal});");
+            if let Err(e) = rt.execute_script("<env-file>", &script) {
+                if *required {
+                    let exe = std::env::current_exe()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "oam".to_string());
+                    let _ = e;
+                    eprintln!("{exe}: {path}: not found");
+                    return Err(9);
+                }
+                eprintln!("{path} not found. Continuing without it.");
+            }
+        }
+        Ok(())
+    }
+
+    /// Node's `--permission` denies everything not explicitly allowed; oam's
+    /// permission checks are already enforced in the native fs/net/env ops,
+    /// so the flag just constructs the restrictive option set.
+    fn permissions(&self) -> Option<oam_engine::PermissionsOptions> {
+        if !self.permission {
+            return None;
+        }
+        Some(oam_engine::PermissionsOptions {
+            read: oam_engine::BoolOrList::Bool(false),
+            write: oam_engine::BoolOrList::Bool(false),
+            net: oam_engine::BoolOrList::Bool(false),
+            env: oam_engine::BoolOrList::Bool(false),
+            ffi: oam_engine::BoolOrList::Bool(false),
+        })
+    }
+
     /// The subset node reflects in process.execArgv (NODE_OPTIONS tokens are
     /// excluded there, so callers pass only argv-sourced flags).
     fn exec_argv(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.pending_deprecation {
             out.push("--pending-deprecation".into());
+        }
+        if self.expose_gc {
+            out.push("--expose-gc".into());
+        }
+        if self.permission {
+            out.push("--permission".into());
         }
         if self.no_warnings {
             out.push("--no-warnings".into());
@@ -1967,15 +2072,25 @@ fn cleanup_eval_artifacts(tmp_dir: Option<&Path>, tmp_file: &Path) {
 fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags) -> ExitCode {
     // Node's eval module resolves from CWD; oam executes a real file, so
     // place it in the CWD (unique name, cleaned up below).
+    // Node reads --input-type to decide how to parse --eval source; oam runs
+    // it from a real file, so the extension carries the same decision.
+    let ext = match flags.input_type.as_deref() {
+        None | Some("commonjs") => "cjs",
+        Some("module") => "mjs",
+        Some(other) => {
+            eprintln!("oam: --input-type must be \"commonjs\" or \"module\", got \"{other}\"");
+            return ExitCode::from(9);
+        }
+    };
     let cwd_candidate = std::env::current_dir()
         .ok()
-        .map(|d| d.join(format!(".oam-eval-{}.cjs", std::process::id())));
+        .map(|d| d.join(format!(".oam-eval-{}.{ext}", std::process::id())));
     let (tmp_dir, tmp_file) = match cwd_candidate {
         Some(p) if std::fs::write(&p, "").is_ok() => (None, p),
         _ => {
             let dir = std::env::temp_dir().join(format!("oam-eval-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create eval temp dir");
-            let file = dir.join("__oam_eval.cjs");
+            let file = dir.join(format!("__oam_eval.{ext}"));
             (Some(dir), file)
         }
     };
@@ -1996,7 +2111,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     };
     std::fs::write(&tmp_file, body).expect("write eval source to temp");
 
-    let mut rt = oam_engine::JsRuntime::new();
+    let mut rt = oam_engine::JsRuntime::new_with_permissions(flags.permissions());
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "oam".to_string());
@@ -2016,13 +2131,21 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     // execArgv carries the node flags (suite children re-spawn with
     // [...process.execArgv, ...]); the eval source itself is not included.
     flags.install(&mut rt);
+    if flags.apply_env_files(&mut rt).is_err() {
+        return ExitCode::from(9);
+    }
     let exec_argv = flags.exec_argv();
     if !exec_argv.is_empty() {
         let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
         let _ = rt.execute_script("<flags>", &format!("globalThis.process.execArgv = {json};"));
     }
 
-    let result = rt.execute_cjs(&tmp_file, &CliHost);
+    // --input-type=module makes the eval source an ES module.
+    let result = if ext == "mjs" {
+        rt.execute_module(&tmp_file, &CliHost)
+    } else {
+        rt.execute_cjs(&tmp_file, &CliHost)
+    };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
     // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
     // fatal forces 1 + honors exit-handler mutations.

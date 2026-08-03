@@ -45,7 +45,16 @@ static OAM_SNAPSHOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oam_snaps
 
 /// Initialize the V8 platform exactly once per process.
 pub fn init_platform() {
+    init_platform_with_flags(&[]);
+}
+
+/// V8 flags must be set BEFORE `V8::initialize`, so the embedder passes any
+/// node-style flags that map to V8 ones (currently `--expose-gc`) here.
+pub fn init_platform_with_flags(v8_flags: &[&str]) {
     V8_INIT.call_once(|| {
+        if !v8_flags.is_empty() {
+            v8::V8::set_flags_from_string(&v8_flags.join(" "));
+        }
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
@@ -362,8 +371,16 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         let context = scope.get_current_context();
         let global = context.global(scope);
-        let process_key = v8::String::new(scope, "process")?;
-        let process = global.get(scope, process_key.into())?;
+        // The internal reference, not globalThis.process -- userland may have
+        // replaced the latter (test-timers-process-tampering).
+        let ref_key = v8::String::new(scope, "__oamProcessRef")?;
+        let process = global
+            .get(scope, ref_key.into())
+            .filter(|v| v.is_object())
+            .or_else(|| {
+                let process_key = v8::String::new(scope, "process")?;
+                global.get(scope, process_key.into())
+            })?;
         let process = v8::Local::<v8::Object>::try_from(process).ok()?;
         let key = v8::String::new(scope, "exitCode")?;
         let value = process.get(scope, key.into())?;
@@ -381,6 +398,8 @@ impl JsRuntime {
     /// prints uncaught exit-handler errors); `process.exit()` inside a handler
     /// still terminates via the native path.
     pub fn emit_process_exit(&mut self) {
+        // A throw from an 'exit' listener is fatal in Node: it reports the
+        // error and exits 1, whatever the handler set exitCode to.
         // Inline the emit (no leaked global): touch process to build it if
         // lazy, guard on process._exiting so it fires once, emit 'exit' with the
         // current exitCode. Mirrors the JS-side emitProcessExit used by
@@ -390,11 +409,14 @@ impl JsRuntime {
         if let Err(e) = self.execute_script(
             "<process-exit>",
             "(function () { \
-               var p = globalThis.process; \
+               var p = globalThis.__oamProcessRef || globalThis.process; \
                if (p && !p._exiting) { \
                  p._exiting = true; \
                  var c = typeof p.exitCode === 'number' ? p.exitCode : 0; \
-                 p.emit('exit', c); \
+                 try { p.emit('exit', c); } catch (e) { \
+                   p.exitCode = 1; \
+                   try { console.error(globalThis.__oamFormatFatal(e)); } catch (_) {} \
+                 } \
                } \
              })();",
         ) {
@@ -532,6 +554,20 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
     install
         .call(scope, recv, &[])
         .expect("runtime globals install cleanly");
+
+    // Node's exit path holds an internal reference to the real process
+    // object, so `globalThis.process = {}` (which userland does -- see
+    // test-timers-process-tampering) cannot break shutdown. Stash the same
+    // reference here. Non-enumerable so Node's leaked-globals check ignores it.
+    let process_key = v8::String::new(scope, "process").unwrap();
+    if let Some(process) = context.global(scope).get(scope, process_key.into()) {
+        let global = context.global(scope);
+        let ref_key = v8::String::new(scope, "__oamProcessRef").unwrap();
+        let mut desc = v8::PropertyDescriptor::new_from_value(process);
+        desc.set_enumerable(false);
+        desc.set_configurable(true);
+        global.define_property(scope, ref_key.into(), &desc);
+    }
 }
 
 // M0 console (install_console + format_args + console_log_stdout/stderr)
@@ -697,7 +733,7 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+        assert_eq!(err, "ERR_ACCESS_DENIED", "got: {err}");
     }
 
     // ---- read allowed for whitelisted prefix
@@ -756,7 +792,7 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+        assert_eq!(err, "ERR_ACCESS_DENIED", "got: {err}");
     }
 
     // ---- write allowed
@@ -821,7 +857,7 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert_eq!(err, "ERR_PERMISSION_DENIED", "got: {err}");
+        assert_eq!(err, "ERR_ACCESS_DENIED", "got: {err}");
     }
 
     // ---- net allowed

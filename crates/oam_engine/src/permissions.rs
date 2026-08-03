@@ -6,7 +6,7 @@
 //!
 //! Gate shape: each op calls `check_read(path)` / `check_write(path)` /
 //! `check_net(host)` at entry, returns `Err(denied_message)` on deny, and
-//! the op translates that into a Node-shaped `ERR_PERMISSION_DENIED` error.
+//! the op translates that into a Node-shaped `ERR_ACCESS_DENIED` error.
 //!
 //! Permission values mirror Deno's `bool | Vec<String>`:
 //! - `true` -> granted unconditionally
@@ -87,51 +87,51 @@ impl Permissions {
         }
     }
 
-    /// Returns `Err(denied_message)` when `read` is denied for `path`.
-    pub fn check_read(&self, path: &str) -> Result<(), String> {
+    /// Returns `Err(denial)` when `read` is denied for `path`.
+    pub fn check_read(&self, path: &str) -> Result<(), PermissionDenial> {
         if self.read.allows(path) {
             Ok(())
         } else {
-            Err(format!(
-                "ERR_PERMISSION_DENIED: Requires read access to \"{path}\", \
-                 run with read permission granted"
-            ))
+            Err(PermissionDenial {
+                permission: "FileSystemRead",
+                resource: path.to_string(),
+            })
         }
     }
 
-    /// Returns `Err(denied_message)` when `write` is denied for `path`.
-    pub fn check_write(&self, path: &str) -> Result<(), String> {
+    /// Returns `Err(denial)` when `write` is denied for `path`.
+    pub fn check_write(&self, path: &str) -> Result<(), PermissionDenial> {
         if self.write.allows(path) {
             Ok(())
         } else {
-            Err(format!(
-                "ERR_PERMISSION_DENIED: Requires write access to \"{path}\", \
-                 run with write permission granted"
-            ))
+            Err(PermissionDenial {
+                permission: "FileSystemWrite",
+                resource: path.to_string(),
+            })
         }
     }
 
-    /// Returns `Err(denied_message)` when `net` is denied for `host`.
-    pub fn check_net(&self, host: &str) -> Result<(), String> {
+    /// Returns `Err(denial)` when `net` is denied for `host`.
+    pub fn check_net(&self, host: &str) -> Result<(), PermissionDenial> {
         if self.net.allows(host) {
             Ok(())
         } else {
-            Err(format!(
-                "ERR_PERMISSION_DENIED: Requires net access to \"{host}\", \
-                 run with net permission granted"
-            ))
+            Err(PermissionDenial {
+                permission: "Net",
+                resource: host.to_string(),
+            })
         }
     }
 
-    /// Returns `Err(denied_message)` when `env` is denied.
-    pub fn check_env(&self, key: &str) -> Result<(), String> {
+    /// Returns `Err(denial)` when `env` is denied.
+    pub fn check_env(&self, key: &str) -> Result<(), PermissionDenial> {
         if self.env.allows(key) {
             Ok(())
         } else {
-            Err(format!(
-                "ERR_PERMISSION_DENIED: Requires env access to \"{key}\", \
-                 run with env permission granted"
-            ))
+            Err(PermissionDenial {
+                permission: "Environment",
+                resource: key.to_string(),
+            })
         }
     }
 
@@ -160,6 +160,23 @@ impl Permissions {
 }
 
 // ----------------------------------------------------------------- public API
+
+/// A denied permission check. Node reports these as an `ERR_ACCESS_DENIED`
+/// Error carrying `permission` (the subsystem) and `resource` (what was asked
+/// for); both are surfaced as own properties on the thrown error.
+#[derive(Debug, Clone)]
+pub struct PermissionDenial {
+    /// Node's permission name. `FileSystemRead` / `FileSystemWrite` are Node's
+    /// own; `Net` / `Environment` cover oam checks Node has no equivalent for.
+    pub permission: &'static str,
+    pub resource: String,
+}
+
+impl std::fmt::Display for PermissionDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Access to this API has been restricted")
+    }
+}
 
 /// Caller-facing descriptor for `JsRuntime::with_permissions`.
 /// Each field is `None` (default: granted) | `Some(true)` (granted) |
@@ -333,12 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn denied_message_carries_code_string() {
+    fn denial_carries_node_permission_and_resource() {
         let p = Permissions::from_opts(Some(PermissionsOptions {
             read: BoolOrList::Bool(false),
             ..Default::default()
         }));
-        let msg = p.check_read("/etc/passwd").unwrap_err();
-        assert!(msg.contains("ERR_PERMISSION_DENIED"), "msg: {msg}");
+        let denial = p.check_read("/etc/passwd").unwrap_err();
+        assert_eq!(denial.permission, "FileSystemRead");
+        assert_eq!(denial.resource, "/etc/passwd");
+        assert_eq!(denial.to_string(), "Access to this API has been restricted");
     }
 }

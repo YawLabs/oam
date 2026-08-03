@@ -243,6 +243,83 @@ pub(crate) fn dispatch_uncaught(
     }
 }
 
+/// Diagnostic code for an uncaught user exception. Rendered verbatim (see
+/// `render` in oam_cli) because the message IS Node's fatal report.
+pub(crate) const FATAL_CODE: &str = "OAM-RT0005";
+
+/// Node's `<file>:<line>` + source line + caret preamble. Built from the V8
+/// Message BEFORE the TryCatch is reset -- the message is gone after.
+fn source_frame(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    message: v8::Local<'_, v8::Message>,
+) -> Option<String> {
+    let file = message
+        .get_script_resource_name(tc)?
+        .to_rust_string_lossy(tc);
+    let line = message.get_line_number(tc)?;
+    // Synthetic messages (eval wrappers) carry no usable location; Node
+    // always has one, so print no frame at all rather than "undefined:0".
+    if line == 0 || file.is_empty() || file == "undefined" {
+        return None;
+    }
+    let src = message.get_source_line(tc)?.to_rust_string_lossy(tc);
+    // V8 hands back a nonsense column for some synthetic messages (an ESM
+    // eval wrapper reported usize::MAX, which overflowed the repeat), so
+    // clamp to the line we are pointing into.
+    let column = message.get_start_column().min(src.chars().count());
+    let caret = format!("{}^", " ".repeat(column));
+    Some(format!(
+        "{file}:{line}
+{src}
+{caret}
+
+"
+    ))
+}
+
+/// Node prints an uncaught exception as the source frame plus
+/// `util.inspect(err)` -- the stack, then any extra own properties
+/// (`code`, `permission`, `syscall`, ...). oam's one-line diagnostic dropped
+/// the stack entirely: unusable in production, and it hides the `^Error:`
+/// line every Node test greps stderr for. The inspect half runs in JS
+/// (`__oamFormatFatal`, js/bootstrap.js) so the formatting is the same
+/// util.inspect userland sees.
+fn fatal_report(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    exception: v8::Local<'_, v8::Value>,
+    frame: Option<String>,
+    fallback: &str,
+) -> String {
+    // An ESM top-level throw arrives as a rejected evaluation promise, with
+    // no live Message on the scope -- rebuild one from the exception so the
+    // report still opens with Node's source frame.
+    let frame = frame.or_else(|| {
+        let message = v8::Exception::create_message(tc, exception);
+        source_frame(tc, message)
+    });
+    let body = (|| {
+        let context = tc.get_current_context();
+        let global = context.global(tc);
+        let key = v8::String::new(tc, "__oamFormatFatal")?;
+        let f = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let out = f.call(tc, recv, &[exception])?;
+        Some(out.to_rust_string_lossy(tc))
+    })();
+    // The formatter itself throwing would leave a pending exception that
+    // poisons every later JS call on this scope.
+    if tc.has_caught() {
+        tc.reset();
+    }
+    let body = body.unwrap_or_else(|| fallback.to_string());
+    format!(
+        "{}{}
+",
+        frame.unwrap_or_default(),
+        body
+    )
+}
+
 /// A callback threw directly (timer/op settle). Offer it to a process
 /// 'uncaughtException' listener; None = handled (continue), Some = fatal.
 pub(crate) fn handle_uncaught_throw(
@@ -256,6 +333,7 @@ pub(crate) fn handle_uncaught_throw(
     };
     let value = v8::Global::new(tc, exception);
     let message = crate::exception_to_error(tc, context).to_string();
+    let frame = tc.message().and_then(|m| source_frame(tc, m));
     tc.reset();
 
     let local = v8::Local::new(tc, &value);
@@ -263,10 +341,10 @@ pub(crate) fn handle_uncaught_throw(
         return None;
     }
     Some(vec![Diagnostic::new(
-        "OAM-RT0001",
+        FATAL_CODE,
         Severity::Error,
         Origin::Runtime,
-        message,
+        fatal_report(tc, local, frame, &message),
     )])
 }
 
@@ -525,9 +603,10 @@ impl JsRuntime {
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))
                     .unwrap_or_else(|| "unknown exception".to_string());
+                let fallback = format!("{}: Uncaught {text}", entry.display());
                 Err(rt_diag(
-                    "OAM-RT0001",
-                    format!("{}: Uncaught {text}", entry.display()),
+                    FATAL_CODE,
+                    fatal_report(tc, exception, None, &fallback),
                 ))
             }
             v8::PromiseState::Pending => Err(rt_diag(

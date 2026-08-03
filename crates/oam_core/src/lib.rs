@@ -10,7 +10,7 @@
 //! Roadmap: the #[op] macro, the io_uring/IOCP completion IoDriver, and
 //! per-workload tokio tuning land here as the op surface grows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -110,6 +110,11 @@ pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Re
 /// reinserting -- otherwise a cancelled body silently revives and holds its
 /// connection open for the rest of the run.
 pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+/// Wakes an in-flight `fetch_body_read`. The tombstone set above is
+/// checked only AFTER `chunk()` resolves, so a server that simply stops
+/// sending leaves the read parked forever and pins the event loop. This
+/// notifier makes cancellation preemptive.
+pub type BodyCancelSignal = std::sync::Arc<tokio::sync::Notify>;
 
 /// Open file handles for fs streams -- same remove-await-reinsert
 /// discipline as BodyRegistry (node:stream's write queue serializes
@@ -164,6 +169,11 @@ pub struct CoreRuntime {
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
     inflight: usize,
+    /// Ops that must NOT keep the event loop alive. A passive watcher (e.g.
+    /// the http response close-watcher) observes something that may never
+    /// happen; counting it in `inflight` pins the process forever. Same
+    /// rationale as SIGNAL_OP_ID, but per-op rather than a fixed id.
+    unref_ops: HashSet<OpId>,
     /// Installed OS-signal watchers keyed by Node signal name (SIGTERM, ...).
     /// Each value keeps a native handler alive; dropping it uninstalls (Unix
     /// aborts the tokio recv task, Windows removes the name from the active
@@ -172,6 +182,7 @@ pub struct CoreRuntime {
     signals: HashMap<String, signal::SignalHandle>,
     bodies: BodyRegistry,
     cancelled_bodies: CancelledBodies,
+    body_cancel_signal: BodyCancelSignal,
     files: FileRegistry,
     sync_files: SyncFileRegistry,
     zlib_streams: ZlibRegistry,
@@ -218,11 +229,13 @@ impl CoreRuntime {
             rx,
             next_id: 1,
             inflight: 0,
+            unref_ops: HashSet::new(),
             signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_bodies: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            body_cancel_signal: std::sync::Arc::new(tokio::sync::Notify::new()),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
             sync_files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -248,6 +261,11 @@ impl CoreRuntime {
     /// so per-run resets drop any unread bodies.
     pub fn bodies(&self) -> BodyRegistry {
         self.bodies.clone()
+    }
+
+    /// Wakes any parked fetch body read so cancellation is preemptive.
+    pub fn body_cancel_signal(&self) -> BodyCancelSignal {
+        self.body_cancel_signal.clone()
     }
 
     /// Cancel tombstones paired with `bodies()` (see CancelledBodies).
@@ -357,6 +375,21 @@ impl CoreRuntime {
         id
     }
 
+    /// Spawn an op that does NOT keep the event loop alive. For passive
+    /// watchers whose trigger may never arrive -- the process must still be
+    /// able to exit. Completion is delivered normally if it does arrive.
+    pub fn spawn_op_unref<F>(&mut self, op: F) -> OpId
+    where
+        F: Future<Output = OpOutcome> + Send + 'static,
+    {
+        let id = self.spawn_op(op);
+        // spawn_op counted it; undo that and remember to skip the matching
+        // decrement when the completion lands.
+        self.inflight -= 1;
+        self.unref_ops.insert(id);
+        id
+    }
+
     pub fn has_inflight(&self) -> bool {
         self.inflight > 0
     }
@@ -368,6 +401,7 @@ impl CoreRuntime {
         // decrementing here would underflow when inflight == 0.
         if let Some(ref c) = completion
             && c.id != SIGNAL_OP_ID
+            && !self.unref_ops.remove(&c.id)
         {
             self.inflight -= 1;
         }
@@ -393,6 +427,7 @@ impl CoreRuntime {
         // path the no-inflight event-loop idle arm now waits on for signals).
         if let Some(ref c) = completion
             && c.id != SIGNAL_OP_ID
+            && !self.unref_ops.remove(&c.id)
         {
             self.inflight -= 1;
         }
@@ -1790,6 +1825,7 @@ pub mod ops {
     pub async fn fetch_body_read(
         bodies: super::BodyRegistry,
         cancelled: super::CancelledBodies,
+        cancel_signal: super::BodyCancelSignal,
         handle: u64,
     ) -> OpOutcome {
         let response = bodies
@@ -1799,7 +1835,25 @@ pub mod ops {
         let Some(mut response) = response else {
             return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
         };
-        let result = response.chunk().await;
+        // Preemptive cancel: a peer that stops sending without closing would
+        // otherwise park this await forever (aborting a request could never
+        // release the op, and the loop could never drain). Re-check the
+        // tombstone after waking -- Notify is broadcast, so another handle's
+        // cancel can wake us spuriously.
+        let result = loop {
+            tokio::select! {
+                r = response.chunk() => break r,
+                _ = cancel_signal.notified() => {
+                    if cancelled
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&handle)
+                    {
+                        return OpOutcome::Done;
+                    }
+                }
+            }
+        };
         let was_cancelled = cancelled
             .lock()
             .unwrap_or_else(|e| e.into_inner())
