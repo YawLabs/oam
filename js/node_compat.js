@@ -180,8 +180,12 @@
             out += String.fromCharCode(((b & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63));
             i += 3;
           } else {
+            // WHATWG "maximal subpart": one U+FFFD stands for the whole
+            // invalid prefix, so resume PAST the bytes that were valid.
+            // Advancing a single byte re-decoded the continuation bytes as
+            // fresh leads and emitted extra replacement characters.
             fail(i);
-            i++;
+            i += i + 1 < bytes.length && b1 >= lower && b1 <= upper ? 2 : 1;
           }
         } else if (b >= 0xf0 && b <= 0xf4) {
           const b1 = bytes[i + 1];
@@ -202,7 +206,9 @@
             i += 4;
           } else {
             fail(i);
-            i++;
+            if (!(i + 1 < bytes.length && b1 >= lower && b1 <= upper)) i += 1;
+            else if (!(i + 2 < bytes.length && (b2 & 0xc0) === 0x80)) i += 2;
+            else i += 3;
           }
         } else {
           fail(i);
@@ -9970,9 +9976,13 @@
     // invalid leads (Node's utf8CheckByte semantics).
     function utf8CheckByte(byte) {
       if (byte <= 0x7f) return 0;
-      if (byte >> 5 === 0x06) return 2;
+      // C0/C1 are overlong-only and F5-FF are beyond U+10FFFF: never legal
+      // leads. The pure-JS reference accepts them (bit-pattern match alone),
+      // so an invalid lead was treated as the start of an incomplete
+      // sequence and swallowed the byte after it.
+      if (byte >> 5 === 0x06) return byte >= 0xc2 ? 2 : -2;
       if (byte >> 4 === 0x0e) return 3;
-      if (byte >> 3 === 0x1e) return 4;
+      if (byte >> 3 === 0x1e) return byte <= 0xf4 ? 4 : -2;
       return byte >> 6 === 0x02 ? -1 : -2;
     }
 
@@ -10079,7 +10089,13 @@
     }
 
     function utf8CheckExtraBytes(self, buf) {
-      if ((buf[0] & 0xc0) !== 0x80) {
+      // Bytes of the sequence already buffered; 1 means only the lead, so
+      // the incoming byte is the SECOND and the lead constrains its range.
+      const have = self.lastTotal - self.lastNeed;
+      if (
+        (buf[0] & 0xc0) !== 0x80 ||
+        (have === 1 && !utf8SecondByteOk(self.lastChar[0], buf[0]))
+      ) {
         self.lastNeed = 0;
         return "�";
       }
@@ -10098,6 +10114,18 @@
       return undefined;
     }
 
+    // Is `b` a legal SECOND byte for this lead? The lead constrains it
+    // (E0:A0-BF, ED:80-9F, F0:90-BF, F4:80-8F, otherwise 80-BF). Node's
+    // shipped StringDecoder is the C++ one and enforces this; the pure-JS
+    // reference this file ports does not, which made "E0 80" look like an
+    // INCOMPLETE 3-byte sequence (one U+FFFD) instead of two errors.
+    function utf8SecondByteOk(lead, b) {
+      if (b === undefined) return true;
+      const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+      const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
+      return b >= lower && b <= upper;
+    }
+
     function utf8CheckIncomplete(self, buf, i) {
       let j = buf.length - 1;
       if (j < i) return 0;
@@ -10109,13 +10137,17 @@
       if (--j < i || nb === -2) return 0;
       nb = utf8CheckByte(buf[j]);
       if (nb >= 0) {
-        if (nb > 0) self.lastNeed = nb - 2;
+        if (nb > 0) {
+          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
+          self.lastNeed = nb - 2;
+        }
         return nb;
       }
       if (--j < i || nb === -2) return 0;
       nb = utf8CheckByte(buf[j]);
       if (nb >= 0) {
         if (nb > 0) {
+          if (!utf8SecondByteOk(buf[j], buf[j + 1])) return 0;
           if (nb === 2) nb = 0;
           else self.lastNeed = nb - 3;
         }
