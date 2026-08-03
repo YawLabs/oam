@@ -451,8 +451,31 @@
   codes.ERR_INVALID_THIS = E("ERR_INVALID_THIS", TypeError, function(expected) {
     return 'Value of "this" must be of type ' + expected;
   });
+  // Node determineSpecificType: "undefined" / "an instance of Map" /
+  // "function foo" / "type string ('x')".
+  function determineSpecificType(value) {
+    if (value === null || value === undefined) return String(value);
+    if (typeof value === "function" && value.name) return "function " + value.name;
+    if (typeof value === "object") {
+      if (value.constructor && value.constructor.name) return "an instance of " + value.constructor.name;
+      try {
+        return require("util").inspect(value, { depth: -1 });
+      } catch {
+        return "an instance of Object";
+      }
+    }
+    let inspected;
+    try {
+      inspected = require("util").inspect(value, { colors: false });
+    } catch {
+      inspected = String(value);
+    }
+    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+    return "type " + typeof value + " (" + inspected + ")";
+  }
   codes.ERR_INVALID_RETURN_VALUE = E("ERR_INVALID_RETURN_VALUE", TypeError, function(input, name, value) {
-    return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' + typeof value + ".";
+    return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' +
+      determineSpecificType(value) + ".";
   });
   codes.ERR_MISSING_ARGS = E("ERR_MISSING_ARGS", TypeError, function() {
     var args = Array.prototype.slice.call(arguments);
@@ -3707,6 +3730,7 @@
     // the backslash, DEL, and the C1 range (0x80-0x9F). BS is the backslash
     // character; built via fromCharCode so the table reads unambiguously.
     const INSPECT_BS = String.fromCharCode(92);
+    const INSPECT_CUSTOM_SYMBOL = Symbol.for("nodejs.util.inspect.custom");
     const strEscapeMeta = (() => {
       const hex = (i) => `${INSPECT_BS}x${i.toString(16).toUpperCase().padStart(2, "0")}`;
       const m = [];
@@ -3773,6 +3797,14 @@
         options.maxArrayLength === null ? Infinity : options.maxArrayLength === undefined ? 100 : options.maxArrayLength;
       const maxStringLength =
         options.maxStringLength === null ? Infinity : options.maxStringLength === undefined ? 10000 : options.maxStringLength;
+      // Node sorts the FORMATTED entry strings (not the keys). For object-type
+      // renders the whole output is sorted; for array-type only the trailing
+      // non-index key entries are.
+      const sorted = options.sorted === undefined ? false : options.sorted;
+      const sortCmp = sorted === true ? undefined : typeof sorted === "function" ? sorted : undefined;
+      // `customInspect: false` suppresses the built-in custom renderers too --
+      // Buffer's `<Buffer ..>` form is Buffer.prototype[inspect.custom] in Node.
+      const customInspect = options.customInspect === undefined ? true : !!options.customInspect;
       const seen = [];
       // object -> ref id; minted the first time a revisit is detected
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
@@ -3790,6 +3822,25 @@
       const width = (s) => (options.colors ? s.replace(ansiRe, "").length : s.length);
       // Node keyStrRegExp -- note: no `$`, so `$foo` keys are quoted.
       const identKeyRe = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
+      // Port of Node getUserOptions: the options bag handed to a user's
+      // [util.inspect.custom] hook as its second argument.
+      function userOptionsSnapshot() {
+        return {
+          stylize,
+          showHidden,
+          depth,
+          colors: !!options.colors,
+          customInspect,
+          showProxy: options.showProxy === undefined ? false : options.showProxy,
+          maxArrayLength,
+          maxStringLength,
+          breakLength,
+          compact,
+          sorted,
+          getters,
+          numericSeparator: options.numericSeparator,
+        };
+      }
 
       function markCircular(v) {
         let id = circular.get(v);
@@ -3822,6 +3873,82 @@
           obj = Object.getPrototypeOf(obj);
         }
         return undefined;
+      }
+      // Node dispatches on un-spoofable INTERNAL SLOTS, not the prototype
+      // chain, so a value wearing a borrowed prototype (or a faked
+      // Symbol.toStringTag) renders as the plain object it really is. Each
+      // probe calls the original accessor, which throws on a wrong receiver.
+      const hasSlot = (getter, v) => {
+        try {
+          getter.call(v);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const DATE_GETTIME = Date.prototype.getTime;
+      const REGEXP_SOURCE = Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get;
+      const AB_BYTELENGTH = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+      const MAP_SIZE = Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
+      const SET_SIZE = Object.getOwnPropertyDescriptor(Set.prototype, "size").get;
+      const isRealDate = (v) => v instanceof Date && hasSlot(DATE_GETTIME, v);
+      const isRealRegExp = (v) => v instanceof RegExp && hasSlot(REGEXP_SOURCE, v);
+      // SharedArrayBuffer has its OWN byteLength getter -- ArrayBuffer's throws
+      // on it -- so both slots must be probed.
+      const SAB_BYTELENGTH =
+        typeof SharedArrayBuffer === "function"
+          ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get
+          : null;
+      const isRealArrayBuffer = (v) =>
+        hasSlot(AB_BYTELENGTH, v) || (SAB_BYTELENGTH !== null && hasSlot(SAB_BYTELENGTH, v));
+      const isRealMap = (v) => v instanceof Map && hasSlot(MAP_SIZE, v);
+      const isRealSet = (v) => v instanceof Set && hasSlot(SET_SIZE, v);
+      const DV_BYTELENGTH = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+      const isRealDataView = (v) => hasSlot(DV_BYTELENGTH, v);
+      function tagOf(v) {
+        // Port of Node's formatRaw tag gate: only surface Symbol.toStringTag
+        // when it is a string AND not an own (enumerable) property, otherwise
+        // it would be printed twice.
+        let tag;
+        try {
+          tag = v[Symbol.toStringTag];
+        } catch {
+          return "";
+        }
+        if (typeof tag !== "string") return "";
+        if (tag !== "") {
+          const own = showHidden
+            ? Object.prototype.hasOwnProperty.call(v, Symbol.toStringTag)
+            : Object.prototype.propertyIsEnumerable.call(v, Symbol.toStringTag);
+          if (own) return "";
+        }
+        return tag;
+      }
+      function typedArrayTag(v) {
+        const tag = tagOf(v);
+        if (tag !== "") return tag;
+        const cn = safeCtorName(v);
+        return cn || "TypedArray";
+      }
+      function inspectPrefix(constructor, tag, fallback, size = "") {
+        // Port of Node getPrefix.
+        if (constructor === undefined || constructor === null) {
+          if (tag !== "" && fallback !== tag) return `[${fallback}${size}: null prototype] [${tag}] `;
+          return `[${fallback}${size}: null prototype] `;
+        }
+        let result = `${constructor}${size} `;
+        if (tag !== "") {
+          const position = constructor.indexOf(tag);
+          if (position === -1) {
+            result += `[${tag}] `;
+          } else {
+            const endPos = position + tag.length;
+            if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
+              result += `[${tag}] `;
+            }
+          }
+        }
+        return result;
       }
       function getKeys(v, hidden) {
         const symbols = Object.getOwnPropertySymbols(v);
@@ -3973,7 +4100,19 @@
           base === "" && braces[0].length === 1 ? " " : `${base ? ` ${base}` : ""}\n${indentation}  `;
         return `${braces[0]}${ln}${output.join(`,\n${indentation}  `)} ${braces[1]}`;
       }
-      function reduce(output, base, braces, level, arrayish, value) {
+      function reduce(output, base, braces, level, arrayish, value, sortKeysLen) {
+        // Port of Node's ctx.sorted block in formatRaw: object-type renders sort
+        // the entire formatted output; array-type renders sort only the trailing
+        // `keys.length` non-index entries.
+        if (sorted) {
+          if (!arrayish) {
+            output.sort(sortCmp);
+          } else if (sortKeysLen > 1) {
+            const head = output.slice(0, output.length - sortKeysLen);
+            const tail = output.slice(output.length - sortKeysLen).sort(sortCmp);
+            output = head.concat(tail);
+          }
+        }
         const res = reduceToSingleString(output, base, braces, level, arrayish, value);
         // Node's output budget: clamp depth once ~2^27 chars accumulate at one
         // indentation level so huge objects cannot OOM the isolate.
@@ -4191,15 +4330,45 @@
         if (t === "symbol") return stylize(v.toString(), "symbol");
         // ---------------- object-like values from here on ----------------
         if (seen.includes(v)) return markCircular(v);
+        // User-supplied [util.inspect.custom] hook (Node formatValue). Skipped
+        // when customInspect is off, when the hook IS util.inspect, and on the
+        // prototype object itself (circular-render guard).
+        if (customInspect) {
+          let maybeCustom;
+          try {
+            maybeCustom = v[INSPECT_CUSTOM_SYMBOL];
+          } catch {
+            maybeCustom = undefined;
+          }
+          if (
+            typeof maybeCustom === "function" &&
+            maybeCustom !== inspect &&
+            Object.getOwnPropertyDescriptor(v, "constructor")?.value?.prototype !== v
+          ) {
+            const customDepth = depth === null ? null : depth - level;
+            const ret = maybeCustom.call(v, customDepth, userOptionsSnapshot(), inspect);
+            // Returning `this` means "render me normally" -- avoids recursion.
+            if (ret !== v) {
+              if (typeof ret !== "string") return walk(ret, level);
+              return ret.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
+            }
+          }
+        }
         if (t === "function") return formatFunction(v, level);
-        if (v instanceof Date) {
-          const base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+        if (isRealDate(v)) {
+          // Node prefixes a Date SUBCLASS with its constructor name.
+          let base = Number.isNaN(v.getTime()) ? "Invalid Date" : v.toISOString();
+          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "Date");
+          if (prefix !== "Date ") base = `${prefix}${base}`;
           const keys = getKeys(v, showHidden);
           if (keys.length === 0 || (depth !== null && level > depth)) return stylize(base, "date");
           return entriesTail(v, keys, stylize(base, "date"), level);
         }
-        if (v instanceof RegExp) {
-          const base = stylize(v.toString(), "regexp");
+        if (isRealRegExp(v)) {
+          let base = v.toString();
+          const prefix = inspectPrefix(safeCtorName(v), tagOf(v), "RegExp");
+          if (prefix !== "RegExp ") base = `${prefix}${base}`;
+          base = stylize(base, "regexp");
           const keys = getKeys(v, showHidden);
           if (keys.length === 0 || (depth !== null && level > depth)) return base;
           return entriesTail(v, keys, base, level);
@@ -4243,13 +4412,29 @@
               return true;
             });
           }
+          // Node surfaces a non-enumerable own `cause` (what `new Error(m, {cause})`
+          // installs) and AggregateError's `errors` as bracketed entries.
+          if (Object.prototype.hasOwnProperty.call(v, "cause") && !keys.includes("cause")) {
+            keys.push("cause");
+          }
+          try {
+            if (
+              Array.isArray(v.errors) &&
+              Object.prototype.hasOwnProperty.call(v, "errors") &&
+              !keys.includes("errors")
+            ) {
+              keys.push("errors");
+            }
+          } catch {
+            // A throwing `errors` getter is ignored, exactly like Node.
+          }
           if (keys.length === 0) return base;
           if (depth !== null && level > depth) {
             return stylize(`[${safeCtorName(v) || "Error"}]`, "special");
           }
           return entriesTail(v, keys, base, level);
         }
-        if (globalThis.Buffer && v instanceof globalThis.Buffer) {
+        if (customInspect && globalThis.Buffer && v instanceof globalThis.Buffer) {
           // Node formats Buffers inline as <Buffer hex ...>; it does NOT call a
           // user .inspect() (that legacy hook is gone) -- an own `inspect` prop
           // is shown like any other property.
@@ -4271,12 +4456,28 @@
           }
           return `<Buffer ${parts.join(", ")}>`;
         }
-        if ((typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer) || v instanceof ArrayBuffer) {
+        if (isRealArrayBuffer(v)) {
           const label = v instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
-          const bytes = new Uint8Array(v);
-          let hex = "";
-          for (let i = 0; i < bytes.length; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
-          return `${label} { [Uint8Contents]: <${hex}>, [byteLength]: ${v.byteLength} }`;
+          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+          const items = [];
+          let bytes;
+          try {
+            bytes = new Uint8Array(v);
+          } catch {
+            bytes = null;
+          }
+          if (bytes === null) {
+            items.push(stylize("(detached)", "special"));
+          } else {
+            const shown = Math.min(maxArrayLength, bytes.length);
+            let hex = "";
+            for (let i = 0; i < shown; i++) hex += (i ? " " : "") + bytes[i].toString(16).padStart(2, "0");
+            const remaining = bytes.length - maxArrayLength;
+            if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+            items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
+          }
+          items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
+          return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
         }
         if (Array.isArray(v)) {
           // Subclass prefix: Node tags an Array subclass "Name(len) [ ... ]".
@@ -4327,9 +4528,9 @@
           } finally {
             seen.pop();
           }
-          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v);
+          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
         }
-        if (v instanceof Map) {
+        if (isRealMap(v)) {
           const cn = safeCtorName(v);
           const prefix = `${cn && cn !== "Map" ? cn : "Map"}(${v.size}) `;
           if (v.size === 0) return `${prefix}{}`;
@@ -4348,7 +4549,7 @@
           }
           return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
         }
-        if (v instanceof Set) {
+        if (isRealSet(v)) {
           const cn = safeCtorName(v);
           const prefix = `${cn && cn !== "Set" ? cn : "Set"}(${v.size}) `;
           if (v.size === 0) return `${prefix}{}`;
@@ -4365,15 +4566,108 @@
           }
           return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
         }
-        if (ArrayBuffer.isView(v)) {
+        if (Symbol.iterator in v && ArrayBuffer.isView(v) && typeof v.subarray === "function") {
+          // Typed arrays (incl. Buffer when customInspect is off). Node routes
+          // these through the normal array-extras render: element entries first,
+          // then non-index own keys, all under `Ctor(len) [ ... ]`.
+          const cn = safeCtorName(v);
+          const tag = typedArrayTag(v);
+          const taLen = v.length;
+          const prefix = inspectPrefix(cn, tag, tag, `(${taLen})`);
+          const extraKeys = [];
+          for (const k of Reflect.ownKeys(v)) {
+            if (typeof k === "string" && String(k >>> 0) === k && (k >>> 0) < taLen) continue;
+            if (!showHidden) {
+              const d = Object.getOwnPropertyDescriptor(v, k);
+              if (!d || !d.enumerable) continue;
+            }
+            extraKeys.push(k);
+          }
+          if (taLen === 0 && extraKeys.length === 0) return `${prefix}[]`;
           if (depth !== null && level > depth) return collapsed(v);
-          const name = v.constructor?.name ?? "TypedArray";
-          const items = Array.from(v.subarray ? v.subarray(0, 50) : []).join(", ");
-          const taLen = v.length ?? v.byteLength;
-          return items.length === 0 ? `${name}(${taLen}) []` : `${name}(${taLen}) [ ${items} ]`;
+          seen.push(v);
+          ictx.currentDepth = level + 1;
+          const items = [];
+          try {
+            const limit = Math.min(taLen, maxArrayLength);
+            const isBig = typeof v[0] === "bigint";
+            for (let idx = 0; idx < limit; idx++) {
+              const el = v[idx];
+              items.push(
+                isBig
+                  ? stylize(`${el}n`, "bigint")
+                  : stylize(Object.is(el, -0) ? "-0" : String(el), "number"),
+              );
+            }
+            if (taLen > limit) {
+              const remaining = taLen - limit;
+              items.push(`... ${remaining} more item${remaining > 1 ? "s" : ""}`);
+            }
+            for (const k of extraKeys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+          } finally {
+            seen.pop();
+          }
+          return reduce(items, refPrefix(v, ""), [`${prefix}[`, "]"], level + 1, true, v, extraKeys.length);
+        }
+        if (isRealDataView(v)) {
+          // DataView: Node renders the three hidden descriptors unconditionally.
+          const cn = safeCtorName(v);
+          const prefix = inspectPrefix(cn, tagOf(v), "DataView");
+          if (depth !== null && level > depth) return collapsed(v);
+          seen.push(v);
+          ictx.currentDepth = level + 1;
+          const items = [];
+          ictx.indentationLvl += 2;
+          try {
+            items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
+            items.push(`[byteOffset]: ${stylize(String(v.byteOffset), "number")}`);
+            items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
+            for (const k of getKeys(v, showHidden)) {
+              items.push(formatProperty(v, k, undefined, level + 1, false, v));
+            }
+          } finally {
+            ictx.indentationLvl -= 2;
+            seen.pop();
+          }
+          return reduce(items, refPrefix(v, ""), [`${prefix}{`, "}"], level + 1, false, v);
+        }
+        if (v instanceof WeakMap || v instanceof WeakSet) {
+          // Node cannot enumerate a weak collection without showHidden.
+          const label = v instanceof WeakMap ? "WeakMap" : "WeakSet";
+          const pfx = inspectPrefix(safeCtorName(v), tagOf(v), label);
+          if (depth !== null && level > depth) return collapsed(v);
+          return reduce([stylize("<items unknown>", "special")], refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
+        }
+        {
+          // Boxed primitives render as `[Boolean: false]`, not `Boolean {}`.
+          const boxType =
+            v instanceof Number
+              ? "Number"
+              : v instanceof String
+                ? "String"
+                : v instanceof Boolean
+                  ? "Boolean"
+                  : null;
+          if (boxType !== null) {
+            const prim = boxType === "Number" ? Number.prototype.valueOf.call(v)
+              : boxType === "String" ? String.prototype.valueOf.call(v)
+                : Boolean.prototype.valueOf.call(v);
+            const ctor = safeCtorName(v);
+            let base = `[${boxType}`;
+            if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
+            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(String(prim), boxType.toLowerCase())}]`;
+            const tg = tagOf(v);
+            if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
+            let bkeys = getKeys(v, showHidden);
+            // Drop the 0..n-1 index entries a boxed String exposes.
+            if (boxType === "String") bkeys = bkeys.slice(prim.length);
+            if (bkeys.length === 0) return base;
+            if (depth !== null && level > depth) return collapsed(v);
+            return entriesTail(v, bkeys, base, level);
+          }
         }
         // Plain objects, class instances, null-prototype objects, and the
-        // remaining object-shaped values (WeakMap/WeakSet/Promise/boxed).
+        // remaining object-shaped values (Promise et al).
         let prefix;
         let nullProto = false;
         if (Object.getPrototypeOf(v) === null) {
@@ -4384,7 +4678,21 @@
           nullProto = true;
         } else {
           const ctor = safeCtorName(v);
-          prefix = ctor && ctor !== "Object" ? `${ctor} ` : "";
+          const tg = tagOf(v);
+          if (ctor === "Object" || ctor === undefined) {
+            // Node tags an arguments object and surfaces a non-own toStringTag.
+            prefix =
+              Object.prototype.toString.call(v) === "[object Arguments]"
+                ? "[Arguments] "
+                : tg !== ""
+                  ? inspectPrefix(ctor ?? "Object", tg, "Object")
+                  : "";
+          } else {
+            // Node getCtxStyle: the tag rides along unless it already prefixes
+            // the constructor name (so `Buffer` + `Uint8Array` renders as
+            // `Buffer [Uint8Array] `, but `ArrayBuffer` + `ArrayBuffer` does not).
+            prefix = inspectPrefix(ctor, tg, "Object");
+          }
         }
         const keys = getKeys(v, showHidden);
         const protoProps = nullProto ? undefined : protoPropsFor(v, level);
@@ -4729,6 +5037,13 @@
       }
     };
     const origGetTime = Date.prototype.getTime;
+    // Un-spoofable [[ErrorData]] probe. `instanceof Error` misses an error whose
+    // prototype was nulled, and Object.prototype.toString can be forged with
+    // Symbol.toStringTag -- Error.isError reads the internal slot directly.
+    const isNativeErrorValue =
+      typeof Error.isError === "function"
+        ? (v) => Error.isError(v)
+        : (v) => v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
     const anyArrayBuffer = (v) =>
       v instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer);
@@ -4740,7 +5055,14 @@
         ? Object.is
         : // eslint-disable-next-line eqeqeq
           (x, y) => x == y || (Number.isNaN(x) && Number.isNaN(y));
-      if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+      // Node's innerDeepEqual treats null and every non-object (including
+      // functions) as a primitive, and a primitive is NEVER deep-equal to an
+      // object in either mode -- `==` coercion must not leak in here
+      // (`'a' == ['a']` is true, but deepEqual('a', ['a']) is false).
+      const aPrim = a === null || typeof a !== "object";
+      const bPrim = b === null || typeof b !== "object";
+      if (aPrim || bPrim) {
+        if (aPrim !== bPrim) return false;
         return primitiveEqual(a, b);
       }
       if (a === b) return true;
@@ -4774,7 +5096,7 @@
       }
       if (a instanceof Date !== b instanceof Date) return false;
       if (a instanceof RegExp !== b instanceof RegExp) return false;
-      if (a instanceof Error !== b instanceof Error) return false;
+      if (isNativeErrorValue(a) !== isNativeErrorValue(b)) return false;
       if (a instanceof Map !== b instanceof Map) return false;
       if (a instanceof Set !== b instanceof Set) return false;
       if (ArrayBuffer.isView(a) !== ArrayBuffer.isView(b)) return false;
@@ -4958,26 +5280,250 @@
       if (prior) prior.add(actual);
       else memo.set(expected, new Set([actual]));
 
+      // Node's partial mode DROPS the prototype/constructor check but keeps the
+      // internal type-tag check -- that tag is what rejects arguments-vs-object,
+      // Error-vs-object, boxed-Symbol-vs-object and Uint8Array-vs-Int8Array.
+      const tagOfVal = Object.prototype.toString;
+      if (tagOfVal.call(actual) !== tagOfVal.call(expected)) return false;
+      // ...and, because Symbol.toStringTag / the prototype can both be spoofed,
+      // the same un-spoofable internal-type battery deepEqualImpl uses.
+      if (Array.isArray(actual) !== Array.isArray(expected)) return false;
+      if (actual instanceof Date !== expected instanceof Date) return false;
+      if (actual instanceof RegExp !== expected instanceof RegExp) return false;
+      if (actual instanceof Map !== expected instanceof Map) return false;
+      if (actual instanceof Set !== expected instanceof Set) return false;
+      if (ArrayBuffer.isView(actual) !== ArrayBuffer.isView(expected)) return false;
+      if (anyArrayBuffer(actual) !== anyArrayBuffer(expected)) return false;
+      if (ArrayBuffer.isView(actual) && taKind(actual) !== taKind(expected)) return false;
+      if (isNativeErrorValue(actual) !== isNativeErrorValue(expected)) return false;
+
+      // Weak collections expose no contents; only reference equality can hold
+      // (and that was already handled above).
+      if (
+        expected instanceof WeakMap || expected instanceof WeakSet ||
+        actual instanceof WeakMap || actual instanceof WeakSet
+      ) {
+        return false;
+      }
+
       if (Array.isArray(expected)) {
         if (!Array.isArray(actual)) return false;
-        // Each expected element must match some actual element in order.
-        let ai = 0;
-        for (let ei = 0; ei < expected.length; ei++) {
-          let matched = false;
-          for (; ai < actual.length; ai++) {
-            if (partialDeepEqualImpl(actual[ai], expected[ei], memo)) {
-              matched = true;
-              ai++;
-              break;
+        if (actual.length < expected.length) return false;
+        if (!partialArrayEquiv(actual, expected, memo)) return false;
+        return partialKeyEquiv(actual, expected, memo, true);
+      }
+
+      if (ArrayBuffer.isView(expected)) {
+        if (!ArrayBuffer.isView(actual)) return false;
+        const va = new Uint8Array(actual.buffer, actual.byteOffset, actual.byteLength);
+        const vb = new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength);
+        if (actual.byteLength === expected.byteLength) {
+          for (let i = 0; i < va.length; i++) if (va[i] !== vb[i]) return false;
+        } else if (!isPartialUint8Array(va, vb)) {
+          return false;
+        }
+        return partialKeyEquiv(actual, expected, memo, true);
+      }
+
+      if (
+        expected instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== "undefined" && expected instanceof SharedArrayBuffer)
+      ) {
+        const va = new Uint8Array(actual);
+        const vb = new Uint8Array(expected);
+        if (va.length === vb.length) {
+          for (let i = 0; i < va.length; i++) if (va[i] !== vb[i]) return false;
+        } else if (!isPartialUint8Array(va, vb)) {
+          return false;
+        }
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      if (expected instanceof Set) {
+        if (!(actual instanceof Set) || actual.size < expected.size) return false;
+        if (!partialSetEquiv(actual, expected, memo)) return false;
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      if (expected instanceof Map) {
+        if (!(actual instanceof Map) || actual.size < expected.size) return false;
+        if (!partialMapEquiv(actual, expected, memo)) return false;
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      if (expected instanceof Date) {
+        // Read [[DateValue]] through the original getTime so an own override
+        // cannot fool the check; a fake clone carrying Date.prototype throws.
+        let ta, tb;
+        try {
+          ta = origGetTime.call(actual);
+          tb = origGetTime.call(expected);
+        } catch {
+          return false;
+        }
+        if (!Object.is(ta, tb)) return false;
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      if (expected instanceof RegExp) {
+        // `source`/`flags` are prototype accessors: a fake clone wearing
+        // RegExp.prototype throws instead of comparing, so treat that as
+        // "not equal" rather than letting the TypeError escape.
+        try {
+          if (!(actual instanceof RegExp) || actual.source !== expected.source || actual.flags !== expected.flags) {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      {
+        const ke = boxedKind(expected);
+        if (ke !== null) {
+          const ka = boxedKind(actual);
+          if (ka !== ke) return false;
+          if (!Object.is(boxedValue(actual, ka), boxedValue(expected, ke))) return false;
+          return partialKeyEquiv(actual, expected, memo, false);
+        }
+      }
+
+      if (isNativeErrorValue(expected)) {
+        if (!isNativeErrorValue(actual)) return false;
+        // message/name/cause/errors are non-enumerable, so the key loop below
+        // never sees them. Node compares them explicitly, treating an absent
+        // (undefined) or empty-string `message` on the expected side as "any".
+        for (const p of ["name", "message", "cause", "errors"]) {
+          if (Object.prototype.propertyIsEnumerable.call(expected, p)) continue;
+          const want = expected[p];
+          if (want === undefined || (p === "message" && want === "")) continue;
+          if (!partialDeepEqualImpl(actual[p], want, memo)) return false;
+        }
+        // An expected `cause` requires an actual one; the reverse is fine.
+        if (
+          Object.prototype.hasOwnProperty.call(expected, "cause") &&
+          !Object.prototype.hasOwnProperty.call(actual, "cause")
+        ) {
+          return false;
+        }
+        return partialKeyEquiv(actual, expected, memo, false);
+      }
+
+      return partialKeyEquiv(actual, expected, memo, false);
+    }
+
+    // Every own ENUMERABLE key (string + symbol) of `expected` must be an own
+    // enumerable key of `actual` and match partially. Extra keys on `actual`
+    // are what makes the comparison "partial".
+    function partialKeyEquiv(actual, expected, memo, skipIndexKeys) {
+      const keys = Object.keys(expected);
+      for (const sym of Object.getOwnPropertySymbols(expected)) {
+        if (Object.prototype.propertyIsEnumerable.call(expected, sym)) keys.push(sym);
+      }
+      for (const key of keys) {
+        if (skipIndexKeys && typeof key === "string" && String(key >>> 0) === key) continue;
+        const d = Object.getOwnPropertyDescriptor(actual, key);
+        if (d === undefined || d.enumerable !== true) return false;
+        if (!partialDeepEqualImpl(actual[key], expected[key], memo)) return false;
+      }
+      return true;
+    }
+
+    function isArrayHole(arr, i) {
+      return arr[i] === undefined && !Object.prototype.hasOwnProperty.call(arr, i);
+    }
+
+    // Port of node partialSparseArrayEquiv: once either side is sparse, only the
+    // DEFINED indices participate, still as an in-order subsequence.
+    function partialSparseArrayEquiv(a, b, memo, startA, startB) {
+      let aPos = 0;
+      const keysA = Object.keys(a).slice(startA);
+      const keysB = Object.keys(b).slice(startB);
+      if (keysA.length < keysB.length) return false;
+      for (let i = 0; i < keysB.length; i++) {
+        const keyB = keysB[i];
+        while (!partialDeepEqualImpl(a[keysA[aPos]], b[keyB], memo)) {
+          aPos++;
+          if (aPos > keysA.length - keysB.length + i) return false;
+        }
+        aPos++;
+      }
+      return true;
+    }
+
+    // Port of node partialArrayEquiv: expected is an in-order subsequence.
+    function partialArrayEquiv(a, b, memo) {
+      let aPos = 0;
+      for (let i = 0; i < b.length; i++) {
+        let isSparse = isArrayHole(b, i);
+        if (isSparse) return partialSparseArrayEquiv(a, b, memo, aPos, i);
+        while (!(isSparse = isArrayHole(a, aPos)) && !partialDeepEqualImpl(a[aPos], b[i], memo)) {
+          aPos++;
+          if (aPos > a.length - b.length + i) return false;
+        }
+        if (isSparse) return partialSparseArrayEquiv(a, b, memo, aPos, i);
+        aPos++;
+      }
+      return true;
+    }
+
+    // Port of node isPartialUint8Array: byte-level in-order subsequence.
+    function isPartialUint8Array(a, b) {
+      if (a.length < b.length) return false;
+      let offsetA = 0;
+      for (let offsetB = 0; offsetB < b.length; offsetB++) {
+        while (!Object.is(a[offsetA], b[offsetB])) {
+          offsetA++;
+          if (offsetA > a.length - b.length + offsetB) return false;
+        }
+        offsetA++;
+      }
+      return true;
+    }
+
+    // Each expected member must match a DISTINCT actual member.
+    function partialSetEquiv(actual, expected, memo) {
+      const pool = [...actual];
+      const used = new Array(pool.length).fill(false);
+      outer: for (const want of expected) {
+        // Fast path for primitives held identically by the actual set.
+        if ((want === null || typeof want !== "object") && actual.has(want)) {
+          for (let i = 0; i < pool.length; i++) {
+            if (!used[i] && Object.is(pool[i], want)) {
+              used[i] = true;
+              continue outer;
             }
           }
-          if (!matched) return false;
         }
-        return true;
+        for (let i = 0; i < pool.length; i++) {
+          if (!used[i] && partialDeepEqualImpl(pool[i], want, memo)) {
+            used[i] = true;
+            continue outer;
+          }
+        }
+        return false;
       }
-      for (const key of Object.keys(expected)) {
-        if (!Object.prototype.hasOwnProperty.call(actual, key)) return false;
-        if (!partialDeepEqualImpl(actual[key], expected[key], memo)) return false;
+      return true;
+    }
+
+    // Each expected entry must match a DISTINCT actual entry (key AND value).
+    function partialMapEquiv(actual, expected, memo) {
+      const pool = [...actual];
+      const used = new Array(pool.length).fill(false);
+      outer: for (const [wantKey, wantVal] of expected) {
+        for (let i = 0; i < pool.length; i++) {
+          if (used[i]) continue;
+          const [gotKey, gotVal] = pool[i];
+          const keyOk =
+            Object.is(gotKey, wantKey) ||
+            (gotKey !== null && typeof gotKey === "object" && partialDeepEqualImpl(gotKey, wantKey, memo));
+          if (!keyOk) continue;
+          if (!partialDeepEqualImpl(gotVal, wantVal, memo)) continue;
+          used[i] = true;
+          continue outer;
+        }
+        return false;
       }
       return true;
     }
@@ -5543,7 +6089,7 @@
       types: {
         isDate: (v) => v instanceof Date,
         isRegExp: (v) => v instanceof RegExp,
-        isNativeError: (v) => v instanceof Error,
+        isNativeError: (v) => isNativeErrorValue(v),
         isPromise: (v) => v instanceof Promise,
         isMap: (v) => v instanceof Map,
         isSet: (v) => v instanceof Set,
@@ -5602,42 +6148,560 @@
     const util = registry.get("util");
     const deepEqual = util._deepEqual;
 
-    class AssertionError extends Error {
-      constructor(options) {
-        let message = options.message;
-        let generatedMessage = false;
-        if (message == null) {
-          generatedMessage = true;
-          if (options.operator === "fail") {
-            message = "Failed";
-          } else {
-            message = `${util.inspect(options.actual)} ${options.operator} ${util.inspect(options.expected)}`;
+    // ---- colors (port of node internal/util/colors.js) ----------------------
+    // Re-read from process.env on every refresh() so a test that flips
+    // NO_COLOR / NODE_DISABLE_COLORS mid-run is honored.
+    function colorDepthFor(stream) {
+      const env = process.env;
+      // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
+      if (env.FORCE_COLOR !== undefined) {
+        switch (env.FORCE_COLOR) {
+          case "":
+          case "1":
+          case "true":
+            return 4;
+          case "2":
+            return 8;
+          case "3":
+            return 24;
+          default:
+            return 1;
+        }
+      }
+      if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+        return 1;
+      }
+      if (!stream || !stream.isTTY) return 1;
+      if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
+      return 4;
+    }
+    const colors = {
+      blue: "", green: "", white: "", red: "", gray: "", yellow: "", clear: "", reset: "",
+      hasColors: false,
+      shouldColorize(stream) {
+        if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
+        return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
+      },
+      refresh() {
+        let hasColors = false;
+        try {
+          hasColors = colors.shouldColorize(process.stderr);
+        } catch {
+          hasColors = false;
+        }
+        colors.blue = hasColors ? "[34m" : "";
+        colors.green = hasColors ? "[32m" : "";
+        colors.white = hasColors ? "[39m" : "";
+        colors.yellow = hasColors ? "[33m" : "";
+        colors.red = hasColors ? "[31m" : "";
+        colors.gray = hasColors ? "[90m" : "";
+        colors.clear = hasColors ? "c" : "";
+        colors.reset = hasColors ? "[0m" : "";
+        colors.hasColors = hasColors;
+      },
+    };
+    colors.refresh();
+
+    // ---- Myers diff (port of node internal/assert/myers_diff.js) -----------
+    const kNopLinesToCollapse = 5;
+    const OP_DELETE = -1;
+    const OP_NOP = 0;
+    const OP_INSERT = 1;
+
+    function areLinesEqual(actual, expected, checkCommaDisparity) {
+      if (actual === expected) return true;
+      if (checkCommaDisparity) {
+        return `${actual},` === expected || actual === `${expected},`;
+      }
+      return false;
+    }
+
+    function myersDiff(actual, expected, checkCommaDisparity = false) {
+      const actualLength = actual.length;
+      const expectedLength = expected.length;
+      const max = actualLength + expectedLength;
+      if (max > 2 ** 31 - 1) {
+        throw new codes.ERR_OUT_OF_RANGE("myersDiff input size", "< 2^31", max);
+      }
+      const v = new Int32Array(2 * max + 1);
+      const trace = [];
+      for (let diffLevel = 0; diffLevel <= max; diffLevel++) {
+        trace.push(new Int32Array(v)); // snapshot of `v` at this level
+        for (let diagonalIndex = -diffLevel; diagonalIndex <= diffLevel; diagonalIndex += 2) {
+          const offset = diagonalIndex + max;
+          const previousOffset = v[offset - 1];
+          const nextOffset = v[offset + 1];
+          let x =
+            diagonalIndex === -diffLevel || (diagonalIndex !== diffLevel && previousOffset < nextOffset)
+              ? nextOffset
+              : previousOffset + 1;
+          let y = x - diagonalIndex;
+          while (x < actualLength && y < expectedLength && areLinesEqual(actual[x], expected[y], checkCommaDisparity)) {
+            x++;
+            y++;
+          }
+          v[offset] = x;
+          if (x >= actualLength && y >= expectedLength) {
+            return myersBacktrack(trace, actual, expected, checkCommaDisparity);
           }
         }
-        super(message);
-        this.name = "AssertionError";
-        this.code = "ERR_ASSERTION";
-        this.actual = options.actual;
-        this.expected = options.expected;
-        this.operator = options.operator;
-        // assert.ok builds its own message text (it needs the call-site
-        // source) but node still reports generatedMessage=true for it.
-        this.generatedMessage = generatedMessage || options.forceGeneratedMessage === true;
-        // Trim oam-internal frames (and the asserting helper itself) from the
-        // stack, the way Node's `stackStartFn` does.
-        if (options.stackStartFn && typeof Error.captureStackTrace === "function") {
-          Error.captureStackTrace(this, options.stackStartFn);
+      }
+      return undefined;
+    }
+
+    function myersBacktrack(trace, actual, expected, checkCommaDisparity) {
+      const actualLength = actual.length;
+      const expectedLength = expected.length;
+      const max = actualLength + expectedLength;
+      let x = actualLength;
+      let y = expectedLength;
+      const result = [];
+      for (let diffLevel = trace.length - 1; diffLevel >= 0; diffLevel--) {
+        const v = trace[diffLevel];
+        const diagonalIndex = x - y;
+        const offset = diagonalIndex + max;
+        let prevDiagonalIndex;
+        if (diagonalIndex === -diffLevel || (diagonalIndex !== diffLevel && v[offset - 1] < v[offset + 1])) {
+          prevDiagonalIndex = diagonalIndex + 1;
+        } else {
+          prevDiagonalIndex = diagonalIndex - 1;
         }
+        const prevX = v[prevDiagonalIndex + max];
+        const prevY = prevX - prevDiagonalIndex;
+        while (x > prevX && y > prevY) {
+          const actualItem = actual[x - 1];
+          const value = checkCommaDisparity && !actualItem.endsWith(",") ? expected[y - 1] : actualItem;
+          result.push([OP_NOP, value]);
+          x--;
+          y--;
+        }
+        if (diffLevel > 0) {
+          if (x > prevX) {
+            result.push([OP_INSERT, actual[--x]]);
+          } else {
+            result.push([OP_DELETE, expected[--y]]);
+          }
+        }
+      }
+      return result;
+    }
+
+    function printSimpleMyersDiff(diff) {
+      let message = "";
+      for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
+        const [operation, value] = diff[diffIdx];
+        let color = colors.white;
+        if (operation === OP_INSERT) color = colors.green;
+        else if (operation === OP_DELETE) color = colors.red;
+        message += `${color}${value}${colors.white}`;
+      }
+      return `\n${message}`;
+    }
+
+    function printMyersDiff(diff, operator) {
+      let message = "";
+      let skipped = false;
+      let nopCount = 0;
+      for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
+        const [operation, value] = diff[diffIdx];
+        const previousOperation = diffIdx < diff.length - 1 ? diff[diffIdx + 1][0] : null;
+        // Avoid grouping if only one line would have been grouped otherwise.
+        if (previousOperation === OP_NOP && operation !== previousOperation) {
+          if (nopCount === kNopLinesToCollapse + 1) {
+            message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+          } else if (nopCount === kNopLinesToCollapse + 2) {
+            message += `${colors.white}  ${diff[diffIdx + 2][1]}\n`;
+            message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+          } else if (nopCount >= kNopLinesToCollapse + 3) {
+            message += `${colors.blue}...${colors.white}\n`;
+            message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+            skipped = true;
+          }
+          nopCount = 0;
+        }
+        if (operation === OP_INSERT) {
+          if (operator === "partialDeepStrictEqual") {
+            message += `${colors.gray}${colors.hasColors ? " " : "+"} ${value}${colors.white}\n`;
+          } else {
+            message += `${colors.green}+${colors.white} ${value}\n`;
+          }
+        } else if (operation === OP_DELETE) {
+          message += `${colors.red}-${colors.white} ${value}\n`;
+        } else if (operation === OP_NOP) {
+          if (nopCount < kNopLinesToCollapse) {
+            message += `${colors.white}  ${value}\n`;
+          }
+          nopCount++;
+        }
+      }
+      message = message.trimEnd();
+      return { message: `\n${message}`, skipped };
+    }
+
+    // ---- assertion messages (port of internal/assert/assertion_error.js) ---
+    const kReadableOperator = {
+      deepStrictEqual: "Expected values to be strictly deep-equal:",
+      partialDeepStrictEqual: "Expected values to be partially and strictly deep-equal:",
+      strictEqual: "Expected values to be strictly equal:",
+      strictEqualObject: 'Expected "actual" to be reference-equal to "expected":',
+      deepEqual: "Expected values to be loosely deep-equal:",
+      notDeepStrictEqual: 'Expected "actual" not to be strictly deep-equal to:',
+      notStrictEqual: 'Expected "actual" to be strictly unequal to:',
+      notStrictEqualObject: 'Expected "actual" not to be reference-equal to "expected":',
+      notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
+      notIdentical: "Values have same structure but are not reference-equal:",
+      notDeepEqualUnequal: "Expected values not to be loosely deep-equal:",
+    };
+    const kMaxShortStringLength = 12;
+    const kMaxLongStringLength = 512;
+    const kMethodsWithCustomMessageDiff = new Set(["deepStrictEqual", "strictEqual", "partialDeepStrictEqual"]);
+
+    function isErrorLike(v) {
+      return v instanceof Error || Object.prototype.toString.call(v) === "[object Error]";
+    }
+
+    function copyError(source) {
+      const target = Object.assign({ __proto__: Object.getPrototypeOf(source) }, source);
+      Object.defineProperty(target, "message", { __proto__: null, value: source.message });
+      if (Object.prototype.hasOwnProperty.call(source, "cause")) {
+        let { cause } = source;
+        if (isErrorLike(cause)) cause = copyError(cause);
+        Object.defineProperty(target, "cause", { __proto__: null, value: cause });
+      }
+      return target;
+    }
+
+    function inspectValue(val) {
+      // The util.inspect default values could be changed. This makes sure the
+      // error messages contain the necessary information nevertheless.
+      return util.inspect(val, {
+        compact: false,
+        customInspect: false,
+        depth: 1000,
+        maxArrayLength: Infinity,
+        // Assert compares only enumerable properties (with a few exceptions).
+        showHidden: false,
+        // Assert does not detect proxies currently.
+        showProxy: false,
+        sorted: true,
+        // Inspect getters as we also check them when comparing entries.
+        getters: true,
+      });
+    }
+
+    function getErrorMessage(operator, message) {
+      return message || kReadableOperator[operator];
+    }
+
+    function checkOperator(actual, expected, operator) {
+      // In case both values are objects or functions explicitly mark them as
+      // not reference equal for the `strictEqual` operator.
+      if (
+        operator === "strictEqual" &&
+        ((typeof actual === "object" && actual !== null && typeof expected === "object" && expected !== null) ||
+          (typeof actual === "function" && typeof expected === "function"))
+      ) {
+        operator = "strictEqualObject";
+      }
+      return operator;
+    }
+
+    function getColoredMyersDiff(actual, expected) {
+      const header = `${colors.green}actual${colors.white} ${colors.red}expected${colors.white}`;
+      const skipped = false;
+      const diff = myersDiff(actual.split(""), expected.split(""));
+      const message = printSimpleMyersDiff(diff);
+      return { message, header, skipped };
+    }
+
+    function getStackedDiff(actual, expected) {
+      const isStringComparison = typeof actual === "string" && typeof expected === "string";
+      let message = `\n${colors.green}+${colors.white} ${actual}\n${colors.red}- ${colors.white}${expected}`;
+      const stringsLen = actual.length + expected.length;
+      let maxTerminalLength = 80;
+      try {
+        if (process.stderr.isTTY) maxTerminalLength = process.stderr.columns;
+      } catch {
+        maxTerminalLength = 80;
+      }
+      const showIndicator = isStringComparison && stringsLen <= maxTerminalLength;
+      if (showIndicator) {
+        let indicatorIdx = -1;
+        for (let i = 0; i < actual.length; i++) {
+          if (actual[i] !== expected[i]) {
+            // Skip the indicator for the first 2 characters because the diff is
+            // immediately apparent. It is 3 instead of 2 to account for quotes.
+            if (i >= 3) indicatorIdx = i;
+            break;
+          }
+        }
+        if (indicatorIdx !== -1) {
+          message += `\n${" ".repeat(indicatorIdx + 2)}^`;
+        }
+      }
+      return { message };
+    }
+
+    function getSimpleDiff(originalActual, actual, originalExpected, expected) {
+      let stringsLen = actual.length + expected.length;
+      // Accounting for the quotes wrapping strings.
+      if (typeof originalActual === "string") stringsLen -= 2;
+      if (typeof originalExpected === "string") stringsLen -= 2;
+      if (stringsLen <= kMaxShortStringLength && (originalActual !== 0 || originalExpected !== 0)) {
+        return { message: `${actual} !== ${expected}`, header: "" };
+      }
+      const isStringComparison = typeof originalActual === "string" && typeof originalExpected === "string";
+      if (isStringComparison && colors.hasColors) {
+        return getColoredMyersDiff(actual, expected);
+      }
+      return getStackedDiff(actual, expected);
+    }
+
+    function isSimpleDiff(actual, inspectedActual, expected, inspectedExpected) {
+      if (inspectedActual.length > 1 || inspectedExpected.length > 1) return false;
+      return typeof actual !== "object" || actual === null || typeof expected !== "object" || expected === null;
+    }
+
+    function createErrDiff(actual, expected, operator, customMessage, diffType = "simple") {
+      operator = checkOperator(actual, expected, operator);
+      let skipped = false;
+      let message = "";
+      const inspectedActual = inspectValue(actual);
+      const inspectedExpected = inspectValue(expected);
+      const inspectedSplitActual = inspectedActual.split("\n");
+      const inspectedSplitExpected = inspectedExpected.split("\n");
+      const showSimpleDiff = isSimpleDiff(actual, inspectedSplitActual, expected, inspectedSplitExpected);
+      let header = `${colors.green}+ actual${colors.white} ${colors.red}- expected${colors.white}`;
+
+      if (showSimpleDiff) {
+        const simpleDiff = getSimpleDiff(actual, inspectedSplitActual[0], expected, inspectedSplitExpected[0]);
+        message = simpleDiff.message;
+        if (typeof simpleDiff.header !== "undefined") header = simpleDiff.header;
+        if (simpleDiff.skipped) skipped = true;
+      } else if (inspectedActual === inspectedExpected) {
+        // Structurally the same but different references.
+        operator = "notIdentical";
+        if (inspectedSplitActual.length > 50 && diffType !== "full") {
+          message = `${inspectedSplitActual.slice(0, 50).join("\n")}\n...}`;
+          skipped = true;
+        } else {
+          message = inspectedSplitActual.join("\n");
+        }
+        header = "";
+      } else {
+        const checkCommaDisparity = actual != null && typeof actual === "object";
+        const diff = myersDiff(inspectedSplitActual, inspectedSplitExpected, checkCommaDisparity);
+        const myersDiffMessage = printMyersDiff(diff, operator);
+        message = myersDiffMessage.message;
+        if (operator === "partialDeepStrictEqual") {
+          header = `${colors.gray}${colors.hasColors ? "" : "+ "}actual${colors.white} ${colors.red}- expected${colors.white}`;
+        }
+        if (myersDiffMessage.skipped) skipped = true;
+      }
+
+      const headerMessage = `${getErrorMessage(operator, customMessage)}\n${header}`;
+      const skippedMessage = skipped ? "\n... Skipped lines" : "";
+      return `${headerMessage}${skippedMessage}\n${message}\n`;
+    }
+
+    function addEllipsis(string) {
+      const lines = string.split("\n", 11);
+      if (lines.length > 10) {
+        lines.length = 10;
+        return `${lines.join("\n")}\n...`;
+      } else if (string.length > kMaxLongStringLength) {
+        // NOTE: node slices FROM kMaxLongStringLength here (shipped behavior).
+        return `${string.slice(kMaxLongStringLength)}...`;
+      }
+      return string;
+    }
+
+    // The `diff` option is per-Assert-instance in Node (`this?.[kOptions]?.diff`).
+    // oam's assert methods are receiver-less arrows, so the active instance's
+    // value is carried in this dynamically-scoped slot for the synchronous
+    // extent of the call -- a destructured (receiver-less) call correctly falls
+    // back to 'simple', exactly like Node.
+    let currentDiff = "simple";
+    // Monotonic id stamped on every AssertionError, so an assert-method wrapper
+    // can tell an error IT caused from one merely passing through.
+    let assertionErrorSerial = 0;
+    const kAssertSerial = Symbol("assertSerial");
+
+    // Re-anchor an AssertionError's stack at `stackStartFn`, dropping the
+    // wrapper frame an Assert-instance method would otherwise leave behind.
+    // The bracketed name is restored during capture so `.stack` keeps its
+    // "AssertionError [ERR_ASSERTION]: ..." header.
+    function recaptureAssertStack(err, stackStartFn) {
+      if (typeof Error.captureStackTrace !== "function") return;
+      const savedName = err.name;
+      try {
+        err.name = "AssertionError [ERR_ASSERTION]";
+        Error.captureStackTrace(err, stackStartFn);
+        err.stack; // eslint-disable-line no-unused-expressions
+      } finally {
+        err.name = savedName;
       }
     }
 
-    function innerFail(actual, expected, message, operator) {
-      throw new AssertionError({
-        actual,
-        expected,
-        message: message instanceof Error ? undefined : message,
-        operator,
-      });
+    class AssertionError extends Error {
+      constructor(options) {
+        if (typeof options !== "object" || options === null) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        const {
+          message,
+          operator,
+          stackStartFn,
+          details,
+          stackStartFunction,
+          diff = currentDiff,
+        } = options;
+        let { actual, expected } = options;
+
+        const limit = Error.stackTraceLimit;
+        Error.stackTraceLimit = 0;
+
+        if (message != null) {
+          if (kMethodsWithCustomMessageDiff.has(operator)) {
+            // A custom message replaces only the HEADER line -- the diff body
+            // is still produced for these three operators.
+            super(createErrDiff(actual, expected, operator, message, diff));
+          } else {
+            super(String(message));
+          }
+        } else {
+          // Reset colors on each call so a dynamically-set env var is honored.
+          colors.refresh();
+          // Prevent the error stack from being visible by duplicating the error
+          // in a very close way to the original in case both sides are Errors.
+          if (
+            typeof actual === "object" && actual !== null &&
+            typeof expected === "object" && expected !== null &&
+            "stack" in actual && actual instanceof Error &&
+            "stack" in expected && expected instanceof Error
+          ) {
+            actual = copyError(actual);
+            expected = copyError(expected);
+          }
+
+          if (kMethodsWithCustomMessageDiff.has(operator)) {
+            super(createErrDiff(actual, expected, operator, message, diff));
+          } else if (operator === "notDeepStrictEqual" || operator === "notStrictEqual") {
+            // The objects are equal but the operator requires unequal: show the
+            // first object and say A equals B.
+            let base = kReadableOperator[operator];
+            const res = inspectValue(actual).split("\n");
+            if (
+              operator === "notStrictEqual" &&
+              ((typeof actual === "object" && actual !== null) || typeof actual === "function")
+            ) {
+              base = kReadableOperator.notStrictEqualObject;
+            }
+            // Only remove lines in case it makes sense to collapse those.
+            if (res.length > 50 && diff !== "full") {
+              res[46] = `${colors.blue}...${colors.white}`;
+              while (res.length > 47) res.pop();
+            }
+            if (res.length === 1) {
+              super(`${base}${res[0].length > 5 ? "\n\n" : " "}${res[0]}`);
+            } else {
+              super(`${base}\n\n${res.join("\n")}\n`);
+            }
+          } else {
+            let res = inspectValue(actual);
+            let other = inspectValue(expected);
+            const knownOperator = kReadableOperator[operator];
+            if (operator === "notDeepEqual" && res === other) {
+              res = `${knownOperator}\n\n${res}`;
+              if (res.length > 1024 && diff !== "full") res = `${res.slice(0, 1021)}...`;
+              super(res);
+            } else {
+              if (res.length > kMaxLongStringLength && diff !== "full") res = `${res.slice(0, 509)}...`;
+              if (other.length > kMaxLongStringLength && diff !== "full") other = `${other.slice(0, 509)}...`;
+              if (operator === "deepEqual") {
+                res = `${knownOperator}\n\n${res}\n\nshould loosely deep-equal\n\n`;
+              } else {
+                const newOp = kReadableOperator[`${operator}Unequal`];
+                if (newOp) {
+                  res = `${newOp}\n\n${res}\n\nshould not loosely deep-equal\n\n`;
+                } else {
+                  other = ` ${operator} ${other}`;
+                }
+              }
+              super(`${res}${other}`);
+            }
+          }
+        }
+
+        Error.stackTraceLimit = limit;
+
+        // assert.ok builds its own message text (it needs the call-site source)
+        // but node still reports generatedMessage=true for it.
+        this.generatedMessage = !message || options.forceGeneratedMessage === true;
+        Object.defineProperty(this, "name", {
+          __proto__: null,
+          value: "AssertionError [ERR_ASSERTION]",
+          enumerable: false,
+          writable: true,
+          configurable: true,
+        });
+        this.code = "ERR_ASSERTION";
+        if (details) {
+          this.actual = undefined;
+          this.expected = undefined;
+          this.operator = undefined;
+          for (let i = 0; i < details.length; i++) {
+            this["message " + i] = details[i].message;
+            this["actual " + i] = details[i].actual;
+            this["expected " + i] = details[i].expected;
+            this["operator " + i] = details[i].operator;
+            this["stack trace " + i] = details[i].stack;
+          }
+        } else {
+          this.actual = actual;
+          this.expected = expected;
+          this.operator = operator;
+        }
+        Object.defineProperty(this, kAssertSerial, {
+          __proto__: null,
+          value: ++assertionErrorSerial,
+          enumerable: false,
+          writable: true,
+          configurable: true,
+        });
+        if (typeof Error.captureStackTrace === "function") {
+          Error.captureStackTrace(this, stackStartFn || stackStartFunction);
+        }
+        // Materialize the stack while `name` still carries the code, then
+        // reset the name -- this is what puts "[ERR_ASSERTION]" in `.stack`.
+        this.stack; // eslint-disable-line no-unused-expressions
+        this.name = "AssertionError";
+        this.diff = diff;
+      }
+
+      toString() {
+        return `${this.name} [${this.code}]: ${this.message}`;
+      }
+
+      [util.inspect.custom](recurseTimes, ctx) {
+        // Long strings should not be fully inspected.
+        const tmpActual = this.actual;
+        const tmpExpected = this.expected;
+        if (typeof this.actual === "string") this.actual = addEllipsis(this.actual);
+        if (typeof this.expected === "string") this.expected = addEllipsis(this.expected);
+        // Limit `actual`/`expected` inspection to the minimum depth; otherwise
+        // they would be far more verbose than the combined message above.
+        const result = util.inspect(this, { ...ctx, customInspect: false, depth: 0 });
+        this.actual = tmpActual;
+        this.expected = tmpExpected;
+        return result;
+      }
+    }
+
+    function innerFail(actual, expected, message, operator, stackStartFn) {
+      // Node's innerFail THROWS an Error passed as the message.
+      if (message instanceof Error) throw message;
+      throw new AssertionError({ actual, expected, message, operator, stackStartFn });
     }
 
     // ---- assert.ok source extraction (node internal/assert/utils.js) ----
@@ -5820,13 +6884,52 @@
       }
     }
 
-    function checkExpected(err, expected) {
+    // Placeholder object pair that makes a validation-object mismatch render
+    // as a clean key-by-key diff (Node's `Comparison`).
+    class Comparison {
+      constructor(obj, keys, actual) {
+        for (const key of keys) {
+          if (key in obj) {
+            if (
+              actual !== undefined &&
+              typeof actual[key] === "string" &&
+              obj[key] instanceof RegExp &&
+              obj[key].test(actual[key])
+            ) {
+              this[key] = actual[key];
+            } else {
+              this[key] = obj[key];
+            }
+          }
+        }
+      }
+    }
+
+    // `operator` / `stackStartFn` shape the AssertionError raised when a
+    // validation function misbehaves. `soft` makes a non-`true` return a plain
+    // false (Node's hasMatchingError, used by the doesNot* family) instead.
+    // `message` is the caller's custom message: when present, a mismatch
+    // returns false so the caller can build the message-carrying error.
+    function checkExpected(err, expected, operator = "throws", stackStartFn = undefined, soft = false, message = undefined) {
       if (expected instanceof RegExp) {
         // Node tests the regexp against String(err) -- i.e. err.toString(),
         // which for coded errors renders "TypeError [ERR_X]: msg" via
         // applyNodeErrorShape. A regex like /ERR_OUT_OF_RANGE/ matches that
         // rendered form even though it isn't present in the bare .message.
-        return expected.test(String(err));
+        const str = String(err);
+        if (expected.test(str)) return true;
+        if (soft || message !== undefined) return false;
+        const rerr = new AssertionError({
+          actual: err,
+          expected,
+          message:
+            `The input did not match the regular expression ${util.inspect(expected)}. ` +
+            `Input:\n\n${util.inspect(str)}\n`,
+          operator,
+          stackStartFn,
+        });
+        rerr.generatedMessage = true;
+        throw rerr;
       }
       if (typeof expected === "function") {
         if (expected.prototype !== undefined && err instanceof expected) return true;
@@ -5836,7 +6939,22 @@
         // "Class constructor cannot be invoked without 'new'". Error.isPrototypeOf
         // catches the whole chain; `=== Error` covers Error itself.
         if (expected === Error || Error.isPrototypeOf(expected)) {
-          return false;
+          if (soft || message !== undefined) return false;
+          let msg = `The error is expected to be an instance of "${expected.name}". Received `;
+          if (isErrorLike(err)) {
+            const name = (err.constructor && err.constructor.name) || err.name;
+            if (expected.name === name) {
+              msg += "an error with identical name but a different prototype.";
+            } else {
+              msg += `"${name}"`;
+            }
+            if (err.message) msg += `\n\nError message:\n\n${err.message}`;
+          } else {
+            msg += `"${util.inspect(err, { depth: -1 })}"`;
+          }
+          const cerr = new AssertionError({ actual: err, expected, message: msg, operator, stackStartFn });
+          cerr.generatedMessage = true;
+          throw cerr;
         }
         // Validation function: Node requires it to return EXACTLY `true`. Any
         // other return value is its own failure mode -- a specific AssertionError
@@ -5844,30 +6962,72 @@
         // "does not match the expected pattern". A throw inside propagates.
         const ret = expected(err);
         if (ret === true) return true;
-        throw new AssertionError({
-          message:
-            'The validation function is expected to return "true". Received ' +
-            util.inspect(ret) +
-            "\n\nCaught error:\n\n" +
-            String(err),
-          operator: "throws",
+        if (soft) return false;
+        // Node names the function in the message and only appends the caught
+        // error when the thrown value actually is one.
+        const fnName = expected.name ? `"${expected.name}" ` : "";
+        let msg =
+          `The ${fnName}validation function is expected to return "true". Received ` + util.inspect(ret);
+        if (isErrorLike(err)) msg += `\n\nCaught error:\n\n${err}`;
+        const aerr = new AssertionError({
+          actual: err,
+          expected,
+          message: msg,
+          operator,
+          stackStartFn,
         });
+        aerr.generatedMessage = true;
+        throw aerr;
       }
       if (expected && typeof expected === "object") {
+        // A validation object cannot be compared against a primitive: Node
+        // reports the whole value with a deepStrictEqual-shaped diff.
+        if (typeof err !== "object" || err === null) {
+          if (soft) return false;
+          const perr = new AssertionError({
+            actual: err,
+            expected,
+            message,
+            operator: "deepStrictEqual",
+            stackStartFn,
+          });
+          perr.operator = operator;
+          throw perr;
+        }
         // Validation object (Node's compareExceptionKey): for every own
         // enumerable key of `expected`, compare against the error. A RegExp
-        // value is `.test()`ed against String(error[key]); any other value
-        // (string message, name, code, arbitrary prop) is deepStrictEqual'd.
-        // String `message` therefore compares by EQUALITY, RegExp `message`
-        // by `.test`, exactly matching Node.
-        for (const key of Object.keys(expected)) {
+        // value is `.test()`ed against the error's STRING property; any other
+        // value (name, code, arbitrary prop) is deepStrictEqual'd. String
+        // `message` therefore compares by EQUALITY, RegExp `message` by
+        // `.test`, exactly matching Node.
+        const keys = Object.keys(expected);
+        // Errors also compare name + message even when not listed.
+        if (isErrorLike(expected)) {
+          keys.push("name", "message");
+        } else if (keys.length === 0) {
+          throw new codes.ERR_INVALID_ARG_VALUE("error", expected, "may not be an empty object");
+        }
+        for (const key of keys) {
           const want = expected[key];
-          // `message` is read off the Error even when not an own key.
-          const got = key === "message" && err instanceof Error ? err.message : err?.[key];
-          if (want instanceof RegExp) {
-            if (!want.test(String(got))) return false;
-          } else if (!deepEqual(got, want, true)) {
-            return false;
+          const got = err[key];
+          if (typeof got === "string" && want instanceof RegExp && want.test(got)) continue;
+          if (!(key in err) || !deepEqual(got, want, true)) {
+            if (soft) return false;
+            if (message !== undefined) return false; // caller attaches the custom message
+            // Node builds paired placeholder objects so the diff shows only
+            // the compared keys, then re-points actual/expected at the reals.
+            const a = new Comparison(err, keys);
+            const b = new Comparison(expected, keys, err);
+            const cerr = new AssertionError({
+              actual: a,
+              expected: b,
+              operator: "deepStrictEqual",
+              stackStartFn,
+            });
+            cerr.actual = err;
+            cerr.expected = expected;
+            cerr.operator = operator;
+            throw cerr;
           }
         }
         return true;
@@ -5875,71 +7035,132 @@
       return true;
     }
 
-    function throws(fn, expected, message) {
-      if (typeof expected === "string") {
-        message = expected;
-        expected = undefined;
-      }
-      let threw = false;
-      let thrown;
+    function throws(fn, ...args) {
+      let actual = NO_EXCEPTION_SENTINEL;
       try {
         fn();
       } catch (e) {
-        threw = true;
-        thrown = e;
+        actual = e;
       }
-      if (!threw) {
+      return expectsError("throws", "exception", actual, args[0], args[1], throws, args.length + 1);
+    }
+
+    // ---- async throws/does-not-reject plumbing (port of node assert.js) ----
+    // A unique sentinel meaning "the callee did not throw / reject".
+    const NO_EXCEPTION_SENTINEL = {};
+
+    // Accept native promises and promise-likes, but NOT a thenable that is a
+    // function or that lacks `catch` (Node checkIsPromise).
+    function checkIsPromise(obj) {
+      return (
+        obj instanceof Promise ||
+        (obj !== null &&
+          typeof obj === "object" &&
+          typeof obj.then === "function" &&
+          typeof obj.catch === "function")
+      );
+    }
+
+    async function waitForActual(promiseFn) {
+      let resultPromise;
+      if (typeof promiseFn === "function") {
+        // A synchronous throw from promiseFn propagates out as a rejection.
+        resultPromise = promiseFn();
+        if (!checkIsPromise(resultPromise)) {
+          throw new codes.ERR_INVALID_RETURN_VALUE("instance of Promise", "promiseFn", resultPromise);
+        }
+      } else if (checkIsPromise(promiseFn)) {
+        resultPromise = promiseFn;
+      } else {
+        throw new codes.ERR_INVALID_ARG_TYPE("promiseFn", ["Function", "Promise"], promiseFn);
+      }
+      try {
+        await resultPromise;
+      } catch (e) {
+        return e;
+      }
+      return NO_EXCEPTION_SENTINEL;
+    }
+
+    // Port of node expectsError's tail, shared by throws/rejects.
+    function expectsError(operator, fnType, actual, expected, message, stackStartFn, argCount) {
+      if (typeof expected === "string") {
+        if (argCount >= 3) {
+          throw new codes.ERR_INVALID_ARG_TYPE("error", ["Object", "Error", "Function", "RegExp"], expected);
+        }
+        message = expected;
+        expected = undefined;
+      } else if (expected != null && typeof expected !== "object" && typeof expected !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("error", ["Object", "Error", "Function", "RegExp"], expected);
+      }
+      if (actual === NO_EXCEPTION_SENTINEL) {
+        let details = "";
+        if (expected && expected.name) details += ` (${expected.name})`;
+        details += message ? `: ${message}` : ".";
         throw new AssertionError({
           actual: undefined,
           expected,
-          message: message ?? "Missing expected exception.",
-          operator: "throws",
-          stackStartFn: throws,
+          operator,
+          message: `Missing expected ${fnType}${details}`,
+          stackStartFn,
         });
       }
-      if (expected !== undefined && !checkExpected(thrown, expected)) {
-        throw thrown instanceof AssertionError
-          ? thrown
-          : new AssertionError({
-              actual: thrown,
-              expected,
-              message: message ?? `The error does not match the expected pattern`,
-              operator: "throws",
-            });
+      if (!expected) return actual;
+      if (!checkExpected(actual, expected, operator, stackStartFn, false, message)) {
+        if (actual instanceof AssertionError) throw actual;
+        const err = new AssertionError({
+          actual,
+          expected,
+          message: message ?? "The error does not match the expected pattern",
+          operator,
+          stackStartFn,
+        });
+        // Node reports generatedMessage=true when IT produced the text.
+        if (message === undefined) err.generatedMessage = true;
+        throw err;
       }
-      return thrown;
+      return actual;
     }
 
-    async function rejects(fnOrPromise, expected, message) {
+    // Port of node expectsNoError: rethrow a NON-matching error untouched;
+    // only a matching (or unconstrained) one becomes "Got unwanted ...".
+    function expectsNoError(operator, fnType, actual, expected, message) {
+      if (actual === NO_EXCEPTION_SENTINEL) return;
       if (typeof expected === "string") {
         message = expected;
         expected = undefined;
       }
-      let rejected = false;
-      let reason;
+      if (!expected || checkExpected(actual, expected, operator, undefined, true)) {
+        const details = message ? `: ${message}` : ".";
+        throw new AssertionError({
+          actual,
+          expected,
+          operator,
+          message: `Got unwanted ${fnType}${details}\nActual message: "${actual === null || actual === undefined ? undefined : actual.message}"`,
+          stackStartFn: operator === "doesNotReject" ? doesNotReject : doesNotThrowImpl,
+        });
+      }
+      throw actual;
+    }
+
+    // Named so it can serve as its own `stackStartFn` (the assert frames must
+    // not appear in the reported stack).
+    function doesNotThrowImpl(fn, ...args) {
+      let actual = NO_EXCEPTION_SENTINEL;
       try {
-        await (typeof fnOrPromise === "function" ? fnOrPromise() : fnOrPromise);
+        fn();
       } catch (e) {
-        rejected = true;
-        reason = e;
+        actual = e;
       }
-      if (!rejected) {
-        throw new AssertionError({
-          actual: undefined,
-          expected,
-          message: message ?? "Missing expected rejection",
-          operator: "rejects",
-        });
-      }
-      if (expected !== undefined && !checkExpected(reason, expected)) {
-        throw new AssertionError({
-          actual: reason,
-          expected,
-          message: message ?? "The rejection reason does not match the expected pattern",
-          operator: "rejects",
-        });
-      }
-      return reason;
+      return expectsNoError("doesNotThrow", "exception", actual, args[0], args[1]);
+    }
+
+    async function rejects(promiseFn, ...args) {
+      return expectsError("rejects", "rejection", await waitForActual(promiseFn), args[0], args[1], rejects, args.length + 1);
+    }
+
+    async function doesNotReject(promiseFn, ...args) {
+      return expectsNoError("doesNotReject", "rejection", await waitForActual(promiseFn), args[0], args[1]);
     }
 
     const assert = Object.assign(ok, {
@@ -5948,13 +7169,15 @@
       fail: (...failArgs) => {
         const argsLen = failArgs.length;
         const [actual, expected, message, operator] = failArgs;
-        // assert.fail() -- no args: generated "Failed" message.
-        if (argsLen === 0) {
+        // assert.fail() / assert.fail(null) -- Node's `internalMessage` path:
+        // the literal message "Failed" but still generatedMessage === true.
+        if (actual == null && argsLen <= 1) {
           throw new AssertionError({
             actual: undefined,
             expected: undefined,
-            message: undefined,
+            message: "Failed",
             operator: "fail",
+            forceGeneratedMessage: true,
           });
         }
         // assert.fail(message) -- 1 arg: an Error rethrows; otherwise the arg
@@ -5977,72 +7200,62 @@
           operator: operator || "fail",
         });
       },
-      equal: (actual, expected, message) => {
+      // The whole equality family validates arity: Node throws ERR_MISSING_ARGS
+      // when called with fewer than two arguments.
+      equal: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         // eslint-disable-next-line eqeqeq
         if (!(actual == expected || (Number.isNaN(actual) && Number.isNaN(expected)))) {
           innerFail(actual, expected, message, "==");
         }
       },
-      notEqual: (actual, expected, message) => {
+      notEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         // eslint-disable-next-line eqeqeq
         if (actual == expected) innerFail(actual, expected, message, "!=");
       },
-      strictEqual: (actual, expected, message) => {
+      strictEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!Object.is(actual, expected)) {
           innerFail(actual, expected, message, "strictEqual");
         }
       },
-      notStrictEqual: (actual, expected, message) => {
+      notStrictEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (Object.is(actual, expected)) {
           innerFail(actual, expected, message, "notStrictEqual");
         }
       },
-      deepEqual: (actual, expected, message) => {
+      deepEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "deepEqual");
         }
       },
-      notDeepEqual: (actual, expected, message) => {
+      notDeepEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (deepEqual(actual, expected, false)) {
           innerFail(actual, expected, message, "notDeepEqual");
         }
       },
-      deepStrictEqual: (actual, expected, message) => {
+      deepStrictEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (!deepEqual(actual, expected, true)) {
           innerFail(actual, expected, message, "deepStrictEqual");
         }
       },
-      notDeepStrictEqual: (actual, expected, message) => {
+      notDeepStrictEqual: function (actual, expected, message) {
+        if (arguments.length < 2) throw new codes.ERR_MISSING_ARGS("actual", "expected");
         if (deepEqual(actual, expected, true)) {
           innerFail(actual, expected, message, "notDeepStrictEqual");
         }
       },
       throws,
-      doesNotThrow: (fn, message) => {
-        try {
-          fn();
-        } catch (e) {
-          throw new AssertionError({
-            actual: e,
-            expected: undefined,
-            message: message ?? `Got unwanted exception: ${e?.message ?? e}`,
-            operator: "doesNotThrow",
-          });
-        }
-      },
+      // (fn, error, message) -- an error that does NOT match `error` is
+      // rethrown untouched rather than reported as unwanted.
+      doesNotThrow: doesNotThrowImpl,
       rejects,
-      doesNotReject: async (fnOrPromise, message) => {
-        try {
-          await (typeof fnOrPromise === "function" ? fnOrPromise() : fnOrPromise);
-        } catch (e) {
-          throw new AssertionError({
-            actual: e,
-            expected: undefined,
-            message: message ?? `Got unwanted rejection: ${e?.message ?? e}`,
-            operator: "doesNotReject",
-          });
-        }
-      },
+      doesNotReject,
       match: (string, regexp, message) => {
         if (!regexp.test(string)) {
           innerFail(string, regexp, message ?? `The input did not match the regular expression`, "match");
@@ -6271,26 +7484,44 @@
     // method is destructured off the instance it loses `this`, so `.diff`
     // falls back to 'simple' -- matching Node's observable behavior.
     function bindAssertMethod(fn) {
-      return function (...args) {
+      const wrapper = function (...args) {
         // The error's `diff` comes from the receiver instance when the method
         // is called as a method; a destructured (receiver-less) call loses
         // `this`, so it falls back to the default 'simple'.
-        const d = this && this.diff !== undefined ? this.diff : "simple";
+        const prev = currentDiff;
+        const serialBefore = assertionErrorSerial;
+        currentDiff = this && this.diff !== undefined ? this.diff : "simple";
         try {
           return fn.apply(this, args);
         } catch (e) {
-          if (e instanceof AssertionError && e.diff === undefined) e.diff = d;
+          // Only re-anchor errors THIS call produced -- one merely passing
+          // through (a user's own AssertionError) keeps its original stack.
+          if (e instanceof AssertionError && e[kAssertSerial] > serialBefore) {
+            recaptureAssertStack(e, wrapper);
+          }
           throw e;
+        } finally {
+          currentDiff = prev;
         }
       };
+      return wrapper;
     }
     function Assert(options) {
       if (!new.target) {
         throw new codes.ERR_CONSTRUCT_CALL_REQUIRED("Assert");
       }
-      const strict = !!(options && options.strict);
+      // Node defaults `strict` to TRUE and validates `diff` against the
+      // allowed set.
+      const strict = options && options.strict !== undefined ? !!options.strict : true;
       const diff = options && options.diff !== undefined ? options.diff : "simple";
-      const base = strict ? assert.strict : assert;
+      if (options && options.diff !== undefined && diff !== "simple" && diff !== "full") {
+        // Node's validateOneOf phrasing (a dotted name reads as "property").
+        throw codedError(
+          TypeError,
+          "ERR_INVALID_ARG_VALUE",
+          `The property 'options.diff' must be one of: 'simple', 'full'. Received ${util.inspect(options.diff)}`,
+        );
+      }
       const self = this;
       self.diff = diff;
       self.strict = strict;
@@ -6301,10 +7532,20 @@
         "throws", "doesNotThrow", "rejects", "doesNotReject", "match",
         "doesNotMatch", "ifError", "fail", "partialDeepStrictEqual",
       ];
+      // Always bind the loose family, then -- exactly like Node -- ALIAS the
+      // loose names onto the already-bound strict ones when strict. Aliasing
+      // (rather than binding twice) is what makes
+      // `instance.equal === instance.strictEqual` hold.
       for (const m of methods) {
-        if (typeof base[m] === "function") {
-          self[m] = bindAssertMethod(base[m]);
+        if (typeof assert[m] === "function") {
+          self[m] = bindAssertMethod(assert[m]);
         }
+      }
+      if (strict) {
+        self.equal = self.strictEqual;
+        self.deepEqual = self.deepStrictEqual;
+        self.notEqual = self.notStrictEqual;
+        self.notDeepEqual = self.notDeepStrictEqual;
       }
       return self;
     }
