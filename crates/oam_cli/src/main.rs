@@ -349,9 +349,27 @@ fn main() -> ExitCode {
         if i < raw.len() {
             let flag = raw[i].as_str();
             // Bare-script node shape, only when a node flag preceded it AND
-            // the argument is an existing file (plain `oam <file>` stays a
-            // clap error pointing at `oam run`).
-            if saw_node_flag && !flag.starts_with('-') && Path::new(flag).is_file() {
+            // the argument is an existing file. Node's `node script.js` shape
+            // is accepted too: every tool that re-invokes the runtime through
+            // process.execPath uses it (test runners, build scripts, and the
+            // vendored suite's `"${process.execPath}" "${__filename}" child`).
+            // A real SUBCOMMAND always wins, so `oam test` still runs the
+            // test runner even if a file named `test` sits in the cwd.
+            const SUBCOMMANDS: &[&str] = &[
+                "run",
+                "test",
+                "repl",
+                "check",
+                "daemon",
+                "mcp",
+                "serve",
+                "install",
+                "trust",
+                "compile",
+                "self-update",
+                "help",
+            ];
+            if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && Path::new(flag).is_file() {
                 let file = PathBuf::from(flag);
                 return match run_file_with_flags(
                     &file,

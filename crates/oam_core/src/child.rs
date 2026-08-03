@@ -56,9 +56,26 @@ pub async fn spawn_child(
     let (prog, final_args) = if shell {
         #[cfg(windows)]
         {
-            let mut shell_args = vec!["/C".to_string(), command];
-            shell_args.extend(args);
-            ("cmd.exe".to_string(), shell_args)
+            // cmd.exe parses its own quoting; Rust's default arg escaping
+            // (MSVCRT rules) mangles a command that embeds quotes, so the
+            // canonical `exec('"C:\path with spaces\app.exe" arg')` fails.
+            // Node passes `/d /s /c "<command>"` with verbatim arguments --
+            // /d skips AutoRun, /s + the wrapping quotes make cmd strip
+            // exactly the outer pair. The raw_arg application is below.
+            let mut full = command;
+            for a in &args {
+                full.push(' ');
+                full.push_str(a);
+            }
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    format!("\"{full}\""),
+                ],
+            )
         }
         #[cfg(not(windows))]
         {
@@ -74,6 +91,20 @@ pub async fn spawn_child(
     };
 
     let mut cmd = tokio::process::Command::new(&prog);
+    #[cfg(windows)]
+    {
+        if shell {
+            // Verbatim: hand cmd.exe the string as written (node's
+            // windowsVerbatimArguments). tokio's Command has raw_arg
+            // natively; the sync path below needs the std CommandExt trait.
+            for a in &final_args {
+                cmd.raw_arg(a);
+            }
+        } else {
+            cmd.args(&final_args);
+        }
+    }
+    #[cfg(not(windows))]
     cmd.args(&final_args);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -122,9 +153,21 @@ pub fn spawn_sync(
     let (prog, final_args) = if shell {
         #[cfg(windows)]
         {
-            let mut shell_args = vec!["/C".to_string(), command.to_string()];
-            shell_args.extend(args.iter().cloned());
-            ("cmd.exe".to_string(), shell_args)
+            // Same cmd.exe verbatim-quoting contract as spawn_child above.
+            let mut full = command.to_string();
+            for a in args {
+                full.push(' ');
+                full.push_str(a);
+            }
+            (
+                "cmd.exe".to_string(),
+                vec![
+                    "/d".to_string(),
+                    "/s".to_string(),
+                    "/c".to_string(),
+                    format!("\"{full}\""),
+                ],
+            )
         }
         #[cfg(not(windows))]
         {
@@ -140,6 +183,18 @@ pub fn spawn_sync(
     };
 
     let mut cmd = std::process::Command::new(&prog);
+    #[cfg(windows)]
+    {
+        if shell {
+            use std::os::windows::process::CommandExt;
+            for a in &final_args {
+                cmd.raw_arg(a);
+            }
+        } else {
+            cmd.args(&final_args);
+        }
+    }
+    #[cfg(not(windows))]
     cmd.args(&final_args);
     if input.is_some() {
         cmd.stdin(std::process::Stdio::piped());
