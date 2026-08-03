@@ -5620,7 +5620,9 @@
         this.actual = options.actual;
         this.expected = options.expected;
         this.operator = options.operator;
-        this.generatedMessage = generatedMessage;
+        // assert.ok builds its own message text (it needs the call-site
+        // source) but node still reports generatedMessage=true for it.
+        this.generatedMessage = generatedMessage || options.forceGeneratedMessage === true;
         // Trim oam-internal frames (and the asserting helper itself) from the
         // stack, the way Node's `stackStartFn` does.
         if (options.stackStartFn && typeof Error.captureStackTrace === "function") {
@@ -5638,15 +5640,182 @@
       });
     }
 
+    // ---- assert.ok source extraction (node internal/assert/utils.js) ----
+    // Node quotes the FAILING EXPRESSION in the message. It does not parse the
+    // file: it takes the call site's ONE source line off the V8 stack and
+    // tokenizes it, walking back from the call column to the start of the
+    // member chain and forward to the matching ')'. Verified byte-identical
+    // to node v22.22.2 on 16 shapes (computed access, ')' inside a string,
+    // unicode identifiers, tagged templates, a preceding statement).
+    const ASSERT_MEMBER_PUNCT = new Set([".", "?.", "[", "]"]);
+    const assertSourceCache = new Map();
+
+    function assertTokenizeLine(code) {
+      const tokens = [];
+      let i = 0;
+      const n = code.length;
+      const isIdStart = (c) => /[\p{ID_Start}$_]/u.test(c);
+      const isIdPart = (c) => /[\p{ID_Continue}$]/u.test(c);
+      while (i < n) {
+        const c = code[i];
+        if (c === " " || c === "\t" || c === "\r" || c === "\v" || c === "\f") { i++; continue; }
+        if (c === "/" && code[i + 1] === "/") break;
+        if (c === "/" && code[i + 1] === "*") {
+          const end = code.indexOf("*/", i + 2);
+          i = end === -1 ? n : end + 2;
+          continue;
+        }
+        const start = i;
+        if (c === '"' || c === "'" || c === "`") {
+          const quote = c;
+          i++;
+          while (i < n) {
+            if (code[i] === "\\") { i += 2; continue; }
+            if (code[i] === quote) { i++; break; }
+            i++;
+          }
+          tokens.push({ type: "string", start, end: i });
+          continue;
+        }
+        if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(code[i + 1] || ""))) {
+          i++;
+          while (i < n && /[0-9a-fA-FxXoObBeE._n]/.test(code[i])) i++;
+          tokens.push({ type: "num", start, end: i });
+          continue;
+        }
+        if (isIdStart(c)) {
+          i++;
+          while (i < n && isIdPart(code[i])) i++;
+          tokens.push({ type: "name", start, end: i });
+          continue;
+        }
+        const three = code.slice(i, i + 3);
+        const two = code.slice(i, i + 2);
+        let punct;
+        if (three === "...") punct = three;
+        else if (["?.", "=>", "&&", "||", "??", "==", "!=", "<=", ">=", "++", "--", "**"].includes(two)) punct = two;
+        else punct = c;
+        i += punct.length;
+        tokens.push({ type: "punct", value: punct, start, end: i });
+      }
+      return tokens;
+    }
+
+    function assertFirstExpression(code, startColumn) {
+      const tokens = assertTokenizeLine(code);
+      let chainStart = -1;
+      let idx = 0;
+      for (; idx < tokens.length; idx++) {
+        const t = tokens[idx];
+        if (t.start >= startColumn) break;
+        if (t.type === "name") {
+          if (chainStart === -1) chainStart = t.start;
+        } else if (t.type === "punct" && ASSERT_MEMBER_PUNCT.has(t.value)) {
+          // still inside the member chain
+        } else if (t.type === "string" || t.type === "num") {
+          // computed member content
+        } else {
+          chainStart = -1;
+        }
+        if (t.type === "punct" && t.value === ";") chainStart = -1;
+      }
+      if (chainStart === -1) chainStart = startColumn;
+      let depth = 0;
+      for (; idx < tokens.length; idx++) {
+        const t = tokens[idx];
+        if (t.type !== "punct") continue;
+        if (t.value === "(") depth++;
+        else if (t.value === ")") {
+          depth--;
+          if (depth <= 0) return code.slice(chainStart, t.end);
+        } else if (t.value === ";" && depth === 0) {
+          return code.slice(chainStart, t.start);
+        }
+      }
+      return code.slice(chainStart);
+    }
+
+    // Returns the source text of the assert call that is `stackStartFn`'s
+    // caller, or null when it cannot be recovered (eval, missing file, a
+    // read error). Never throws -- a failed extraction must not replace the
+    // user's assertion failure.
+    function assertCallSource(stackStartFn) {
+      const target = {};
+      const originalPrepare = Error.prepareStackTrace;
+      const originalLimit = Error.stackTraceLimit;
+      try {
+        Error.prepareStackTrace = (_e, frames) => frames;
+        Error.stackTraceLimit = 10;
+        Error.captureStackTrace(target, stackStartFn);
+        const frames = Array.isArray(target.stack) ? target.stack : [];
+        // assert.ok is exposed through an anonymous wrapper, so the frame
+        // right after stackStartFn is still oam-internal. node_compat.js is
+        // snapshot-embedded and its frames report no real filename, so the
+        // first frame with an absolute path IS the user's call site.
+        let file = null;
+        let lineNo = 0;
+        let colNo = 0;
+        for (const f of frames) {
+          const name = typeof f.getFileName === "function" ? f.getFileName() : null;
+          if (!name || !/^[a-zA-Z]:[\\/]|^\//.test(name)) continue; // eval / virtual / internal
+          file = name;
+          lineNo = typeof f.getLineNumber === "function" ? f.getLineNumber() : 0;
+          colNo = typeof f.getColumnNumber === "function" ? f.getColumnNumber() : 0;
+          break;
+        }
+        if (!file || !lineNo || !colNo) return null;
+        let lines = assertSourceCache.get(file);
+        if (lines === undefined) {
+          try {
+            // `natives` is not in this factory's closure; read through the
+            // same global the runtime exposes.
+            const bytes = globalThis.__oam.node.fsReadFileSync(file);
+            lines = (typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes)).split("\n");
+          } catch {
+            lines = null;
+          }
+          assertSourceCache.set(file, lines);
+        }
+        if (!lines) return null;
+        const line = lines[lineNo - 1];
+        if (typeof line !== "string") return null;
+        const expr = assertFirstExpression(line.replace(/\r$/, ""), colNo - 1);
+        return expr ? expr.trim() : null;
+      } catch {
+        return null;
+      } finally {
+        Error.prepareStackTrace = originalPrepare;
+        Error.stackTraceLimit = originalLimit;
+      }
+    }
+
     function ok(value, message) {
+      if (arguments.length === 0) {
+        throw new AssertionError({
+          actual: undefined,
+          expected: true,
+          message: "No value argument passed to `assert.ok()`",
+          operator: "==",
+          stackStartFn: ok,
+        });
+      }
       if (!value) {
         if (message instanceof Error) throw message;
+        let generated = message;
+        if (generated === undefined) {
+          const source = assertCallSource(ok);
+          generated = source
+            ? `The expression evaluated to a falsy value:\n\n  ${source}\n`
+            : "The expression evaluated to a falsy value";
+        }
         throw new AssertionError({
           actual: value,
           expected: true,
-          message:
-            message ?? "The expression evaluated to a falsy value",
+          message: generated,
           operator: "==",
+          stackStartFn: ok,
+          // node reports generatedMessage=true whenever IT built the text.
+          forceGeneratedMessage: message === undefined,
         });
       }
     }
