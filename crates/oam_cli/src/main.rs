@@ -220,6 +220,7 @@ fn main() -> ExitCode {
     // oam cache dir on any Rust panic or V8 OOM (internal diagnostics, not
     // public telemetry). Installed before anything can panic.
     oam_engine::install_panic_hook();
+    register_worker_host();
     // Internal self-test hook (undocumented, env-gated): exercises the crash
     // path deterministically in CI without needing a JS-reachable panic.
     if std::env::var("OAM_CRASH_SELFTEST").as_deref() == Ok("panic") {
@@ -1407,6 +1408,12 @@ fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
 /// resolution rules from oam_loader. Everything `oam run` executes goes
 /// through this — entry file included — as an ES module (ESM-first per plan).
 struct CliHost;
+
+/// Workers are spawned inside the engine, which cannot name this type -- so
+/// hand it a constructor (see oam_engine::set_worker_host_factory).
+fn register_worker_host() {
+    oam_engine::set_worker_host_factory(|| Box::new(CliHost));
+}
 
 impl oam_engine::ModuleHost for CliHost {
     fn resolve(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Vec<Diagnostic>> {

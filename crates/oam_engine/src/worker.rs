@@ -10,14 +10,34 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 impl super::JsRuntime {
-    /// Execute a CJS script as a worker thread entry. Sets up worker
-    /// context (parentPort, isMainThread=false, workerData) before
-    /// loading the script. Called on the WORKER thread, not the parent.
+    /// Execute a worker thread entry. Sets up worker context (parentPort,
+    /// isMainThread=false, workerData) before loading the script. Called on
+    /// the WORKER thread, not the parent.
     pub(crate) fn execute_worker(
         &mut self,
         entry: &Path,
         ctx: WorkerContext,
     ) -> Result<(), Vec<Diagnostic>> {
+        // An ESM entry has to go through the module graph. load_cjs compiles
+        // it as a classic script, so `new Worker('x.mjs')` threw on its first
+        // import statement -- the ESM guard lives in the require() callback,
+        // which an entry never passes through.
+        if oam_loader::module_kind(entry) == oam_loader::ModuleKind::Esm {
+            let host = crate::worker_host().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "OAM-MOD0003",
+                    oam_diagnostics::Severity::Error,
+                    oam_diagnostics::Origin::Resolve,
+                    format!(
+                        "no module host registered for ESM worker entries: {}",
+                        entry.display()
+                    ),
+                )]
+            })?;
+            self.reset_run_slots()?;
+            self.isolate.set_slot(ctx);
+            return self.execute_module(entry, host.as_ref());
+        }
         self.reset_run_slots()?;
         self.isolate.set_slot(ctx);
 
@@ -104,5 +124,8 @@ fn run_worker(
         ));
         return 1;
     }
+    // Node emits 'exit' on the worker's own process object before the thread
+    // ends, and re-reads exitCode after (a handler may set it).
+    rt.emit_process_exit();
     rt.process_exit_code().unwrap_or(0)
 }

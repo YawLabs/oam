@@ -48,6 +48,22 @@ pub fn init_platform() {
     init_platform_with_flags(&[]);
 }
 
+/// Builds the module host a WORKER thread uses for an ESM entry. The host
+/// lives in oam_cli (filesystem + oxc + oam_loader rules) and workers are
+/// spawned inside the engine, so the embedder registers a constructor here
+/// rather than the engine duplicating it. Only the fn pointer crosses
+/// threads; the host itself is built on the worker.
+pub type WorkerHostFactory = fn() -> Box<dyn ModuleHost>;
+static WORKER_HOST_FACTORY: std::sync::OnceLock<WorkerHostFactory> = std::sync::OnceLock::new();
+
+pub fn set_worker_host_factory(factory: WorkerHostFactory) {
+    let _ = WORKER_HOST_FACTORY.set(factory);
+}
+
+pub(crate) fn worker_host() -> Option<Box<dyn ModuleHost>> {
+    WORKER_HOST_FACTORY.get().map(|f| f())
+}
+
 /// V8 flags must be set BEFORE `V8::initialize`, so the embedder passes any
 /// node-style flags that map to V8 ones (currently `--expose-gc`) here.
 pub fn init_platform_with_flags(v8_flags: &[&str]) {

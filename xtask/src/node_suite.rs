@@ -238,7 +238,11 @@ fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path) -> Outcome {
                 .arg("--no-check")
                 .env("OAM_CACHE_DIR", cache)
                 .current_dir(cwd),
-            Duration::from_secs(60),
+            // 60s was below the honest debug-build runtime of the slowest
+            // vendored tests (test-util-inspect-long-running takes ~90s here),
+            // which made their result depend on machine load rather than on
+            // correctness. Still bounded, so a genuine hang is still caught.
+            Duration::from_secs(150),
         ) {
             Ok(c) => c,
             Err(e) => return Outcome::Fail(format!("harness error: {e}")),

@@ -8549,12 +8549,19 @@
             // Local, not entry[0](...): calling a function off an array makes
             // V8 name the callee's frame "Array.<anonymous>".
             const tickFn = entry[0];
-            const setFrame = registry._setContinuationFrame;
-            const prevFrame = setFrame ? setFrame(entry[3]) : undefined;
-            try {
+            // Only pay the continuation get/set when a frame was actually
+            // captured -- the overwhelmingly common case is no ALS in play,
+            // and this is the hottest loop in the runtime.
+            const frame = entry[3];
+            if (frame === undefined) {
               tickFn(...entry[1]);
-            } finally {
-              if (setFrame) setFrame(prevFrame);
+            } else {
+              const prevFrame = registry._setContinuationFrame(frame);
+              try {
+                tickFn(...entry[1]);
+              } finally {
+                registry._setContinuationFrame(prevFrame);
+              }
             }
             if (tickDom) tickDom.exit();
           } catch (e) {
@@ -8890,7 +8897,109 @@
       }
     });
 
+    // Node's internal/process/finalization, ported. Pure JS there too: it
+    // needs only WeakRef, FinalizationRegistry and the exit/beforeExit
+    // events. The WeakRef deref is what makes `register` NOT resurrect a
+    // collected object -- the callback is skipped, not called with a
+    // dangling handle.
+    function createFinalization() {
+      let registry = null;
+      const refs = { exit: [], beforeExit: [] };
+      const listeners = { exit: null, beforeExit: null };
+
+      function callRefsToFree(event) {
+        const pending = refs[event];
+        refs[event] = [];
+        for (const ref of pending) {
+          const obj = ref.deref();
+          if (obj !== undefined) ref.fn(obj, event);
+        }
+      }
+
+      function detachIfEmpty(event) {
+        if (refs[event].length === 0 && listeners[event]) {
+          process.removeListener(event, listeners[event]);
+          listeners[event] = null;
+        }
+      }
+
+      // FinalizationRegistry callback: the object is gone, so drop our
+      // WeakRef too rather than keeping a dead entry until exit.
+      function clear(ref) {
+        for (const event of ["exit", "beforeExit"]) {
+          const i = refs[event].indexOf(ref);
+          if (i !== -1) {
+            refs[event].splice(i, 1);
+            detachIfEmpty(event);
+          }
+        }
+      }
+
+      function _register(event, obj, fn) {
+        if (obj === null || (typeof obj !== "object" && typeof obj !== "function")) {
+          throw new codes.ERR_INVALID_ARG_TYPE("obj", "object", obj);
+        }
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("fn", "function", fn);
+        }
+        if (!listeners[event]) {
+          listeners[event] = () => callRefsToFree(event);
+          process.on(event, listeners[event]);
+        }
+        const ref = new WeakRef(obj);
+        ref.fn = fn;
+        refs[event].push(ref);
+        if (!registry) registry = new FinalizationRegistry(clear);
+        registry.register(obj, ref);
+      }
+
+      return {
+        register(obj, fn) {
+          _register("exit", obj, fn);
+        },
+        registerBeforeExit(obj, fn) {
+          _register("beforeExit", obj, fn);
+        },
+        unregister(obj) {
+          if (!registry) return;
+          registry.unregister(obj);
+          for (const event of ["exit", "beforeExit"]) {
+            refs[event] = refs[event].filter((ref) => {
+              const held = ref.deref();
+              return held !== undefined && held !== obj;
+            });
+            detachIfEmpty(event);
+          }
+        },
+      };
+    }
+
     Object.assign(process, {
+      finalization: createFinalization(),
+      // Node's process.dlopen. oam cannot load a native addon through this
+      // entry point, but the ERROR SHAPE is observable and was wrong: a
+      // missing process.dlopen threw a bare TypeError where Node throws a
+      // plain Error with code ERR_DLOPEN_FAILED. The filename is
+      // CONCATENATED into the message, never used as a format string --
+      // that is what test-process-dlopen-error-message-crash guards.
+      dlopen() {
+        if (arguments.length < 2) {
+          const err = new TypeError("process.dlopen needs at least 2 arguments");
+          err.code = "ERR_MISSING_ARGS";
+          throw err;
+        }
+        const filename = String(arguments[1]);
+        const exists = natives.fsExistsSync ? natives.fsExistsSync(filename) : false;
+        const err = new Error(
+          exists
+            ? "Module did not self-register: '" + filename + "'."
+            : natives.platform === "win32"
+              ? "The specified module could not be found.\r\n" + filename
+              : filename + ": cannot open shared object file: No such file or directory\n" + filename,
+        );
+        err.code = "ERR_DLOPEN_FAILED";
+        throw err;
+      },
       env,
       execArgv: [],
       platform: natives.platform,
@@ -18838,18 +18947,36 @@
       parentPort.postMessage = function postMessage(data) {
         natives.parentPortPostMessage(JSON.stringify(data));
       };
-      (async () => {
-        while (true) {
-          let raw;
-          try { raw = await natives.parentPortRecvMessage(); } catch { break; }
-          if (raw === undefined) break;
-          if (raw instanceof Uint8Array) {
-            const text = new TextDecoder().decode(raw);
-            try { parentPort.emit("message", JSON.parse(text)); }
-            catch { parentPort.emit("message", text); }
+      // Start the receive loop LAZILY. It awaits a message that may never
+      // come, and that pending op keeps the worker's event loop alive -- so
+      // starting it eagerly meant any worker that merely required
+      // worker_threads never exited, and a parent waiting on 'exit' hung
+      // forever. Node refs the port when a 'message' listener is attached
+      // (or start() is called), which is what this mirrors.
+      let recvLoopStarted = false;
+      const startRecvLoop = () => {
+        if (recvLoopStarted) return;
+        recvLoopStarted = true;
+        (async () => {
+          while (true) {
+            let raw;
+            try { raw = await natives.parentPortRecvMessage(); } catch { break; }
+            if (raw === undefined) break;
+            if (raw instanceof Uint8Array) {
+              const text = new TextDecoder().decode(raw);
+              try { parentPort.emit("message", JSON.parse(text)); }
+              catch { parentPort.emit("message", text); }
+            }
           }
-        }
-      })();
+        })();
+      };
+      parentPort.on("newListener", (type) => {
+        if (type === "message") startRecvLoop();
+      });
+      parentPort.start = function start() {
+        startRecvLoop();
+        return this;
+      };
     }
 
     const _bc = typeof globalThis.BroadcastChannel !== "undefined" ? globalThis.BroadcastChannel : null;
