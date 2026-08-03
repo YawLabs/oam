@@ -4203,12 +4203,17 @@ fn uncaught_microtask_exception_fails_the_run() {
     let out = oam(&["run", main.to_str().unwrap(), "--json"]);
     assert!(!out.status.success(), "must exit non-zero");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-RT0001"), "stderr: {stderr}");
+    // Node-shaped fatal report, same as the sync and timer paths.
+    assert!(stderr.contains("OAM-RT0005"), "stderr: {stderr}");
     assert!(
         stderr.contains("vanished-from-microtask"),
         "stderr: {stderr}"
     );
-    assert!(stderr.contains("in microtask"), "stderr: {stderr}");
+    // The report carries a stack (Node prints no "in microtask" wording, so
+    // the old pin on that phrase was pinning a divergence).
+    // (stderr is JSONL here, so the report's newlines are escaped -- match
+    // the frame indent rather than a literal newline.)
+    assert!(stderr.contains("    at "), "stderr: {stderr}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         "",

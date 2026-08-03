@@ -70,7 +70,12 @@ struct ModuleMap {
 /// text) so a process 'unhandledRejection' listener gets the real reason.
 #[derive(Default)]
 pub(crate) struct RejectionLedger {
-    unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>, String)>,
+    /// The reason VALUE only. Stringifying here would run user
+    /// `toString`/`Symbol.toPrimitive` inside V8's reject callback -- which
+    /// Node does not do, and which throws outright for a Symbol reason,
+    /// leaving a scheduled exception that surfaces at the next check as a
+    /// bogus "Cannot convert a Symbol value to a string" at the reject site.
+    unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)>,
 }
 
 /// Uncaught exceptions V8 reports outside any TryCatch — microtask callbacks
@@ -181,7 +186,7 @@ pub(crate) fn flush_handled_rejections(
     }
     let drained: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
-        .map(|ledger| ledger.unhandled.drain(..).map(|(p, r, _)| (p, r)).collect())
+        .map(|ledger| ledger.unhandled.drain(..).collect())
         .unwrap_or_default();
     let ran_listener = !drained.is_empty();
     for (promise, reason) in drained {
@@ -207,10 +212,26 @@ pub(crate) fn flush_handled_rejections(
 /// Returns true when JS consumed the error and the run survives. Falls back
 /// to a bare 'uncaughtException' emit when the dispatcher global is
 /// unavailable (early boot, stripped globals).
+/// Outcome of routing an exception through the JS uncaught ladder.
+pub(crate) enum Uncaught {
+    /// A listener consumed it; the run survives.
+    Handled,
+    /// Nothing consumed it; report the ORIGINAL exception and exit.
+    Fatal,
+    /// A listener itself threw. Node reports the SECONDARY exception (its
+    /// TryCatchScope(kFatal) around _fatalException reports what it caught),
+    /// not the original, and exits 7.
+    HandlerThrew {
+        value: v8::Global<v8::Value>,
+        frame: Option<String>,
+        message: String,
+    },
+}
+
 pub(crate) fn dispatch_uncaught(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     exception: v8::Local<v8::Value>,
-) -> bool {
+) -> Uncaught {
     let lookup = (|| {
         let context = tc.get_current_context();
         let global = context.global(tc);
@@ -218,13 +239,32 @@ pub(crate) fn dispatch_uncaught(
         v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
     })();
     let Some(dispatch) = lookup else {
-        return emit_process_event(tc, "uncaughtException", &[exception]);
+        return if emit_process_event(tc, "uncaughtException", &[exception]) {
+            Uncaught::Handled
+        } else {
+            Uncaught::Fatal
+        };
     };
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
     match dispatch.call(tc, recv, &[exception]) {
-        Some(result) => result.is_true(),
+        Some(result) => {
+            if result.is_true() {
+                Uncaught::Handled
+            } else {
+                Uncaught::Fatal
+            }
+        }
         None => {
-            tc.reset(); // handler threw: clear it, the original stays fatal
+            // Capture the handler's own exception BEFORE clearing -- that is
+            // what Node reports.
+            let thrown = tc.exception().map(|e| {
+                let value = v8::Global::new(tc, e);
+                let message =
+                    crate::exception_to_error(tc, "uncaughtException handler").to_string();
+                let frame = tc.message().and_then(|m| source_frame(tc, m));
+                (value, frame, message)
+            });
+            tc.reset();
             // Node exits 7 when the uncaughtException handler itself throws
             // (kExceptionInFatalExceptionHandler). Stamp the sub-code for the
             // CLI's fatal path; 'exit' handlers can still mutate it after.
@@ -238,7 +278,14 @@ pub(crate) fn dispatch_uncaught(
                 let seven: v8::Local<v8::Value> = v8::Number::new(tc, 7.0).into();
                 process.set(tc, key.into(), seven)
             })();
-            false
+            match thrown {
+                Some((value, frame, message)) => Uncaught::HandlerThrew {
+                    value,
+                    frame,
+                    message,
+                },
+                None => Uncaught::Fatal,
+            }
         }
     }
 }
@@ -312,12 +359,37 @@ fn fatal_report(
         tc.reset();
     }
     let body = body.unwrap_or_else(|| fallback.to_string());
+    // Node closes a fatal report with its runtime banner ("Node.js vX.Y.Z").
+    // oam prints its OWN -- same structural role, and claiming to be Node
+    // here would be a lie about which runtime produced the crash.
     format!(
         "{}{}
+
+oam v{}
 ",
         frame.unwrap_or_default(),
-        body
+        body,
+        env!("CARGO_PKG_VERSION")
     )
+}
+
+/// `util.inspect(value)` via the JS side. ToString is wrong for a rejection
+/// reason -- it throws on a Symbol and runs user `Symbol.toPrimitive` -- and
+/// inspect is what Node renders these with anyway.
+fn inspect_value(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<String> {
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let key = v8::String::new(tc, "__oamFormatFatal")?;
+    let f = v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()?;
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+    let out = f.call(tc, recv, &[value]);
+    if tc.has_caught() {
+        tc.reset();
+    }
+    Some(out?.to_rust_string_lossy(tc))
 }
 
 /// A callback threw directly (timer/op settle). Offer it to a process
@@ -337,9 +409,17 @@ pub(crate) fn handle_uncaught_throw(
     tc.reset();
 
     let local = v8::Local::new(tc, &value);
-    if dispatch_uncaught(tc, local) {
-        return None;
-    }
+    // A handler that threw replaces what gets reported (Node reports the
+    // secondary exception, not the original).
+    let (local, frame, message) = match dispatch_uncaught(tc, local) {
+        Uncaught::Handled => return None,
+        Uncaught::Fatal => (local, frame, message),
+        Uncaught::HandlerThrew {
+            value,
+            frame,
+            message,
+        } => (v8::Local::new(tc, &value), frame, message),
+    };
     Some(vec![Diagnostic::new(
         FATAL_CODE,
         Severity::Error,
@@ -369,14 +449,20 @@ pub(crate) fn drain_uncaught(
         }
         for (value, text) in captured {
             let local = v8::Local::new(tc, &value);
-            if dispatch_uncaught(tc, local) {
-                continue; // a listener handled it
-            }
+            let (local, frame, message) = match dispatch_uncaught(tc, local) {
+                Uncaught::Handled => continue,
+                Uncaught::Fatal => (local, None, format!("Uncaught (in microtask) {text}")),
+                Uncaught::HandlerThrew {
+                    value,
+                    frame,
+                    message,
+                } => (v8::Local::new(tc, &value), frame, message),
+            };
             fatal.push(Diagnostic::new(
-                "OAM-RT0001",
+                FATAL_CODE,
                 Severity::Error,
                 Origin::Runtime,
-                format!("Uncaught (in microtask) {text}"),
+                fatal_report(tc, local, frame, &message),
             ));
         }
         // Flush what the listeners queued -- explicit policy means nothing
@@ -582,23 +668,34 @@ impl JsRuntime {
                 // ALSO route this promise to the unhandled-rejection ledger.
                 promise.mark_as_handled();
                 let exception = promise.result(tc);
-                if emit_process_event(tc, "uncaughtException", &[exception]) {
-                    // A listener suppressed the fatal exit: continue like a
-                    // clean run -- drain ticks + microtasks the handler
-                    // queued (delivering any fresh throws), pump any
-                    // pending timers/ops, then report unhandled rejections.
-                    if let Some(failure) = run_ticks_and_microtasks(tc) {
-                        return Err(failure);
+                // The full ladder, same as the CJS path: monitor -> capture
+                // callback -> listeners. A bare emit here skipped
+                // uncaughtExceptionMonitor entirely and mis-reported a
+                // throwing handler.
+                let (exception, frame) = match dispatch_uncaught(tc, exception) {
+                    Uncaught::Handled => {
+                        // A listener suppressed the fatal exit: continue like
+                        // a clean run -- drain ticks + microtasks the handler
+                        // queued (delivering any fresh throws), pump any
+                        // pending timers/ops, then report unhandled
+                        // rejections.
+                        if let Some(failure) = run_ticks_and_microtasks(tc) {
+                            return Err(failure);
+                        }
+                        if let Some(failure) = drain_uncaught(tc) {
+                            return Err(failure);
+                        }
+                        pump_event_loop(tc, None, true)?;
+                        return match unhandled_rejection_failures(tc) {
+                            Some(failures) => Err(failures),
+                            None => Ok(()),
+                        };
                     }
-                    if let Some(failure) = drain_uncaught(tc) {
-                        return Err(failure);
+                    Uncaught::Fatal => (exception, None),
+                    Uncaught::HandlerThrew { value, frame, .. } => {
+                        (v8::Local::new(tc, &value), frame)
                     }
-                    pump_event_loop(tc, None, true)?;
-                    return match unhandled_rejection_failures(tc) {
-                        Some(failures) => Err(failures),
-                        None => Ok(()),
-                    };
-                }
+                };
                 let text = exception
                     .to_string(tc)
                     .map(|s| s.to_rust_string_lossy(tc))
@@ -606,7 +703,7 @@ impl JsRuntime {
                 let fallback = format!("{}: Uncaught {text}", entry.display());
                 Err(rt_diag(
                     FATAL_CODE,
-                    fatal_report(tc, exception, None, &fallback),
+                    fatal_report(tc, exception, frame, &fallback),
                 ))
             }
             v8::PromiseState::Pending => Err(rt_diag(
@@ -1333,7 +1430,7 @@ pub(crate) fn pump_event_loop(
 pub(crate) fn unhandled_rejection_failures(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> Option<Vec<Diagnostic>> {
-    let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>, String)> = tc
+    let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
         .map(|ledger| ledger.unhandled.drain(..).collect())
         .unwrap_or_default();
@@ -1341,7 +1438,7 @@ pub(crate) fn unhandled_rejection_failures(
         return None;
     }
     let mut fatal = Vec::new();
-    for (promise, reason, message) in unhandled {
+    for (promise, reason) in unhandled {
         // Node: process.emit('unhandledRejection', reason, promise).
         let reason_local = v8::Local::new(tc, &reason);
         let promise_local = v8::Local::new(tc, &promise);
@@ -1356,7 +1453,10 @@ pub(crate) fn unhandled_rejection_failures(
             "OAM-RT0004",
             Severity::Error,
             Origin::Runtime,
-            format!("unhandled promise rejection: {message}"),
+            format!(
+                "unhandled promise rejection: {}",
+                inspect_value(tc, reason_local).unwrap_or_else(|| "unknown value".to_string())
+            ),
         ));
     }
     // Flush what the listeners queued (async listener continuations) --
@@ -2292,14 +2392,10 @@ pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseReje
             let reason = message
                 .get_value()
                 .unwrap_or_else(|| v8::undefined(scope).into());
-            let text = reason
-                .to_string(scope)
-                .map(|s| s.to_rust_string_lossy(scope))
-                .unwrap_or_else(|| "unknown value".to_string());
             let reason_global = v8::Global::new(scope, reason);
             let global = v8::Global::new(scope, promise);
             if let Some(ledger) = scope.get_slot_mut::<RejectionLedger>() {
-                ledger.unhandled.push((global, reason_global, text));
+                ledger.unhandled.push((global, reason_global));
             }
         }
         v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
@@ -2311,7 +2407,7 @@ pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseReje
                         .unhandled
                         .iter()
                         .enumerate()
-                        .map(|(i, (g, _, _))| (i, g.clone()))
+                        .map(|(i, (g, _))| (i, g.clone()))
                         .collect()
                 })
                 .unwrap_or_default();

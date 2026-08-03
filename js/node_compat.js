@@ -4894,6 +4894,25 @@
     // nextTick delivery (not queueMicrotask), ERR_FALSY_VALUE_REJECTION for
     // ALL falsy rejections (?? missed false/0/''), and descriptor copying
     // with length+1 / name+'Callbackified'.
+    // Node's lib/util.js hoists this so the pruned stack has a real frame to
+    // cut at. Capturing against `callbackified` (which has already RETURNED by
+    // the time the tick runs) leaves V8 no matching frame, so the whole stack
+    // is pruned away and err.stack is just the header.
+    function callbackifyOnRejected(reason, cb) {
+      if (!reason) {
+        const err = new Error("Promise was rejected with falsy value");
+        err.reason = reason;
+        // Capture BEFORE shaping: applyNodeErrorShape rewrites the current
+        // stack's first line into the "Error [ERR_FALSY_VALUE_REJECTION]:"
+        // header node renders -- capturing afterward would regenerate an
+        // unshaped stack.
+        Error.captureStackTrace(err, callbackifyOnRejected);
+        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION");
+        reason = err;
+      }
+      return cb(reason);
+    }
+
     function callbackify(original) {
       if (typeof original !== "function") {
         throw new codes.ERR_INVALID_ARG_TYPE("original", "Function", original);
@@ -4908,20 +4927,7 @@
         const cb = maybeCb.bind(this);
         Reflect.apply(original, this, args).then(
           (ret) => process.nextTick(cb, null, ret),
-          (rej) => process.nextTick(() => {
-            let reason = rej;
-            if (!reason) {
-              reason = new Error("Promise was rejected with falsy value");
-              reason.reason = rej;
-              // Capture BEFORE shaping: applyNodeErrorShape rewrites the
-              // current stack's first line into the
-              // "Error [ERR_FALSY_VALUE_REJECTION]:" header node renders --
-              // capturing afterward would regenerate an unshaped stack.
-              Error.captureStackTrace(reason, callbackified);
-              applyNodeErrorShape(reason, "ERR_FALSY_VALUE_REJECTION");
-            }
-            return cb(reason);
-          }),
+          (rej) => process.nextTick(callbackifyOnRejected, rej, cb),
         );
       }
       const descriptors = Object.getOwnPropertyDescriptors(original);
@@ -8403,10 +8409,10 @@
     // drain -> microtask checkpoint at every tick point, Node's
     // processTicksAndRejections shape. The drain runs the queue to
     // exhaustion, including entries appended mid-drain. Each callback is
-    // bound to its scheduling ALS frame individually (via
-    // registry._bindToCurrentFrame, exported by the timers init) -- binding
-    // only the drain would leak the first scheduler's frame into every
-    // other callback in the batch.
+    // bound to its scheduling ALS frame individually (captured as DATA at
+    // schedule time and restored by the drain) -- binding only the drain
+    // would leak the first scheduler's frame into every other callback in
+    // the batch.
     let tickQueue = [];
     let tickIndex = 0;
     // Canonical uncaught dispatcher -- Node's onGlobalUncaughtException
@@ -8506,7 +8512,10 @@
       enumerable: false,
     });
 
-    const drainTickQueue = () => {
+    // Named to match the frame Node renders in every tick-drain stack:
+    // "at process.processTicksAndRejections". Installed as a real process
+    // method below and invoked through it, so V8 renders the receiver too.
+    const drainTickQueue = function processTicksAndRejections() {
       // The finally is load-bearing: EVERY exit -- normal completion, the
       // fatal no-listener rethrow, or a throw from a user's uncaughtException/
       // monitor handler itself -- must reset the queue state so a later
@@ -8531,7 +8540,16 @@
             // (in the catch below) routes it to the domain's error handler.
             const tickDom = entry[2];
             if (tickDom) tickDom.enter();
-            entry[0](...entry[1]);
+            // Local, not entry[0](...): calling a function off an array makes
+            // V8 name the callee's frame "Array.<anonymous>".
+            const tickFn = entry[0];
+            const setFrame = registry._setContinuationFrame;
+            const prevFrame = setFrame ? setFrame(entry[3]) : undefined;
+            try {
+              tickFn(...entry[1]);
+            } finally {
+              if (setFrame) setFrame(prevFrame);
+            }
             if (tickDom) tickDom.exit();
           } catch (e) {
             // Node's onGlobalUncaughtException order: monitor first; then the
@@ -8566,6 +8584,14 @@
     // non-configurable: a global-scrubbing test harness deleting them would
     // otherwise strand queued ticks (the host also guards: no drain fn =
     // stop looping, never spin).
+    // V8 renders a frame from the function's own name, and the host invokes
+    // this through a global rather than off `process`, so name it what Node
+    // renders: "at process.processTicksAndRejections". It is not added to
+    // `process` -- Node does not expose it there either.
+    Object.defineProperty(drainTickQueue, "name", {
+      value: "process.processTicksAndRejections",
+      configurable: true,
+    });
     Object.defineProperty(globalThis, "__oamDrainTicks", {
       value: drainTickQueue,
       writable: false,
@@ -8933,7 +8959,11 @@
         if (typeof fn !== "function") {
           throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", fn);
         }
-        const bind = registry._bindToCurrentFrame;
+        // Capture the ALS frame as DATA. Wrapping the callback in a binder
+        // closure (the old shape) put an extra "at Array.<anonymous>" frame
+        // between the user's frame and the drain -- Node has no such frame,
+        // because its continuation propagation is native, not a JS closure.
+        const captureFrame = registry._captureContinuationFrame;
         // Just enqueue: the HOST drains at every tick point (see
         // __oamDrainTicks above) -- no microtask trampoline.
         // entry[2]: domain captured at schedule time (undefined until
@@ -8944,7 +8974,12 @@
         // returns immediately when no hook is enabled, so the hot path is
         // unchanged for the overwhelmingly common no-hooks case.
         if (registry._emitAsyncInit) registry._emitAsyncInit("TickObject", null);
-        tickQueue.push([bind ? bind(fn) : fn, args, process.domain || null]);
+        tickQueue.push([
+          fn,
+          args,
+          process.domain || null,
+          captureFrame ? captureFrame() : undefined,
+        ]);
       },
       hrtime: Object.assign(
         (prev) => {
@@ -19647,6 +19682,14 @@
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.
       registry._bindToCurrentFrame = bindToCurrentFrame;
+      // Frame-as-data, for callers that must not pay a wrapper closure's
+      // stack frame (process.nextTick -- see the tick drain).
+      registry._captureContinuationFrame = () => natives.getContinuationData();
+      registry._setContinuationFrame = (frame) => {
+        const prev = natives.getContinuationData();
+        natives.setContinuationData(frame);
+        return prev;
+      };
 
       // queueMicrotask still just needs ALS frame-binding.
       {
