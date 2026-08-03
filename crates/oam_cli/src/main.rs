@@ -296,6 +296,12 @@ fn main() -> ExitCode {
                         return ExitCode::from(9);
                     }
                 }
+            } else if arg == "--" {
+                // End of node options: everything after is the script and
+                // its arguments. Consume it (it is a separator, never part
+                // of execArgv) and stop option parsing.
+                i += 1;
+                break;
             } else if arg == "--permission" {
                 flags.permission = true;
                 i += 1;

@@ -66,12 +66,19 @@ impl super::JsRuntime {
 
 /// Spawn a worker thread. Returns (worker_id, thread_id). The caller
 /// must store the returned handles in the parent's WorkerRegistry.
+pub(crate) struct WorkerOptions {
+    pub pipe_stdout: bool,
+    pub pipe_stderr: bool,
+    pub exec_argv: Vec<String>,
+}
+
 pub(crate) fn spawn_worker(
     script_path: PathBuf,
     worker_data: Option<String>,
     worker_id: u64,
     parent_rx: mpsc::Receiver<Vec<u8>>,
     worker_tx: mpsc::Sender<WorkerEvent>,
+    options: WorkerOptions,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("oam-worker-{worker_id}"))
@@ -82,6 +89,7 @@ pub(crate) fn spawn_worker(
                 worker_id,
                 parent_rx,
                 worker_tx.clone(),
+                options,
             );
             let _ = worker_tx.send(WorkerEvent::Exit(exit_code));
         })
@@ -94,7 +102,13 @@ fn run_worker(
     thread_id: u64,
     from_parent: mpsc::Receiver<Vec<u8>>,
     to_parent: mpsc::Sender<WorkerEvent>,
+    options: WorkerOptions,
 ) -> i32 {
+    let WorkerOptions {
+        pipe_stdout,
+        pipe_stderr,
+        exec_argv,
+    } = options;
     // Worker isolate: no fork pool (same recursion hazard as the prewarm
     // path -- a worker that installed a pool would spawn prewarm threads that
     // each spawn more pools). A nested oam.fork() inside a worker cold-spawns
@@ -110,8 +124,18 @@ fn run_worker(
         outbox: to_parent.clone(),
         thread_id,
         worker_data,
+        pipe_stdout,
+        pipe_stderr,
+        exec_argv: exec_argv.clone(),
     };
 
+    if !exec_argv.is_empty() {
+        let json = serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".into());
+        let _ = rt.execute_script(
+            "<worker-exec-argv>",
+            &format!("globalThis.process.execArgv = {json};"),
+        );
+    }
     // Inherit the parent's process-level flags (--no-warnings etc.); a
     // fresh isolate would otherwise start with none of them.
     if let Some(js) = crate::inherited_flags_js() {

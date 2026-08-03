@@ -18923,7 +18923,26 @@
         // Note SHARE_ENV usage (workers share process env by default in oam)
         this._shareEnv = opts.env === SHARE_ENV;
 
-        const result = natives.workerNew(resolved, wd);
+        // Node always exposes worker.stdout/.stderr; the option controls
+        // whether the worker's output is ROUTED here instead of going
+        // straight to the parent's console.
+        const { Readable } = registry.get("stream");
+        this.stdout = new Readable({ read() {} });
+        this.stderr = new Readable({ read() {} });
+
+        const result = natives.workerNew(
+          resolved,
+          wd,
+          JSON.stringify({
+            stdout: opts.stdout === true,
+            stderr: opts.stderr === true,
+            // Absent means INHERIT the parent's execArgv (Node's default);
+            // an explicit [] means run the worker with no options.
+            execArgv: Array.isArray(opts.execArgv)
+              ? opts.execArgv.map(String)
+              : (process.execArgv || []).map(String),
+          }),
+        );
         this._workerId = result.workerId;
         this.threadId = result.threadId;
 
@@ -18950,7 +18969,17 @@
             }
           } else if (typeof raw === "object" && raw !== null) {
             if (raw.type === "error") { this.emit("error", new Error(raw.message)); }
-            if (raw.type === "exit") { this.emit("exit", raw.code); break; }
+            if (raw.type === "stdout" || raw.type === "stderr") {
+              // latin1: the Rust side encoded each byte as one code unit.
+              this[raw.type].push(Buffer.from(raw.data, "latin1"));
+            }
+            if (raw.type === "exit") {
+              // EOF both streams so a waiting 'end' listener fires.
+              this.stdout.push(null);
+              this.stderr.push(null);
+              this.emit("exit", raw.code);
+              break;
+            }
           }
         }
       }

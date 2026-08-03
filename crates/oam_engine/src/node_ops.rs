@@ -644,6 +644,16 @@ fn op_stdout_write(
     // arg_bytes: views pass through VERBATIM (binary pipes stay binary),
     // strings encode as UTF-8.
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
+        // In a worker started with { stdout: true }, output belongs to the
+        // parent's worker.stdout stream, not the shared process fd.
+        if let Some(ctx) = scope.get_slot::<oam_core::worker::WorkerContext>()
+            && ctx.pipe_stdout
+        {
+            let _ = ctx
+                .outbox
+                .send(oam_core::worker::WorkerEvent::Stdout(bytes));
+            return;
+        }
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
@@ -3022,6 +3032,30 @@ fn op_worker_new(
         arg_string(scope, &args, 1)
     };
 
+    // arg 2: JSON options from the JS Worker constructor
+    // ({ stdout, stderr, execArgv }).
+    let options = arg_string(scope, &args, 2)
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let flag = |key: &str| options.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let worker_options = crate::worker::WorkerOptions {
+        pipe_stdout: flag("stdout"),
+        pipe_stderr: flag("stderr"),
+        exec_argv: options
+            .get("execArgv")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    // `--` terminates option parsing; it is a separator, not
+                    // an option, and Node does not report it in execArgv.
+                    .filter(|s| *s != "--")
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+
     let path = PathBuf::from(&script_path);
     if !path.is_file() {
         throw_type_error(scope, &format!("worker script not found: {script_path}"));
@@ -3043,6 +3077,7 @@ fn op_worker_new(
         worker_id,
         parent_to_worker_rx,
         worker_to_parent_tx,
+        worker_options,
     );
 
     {

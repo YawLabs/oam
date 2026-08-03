@@ -198,7 +198,18 @@ fn cold_spawn(
     msg_rx: mpsc::Receiver<Vec<u8>>,
     event_tx: mpsc::Sender<WorkerEvent>,
 ) {
-    crate::worker::spawn_worker(script, worker_data, worker_id, msg_rx, event_tx);
+    crate::worker::spawn_worker(
+        script,
+        worker_data,
+        worker_id,
+        msg_rx,
+        event_tx,
+        crate::worker::WorkerOptions {
+            pipe_stdout: false,
+            pipe_stderr: false,
+            exec_argv: Vec::new(),
+        },
+    );
 }
 
 /// Execute a `ForkRequest` on an already-initialized `JsRuntime`.
@@ -217,6 +228,10 @@ fn run_fork_request(rt: &mut super::JsRuntime, req: ForkRequest) -> i32 {
         outbox: req.event_tx.clone(),
         thread_id: req.worker_id,
         worker_data: req.worker_data,
+        // A fork has its own process stdio; only worker_threads pipes.
+        pipe_stdout: false,
+        pipe_stderr: false,
+        exec_argv: Vec::new(),
     };
 
     // Inherit the parent's process-level flags (--no-warnings etc.); a

@@ -639,6 +639,11 @@ fn op_fork_spawn(
                 worker_id,
                 parent_to_worker_rx,
                 worker_to_parent_tx.clone(),
+                crate::worker::WorkerOptions {
+                    pipe_stdout: false,
+                    pipe_stderr: false,
+                    exec_argv: Vec::new(),
+                },
             );
         }
     }

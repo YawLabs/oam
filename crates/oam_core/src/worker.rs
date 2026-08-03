@@ -16,6 +16,11 @@ pub enum WorkerEvent {
     Message(Vec<u8>),
     Error(String),
     Exit(i32),
+    /// Worker stdout/stderr, when the parent asked for it with
+    /// `new Worker(..., { stdout: true })`. Without this the worker writes
+    /// straight to the shared process fd, so the parent cannot capture it.
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
 }
 
 /// Parent-side handle to one worker.
@@ -59,6 +64,11 @@ pub struct WorkerContext {
     pub outbox: mpsc::Sender<WorkerEvent>,
     pub thread_id: u64,
     pub worker_data: Option<String>,
+    /// Route this worker's stdout/stderr to the parent instead of fd 1/2.
+    pub pipe_stdout: bool,
+    pub pipe_stderr: bool,
+    /// process.execArgv inside the worker (`{ execArgv: [...] }`).
+    pub exec_argv: Vec<String>,
 }
 
 fn reinsert_receiver(
@@ -104,6 +114,22 @@ pub async fn parent_recv(registry: WorkerRegistry, worker_id: u64) -> OpOutcome 
                 WorkerEvent::Exit(code) => {
                     OpOutcome::Json(serde_json::json!({"type": "exit", "code": code}).to_string())
                 }
+                // Latin-1 keeps the round-trip lossless for arbitrary bytes:
+                // the JS side maps each code unit straight back to a byte.
+                WorkerEvent::Stdout(bytes) => OpOutcome::Json(
+                    serde_json::json!({
+                        "type": "stdout",
+                        "data": bytes.iter().map(|b| *b as char).collect::<String>(),
+                    })
+                    .to_string(),
+                ),
+                WorkerEvent::Stderr(bytes) => OpOutcome::Json(
+                    serde_json::json!({
+                        "type": "stderr",
+                        "data": bytes.iter().map(|b| *b as char).collect::<String>(),
+                    })
+                    .to_string(),
+                ),
             }
         }
         Ok((_, Err(_))) => OpOutcome::Done,
