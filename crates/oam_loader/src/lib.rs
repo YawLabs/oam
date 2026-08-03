@@ -75,7 +75,17 @@ pub fn classify(path: &Path) -> SourceKind {
 pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, TranspileError> {
     let file = path.to_string_lossy().into_owned();
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    // Always MODULE, never Script. SourceType::from_path infers script-vs-
+    // module from the extension, and oxc's JSX transform picks the shape of
+    // its injected runtime import from that: a Script gets
+    // `var _x = require("react/jsx-runtime")`, which is undefined in oam's
+    // ESM context, so a .tsx file with no import/export of its own died with
+    // "require is not defined". oam only ever feeds this function ESM
+    // (CommonJS entries route through the interop path instead), so pinning
+    // module here is correct as well as necessary.
+    let source_type = SourceType::from_path(path)
+        .unwrap_or_else(|_| SourceType::ts())
+        .with_module(true);
 
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if !parsed.errors.is_empty() {

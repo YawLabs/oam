@@ -3586,12 +3586,75 @@ fn import_cycles_follow_esm_tdz_semantics() {
 }
 
 #[test]
-fn jsx_is_a_clear_diagnostic_not_a_crash() {
-    let file = write_temp("app.tsx", "const a = <div/>;");
+fn jsx_without_a_runtime_is_a_clear_diagnostic_not_a_crash() {
+    // .tsx now COMPILES (oxc emits the automatic runtime), so the failure
+    // moved from "unsupported" to "react/jsx-runtime is not installed" --
+    // a resolve diagnostic, still never a crash or a raw syntax error.
+    let file = write_temp(
+        "app.tsx",
+        "const a = <div/>;
+console.log(a);
+",
+    );
     let out = oam(&["run", file.to_str().unwrap(), "--json"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("OAM-PARSE0003"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("react"),
+        "expected the missing JSX runtime package to be named; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Unexpected token"),
+        "JSX must not reach V8 untransformed; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn jsx_compiles_and_runs_with_a_jsx_runtime() {
+    // End-to-end: a .tsx file with NO import/export of its own (the shape
+    // that used to emit `require(...)`, because oxc treats an import/export
+    // free file as a Script) must transform to the automatic runtime and
+    // execute. A stub stands in for react so the test needs no real install.
+    // A DEDICATED dir: write_temp's shared RUN_DIR must never gain a
+    // node_modules/react, or every other test's module resolution changes.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-jsx-e2e-{}-{nanos}", std::process::id()));
+    let rt = dir.join("node_modules").join("react");
+    std::fs::create_dir_all(&rt).expect("mkdir");
+    std::fs::write(
+        rt.join("package.json"),
+        r#"{"name":"react","version":"19.0.0","exports":{"./jsx-runtime":"./jsx-runtime.js"}}"#,
+    )
+    .expect("write pkg");
+    std::fs::write(
+        rt.join("jsx-runtime.js"),
+        "exports.jsx = (t, p) => ({ tag: t, props: p });
+exports.jsxs = exports.jsx;
+",
+    )
+    .expect("write runtime");
+    let app = dir.join("app.tsx");
+    std::fs::write(
+        &app,
+        "const el = <div id=\"x\">hi</div>;
+console.log(JSON.stringify(el));
+",
+    )
+    .expect("write app");
+
+    let out = oam(&["run", app.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}
+stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("\"tag\":\"div\""), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

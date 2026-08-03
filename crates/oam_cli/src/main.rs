@@ -1367,17 +1367,6 @@ impl oam_engine::ModuleHost for CliHost {
 
     fn load(&self, path: &Path) -> Result<String, Vec<Diagnostic>> {
         let kind = oam_loader::classify(path);
-        if kind == SourceKind::Jsx {
-            return Err(vec![Diagnostic::new(
-                "OAM-PARSE0003",
-                Severity::Error,
-                Origin::Parse,
-                format!(
-                    ".tsx/.jsx support lands with the JSX automatic runtime (needs npm resolution, M2): {}",
-                    path.display()
-                ),
-            )]);
-        }
 
         // Anything we'd silently mis-execute gets a clear diagnostic instead:
         // .json would parse as JS and die on 'Unexpected token'. CJS files
@@ -1385,7 +1374,7 @@ impl oam_engine::ModuleHost for CliHost {
         // before load — so a .cjs/.cts here is an engine routing bug.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "js" | "mjs" | "ts" | "mts" => {}
+            "js" | "mjs" | "ts" | "mts" | "tsx" | "jsx" => {}
             "cjs" | "cts" => {
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
@@ -1434,7 +1423,11 @@ impl oam_engine::ModuleHost for CliHost {
         })?;
 
         match kind {
-            SourceKind::TypeScript => {
+            // .tsx/.jsx take the same oxc pipeline as .ts -- the JSX
+            // transform emits the automatic runtime
+            // (`import { jsx as _jsx } from "react/jsx-runtime"`), which
+            // resolves through normal npm resolution + CJS interop.
+            SourceKind::TypeScript | SourceKind::Jsx => {
                 // Install-time pre-compilation cache (oam install --precompile),
                 // keyed by source hash; a hit skips the oxc transpile. Misses
                 // (project sources, stale entries) fall through to transpile.

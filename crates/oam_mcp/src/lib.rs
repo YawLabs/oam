@@ -315,10 +315,6 @@ fn explain_code(code: &str) -> String {
             "TypeScript transform error: the source parsed but could not be lowered to JavaScript (e.g. unsupported syntax combination).",
         ),
         (
-            "OAM-PARSE0003",
-            ".tsx/.jsx is not supported yet; the JSX automatic runtime lands with npm resolution (M2). Rename to .ts or remove JSX.",
-        ),
-        (
             "OAM-MOD0001",
             "A relative import did not resolve to any file. The message lists every candidate path tried; create the file or fix the specifier.",
         ),
