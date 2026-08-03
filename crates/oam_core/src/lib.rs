@@ -308,6 +308,15 @@ impl CoreRuntime {
     }
 
     /// Child process registry (Arc clone; dies with the run).
+    /// Enter the tokio runtime context for the duration of the returned
+    /// guard. Required around any tokio type constructed on the V8 thread --
+    /// notably `tokio::process::Command::spawn`, which registers the child
+    /// with the signal-driver reactor on Unix and panics with
+    /// "there is no reactor running" outside a runtime context.
+    pub fn enter(&self) -> Option<tokio::runtime::EnterGuard<'_>> {
+        self.tokio.as_ref().map(|rt| rt.enter())
+    }
+
     pub fn children(&self) -> child::ChildRegistry {
         self.children.clone()
     }

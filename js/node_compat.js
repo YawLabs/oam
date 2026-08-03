@@ -15840,10 +15840,21 @@
         }
       };
 
-      natives.spawnAsync(norm.command, norm.args, nativeOpts).then((info) => {
+      // SYNCHRONOUS spawn (node parity): pid must be readable the instant
+      // spawn() returns. The native op throws on failure; the 'spawn' event
+      // and everything after it stay ASYNC, as node emits them.
+      let info;
+      try {
+        info = JSON.parse(natives.spawnAsync(norm.command, norm.args, nativeOpts));
+      } catch (err) {
+        info = null;
+        queueMicrotask(() => handleSpawnFailure(err));
+      }
+      if (info) {
         cp._handle = info.handle;
         cp.pid = info.pid;
 
+        queueMicrotask(() => {
         cp.emit("spawn");
 
         const stdoutDone = readStdout(info.handle);
@@ -15863,7 +15874,9 @@
             cp.emit("close", result.code, result.signal);
           });
         });
-      }).catch((err) => {
+        });
+      }
+      function handleSpawnFailure(err) {
         const e = typeof err === "string" ? new Error(err) : err;
         // Settle deferred stdin write/final waiters, then end the read streams
         // so consumers awaiting completion don't hang on a failed spawn.
@@ -15871,7 +15884,7 @@
         cp.stdout.push(null);
         cp.stderr.push(null);
         queueMicrotask(() => cp.emit("error", e));
-      });
+      }
 
       return cp;
     }
@@ -16036,9 +16049,19 @@
           });
         });
 
-        natives.spawnAsync(execPath, spawnArgs, nativeOpts).then((info) => {
+        // Synchronous spawn (node parity: fork() also yields a live pid
+        // immediately). Everything after stays async.
+        let info = null;
+        try {
+          info = JSON.parse(natives.spawnAsync(execPath, spawnArgs, nativeOpts));
+        } catch (err) {
+          ipcServer.close();
+          queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+        }
+        if (info) {
           cp._handle = info.handle;
           cp.pid = info.pid;
+          queueMicrotask(() => {
 
           if (silent) {
             cp.stdin = new Writable({
@@ -16096,10 +16119,8 @@
               cp.emit("close", result.code, result.signal);
             });
           });
-        }).catch((err) => {
-          ipcServer.close();
-          queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
-        });
+          });
+        }
       });
 
       return cp;

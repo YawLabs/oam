@@ -3418,21 +3418,36 @@ fn op_spawn_async(
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
 
-    let children2 = children.clone();
-    crate::ops::spawn_op(scope, &mut rv, async move {
-        match oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env)
-            .await
-        {
-            Ok((child, pid)) => {
-                let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut guard = children2.lock().unwrap_or_else(|e| e.into_inner());
+    // SYNCHRONOUS spawn (node's uv_spawn is synchronous): the child exists and
+    // its pid is known before this op returns, so JS can set `child.pid`
+    // immediately -- execa, tree-kill and pidusage all read it the instant
+    // spawn() returns. The runtime-context guard is required: tokio's
+    // Command::spawn registers the child with the signal-driver reactor.
+    let spawned = {
+        let core = core_runtime!(scope);
+        let _guard = core.enter();
+        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env)
+    };
+    match spawned {
+        Ok((child, pid)) => {
+            let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                 guard.insert(handle, oam_core::child::ChildProcess::new(child, pid));
-                let json = serde_json::json!({ "handle": handle, "pid": pid });
-                oam_core::OpOutcome::Json(json.to_string())
             }
-            Err(msg) => oam_core::OpOutcome::Failed(msg),
+            let json = serde_json::json!({ "handle": handle, "pid": pid });
+            if let Some(s) = v8::String::new(scope, &json.to_string()) {
+                rv.set(s.into());
+            }
         }
-    });
+        Err(msg) => {
+            // Keep the failure shape callers already parse (a JSON error
+            // body), surfaced synchronously as a thrown Error.
+            let text = v8::String::new(scope, &msg).unwrap();
+            let err = v8::Exception::error(scope, text);
+            scope.throw_exception(err);
+        }
+    }
 }
 
 fn op_spawn_kill(

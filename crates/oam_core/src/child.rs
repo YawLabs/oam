@@ -45,7 +45,14 @@ impl ChildProcess {
 
 pub type ChildRegistry = Arc<Mutex<HashMap<u64, ChildProcess>>>;
 
-pub async fn spawn_child(
+/// Spawn a child and return it with its pid. SYNCHRONOUS: node's uv_spawn is
+/// synchronous, so `child.pid` must be readable the instant `spawn()` returns
+/// (execa, tree-kill and pidusage all read it immediately). There are no
+/// awaits in this body -- `tokio::process::Command::spawn` is itself a sync
+/// call -- but it MUST run inside a tokio runtime context, because on Unix it
+/// registers the child with the signal-driver reactor. Callers on the V8
+/// thread must hold a `Handle::enter()` guard; see `CoreRuntime::enter`.
+pub fn spawn_child(
     command: String,
     args: Vec<String>,
     cwd: Option<String>,
