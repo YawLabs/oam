@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose something oam does not do yet.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A missing or divergent **Node** API is not a feature request — file it
+        as a **Node compatibility divergence**, which is a higher-priority
+        queue. This template is for capability oam would add beyond Node.
+
+        Large changes should start as a discussion rather than an issue or a
+        PR (see `CONTRIBUTING.md`).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where oam gets in the way.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: >-
+        What you want oam to do. If it has a shape in another runtime, say
+        which and how it works there.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have tried
+      description: >-
+        Including "worked around it in userland like this" — a working
+        workaround tells us how urgent this is.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: charter
+    attributes:
+      label: Charter check
+      options:
+        - label: >-
+            This does not privilege any single AI or cloud vendor
+            (see `GOVERNANCE.md`).
+          required: false

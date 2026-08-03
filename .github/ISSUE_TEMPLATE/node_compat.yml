@@ -1,0 +1,75 @@
+name: Node compatibility divergence
+description: oam and node disagree, or a Node API is missing or a stub.
+labels: ["node-compat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Node is the specification. A divergence with no security consequence
+        is an ordinary bug and belongs here in public.
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest script that shows the divergence, plus the exact command.
+      render: javascript
+    validations:
+      required: true
+
+  - type: textarea
+    id: node-output
+    attributes:
+      label: What real node does
+      description: Paste the output, and give `node --version`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: oam-output
+    attributes:
+      label: What oam does
+      description: Paste the output.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: api
+    attributes:
+      label: API surface
+      description: >-
+        The module and symbol involved, as precisely as you can name it.
+      placeholder: "node:fs — fs.promises.cp() with { dereference: true }"
+    validations:
+      required: false
+
+  - type: input
+    id: oam-version
+    attributes:
+      label: oam version
+      description: Output of `oam --version`.
+      placeholder: "0.8.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 15.2, arm64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: What it blocks
+      description: >-
+        If this divergence stops a real package or app from running, name it.
+        Divergences that block real software get prioritized over ones found
+        by inspection.
+    validations:
+      required: false

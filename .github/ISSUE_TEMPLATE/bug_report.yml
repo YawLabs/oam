@@ -1,0 +1,102 @@
+name: Bug report
+description: Something in oam crashes, hangs, or behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the bug is that oam behaves differently from `node`, use the
+        **Node compatibility divergence** template instead — it asks the
+        right questions.
+
+        If the bug is exploitable, do not file it here. Report it privately:
+        **Security** tab, then **Report a vulnerability** (see `SECURITY.md`).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including the full error output or stack trace.
+      placeholder: |
+        oam exits with `TypeError: ... is not a function` after ~2s.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >-
+        The smallest self-contained script that shows the problem, plus the
+        exact command you ran. If it needs npm packages, list them with
+        versions — a repro we can paste into a file and run is worth more
+        than a description of one.
+      render: javascript
+    validations:
+      required: true
+
+  - type: textarea
+    id: node-behavior
+    attributes:
+      label: What does real node do?
+      description: >-
+        oam aims for Node compatibility, so Node's behavior is the
+        specification. Run the same repro under `node` and paste the output,
+        with `node --version`. If you did not or could not, say so — that is
+        useful too, it just means we run it.
+      placeholder: |
+        $ node --version
+        v22.22.2
+        $ node repro.mjs
+        <output>
+    validations:
+      required: false
+
+  - type: input
+    id: oam-version
+    attributes:
+      label: oam version
+      description: Output of `oam --version`.
+      placeholder: "0.8.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: >-
+        OS, version, and CPU architecture. If you installed a release binary,
+        say which asset; if you built from source, give the commit.
+      placeholder: "Windows 11 26200, arm64, release asset oam-aarch64-pc-windows-msvc.exe"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-source
+    attributes:
+      label: How did you get oam?
+      options:
+        - Release binary / install script
+        - Built from source
+        - Other (explain above)
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: >-
+        Regression? Say which version last worked. Intermittent? Say roughly
+        how often. Relevant flags (`--permission`, `NODE_OPTIONS`, ...) go
+        here.
+    validations:
+      required: false
