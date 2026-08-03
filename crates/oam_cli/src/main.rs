@@ -1455,16 +1455,16 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
             flags.expose_gc = true;
         } else if let Some(v) = tok.strip_prefix("--disable-warning=") {
             flags.disabled_warnings.push(v.to_string());
-        } else if tok == "--disable-warning" {
-            if let Some(v) = it.next() {
-                flags.disabled_warnings.push(v.clone());
-            }
+        } else if tok == "--disable-warning"
+            && let Some(v) = it.next()
+        {
+            flags.disabled_warnings.push(v.clone());
         } else if let Some(v) = tok.strip_prefix("--redirect-warnings=") {
             flags.redirect_warnings = Some(v.to_string());
-        } else if tok == "--redirect-warnings" {
-            if let Some(v) = it.next() {
-                flags.redirect_warnings = Some(v.clone());
-            }
+        } else if tok == "--redirect-warnings"
+            && let Some(v) = it.next()
+        {
+            flags.redirect_warnings = Some(v.clone());
         }
         // Anything else: ignored on purpose (see the call site).
     }
