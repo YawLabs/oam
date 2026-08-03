@@ -7360,10 +7360,24 @@
     // does (get -> undefined, set -> TypeError, `in` -> false, delete ->
     // true); defineProperty only accepts a configurable+writable+enumerable
     // data descriptor.
+    // Windows environment variables are CASE-INSENSITIVE (probe-verified:
+    // node reads process.env.CASETEST after setting process.env.CaseTest).
+    // The stored key keeps the ORIGINAL casing -- only lookups fold -- so
+    // Object.keys() still reports the name as it was written.
+    const envCaseFold = natives.platform === "win32";
+    const envResolveKey = (store, prop) => {
+      if (!envCaseFold || prop in store) return prop;
+      const wanted = String(prop).toLowerCase();
+      for (const k of Object.keys(store)) {
+        if (k.toLowerCase() === wanted) return k;
+      }
+      return prop;
+    };
     const env = new Proxy(Object.create(null), {
       get(_, prop) {
         if (typeof prop === "symbol") return undefined;
-        return ensureEnv()[prop];
+        const store = ensureEnv();
+        return store[envResolveKey(store, prop)];
       },
       set(_, prop, value) {
         if (typeof prop === "symbol") {
@@ -7372,16 +7386,25 @@
         if (typeof value === "symbol") {
           throw new TypeError("Cannot convert a Symbol value to a string");
         }
-        ensureEnv()[prop] = String(value);
+        // An empty name is not a valid environment variable: node accepts the
+        // assignment expression but stores nothing (probe: reads back
+        // undefined). Silently ignore rather than throw.
+        if (prop === "") return true;
+        const store = ensureEnv();
+        store[envResolveKey(store, prop)] = String(value);
         return true;
       },
       has(_, prop) {
         if (typeof prop === "symbol") return false;
-        return prop in ensureEnv();
+        const store = ensureEnv();
+        // `in` on process.env reports only real variables (node: an
+        // inherited name like 'hasOwnProperty' is NOT in process.env).
+        return Object.prototype.hasOwnProperty.call(store, envResolveKey(store, prop));
       },
       deleteProperty(_, prop) {
         if (typeof prop === "symbol") return true;
-        delete ensureEnv()[prop];
+        const store = ensureEnv();
+        delete store[envResolveKey(store, prop)];
         return true;
       },
       defineProperty(_, prop, desc) {
@@ -7418,8 +7441,14 @@
       ownKeys() { return Reflect.ownKeys(ensureEnv()); },
       getOwnPropertyDescriptor(_, prop) {
         const obj = ensureEnv();
-        if (typeof prop === "symbol" || !(prop in obj)) return undefined;
-        return { value: obj[prop], writable: true, enumerable: true, configurable: true };
+        if (typeof prop === "symbol") return undefined;
+        // OWN properties only: `prop in obj` walks the prototype chain, so an
+        // inherited name reported as own -- node asserts
+        // Object.hasOwn(process.env, 'hasOwnProperty') === false while
+        // process.env.hasOwnProperty still resolves via the prototype.
+        const key = envResolveKey(obj, prop);
+        if (!Object.prototype.hasOwnProperty.call(obj, key)) return undefined;
+        return { value: obj[key], writable: true, enumerable: true, configurable: true };
       },
     });
     const stdoutIsTTY = natives.isTTY(1);
@@ -15511,7 +15540,11 @@
       const opts = norm.options;
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        env: opts.env || undefined,
+        // No explicit env: hand the child the LIVE process.env view, not the
+        // pristine OS environment. node's process.env writes through to the
+        // real environment, so a runtime `process.env.X = v` is inherited by
+        // children; oam's proxy mutates a JS-side cache, so pass that.
+        env: opts.env || globalThis.process.env,
         shell: !!opts.shell,
         clearEnv: false,
         timeout: opts.timeout || 0,
@@ -15642,7 +15675,11 @@
       const codes = stdioArr.map((e, i) => stdioCode(e, i));
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        env: opts.env || undefined,
+        // No explicit env: hand the child the LIVE process.env view, not the
+        // pristine OS environment. node's process.env writes through to the
+        // real environment, so a runtime `process.env.X = v` is inherited by
+        // children; oam's proxy mutates a JS-side cache, so pass that.
+        env: opts.env || globalThis.process.env,
         clearEnv: false,
       };
 
@@ -15773,7 +15810,11 @@
 
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        env: opts.env || undefined,
+        // No explicit env: hand the child the LIVE process.env view, not the
+        // pristine OS environment. node's process.env writes through to the
+        // real environment, so a runtime `process.env.X = v` is inherited by
+        // children; oam's proxy mutates a JS-side cache, so pass that.
+        env: opts.env || globalThis.process.env,
         shell: !!opts.shell,
         clearEnv: false,
       };
