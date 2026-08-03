@@ -12909,6 +12909,9 @@
             res.headers[key] = key in res.headers ? res.headers[key] + ", " + value : value;
             res.rawHeaders.push(name, value);
           });
+          // Handle for req.destroy(): node destroys the socket, which
+          // surfaces as ECONNRESET on an in-flight response stream.
+          self._res = res;
           self.emit("response", res);
         }, function (err) {
           // Map transport failures to Node-shaped codes: retry logic keys
@@ -13003,6 +13006,9 @@
                   res.httpVersion = "1.1";
                   res.headers = resHeaders;
                   res.rawHeaders = rawHeaders;
+                  // Handle for req.destroy(): node destroys the socket, which
+                  // surfaces as ECONNRESET on an in-flight response stream.
+                  self._res = res;
                   self.emit("response", res);
                   if (remaining.length > 0) res.push(remaining);
                   natives.tcpRead(handle, 65536).then(function readRest(chunk) {
@@ -13022,7 +13028,18 @@
         this.emit("abort");
       }
       destroy(err) {
+        if (this._aborted) return this;
         this._aborted = true;
+        // Node semantics: destroying the request destroys the underlying
+        // socket, so an in-flight response stream fails with ECONNRESET --
+        // otherwise `for await (const c of res)` never terminates and the
+        // program hangs. The request's own 'error' carries the caller's error.
+        const res = this._res;
+        if (res && !res.destroyed) {
+          const reset = new Error("aborted");
+          reset.code = "ECONNRESET";
+          res.destroy(reset);
+        }
         if (err) this.emit("error", err);
         return this;
       }
@@ -15276,6 +15293,9 @@
               } else {
                 bodyMode = "eof";
               }
+              // Handle for req.destroy(): node destroys the socket, which
+              // surfaces as ECONNRESET on an in-flight response stream.
+              self._res = res;
               self.emit("response", res);
               if (bodyStart.length > 0) feedBody(bodyStart);
               else if (bodyMode === "length" && remaining <= 0) finishRes();
