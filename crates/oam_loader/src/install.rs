@@ -1323,12 +1323,14 @@ mod tests {
     // the failure mode, so a malicious or buggy tarball cannot write files
     // outside the destination directory.
     //
-    // NOTE on coverage: the existing safety check at `extract_tarball`
-    // (`target.starts_with(dest)`) is purely lexical and therefore cannot
-    // detect `..`-based traversal — `dest.join("../escape.txt")` lexically
-    // starts with `dest`. The check DOES catch absolute paths (where
-    // `Path::join` replaces the base), and that's what this test exercises.
-    // The `..` case is a known gap and is separately tracked.
+    // NOTE on coverage: this test exercises the ABSOLUTE-path case, where
+    // `Path::join` replaces the base so the prefix check fails outright.
+    // The `..` case is covered separately by
+    // `extract_tarball_rejects_dotdot_path_traversal` — `extract_into` runs
+    // `path_clean` (which collapses `..`) on BOTH sides before comparing,
+    // so a `..` entry cannot escape. An earlier revision of this comment
+    // described that as an open gap; it was fixed, and the stale wording
+    // read as a live path-traversal vulnerability.
     #[test]
     fn extract_tarball_rejects_path_traversal() {
         use flate2::Compression;

@@ -266,6 +266,33 @@ you are coming from a TypeScript toolchain:
 
 ---
 
+### 16. HTTP request bodies do not stream
+
+Both halves of the HTTP path materialize a request body before it moves:
+
+- **Server:** the runtime collects the full request body before dispatching
+  the JS handler (`crates/oam_core/src/http_server.rs`). A chunked request
+  that withholds its terminator delays the handler by exactly that long --
+  measured at 521ms against Node's 13ms for a 500ms-delayed terminator.
+- **Client:** `http.ClientRequest` accumulates writes and hands the complete
+  body to the transport at `end()`. There is no streaming request body and
+  no in-flight cancel.
+
+Consequence: a pipeline that interleaves an unfinished request body with the
+response cannot complete. `stream.pipeline(readable, req)` works when the
+readable ends; it stalls when the readable stays open and expects the server
+to respond to partial input. This is why `test-stream-pipeline.js` is a
+failing test rather than a skipped one -- it is a real gap, not a harness
+artifact, and it is left visible on purpose.
+
+### 17. `req.end(callback)` fires the callback on `'response'`, not `'finish'`
+
+Node invokes the `end()` callback when the request finishes writing. oam
+invokes it when the response arrives, which is strictly later. `'finish'`
+itself is emitted correctly and in Node's position (`socket -> finish ->
+response -> close`), so `req.on('finish', ...)` and `stream.finished(req)`
+both behave; only the `end(cb)` shorthand differs.
+
 ## Platform constant tables
 
 `os.constants.errno` and `os.constants.signals` are a single compiled-in POSIX/Linux table

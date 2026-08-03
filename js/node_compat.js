@@ -14283,6 +14283,20 @@
         this._ended = false;
         this._aborted = false;
         this.headersSent = false;
+        // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
+        // stream -- no _writableState, lifecycle duck-read off plain
+        // properties. The vendored end-of-stream keys on exactly these, so
+        // without them `pipeline(src, req)` / `stream.finished(req)` wait
+        // forever on a 'finish' that never comes (test-stream-pipeline).
+        this.writable = true;
+        this.finished = false;
+        this.destroyed = false;
+        this.closed = false;
+        this.aborted = false;
+        this.res = null;
+        this.errored = null;
+        this._bodyLength = 0;
+        this._finished = false;
         var self = this;
         this.socket = {
           remoteAddress: host,
@@ -14301,6 +14315,14 @@
           self.emit("socket", self.socket);
         });
       }
+      // Node OutgoingMessage writable-shape getters. Computed, not stored:
+      // end-of-stream reads writableFinished/writableEnded directly.
+      get writableEnded() { return this.finished; }
+      get writableFinished() { return this._finished; }
+      get writableLength() { return this._bodyLength; }
+      get writableHighWaterMark() { return 16384; }
+      get writableObjectMode() { return false; }
+      get writableCorked() { return 0; }
       setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
       getHeader(name) { return this._headers[name.toLowerCase()]; }
       removeHeader(name) { delete this._headers[name.toLowerCase()]; }
@@ -14309,21 +14331,32 @@
       flushHeaders() { /* fetch sends headers with the body */ }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        var bytes;
         if (typeof chunk === "string") {
-          this._body.push(globalThis.Buffer.from(chunk, encoding || "utf8"));
+          bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
         } else if (chunk instanceof Uint8Array) {
-          this._body.push(chunk);
+          bytes = chunk;
         } else {
-          this._body.push(globalThis.Buffer.from(chunk));
+          bytes = globalThis.Buffer.from(chunk);
         }
+        this._body.push(bytes);
+        this._bodyLength += bytes.length;
         if (callback) queueMicrotask(callback);
         return true;
       }
       end(data, encoding, callback) {
         if (typeof data === "function") { callback = data; data = undefined; }
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        // Node's end() is idempotent. Without the guard a second end() --
+        // pipeline ends the destination, then the caller ends it too --
+        // fires a SECOND request over the wire.
+        if (this._ended) {
+          if (callback) this.once("response", callback);
+          return this;
+        }
         if (data != null) this.write(data, encoding);
         this._ended = true;
+        this.finished = true;
         this.headersSent = true;
         var self = this;
         var bodyData = null;
@@ -14344,6 +14377,16 @@
         } else {
           self._doFetchRequest(bodyData);
         }
+        // Node emits 'finish' once the message has been handed to the
+        // socket -- here, once the body has been handed to the transport.
+        // The tick keeps the ctor's 'socket' first, matching Node's
+        // socket -> finish -> response -> close order.
+        process.nextTick(function () {
+          if (self._finished) return;
+          self._finished = true;
+          self._bodyLength = 0;
+          self.emit("finish");
+        });
         if (callback) self.once("response", callback);
         return this;
       }
@@ -14369,7 +14412,8 @@
               reader.read().then(function (r) {
                 if (r.done) {
                   res.push(null);
-                  process.nextTick(function() { self.emit("close"); });
+                  self.destroyed = true;
+                  self._emitClose();
                 } else {
                   res.push(globalThis.Buffer.from(r.value));
                 }
@@ -14393,9 +14437,14 @@
           });
           // Handle for req.destroy(): node destroys the socket, which
           // surfaces as ECONNRESET on an in-flight response stream.
+          self.res = res;
           self._res = res;
           self.emit("response", res);
         }, function (err) {
+          // A torn-down request swallows the transport failure it caused:
+          // Node's abort()/destroy() destroys the socket, and the resulting
+          // ECONNRESET is never re-emitted on the destroyed request.
+          if (self._aborted) return;
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and reqwest's strings carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
@@ -14410,6 +14459,9 @@
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
           }
+          self.errored = mapped;
+          self.destroyed = true;
+          self._emitClose();
           self.emit("error", mapped);
         });
       }
@@ -14490,6 +14542,7 @@
                   res.rawHeaders = rawHeaders;
                   // Handle for req.destroy(): node destroys the socket, which
                   // surfaces as ECONNRESET on an in-flight response stream.
+                  self.res = res;
                   self._res = res;
                   self.emit("response", res);
                   if (remaining.length > 0) res.push(remaining);
@@ -14506,24 +14559,45 @@
         }, function (err) { self.emit("error", err); });
       }
       abort() {
+        if (this.aborted) return;
+        this.aborted = true;
         this._aborted = true;
         this.emit("abort");
+        this._tearDown();
       }
       destroy(err) {
+        // Node's ClientRequest.destroy() returns early on an already-
+        // destroyed request and does NOT re-emit -- a second destroy(err)
+        // (or one after abort()) is silent.
         if (this._aborted) return this;
         this._aborted = true;
-        // Node semantics: destroying the request destroys the underlying
-        // socket, so an in-flight response stream fails with ECONNRESET --
-        // otherwise `for await (const c of res)` never terminates and the
-        // program hangs. The request's own 'error' carries the caller's error.
-        const res = this._res;
+        this._tearDown();
+        if (err) {
+          this.errored = err;
+          this.emit("error", err);
+        }
+        return this;
+      }
+      // Node semantics: aborting or destroying the request destroys the
+      // underlying socket, so an in-flight response stream fails with
+      // ECONNRESET -- otherwise `for await (const c of res)` never
+      // terminates and the program hangs. 'close' follows, once.
+      _tearDown() {
+        if (this.destroyed) return;
+        this.destroyed = true;
+        const res = this.res;
         if (res && !res.destroyed) {
           const reset = new Error("aborted");
           reset.code = "ECONNRESET";
           res.destroy(reset);
         }
-        if (err) this.emit("error", err);
-        return this;
+        this._emitClose();
+      }
+      _emitClose() {
+        if (this.closed) return;
+        this.closed = true;
+        var self = this;
+        process.nextTick(function () { self.emit("close"); });
       }
       setTimeout(ms, callback) {
         if (callback) this.once("timeout", callback);
