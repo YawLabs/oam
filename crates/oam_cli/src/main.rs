@@ -236,15 +236,21 @@ fn main() -> ExitCode {
     // shape). Suite children spawn process.execPath with these shapes --
     // the compat surface that unblocks spawnPromisified-shaped tests.
     {
-        // NOTE: NODE_OPTIONS is deliberately NOT parsed. Node gates it behind
-        // an allowlist of permitted options; feeding it through this loop
-        // unfiltered let an unrecognized token reach clap (bricking every
-        // subcommand) and let `-e`/`--eval` in the environment inject code or
-        // replace the entry point. Adding it needs the allowlist first.
         let argv: Vec<String> = std::env::args().collect();
         let raw: Vec<String> = argv.clone();
         let mut i = 1;
         let mut flags = NodeFlags::default();
+        // NODE_OPTIONS, folded in BEFORE argv so an explicit command-line
+        // flag still wins. Node gates it behind an allowlist and so does
+        // this: it is a strict allowlist of process-level toggles, it never
+        // touches `raw`/`i` (so no environment token can reach clap and
+        // brick a subcommand), and it deliberately excludes everything that
+        // executes code or names a file -- `-e`/`--eval`/`-p`/`--input-type`/
+        // `--env-file`/`--permission`. An unrecognized token is ignored
+        // rather than fatal, because NODE_OPTIONS is usually set globally in
+        // a shell profile and may legitimately carry flags oam has no
+        // opinion on.
+        let from_env = apply_node_options_env(&mut flags);
         // Node accepts eval flags in any order and in several spellings:
         // `-e code`, `--eval code`, `--eval=code`, `-p code`, `-pe code`
         // (bundled: print + eval), and `-p -e code`. print and eval compose;
@@ -434,8 +440,13 @@ fn main() -> ExitCode {
         // [...execArgv, "run", file]. Hand clap the argv with the node
         // flags stripped, and stash them for the run to install; without
         // this, ANY fork({execArgv}) dies with a clap "unexpected argument".
-        if saw_node_flag {
+        // Stash whenever anything set flags -- including NODE_OPTIONS alone,
+        // where argv carries no flag at all and the run paths would
+        // otherwise start with defaults.
+        if saw_node_flag || from_env {
             NODE_FLAGS.set(flags.clone()).ok();
+        }
+        if saw_node_flag {
             let filtered: Vec<String> = std::iter::once(argv[0].clone())
                 .chain(raw[i..].iter().cloned())
                 .collect();
@@ -1393,6 +1404,73 @@ fn trust_command(action: &TrustAction) -> ExitCode {
 }
 
 /// Walk upward from `start` looking for a directory that contains `target`.
+/// Split NODE_OPTIONS the way Node does: on whitespace, honoring single and
+/// double quotes (no escape processing inside quotes).
+fn split_node_options(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut has = false;
+    for ch in raw.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => cur.push(ch),
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                has = true;
+            }
+            None if ch.is_whitespace() => {
+                if has || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            None => cur.push(ch),
+        }
+    }
+    if has || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Fold the allowlisted NODE_OPTIONS tokens into `flags`. See the call site
+/// for why the allowlist is strict.
+fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
+    let Ok(raw) = std::env::var("NODE_OPTIONS") else {
+        return false;
+    };
+    let before = flags.clone();
+    let tokens = split_node_options(&raw);
+    let mut it = tokens.iter().peekable();
+    while let Some(tok) = it.next() {
+        let tok = tok.as_str();
+        if tok == "--pending-deprecation" {
+            flags.pending_deprecation = true;
+        } else if tok == "--no-warnings" {
+            flags.no_warnings = true;
+        } else if tok == "--no-deprecation" {
+            flags.no_deprecation = true;
+        } else if tok == "--expose-gc" {
+            flags.expose_gc = true;
+        } else if let Some(v) = tok.strip_prefix("--disable-warning=") {
+            flags.disabled_warnings.push(v.to_string());
+        } else if tok == "--disable-warning" {
+            if let Some(v) = it.next() {
+                flags.disabled_warnings.push(v.clone());
+            }
+        } else if let Some(v) = tok.strip_prefix("--redirect-warnings=") {
+            flags.redirect_warnings = Some(v.to_string());
+        } else if tok == "--redirect-warnings" {
+            if let Some(v) = it.next() {
+                flags.redirect_warnings = Some(v.clone());
+            }
+        }
+        // Anything else: ignored on purpose (see the call site).
+    }
+    before != *flags
+}
+
 fn find_project_dir(start: &Path, target: &str) -> Option<PathBuf> {
     let mut dir = Some(start.to_path_buf());
     while let Some(current) = dir {
@@ -1940,7 +2018,7 @@ fn extract_embedded() -> Option<(String, Option<Vec<u8>>)> {
 /// Node process-level flags accepted before any oam subcommand (also read
 /// from NODE_OPTIONS). They reach JS as non-enumerable globals -- node's own
 /// test/common leaked-globals check walks enumerable globals.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct NodeFlags {
     pending_deprecation: bool,
     expose_gc: bool,
@@ -1990,6 +2068,9 @@ impl NodeFlags {
         }
         if !js.is_empty() {
             let _ = rt.execute_script("<flags>", &js);
+            // Workers and forks get their own isolate; publish the same
+            // snippet so they inherit the flags instead of starting clean.
+            oam_engine::set_inherited_flags_js(js);
         }
     }
 

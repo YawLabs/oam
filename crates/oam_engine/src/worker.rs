@@ -112,6 +112,11 @@ fn run_worker(
         worker_data,
     };
 
+    // Inherit the parent's process-level flags (--no-warnings etc.); a
+    // fresh isolate would otherwise start with none of them.
+    if let Some(js) = crate::inherited_flags_js() {
+        let _ = rt.execute_script("<flags>", js);
+    }
     if let Err(diagnostics) = rt.execute_worker(script_path, ctx) {
         for d in &diagnostics {
             eprintln!("worker {thread_id}: {}", d.message);

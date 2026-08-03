@@ -56,6 +56,20 @@ pub fn init_platform() {
 pub type WorkerHostFactory = fn() -> Box<dyn ModuleHost>;
 static WORKER_HOST_FACTORY: std::sync::OnceLock<WorkerHostFactory> = std::sync::OnceLock::new();
 
+/// Process-level flag state (`--no-warnings` and friends) as the JS snippet
+/// that installs it. Workers are OS threads in this process with their own
+/// isolates, so they need it re-run per isolate to inherit -- Node's worker
+/// flags are inherited the same way.
+static INHERITED_FLAGS_JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_inherited_flags_js(js: String) {
+    let _ = INHERITED_FLAGS_JS.set(js);
+}
+
+pub(crate) fn inherited_flags_js() -> Option<&'static str> {
+    INHERITED_FLAGS_JS.get().map(String::as_str)
+}
+
 pub fn set_worker_host_factory(factory: WorkerHostFactory) {
     let _ = WORKER_HOST_FACTORY.set(factory);
 }
