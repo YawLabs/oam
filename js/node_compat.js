@@ -902,6 +902,40 @@
     }
   }
 
+  const poolSizeRef = { value: 8192 };
+  // Node's lib/buffer.js pool. Small allocations are carved out of one
+  // shared ArrayBuffer, so an allocUnsafe Buffer normally has a NON-ZERO
+  // byteOffset and a .buffer much larger than its length. Userland observes
+  // this (it is why .buffer must never be handed out unsliced), and code
+  // that assumes otherwise is already wrong against Node.
+  let allocPool = null;
+  let poolOffset = 0;
+  // Objects that must never appear in a postMessage transfer list. The
+  // Buffer pool is the reason this exists: transferring it would detach the
+  // backing store of every small Buffer in the process at once.
+  const untransferable = new WeakSet();
+  function createPool() {
+    allocPool = new ArrayBuffer(poolSizeRef.value);
+    untransferable.add(allocPool);
+    poolOffset = 0;
+  }
+  function alignPool() {
+    // Ensure aligned slices, exactly as Node does.
+    if (poolOffset & 0x7) poolOffset = (poolOffset | 0x7) + 1;
+  }
+  // Requests at or above half the pool get their own ArrayBuffer (Node's
+  // rule), so a large buffer never evicts the pool.
+  function poolAllocate(BufferCtor, size) {
+    if (size <= 0) return new BufferCtor(0);
+    if (size >= (poolSizeRef.value >>> 1)) return new BufferCtor(size);
+    if (allocPool === null) createPool();
+    if (size > poolSizeRef.value - poolOffset) createPool();
+    const b = new BufferCtor(allocPool, poolOffset, size);
+    poolOffset += size;
+    alignPool();
+    return b;
+  }
+
   class Buffer extends Uint8Array {
     static get [Symbol.species]() {
       return Buffer;
@@ -924,7 +958,7 @@
 
     static allocUnsafe(size) {
       validateSize(size);
-      return new Buffer(size);
+      return poolAllocate(Buffer, size);
     }
 
     static allocUnsafeSlow(size) {
@@ -971,7 +1005,9 @@
         let enc = encodingOrOffset;
         if (typeof enc !== "string" || enc.length === 0) enc = undefined;
         const bytes = bytesFromString(value, enc);
-        return new Buffer(bytes.buffer, bytes.byteOffset, bytes.length);
+        const out = poolAllocate(Buffer, bytes.length);
+        out.set(bytes);
+        return out;
       }
       if (value instanceof Uint8Array) {
         // Buffer / Uint8Array: COPIES its bytes, per Node (from(typedArray)
@@ -1797,7 +1833,14 @@
       Object.defineProperty(Buffer, name, { ...descriptor, enumerable: true });
     }
   }
-  Buffer.poolSize = 8192;
+  Object.defineProperty(Buffer, "poolSize", {
+    get: () => poolSizeRef.value,
+    set: (v) => {
+      poolSizeRef.value = v;
+    },
+    enumerable: true,
+    configurable: true,
+  });
 
   function btoa(input) {
     const str = String(input);
@@ -15309,7 +15352,10 @@
       constants: { MAX_LENGTH: 9007199254740991, MAX_STRING_LENGTH: 536870888 },
       kMaxLength: 9007199254740991,
       kStringMaxLength: 536870888,
-      SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafe(size); },
+      // NOT allocUnsafe: "slow" means unpooled, i.e. its own exact-size
+      // ArrayBuffer. Routing it through the pool made sb.buffer.byteLength
+      // the pool size.
+      SlowBuffer: function SlowBuffer(size) { return globalThis.Buffer.allocUnsafeSlow(size); },
       isUtf8: (input) => {
         const bytes = validateBinaryInput(input);
         try {
@@ -18826,11 +18872,21 @@
 
     // WeakSet for markAsUntransferable -- marks objects so transfer attempts
     // can check (actual enforcement is future; the mark is the contract).
-    const _untransferableSet = new WeakSet();
+    const _untransferableSet = untransferable;
 
     class MessagePort extends EventEmitter {
       constructor() { super(); this._twin = null; this._active = true; }
-      postMessage(data) {
+      postMessage(data, transferList) {
+        if (Array.isArray(transferList)) {
+          for (const item of transferList) {
+            if (untransferable.has(item)) {
+              throw new DOMException(
+                "Cannot transfer object of unsupported type.",
+                "DataCloneError",
+              );
+            }
+          }
+        }
         const twin = this._twin;
         if (twin && twin._active) {
           const cloned = (typeof data === "object" && data !== null) ? structuredClone(data) : data;
