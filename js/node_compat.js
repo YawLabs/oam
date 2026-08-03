@@ -7698,6 +7698,11 @@
         // entry[2]: domain captured at schedule time (undefined until
         // require('domain') installs process.domain) -- the drain enters it
         // around the callback so throws route to the domain, like timers.
+        // async_hooks init for the TickObject, before the enqueue (node
+        // order). The helper is installed by the async_hooks factory and
+        // returns immediately when no hook is enabled, so the hot path is
+        // unchanged for the overwhelmingly common no-hooks case.
+        if (registry._emitAsyncInit) registry._emitAsyncInit("TickObject", null);
         tickQueue.push([bind ? bind(fn) : fn, args, process.domain || null]);
       },
       hrtime: Object.assign(
@@ -8564,24 +8569,29 @@
       }
     }
 
-    let warnedCreateHook = false;
-    function createHook(_callbacks) {
-      if (!warnedCreateHook) {
-        warnedCreateHook = true;
-        if (globalThis.console) {
-          globalThis.console.warn(
-            "(oam) async_hooks.createHook is a no-op: the legacy hooks API is " +
-              "deprecated in Node; use AsyncLocalStorage (fully supported)",
-          );
+    // createHook: a REAL registry, but a deliberately NARROW one. oam emits
+    // init for the resource kinds it actually models (currently TickObject);
+    // executionAsyncId/triggerAsyncId stay 0 because oam has no async-id
+    // plumbing, and before/after/destroy never fire. This is NOT full
+    // async_hooks -- it is an honest init-observer instead of a silent no-op.
+    // Full support would need a PromiseHook binding plus hook dispatch around
+    // every native op; AsyncLocalStorage (fully supported here) is what real
+    // code overwhelmingly uses.
+    const activeHooks = new Set();
+    let asyncIdSeq = 1;
+    registry._emitAsyncInit = (type, resource) => {
+      if (activeHooks.size === 0) return;
+      const id = ++asyncIdSeq;
+      for (const h of activeHooks) {
+        if (typeof h.init === "function") {
+          try { h.init(id, type, 0, resource); } catch { /* node swallows */ }
         }
       }
+    };
+    function createHook(callbacks) {
       return {
-        enable() {
-          return this;
-        },
-        disable() {
-          return this;
-        },
+        enable() { activeHooks.add(callbacks); return this; },
+        disable() { activeHooks.delete(callbacks); return this; },
       };
     }
 
@@ -12280,8 +12290,20 @@
         if (!this._out || typeof this._out.write !== "function") {
           throw new TypeError("Console expects a writable stream instance");
         }
-        const writeTo = (stream) => (...args) => {
-          stream.write(`${util.format(...args)}\n`);
+        // Node's kIgnoreErrors shape: attach a no-op 'error' listener once
+        // so a failing stream cannot throw out of console.log, and pass an
+        // error handler as write()'s CALLBACK -- consumers (and node's own
+        // samecb-singletick test) rely on that callback being invoked.
+        const ignoreErr = () => {};
+        const writeTo = (stream) => {
+          let armed = false;
+          return (...args) => {
+            if (!armed) {
+              armed = true;
+              if (typeof stream.once === "function") stream.once("error", ignoreErr);
+            }
+            stream.write(`${util.format(...args)}\n`, ignoreErr);
+          };
         };
         this.log = writeTo(this._out);
         this.info = this.log;
