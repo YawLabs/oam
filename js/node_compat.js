@@ -17272,9 +17272,107 @@
       return cp;
     }
 
+    // The IPC half of fork(), reusable by spawn(stdio:[...,'ipc']). Binds a
+    // loopback channel, hands the port to `launch` as an env override, and
+    // wires send/disconnect/'message' onto `cp`. The bind is async, so a
+    // child started this way resolves its pid one tick later than a plain
+    // spawn -- the same property fork() already has.
+    function attachIpcChannel(cp, launch) {
+      let ipcSocket = null;
+      const pendingSends = [];
+      cp.connected = true;
+
+      cp.send = function send(message, _sendHandle, _options, callback) {
+        if (typeof _sendHandle === "function") callback = _sendHandle;
+        else if (typeof _options === "function") callback = _options;
+        if (!cp.connected) {
+          const err = new Error("channel closed");
+          err.code = "ERR_IPC_CHANNEL_CLOSED";
+          if (callback) callback(err);
+          return false;
+        }
+        const line = JSON.stringify(message) + "\n";
+        if (ipcSocket) ipcSocket.write(line, "utf8", callback);
+        else pendingSends.push({ line, callback });
+        return true;
+      };
+
+      cp.disconnect = function disconnect() {
+        cp.connected = false;
+        if (ipcSocket) {
+          const sock = ipcSocket;
+          ipcSocket = null;
+          sock.destroy();
+        }
+        cp.emit("disconnect");
+      };
+
+      const net = registry.get("net");
+      const ipcServer = net.createServer();
+      // Node reports the ipc slot as null in child.stdio.
+      if (Array.isArray(cp.stdio)) cp.stdio[3] = null;
+
+      ipcServer.on("connection", (socket) => {
+        ipcSocket = socket;
+        // One channel per child; stop accepting so the listener does not pin
+        // the parent's event loop open.
+        ipcServer.close();
+        for (const p of pendingSends) socket.write(p.line, "utf8", p.callback);
+        pendingSends.length = 0;
+
+        let buf = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => {
+          buf += chunk;
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            try {
+              cp.emit("message", JSON.parse(line));
+            } catch (_) { /* ignore malformed */ }
+          }
+        });
+        socket.on("end", () => {
+          cp.connected = false;
+          cp.emit("disconnect");
+        });
+        socket.on("error", () => {
+          cp.connected = false;
+        });
+      });
+
+      ipcServer.listen(0, "127.0.0.1", () => {
+        launch({ OAM_FORK_IPC_PORT: String(ipcServer.address().port) });
+      });
+
+      // Never leave the listener or socket holding the loop open.
+      cp.on("exit", () => {
+        try { ipcServer.close(); } catch (_) { /* already closed */ }
+        if (ipcSocket) {
+          const sock = ipcSocket;
+          ipcSocket = null;
+          cp.connected = false;
+          try { sock.destroy(); } catch (_) { /* already gone */ }
+        }
+      });
+    }
+
     function spawn(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
+      // stdio: [..., 'ipc'] asks for a message channel, the same one fork()
+      // sets up. Splice the slot out FIRST so a 4-entry array does not get
+      // misrouted to the extra-fd path below; Node reports stdio[3] as null.
+      let wantsIpc = false;
+      if (Array.isArray(opts.stdio)) {
+        const ipcIndex = opts.stdio.indexOf("ipc");
+        if (ipcIndex !== -1) {
+          wantsIpc = true;
+          opts.stdio = opts.stdio.slice();
+          opts.stdio.splice(ipcIndex, 1);
+        }
+      }
       // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
       // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
       // pre_exec dup2 on Unix). Gated to platforms with a real native backend.
@@ -17348,6 +17446,18 @@
       // SYNCHRONOUS spawn (node parity): pid must be readable the instant
       // spawn() returns. The native op throws on failure; the 'spawn' event
       // and everything after it stay ASYNC, as node emits them.
+      //
+      // The one exception is stdio:'ipc' below, which must know the channel
+      // port before exec'ing and so binds first; that shape resolves pid a
+      // tick later (fork() has the same property today).
+      const launch = (extraEnv) => {
+      if (extraEnv) {
+        nativeOpts.env = Object.assign(
+          {},
+          opts.env || globalThis.process.env,
+          extraEnv,
+        );
+      }
       let info;
       try {
         info = JSON.parse(natives.spawnAsync(norm.command, norm.args, nativeOpts));
@@ -17380,6 +17490,12 @@
           });
         });
         });
+      }
+      };
+      if (wantsIpc) {
+        attachIpcChannel(cp, launch);
+      } else {
+        launch(null);
       }
       function handleSpawnFailure(err) {
         const e = typeof err === "string" ? new Error(err) : err;
