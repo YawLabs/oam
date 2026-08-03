@@ -1122,6 +1122,17 @@
         if (e < 0) e = 0;
         else if (e > len) e = len;
       }
+      // Node refuses UP FRONT when the result cannot fit in a V8 string
+      // (kStringMaxLength = 0x1fffffe8): without this guard the decode is
+      // attempted and the process dies with a V8 heap OOM instead of
+      // throwing a catchable error -- e.g. readFileSync(bigFile).toString().
+      // The check is on the BYTE span, matching node: a multi-byte encoding
+      // can only produce fewer characters, and node throws on the span too.
+      if (e - s > 0x1fffffe8) {
+        const err = new Error("Cannot create a string longer than 0x1fffffe8 characters");
+        err.code = "ERR_STRING_TOO_LONG";
+        throw err;
+      }
       const view = e <= s ? this.subarray(0, 0) : this.subarray(s, e);
       switch (normalizeEncoding(encoding)) {
         case "hex":
