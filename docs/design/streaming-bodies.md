@@ -113,8 +113,17 @@ Each is independently shippable and gated by the full chain
    55/55, all identical to the commit before.
 2. **Inbound streaming behind an opt-in**, with the cap semantics above.
    Server dispatch moves to headers-received for opted-in servers only.
-   Lands the `Stream` variant plus the two body ops on their first real
-   caller.
+   ENGINE SIDE DONE: `RequestBody::Stream` over a bounded channel,
+   `pump_request_body` enforcing MAX_REQUEST_BODY cumulatively as a channel
+   `Err` (no 413 -- the handler may already be responding), and the
+   `httpRequestBodyRead` / `httpRequestBodyCancel` ops. Opt-in is a third
+   arg to `httpServe`; absent = false, so every existing caller is
+   unchanged. Measured: handler dispatches at ~8ms on a request whose body
+   completes at 500ms (buffered path was 521ms; Node is 13ms).
+
+   NOT yet done in this slice: TLS and http2 still pass `false` at their
+   `handle_request` call sites, and no production JS path opts in -- the
+   only caller is a probe. Both land with slice 3.
 3. **`IncomingMessage` as a real Readable** over the pull op, and flip the
    default once e2e is green on it.
 4. **Outbound streaming + cancel.** `FetchRequest` channel variant,

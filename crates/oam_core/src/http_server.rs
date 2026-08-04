@@ -76,6 +76,14 @@ pub struct IncomingRequest {
 pub enum RequestBody {
     /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
     Full(Vec<u8>),
+    /// Chunks as they arrive. The handler is dispatched on headers, so 413
+    /// is no longer available -- exceeding MAX_REQUEST_BODY delivers Err on
+    /// this channel instead, and the connection is torn down.
+    ///
+    /// Taken out for the duration of each read await and reinserted after,
+    /// the same remove-await-reinsert the accept queue uses; the JS side is
+    /// the single consumer.
+    Stream(mpsc::Receiver<Result<Vec<u8>, String>>),
 }
 
 pub enum ResponseBody {
@@ -143,7 +151,44 @@ impl HttpState {
             .remove(&id)?;
         match taken {
             RequestBody::Full(bytes) => Some(bytes),
+            // Streamed: put it back, the caller wants the chunk ops.
+            other => {
+                self.bodies
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, other);
+                None
+            }
         }
+    }
+
+    /// Take the chunk receiver for a streamed body (remove-await-reinsert).
+    pub fn take_body_stream(&self, id: u64) -> Option<mpsc::Receiver<Result<Vec<u8>, String>>> {
+        let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.remove(&id) {
+            Some(RequestBody::Stream(rx)) => Some(rx),
+            // Not streamed (or already taken): put it back untouched.
+            Some(other) => {
+                guard.insert(id, other);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Reinsert a receiver taken by `take_body_stream`. Dropped silently if
+    /// the request finished while the read was in flight.
+    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<Vec<u8>, String>>) {
+        let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry(id).or_insert(RequestBody::Stream(rx));
+    }
+
+    /// Drop a streamed body outright (JS cancelled / destroyed the request).
+    pub fn cancel_body_stream(&self, id: u64) {
+        self.bodies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 
     pub fn respond_full(
@@ -367,6 +412,9 @@ pub async fn http_serve(
     tcp_ids: Arc<std::sync::atomic::AtomicU64>,
     host: String,
     port: u16,
+    // Dispatch the JS handler on headers and stream the body (slice 2 of
+    // docs/design/streaming-bodies.md). Off = today's buffered behavior.
+    stream_request_body: bool,
 ) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -457,12 +505,18 @@ pub async fn http_serve(
                     // Normal HTTP: hand to hyper.
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
+                    let conn_stream_bodies = stream_request_body;
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
-                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                            handle_request(
+                                conn_state.clone(),
+                                conn_queue.clone(),
+                                req,
+                                conn_stream_bodies, // per-server opt-in
+                            )
                         });
                         let conn = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service);
@@ -552,6 +606,43 @@ fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
 ///
 /// Returns `Ok(bytes)` when the body fit, `Err(())` when it exceeded the
 /// cap (the drain has already completed by the time `Err` is returned).
+/// Feed request chunks to the JS side as they arrive, enforcing
+/// MAX_REQUEST_BODY cumulatively. Exceeding it sends Err (the JS request
+/// stream errors) rather than a 413, because the handler was dispatched on
+/// headers and may already have responded. Ends by dropping the sender, which
+/// the reader sees as EOF.
+async fn pump_request_body(
+    mut body: hyper::body::Incoming,
+    chunk_tx: mpsc::Sender<Result<Vec<u8>, String>>,
+) {
+    use http_body_util::BodyExt;
+    let mut total: usize = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = chunk_tx.send(Err(format!("request body: {e}"))).await;
+                return;
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        total += data.len();
+        if total > MAX_REQUEST_BODY {
+            let _ = chunk_tx
+                .send(Err("request body too large".to_string()))
+                .await;
+            return;
+        }
+        // send() awaits when the channel is full: that IS the backpressure.
+        // Err means the consumer is gone, so stop reading the socket.
+        if chunk_tx.send(Ok(data.to_vec())).await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, ()> {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
@@ -605,6 +696,7 @@ async fn handle_request(
     state: Arc<HttpState>,
     queue: mpsc::Sender<IncomingRequest>,
     req: hyper::Request<hyper::body::Incoming>,
+    stream_request_body: bool,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     let (parts, body) = req.into_parts();
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -616,11 +708,21 @@ async fn handle_request(
     // client reads "connection reset" instead of "413 Request Entity Too
     // Large".  Draining empties the recv-buffer so the connection can close
     // with a clean FIN and the client reliably reads the status line first.
-    let collected = match collect_body(body).await {
-        Ok(bytes) => bytes,
-        Err(()) => return Ok(status_body(413, b"request body too large")),
+    // Streamed: dispatch on headers and pump chunks behind the request.
+    // 413 is unavailable from here on (the handler may already be
+    // responding), so the cap becomes an Err delivered on the chunk channel.
+    let (collected, body_stream) = if stream_request_body {
+        (bytes::Bytes::new(), Some(body))
+    } else {
+        let collected = match collect_body(body).await {
+            Ok(bytes) => bytes,
+            Err(()) => return Ok(status_body(413, b"request body too large")),
+        };
+        (collected, None)
     };
-    // Reserve the retained bytes; refund (RequestGuard) on completion.
+    // Reserve the retained bytes; refund (RequestGuard) on completion. A
+    // streamed body reserves nothing here -- it is charged per outstanding
+    // chunk instead, so a prompt consumer is not billed for the whole upload.
     let body_len = collected.len();
     let prev = state.body_bytes.fetch_add(body_len, Ordering::AcqRel);
     if prev + body_len > GLOBAL_BODY_BUDGET {
@@ -650,11 +752,24 @@ async fn handle_request(
         .lock()
         .expect("http pending lock")
         .insert(id, tx);
-    state
-        .bodies
-        .lock()
-        .expect("http bodies lock")
-        .insert(id, RequestBody::Full(collected.to_vec()));
+    if let Some(body) = body_stream {
+        // Bounded: an unconsumed body applies backpressure to hyper rather
+        // than growing without limit. This is the memory ceiling that
+        // replaces the buffered path's byte reservation.
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Vec<u8>, String>>(8);
+        state
+            .bodies
+            .lock()
+            .expect("http bodies lock")
+            .insert(id, RequestBody::Stream(chunk_rx));
+        tokio::spawn(pump_request_body(body, chunk_tx));
+    } else {
+        state
+            .bodies
+            .lock()
+            .expect("http bodies lock")
+            .insert(id, RequestBody::Full(collected.to_vec()));
+    }
     // From here on, every exit cleans up — including a cancelled future
     // if the client disconnects while the handler runs — and refunds the
     // reserved body bytes.
@@ -759,7 +874,12 @@ pub async fn https_serve(
                         };
                         let io = hyper_util::rt::TokioIo::new(tls_stream);
                         let service = hyper::service::service_fn(move |req| {
-                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                            handle_request(
+                                conn_state.clone(),
+                                conn_queue.clone(),
+                                req,
+                                false, // TLS: buffered until a later slice
+                            )
                         });
                         let conn = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service);
@@ -932,7 +1052,12 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
 
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {
-                            handle_request(conn_state.clone(), conn_queue.clone(), req)
+                            handle_request(
+                                conn_state.clone(),
+                                conn_queue.clone(),
+                                req,
+                                false, // http2: buffered until a later slice
+                            )
                         });
 
                         if is_h2 {

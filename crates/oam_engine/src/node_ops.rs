@@ -206,6 +206,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBodyPush", op_http_body_push),
         ("httpBodyEnd", op_http_body_end),
         ("httpStreamClosed", op_http_stream_closed),
+        ("httpRequestBodyRead", op_http_request_body_read),
+        ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
@@ -1027,7 +1029,15 @@ fn op_http_serve(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http_serve(state, tcp, tcp_ids, host, port),
+        oam_core::http_server::http_serve(
+            state,
+            tcp,
+            tcp_ids,
+            host,
+            port,
+            // arg 2: opt into dispatch-on-headers + streamed request bodies.
+            args.get(2).is_true(),
+        ),
     );
 }
 
@@ -1043,6 +1053,45 @@ fn op_http_accept(
         &mut rv,
         oam_core::http_server::http_accept(state, server_id),
     );
+}
+
+/// Read the next chunk of a STREAMED request body. Resolves a Uint8Array,
+/// or Done at EOF. Remove-await-reinsert on the receiver, matching the
+/// accept queue.
+fn op_http_request_body_read(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let state = core_runtime!(scope).http();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let Some(mut rx) = state.take_body_stream(id) else {
+            return oam_core::OpOutcome::Done;
+        };
+        let next = rx.recv().await;
+        // Only reinsert while the stream is live; EOF/error drops it so a
+        // later read sees Done instead of parking forever.
+        match next {
+            Some(Ok(chunk)) => {
+                state.put_body_stream(id, rx);
+                oam_core::OpOutcome::Bytes(chunk)
+            }
+            Some(Err(e)) => oam_core::OpOutcome::Failed(e),
+            None => oam_core::OpOutcome::Done,
+        }
+    });
+}
+
+/// Drop a streamed request body (req.destroy() / handler done early). Stops
+/// the pump, which stops reading the socket.
+fn op_http_request_body_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).http().cancel_body_stream(id);
 }
 
 fn op_http_request_body(
