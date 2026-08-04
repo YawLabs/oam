@@ -453,12 +453,23 @@ unchanged because these tests never ran there):
   so does this.)
 - **`O_NOATIME`** is now present on Linux and absent everywhere else.
 
+After those fixes the sweep re-measured **399/418 on macos-aarch64 (97.8%)
+and 401/418 on linux-x86_64 (98.0%)**, up from 392 on both.
+
 **Still open:**
 
 - **`process.execve` is unimplemented** (6 tests) — it throws
   `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` everywhere, which is honest on
   Windows (Node has no execve there either) but a real gap on POSIX.
 - **`process.execPath`** diverges on macOS.
+- **`test-process-remove-all-signal-listeners` HANGS intermittently** on both
+  POSIX hosts. It passed in the sweep before the fixes above and hangs in
+  the one after, which looks like a regression and is not: building the
+  pre-fix commit reproduces the hang, so it is a pre-existing race in the
+  spawn/signal path that the earlier run got lucky on. The per-host pass
+  floors are deliberately set one below the observed number to absorb it —
+  a gate that trips at random teaches people to ignore it — and they go up
+  once the race is fixed.
 
 These are gaps to close, not documented behavior. They are listed here
 because the alternative — quoting 400/401 and staying quiet about two
