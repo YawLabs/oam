@@ -386,7 +386,10 @@ entries below were executed on both runtimes unless marked.
 
 ## Known failures in the vendored suite
 
-The one failure behind the 400/401, triaged honestly.
+The one failure behind the 400/401 **on windows-aarch64**, triaged honestly.
+Per-platform numbers differ because the harness skips POSIX-only tests on
+Windows — see "POSIX-only gaps" below, which is where the other platforms'
+failures live.
 
 | Test | Status |
 |---|---|
@@ -397,7 +400,37 @@ The one failure behind the 400/401, triaged honestly.
 on a full-duplex echo). It passes since the streaming-bodies work completed:
 the engine no longer reaps a streamed request body when the response starts,
 and GET/HEAD writes follow Node's dispatch-on-first-write shape
-(divergence 16).
+(divergence 16). Confirmed on all three release platforms: `stream` is
+**164/164 (100%)** on windows-aarch64, macos-aarch64, and linux-x86_64.
+
+### POSIX-only gaps (measured 2026-08-04)
+
+The Windows number is not the whole story, and this is the honest rest of
+it. A cross-platform sweep on the real release hosts measured
+**392 passing on macos-aarch64 (of 408 runnable) and 392 on linux-x86_64
+(of 409)** versus 400/401 on windows-aarch64. The denominators differ
+because Windows skips POSIX-only tests the other hosts actually run, and
+that is where every extra failure sits — all of them in `process`, `path`,
+and `url`, none in `stream`, `http`, or `buffer`:
+
+- **`process.execve` is unimplemented** (6 tests) — it throws
+  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` everywhere, which is honest on
+  Windows (Node has no execve there either) but a real gap on POSIX.
+- **uid/gid argument validation is missing** (5 tests:
+  `euid-egid`, `uid-gid`, `initgroups`, `setgroups`, `getgroups`) — the
+  functions exist, but they do not throw the `TypeError` Node throws for
+  invalid arguments, so "Missing expected exception" is the failure shape.
+- **`path.resolve` diverges on POSIX** (`test-path-resolve`) — a core-module
+  bug invisible from Windows, whose path semantics differ.
+- **`url.fileURLToPath`** (`test-url-fileurltopath`) fails POSIX subtests.
+- **`process.env.TZ`** (`test-process-env-tz`) does not reformat dates.
+- **`process.execPath`** diverges on macOS; **`O_NOATIME`** is absent on Linux
+  (`test-process-constants-noatime`).
+
+These are gaps to close, not documented behavior. They are listed here
+because the alternative — quoting 400/401 and staying quiet about two
+platforms measuring 392 — would make the headline number mean less than it
+claims.
 
 ---
 
