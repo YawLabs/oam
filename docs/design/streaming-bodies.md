@@ -169,14 +169,25 @@ Each is independently shippable and gated by the full chain
    An earlier revision of this note blamed the wrapper. That was inference,
    not measurement, and the A/B above refutes it -- do not start there.
 
-   What is actually known: streaming arms at 3ms and `_doFetchRequest` runs
-   there, yet headers do not reach the wire until `end()`. Since both
-   transport paths dispatch immediately when driven directly, the remaining
-   suspect is what `ClientRequest._doFetchRequest` passes or does
-   differently from the probes -- start by diffing its fetch options
-   (notably `self._headers`, which the probes did not send) against the
-   working `{ method, __oamBodyStream }` call, and confirm `globalThis.fetch`
-   is actually reached with the handle set.
+   Also cleared since: `self._headers` is `{}` for a plain http.request and
+   passing it changes nothing, and `self._url` is set in the constructor
+   (node_compat.js:14300), so it is available when streaming arms at 3ms.
+
+   MEASUREMENT PITFALL, which cost one wrong conclusion here: these probes
+   print ABSOLUTE elapsed time, and a second sequential request naturally
+   starts ~300ms in, so it LOOKS slow while actually dispatching ~1ms after
+   its own call. Measure per-request deltas (call -> dispatch), never
+   absolute stamps, or you will "find" a delay that is not there.
+
+   Still unexplained, and it IS a real delta: in the reverted 4b,
+   `a.write('hello')` at ~0ms with streaming armed at 3ms produced a server
+   dispatch at ~316ms -- call and dispatch on the same request, so the
+   pitfall above does not explain it. Everything on the transport side is
+   cleared, so the next step is to prove whether `globalThis.fetch` is
+   actually REACHED at 3ms in the ClientRequest path (log immediately before
+   the call inside `_doFetchRequest`, not just inside
+   `_startBodyStreamIfOpen`) -- the arming was instrumented, the fetch call
+   itself never was.
 
    Until that is understood, flipping ClientRequest buys chunked encoding
    with none of the latency win, which is a strictly worse wire trade on the
