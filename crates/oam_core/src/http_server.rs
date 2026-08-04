@@ -84,6 +84,20 @@ pub enum RequestBody {
     /// the same remove-await-reinsert the accept queue uses; the JS side is
     /// the single consumer.
     Stream(mpsc::Receiver<Result<Vec<u8>, String>>),
+    /// The receiver is checked out by an in-flight read. The entry STAYS in
+    /// the registry so a miss can be told apart from "no such body" -- a
+    /// bare removal made a checked-out stream look absent, and the buffered
+    /// fallback then reported EOF while frames were still queued.
+    StreamPending,
+}
+
+/// Outcome of checking out a streamed body receiver.
+pub enum BodyCheckout {
+    Ready(mpsc::Receiver<Result<Vec<u8>, String>>),
+    /// Another read holds it; the caller must NOT treat this as EOF.
+    InFlight,
+    /// No streamed body for this id (buffered, or already finished).
+    Absent,
 }
 
 pub enum ResponseBody {
@@ -163,16 +177,25 @@ impl HttpState {
     }
 
     /// Take the chunk receiver for a streamed body (remove-await-reinsert).
-    pub fn take_body_stream(&self, id: u64) -> Option<mpsc::Receiver<Result<Vec<u8>, String>>> {
+    pub fn take_body_stream(&self, id: u64) -> BodyCheckout {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
         match guard.remove(&id) {
-            Some(RequestBody::Stream(rx)) => Some(rx),
-            // Not streamed (or already taken): put it back untouched.
+            Some(RequestBody::Stream(rx)) => {
+                // Leave a marker so the entry still EXISTS while we await --
+                // a bare removal made a checked-out stream look absent, and
+                // the buffered fallback then reported EOF mid-body.
+                guard.insert(id, RequestBody::StreamPending);
+                BodyCheckout::Ready(rx)
+            }
+            Some(RequestBody::StreamPending) => {
+                guard.insert(id, RequestBody::StreamPending);
+                BodyCheckout::InFlight
+            }
             Some(other) => {
                 guard.insert(id, other);
-                None
+                BodyCheckout::Absent
             }
-            None => None,
+            None => BodyCheckout::Absent,
         }
     }
 
@@ -180,7 +203,9 @@ impl HttpState {
     /// the request finished while the read was in flight.
     pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<Vec<u8>, String>>) {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
-        guard.entry(id).or_insert(RequestBody::Stream(rx));
+        // insert, NOT or_insert: the placeholder left by take_body_stream is
+        // present and must be replaced by the live receiver.
+        guard.insert(id, RequestBody::Stream(rx));
     }
 
     /// Drop a streamed body outright (JS cancelled / destroyed the request).

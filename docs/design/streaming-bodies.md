@@ -247,7 +247,21 @@ Each is independently shippable and gated by the full chain
    `Done`. So a receiver that is merely CHECKED OUT is indistinguishable from
    a body that never existed, and the miss is reported to JS as EOF.
 
-   FIX DIRECTION: keep an entry present while the receiver is checked out
+   FIXED (partially -- read on). `take_body_stream` now leaves a
+   `StreamPending` marker and returns a `BodyCheckout` enum, so the op tells
+   Ready / InFlight / Absent apart and no longer reports EOF for a receiver
+   that is merely checked out. The false-EOF class is gone and the ordering
+   improves: the server pipeline no longer completes before the response.
+
+   b008 STILL FAILS THOUGH. The client still receives no data chunks and the
+   server still echoes an empty body (`[srv] pipeline done err=undefined`),
+   so something ELSE also ends the server-side body early. The false EOF was
+   real and worth fixing on its own, but it was not the only cause -- do not
+   assume this was the last one. Next: trace where the server's
+   IncomingMessage reaches `complete`/`push(null)` now, since the read op no
+   longer produces a premature EOF.
+
+   ORIGINAL FIX DIRECTION: keep an entry present while the receiver is checked out
    (a Stream/StreamPending distinction, or hold it under a lock instead of
    remove-await-reinsert) so a subsequent read WAITS rather than EOFing.
    Note remove-await-reinsert was copied from the accept queue, where it is

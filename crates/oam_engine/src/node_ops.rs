@@ -1147,15 +1147,25 @@ fn op_http_request_body_read(
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let state = core_runtime!(scope).http();
     crate::ops::spawn_op(scope, &mut rv, async move {
-        let Some(mut rx) = state.take_body_stream(id) else {
-            // Not a streamed body: a buffered one (TLS and http2 still
-            // collect, and so does any server that did not opt in). Hand it
-            // over as a single chunk; the take empties the registry so the
-            // next read reports EOF.
-            return match state.take_request_body(id) {
-                Some(bytes) if !bytes.is_empty() => oam_core::OpOutcome::Bytes(bytes),
-                _ => oam_core::OpOutcome::Done,
-            };
+        let mut rx = match state.take_body_stream(id) {
+            oam_core::http_server::BodyCheckout::Ready(rx) => rx,
+            // Checked out by another read: reporting EOF here is what made
+            // the server see an empty body mid-stream. Surface it instead.
+            oam_core::http_server::BodyCheckout::InFlight => {
+                return oam_core::OpOutcome::Failed(
+                    "concurrent read of the same request body".to_string(),
+                );
+            }
+            oam_core::http_server::BodyCheckout::Absent => {
+                // Not a streamed body: a buffered one (TLS and http2 still
+                // collect, and so does any server that did not opt in). Hand it
+                // over as a single chunk; the take empties the registry so the
+                // next read reports EOF.
+                return match state.take_request_body(id) {
+                    Some(bytes) if !bytes.is_empty() => oam_core::OpOutcome::Bytes(bytes),
+                    _ => oam_core::OpOutcome::Done,
+                };
+            }
         };
         let next = rx.recv().await;
         // Only reinsert while the stream is live; EOF/error drops it so a
