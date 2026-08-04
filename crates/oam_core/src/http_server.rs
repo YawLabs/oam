@@ -711,7 +711,19 @@ async fn handle_request(
     // Streamed: dispatch on headers and pump chunks behind the request.
     // 413 is unavailable from here on (the handler may already be
     // responding), so the cap becomes an Err delivered on the chunk channel.
-    let (collected, body_stream) = if stream_request_body {
+    // A body that DECLARES itself over the cap is rejected before the
+    // handler is dispatched, so 413 (and the Windows drain behind it) still
+    // works exactly as it did. Only an undeclared body -- chunked, or a
+    // lying Content-Length -- can exceed mid-stream, and that is the case
+    // the pump turns into a stream error because the handler may already
+    // have responded.
+    let declared_oversize = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > MAX_REQUEST_BODY);
+    let (collected, body_stream) = if stream_request_body && !declared_oversize {
         (bytes::Bytes::new(), Some(body))
     } else {
         let collected = match collect_body(body).await {

@@ -125,7 +125,17 @@ Each is independently shippable and gated by the full chain
    `handle_request` call sites, and no production JS path opts in -- the
    only caller is a probe. Both land with slice 3.
 3. **`IncomingMessage` as a real Readable** over the pull op, and flip the
-   default once e2e is green on it.
+   default. DONE. `_read` pulls one chunk per call and lets `push()`
+   backpressure pace the socket; `_dump` cancels so an unread body stops the
+   pump. The read op serves a BUFFERED body as a single chunk, so TLS and
+   http2 (still buffered) run the same JS path with no special-casing.
+
+   Cap refinement found by the flip: a body that DECLARES itself over the
+   cap via Content-Length is rejected before dispatch and stays on the
+   buffered 413 + drain path. Only an undeclared body (chunked, or a lying
+   Content-Length) can exceed mid-stream and become a stream error. Both
+   413 e2e tests pass UNMODIFIED, which is the check that the guarantee
+   survived rather than being redefined.
 4. **Outbound streaming + cancel.** `FetchRequest` channel variant,
    `ClientRequest.write` re-pointed.
 5. **Re-check `test-stream-pipeline`.** Blocks b008; b006 additionally needs
@@ -155,6 +165,7 @@ the live MCP client path.
   before-number).
 - A large upload streams with bounded memory -- a slow-consumer test shows
   flat RSS.
-- Oversize handling: buffered path still returns 413 and still reads cleanly
-  on Windows; streamed path errors the request stream.
+- Oversize handling: a declared-oversize body still returns 413 and still
+  reads cleanly on Windows (it never reaches the streamed path); an
+  undeclared body that exceeds mid-stream errors the request stream.
 - `test-stream-pipeline.js` b008 passes; b006 tracked separately.

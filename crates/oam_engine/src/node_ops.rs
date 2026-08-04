@@ -1067,7 +1067,14 @@ fn op_http_request_body_read(
     let state = core_runtime!(scope).http();
     crate::ops::spawn_op(scope, &mut rv, async move {
         let Some(mut rx) = state.take_body_stream(id) else {
-            return oam_core::OpOutcome::Done;
+            // Not a streamed body: a buffered one (TLS and http2 still
+            // collect, and so does any server that did not opt in). Hand it
+            // over as a single chunk; the take empties the registry so the
+            // next read reports EOF.
+            return match state.take_request_body(id) {
+                Some(bytes) if !bytes.is_empty() => oam_core::OpOutcome::Bytes(bytes),
+                _ => oam_core::OpOutcome::Done,
+            };
         };
         let next = rx.recv().await;
         // Only reinsert while the stream is live; EOF/error drops it so a

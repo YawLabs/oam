@@ -13815,6 +13815,8 @@
         });
         this._requestId = meta.requestId;
         this._bodyPushed = false;
+        this._bodyDone = false;
+        this._reading = false;
         this.complete = false;
         this.aborted = false;
         // Server-request duck props: the vendored destroyer keys
@@ -13825,15 +13827,33 @@
         this._dumped = false;
       }
       _read() {
-        if (!this._bodyPushed) {
-          this._bodyPushed = true;
-          const body = natives.httpRequestBody(this._requestId);
-          if (body.length > 0) {
-            this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
-          }
-          this.complete = true;
-          this.push(null);
-        }
+        // Pull one chunk per _read. The op serves a streamed body chunk by
+        // chunk and a buffered one as a single chunk, so this is the same
+        // code path whether or not the server opted into streaming.
+        // push() returning false is backpressure -- Readable calls _read
+        // again when drained, which is what paces the socket.
+        if (this._bodyDone || this._reading) return;
+        this._reading = true;
+        natives.httpRequestBodyRead(this._requestId).then(
+          (chunk) => {
+            this._reading = false;
+            if (chunk === undefined || chunk === null || chunk.length === 0) {
+              this._bodyDone = true;
+              this.complete = true;
+              this.push(null);
+              return;
+            }
+            this.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length));
+          },
+          (err) => {
+            // Body too large, or the transport failed mid-body. The handler
+            // may already have responded, so this errors the request stream
+            // rather than producing a status.
+            this._reading = false;
+            this._bodyDone = true;
+            this.destroy(err instanceof Error ? err : new Error(String(err)));
+          },
+        );
       }
       // Node's server dumps an unconsumed request when its response
       // finishes: mark complete + drain so a later destroy() is routine
@@ -13842,6 +13862,9 @@
         if (this._dumped) return;
         this._dumped = true;
         this.complete = true;
+        // Drop any un-read body so the pump stops reading the socket
+        // instead of buffering for a consumer that will never arrive.
+        if (!this._bodyDone) natives.httpRequestBodyCancel(this._requestId);
         this.resume();
       }
       _destroy(err, callback) {
@@ -14167,7 +14190,10 @@
         }
         if (typeof callback === "function") this.once("listening", callback);
         const hostname = host ?? "127.0.0.1";
-        natives.httpServe(hostname, port ?? 0).then(
+        // Stream request bodies: the handler is dispatched on headers and
+        // req delivers chunks as they arrive, instead of waiting for the
+        // last byte (docs/design/streaming-bodies.md).
+        natives.httpServe(hostname, port ?? 0, true).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
