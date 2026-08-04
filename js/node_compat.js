@@ -449,7 +449,22 @@
     return buildArgTypeMessage(name, expected, actual);
   });
   codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, function(name, value, reason) {
-    return 'The argument "' + name + '" is invalid. Received ' + String(value) + (reason ? ". " + reason : "");
+    // Node's exact shape: `The ${type} '${name}' ${reason}. Received
+    // ${inspect(value)}` -- 'property' when the name contains a dot,
+    // 'argument' otherwise, and INSPECT rather than String() so a string
+    // shows its quotes and an object shows its contents. oam previously
+    // emitted `The argument "x" is invalid. Received <String(v)>. <reason>`,
+    // which got the quoting, the order and the value rendering wrong at
+    // all 15 call sites.
+    let inspected;
+    try {
+      inspected = nodeInspect(value);
+    } catch {
+      inspected = String(value);
+    }
+    if (inspected.length > 128) inspected = `${inspected.slice(0, 128)}...`;
+    const type = String(name).includes(".") ? "property" : "argument";
+    return `The ${type} '${name}' ${reason ?? "is invalid"}. Received ${inspected}`;
   });
   codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
     return 'Callback must be a function. Received ' + String(name);
@@ -2189,13 +2204,50 @@
       return this.removeListener(type, listener);
     };
     EventEmitter.prototype.removeAllListeners = function (type) {
-      eventsOf(this);
+      const events = eventsOf(this);
+      // Node emits 'removeListener' for every listener it drops here, and
+      // that is not cosmetic: oam's own signal watchers DISARM on that event
+      // (see the SIGNAL_NAMES wiring in the process factory). Dropping them
+      // silently left the native SIGINT watcher armed after
+      // removeAllListeners('SIGINT'), so the next SIGINT was swallowed
+      // instead of killing the process -- an unkillable hang.
+      //
+      // Fast path when nobody is listening for removals, exactly as Node
+      // does: no observable difference, no per-listener emit cost.
+      if (events.removeListener === undefined) {
+        if (type === undefined) {
+          this._events = { __proto__: null };
+          this._eventsCount = 0;
+        } else if (events[type] !== undefined) {
+          delete this._events[type];
+          this._eventsCount--;
+        }
+        return this;
+      }
+
       if (type === undefined) {
+        // 'removeListener' itself goes LAST, so removals of the other
+        // events are still observable while they happen.
+        for (const key of Reflect.ownKeys(events)) {
+          if (key === "removeListener") continue;
+          this.removeAllListeners(key);
+        }
+        this.removeAllListeners("removeListener");
         this._events = { __proto__: null };
         this._eventsCount = 0;
-      } else if (this._events[type] !== undefined) {
-        delete this._events[type];
-        this._eventsCount--;
+        return this;
+      }
+
+      const listeners = events[type];
+      if (typeof listeners === "function") {
+        this.removeListener(type, listeners);
+      } else if (listeners !== undefined) {
+        // LIFO, and over a COPY: each removeListener() mutates the live
+        // array (and a handler may add or remove more).
+        const copy = listeners.slice();
+        for (let i = copy.length - 1; i >= 0; i--) {
+          this.removeListener(type, copy[i]);
+        }
       }
       return this;
     };
@@ -9579,13 +9631,65 @@
         if (sig !== 0 && !VALID.includes(sig)) return -22; // EINVAL before touching the sandbox
         try { natives.processKill(pid, sig); return 0; } catch { return -1; }
       },
-      execve() {
-        // execve(2) replaces the current process image. oam has no implementation,
-        // and Node itself reports it unavailable on Windows. Surface the same coded
-        // TypeError so callers (and the conformance test) see ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+      execve(execPath, args, env) {
+        // execve(2) REPLACES the current process image: on success nothing
+        // after this call ever runs -- no 'exit' handlers, no unwind, no
+        // flush (the op flushes first for that reason). Node has it on
+        // POSIX only.
+        if (natives.platform === "win32") {
+          throw applyNodeErrorShape(
+            new TypeError("process.execve is unavailable on the current platform"),
+            "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
+          );
+        }
+        // A worker replacing the image would take its siblings with it.
+        if (
+          typeof natives.workerIsMainThread === "function" &&
+          !natives.workerIsMainThread()
+        ) {
+          throw applyNodeErrorShape(
+            new TypeError("process.execve() is not available in workers"),
+            "ERR_WORKER_UNSUPPORTED_OPERATION",
+          );
+        }
+        if (typeof execPath !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("execPath", "string", execPath);
+        }
+        if (!Array.isArray(args)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("args", "Array", args);
+        }
+        // Everything crosses into C as a NUL-terminated string, so an
+        // embedded NUL would silently TRUNCATE the value. Node refuses
+        // rather than pass a shortened argv, and names the bad index.
+        const NUL = String.fromCharCode(0);
+        const clean = (v) => typeof v === "string" && !v.includes(NUL);
+        for (let i = 0; i < args.length; i++) {
+          if (!clean(args[i])) {
+            throw new codes.ERR_INVALID_ARG_VALUE(
+              `args[${i}]`,
+              args[i],
+              "must be a string without null bytes",
+            );
+          }
+        }
+        if (env === null || typeof env !== "object") {
+          throw new codes.ERR_INVALID_ARG_TYPE("env", "object", env);
+        }
+        for (const key of Object.keys(env)) {
+          if (!clean(key) || !clean(env[key])) {
+            throw new codes.ERR_INVALID_ARG_VALUE(
+              "env",
+              env,
+              "must be an object with string keys and values without null bytes",
+            );
+          }
+        }
+        const envp = Object.keys(env).map((k) => `${k}=${env[k]}`);
+        const errnoName = natives.processExecve(execPath, args, envp);
+        // Only reachable when execve FAILED -- success never returns.
         throw applyNodeErrorShape(
-          new TypeError("process.execve is unavailable on the current platform"),
-          "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
+          new Error(`process.execve failed with error code ${errnoName}`),
+          "ERR_OPERATION_FAILED",
         );
       },
       umask(mask) {

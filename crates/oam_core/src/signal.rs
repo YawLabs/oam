@@ -10,12 +10,17 @@
 //! * Unix — `tokio::signal::unix::signal`. Creating the `Signal` (under the
 //!   runtime enter guard) replaces `SIG_DFL` immediately, so the default
 //!   terminate is suppressed the moment the first JS listener attaches. The
-//!   `SignalHandle` holds the recv task's `AbortHandle`; dropping it stops
-//!   delivery. CAVEAT: tokio leaves its process-global handler installed on
-//!   drop, so after the LAST listener is removed a later signal is caught and
-//!   dropped (the process will not terminate) — this diverges from Node's
-//!   "no listener -> OS default" only on the *remove* path and is benign for
-//!   the k8s graceful-shutdown shape (the listener lives for the process).
+//!   `SignalHandle` holds the recv task's `AbortHandle`. Removing the last
+//!   listener does NOT drop the handle: tokio leaves its process-global
+//!   handler installed for the process lifetime and offers no way to restore
+//!   `SIG_DFL`, so a dropped stream would leave the signal caught and
+//!   silently discarded — the process becomes unkillable by it. Instead the
+//!   handle goes DORMANT (`set_watched(false)`) and the still-running task
+//!   reproduces the OS default itself: restore `SIG_DFL` and re-raise, so the
+//!   process dies exactly as it would have and the parent sees the right
+//!   terminating signal. Re-adding a listener re-arms the same task.
+//!   (This was previously documented as a benign divergence. It is not:
+//!   `removeAllListeners('SIGINT')` followed by a SIGINT hung forever.)
 //!
 //! * Windows — `SetConsoleCtrlHandler`. The handler is a zero-capture
 //!   `extern "system"` fn, so state lives in a process-global. It maps
@@ -33,6 +38,16 @@ use std::sync::mpsc::Sender;
 #[cfg(unix)]
 pub struct SignalHandle {
     abort: tokio::task::AbortHandle,
+    /// False once the last JS listener is removed. The recv task stays
+    /// ALIVE while dormant -- see `stop_signal` for why it must.
+    watched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl SignalHandle {
+    pub fn set_watched(&self, on: bool) {
+        self.watched.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(unix)]
@@ -40,6 +55,18 @@ impl Drop for SignalHandle {
     fn drop(&mut self) {
         self.abort.abort();
     }
+}
+
+/// Does the OS default action for this signal TERMINATE the process?
+/// Only those need the restore-and-re-raise dance when no listener is
+/// attached; for an ignore-by-default signal (SIGWINCH) simply dropping the
+/// delivery already reproduces the default exactly.
+#[cfg(unix)]
+fn default_terminates(signum: i32) -> bool {
+    matches!(
+        signum,
+        libc::SIGHUP | libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGUSR1 | libc::SIGUSR2
+    )
 }
 
 /// Map a Node signal name to a tokio `SignalKind`. Returns `None` for names
@@ -78,8 +105,29 @@ pub fn start_signal(
     };
     let tx = tx.clone();
     let nm = name.to_string();
+    let signum = kind.as_raw_value();
+    let watched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let task_watched = watched.clone();
     let join = runtime.spawn(async move {
         while sig.recv().await.is_some() {
+            if !task_watched.load(std::sync::atomic::Ordering::SeqCst) {
+                // No JS listener left. tokio's handler CANNOT be uninstalled
+                // (its registration is a one-time global), so without this
+                // the signal would be caught and silently discarded and the
+                // process would be unkillable by it -- e.g. SIGINT after
+                // removeAllListeners('SIGINT'). Restore the default and
+                // re-raise so the process dies exactly as it would have,
+                // and the parent observes the right terminating signal.
+                if default_terminates(signum) {
+                    unsafe {
+                        libc::signal(signum, libc::SIG_DFL);
+                        libc::raise(signum);
+                    }
+                }
+                // Ignore-by-default signals need nothing: dropping the
+                // delivery already IS the default action.
+                continue;
+            }
             let sent = tx.send(OpCompletion {
                 id: SIGNAL_OP_ID,
                 outcome: OpOutcome::Signal(nm.clone()),
@@ -92,7 +140,20 @@ pub fn start_signal(
     });
     Some(SignalHandle {
         abort: join.abort_handle(),
+        watched,
     })
+}
+
+/// Stop delivering `name` to JS.
+///
+/// Unix keeps the handle DORMANT rather than dropping it: the recv task owns
+/// the only path back to the OS default action (see `start_signal`), so
+/// aborting it would leave the signal permanently swallowed.
+#[cfg(unix)]
+pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, name: &str) {
+    if let Some(handle) = map.get(name) {
+        handle.set_watched(false);
+    }
 }
 
 // ========================================================== Windows backend
@@ -207,12 +268,37 @@ pub fn start_signal(
     })
 }
 
+#[cfg(windows)]
+impl SignalHandle {
+    /// No-op: Windows suppression is driven by the ctrl handler's `active`
+    /// set, which `Drop` maintains, so dropping the handle already restores
+    /// the OS default.
+    pub fn set_watched(&self, _on: bool) {}
+}
+
+/// Windows drops the handle, which removes the name from the ctrl handler's
+/// active set so the next event falls through to the OS default.
+#[cfg(windows)]
+pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, name: &str) {
+    map.remove(name);
+}
+
 // ================================================ fallback (no known backend)
 // Every tier-1 target is unix or windows; this keeps the crate compiling on a
 // hypothetical other target (signals simply never fire there).
 
 #[cfg(not(any(unix, windows)))]
 pub struct SignalHandle;
+
+#[cfg(not(any(unix, windows)))]
+impl SignalHandle {
+    pub fn set_watched(&self, _on: bool) {}
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, name: &str) {
+    map.remove(name);
+}
 
 #[cfg(not(any(unix, windows)))]
 pub fn start_signal(

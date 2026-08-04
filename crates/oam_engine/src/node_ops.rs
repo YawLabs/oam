@@ -124,6 +124,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("posixInitGroups", op_posix_init_groups),
         ("posixLookupId", op_posix_lookup_id),
         ("setTimeZone", op_set_timezone),
+        ("processExecve", op_process_execve),
         ("nowMs", op_now_ms),
         ("hrtimeNanos", op_hrtime_nanos),
         ("uptimeMs", op_uptime_ms),
@@ -1216,6 +1217,71 @@ fn op_set_timezone(
     scope.date_time_configuration_change_notification(v8::TimeZoneDetection::Redetect);
 }
 
+/// execve(2): replace the current process image. On success this NEVER
+/// returns -- the process is gone, which is why nothing after it can run and
+/// why 'exit' handlers must not fire. On failure it returns the errno name.
+///
+/// Args: (path, argv[], envp[] as "K=V"). Validation lives in JS so the
+/// error shapes match Node exactly; by here everything is a clean string.
+fn op_process_execve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let Some(path) = arg_string(scope, &args, 0) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
+        let to_cstrings = |scope: &mut v8::PinScope<'_, '_>, idx: i32| -> Option<Vec<CString>> {
+            let arr = v8::Local::<v8::Array>::try_from(args.get(idx)).ok()?;
+            let mut out = Vec::with_capacity(arr.length() as usize);
+            for i in 0..arr.length() {
+                let v = arr.get_index(scope, i)?;
+                let s = v.to_rust_string_lossy(scope);
+                out.push(CString::new(s).ok()?);
+            }
+            Some(out)
+        };
+        let (Ok(cpath), Some(argv), Some(envp)) = (
+            CString::new(path),
+            to_cstrings(scope, 1),
+            to_cstrings(scope, 2),
+        ) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
+        // Flush before the image is replaced: anything still sitting in a
+        // userspace buffer is lost the instant execve succeeds.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+
+        unsafe {
+            libc::execve(cpath.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        }
+        // Only reachable when execve failed.
+        let name = errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        let msg = v8::String::new(scope, name).expect("errno name is short");
+        rv.set(msg.into());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        let msg = v8::String::new(scope, "ENOSYS").expect("static errno string");
+        rv.set(msg.into());
+    }
+}
+
 /// The handful of errno values these ops can realistically produce, by name.
 /// Anything else is reported numerically rather than guessed at.
 #[cfg(unix)]
@@ -1225,6 +1291,17 @@ fn errno_name(code: i32) -> &'static str {
         libc::EINVAL => "EINVAL",
         libc::ESRCH => "ESRCH",
         libc::ENOSYS => "ENOSYS",
+        // exec(2) failure modes -- ENOENT is the one users hit (bad path).
+        libc::ENOENT => "ENOENT",
+        libc::EACCES => "EACCES",
+        libc::ENOEXEC => "ENOEXEC",
+        libc::E2BIG => "E2BIG",
+        libc::ENOMEM => "ENOMEM",
+        libc::ELOOP => "ELOOP",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EISDIR => "EISDIR",
+        libc::ETXTBSY => "ETXTBSY",
         _ => "EIO",
     }
 }

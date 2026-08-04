@@ -453,23 +453,36 @@ unchanged because these tests never ran there):
   so does this.)
 - **`O_NOATIME`** is now present on Linux and absent everywhere else.
 
-After those fixes the sweep re-measured **399/418 on macos-aarch64 (97.8%)
-and 401/418 on linux-x86_64 (98.0%)**, up from 392 on both.
+**Closed in a second pass:**
+
+- **`process.execve` is implemented** on POSIX (5 of its 6 tests pass; the
+  sixth is deliberate, below). It really does replace the process image:
+  `'exit'` handlers do not run, open sockets are gone in the new image, and
+  a failure reports the errno. Workers get `ERR_WORKER_UNSUPPORTED_OPERATION`
+  and Windows keeps `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`, both matching Node.
+- **`removeAllListeners` now emits `'removeListener'`**, which it never did.
+  That was not cosmetic: oam disarms its signal watchers on that event, so
+  `process.removeAllListeners('SIGINT')` left the native watcher armed and
+  the next SIGINT was caught and discarded — **the process became unkillable
+  by it**. The apparent "flaky hang" was this plus a startup race: if the
+  first signal beat the watcher being armed, the process died by default
+  disposition and the test passed for the wrong reason.
+- **Removing the last listener for a signal restores the OS default.** tokio's
+  signal registration is a one-time global with no way back to `SIG_DFL`, so
+  the watcher task now stays alive but dormant and reproduces the default
+  itself (restore + re-raise) when no listener remains.
 
 **Still open:**
 
-- **`process.execve` is unimplemented** (6 tests) — it throws
-  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` everywhere, which is honest on
-  Windows (Node has no execve there either) but a real gap on POSIX.
 - **`process.execPath`** diverges on macOS.
-- **`test-process-remove-all-signal-listeners` HANGS intermittently** on both
-  POSIX hosts. It passed in the sweep before the fixes above and hangs in
-  the one after, which looks like a regression and is not: building the
-  pre-fix commit reproduces the hang, so it is a pre-existing race in the
-  spawn/signal path that the earlier run got lucky on. The per-host pass
-  floors are deliberately set one below the observed number to absorb it —
-  a gate that trips at random teaches people to ignore it — and they go up
-  once the race is fixed.
+- **`test-process-execve-abort` is a deliberate non-pass.** oam produces
+  Node's exact failure message (`process.execve failed with error code
+  ENOENT`), and the test's first assertion passes. Its second requires the
+  stack to contain `execve (node:internal/process/per_thread` — a module oam
+  does not have (see divergence 3: no `node:internal/…` frames). Passing it
+  would mean fabricating a frame pointing at a file that does not exist,
+  sending anyone who reads the trace to the wrong place. Same call as
+  `process.versions`: the number stays honest.
 
 These are gaps to close, not documented behavior. They are listed here
 because the alternative — quoting 400/401 and staying quiet about two

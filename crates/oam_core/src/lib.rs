@@ -492,7 +492,12 @@ impl CoreRuntime {
     /// least one watcher is live (Unix: replaces SIG_DFL; Windows: the console
     /// ctrl handler returns TRUE for the mapped event).
     pub fn start_signal(&mut self, name: &str) {
-        if self.signals.contains_key(name) {
+        if let Some(existing) = self.signals.get(name) {
+            // A DORMANT unix handle (every listener removed, task still
+            // alive to serve the OS default) is re-armed, not recreated:
+            // tokio's signal registration is a one-time global, so the task
+            // owning the stream has to outlive the JS listeners.
+            existing.set_watched(true);
             return;
         }
         let runtime = self.tokio.as_ref().expect("runtime alive");
@@ -501,11 +506,13 @@ impl CoreRuntime {
         }
     }
 
-    /// Stop delivering OS signal `name`. Dropping the stored handle uninstalls
-    /// the watcher (Unix aborts the recv task; Windows removes the name from
-    /// the active set so its ctrl handler falls through to the OS default).
+    /// Stop delivering OS signal `name`, restoring the OS default action.
+    /// Backend-specific (see `signal::stop_signal`): Windows drops the handle
+    /// so its ctrl handler falls through; unix keeps it dormant, because
+    /// tokio's handler cannot be uninstalled and the task is what reproduces
+    /// the default.
     pub fn stop_signal(&mut self, name: &str) {
-        self.signals.remove(name);
+        signal::stop_signal(&mut self.signals, name);
     }
 }
 
