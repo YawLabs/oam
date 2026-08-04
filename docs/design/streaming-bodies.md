@@ -232,11 +232,27 @@ Each is independently shippable and gated by the full chain
    So the server-side `req` reaches EOF straight away and echoes an EMPTY
    body, which is why the client never sees the 10 chunks it waits on. The
    client IS streaming (slice 4b, verified separately at ~9ms dispatch), so
-   the fault is on the RECEIVE side: either the server's IncomingMessage
-   `_read` gets an immediate EOF from `httpRequestBodyRead`, or the pump
-   (`pump_request_body`) sees `body.frame()` return None before the client's
-   chunks arrive. Instrument those two points -- that is the whole question,
-   and it is a much smaller one than "b008 needs streaming".
+   the fault is on the RECEIVE side. INSTRUMENTED, and here is the answer:
+
+       [pump]  frame 5 bytes ... x10   (client streams fine, hyper delivers)
+       [srv]   dispatched
+       [_read] chunk 5 id=2            (first read OK)
+       [_read] EOF chunk=undefined     (SECOND read reports EOF)
+       [pump]  consumer gone
+
+   The pump has frames queued, yet the second read returns EOF. The cause is
+   in `op_http_request_body_read`: `take_body_stream(id)` REMOVES the
+   receiver from the registry for the duration of the await, and when that
+   lookup misses, the op falls through to `take_request_body(id)` and returns
+   `Done`. So a receiver that is merely CHECKED OUT is indistinguishable from
+   a body that never existed, and the miss is reported to JS as EOF.
+
+   FIX DIRECTION: keep an entry present while the receiver is checked out
+   (a Stream/StreamPending distinction, or hold it under a lock instead of
+   remove-await-reinsert) so a subsequent read WAITS rather than EOFing.
+   Note remove-await-reinsert was copied from the accept queue, where it is
+   safe -- single consumer, no fallback. The fallback added so buffered
+   bodies (TLS/http2) share one JS path is what makes it unsafe here.
 
    Original text: blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
