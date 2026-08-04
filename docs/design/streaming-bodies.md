@@ -158,16 +158,29 @@ Each is independently shippable and gated by the full chain
    does NOT work is the latency, which is the entire point: the server saw
    headers at ~316ms, i.e. only after `end()`, versus Node's ~36ms.
 
-   The cause is NOT reqwest and NOT the channel. Driving the SAME machinery
-   through the raw native (`__oam.fetch` with `body_stream`) dispatches at
-   ~7ms. Instrumenting the JS showed streaming arms at 3ms and
-   `_doFetchRequest` runs there, so the request is handed to
-   `globalThis.fetch` early and still does not reach the wire until the body
-   closes. So the defect is in the fetch WRAPPER path (js/bootstrap.js
-   `fetch`) deferring the native call -- find what it awaits between
-   `_doFetchRequest` and `__oam.fetch(...)`. Until that is fixed, flipping
-   ClientRequest buys chunked encoding with none of the latency win, which
-   is a strictly worse wire trade on the MCP path.
+   The cause is NOT reqwest, NOT the channel, and NOT the fetch wrapper.
+   Measured, all three are fine:
+
+   - raw `__oam.fetch` with `body_stream`: server dispatched at ~7ms
+   - `globalThis.fetch(url, { __oamBodyStream })`: dispatched at ~5ms
+   - `globalThis.fetch` has NO await before the native call on the plain
+     path (the connect-lookup branch is the only one, and it is not taken)
+
+   An earlier revision of this note blamed the wrapper. That was inference,
+   not measurement, and the A/B above refutes it -- do not start there.
+
+   What is actually known: streaming arms at 3ms and `_doFetchRequest` runs
+   there, yet headers do not reach the wire until `end()`. Since both
+   transport paths dispatch immediately when driven directly, the remaining
+   suspect is what `ClientRequest._doFetchRequest` passes or does
+   differently from the probes -- start by diffing its fetch options
+   (notably `self._headers`, which the probes did not send) against the
+   working `{ method, __oamBodyStream }` call, and confirm `globalThis.fetch`
+   is actually reached with the handle set.
+
+   Until that is understood, flipping ClientRequest buys chunked encoding
+   with none of the latency win, which is a strictly worse wire trade on the
+   MCP path.
 5. **Re-check `test-stream-pipeline`.** Blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd
