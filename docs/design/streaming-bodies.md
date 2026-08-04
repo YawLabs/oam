@@ -220,6 +220,24 @@ Each is independently shippable and gated by the full chain
    `conformance/vendor/node/test/parallel/` -- files there are picked up by
    the harness as new suite tests.
 
+   FIRST DIVERGENCE, measured (b008 reduced to a traced probe -- server does
+   `pipeline(req, res)`, client streams 11 chunks via `pipeline(rs, req)`):
+
+       node: srv dispatched -> cli got response -> cli receives 10 data
+             chunks -> rs.destroy() -> both pipelines settle
+       oam:  srv dispatched -> srv pipeline done IMMEDIATELY err=undefined
+             -> cli got response -> NO data chunks ever -> cli pipeline
+             "Premature close"
+
+   So the server-side `req` reaches EOF straight away and echoes an EMPTY
+   body, which is why the client never sees the 10 chunks it waits on. The
+   client IS streaming (slice 4b, verified separately at ~9ms dispatch), so
+   the fault is on the RECEIVE side: either the server's IncomingMessage
+   `_read` gets an immediate EOF from `httpRequestBodyRead`, or the pump
+   (`pump_request_body`) sees `body.frame()` return None before the client's
+   chunks arrive. Instrument those two points -- that is the whole question,
+   and it is a much smaller one than "b008 needs streaming".
+
    Original text: blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd
