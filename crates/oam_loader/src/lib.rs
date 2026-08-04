@@ -104,7 +104,12 @@ pub fn transpile_typescript(path: &Path, source: &str) -> Result<String, Transpi
         .semantic
         .into_scoping();
 
-    let options = TransformOptions::default();
+    let mut options = TransformOptions::default();
+    // tsconfig's compilerOptions.jsxImportSource retargets the automatic JSX
+    // runtime (Preact, Solid: `preact` -> imports from `preact/jsx-runtime`).
+    // A per-file `@jsxImportSource` pragma is parsed by oxc itself and wins
+    // over this, matching tsc's precedence.
+    options.jsx.import_source = tsconfig::jsx_import_source_for(path);
     let transformed =
         Transformer::new(&allocator, path, &options).build_with_scoping(scoping, &mut program);
     if !transformed.errors.is_empty() {

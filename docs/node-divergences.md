@@ -275,16 +275,23 @@ supported yet. Packages that compile a native addon or download a binary in `pos
 will install but not work. `oam trust` marks a package as expected so it stops warning
 (`OAM-PKG0007`); it does not make the script run.
 
-### 12. JSX: the pragma retargets, `tsconfig.json` does not
+### 12. JSX runtime retargeting (no longer a divergence)
 
-JSX is an oam extension — Node v22 cannot run a `.tsx`/`.jsx` file at all. Two caveats if
-you are coming from a TypeScript toolchain:
+JSX is an oam extension — Node v22 cannot run a `.tsx`/`.jsx` file at all. Retargeting
+the runtime now works the way a TypeScript toolchain expects, by both routes:
 
-- **`/** @jsxImportSource preact */` works.** The per-file pragma is honored, so Preact,
-  Solid, and anything else with a `jsx-runtime` export can retarget.
-- **`compilerOptions.jsxImportSource` in `tsconfig.json` is ignored,** as is the classic
-  `/** @jsx h */` pragma. Without a per-file `@jsxImportSource`, oam always emits the
-  automatic runtime against `react/jsx-runtime`.
+- **`compilerOptions.jsxImportSource` in `tsconfig.json` is honored** (as of 2026-08-04).
+  The nearest `tsconfig.json` above the file is consulted, with `extends` chains merged
+  per-option — a child that sets only `paths` still inherits the base's
+  `jsxImportSource`.
+- **`/** @jsxImportSource preact */` works** and, per tsc's precedence, a per-file pragma
+  **wins over** the tsconfig value.
+- **The classic `/** @jsx h */` + `@jsxRuntime classic` pragmas work too.** (An earlier
+  revision of this document claimed they were ignored; that was wrong when written —
+  measured, `@jsx h @jsxRuntime classic` emits `h(...)` calls.)
+
+With no pragma and no tsconfig value, the automatic runtime targets `react/jsx-runtime`,
+matching tsc's default.
 
 ---
 

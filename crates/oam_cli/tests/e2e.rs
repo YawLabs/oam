@@ -6895,6 +6895,78 @@ fn http_streamed_body_backpressure_bounds_memory() {
 }
 
 #[test]
+fn tsx_jsx_import_source_retargets_automatic_runtime() {
+    // compilerOptions.jsxImportSource (nearest tsconfig, extends-chain
+    // merged) retargets oxc's automatic JSX runtime; a per-file
+    // @jsxImportSource pragma wins over it, matching tsc. Stub packages
+    // record which runtime was imported.
+    write_temp(
+        "jsxsrc/node_modules/preact/package.json",
+        "{\"name\":\"preact\",\"version\":\"0.0.1\",\"type\":\"module\",\
+         \"exports\":{\"./jsx-runtime\":\"./jsx-runtime.js\"}}",
+    );
+    write_temp(
+        "jsxsrc/node_modules/preact/jsx-runtime.js",
+        "export function jsx(t, p) { return 'preact:' + t + ':' + p.a; }\n\
+         export const jsxs = jsx;\n\
+         export const Fragment = 'pf';",
+    );
+    write_temp(
+        "jsxsrc/node_modules/solidstub/package.json",
+        "{\"name\":\"solidstub\",\"version\":\"0.0.1\",\"type\":\"module\",\
+         \"exports\":{\"./jsx-runtime\":\"./jsx-runtime.js\"}}",
+    );
+    write_temp(
+        "jsxsrc/node_modules/solidstub/jsx-runtime.js",
+        "export function jsx(t, p) { return 'solid:' + t + ':' + p.a; }\n\
+         export const jsxs = jsx;\n\
+         export const Fragment = 'sf';",
+    );
+    // jsxImportSource lives in the EXTENDED base, not the child: covers the
+    // per-option extends merge, not just same-file reads.
+    write_temp(
+        "jsxsrc/base.json",
+        "{\"compilerOptions\":{\"jsxImportSource\":\"preact\"}}",
+    );
+    write_temp(
+        "jsxsrc/tsconfig.json",
+        "{\"extends\":\"./base.json\",\"compilerOptions\":{}}",
+    );
+    write_temp(
+        "jsxsrc/pragma.tsx",
+        "/** @jsxImportSource solidstub */\n\
+         const el = <div a={2}>x</div>;\n\
+         console.log('pragma_wins:', el === 'solid:div:2');\n\
+         export {};",
+    );
+    let main = write_temp(
+        "jsxsrc/app.tsx",
+        "const el = <div a={1}>x</div>;\n\
+         console.log('tsconfig_extends:', el === 'preact:div:1');\n\
+         await import('./pragma.tsx');",
+    );
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.trim().lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+    assert_eq!(
+        stdout.trim().lines().count(),
+        2,
+        "expected both checks to run"
+    );
+}
+
+#[test]
 fn process_versions_honest_keys() {
     // process.versions publishes REAL shipped implementations under their
     // real names (versions read from Cargo.lock at build time by
