@@ -235,6 +235,19 @@ impl CoreRuntime {
             .map_err(|e| format!("tokio runtime: {e}"))?;
         let http = reqwest::Client::builder()
             .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
+            // `localhost` IPv4-first. Measured: oam's first request to
+            // localhost cost ~317ms against Node's ~6ms, because resolution
+            // yields ::1 first, the common case is a server bound to
+            // 127.0.0.1, and the connector waits out its happy-eyeballs
+            // fallback delay before trying IPv4. ::1 stays in the list as a
+            // fallback, so a server bound only to IPv6 loopback still works.
+            .resolve_to_addrs(
+                "localhost",
+                &[
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                    std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+                ],
+            )
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         let (tx, rx) = mpsc::channel();

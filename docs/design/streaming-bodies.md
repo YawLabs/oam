@@ -246,6 +246,16 @@ masqueraded as a streaming defect for two rounds of diagnosis. The shape
 (a few hundred ms, first call only) points at an IPv6-first attempt to `::1`
 waiting out a timeout before falling back to `127.0.0.1`.
 
-Worth fixing on its own merits: every oam process pays it once on its first
-localhost HTTP call, which is the common case in local development and for
-MCP sidecars talking to a local endpoint. Not part of the streaming work.
+PARTIALLY FIXED: the reqwest client now resolves `localhost` IPv4-first
+(`resolve_to_addrs`, with ::1 retained as a fallback). IPv4 loopback went
+317ms -> 2ms, matching Node.
+
+The cost is MOVED, not removed, and that is worth knowing before touching
+this again: a server bound only to `::1` now pays the fallback delay
+instead, ~307ms where Node does it in ~10ms. That is the rarer case, so the
+trade is a net win, but it IS a regression for IPv6-only loopback.
+
+The real fix is a bounded happy-eyeballs delay rather than an ordering
+preference -- reqwest 0.13 exposes no `happy_eyeballs_timeout`, so it needs
+either a custom connector/resolver or an upstream knob. Node avoids both
+tails via autoSelectFamily with a 250ms attempt timeout.
