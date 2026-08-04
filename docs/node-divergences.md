@@ -423,22 +423,42 @@ it. A cross-platform sweep on the real release hosts measured
 **392 passing on macos-aarch64 (of 408 runnable) and 392 on linux-x86_64
 (of 409)** versus 400/401 on windows-aarch64. The denominators differ
 because Windows skips POSIX-only tests the other hosts actually run, and
-that is where every extra failure sits — all of them in `process`, `path`,
-and `url`, none in `stream`, `http`, or `buffer`:
+that is where every extra failure sat — all in `process`, `path`, and
+`url`, none in `stream`, `http`, or `buffer`.
+
+**Closed the same day** (verified on macos-aarch64; the Windows number is
+unchanged because these tests never ran there):
+
+- **`path.resolve` on POSIX.** Node's path module reads `process.cwd()` —
+  the patchable JS function — and oam went straight to an internal syscall,
+  so a program that overrides `process.cwd` (Node's own suite does, to prove
+  `resolve()` degrades to `'.'` when the cwd is unavailable) saw its
+  override ignored. Both the posix and win32 resolvers now read it.
+- **`url.fileURLToPath`.** Three bugs: the Node v22 `{ windows }` option was
+  missing entirely; encoded `%5C` was rejected on POSIX, where a backslash
+  is a **legal filename character**, making `file:///foo%5Cbar` — a real,
+  addressable file — unopenable; and a URL with a host silently dropped it
+  instead of throwing `ERR_INVALID_FILE_URL_HOST`, returning a path that
+  pointed somewhere else.
+- **The whole uid/gid family** (`uid-gid`, `euid-egid`, `getgroups`,
+  `setgroups`, `initgroups`). These were stubs: `getuid()` returned a
+  hardcoded `0`, **claiming the process was root** — false, and load-bearing,
+  since real code branches on `getuid() === 0`. They are real syscalls now,
+  and the setters validate arguments exactly as Node does (including naming
+  the offending index in `groups[N]`) instead of accepting anything.
+- **`process.env.TZ`.** Assigning it changed a string in a JS object and
+  nothing else, so every `Date` kept the zone the process started in.
+  Writes now run `tzset(3)` and notify V8 to re-detect, matching Node.
+  (Windows uses a different TZ format; Node skips its own test there, and
+  so does this.)
+- **`O_NOATIME`** is now present on Linux and absent everywhere else.
+
+**Still open:**
 
 - **`process.execve` is unimplemented** (6 tests) — it throws
   `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` everywhere, which is honest on
   Windows (Node has no execve there either) but a real gap on POSIX.
-- **uid/gid argument validation is missing** (5 tests:
-  `euid-egid`, `uid-gid`, `initgroups`, `setgroups`, `getgroups`) — the
-  functions exist, but they do not throw the `TypeError` Node throws for
-  invalid arguments, so "Missing expected exception" is the failure shape.
-- **`path.resolve` diverges on POSIX** (`test-path-resolve`) — a core-module
-  bug invisible from Windows, whose path semantics differ.
-- **`url.fileURLToPath`** (`test-url-fileurltopath`) fails POSIX subtests.
-- **`process.env.TZ`** (`test-process-env-tz`) does not reformat dates.
-- **`process.execPath`** diverges on macOS; **`O_NOATIME`** is absent on Linux
-  (`test-process-constants-noatime`).
+- **`process.execPath`** diverges on macOS.
 
 These are gaps to close, not documented behavior. They are listed here
 because the alternative — quoting 400/401 and staying quiet about two

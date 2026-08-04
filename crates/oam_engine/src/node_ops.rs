@@ -113,6 +113,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // TTY raw-mode + window-size for interactive TUIs (process.stdin/stdout).
         ("ttySetRawMode", op_tty_set_raw_mode),
         ("ttyGetWinSize", op_tty_get_win_size),
+        // POSIX identity. Real syscalls -- a hardcoded uid of 0 would claim
+        // the process is root, which is both false and load-bearing (code
+        // branches on `getuid() === 0`). Absent on Windows, where Node does
+        // not define these at all.
+        ("posixGetId", op_posix_get_id),
+        ("posixSetId", op_posix_set_id),
+        ("posixGetGroups", op_posix_get_groups),
+        ("posixSetGroups", op_posix_set_groups),
+        ("posixInitGroups", op_posix_init_groups),
+        ("posixLookupId", op_posix_lookup_id),
+        ("setTimeZone", op_set_timezone),
         ("nowMs", op_now_ms),
         ("hrtimeNanos", op_hrtime_nanos),
         ("uptimeMs", op_uptime_ms),
@@ -906,6 +917,315 @@ fn op_tty_get_win_size(
         None => {
             rv.set(v8::null(scope).into());
         }
+    }
+}
+
+/// POSIX identity ops. Every one is a real syscall on unix and a no-op that
+/// reports "unsupported" on Windows, where the JS layer never installs the
+/// corresponding `process.*` function in the first place (Node does not
+/// define them there either).
+///
+/// `which`: 0=uid 1=gid 2=euid 3=egid.
+fn op_posix_get_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let which = args.get(0).int32_value(scope).unwrap_or(0);
+    #[cfg(unix)]
+    {
+        let id = unsafe {
+            match which {
+                0 => libc::getuid(),
+                1 => libc::getgid(),
+                2 => libc::geteuid(),
+                _ => libc::getegid(),
+            }
+        };
+        rv.set_double(f64::from(id));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = which;
+        rv.set(v8::null(scope).into());
+    }
+}
+
+/// Set a POSIX id. Returns null on success or the errno NAME on failure, so
+/// JS can raise Node's `EPERM`-shaped error without a second op.
+/// `which`: 0=uid 1=gid 2=euid 3=egid.
+fn op_posix_set_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let which = args.get(0).int32_value(scope).unwrap_or(0);
+    // uid_t is unsigned; a JS number arrives as f64 and must round-trip
+    // without wrapping (-0 and values past 2^31-1 are explicitly exercised
+    // by test-process-uid-gid).
+    let raw = args.get(1).number_value(scope).unwrap_or(-1.0);
+    #[cfg(unix)]
+    {
+        if !(0.0..=f64::from(u32::MAX)).contains(&raw) || raw.fract() != 0.0 {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        }
+        let id = raw as u32;
+        let ok = unsafe {
+            match which {
+                0 => libc::setuid(id),
+                1 => libc::setgid(id),
+                2 => libc::seteuid(id),
+                _ => libc::setegid(id),
+            }
+        } == 0;
+        if ok {
+            rv.set(v8::null(scope).into());
+        } else {
+            let name = errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            let msg = v8::String::new(scope, name).expect("errno name is short");
+            rv.set(msg.into());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let (_, _) = (which, raw);
+        let msg = v8::String::new(scope, "ENOSYS").expect("static errno string");
+        rv.set(msg.into());
+    }
+}
+
+fn op_posix_get_groups(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    #[cfg(unix)]
+    {
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        if count < 0 {
+            rv.set(v8::null(scope).into());
+            return;
+        }
+        let mut buf = vec![0 as libc::gid_t; count as usize];
+        let got = unsafe { libc::getgroups(count, buf.as_mut_ptr()) };
+        if got < 0 {
+            rv.set(v8::null(scope).into());
+            return;
+        }
+        buf.truncate(got as usize);
+        let arr = v8::Array::new(scope, got);
+        for (i, gid) in buf.iter().enumerate() {
+            let n = v8::Number::new(scope, f64::from(*gid));
+            arr.set_index(scope, i as u32, n.into());
+        }
+        rv.set(arr.into());
+    }
+    #[cfg(not(unix))]
+    {
+        rv.set(v8::null(scope).into());
+    }
+}
+
+/// Takes an array of numeric gids. Returns null on success or an errno name.
+fn op_posix_set_groups(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    #[cfg(unix)]
+    {
+        let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(0)) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
+        let len = arr.length();
+        let mut gids: Vec<libc::gid_t> = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let Some(v) = arr.get_index(scope, i) else {
+                continue;
+            };
+            gids.push(v.number_value(scope).unwrap_or(0.0) as libc::gid_t);
+        }
+        let ok = unsafe { libc::setgroups(gids.len() as _, gids.as_ptr()) } == 0;
+        if ok {
+            rv.set(v8::null(scope).into());
+        } else {
+            let name = errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            let msg = v8::String::new(scope, name).expect("errno name is short");
+            rv.set(msg.into());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        let msg = v8::String::new(scope, "ENOSYS").expect("static errno string");
+        rv.set(msg.into());
+    }
+}
+
+/// initgroups(user, extraGid). Returns null on success or an errno name.
+fn op_posix_init_groups(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    #[cfg(unix)]
+    {
+        let Some(user) = arg_string(scope, &args, 0) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
+        let gid = args.get(1).number_value(scope).unwrap_or(0.0) as libc::gid_t;
+        let Ok(cuser) = std::ffi::CString::new(user) else {
+            let msg = v8::String::new(scope, "EINVAL").expect("static errno string");
+            rv.set(msg.into());
+            return;
+        };
+        // `as _`, not a fixed cast: initgroups(3) takes c_int on macOS and
+        // gid_t (u32) on Linux, so a concrete type breaks one of them.
+        let ok = unsafe { libc::initgroups(cuser.as_ptr(), gid as _) } == 0;
+        if ok {
+            rv.set(v8::null(scope).into());
+        } else {
+            let name = errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            let msg = v8::String::new(scope, name).expect("errno name is short");
+            rv.set(msg.into());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        let msg = v8::String::new(scope, "ENOSYS").expect("static errno string");
+        rv.set(msg.into());
+    }
+}
+
+/// Credential lookup. `kind`: 0 = user NAME -> uid (getpwnam), 1 = group
+/// NAME -> gid (getgrnam), 2 = uid -> user NAME (getpwuid, the reverse
+/// direction initgroups(3) needs since it takes a name, not an id).
+/// Returns null when there is no such entry, which JS turns into Node's
+/// ERR_UNKNOWN_CREDENTIAL.
+fn op_posix_lookup_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let kind = args.get(0).int32_value(scope).unwrap_or(0);
+    #[cfg(unix)]
+    {
+        // uid -> name is the one direction whose input is numeric.
+        if kind == 2 {
+            let uid = args.get(1).number_value(scope).unwrap_or(-1.0);
+            if !(0.0..=f64::from(u32::MAX)).contains(&uid) || uid.fract() != 0.0 {
+                rv.set(v8::null(scope).into());
+                return;
+            }
+            // getpwuid returns a pointer into static storage: copy the name
+            // out immediately, never retain the pointer.
+            let name = unsafe {
+                let pw = libc::getpwuid(uid as libc::uid_t);
+                if pw.is_null() {
+                    None
+                } else {
+                    std::ffi::CStr::from_ptr((*pw).pw_name)
+                        .to_str()
+                        .ok()
+                        .map(str::to_string)
+                }
+            };
+            match name.and_then(|n| v8::String::new(scope, &n)) {
+                Some(s) => rv.set(s.into()),
+                None => rv.set(v8::null(scope).into()),
+            }
+            return;
+        }
+        let Some(name) = arg_string(scope, &args, 1) else {
+            rv.set(v8::null(scope).into());
+            return;
+        };
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            rv.set(v8::null(scope).into());
+            return;
+        };
+        // Same static-storage rule as above.
+        let id: Option<u32> = unsafe {
+            if kind == 0 {
+                let pw = libc::getpwnam(cname.as_ptr());
+                if pw.is_null() {
+                    None
+                } else {
+                    Some((*pw).pw_uid)
+                }
+            } else {
+                let gr = libc::getgrnam(cname.as_ptr());
+                if gr.is_null() {
+                    None
+                } else {
+                    Some((*gr).gr_gid)
+                }
+            }
+        };
+        match id {
+            Some(v) => rv.set_double(f64::from(v)),
+            None => rv.set(v8::null(scope).into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kind;
+        rv.set(v8::null(scope).into());
+    }
+}
+
+/// Apply a `process.env.TZ` write to the actual time zone. Node intercepts
+/// TZ writes and re-reads the zone; without this, assigning TZ changed a
+/// string in a JS object and nothing else, so every `Date` kept the zone the
+/// process started in. Passing null clears TZ (back to the host zone).
+fn op_set_timezone(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = arg_string(scope, &args, 0);
+    // SAFETY: edition 2024 marks env mutation unsafe because it races other
+    // threads calling getenv. This runs on the isolate thread during a JS
+    // property set, and the tzset/ICU refresh below is the whole point of
+    // the call -- the same trade Node makes for process.env.TZ.
+    unsafe {
+        match &value {
+            Some(tz) => std::env::set_var("TZ", tz),
+            None => std::env::remove_var("TZ"),
+        }
+    }
+    // libc caches the parsed zone; tzset() re-reads TZ for anything going
+    // through localtime(3). Declared here rather than used from the libc
+    // crate, which does not export it on darwin.
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn tzset();
+        }
+        unsafe { tzset() };
+    }
+    // V8 caches its own zone for Date: without this notification the change
+    // is invisible to JS no matter what the environment says.
+    scope.date_time_configuration_change_notification(v8::TimeZoneDetection::Redetect);
+}
+
+/// The handful of errno values these ops can realistically produce, by name.
+/// Anything else is reported numerically rather than guessed at.
+#[cfg(unix)]
+fn errno_name(code: i32) -> &'static str {
+    match code {
+        libc::EPERM => "EPERM",
+        libc::EINVAL => "EINVAL",
+        libc::ESRCH => "ESRCH",
+        libc::ENOSYS => "ENOSYS",
+        _ => "EIO",
     }
 }
 

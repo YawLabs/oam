@@ -2641,6 +2641,16 @@
       return dir === pathObject.root ? `${dir}${base}` : `${dir}${sep}${base}`;
     }
 
+    // Node's win32 path.resolve reads process.cwd() (the patchable JS
+    // function), not an internal syscall -- same contract as the posix
+    // side's posixCwd. The default process.cwd IS natives.cwd(), so this
+    // only differs once someone patches it.
+    const win32ProcessCwd = () => {
+      const proc = globalThis.process;
+      if (proc && typeof proc.cwd === "function") return proc.cwd();
+      return natives ? natives.cwd() : "/";
+    };
+
     let mod;
     if (isWin) {
       mod = {
@@ -2655,11 +2665,13 @@
               assertPath(path, `paths[${i}]`);
               if (path.length === 0) continue;
             } else if (resolvedDevice.length === 0) {
-              path = natives ? natives.cwd() : "/";
+              // process.cwd(), not natives.cwd(): Node reads the patchable
+              // JS function here too (see the posix posixCwd note).
+              path = win32ProcessCwd();
             } else {
               // Windows has per-drive CWDs; oam tracks only the process CWD,
               // so fall back to it when the device matches, else the drive root.
-              const envCwd = natives ? natives.cwd() : "/";
+              const envCwd = win32ProcessCwd();
               path =
                 envCwd.slice(0, 2).toLowerCase() === resolvedDevice.toLowerCase()
                   ? envCwd
@@ -3323,8 +3335,20 @@
       // Node's internal posixCwd: on Windows, expose the process CWD in POSIX
       // form (drive letter dropped, '\' -> '/') so path.posix.* on a Windows
       // host behaves like the test corpus expects.
+      // Node's path module reads `process.cwd()` -- the PATCHABLE JS
+      // function -- never an internal syscall. Going straight to
+      // natives.cwd() made a patched cwd unobservable, so `path.resolve()`
+      // could not degrade to '.' the way test-path-resolve requires when
+      // process.cwd() is made to fail (it patches it to return ''). The
+      // default process.cwd IS natives.cwd(), so this is behavior-neutral
+      // until someone patches it.
+      const processCwd = () => {
+        const proc = globalThis.process;
+        if (proc && typeof proc.cwd === "function") return proc.cwd();
+        return natives ? natives.cwd() : "/";
+      };
       const posixCwd = () => {
-        const raw = natives ? natives.cwd() : "/";
+        const raw = processCwd();
         if (natives && natives.platform === "win32") {
           const slashed = raw.replace(/\\/g, "/");
           const idx = slashed.indexOf("/");
@@ -3642,7 +3666,9 @@
   function platformOFlags(platform) {
     if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
     if (platform === "darwin") return { O_CREAT: 512, O_EXCL: 2048, O_TRUNC: 1024, O_APPEND: 8 };
-    return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024 }; // linux + other
+    // O_NOATIME is Linux-only and must be ABSENT elsewhere -- Node's test
+    // asserts both directions, and code feature-detects with `in`.
+    return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
   }
 
   // os.constants.errno is POSITIVE in Node (POSIX errno; ENOENT=2), unlike the
@@ -8453,6 +8479,63 @@
     // runtime at startup. Node lazy-initializes stdio the same way.
     const { Buffer } = registry.get("buffer");
 
+    // ---- POSIX credential helpers (see the identity block far below) ----
+    // Node validates every id argument before it reaches the syscall, and
+    // the conformance suite asserts the exact message text, so these build
+    // Node's shapes rather than approximating them.
+    const credentialKindWord = (kind) => (kind === "uid" ? "User" : "Group");
+    /// TYPE validation only -- Node checks the shape of EVERY argument before
+    /// resolving ANY of them, so `initgroups('nonexistent', undefined)`
+    /// reports the bad extraGroup rather than failing the name lookup first.
+    const validateCredentialType = (value, argName) => {
+      if (typeof value === "number") {
+        // Node rejects non-integers and anything outside uid_t range here;
+        // -0 and 2**32-1 are explicitly exercised and must not crash.
+        if (!Number.isInteger(value) || value < 0 || value > 4294967295) {
+          throw new codes.ERR_OUT_OF_RANGE(
+            argName,
+            ">= 0 && < 4294967296",
+            value,
+          );
+        }
+        return;
+      }
+      if (typeof value !== "string") {
+        throw new codes.ERR_INVALID_ARG_TYPE(argName, ["number", "string"], value);
+      }
+    };
+    /// number | string -> numeric id. ERR_UNKNOWN_CREDENTIAL for a name with
+    /// no passwd/group entry.
+    const resolveCredential = (value, argName, kind) => {
+      validateCredentialType(value, argName);
+      if (typeof value === "number") return value;
+      const id = natives.posixLookupId(kind === "uid" ? 0 : 1, value);
+      if (id === null || id === undefined) {
+        throw makeNodeError(
+          "ERR_UNKNOWN_CREDENTIAL",
+          `${credentialKindWord(kind)} identifier does not exist: ${value}`,
+        );
+      }
+      return id;
+    };
+    /// An errno name from a credential syscall -> a Node-shaped Error.
+    const credentialSyscallError = (errnoName, syscall) => {
+      const err = makeNodeError(errnoName, `${errnoName}, ${syscall}`);
+      err.errno = errnoName;
+      err.syscall = syscall;
+      return err;
+    };
+    const posixSetId = (which, id, kind) => {
+      const resolved = resolveCredential(id, "id", kind);
+      const errnoName = natives.posixSetId(which, resolved);
+      if (errnoName) {
+        throw credentialSyscallError(
+          errnoName,
+          ["setuid", "setgid", "seteuid", "setegid"][which],
+        );
+      }
+    };
+
     // process.nextTick: a real FIFO tick queue (streams-port slice 0), now
     // HOST-DRAINED (docs/design/nexttick-engine.md): the engine loops
     // drain -> microtask checkpoint at every tick point, Node's
@@ -8714,7 +8797,12 @@
         // undefined). Silently ignore rather than throw.
         if (prop === "") return true;
         const store = ensureEnv();
-        store[envResolveKey(store, prop)] = String(value);
+        const key = envResolveKey(store, prop);
+        store[key] = String(value);
+        // TZ is not just a string: Node re-reads the zone on assignment so
+        // subsequent Dates render in it. Without this the variable changed
+        // and every Date kept the zone the process started in.
+        if (key === "TZ") natives.setTimeZone(String(value));
         return true;
       },
       has(_, prop) {
@@ -8727,7 +8815,10 @@
       deleteProperty(_, prop) {
         if (typeof prop === "symbol") return true;
         const store = ensureEnv();
-        delete store[envResolveKey(store, prop)];
+        const key = envResolveKey(store, prop);
+        delete store[key];
+        // Deleting TZ returns to the host zone -- same refresh as setting it.
+        if (key === "TZ") natives.setTimeZone(null);
         return true;
       },
       defineProperty(_, prop, desc) {
@@ -9581,18 +9672,59 @@
       // POSIX identity API. Node defines these only on POSIX hosts -- on
       // Windows every one of them is undefined (test-process-uid-gid and
       // friends assert exactly that), so the keys must be absent, not stubbed.
+      //
+      // These were stubs returning 0 until 2026-08-04. `getuid: () => 0`
+      // claimed the process was ROOT, which is both false and load-bearing:
+      // real code (and Node's own suite) branches on `getuid() === 0`. They
+      // are real syscalls now, and the setters validate their arguments
+      // exactly as Node does instead of silently accepting anything.
       ...(natives.platform === "win32" ? {} : {
-        getuid: () => 0,
-        getgid: () => 0,
-        geteuid: () => 0,
-        getegid: () => 0,
-        setuid: () => {},
-        setgid: () => {},
-        seteuid: () => {},
-        setegid: () => {},
-        getgroups: () => [0],
-        setgroups: () => {},
-        initgroups: () => {},
+        getuid: () => natives.posixGetId(0),
+        getgid: () => natives.posixGetId(1),
+        geteuid: () => natives.posixGetId(2),
+        getegid: () => natives.posixGetId(3),
+        setuid: (id) => posixSetId(0, id, "uid"),
+        setgid: (id) => posixSetId(1, id, "gid"),
+        seteuid: (id) => posixSetId(2, id, "uid"),
+        setegid: (id) => posixSetId(3, id, "gid"),
+        getgroups: () => natives.posixGetGroups() ?? [],
+        setgroups: (groups) => {
+          if (!Array.isArray(groups)) {
+            throw new codes.ERR_INVALID_ARG_TYPE("groups", "Array", groups);
+          }
+          // Node names the INDEX in element errors ("groups[0]"), which is
+          // the difference between a usable message and a guess when one
+          // entry of a long list is wrong.
+          const resolved = groups.map((g, i) =>
+            resolveCredential(g, `groups[${i}]`, "gid"),
+          );
+          const err = natives.posixSetGroups(resolved);
+          if (err) throw credentialSyscallError(err, "setgroups");
+        },
+        initgroups: (user, extraGroup) => {
+          validateCredentialType(user, "user");
+          validateCredentialType(extraGroup, "extraGroup");
+          const gid = resolveCredential(extraGroup, "extraGroup", "gid");
+          // initgroups(3) takes the user by NAME, so a numeric uid is mapped
+          // back through getpwuid rather than rejected.
+          let name = user;
+          if (typeof user === "number") {
+            name = natives.posixLookupId(2, user);
+            if (name === null || name === undefined) {
+              throw makeNodeError(
+                "ERR_UNKNOWN_CREDENTIAL",
+                `User identifier does not exist: ${user}`,
+              );
+            }
+          } else if (natives.posixLookupId(0, user) === null) {
+            throw makeNodeError(
+              "ERR_UNKNOWN_CREDENTIAL",
+              `User identifier does not exist: ${user}`,
+            );
+          }
+          const err = natives.posixInitGroups(name, gid);
+          if (err) throw credentialSyscallError(err, "initgroups");
+        },
       }),
       setUncaughtExceptionCaptureCallback(fn) {
         if (fn === null) { process._uncaughtCaptureCb = null; return; }
@@ -10717,7 +10849,7 @@
   registry.factories.url = (natives) => {
     const isWin = natives.platform === "win32";
 
-    function fileURLToPath(input) {
+    function fileURLToPath(input, options) {
       if (typeof input !== "string" && !(input instanceof globalThis.URL)) {
         throw new codes.ERR_INVALID_ARG_TYPE("path", ["string", "URL"], input);
       }
@@ -10728,19 +10860,26 @@
           "The URL must be of scheme file",
         );
       }
-      // Encoded separators would let a URL smuggle path segments past
-      // consumers â€” Node throws, so do we.
-      if (/%2f|%5c/i.test(url.pathname)) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_PATH",
-          "File URL path must not include encoded \\ or / characters",
-        );
-        e.input = url;
-        throw e;
-      }
-      let pathname = decodeURIComponent(url.pathname);
-      if (isWin) {
-        pathname = pathname.replaceAll("/", "\\");
+      // options.windows forces win32/posix semantics regardless of host
+      // (Node v22: fileURLToPath(path, { windows }), mirroring
+      // pathToFileURL). `null` is explicitly allowed and means host default.
+      const win =
+        options != null && typeof options === "object" && options.windows !== undefined
+          ? !!options.windows
+          : isWin;
+
+      if (win) {
+        // Encoded separators would let a URL smuggle path segments past
+        // consumers. Windows rejects BOTH, since '\' is a separator there.
+        if (/%2f|%5c/i.test(url.pathname)) {
+          const e = makeNodeError(
+            "ERR_INVALID_FILE_URL_PATH",
+            "File URL path must not include encoded \\ or / characters",
+          );
+          e.input = url;
+          throw e;
+        }
+        let pathname = decodeURIComponent(url.pathname).replaceAll("/", "\\");
         if (url.hostname) {
           // file://server/share -> \\server\share
           return `\\\\${url.hostname}${pathname}`;
@@ -10757,7 +10896,32 @@
         }
         return pathname.slice(1); // strip the slash before the drive letter
       }
-      return pathname;
+
+      // POSIX: only an encoded '/' is rejected. A BACKSLASH IS A LEGAL
+      // FILENAME CHARACTER here, so rejecting %5C (the Windows rule)
+      // made 'file:///foo%5Cbar' -- a real, addressable file -- unopenable.
+      if (/%2f/i.test(url.pathname)) {
+        const e = makeNodeError(
+          "ERR_INVALID_FILE_URL_PATH",
+          "File URL path must not include encoded / characters",
+        );
+        e.input = url;
+        throw e;
+      }
+      // A host is meaningless for a POSIX file path (no UNC), so Node
+      // refuses rather than silently dropping it and returning a path
+      // that points somewhere else entirely.
+      if (url.hostname) {
+        const e = makeNodeError(
+          "ERR_INVALID_FILE_URL_HOST",
+          `File URL host must be "localhost" or empty on ${
+            natives && natives.platform ? natives.platform : "posix"
+          }`,
+        );
+        e.input = url;
+        throw e;
+      }
+      return decodeURIComponent(url.pathname);
     }
 
     function pathToFileURL(path, options) {
