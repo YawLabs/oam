@@ -1,7 +1,8 @@
 # Streaming HTTP bodies
 
-Status: proposed. Owner: unassigned. Prereq for: `test-stream-pipeline.js`,
-divergence #16 in `docs/node-divergences.md`.
+Status: SHIPPED (slices 1-5 complete, 2026-08-04). `test-stream-pipeline.js`
+passes; divergence #16 in `docs/node-divergences.md` now documents only the
+GET/HEAD wire-shape difference that remains.
 
 ## The problem
 
@@ -261,6 +262,92 @@ Each is independently shippable and gated by the full chain
    IncomingMessage reaches `complete`/`push(null)` now, since the read op no
    longer produces a premature EOF.
 
+   THE SOMETHING ELSE, FOUND AND FIXED: `RequestGuard::drop`. The guard
+   fires when `handle_request` returns -- which for a STREAMING response is
+   the moment JS sends headers, not when the exchange ends -- and it removed
+   the `bodies` entry unconditionally, dropping the live chunk receiver
+   mid-body. So the instant `pipeline(req, res)` wrote its first chunk, the
+   pump lost its consumer and the next read fell through to Absent -> EOF.
+   Reproduced outside b008 with a POST echo (5 chunks, 30ms apart): node
+   echoes all 5 live; oam echoed only c1. The fix, as finally landed after
+   an adversarial review round tore up the first version:
+
+   - `RequestGuard` carries a `dispatched` flag, set once the request has
+     been handed to the JS accept queue. On drop, Stream/StreamPending
+     entries of a DISPATCHED request survive -- whether or not a response
+     was sent, because an aborted upload must deliver the pump's queued
+     `Err` to the consumer (Node errors the request; reaping here silently
+     truncated it to a clean 'end'). An undispatched request (queue send
+     failed or cancelled mid-send) has no JS reaper, so drop removes it.
+     The first version keyed on "was a response sent" (pending responder
+     absent) instead -- wrong twice: a respond-vs-disconnect race leaked
+     the entry with no JS path ever notified, and the cancelled-pre-
+     response path swallowed the error.
+   - `put_body_stream` reinserts ONLY onto a StreamPending marker, so a
+     body cancelled while a read was in flight stays cancelled (dropping
+     the receiver stops the pump) instead of being resurrected.
+   - JS owns the reap of every dispatched streamed body: read-to-EOF and
+     read-error remove the entry in the op itself; `_dumpReq` fires on
+     response finish, on the `httpStreamClosed` watcher (client vanished
+     mid-response), and on the respond-failed branch of `res.write()`
+     (the respond-vs-disconnect race above -- the only notification JS
+     gets that the exchange died); and `IncomingMessage._destroy` cancels
+     on mid-stream destroy.
+   - `_dumpReq` is gated on Node's resOnFinish semantics: `req._consuming
+     || req._readableState.resumeScheduled`. `_read` sets `_consuming`,
+     but that alone loses a RACE the e2e gate caught: a handler that does
+     `req.on('data')` and `res.end()` in the same tick has only SCHEDULED
+     its first read (resume runs on nextTick; the finish path on a
+     microtask), so the dump fired before `_consuming` was set and
+     truncated the drain. Without the gate at all, a handler that
+     responds early and keeps draining had its body cancelled mid-read,
+     and a client abort mid-upload was converted into a clean truncated
+     'end' with `complete === true` -- the review's worst finding.
+   - A handler that neither reads, responds, nor destroys leaks the entry
+     (bounded: <= 8 chunks + a parked pump task) for the request's
+     lifetime -- the same class as JS holding a request object forever.
+     Accepted and documented rather than papered over.
+
+   AND THE PART NOBODY PREDICTED: with full-duplex fixed, b008 does not
+   even exercise it. The vendored block's client is `http.request({port})`
+   -- a GET -- and Node never chunk-frames GET/HEAD writes
+   (`useChunkedEncodingByDefault` = false): the request goes out on first
+   write with the body bytes following UNFRAMED. A Node server parses a
+   bodyless GET (req ends immediately, handler echoes EMPTY -- measured:
+   the raw wire is `GET / ... \r\n\r\nhelloworld`), and the stray bytes
+   poison the connection (400 + teardown), which is what settles the
+   client pipeline with ERR_STREAM_PREMATURE_CLOSE. On Node, b008 passes
+   via this degenerate path -- data never flows through the echo at all.
+   A framed (POST) variant of b008 would fail `mustSucceed` on Node too,
+   because the client-side rs.destroy() would abort a request the server
+   is still reading.
+
+   oam's client streamed a PROPERLY-FRAMED chunked body even for GET, so
+   it diverged: the old GET/HEAD early-return in `_startBodyStreamIfOpen`
+   meant the request never went out until `end()` -- which b008 never
+   calls -- so the whole block hung. Fixed by matching Node's observable
+   shape without the wire poisoning: a GET/HEAD with a body still open on
+   the next tick dispatches the request BODYLESS immediately (`_sent`
+   guard keeps a later `end()` from firing a second request; buffered
+   writes never go on the wire). The response completing then closes a
+   never-finished request -- the same premature close Node's dead
+   connection produces. Divergence #16 in docs/node-divergences.md
+   documents the wire-level difference.
+
+   Three holes caught after the first version, all fixed: upgrade
+   handshakes (`connection: upgrade` with a preamble write before
+   `end()`) must NOT early-dispatch or `_doUpgradeRequest` never runs and
+   'upgrade' never fires -- the arm branch skips them; `end(cb)`
+   registered its callback via `once('response')`, which the early
+   dispatch makes droppable (the response can now precede `end()`), so
+   both registration sites fire the callback immediately when `this.res`
+   is already set; and the premature close originally rode the
+   response-reader's EOF, so a caller that never CONSUMED the response
+   hung forever (the e2e gate caught this -- 2 wedged hours of it). Now a
+   `_droppedWrites` request that is still un-`end()`ed when its response
+   arrives is closed on the next tick, the socket-death shape, regardless
+   of whether anyone reads the response.
+
    ORIGINAL FIX DIRECTION: keep an entry present while the receiver is checked out
    (a Stream/StreamPending distinction, or hold it under a lock instead of
    remove-await-reinsert) so a subsequent read WAITS rather than EOFing.
@@ -273,6 +360,14 @@ Each is independently shippable and gated by the full chain
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd
    today because ref'ing it can pin the loop forever when hyper never
    notices a vanished peer.
+
+   OUTCOME: with the two fixes above, the ENTIRE vendored
+   test-stream-pipeline.js exits 0 -- b008 and b006 both pass, and the
+   ref/unref question never needed answering. node-suite moved 399/401 ->
+   400/401 (the windows-aarch64 pass floor is ratcheted to 400); the only
+   remaining failure is test-process-versions, the deliberate one. The
+   MCP-shaped smoke (keep-alive JSON-RPC agent, including a 64KB body the
+   handler never reads, then more requests on the same socket) passes.
 
 Slices 1-3 are the bulk. Slice 4 is smaller but touches `fetch`, which is on
 the live MCP client path.
@@ -299,6 +394,7 @@ the live MCP client path.
   reads cleanly on Windows (it never reaches the streamed path); an
   undeclared body that exceeds mid-stream errors the request stream.
 - `test-stream-pipeline.js` b008 passes; b006 tracked separately.
+  MET 2026-08-04: the whole file exits 0 (b006 included).
 
 ## Adjacent bug found while diagnosing slice 4b: localhost resolution
 
@@ -333,32 +429,28 @@ Paste-able brief for a fresh session. Read the rest of this document first --
 it carries the design, what shipped, and the wrong turns, and it outranks this
 summary wherever they disagree.
 
-**State.** Branch `main`, clean and pushed. node-suite 399/401 (99.5%), e2e
-324/0, conformance 55/55. Slices 1-4b landed: server dispatches on headers,
-`IncomingMessage` is a real Readable, outbound body channels exist, and
-`ClientRequest` streams an incremental body. The loopback latency bug found
-along the way is fixed.
+**State.** COMPLETE as of 2026-08-04. Slices 1-5 all landed: server
+dispatches on headers, `IncomingMessage` is a real Readable, outbound body
+channels exist, `ClientRequest` streams an incremental body, a streamed
+request body survives the response starting (full-duplex
+`pipeline(req, res)` echoes live), and GET/HEAD writes follow Node's
+dispatch-on-first-write shape. `test-stream-pipeline.js` exits 0 (b008 AND
+b006). node-suite 400/401 (99.8%, floor ratcheted to 400 on
+windows-aarch64), e2e 324/0, conformance 55/55. The loopback latency bug
+found along the way is fixed.
 
-**Task.** `test-stream-pipeline` block b008 still fails. Reduce it and find the
-next divergence.
+**Remaining follow-ups**, all optional:
 
-Server does `pipeline(req, res)` echoing the body; client streams 11 chunks via
-`pipeline(rs, req)`. Node: the client receives 10 data chunks, then
-`rs.destroy()`. oam: the client receives NO data -- the server echoes an EMPTY
-body (`[srv] pipeline done err=undefined`).
-
-Already fixed and NOT the answer: the read op used to report EOF for a receiver
-that was merely checked out. That class is gone and the ordering improved, but
-the body still ends early. Next step is to trace where the server-side
-`IncomingMessage` reaches `complete` / `push(null)` now that
-`httpRequestBodyRead` no longer returns a premature EOF -- instrument
-`IncomingMessage._read` (js/node_compat.js) and `pump_request_body`
-(crates/oam_core/src/http_server.rs) behind an env gate, then REVERT the
-instrumentation before committing.
-
-Lower priority, same file: b006 exits 1 and needs the `op_http_stream_closed`
-ref/unref trade decided (a real engine tradeoff, not a bug), and the
-happy-eyeballs follow-up for loopback.
+- Happy-eyeballs for loopback: a server bound only to `::1` pays ~307ms on
+  first contact (Node ~10ms). Needs a custom resolver/connector or an
+  upstream reqwest knob -- see "localhost resolution" below.
+- The slow-consumer memory test from Risks (assert flat RSS with a slow
+  reader) was never written; the bounded channel is the guard but nothing
+  asserts it.
+- GET/HEAD buffered writes are retained in `_body` until the request
+  object dies; an unbounded producer piping into a GET grows it. Node
+  instead writes the bytes to a (poisoned) socket. Pathological either
+  way; noted in divergence #16.
 
 **Gates.** All must pass before committing; run sequentially with
 `set -o pipefail`:
@@ -397,4 +489,5 @@ time out the call.
    a keep-alive agent, including a body the handler never reads), not just e2e.
 
 Do NOT mark b008 skipped in the manifest to make the number green. It is a real
-gap and is deliberately left failing.
+gap and is deliberately left failing. (Resolved 2026-08-04: it PASSES now --
+never skipped, the gap was closed for real.)

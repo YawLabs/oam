@@ -266,24 +266,26 @@ you are coming from a TypeScript toolchain:
 
 ---
 
-### 16. HTTP request bodies do not stream
+### 16. GET/HEAD body writes are dropped, not sent unframed
 
-Both halves of the HTTP path materialize a request body before it moves:
+HTTP bodies stream in both directions now (docs/design/streaming-bodies.md):
+the server dispatches handlers on headers and feeds the body incrementally,
+the client streams an incremental body with chunked encoding, and a
+full-duplex `pipeline(req, res)` echoes chunks while the request is still
+arriving. What remains divergent is Node's degenerate GET/HEAD wire shape.
 
-- **Server:** the runtime collects the full request body before dispatching
-  the JS handler (`crates/oam_core/src/http_server.rs`). A chunked request
-  that withholds its terminator delays the handler by exactly that long --
-  measured at 521ms against Node's 13ms for a 500ms-delayed terminator.
-- **Client:** `http.ClientRequest` accumulates writes and hands the complete
-  body to the transport at `end()`. There is no streaming request body and
-  no in-flight cancel.
-
-Consequence: a pipeline that interleaves an unfinished request body with the
-response cannot complete. `stream.pipeline(readable, req)` works when the
-readable ends; it stalls when the readable stays open and expects the server
-to respond to partial input. This is why `test-stream-pipeline.js` is a
-failing test rather than a skipped one -- it is a real gap, not a harness
-artifact, and it is left visible on purpose.
+Node never chunk-frames writes on a GET or HEAD request
+(`useChunkedEncodingByDefault` is false): the request goes out on the first
+write and the body bytes follow **unframed**, so a server parses a bodyless
+request and the stray bytes then poison the keep-alive connection --
+typically a 400 for a garbage pipelined request, then teardown. oam matches
+the observable JS shape without the wire poisoning: the request is
+dispatched **bodyless** on the first write, the written bytes never go on
+the wire, and the response completing closes the never-`end()`ed request
+(the same `ERR_STREAM_PREMATURE_CLOSE` a Node caller observes). Code that
+byte-inspects the wire, or depends on the poisoned connection 400ing a
+subsequent request, will see the difference; `pipeline(readable, http.get)`
+behaves as on Node.
 
 ### 17. `req.end(callback)` fires the callback on `'response'`, not `'finish'`
 
@@ -362,13 +364,18 @@ entries below were executed on both runtimes unless marked.
 
 ## Known failures in the vendored suite
 
-The three failures behind the 399/402, triaged honestly.
+The one failure behind the 400/401, triaged honestly.
 
 | Test | Status |
 |---|---|
 | `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. |
-| `test-process-dlopen-error-message-crash.js` | **Harness artifact, not an oam divergence.** The test's actual assertion — that a `%s`-bearing filename is never passed to a format function — passes in oam. It then calls `fs.accessSync('test/addons/not-a-binding')`, a compiled-addon fixture the vendored subset does not ship, and dies there. Verified: real Node v22.22.2 fails this test identically from the same vendored tree. |
-| `test-stream-pipeline.js` | **A real bug.** It hangs rather than failing an assertion (the suite records it as a timeout); Node completes it in under a second. The test exercises `stream.pipeline` across `http`, `net`, and `timers/promises`, so the fault is in one of those seams. Being fixed — it is not a documented behavior. |
+| `test-process-dlopen-error-message-crash.js` | **Reclassified unrunnable, not a failure.** The test's actual assertion — that a `%s`-bearing filename is never passed to a format function — passes in oam. It then calls `fs.accessSync('test/addons/not-a-binding')`, a compiled-addon fixture the vendored subset does not ship, and dies there. Verified: real Node v22.22.2 fails this test identically from the same vendored tree. |
+
+`test-stream-pipeline.js` used to sit in this table as a real bug (it hung
+on a full-duplex echo). It passes since the streaming-bodies work completed:
+the engine no longer reaps a streamed request body when the response starts,
+and GET/HEAD writes follow Node's dispatch-on-first-write shape
+(divergence 16).
 
 ---
 
