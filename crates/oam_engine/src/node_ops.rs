@@ -52,7 +52,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 6] = [
+    let data: [(&str, v8::Local<v8::Value>); 7] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
         (
@@ -64,6 +64,14 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "v8Version",
             v8::String::new(scope, v8::VERSION_STRING).unwrap().into(),
+        ),
+        (
+            // Real shipped dependency versions (JSON), read from Cargo.lock
+            // by build.rs -- the honest tail of process.versions.
+            "depVersions",
+            v8::String::new(scope, env!("OAM_DEP_VERSIONS"))
+                .unwrap()
+                .into(),
         ),
         (
             "pid",

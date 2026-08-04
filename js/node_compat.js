@@ -9054,6 +9054,15 @@
         node: "22.16.0",
         oam: natives.oamVersion,
         v8: natives.v8Version,
+        // Real shipped implementations under their REAL names, versions
+        // read from Cargo.lock at build time (oam_engine/build.rs), so
+        // they can never drift from what is linked. Node's dependency
+        // keys (uv, openssl, llhttp, ares, napi, modules, ...) stay
+        // ABSENT on purpose: packages branch on those claims -- addon
+        // loaders load .node binaries when `modules` looks right, crypto
+        // detection takes OpenSSL paths -- and a missing key routes them
+        // to their supported fallbacks. docs/node-divergences.md #1.
+        ...JSON.parse(natives.depVersions),
       },
       pid: natives.pid,
       ppid: natives.ppid,

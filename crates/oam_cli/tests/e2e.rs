@@ -6809,6 +6809,38 @@ fn http_body_keeps_streaming_after_early_response() {
 }
 
 #[test]
+fn process_versions_honest_keys() {
+    // process.versions publishes REAL shipped implementations under their
+    // real names (versions read from Cargo.lock at build time by
+    // oam_engine/build.rs) and NEVER publishes Node's dependency names for
+    // libraries oam does not contain -- packages branch on those claims
+    // (addon loaders crash on a lying `modules`; crypto detection takes
+    // OpenSSL paths that do not exist). docs/node-divergences.md #1.
+    let stdout = run_ok(
+        "process_versions.mjs",
+        "const v = process.versions;\n\
+         const versionish = /^\\d+\\.\\d+\\.\\d+/;\n\
+         const real = ['node', 'oam', 'v8', 'brotli', 'flate2', 'h2', 'hickory',\n\
+                       'hyper', 'oxc', 'reqwest', 'ring', 'rustls', 'tokio', 'url'];\n\
+         for (const k of real) {\n\
+           console.log('has_' + k + ':', typeof v[k] === 'string' && versionish.test(v[k]));\n\
+         }\n\
+         const lying = ['uv', 'openssl', 'llhttp', 'ares', 'nghttp2', 'napi',\n\
+                        'modules', 'undici', 'zlib', 'ada', 'acorn', 'zstd', 'icu'];\n\
+         for (const k of lying) {\n\
+           console.log('absent_' + k + ':', !(k in v));\n\
+         }\n\
+         console.log('node_first:', Object.keys(v)[0] === 'node');",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn http_client_socket_event_and_headers() {
     let addr = spawn_echo_server();
     let stdout = run_ok(

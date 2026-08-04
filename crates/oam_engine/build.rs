@@ -9,7 +9,84 @@
 //! of the blob entirely. The win grows as js/ grows (ECMA-429 surface,
 //! node: shims land here).
 
+/// Real dependency versions for `process.versions`, read from the workspace
+/// lockfile at build time so the published numbers can never drift from what
+/// is actually linked. A missing crate is a BUILD error, not a silent
+/// absence: dropping a dependency must consciously update this list. Only
+/// libraries oam genuinely ships are listed -- Node's dependency names (uv,
+/// openssl, llhttp, ares, napi, modules, ...) are deliberately never
+/// published for software that is not in the binary
+/// (docs/node-divergences.md divergence 1).
+fn dep_versions_json() -> String {
+    // (process.versions key, Cargo.lock package name), alphabetical by key.
+    const DEPS: &[(&str, &str)] = &[
+        ("brotli", "brotli"),
+        ("flate2", "flate2"),
+        ("h2", "h2"),
+        ("hickory", "hickory-resolver"),
+        ("hyper", "hyper"),
+        ("oxc", "oxc_parser"),
+        ("reqwest", "reqwest"),
+        ("ring", "ring"),
+        ("rustls", "rustls"),
+        ("tokio", "tokio"),
+        ("url", "url"),
+    ];
+    let lock_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let lock = std::fs::read_to_string(&lock_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", lock_path.display()));
+    let mut json = String::from("{");
+    for (i, (key, package)) in DEPS.iter().enumerate() {
+        let versions = lock_package_versions(&lock, package);
+        let version = match versions.as_slice() {
+            [one] => one,
+            [] => panic!(
+                "{package} not found in Cargo.lock -- process.versions.{key} would go stale; \
+                 update DEPS in oam_engine/build.rs to match the real dependency set"
+            ),
+            many => panic!(
+                "{package} appears {} times in Cargo.lock ({many:?}) -- process.versions.{key} \
+                 would be ambiguous; deduplicate the dependency or pick explicitly in build.rs",
+                many.len()
+            ),
+        };
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{key}\":\"{version}\""));
+    }
+    json.push('}');
+    json
+}
+
+/// Every version of `package` pinned in the lockfile text (lockfile v3/v4
+/// shape: a `[[package]]` block with `name = "..."` then `version = "..."`).
+fn lock_package_versions(lock: &str, package: &str) -> Vec<String> {
+    let needle = format!("name = \"{package}\"");
+    let mut versions = Vec::new();
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != needle {
+            continue;
+        }
+        for follow in lines.by_ref() {
+            let follow = follow.trim();
+            if let Some(v) = follow.strip_prefix("version = \"") {
+                versions.push(v.trim_end_matches('"').to_string());
+                break;
+            }
+            if follow.starts_with("[[") {
+                break;
+            }
+        }
+    }
+    versions
+}
+
 fn main() {
+    println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
+
     // V8 snapshots are architecture-specific, and this build script runs on
     // the HOST: cross-compiling would silently embed a host-arch blob that
     // crashes the target binary at first isolate creation. Fail loudly until

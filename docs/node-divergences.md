@@ -48,8 +48,9 @@ something false.
 ### 1. `process.versions` lists only what oam actually contains
 
 ```js
-// oam
-{ node: '22.16.0', oam: '0.8.0', v8: '15.0.245.2-rusty' }
+// oam — compat claims, identity, then the REAL dependency tree
+{ node: '22.16.0', oam: '0.8.0', v8: '15.0.245.2-rusty',
+  brotli, flate2, h2, hickory, hyper, oxc, reqwest, ring, rustls, tokio, url }
 
 // Node v22.22.2 — 27 keys
 { node, acorn, ada, amaro, ares, brotli, cjs_module_lexer, cldr, icu, llhttp, modules,
@@ -61,7 +62,20 @@ Node's extra keys are the versions of the C libraries it bundles. oam does not b
 them — it has no libuv, no OpenSSL, no llhttp, no nghttp2, no ICU build of its own — so
 there is no honest version string to print. Publishing `uv: '1.51.0'` for software that
 is not in the binary would mislead exactly the code that reads it: feature detection,
-CVE scanners, and support tooling that maps a version to a known vulnerability.
+CVE scanners, and support tooling that maps a version to a known vulnerability. The
+sharpest case is `modules`/`napi`: addon loaders read those to decide a precompiled
+`.node` binary can be loaded — oam cannot load those, so the lie converts a package's
+working JS fallback into a crash.
+
+What oam publishes instead is its own real dependency tree, under real names: `tokio`
+(event loop), `hyper` + `h2` (HTTP), `reqwest` (client), `rustls` + `ring` (TLS/crypto),
+`hickory` (DNS), `flate2` + `brotli` (compression), `oxc` (JS/TS parser), `url`
+(WHATWG URL). The versions are read from `Cargo.lock` at build time
+(`crates/oam_engine/build.rs`) — a missing or version-ambiguous crate fails the build,
+so the published numbers can never drift from what is linked. `brotli` appears in both
+lists and means the same thing in both: the brotli implementation genuinely in the
+binary. An e2e test asserts both directions: real keys present and version-shaped,
+Node-only dependency names provably absent.
 
 `process.version` reports **`v22.16.0`** — the Node LTS line oam's compat layer targets,
 not a Node build you have installed. Packages feature-detect on it, so it has to be a
