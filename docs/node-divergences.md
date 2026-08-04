@@ -8,10 +8,11 @@ Node exactly would mean publishing something untrue. This page is the list. If o
 surprises you, check here first; if the surprise is not here, it is a bug and we want the
 report.
 
-**Verified against:** oam 0.8.0 vs Node v22.22.2, on windows-aarch64. Items marked
-_(source)_ were read out of oam's implementation rather than executed on every platform;
-items marked _(Windows-verified)_ were measured on Windows and the same measurement has
-not been repeated on Linux/macOS.
+**Verified against:** oam 0.8.0 vs Node v22.22.2, on windows-aarch64, with a
+suite-level cross-platform sweep on macos-aarch64 and linux-x86_64 (2026-08-04).
+Items marked _(source)_ were read out of oam's implementation rather than executed on
+every platform; items marked _(Windows-verified)_ were measured on Windows and that
+specific measurement has not been repeated on Linux/macOS.
 
 Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scorecard),
 [CONFORMANCE.md](../CONFORMANCE.md) (WPT + the Node differential suite),
@@ -21,16 +22,21 @@ Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scor
 
 ## The conformance number, qualified
 
-oam passes **399/402 (99.3%)** of the vendored Node core tests it can run. Read that with
-the denominator in view:
+oam passes **400/401 (99.8%)** of the vendored Node core tests it can run **on
+windows-aarch64**. Read that with the denominator in view:
 
 - **The corpus is a subset.** It currently covers `assert`, `buffer`, `events`, `path`,
   `process`, `querystring`, `stream`, `string_decoder`, `timers`, `url`, and `util`. The
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
-- **399/402 is pass/runnable, not pass/total.** Against every vendored file it is
-  **399/476 (83.8%)**: 17 tests skip themselves at runtime and 57 are unrunnable by the
+- **400/401 is pass/runnable, not pass/total.** Against every vendored file it is
+  **400/476 (84.0%)**: 17 tests skip themselves at runtime and 58 are unrunnable by the
   harness (they need `// Flags:` support or fixtures the vendored subset does not carry).
+- **It is also the BEST of the three platforms, because Windows runs the fewest tests.**
+  macos-aarch64 measures 392/408 and linux-x86_64 392/409 — larger denominators, since
+  Windows skips POSIX-only tests the others run. See "POSIX-only gaps" near the end for
+  exactly what fails there; quoting only the Windows figure would overstate the state of
+  the runtime.
 - **The oracle is exit 0.** Node core tests self-assert; a test "passes" when it runs to
   completion without throwing. That is Node's own bar, but it is a coarser signal than a
   golden-output diff. The [Node differential suite](../CONFORMANCE.md) (55 cases,
@@ -89,8 +95,8 @@ fabrication like any other.
 not a Node build you have installed. Packages feature-detect on it, so it has to be a
 real Node version; treat it as a compatibility claim, not an identity.
 
-`node:process`'s `test-process-versions.js` fails for this reason, on purpose. It is one
-of the three failures in the scorecard.
+`node:process`'s `test-process-versions.js` fails for this reason, on purpose. It is the
+single remaining failure in the windows-aarch64 scorecard.
 
 ### 2. `process.dlopen` exists but cannot load a native addon
 
