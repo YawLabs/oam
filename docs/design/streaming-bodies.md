@@ -179,15 +179,24 @@ Each is independently shippable and gated by the full chain
    its own call. Measure per-request deltas (call -> dispatch), never
    absolute stamps, or you will "find" a delay that is not there.
 
-   Still unexplained, and it IS a real delta: in the reverted 4b,
-   `a.write('hello')` at ~0ms with streaming armed at 3ms produced a server
-   dispatch at ~316ms -- call and dispatch on the same request, so the
-   pitfall above does not explain it. Everything on the transport side is
-   cleared, so the next step is to prove whether `globalThis.fetch` is
-   actually REACHED at 3ms in the ClientRequest path (log immediately before
-   the call inside `_doFetchRequest`, not just inside
-   `_startBodyStreamIfOpen`) -- the arming was instrumented, the fetch call
-   itself never was.
+   **RESOLVED: slice 4b was never broken.** Instrumenting inside
+   `_doFetchRequest` (the step this note asked for) showed it calls
+   `globalThis.fetch` at +4ms with the handle set, exactly as designed. The
+   ~313ms was the probe's URL: the test client used the default host
+   (`localhost`) while the server bound `127.0.0.1`. Re-run against
+   `127.0.0.1` and the same 4b code dispatches at **+6ms**.
+
+   So 4b is implementable as written -- arm on first `write()`, stream only
+   if the body is still open next tick, keep `write()+end()` materialized.
+   It should be re-applied and taken through the full gate chain.
+
+   The delay was a SEPARATE, REAL BUG, unrelated to streaming: see
+   "localhost resolution" below.
+
+   Historical note on the earlier text here:
+   `a.write('hello')` at ~0ms produced a server dispatch at ~316ms. That
+   measurement was real but MIS-ATTRIBUTED to streaming; it was the
+   localhost penalty.
 
    Until that is understood, flipping ClientRequest buys chunked encoding
    with none of the latency win, which is a strictly worse wire trade on the
@@ -223,3 +232,20 @@ the live MCP client path.
   reads cleanly on Windows (it never reaches the streamed path); an
   undeclared body that exceeds mid-stream errors the request stream.
 - `test-stream-pipeline.js` b008 passes; b006 tracked separately.
+
+## Adjacent bug found while diagnosing slice 4b: localhost resolution
+
+oam's FIRST request to `localhost` costs ~317ms; Node's costs ~6ms. Measured
+on the same process, same server, plain `http.get`, no streaming involved:
+
+    oam    127.0.0.1: 4ms    localhost: 317ms   (then 1ms / 0ms cached)
+    node   127.0.0.1: 9ms    localhost: 6ms     (then 0ms / 1ms)
+
+One-time per process, then cached, which is why it hid so well -- and why it
+masqueraded as a streaming defect for two rounds of diagnosis. The shape
+(a few hundred ms, first call only) points at an IPv6-first attempt to `::1`
+waiting out a timeout before falling back to `127.0.0.1`.
+
+Worth fixing on its own merits: every oam process pays it once on its first
+localhost HTTP call, which is the common case in local development and for
+MCP sidecars talking to a local endpoint. Not part of the streaming work.
