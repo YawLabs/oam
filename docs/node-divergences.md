@@ -77,6 +77,14 @@ lists and means the same thing in both: the brotli implementation genuinely in t
 binary. An e2e test asserts both directions: real keys present and version-shaped,
 Node-only dependency names provably absent.
 
+`icu` and `unicode` ARE published, because V8's bundled ICU is real: the values are
+read at build time from the version headers of the exact `v8` crate pinned in
+`Cargo.lock` — the same source snapshot the linked V8 static library was built from,
+with the crate's versioned ICU binding symbol corroborating the major. `cldr` and `tz`
+stay absent: those versions live in ICU *data* files the crate does not vendor, so
+there is nothing to verify them against, and an unverifiable version string is a
+fabrication like any other.
+
 `process.version` reports **`v22.16.0`** — the Node LTS line oam's compat layer targets,
 not a Node build you have installed. Packages feature-detect on it, so it has to be a
 real Node version; treat it as a compatibility claim, not an identity.

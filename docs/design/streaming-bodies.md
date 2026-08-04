@@ -439,14 +439,23 @@ b006). node-suite 400/401 (99.8%, floor ratcheted to 400 on
 windows-aarch64), e2e 324/0, conformance 55/55. The loopback latency bug
 found along the way is fixed.
 
-**Remaining follow-ups**, all optional:
+**Remaining follow-ups:**
 
-- Happy-eyeballs for loopback: a server bound only to `::1` pays ~307ms on
-  first contact (Node ~10ms). Needs a custom resolver/connector or an
-  upstream reqwest knob -- see "localhost resolution" below.
-- The slow-consumer memory test from Risks (assert flat RSS with a slow
-  reader) was never written; the bounded channel is the guard but nothing
-  asserts it.
+- Happy-eyeballs for loopback: BLOCKED UPSTREAM, root cause fully
+  identified (2026-08-04). The ~307ms a `::1`-only server pays is
+  hyper-util's `happy_eyeballs_timeout` -- `ConnectingTcp::new`
+  (hyper-util 0.1.20, client/legacy/connect/http.rs) parks the fallback
+  address family behind a `tokio::time::sleep(300ms)` default.
+  `HttpConnector::set_happy_eyeballs_timeout` exists, but reqwest 0.13.4
+  exposes no path to it for h1/h2 (only its private h3 connector has an
+  eyeballs impl), and reqwest accepts no custom connector. Fix is an
+  upstream reqwest knob or moving the client off reqwest; a pre-probe
+  connection was considered and REJECTED (every first localhost request
+  would show the server a phantom accept+EOF).
+- DONE 2026-08-04: the slow-consumer memory test from Risks
+  (`http_streamed_body_backpressure_bounds_memory`) -- 64MB upload with a
+  parked consumer: accepted writes must plateau under 16MB, RSS growth
+  under 32MB, then every byte still arrives after the drain.
 - GET/HEAD buffered writes are retained in `_body` until the request
   object dies; an unbounded producer piping into a GET grows it. Node
   instead writes the bytes to a (poisoned) socket. Pathological either

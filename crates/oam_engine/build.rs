@@ -36,11 +36,11 @@ fn dep_versions_json() -> String {
     println!("cargo:rerun-if-changed={}", lock_path.display());
     let lock = std::fs::read_to_string(&lock_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", lock_path.display()));
-    let mut json = String::from("{");
-    for (i, (key, package)) in DEPS.iter().enumerate() {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (key, package) in DEPS {
         let versions = lock_package_versions(&lock, package);
         let version = match versions.as_slice() {
-            [one] => one,
+            [one] => one.clone(),
             [] => panic!(
                 "{package} not found in Cargo.lock -- process.versions.{key} would go stale; \
                  update DEPS in oam_engine/build.rs to match the real dependency set"
@@ -51,6 +51,12 @@ fn dep_versions_json() -> String {
                 many.len()
             ),
         };
+        entries.push((key.to_string(), version));
+    }
+    entries.extend(icu_versions(&lock));
+    entries.sort();
+    let mut json = String::from("{");
+    for (i, (key, version)) in entries.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
@@ -58,6 +64,69 @@ fn dep_versions_json() -> String {
     }
     json.push('}');
     json
+}
+
+/// `icu` and `unicode` for process.versions, read from the version headers
+/// of the EXACT v8 crate pinned in Cargo.lock -- the same source snapshot
+/// the linked V8 static library (and its embedded ICU data) was built from,
+/// so this is the same provenance class as the Cargo.lock versions above.
+/// The crate's ICU binding symbol (`udata_setCommonData_77`) corroborates
+/// the major. CLDR and tzdata versions live in ICU *data* files the crate
+/// does not vendor, so they are deliberately NOT published: printing a
+/// guessed version would be fabrication.
+fn icu_versions(lock: &str) -> Vec<(String, String)> {
+    let v8_version = match lock_package_versions(lock, "v8").as_slice() {
+        [one] => one.clone(),
+        other => panic!("expected exactly one v8 crate in Cargo.lock, found {other:?}"),
+    };
+    let cargo_home = std::env::var("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            #[allow(deprecated)] // build script, host-only; home_dir is fine here
+            std::env::home_dir()
+                .expect("neither CARGO_HOME nor a home directory is set")
+                .join(".cargo")
+        });
+    let registry_src = cargo_home.join("registry").join("src");
+    let icu_unicode = std::fs::read_dir(&registry_src)
+        .unwrap_or_else(|e| panic!("read {}: {e}", registry_src.display()))
+        .flatten()
+        .map(|entry| entry.path().join(format!("v8-{v8_version}")))
+        .find(|candidate| candidate.is_dir())
+        .map(|v8_dir| {
+            let unicode_dir = v8_dir
+                .join("third_party")
+                .join("icu")
+                .join("source")
+                .join("common")
+                .join("unicode");
+            let icu = header_define(&unicode_dir.join("uvernum.h"), "U_ICU_VERSION");
+            let unicode = header_define(&unicode_dir.join("uchar.h"), "U_UNICODE_VERSION");
+            (icu, unicode)
+        });
+    let Some((icu, unicode)) = icu_unicode else {
+        panic!(
+            "v8-{v8_version} not found under {} -- cannot verify the linked ICU version; \
+             if the registry layout changed, update icu_versions() in oam_engine/build.rs \
+             (do NOT hardcode a version string)",
+            registry_src.display()
+        );
+    };
+    vec![("icu".to_string(), icu), ("unicode".to_string(), unicode)]
+}
+
+/// Value of `#define <name> "<value>"` in a C header, or panic.
+fn header_define(path: &std::path::Path, name: &str) -> String {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let needle = format!("#define {name} \"");
+    text.lines()
+        .find_map(|line| {
+            line.strip_prefix(&needle)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("{name} not found in {}", path.display()))
 }
 
 /// Every version of `package` pinned in the lockfile text (lockfile v3/v4

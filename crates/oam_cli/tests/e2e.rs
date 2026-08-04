@@ -6809,6 +6809,84 @@ fn http_body_keeps_streaming_after_early_response() {
 }
 
 #[test]
+fn http_streamed_body_backpressure_bounds_memory() {
+    // The streaming-bodies acceptance criterion nothing previously
+    // asserted: an unconsumed request body must NOT be buffered without
+    // bound. The chunk channel is capped at 8, so with the server never
+    // reading, the client's writes must STALL (accepted bytes plateau far
+    // below the total) and server-process RSS must stay flat. Then the
+    // handler drains and every byte must still arrive intact.
+    let stdout = run_ok(
+        "http_backpressure.mjs",
+        "import http from 'node:http';\n\
+         const CHUNK = 256 * 1024;\n\
+         const TOTAL = 64 * 1024 * 1024;\n\
+         let srvReceived = 0;\n\
+         let srvResolve;\n\
+         const srvDone = new Promise((r) => (srvResolve = r));\n\
+         let startDrain;\n\
+         const drainSignal = new Promise((r) => (startDrain = r));\n\
+         const server = http.createServer((req, res) => {\n\
+           drainSignal.then(() => {\n\
+             req.on('data', (c) => (srvReceived += c.length));\n\
+             req.on('end', () => {\n\
+               res.end('got ' + srvReceived);\n\
+               srvResolve();\n\
+             });\n\
+           });\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         const rssBefore = process.memoryUsage().rss;\n\
+         let accepted = 0;\n\
+         let done = false;\n\
+         const req = http.request(\n\
+           { host: '127.0.0.1', port, method: 'POST' },\n\
+           (res) => {\n\
+             let body = '';\n\
+             res.on('data', (c) => (body += c));\n\
+             res.on('end', () => {\n\
+               console.log('echo_total:', body === 'got ' + TOTAL);\n\
+               done = true;\n\
+             });\n\
+           },\n\
+         );\n\
+         req.on('error', (e) => console.log('req_error:', String(e)));\n\
+         const chunk = globalThis.Buffer.alloc(CHUNK, 0x61);\n\
+         (async () => {\n\
+           for (let sent = 0; sent < TOTAL; sent += CHUNK) {\n\
+             await new Promise((r) => req.write(chunk, r));\n\
+             accepted += CHUNK;\n\
+           }\n\
+           req.end();\n\
+         })();\n\
+         // Give the writer a real window with the consumer parked.\n\
+         await new Promise((r) => setTimeout(r, 500));\n\
+         const stalled = accepted;\n\
+         const rssDuring = process.memoryUsage().rss;\n\
+         // Backpressure: with nothing consuming, only the channel (8 x\n\
+         // 256KB) plus socket buffers can be in flight -- nowhere near\n\
+         // the 64MB total. 16MB is a generous ceiling.\n\
+         console.log('writes_stalled:', stalled < 16 * 1024 * 1024);\n\
+         // Memory: client + server share this process; a buffering\n\
+         // regression would grow RSS by ~the body size. Allow 32MB slack.\n\
+         console.log('rss_flat:', rssDuring - rssBefore < 32 * 1024 * 1024);\n\
+         startDrain();\n\
+         await srvDone;\n\
+         await new Promise((r) => setTimeout(r, 50));\n\
+         console.log('all_bytes_arrived:', srvReceived === TOTAL);\n\
+         console.log('response_done:', done);\n\
+         server.close();",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn process_versions_honest_keys() {
     // process.versions publishes REAL shipped implementations under their
     // real names (versions read from Cargo.lock at build time by
@@ -6825,8 +6903,16 @@ fn process_versions_honest_keys() {
          for (const k of real) {\n\
            console.log('has_' + k + ':', typeof v[k] === 'string' && versionish.test(v[k]));\n\
          }\n\
+         // icu/unicode are x.y shaped (77.1, 16.0), verified from the pinned\n\
+         // v8 crate's own headers at build time.\n\
+         for (const k of ['icu', 'unicode']) {\n\
+           console.log('has_' + k + ':', typeof v[k] === 'string' && /^\\d+\\.\\d+/.test(v[k]));\n\
+         }\n\
+         // cldr/tz live in ICU DATA files the v8 crate does not vendor, so\n\
+         // their versions cannot be verified -- they must stay absent.\n\
          const lying = ['uv', 'openssl', 'llhttp', 'ares', 'nghttp2', 'napi',\n\
-                        'modules', 'undici', 'zlib', 'ada', 'acorn', 'zstd', 'icu'];\n\
+                        'modules', 'undici', 'zlib', 'ada', 'acorn', 'zstd',\n\
+                        'cldr', 'tz'];\n\
          for (const k of lying) {\n\
            console.log('absent_' + k + ':', !(k in v));\n\
          }\n\
