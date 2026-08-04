@@ -136,8 +136,19 @@ Each is independently shippable and gated by the full chain
    Content-Length) can exceed mid-stream and become a stream error. Both
    413 e2e tests pass UNMODIFIED, which is the check that the guarantee
    survived rather than being redefined.
-4. **Outbound streaming + cancel.** `FetchRequest` channel variant,
-   `ClientRequest.write` re-pointed.
+4. **Outbound streaming + cancel.** PLUMBING DONE (4a): `OutboundBodies`
+   registry, `FetchRequest.body_stream`, `fetch` handing reqwest the
+   receiving half via `Body::wrap_stream`, and the new/write/end/cancel ops
+   (`write` resolves only once the chunk is accepted, so JS backpressure
+   follows the socket). Needs the `stream` feature on reqwest. Verified: a
+   request whose body does not exist yet goes out at ~22ms and streams
+   chunks written 400ms apart.
+
+   NOT done (4b): `ClientRequest.write` is still buffered and nothing in
+   production opts in. Streaming a body means reqwest cannot set
+   Content-Length and falls back to chunked -- a WIRE change on the live MCP
+   client path -- so the flip is its own step and must preserve the declared
+   length when it is known, the same way slice 3 was separated from slice 2.
 5. **Re-check `test-stream-pipeline`.** Blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd

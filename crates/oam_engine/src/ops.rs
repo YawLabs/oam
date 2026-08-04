@@ -275,10 +275,11 @@ fn op_fetch(
     let client = core.http_client();
     let bodies = core.bodies();
     let ids = core.body_ids();
+    let outbound = core.outbound_bodies();
     spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fetch(client, request, bodies, ids),
+        oam_core::ops::fetch(client, request, bodies, ids, outbound),
     );
 }
 

@@ -207,6 +207,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBodyEnd", op_http_body_end),
         ("httpStreamClosed", op_http_stream_closed),
         ("httpRequestBodyRead", op_http_request_body_read),
+        ("fetchBodyChannelNew", op_fetch_body_channel_new),
+        ("fetchBodyChannelWrite", op_fetch_body_channel_write),
+        ("fetchBodyChannelEnd", op_fetch_body_channel_end),
+        ("fetchBodyChannelCancel", op_fetch_body_channel_cancel),
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
@@ -1058,6 +1062,83 @@ fn op_http_accept(
 /// Read the next chunk of a STREAMED request body. Resolves a Uint8Array,
 /// or Done at EOF. Remove-await-reinsert on the receiver, matching the
 /// accept queue.
+/// Open an outbound request-body channel. Returns the handle to put in the
+/// fetch request's `body_stream`. Slice 4 of docs/design/streaming-bodies.md.
+fn op_fetch_body_channel_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = core_runtime!(scope).new_outbound_body();
+    rv.set(v8::Number::new(scope, handle as f64).into());
+}
+
+/// Push a chunk. Resolves when the chunk is accepted, so JS write()
+/// backpressure follows the socket.
+fn op_fetch_body_channel_write(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "fetchBodyChannelWrite requires bytes");
+        return;
+    };
+    let outbound = core_runtime!(scope).outbound_bodies();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let tx = outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .and_then(|slot| slot.0.clone());
+        let Some(tx) = tx else {
+            return oam_core::OpOutcome::Failed(format!("unknown body stream {handle}"));
+        };
+        match tx.send(Ok(bytes)).await {
+            Ok(()) => oam_core::OpOutcome::Done,
+            // Receiver gone: the request finished or failed. Not an error to
+            // the writer -- the transport already reported it.
+            Err(_) => oam_core::OpOutcome::Done,
+        }
+    });
+}
+
+/// Close the channel: drops the sender, which ends the request body.
+fn op_fetch_body_channel_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    if let Some(slot) = core_runtime!(scope)
+        .outbound_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&handle)
+    {
+        slot.0 = None;
+    }
+}
+
+/// Abort an in-flight upload (req.destroy()): send an error so the transport
+/// tears the request down instead of completing it, then drop the entry.
+fn op_fetch_body_channel_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let entry = core_runtime!(scope)
+        .outbound_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
+    if let Some((Some(tx), _)) = entry {
+        let _ = tx.try_send(Err("request aborted".to_string()));
+    }
+}
+
 fn op_http_request_body_read(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

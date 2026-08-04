@@ -110,6 +110,21 @@ pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Re
 /// reinserting -- otherwise a cancelled body silently revives and holds its
 /// connection open for the rest of the run.
 pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
+/// Outbound request-body channels: JS writes chunks, reqwest drains them.
+/// The receiver is taken by `fetch` when the request goes out; the sender
+/// stays here so later writes reach the in-flight request.
+/// Slice 4 of docs/design/streaming-bodies.md.
+pub type OutboundBodies = std::sync::Arc<
+    std::sync::Mutex<
+        HashMap<
+            u64,
+            (
+                Option<tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
+                Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+            ),
+        >,
+    >,
+>;
 /// Wakes an in-flight `fetch_body_read`. The tombstone set above is
 /// checked only AFTER `chunk()` resolves, so a server that simply stops
 /// sending leaves the read parked forever and pins the event loop. This
@@ -201,6 +216,7 @@ pub struct CoreRuntime {
     // shim routes fd 1/2 to the stdout/stderr sinks, which is only correct if a
     // real file can never be handed those numbers (Node reserves them too).
     next_body: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    outbound_bodies: OutboundBodies,
 }
 
 impl CoreRuntime {
@@ -249,7 +265,29 @@ impl CoreRuntime {
             #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3)),
+            outbound_bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Open an outbound request-body channel and return its handle. Lives
+    /// here rather than in the engine so channel construction stays with the
+    /// tokio runtime that owns it. Bounded: a producer outrunning the socket
+    /// awaits instead of buffering the whole body.
+    pub fn new_outbound_body(&self) -> u64 {
+        let handle = self
+            .next_body
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(8);
+        self.outbound_bodies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, (Some(tx), Some(rx)));
+        handle
+    }
+
+    /// Outbound request-body channels (Arc clone). Slice 4.
+    pub fn outbound_bodies(&self) -> OutboundBodies {
+        self.outbound_bodies.clone()
     }
 
     /// Cheap Arc clone for ops that need the pooled HTTP client.
@@ -1347,6 +1385,11 @@ pub mod ops {
         pub body: Option<String>,
         #[serde(default)]
         pub body_base64: Option<String>,
+        /// Handle into OutboundBodies: stream the body from JS instead of
+        /// sending a materialized one. Mutually exclusive with body /
+        /// body_base64.
+        #[serde(default)]
+        pub body_stream: Option<u64>,
         /// Connection pin: dial this IP for the URL's host instead of
         /// resolving DNS, while keeping Host header + TLS SNI = the host.
         /// Set by globalThis.fetch when an undici dispatcher carries a
@@ -1392,6 +1435,7 @@ pub mod ops {
         req: FetchRequest,
         bodies: super::BodyRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        outbound: super::OutboundBodies,
     ) -> OpOutcome {
         let method = req.method.as_deref().unwrap_or("GET");
         let method = match reqwest::Method::from_bytes(method.as_bytes()) {
@@ -1412,7 +1456,26 @@ pub mod ops {
         for (name, value) in &req.headers {
             builder = builder.header(name, value);
         }
-        if let Some(body) = req.body {
+        if let Some(handle) = req.body_stream {
+            // Streamed body: hand reqwest the receiving half. Note this
+            // sends chunked (no Content-Length) unless the caller set one.
+            let rx = outbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&handle)
+                .and_then(|slot| slot.1.take());
+            let Some(rx) = rx else {
+                return OpOutcome::Failed(format!("fetch: unknown body stream {handle}"));
+            };
+            // futures-util (already a dep) rather than tokio-stream: unfold
+            // the receiver into a Stream of io::Result chunks.
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|item| (item.map_err(std::io::Error::other), rx))
+            });
+            builder = builder.body(reqwest::Body::wrap_stream(stream));
+        } else if let Some(body) = req.body {
             builder = builder.body(body);
         } else if let Some(b64) = req.body_base64 {
             use base64::Engine;
