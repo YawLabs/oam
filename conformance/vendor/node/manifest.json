@@ -4,10 +4,10 @@
   "ratchet": {
     "maxSkips": 1,
     "maxKnownIssues": 0,
-    "minPass": 398,
+    "minPass": 405,
     "minPassByHost": {
-      "linux-x86_64": 400,
-      "macos-aarch64": 398,
+      "linux-x86_64": 407,
+      "macos-aarch64": 405,
       "windows-aarch64": 400
     }
   },

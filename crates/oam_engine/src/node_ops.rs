@@ -52,7 +52,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 7] = [
+    let data: [(&str, v8::Local<v8::Value>); 8] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
         (
@@ -64,6 +64,23 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "v8Version",
             v8::String::new(scope, v8::VERSION_STRING).unwrap().into(),
+        ),
+        (
+            // process.execPath is the REAL path of the running binary, not
+            // argv[0]: launched through a symlink, Node still reports the
+            // resolved target (argv[0] keeps the invoked name, and that is
+            // what process.argv0 is for). Canonicalized on unix only --
+            // on Windows it would add a \\?\ verbatim prefix that nothing
+            // else in the ecosystem expects.
+            "execPath",
+            {
+                let exe = std::env::current_exe().unwrap_or_default();
+                #[cfg(unix)]
+                let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+                v8::String::new(scope, &exe.to_string_lossy())
+                    .unwrap_or_else(|| v8::String::empty(scope))
+                    .into()
+            },
         ),
         (
             // Real shipped dependency versions (JSON), read from Cargo.lock

@@ -32,11 +32,11 @@ windows-aarch64**. Read that with the denominator in view:
 - **400/401 is pass/runnable, not pass/total.** Against every vendored file it is
   **400/476 (84.0%)**: 17 tests skip themselves at runtime and 58 are unrunnable by the
   harness (they need `// Flags:` support or fixtures the vendored subset does not carry).
-- **It is also the BEST of the three platforms, because Windows runs the fewest tests.**
-  macos-aarch64 measures 392/408 and linux-x86_64 392/409 — larger denominators, since
-  Windows skips POSIX-only tests the others run. See "POSIX-only gaps" near the end for
-  exactly what fails there; quoting only the Windows figure would overstate the state of
-  the runtime.
+- **Windows runs the FEWEST tests of the three platforms**, so its ratio is not the
+  whole picture. The POSIX hosts carry larger denominators (they run the POSIX-only
+  tests Windows skips) and now measure **405/418 (99.3%) on macos-aarch64** and
+  **407/418 (99.5%) on linux-x86_64**. See "POSIX-only gaps" near the end for what
+  remains there; quoting only the Windows figure would flatter the runtime.
 - **The oracle is exit 0.** Node core tests self-assert; a test "passes" when it runs to
   completion without throwing. That is Node's own bar, but it is a coarser signal than a
   golden-output diff. The [Node differential suite](../CONFORMANCE.md) (55 cases,
@@ -472,9 +472,17 @@ unchanged because these tests never ran there):
   the watcher task now stays alive but dormant and reproduces the default
   itself (restore + re-raise) when no listener remains.
 
+- **`process.execPath` is the resolved binary path**, not `argv[0]`. Launched
+  through a symlink, Node reports the symlink's target and keeps the invoked
+  name in `process.argv0`; oam returned `argv[0]` for both.
+
+With those, the POSIX hosts measure **405/418 (99.3%) on macos-aarch64 and
+407/418 (99.5%) on linux-x86_64**, up from 392 each. Every remaining failure
+on both is deliberate and listed below — there are no known open bugs in the
+suite on Linux.
+
 **Still open:**
 
-- **`process.execPath`** diverges on macOS.
 - **`test-process-execve-abort` is a deliberate non-pass.** oam produces
   Node's exact failure message (`process.execve failed with error code
   ENOENT`), and the test's first assertion passes. Its second requires the

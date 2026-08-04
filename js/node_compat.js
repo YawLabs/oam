@@ -9005,7 +9005,11 @@
       configurable: true,
     });
     Object.defineProperty(process, "execPath", {
-      get: () => argv()[0],
+      // The RESOLVED binary path, not argv[0]: invoked through a symlink,
+      // Node reports the symlink's target here and keeps the invoked name
+      // in process.argv0. Falling back to argv[0] keeps embedders that
+      // never set the native value working.
+      get: () => natives.execPath || argv()[0],
       enumerable: true,
       configurable: true,
     });
