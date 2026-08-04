@@ -9,9 +9,9 @@ Both halves of the HTTP path materialize a request body before it moves.
 
 **Server.** `handle_request` calls `collect_body(body).await`
 (`crates/oam_core/src/http_server.rs:603`) and only then sends
-`IncomingRequest` to the JS queue (`:652`). `IncomingRequest.body` is a
-`Vec<u8>` (`:64`). The JS handler therefore does not run until the last byte
-of the request has arrived. Measured with a chunked request that withholds
+`IncomingRequest` to the JS queue (`:652`), stashing the collected bytes in
+the `bodies` registry for JS to drain. The JS handler therefore does not run
+until the last byte of the request has arrived. Measured with a chunked request that withholds
 its terminator for 500ms: Node dispatches the handler at 13ms, oam at 521ms.
 
 **Client.** `ClientRequest` accumulates writes and hands a complete body to
@@ -72,10 +72,12 @@ re-opens the Windows RST bug or removes the memory ceiling.
 
 ## Shape
 
-**Inbound.** Replace `IncomingRequest.body: Vec<u8>` with an enum: `Full(Vec<u8>)`
-for the common small-body case (keeps the fast path allocation-identical) and
-`Stream(handle)` when the request is a candidate for streaming. Dispatch on
-headers; feed chunks through a bounded channel keyed by handle. New ops
+**Inbound.** The seam is the `bodies` registry (`HashMap<u64, RequestBody>`)
+drained by `take_request_body`, NOT `IncomingRequest.body` -- that field was
+dead and is gone (slice 1). `RequestBody` is `Full(Vec<u8>)` for the common
+small-body case (fast path allocation-identical) and gains `Stream(handle)`
+for a streamed request. Dispatch on headers; feed chunks through a bounded
+channel keyed by handle. New ops
 mirroring the outbound set: `httpRequestBodyRead(handle)` (async, resolves a
 chunk or EOF) and `httpRequestBodyCancel(handle)`.
 
@@ -99,11 +101,20 @@ client side is mostly re-pointing `write`/`end` at the channel.
 Each is independently shippable and gated by the full chain
 (`e2e` + `node-suite` + `conformance` + fmt + clippy).
 
-1. **Inbound plumbing, buffered behavior unchanged.** Introduce the enum and
-   the ops; keep every request on `Full`. Pure refactor, zero behavior
-   change. Proves the seam without risk.
+1. **Inbound plumbing, buffered behavior unchanged.** DONE. The seam is not
+   `IncomingRequest.body` (which was dead -- always `Vec::new()`, never
+   read, now removed) but the `bodies` registry drained by
+   `take_request_body`: it is now `HashMap<u64, RequestBody>` with a single
+   `Full` variant, and `take_request_body` returns `None` rather than an
+   empty body for a future `Stream` request. The `httpRequestBodyRead` /
+   `httpRequestBodyCancel` ops moved to slice 2 -- with every request on
+   `Full` they would have had no caller, and dead ops are worse than no
+   ops. Verified zero-change: e2e 324/0, node-suite 399/401, conformance
+   55/55, all identical to the commit before.
 2. **Inbound streaming behind an opt-in**, with the cap semantics above.
    Server dispatch moves to headers-received for opted-in servers only.
+   Lands the `Stream` variant plus the two body ops on their first real
+   caller.
 3. **`IncomingMessage` as a real Readable** over the pull op, and flip the
    default once e2e is green on it.
 4. **Outbound streaming + cancel.** `FetchRequest` channel variant,

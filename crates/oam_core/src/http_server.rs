@@ -61,11 +61,21 @@ pub struct IncomingRequest {
     /// Path + query, as received.
     pub uri: String,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
     pub is_upgrade: bool,
     pub socket_handle: Option<u64>,
     pub remote_addr: Option<String>,
     pub remote_port: Option<u16>,
+}
+
+/// An inbound request body as the JS side will consume it.
+///
+/// Slice 1 of docs/design/streaming-bodies.md: every request is still
+/// `Full`, so behavior is unchanged. The variant exists so the streaming
+/// path has a seam to land on -- `Stream` will carry a chunk receiver and
+/// the handler will be dispatched on headers rather than on last byte.
+pub enum RequestBody {
+    /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
+    Full(Vec<u8>),
 }
 
 pub enum ResponseBody {
@@ -103,8 +113,8 @@ pub struct HttpState {
     servers: Mutex<HashMap<u64, ServerEntry>>,
     /// request id -> the hyper-side responder waiting for JS.
     pending: Mutex<HashMap<u64, oneshot::Sender<ResponseSpec>>>,
-    /// request id -> buffered request body (fetched once by JS).
-    bodies: Mutex<HashMap<u64, Vec<u8>>>,
+    /// request id -> request body (fetched once by JS).
+    bodies: Mutex<HashMap<u64, RequestBody>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
     streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     /// response-stream id -> resolves when hyper drops the response body
@@ -122,11 +132,18 @@ impl HttpState {
     }
 
     /// Sync (isolate-thread) helpers consumed by the engine natives.
+    /// Take the fully-collected body. Returns None for a request whose body
+    /// is being streamed (no such request yet -- see slice 2), so callers
+    /// keep working unchanged when that variant lands.
     pub fn take_request_body(&self, id: u64) -> Option<Vec<u8>> {
-        self.bodies
+        let taken = self
+            .bodies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
+            .remove(&id)?;
+        match taken {
+            RequestBody::Full(bytes) => Some(bytes),
+        }
     }
 
     pub fn respond_full(
@@ -426,7 +443,6 @@ pub async fn http_serve(
                                     method,
                                     uri,
                                     headers,
-                                    body: Vec::new(),
                                     is_upgrade: true,
                                     socket_handle: Some(handle),
                                     remote_addr: Some(peer.ip().to_string()),
@@ -638,7 +654,7 @@ async fn handle_request(
         .bodies
         .lock()
         .expect("http bodies lock")
-        .insert(id, collected.to_vec());
+        .insert(id, RequestBody::Full(collected.to_vec()));
     // From here on, every exit cleans up — including a cancelled future
     // if the client disconnects while the handler runs — and refunds the
     // reserved body bytes.
@@ -654,7 +670,6 @@ async fn handle_request(
             method: parts.method.as_str().to_string(),
             uri,
             headers,
-            body: Vec::new(), // delivered via take_request_body
             is_upgrade: false,
             socket_handle: None,
             remote_addr: None,
