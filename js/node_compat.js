@@ -9624,7 +9624,16 @@
         signalsCount: 0, voluntaryContextSwitches: 0, involuntaryContextSwitches: 0,
       }),
       release: { name: "node", lts: "Jod" },
-      config: Object.freeze({ variables: Object.freeze({}) }),
+      config: Object.freeze({
+        variables: Object.freeze({
+          // Which of Node's shareable builtin JS deps are compiled into
+          // this binary: none -- oam ships its own builtin set, so the
+          // honest value is the empty list (it also answers probes like
+          // test-process-versions' hasUndici/hasAmaro with false, which
+          // is the truth).
+          node_builtin_shareable_builtins: Object.freeze([]),
+        }),
+      }),
       features: {
         inspector: false,
         debug: false,

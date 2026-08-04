@@ -382,7 +382,7 @@ The one failure behind the 400/401, triaged honestly.
 
 | Test | Status |
 |---|---|
-| `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. |
+| `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. It genuinely runs: the `deps/acorn`, `deps/cjs-module-lexer`, and `deps/undici` package.json fixtures are vendored verbatim from upstream v22.22.2, real Node passes it (exit 0) from this tree, and oam fails at the key-set assertion — whose diff prints exactly the honest key set oam publishes instead. |
 | `test-process-dlopen-error-message-crash.js` | **Reclassified unrunnable, not a failure.** The test's actual assertion — that a `%s`-bearing filename is never passed to a format function — passes in oam. It then calls `fs.accessSync('test/addons/not-a-binding')`, a compiled-addon fixture the vendored subset does not ship, and dies there. Verified: real Node v22.22.2 fails this test identically from the same vendored tree. |
 
 `test-stream-pipeline.js` used to sit in this table as a real bug (it hung
