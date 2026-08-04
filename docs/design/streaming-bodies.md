@@ -202,7 +202,25 @@ Each is independently shippable and gated by the full chain
    Until that is understood, flipping ClientRequest buys chunked encoding
    with none of the latency win, which is a strictly worse wire trade on the
    MCP path.
-5. **Re-check `test-stream-pipeline`.** Blocks b008; b006 additionally needs
+5. **Re-check `test-stream-pipeline`.** DONE, and the prediction in this
+   doc was WRONG: with slices 1-4b landed (server dispatches on headers,
+   client streams an incremental body), b008 STILL TIMES OUT and b006 still
+   exits 1. Both pass on Node from the same extracted blocks, so the
+   extraction is sound.
+
+   So "b008 unblocks once slice 4 lands" was an assumption, never verified,
+   and it does not hold. Whatever b008 needs is NOT simply streaming in both
+   directions -- that now exists and is measured (server dispatch ~7ms,
+   client dispatch ~9ms). Re-diagnose it from scratch rather than trusting
+   the earlier attribution: extract the block (it starts at line 258 of the
+   vendored file), run it against Node with tracing on both sides, and find
+   the actual first divergence.
+
+   NOTE for whoever does that: extract into a scratch dir, NOT into
+   `conformance/vendor/node/test/parallel/` -- files there are picked up by
+   the harness as new suite tests.
+
+   Original text: blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd
    today because ref'ing it can pin the loop forever when hyper never
