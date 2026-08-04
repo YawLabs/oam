@@ -144,8 +144,7 @@ Each is independently shippable and gated by the full chain
    request whose body does not exist yet goes out at ~22ms and streams
    chunks written 400ms apart.
 
-   NOT done (4b): `ClientRequest.write` is still buffered and nothing in
-   production opts in. Streaming a body means reqwest cannot set
+   4b DONE: `ClientRequest.write` streams an incremental body. Streaming a body means reqwest cannot set
    Content-Length and falls back to chunked -- a WIRE change on the live MCP
    client path -- so the flip is its own step and must preserve the declared
    length when it is known, the same way slice 3 was separated from slice 2.
@@ -178,6 +177,8 @@ Each is independently shippable and gated by the full chain
    starts ~300ms in, so it LOOKS slow while actually dispatching ~1ms after
    its own call. Measure per-request deltas (call -> dispatch), never
    absolute stamps, or you will "find" a delay that is not there.
+
+   **4b IS NOW LANDED** (see below). Kept for the record:
 
    **RESOLVED: slice 4b was never broken.** Instrumenting inside
    `_doFetchRequest` (the step this note asked for) showed it calls

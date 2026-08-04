@@ -14322,6 +14322,8 @@
         this.res = null;
         this.errored = null;
         this._bodyLength = 0;
+        this._bodyStream = null;
+        this._streamArmed = false;
         this._finished = false;
         var self = this;
         this.socket = {
@@ -14365,10 +14367,46 @@
         } else {
           bytes = globalThis.Buffer.from(chunk);
         }
-        this._body.push(bytes);
         this._bodyLength += bytes.length;
+        if (this._bodyStream !== null) {
+          // Already streaming: hand the chunk to the transport. The op
+          // resolves once the socket accepts it, so write() backpressure
+          // follows the wire rather than buffering.
+          natives.fetchBodyChannelWrite(this._bodyStream, bytes).then(
+            () => { if (callback) callback(); },
+            () => { if (callback) callback(); },
+          );
+          return true;
+        }
+        this._body.push(bytes);
         if (callback) queueMicrotask(callback);
+        // A body still open on the next tick is INCREMENTAL and has to
+        // stream, or the request cannot go out until the producer finishes
+        // (the pipeline-into-a-request stall). The common write()+end() in
+        // one tick never reaches here, so it keeps the materialized body and
+        // its Content-Length instead of falling back to chunked.
+        if (!this._streamArmed) {
+          this._streamArmed = true;
+          queueMicrotask(() => this._startBodyStreamIfOpen());
+        }
         return true;
+      }
+
+      _startBodyStreamIfOpen() {
+        if (this.finished || this._bodyStream !== null || this._aborted) return;
+        if (this.method === "GET" || this.method === "HEAD") return;
+        this._bodyStream = natives.fetchBodyChannelNew();
+        const pending = this._body;
+        this._body = [];
+        this.headersSent = true;
+        // Send now; the body follows over the channel.
+        this._doFetchRequest(null);
+        for (const chunk of pending) {
+          natives.fetchBodyChannelWrite(this._bodyStream, chunk).then(
+            () => {},
+            () => {},
+          );
+        }
       }
       end(data, encoding, callback) {
         if (typeof data === "function") { callback = data; data = undefined; }
@@ -14398,7 +14436,18 @@
           bodyData = merged;
         }
         var connHdr = (self._headers["connection"] || "").toLowerCase();
-        if (connHdr.indexOf("upgrade") !== -1) {
+        if (self._bodyStream !== null) {
+          // Already in flight: flush the tail and close the channel, which
+          // ends the body. Must NOT send a second request.
+          if (bodyData) {
+            natives.fetchBodyChannelWrite(self._bodyStream, bodyData).then(
+              () => natives.fetchBodyChannelEnd(self._bodyStream),
+              () => natives.fetchBodyChannelEnd(self._bodyStream),
+            );
+          } else {
+            natives.fetchBodyChannelEnd(self._bodyStream);
+          }
+        } else if (connHdr.indexOf("upgrade") !== -1) {
           self._doUpgradeRequest(bodyData);
         } else {
           self._doFetchRequest(bodyData);
@@ -14422,7 +14471,9 @@
           method: self.method,
           headers: self._headers,
         };
-        if (bodyData && self.method !== "GET" && self.method !== "HEAD") {
+        if (self._bodyStream !== null) {
+          fetchOpts.__oamBodyStream = self._bodyStream;
+        } else if (bodyData && self.method !== "GET" && self.method !== "HEAD") {
           fetchOpts.body = bodyData;
         }
         globalThis.fetch(self._url, fetchOpts).then(function (resp) {
@@ -14608,9 +14659,19 @@
       // underlying socket, so an in-flight response stream fails with
       // ECONNRESET -- otherwise `for await (const c of res)` never
       // terminates and the program hangs. 'close' follows, once.
+      _cancelBodyStream() {
+        if (this._bodyStream !== null) {
+          natives.fetchBodyChannelCancel(this._bodyStream);
+          this._bodyStream = null;
+        }
+      }
+
       _tearDown() {
         if (this.destroyed) return;
         this.destroyed = true;
+        // Abort an in-flight upload so the transport tears the request down
+        // instead of completing it with a truncated body.
+        this._cancelBodyStream();
         const res = this.res;
         if (res && !res.destroyed) {
           const reset = new Error("aborted");

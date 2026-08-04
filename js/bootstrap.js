@@ -738,7 +738,13 @@
         if (ip) request.pin = { host, ip };
       }
     }
-    if (init.body != null) {
+    // Internal escape hatch: a request whose body is produced over time
+    // rides an outbound body channel instead of a materialized body
+    // (docs/design/streaming-bodies.md). Not part of the WHATWG surface --
+    // http.ClientRequest sets it.
+    if (typeof init.__oamBodyStream === "number") {
+      request.body_stream = init.__oamBodyStream;
+    } else if (init.body != null) {
       if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
         const bytes = init.body instanceof ArrayBuffer
           ? new Uint8Array(init.body)
