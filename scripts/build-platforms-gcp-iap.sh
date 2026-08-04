@@ -123,28 +123,50 @@ IAP_TUNNEL_PID=""
 IAP_TUNNEL_PORT=""
 IAP_SSH_KEY="${HOME}/.ssh/google_compute_engine"
 start_iap_tunnel() {
-  ok "starting IAP tunnel to $INSTANCE (gcloud start-iap-tunnel)..."
-  : >"$IAP_TUNNEL_LOG"
-  gcloud compute start-iap-tunnel "$INSTANCE" 22 \
-    --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT" \
-    >"$IAP_TUNNEL_LOG" 2>&1 &
-  IAP_TUNNEL_PID=$!
-  # Wait for "Listening on port [NNNN]." -- the canonical bound-and-serving
-  # signal -- with a 15s ceiling, then fall back to a port-reachability probe
-  # ("Picking local unused port [NNNN]" + TCP connect poll). Some gcloud
-  # versions hang in their internal tunnel self-test while the port already
-  # serves fine.
-  local waited=0
-  while ! grep -q "Listening on port" "$IAP_TUNNEL_LOG" 2>/dev/null; do
-    sleep 1
-    waited=$((waited + 1))
-    if [ "$waited" -ge 15 ]; then
-      warn "gcloud did not log 'Listening on port' within 15s -- falling back to port-reachability probe"
-      break
+  # sshd is NOT up the instant `instances start` returns: the guest keeps
+  # booting for ~30-60s, IAP reports 4003 'failed to connect to backend',
+  # and gcloud EXITS rather than retrying. Respawn the tunnel across the
+  # boot window (observed 2026-08-04: two consecutive leg failures from
+  # this race, then first-try success ~60s after boot).
+  local attempt=1 max_attempts=8 waited=0
+  while :; do
+    ok "starting IAP tunnel to $INSTANCE (gcloud start-iap-tunnel, attempt $attempt/$max_attempts)..."
+    : >"$IAP_TUNNEL_LOG"
+    gcloud compute start-iap-tunnel "$INSTANCE" 22 \
+      --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT" \
+      >"$IAP_TUNNEL_LOG" 2>&1 &
+    IAP_TUNNEL_PID=$!
+    # Wait for "Listening on port [NNNN]." -- the canonical bound-and-serving
+    # signal -- with a 15s ceiling, then fall back to a port-reachability probe
+    # ("Picking local unused port [NNNN]" + TCP connect poll). Some gcloud
+    # versions hang in their internal tunnel self-test while the port already
+    # serves fine.
+    local died=0
+    waited=0
+    while ! grep -q "Listening on port" "$IAP_TUNNEL_LOG" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+      if [ "$waited" -ge 15 ]; then
+        warn "gcloud did not log 'Listening on port' within 15s -- falling back to port-reachability probe"
+        break
+      fi
+      if ! kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
+        died=1
+        break
+      fi
+    done
+    if [ "$died" = "1" ]; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        # Inline the log tail: cleanup rm's the file, so a path alone
+        # destroys the evidence the operator needs.
+        fail "IAP tunnel process exited before listening on all $max_attempts attempts. Last output: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr '\n' ' ')"
+      fi
+      warn "tunnel process exited before listening (sshd likely still booting) -- retrying in 15s"
+      attempt=$((attempt + 1))
+      sleep 15
+      continue
     fi
-    if ! kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
-      fail "IAP tunnel process exited before listening. Log: $IAP_TUNNEL_LOG"
-    fi
+    break
   done
   IAP_TUNNEL_PORT=$(awk -F'[][]' '/Listening on port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
   if [ -z "$IAP_TUNNEL_PORT" ]; then

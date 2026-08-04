@@ -309,19 +309,23 @@ pub(crate) fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
     let exe = repo
         .join(format!("target/{profile}"))
         .join(format!("oam{}", std::env::consts::EXE_SUFFIX));
-    if !exe.is_file() {
-        println!("building oam ({profile})...");
-        let mut args = vec!["build", "-p", "oam_cli"];
-        if release {
-            args.push("--release");
-        }
-        let status = Command::new("cargo")
-            .args(&args)
-            .current_dir(repo)
-            .status()?;
-        if !status.success() {
-            bail!("cargo build -p oam_cli failed");
-        }
+    // ALWAYS build, never gate on the binary existing: cargo's own freshness
+    // check makes this a ~1s no-op when current, and an existing-but-STALE
+    // binary silently measures month-old code. Bit for real on 2026-08-04:
+    // the mac measure leg preserved target/ across source syncs, xtask saw
+    // target/debug/oam from July 22 and ran the whole node-suite against it
+    // -- 140 phantom failures against today's corpus.
+    println!("building oam ({profile})...");
+    let mut args = vec!["build", "-p", "oam_cli"];
+    if release {
+        args.push("--release");
+    }
+    let status = Command::new("cargo")
+        .args(&args)
+        .current_dir(repo)
+        .status()?;
+    if !status.success() {
+        bail!("cargo build -p oam_cli failed");
     }
     Ok(exe)
 }
