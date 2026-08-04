@@ -74,6 +74,11 @@ fn dep_versions_json() -> String {
 /// the major. CLDR and tzdata versions live in ICU *data* files the crate
 /// does not vendor, so they are deliberately NOT published: printing a
 /// guessed version would be fabrication.
+///
+/// Known limitation: this looks under `$CARGO_HOME/registry/src`, so a
+/// cargo-vendor / offline build fails loudly here. No such build leg
+/// exists today; if one ever does, teach this lookup the vendor-dir
+/// layout -- do NOT respond by hardcoding a version string.
 fn icu_versions(lock: &str) -> Vec<(String, String)> {
     let v8_version = match lock_package_versions(lock, "v8").as_slice() {
         [one] => one.clone(),

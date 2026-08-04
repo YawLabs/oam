@@ -6840,6 +6840,8 @@ fn http_streamed_body_backpressure_bounds_memory() {
          const rssBefore = process.memoryUsage().rss;\n\
          let accepted = 0;\n\
          let done = false;\n\
+         let cliResolve;\n\
+         const cliDone = new Promise((r) => (cliResolve = r));\n\
          const req = http.request(\n\
            { host: '127.0.0.1', port, method: 'POST' },\n\
            (res) => {\n\
@@ -6848,6 +6850,7 @@ fn http_streamed_body_backpressure_bounds_memory() {
              res.on('end', () => {\n\
                console.log('echo_total:', body === 'got ' + TOTAL);\n\
                done = true;\n\
+               cliResolve();\n\
              });\n\
            },\n\
          );\n\
@@ -6864,16 +6867,21 @@ fn http_streamed_body_backpressure_bounds_memory() {
          await new Promise((r) => setTimeout(r, 500));\n\
          const stalled = accepted;\n\
          const rssDuring = process.memoryUsage().rss;\n\
-         // Backpressure: with nothing consuming, only the channel (8 x\n\
-         // 256KB) plus socket buffers can be in flight -- nowhere near\n\
-         // the 64MB total. 16MB is a generous ceiling.\n\
-         console.log('writes_stalled:', stalled < 16 * 1024 * 1024);\n\
+         // Backpressure: with nothing consuming, in-flight bytes are the\n\
+         // client channel (8 x 256KB) + pump chunks + kernel socket\n\
+         // buffers, which DRS-autotune to several MB on Linux and more on\n\
+         // tuned sysctls -- so assert against TOTAL/2, which still proves\n\
+         // buffering is bounded without racing kernel tunables.\n\
+         console.log('writes_stalled:', stalled < TOTAL / 2);\n\
          // Memory: client + server share this process; a buffering\n\
          // regression would grow RSS by ~the body size. Allow 32MB slack.\n\
          console.log('rss_flat:', rssDuring - rssBefore < 32 * 1024 * 1024);\n\
          startDrain();\n\
          await srvDone;\n\
-         await new Promise((r) => setTimeout(r, 50));\n\
+         // Await the client's 'end' rather than sleeping: the response\n\
+         // still has to cross the runtime after res.end(), and a fixed\n\
+         // delay races the scheduler under parallel-test load.\n\
+         await cliDone;\n\
          console.log('all_bytes_arrived:', srvReceived === TOTAL);\n\
          console.log('response_done:', done);\n\
          server.close();",
