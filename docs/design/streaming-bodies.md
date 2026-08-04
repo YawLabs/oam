@@ -149,6 +149,25 @@ Each is independently shippable and gated by the full chain
    Content-Length and falls back to chunked -- a WIRE change on the live MCP
    client path -- so the flip is its own step and must preserve the declared
    length when it is known, the same way slice 3 was separated from slice 2.
+
+   **4b was attempted and reverted; read this before retrying.** The JS half
+   works: arming a microtask on first `write()` and streaming only if the
+   body is still open on the next tick correctly keeps the common
+   `write()+end()` materialized (Content-Length preserved) and streams the
+   incremental case (chunked, body intact) -- measured, both correct. What
+   does NOT work is the latency, which is the entire point: the server saw
+   headers at ~316ms, i.e. only after `end()`, versus Node's ~36ms.
+
+   The cause is NOT reqwest and NOT the channel. Driving the SAME machinery
+   through the raw native (`__oam.fetch` with `body_stream`) dispatches at
+   ~7ms. Instrumenting the JS showed streaming arms at 3ms and
+   `_doFetchRequest` runs there, so the request is handed to
+   `globalThis.fetch` early and still does not reach the wire until the body
+   closes. So the defect is in the fetch WRAPPER path (js/bootstrap.js
+   `fetch`) deferring the native call -- find what it awaits between
+   `_doFetchRequest` and `__oam.fetch(...)`. Until that is fixed, flipping
+   ClientRequest buys chunked encoding with none of the latency win, which
+   is a strictly worse wire trade on the MCP path.
 5. **Re-check `test-stream-pipeline`.** Blocks b008; b006 additionally needs
    the `op_http_stream_closed` ref/unref question resolved
    (`crates/oam_engine/src/node_ops.rs:1140`) -- it is deliberately unref'd
