@@ -326,3 +326,75 @@ The real fix is a bounded happy-eyeballs delay rather than an ordering
 preference -- reqwest 0.13 exposes no `happy_eyeballs_timeout`, so it needs
 either a custom connector/resolver or an upstream knob. Node avoids both
 tails via autoSelectFamily with a 250ms attempt timeout.
+
+## Resuming this work
+
+Paste-able brief for a fresh session. Read the rest of this document first --
+it carries the design, what shipped, and the wrong turns, and it outranks this
+summary wherever they disagree.
+
+**State.** Branch `main`, clean and pushed. node-suite 399/401 (99.5%), e2e
+324/0, conformance 55/55. Slices 1-4b landed: server dispatches on headers,
+`IncomingMessage` is a real Readable, outbound body channels exist, and
+`ClientRequest` streams an incremental body. The loopback latency bug found
+along the way is fixed.
+
+**Task.** `test-stream-pipeline` block b008 still fails. Reduce it and find the
+next divergence.
+
+Server does `pipeline(req, res)` echoing the body; client streams 11 chunks via
+`pipeline(rs, req)`. Node: the client receives 10 data chunks, then
+`rs.destroy()`. oam: the client receives NO data -- the server echoes an EMPTY
+body (`[srv] pipeline done err=undefined`).
+
+Already fixed and NOT the answer: the read op used to report EOF for a receiver
+that was merely checked out. That class is gone and the ordering improved, but
+the body still ends early. Next step is to trace where the server-side
+`IncomingMessage` reaches `complete` / `push(null)` now that
+`httpRequestBodyRead` no longer returns a premature EOF -- instrument
+`IncomingMessage._read` (js/node_compat.js) and `pump_request_body`
+(crates/oam_core/src/http_server.rs) behind an env gate, then REVERT the
+instrumentation before committing.
+
+Lower priority, same file: b006 exits 1 and needs the `op_http_stream_closed`
+ref/unref trade decided (a real engine tradeoff, not a bug), and the
+happy-eyeballs follow-up for loopback.
+
+**Gates.** All must pass before committing; run sequentially with
+`set -o pipefail`:
+
+    cargo test -p oam_cli --test e2e          # 324 passed, 0 failed
+    cargo run -q -p xtask -- node-suite       # 399/401; the 2 failures are known
+    cargo run -q -p xtask -- conformance      # 55/55, wpt 888/888 + 278/278
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+
+node-suite takes >10 minutes -- run it in the background rather than letting it
+time out the call.
+
+**Traps that cost real time.**
+
+1. `js/*.js` is compiled into the V8 startup snapshot. Every JS edit needs
+   `cargo build -p oam_cli` before it takes effect.
+2. The Bash heredoc MANGLES backslash escapes: `\n` written inside a python
+   heredoc lands as a REAL newline, breaks the JS string literal, and the
+   snapshot builder dies with `STATUS_STACK_BUFFER_OVERRUN` -- an error that
+   looks unrelated to what you edited. Build escapes via `chr(92)`, or edit
+   line-wise. Always `node --check js/node_compat.js` afterwards.
+3. Measure call -> dispatch DELTAS per request, never absolute timestamps. A
+   second sequential request naturally starts ~300ms in and looks slow while
+   actually being fast. This produced two false root causes in one session.
+4. Extract test blocks into a scratch directory, NEVER into
+   `conformance/vendor/node/test/parallel/` -- anything there is picked up by
+   the harness as a new suite test and silently moves the denominator.
+5. Never kill release-path `oam.exe` (those are live MCP sidecars). If a build
+   fails with "failed to remove file ... Access is denied", kill ONLY processes
+   whose path matches `*target\debug*`.
+6. Any probe that re-spawns the runtime must guard recursion with an ENV VAR,
+   never argv -- an argv guard fork-bombed the machine (7k processes).
+7. `http.request` / `ClientRequest` and the http server are on the LIVE MCP
+   sidecar path. Anything touching them needs an MCP-shaped smoke (JSON-RPC over
+   a keep-alive agent, including a body the handler never reads), not just e2e.
+
+Do NOT mark b008 skipped in the manifest to make the number green. It is a real
+gap and is deliberately left failing.
