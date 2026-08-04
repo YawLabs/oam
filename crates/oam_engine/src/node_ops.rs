@@ -1168,15 +1168,24 @@ fn op_http_request_body_read(
             }
         };
         let next = rx.recv().await;
-        // Only reinsert while the stream is live; EOF/error drops it so a
-        // later read sees Done instead of parking forever.
+        // Only reinsert while the stream is live. EOF/error must also REMOVE
+        // the StreamPending marker left by the checkout: once a response is
+        // in flight the engine-side guard no longer reaps this entry (a
+        // full-duplex handler may still be reading), so a finished stream
+        // left as a marker would leak until process exit.
         match next {
             Some(Ok(chunk)) => {
                 state.put_body_stream(id, rx);
                 oam_core::OpOutcome::Bytes(chunk)
             }
-            Some(Err(e)) => oam_core::OpOutcome::Failed(e),
-            None => oam_core::OpOutcome::Done,
+            Some(Err(e)) => {
+                state.cancel_body_stream(id);
+                oam_core::OpOutcome::Failed(e)
+            }
+            None => {
+                state.cancel_body_stream(id);
+                oam_core::OpOutcome::Done
+            }
         }
     });
 }

@@ -13832,6 +13832,10 @@
         // code path whether or not the server opted into streaming.
         // push() returning false is backpressure -- Readable calls _read
         // again when drained, which is what paces the socket.
+        // Node sets _consuming on first _read; resOnFinish (_dumpReq here)
+        // dumps only NON-consumed requests, so a handler that responds
+        // early and keeps draining the body must not have it cancelled.
+        this._consuming = true;
         if (this._bodyDone || this._reading) return;
         this._reading = true;
         natives.httpRequestBodyRead(this._requestId).then(
@@ -13871,6 +13875,14 @@
         if ((!this.readableEnded || !this.complete) && !this._dumped) {
           this.aborted = true;
           this.emit("aborted");
+        }
+        // A request destroyed mid-body must stop the pump: once a response
+        // is in flight the engine no longer reaps the body entry (a live
+        // full-duplex read has to survive responding), so an unconsumed
+        // remainder would pin the channel and its pump task forever.
+        if (!this._bodyDone && typeof this._requestId === "number") {
+          this._bodyDone = true;
+          natives.httpRequestBodyCancel(this._requestId);
         }
         // Node tears the transport down only when the socket is still
         // ATTACHED and the message aborted mid-stream (req.destroy());
@@ -14004,9 +14016,13 @@
             // Exchange already gone (req.destroy() aborted it, or the
             // request was answered elsewhere): Node's post-abort write is
             // a soft failure, never a synchronous throw. Surface the
-            // premature close once and error the callback async.
+            // premature close once and error the callback async. Reap the
+            // request body too -- the engine keeps a dispatched streamed
+            // body alive for JS, and this branch is the only notification
+            // JS gets that the exchange is dead.
             if (!this.closed) {
               this.closed = true;
+              this._dumpReq();
               queueMicrotask(() => this.emit("close"));
             }
             if (cb) {
@@ -14028,6 +14044,10 @@
             if (this._finished || this.closed) return;
             this.closed = true;
             natives.httpBodyEnd(watchedId);
+            // The connection died mid-response: reap an unconsumed request
+            // body too, or its pump outlives the exchange (the engine keeps
+            // streamed bodies alive once a response is in flight).
+            this._dumpReq();
             this.emit("close");
           }, () => {});
         }
@@ -14121,10 +14141,22 @@
       }
       // Node's resOnFinish dumps an unconsumed request when the response
       // finishes, so a later req.destroy() reads as routine teardown, not a
-      // client abort (aborted stays false, no 'aborted' event).
+      // client abort (aborted stays false, no 'aborted' event). A CONSUMED
+      // request is never dumped (Node gates on _consuming): the handler may
+      // respond early and keep draining, and on a client abort the pump's
+      // queued error must reach the consumer instead of being cancelled
+      // into a clean truncated 'end'.
       _dumpReq() {
         const req = this.req;
-        if (req && typeof req._dump === "function") req._dump();
+        if (!req || typeof req._dump !== "function") return;
+        // Node's resOnFinish gate is _consuming OR resumeScheduled: a
+        // handler that attached 'data' in the same tick as res.end() has
+        // only SCHEDULED its first read (resume runs on nextTick, the
+        // finish path on a microtask), so _consuming alone dumps a body
+        // the handler is about to drain.
+        const rs = req._readableState;
+        if (req._consuming || (rs && rs.resumeScheduled)) return;
+        req._dump();
       }
       flushHeaders() {
         if (this._mock) return;
@@ -14324,6 +14356,8 @@
         this._bodyLength = 0;
         this._bodyStream = null;
         this._streamArmed = false;
+        this._sent = false;
+        this._droppedWrites = false;
         this._finished = false;
         var self = this;
         this.socket = {
@@ -14394,7 +14428,28 @@
 
       _startBodyStreamIfOpen() {
         if (this.finished || this._bodyStream !== null || this._aborted) return;
-        if (this.method === "GET" || this.method === "HEAD") return;
+        if (this.method === "GET" || this.method === "HEAD") {
+          // Upgrade handshakes (websocket preamble written before end())
+          // must keep waiting for end() -> _doUpgradeRequest; an early
+          // fetch here would consume the exchange and 'upgrade' would
+          // never fire.
+          var conn = (this._headers["connection"] || "").toLowerCase();
+          if (conn.indexOf("upgrade") !== -1) return;
+          // Node never chunk-frames GET/HEAD writes: the request goes out on
+          // the first write and the body bytes follow UNFRAMED, so a server
+          // parses a bodyless request (the stray bytes then poison the
+          // keep-alive connection). Match the observable shape without the
+          // wire poisoning: dispatch the request bodyless now; the buffered
+          // writes never go out. The response completing then closes a
+          // request that never end()ed, which surfaces the same premature
+          // close Node's dead connection produces (test-stream-pipeline
+          // pipes a Readable into a GET and waits on exactly that).
+          if (this._sent) return;
+          this.headersSent = true;
+          this._droppedWrites = true;
+          this._doFetchRequest(null);
+          return;
+        }
         this._bodyStream = natives.fetchBodyChannelNew();
         const pending = this._body;
         this._body = [];
@@ -14415,7 +14470,13 @@
         // pipeline ends the destination, then the caller ends it too --
         // fires a SECOND request over the wire.
         if (this._ended) {
-          if (callback) this.once("response", callback);
+          // The response may already have arrived (a GET dispatched on its
+          // first write, or a re-end after completion): once('response')
+          // would never fire again, silently dropping the callback.
+          if (callback) {
+            if (this.res) queueMicrotask(callback);
+            else this.once("response", callback);
+          }
           return this;
         }
         if (data != null) this.write(data, encoding);
@@ -14447,6 +14508,9 @@
           } else {
             natives.fetchBodyChannelEnd(self._bodyStream);
           }
+        } else if (self._sent) {
+          // Dispatched bodyless on first write (GET/HEAD): nothing further
+          // goes on the wire, and re-sending would fire a second request.
         } else if (connHdr.indexOf("upgrade") !== -1) {
           self._doUpgradeRequest(bodyData);
         } else {
@@ -14462,11 +14526,18 @@
           self._bodyLength = 0;
           self.emit("finish");
         });
-        if (callback) self.once("response", callback);
+        if (callback) {
+          // A GET dispatched on its first write may have its response
+          // before end() is ever called; once('response') would then
+          // never fire.
+          if (self.res) queueMicrotask(callback);
+          else self.once("response", callback);
+        }
         return this;
       }
       _doFetchRequest(bodyData) {
         var self = this;
+        self._sent = true;
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
@@ -14517,6 +14588,19 @@
           self.res = res;
           self._res = res;
           self.emit("response", res);
+          if (self._droppedWrites && !self._ended) {
+            // Node's unframed GET/HEAD writes poison the connection, which
+            // dies around response time and closes the never-finished
+            // request whether or not anyone reads the response. Emulate the
+            // socket death: close the request now (the response stays
+            // readable). Waiting for the response reader to hit EOF instead
+            // would hang a caller that never consumes the response.
+            process.nextTick(function () {
+              if (self.destroyed) return;
+              self.destroyed = true;
+              self._emitClose();
+            });
+          }
         }, function (err) {
           // A torn-down request swallows the transport failure it caused:
           // Node's abort()/destroy() destroys the socket, and the resulting

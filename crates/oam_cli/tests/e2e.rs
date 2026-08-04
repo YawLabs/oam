@@ -6671,6 +6671,144 @@ fn http_request_and_get_client() {
 }
 
 #[test]
+fn http_full_duplex_pipeline_echoes_while_request_streams() {
+    // Regression: a streamed request body must survive the response starting.
+    // RequestGuard used to reap the body registry entry the moment JS sent
+    // response headers, so pipeline(req, res) echoed one chunk then EOF'd.
+    // The ping-pong below writes chunk N+1 only after chunk N's echo comes
+    // back, so it deadlocks unless echoes flow while the request is open.
+    let stdout = run_ok(
+        "http_full_duplex.mjs",
+        "import http from 'node:http';\n\
+         import { pipeline } from 'node:stream';\n\
+         const server = http.createServer((req, res) => {\n\
+           pipeline(req, res, (err) => console.log('srv_pipeline_ok:', err == null));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         const got = await new Promise((resolve, reject) => {\n\
+           const req = http.request({ host: '127.0.0.1', port, method: 'POST' }, (res) => {\n\
+             let acc = '';\n\
+             let next = 2;\n\
+             res.on('data', (c) => {\n\
+               acc += c;\n\
+               while (next <= 5 && acc.length >= (next - 1) * 2) {\n\
+                 req.write('c' + next);\n\
+                 next += 1;\n\
+               }\n\
+               if (acc.length >= 10) req.end();\n\
+             });\n\
+             res.on('end', () => resolve(acc));\n\
+           });\n\
+           req.on('error', reject);\n\
+           req.write('c1');\n\
+         });\n\
+         console.log('echoed_all:', got === 'c1c2c3c4c5');\n\
+         server.close();",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn http_get_with_piped_body_dispatches_and_settles() {
+    // Node parity (test-stream-pipeline b008): a Readable piped into a GET
+    // that never end()s must dispatch immediately as a BODYLESS request --
+    // Node never chunk-frames GET/HEAD writes, so its server parses an
+    // empty request. The server pipeline succeeds on the empty body and the
+    // client pipeline settles with a premature close instead of hanging.
+    let stdout = run_ok(
+        "http_get_piped_body.mjs",
+        "import http from 'node:http';\n\
+         import { pipeline, Readable } from 'node:stream';\n\
+         const server = http.createServer((req, res) => {\n\
+           let len = 0;\n\
+           req.on('data', (c) => (len += c.length));\n\
+           pipeline(req, res, (err) => {\n\
+             console.log('srv_pipeline_ok:', err == null && len === 0);\n\
+           });\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         let sent = 0;\n\
+         const rs = new Readable({\n\
+           read() {\n\
+             if (sent++ > 10) return;\n\
+             rs.push('hello');\n\
+           },\n\
+         });\n\
+         const err = await new Promise((resolve) => {\n\
+           const req = http.request({ host: '127.0.0.1', port });\n\
+           pipeline(rs, req, (e) => resolve(e));\n\
+           req.on('response', () => {});\n\
+         });\n\
+         console.log('cli_settled_premature:', !!err && err.code === 'ERR_STREAM_PREMATURE_CLOSE');\n\
+         server.close();",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn http_body_keeps_streaming_after_early_response() {
+    // Node gates the response-finish dump on req._consuming: a handler that
+    // responds immediately but keeps draining the body must still receive
+    // every chunk. The reap paths for streamed bodies must never cancel a
+    // body the handler is actively consuming.
+    let stdout = run_ok(
+        "http_early_response_drain.mjs",
+        "import http from 'node:http';\n\
+         let srvResolve;\n\
+         const srvDone = new Promise((r) => (srvResolve = r));\n\
+         const server = http.createServer((req, res) => {\n\
+           let len = 0;\n\
+           req.on('data', (c) => (len += c.length));\n\
+           req.on('end', () => {\n\
+             console.log('srv_got_all:', len === 10);\n\
+             srvResolve();\n\
+           });\n\
+           res.end('accepted');\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         const status = await new Promise((resolve, reject) => {\n\
+           const req = http.request({ host: '127.0.0.1', port, method: 'POST' }, (res) => {\n\
+             res.resume();\n\
+             res.on('end', () => resolve(res.statusCode));\n\
+           });\n\
+           req.on('error', reject);\n\
+           let n = 0;\n\
+           const iv = setInterval(() => {\n\
+             n += 1;\n\
+             if (n <= 5) {\n\
+               req.write('c' + n);\n\
+             } else {\n\
+               clearInterval(iv);\n\
+               req.end();\n\
+             }\n\
+           }, 20);\n\
+         });\n\
+         console.log('cli_status:', status === 200);\n\
+         await srvDone;\n\
+         server.close();",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn http_client_socket_event_and_headers() {
     let addr = spawn_echo_server();
     let stdout = run_ok(

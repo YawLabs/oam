@@ -203,9 +203,14 @@ impl HttpState {
     /// the request finished while the read was in flight.
     pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<Vec<u8>, String>>) {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
-        // insert, NOT or_insert: the placeholder left by take_body_stream is
-        // present and must be replaced by the live receiver.
-        guard.insert(id, RequestBody::Stream(rx));
+        // Reinsert ONLY onto the StreamPending marker left by
+        // take_body_stream. A missing entry means the body was cancelled or
+        // the request torn down while this read was in flight; resurrecting
+        // it here would leak the stream past the request's lifetime, and
+        // dropping rx instead is what stops the pump.
+        if let Some(slot @ RequestBody::StreamPending) = guard.get_mut(&id) {
+            *slot = RequestBody::Stream(rx);
+        }
     }
 
     /// Drop a streamed body outright (JS cancelled / destroyed the request).
@@ -590,20 +595,37 @@ struct RequestGuard {
     /// Body bytes this request reserved against the global budget; refunded
     /// on drop along with the map cleanup.
     reserved: usize,
+    /// Set once the request has been handed to the JS accept queue. Until
+    /// then no JS reap path can exist, so Drop must remove the body entry
+    /// itself (queue send failed, or the future was cancelled mid-send).
+    dispatched: bool,
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.state
-            .bodies
-            .lock()
-            .expect("http bodies lock")
-            .remove(&self.id);
-        self.state
             .pending
             .lock()
             .expect("http pending lock")
             .remove(&self.id);
+        let mut bodies = self.state.bodies.lock().expect("http bodies lock");
+        match bodies.get(&self.id) {
+            // Streamed bodies on a DISPATCHED request outlive this guard:
+            // handle_request returns the moment JS sends response headers --
+            // or is cancelled by a client disconnect -- while the handler
+            // may still be mid-read, and an aborted upload must surface the
+            // pump's queued error to the consumer rather than vanish into a
+            // clean EOF. The JS side reaps instead: a terminal read
+            // (EOF/error) in the read op, _dump for a never-consumed body,
+            // and _destroy's cancel. A request JS never learned about has
+            // no JS reaper, so it IS removed here.
+            Some(RequestBody::Stream(_) | RequestBody::StreamPending) if self.dispatched => {}
+            Some(_) => {
+                bodies.remove(&self.id);
+            }
+            None => {}
+        }
+        drop(bodies);
         if self.reserved > 0 {
             self.state
                 .body_bytes
@@ -810,10 +832,11 @@ async fn handle_request(
     // From here on, every exit cleans up — including a cancelled future
     // if the client disconnects while the handler runs — and refunds the
     // reserved body bytes.
-    let _guard = RequestGuard {
+    let mut guard = RequestGuard {
         state: state.clone(),
         id,
         reserved: body_len,
+        dispatched: false,
     };
 
     let sent = queue
@@ -834,6 +857,7 @@ async fn handle_request(
             .body(http_body_util::Full::new(Bytes::from_static(b"server is closing")).boxed())
             .expect("static 503 builds"));
     }
+    guard.dispatched = true;
 
     match rx.await {
         Ok(ResponseSpec {

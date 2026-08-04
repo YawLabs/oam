@@ -7,7 +7,7 @@
     "minPass": 393,
     "minPassByHost": {
       "linux-x86_64": 267,
-      "windows-aarch64": 399
+      "windows-aarch64": 400
     }
   },
   "tests": {
