@@ -21,11 +21,9 @@ use std::sync::Mutex;
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 
-use crate::tsconfig::PathsConfig;
-
 /// A loaded tsconfig entry: either a parsed `PathsConfig` (may be empty) or
 /// the explicit `None` we cached for a tsconfig that had no `paths` field.
-pub type TsconfigEntry = Option<PathsConfig>;
+pub type TsconfigEntry = Option<crate::tsconfig::TsconfigInfo>;
 
 /// Owns the per-resolver caches that used to be process-globals.
 #[derive(Default)]

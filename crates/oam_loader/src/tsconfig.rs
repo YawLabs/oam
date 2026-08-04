@@ -40,6 +40,15 @@ pub(crate) struct PathsConfig {
     pub patterns: Vec<(String, Vec<String>)>,
 }
 
+/// The subset of a tsconfig (extends-chain merged) the loader consumes.
+/// Each field merges independently: the nearest declaration wins, a child
+/// without one inherits the parent's (matching tsc's per-option override).
+#[derive(Debug, Clone)]
+pub struct TsconfigInfo {
+    pub(crate) paths: Option<PathsConfig>,
+    pub(crate) jsx_import_source: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct RawTsconfig {
     #[serde(default)]
@@ -57,6 +66,10 @@ struct RawCompilerOptions {
     // honor what the checker rejects.
     #[serde(default)]
     paths: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Retargets the automatic JSX runtime (`preact` -> imports from
+    /// `preact/jsx-runtime`). Consumed by `transpile_typescript`.
+    #[serde(default, rename = "jsxImportSource")]
+    jsx_import_source: Option<String>,
 }
 
 /// Walk up from `referrer` to the nearest tsconfig.json and load its
@@ -67,6 +80,12 @@ struct RawCompilerOptions {
 /// `resolver.clear_caches()` to drop stale entries when the project layout
 /// changes (e.g. after `oam install` writes a new `node_modules/`).
 pub(crate) fn load_for_with(resolver: &Resolver, referrer: &Path) -> Option<PathsConfig> {
+    info_for_with(resolver, referrer)?.paths
+}
+
+/// The cached core: nearest tsconfig.json upward from `referrer`, with its
+/// extends chain merged into a `TsconfigInfo`.
+pub(crate) fn info_for_with(resolver: &Resolver, referrer: &Path) -> Option<TsconfigInfo> {
     let mut dir = if referrer.is_dir() {
         referrer.to_path_buf()
     } else {
@@ -98,9 +117,15 @@ pub(crate) fn load_for(referrer: &Path) -> Option<PathsConfig> {
     load_for_with(crate::resolver::default_resolver(), referrer)
 }
 
-/// Load a tsconfig and merge its relative `extends` chain (child wins;
-/// paths resolve against the file that DECLARED them, per TS 7).
-fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
+/// `compilerOptions.jsxImportSource` for the file at `referrer`, from the
+/// nearest tsconfig (extends-chain merged, nearest declaration wins).
+pub(crate) fn jsx_import_source_for(referrer: &Path) -> Option<String> {
+    info_for_with(crate::resolver::default_resolver(), referrer)?.jsx_import_source
+}
+
+/// Load a tsconfig and merge its relative `extends` chain (child wins
+/// per-option; paths resolve against the file that DECLARED them, per TS 7).
+fn load_chain(tsconfig: &Path, depth: u8) -> Option<TsconfigInfo> {
     if depth > 8 {
         return None; // extends cycle / absurd chain: give up quietly
     }
@@ -110,6 +135,7 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
     let raw = raw.trim_start_matches('\u{feff}');
     let parsed: RawTsconfig = serde_json::from_str(&strip_jsonc(raw)).ok()?;
     let dir = tsconfig.parent()?.to_path_buf();
+    let own_jsx = parsed.compiler_options.jsx_import_source.clone();
 
     let own = parsed.compiler_options.paths.map(|paths| {
         let base_dir = dir.clone();
@@ -129,34 +155,48 @@ fn load_chain(tsconfig: &Path, depth: u8) -> Option<PathsConfig> {
             .collect();
         PathsConfig { base_dir, patterns }
     });
-    if let Some(config) = own {
-        return Some(config); // child paths replace parent paths entirely (TS semantics)
+    if own.is_some() && own_jsx.is_some() {
+        // Every merged option declared right here: the chain cannot add
+        // anything (child declarations replace parent ones entirely).
+        return Some(TsconfigInfo {
+            paths: own,
+            jsx_import_source: own_jsx,
+        });
     }
 
-    // No paths here: a relative extends may carry them.
-    let extends = parsed.extends?;
-    if !(extends.starts_with("./") || extends.starts_with("../")) {
-        let mut set = warned_bare_extends()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if set.insert(tsconfig.to_path_buf()) {
-            eprintln!(
-                "OAM-MOD: bare-package tsconfig extends ({:?}) is not yet resolved; \
-                 tsconfig paths from {:?} will be unavailable",
-                extends, tsconfig
-            );
+    // Some option is missing here: a relative extends may carry it.
+    let parent_info = match parsed.extends {
+        None => None,
+        Some(extends) if !(extends.starts_with("./") || extends.starts_with("../")) => {
+            let mut set = warned_bare_extends()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if set.insert(tsconfig.to_path_buf()) {
+                eprintln!(
+                    "OAM-MOD: bare-package tsconfig extends ({:?}) is not yet resolved; \
+                     tsconfig paths from {:?} will be unavailable",
+                    extends, tsconfig
+                );
+            }
+            None // bare-package extends: needs npm resolution (M2)
         }
-        return None; // bare-package extends: needs npm resolution (M2)
-    }
-    // TS resolves './tsconfig.base' by trying the exact path, then with
-    // '.json' APPENDED (never set_extension — dotted basenames are normal).
-    let mut parent = dir.join(&extends);
-    if !parent.is_file() {
-        let mut with_json = parent.into_os_string();
-        with_json.push(".json");
-        parent = PathBuf::from(with_json);
-    }
-    load_chain(&parent, depth + 1)
+        Some(extends) => {
+            // TS resolves './tsconfig.base' by trying the exact path, then with
+            // '.json' APPENDED (never set_extension — dotted basenames are normal).
+            let mut parent = dir.join(&extends);
+            if !parent.is_file() {
+                let mut with_json = parent.into_os_string();
+                with_json.push(".json");
+                parent = PathBuf::from(with_json);
+            }
+            load_chain(&parent, depth + 1)
+        }
+    };
+
+    Some(TsconfigInfo {
+        paths: own.or_else(|| parent_info.as_ref().and_then(|p| p.paths.clone())),
+        jsx_import_source: own_jsx.or_else(|| parent_info.and_then(|p| p.jsx_import_source)),
+    })
 }
 
 /// Candidate raw paths for a bare specifier, per TypeScript's precedence.
@@ -540,5 +580,57 @@ mod tests {
         assert_eq!(cfg.base_dir, nested);
         // Sanity: the nested path actually resolves.
         assert!(!match_specifier(&cfg, "@nested/thing").is_empty());
+    }
+
+    /// jsxImportSource and paths merge INDEPENDENTLY across the extends
+    /// chain. The interesting case is a child that declares only one of
+    /// them: before this option existed, load_chain returned the moment it
+    /// saw `paths` and never read the parent at all.
+    #[test]
+    fn jsx_import_source_and_paths_merge_independently() {
+        let dir = std::env::temp_dir().join(format!("oam-tsc-jsx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("base.json"),
+            r#"{"compilerOptions":{"jsxImportSource":"preact","paths":{"@base/*":["./b/*"]}}}"#,
+        )
+        .unwrap();
+        // Child declares paths ONLY -> inherits jsxImportSource, overrides paths.
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{"extends":"./base.json","compilerOptions":{"paths":{"@child/*":["./c/*"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("entry.tsx"), "").unwrap();
+        let entry = dir.join("entry.tsx");
+        assert_eq!(jsx_import_source_for(&entry).as_deref(), Some("preact"));
+        let cfg = load_for(&entry).expect("paths present");
+        let keys: Vec<&str> = cfg.patterns.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["@child/*"], "child paths replace parent's");
+
+        // Child override wins over the extended base.
+        let over = dir.join("over");
+        std::fs::create_dir_all(&over).unwrap();
+        std::fs::write(
+            over.join("tsconfig.json"),
+            r#"{"extends":"../base.json","compilerOptions":{"jsxImportSource":"solid-js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(over.join("e.tsx"), "").unwrap();
+        assert_eq!(
+            jsx_import_source_for(&over.join("e.tsx")).as_deref(),
+            Some("solid-js")
+        );
+
+        // No tsconfig at all -> None, never a fabricated default.
+        let bare = std::env::temp_dir().join(format!("oam-tsc-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("e.tsx"), "").unwrap();
+        assert_eq!(jsx_import_source_for(&bare.join("e.tsx")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 }
