@@ -86,11 +86,46 @@
       this.composed = init.composed === true;
       this.isTrusted = false;
       this.eventPhase = 0;
-      this.cancelBubble = false;
+      this._stopPropagation = false;
     }
     // Legacy alias for !defaultPrevented, still widely read.
     get returnValue() {
       return !this.defaultPrevented;
+    }
+    // Legacy alias for `target`, kept alive by older DOM-shaped code.
+    get srcElement() {
+      return this.target;
+    }
+    // Node gives Event a custom inspect: at negative depth it collapses to
+    // the bare class name rather than util.inspect's generic "[ClassName]",
+    // so a nested event reads as `CustomEvent` in a dump.
+    [Symbol.for("nodejs.util.inspect.custom")](depth, options) {
+      const name = this.constructor?.name ?? "Event";
+      if (depth < 0) return name;
+      const fields = {
+        type: this.type,
+        defaultPrevented: this.defaultPrevented,
+        cancelable: this.cancelable,
+        timeStamp: this.timeStamp,
+      };
+      if ("detail" in this) fields.detail = this.detail;
+      const inspect = globalThis.__oamNode?.get?.("util")?.inspect;
+      const body = inspect
+        ? inspect(fields, { ...options, depth: (options?.depth ?? 2) - 1 })
+        : "{}";
+      return `${name} ${body}`;
+    }
+    // cancelBubble is the legacy face of the stop-propagation flag: reading
+    // it reports the flag, and assigning a TRUTHY value sets it (assigning
+    // false is a no-op per spec -- the flag cannot be un-set). It used to be
+    // a plain field, so stopPropagation() left it reading false and code
+    // that checks cancelBubble to see whether propagation was halted got
+    // the wrong answer.
+    get cancelBubble() {
+      return this._stopPropagation;
+    }
+    set cancelBubble(value) {
+      if (value) this._stopPropagation = true;
     }
     preventDefault() {
       if (this.cancelable) this.defaultPrevented = true;
@@ -101,11 +136,33 @@
     composedPath() {
       return this.currentTarget ? [this.currentTarget] : [];
     }
-    stopPropagation() {}
+    stopPropagation() {
+      this._stopPropagation = true;
+    }
     stopImmediatePropagation() {
+      // Immediate also implies ordinary propagation is stopped.
+      this._stopPropagation = true;
       this._stopImmediate = true;
     }
   }
+  // Event-phase constants. The spec puts them on BOTH the constructor and
+  // the prototype (`Event.NONE` and `ev.NONE`), and code compares
+  // `ev.eventPhase === Event.AT_TARGET` -- against undefined, before this,
+  // which is never true.
+  const EVENT_PHASES = {
+    NONE: 0,
+    CAPTURING_PHASE: 1,
+    AT_TARGET: 2,
+    BUBBLING_PHASE: 3,
+  };
+  const defineEventPhases = (ctor) => {
+    for (const [name, value] of Object.entries(EVENT_PHASES)) {
+      const descriptor = { value, writable: false, enumerable: true, configurable: false };
+      Object.defineProperty(ctor, name, descriptor);
+      Object.defineProperty(ctor.prototype, name, descriptor);
+    }
+  };
+  defineEventPhases(Event);
   globalThis.Event = Event;
 
   // CustomEvent: the standard way to carry a payload on an event, and a
@@ -137,6 +194,10 @@
     value: "CustomEvent",
     configurable: true,
   });
+  // Subclasses carry their own copies of the phase constants; inheriting
+  // them from Event is not enough for `CustomEvent.NONE`, since the
+  // non-writable own properties above do not surface as static members.
+  defineEventPhases(CustomEvent);
   globalThis.CustomEvent = CustomEvent;
 
   class EventTarget {
@@ -165,14 +226,32 @@
     dispatchEvent(event) {
       event.target = this;
       event.currentTarget = this;
-      const list = (this._listeners.get(event.type) ?? []).slice();
-      for (const entry of list) {
-        // Resist-marked listeners (Node's kResistStopPropagation) still run
-        // after stopImmediatePropagation; everything else is skipped.
-        if (event._stopImmediate && !entry.resist) continue;
-        if (entry.once) this.removeEventListener(event.type, entry.fn);
-        const handler = typeof entry.fn === "function" ? entry.fn : entry.fn.handleEvent;
-        handler.call(this, event);
+      // eventPhase reads AT_TARGET while listeners run and returns to NONE
+      // afterwards. It was pinned at NONE throughout, so a handler asking
+      // which phase it was in always got the "not dispatching" answer.
+      event.eventPhase = 2; // AT_TARGET
+      try {
+        const list = (this._listeners.get(event.type) ?? []).slice();
+        for (const entry of list) {
+          // Resist-marked listeners (Node's kResistStopPropagation) still run
+          // after stopImmediatePropagation; everything else is skipped.
+          if (event._stopImmediate && !entry.resist) continue;
+          if (entry.once) this.removeEventListener(event.type, entry.fn);
+          // A plain function listener is called with the TARGET as `this`;
+          // an object listener is called with the LISTENER OBJECT, so
+          // `handleEvent` can reach its own state. Both were getting the
+          // target, which broke the object form's whole point.
+          if (typeof entry.fn === "function") {
+            entry.fn.call(this, event);
+          } else {
+            entry.fn.handleEvent.call(entry.fn, event);
+          }
+        }
+      } finally {
+        // Restored even if a listener throws, so a later reader never sees
+        // a stale mid-dispatch phase.
+        event.eventPhase = 0; // NONE
+        event.currentTarget = null;
       }
       return !event.defaultPrevented;
     }
