@@ -129,8 +129,12 @@ pub(crate) fn run(release: bool) -> Result<()> {
     }
 
     let total = tests.len();
-    let runnable = pass + fail + skip;
-    let scored = pass + fail; // skips excluded from the rate denominator
+    // The rate denominator is SCORED tests -- a self-skipping test produced no
+    // verdict, so counting it would let a platform look better by skipping
+    // more. `skip` and `unrunnable` stay in the scorecard beside it so nothing
+    // is hidden; what must never happen is the published count and the
+    // published percentage disagreeing about which denominator they used.
+    let scored = pass + fail;
     let pct = |n: usize, d: usize| {
         if d == 0 {
             0.0
@@ -140,7 +144,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
     };
 
     write_scorecard(
-        &repo, &oam, &by_module, &failures, total, runnable, pass, fail, skip, unrunnable,
+        &repo, &oam, &by_module, &failures, total, scored, pass, fail, skip, unrunnable,
     )?;
 
     println!();
@@ -546,6 +550,7 @@ fn write_scorecard(
         "host": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
         "total": total,
+        // pass + fail. Must stay the denominator `passOverRunnable` divides by.
         "runnable": runnable,
         "pass": pass,
         "fail": fail,
