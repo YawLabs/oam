@@ -308,6 +308,18 @@ fn main() -> ExitCode {
             } else if arg == "--expose-gc" {
                 flags.expose_gc = true;
                 i += 1;
+            } else if arg == "--allow-natives-syntax" {
+                flags.allow_natives_syntax = true;
+                i += 1;
+            } else if arg == "--js-float16array" {
+                flags.js_float16array = true;
+                i += 1;
+            } else if arg == "--zero-fill-buffers" {
+                flags.zero_fill_buffers = true;
+                i += 1;
+            } else if let Some(v) = arg.strip_prefix("--title=") {
+                flags.title = Some(v.to_string());
+                i += 1;
             } else if arg == "--no-warnings" {
                 flags.no_warnings = true;
                 i += 1;
@@ -383,8 +395,23 @@ fn main() -> ExitCode {
         }
         // V8 flags must be set before V8::initialize, i.e. before any
         // JsRuntime is constructed.
-        if flags.expose_gc {
-            oam_engine::init_platform_with_flags(&["--expose-gc"]);
+        // Collect every node flag that is really a V8 flag: they all have to
+        // go in ONE call, because V8::initialize runs on the first one and
+        // later calls are ignored.
+        {
+            let mut v8_flags: Vec<&str> = Vec::new();
+            if flags.expose_gc {
+                v8_flags.push("--expose-gc");
+            }
+            if flags.allow_natives_syntax {
+                v8_flags.push("--allow-natives-syntax");
+            }
+            if flags.js_float16array {
+                v8_flags.push("--js-float16array");
+            }
+            if !v8_flags.is_empty() {
+                oam_engine::init_platform_with_flags(&v8_flags);
+            }
         }
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
@@ -2040,6 +2067,14 @@ struct NodeFlags {
     no_deprecation: bool,
     disabled_warnings: Vec<String>,
     redirect_warnings: Option<String>,
+    /// Node flags that are really V8 flags: forwarded verbatim before
+    /// V8::initialize rather than reimplemented.
+    allow_natives_syntax: bool,
+    js_float16array: bool,
+    /// `--zero-fill-buffers`: Buffer.allocUnsafe behaves like Buffer.alloc.
+    zero_fill_buffers: bool,
+    /// `--title=x`: the initial process.title.
+    title: Option<String>,
 }
 
 impl NodeFlags {
@@ -2071,6 +2106,13 @@ impl NodeFlags {
         if let Some(path) = &self.redirect_warnings {
             let p = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
             js.push_str(&def("__oamRedirectWarnings", p));
+        }
+        if self.zero_fill_buffers {
+            js.push_str(&def("__oamZeroFillBuffers", "true".into()));
+        }
+        if let Some(title) = &self.title {
+            let t = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".into());
+            js.push_str(&format!("globalThis.process.title = {t};"));
         }
         if !js.is_empty() {
             let _ = rt.execute_script("<flags>", &js);

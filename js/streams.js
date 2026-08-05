@@ -130,7 +130,13 @@
 
     getReader() {
       if (this._reader !== null) {
-        throw new TypeError("ReadableStream is locked to a reader");
+        // Node tags this ERR_INVALID_STATE, and callers key on the code --
+        // stream/consumers' rejection is asserted by code, not by message.
+        // A bare TypeError left them unable to tell "already locked" apart
+        // from any other TypeError.
+        const err = new TypeError("ReadableStream is locked to a reader");
+        err.code = "ERR_INVALID_STATE";
+        throw err;
       }
       const stream = this;
       let closedResolve;
@@ -435,7 +441,18 @@
       };
       this.writable = new WritableStream({
         start: () => transformer.start?.(controller),
-        write: (chunk) => transformer.transform?.(chunk, controller),
+        // No `transform` means the IDENTITY transform, which enqueues the
+        // chunk unchanged -- per spec, and it is the whole point of the
+        // bare `new TransformStream()` used as a plumbing pipe. The
+        // optional call alone returned undefined and silently DISCARDED
+        // every chunk, so such a stream read back empty.
+        write: (chunk) => {
+          if (typeof transformer.transform === "function") {
+            return transformer.transform(chunk, controller);
+          }
+          controller.enqueue(chunk);
+          return undefined;
+        },
         close: async () => {
           await transformer.flush?.(controller);
           readableController.close();

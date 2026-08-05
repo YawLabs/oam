@@ -973,11 +973,17 @@
 
     static allocUnsafe(size) {
       validateSize(size);
+      // --zero-fill-buffers turns the whole unsafe family into alloc(): the
+      // point of the flag is that NO buffer can hand back another
+      // allocation's leftover bytes, which the pooled path otherwise does
+      // by design.
+      if (globalThis.__oamZeroFillBuffers) return Buffer.alloc(size);
       return poolAllocate(Buffer, size);
     }
 
     static allocUnsafeSlow(size) {
       validateSize(size);
+      if (globalThis.__oamZeroFillBuffers) return Buffer.alloc(size);
       return new Buffer(size);
     }
 
@@ -1054,6 +1060,14 @@
           } else {
             len = 0;
           }
+        }
+        // A RESIZABLE ArrayBuffer with no explicit length yields a
+        // LENGTH-TRACKING view: passing a computed length pins it, so a
+        // later ab.resize() left the Buffer reporting the old byteLength
+        // (and reading past the live end after a shrink). Omitting the
+        // length is what makes the view track, per the spec and Node.
+        if (length === undefined && value.resizable === true) {
+          return new Buffer(value, off);
         }
         return new Buffer(value, off, len);
       }
@@ -5338,10 +5352,22 @@
         // the true kind via the %TypedArray% toStringTag getter, which ignores
         // own-toStringTag / prototype spoofing.
         if (taKind(a) !== taKind(b)) return false;
-        const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-        const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-        if (ua.length !== ub.length) return false;
-        for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+        const kind = taKind(a);
+        const isFloatArray =
+          kind === "Float16Array" || kind === "Float32Array" || kind === "Float64Array";
+        if (!strict && isFloatArray) {
+          // LOOSE mode compares float arrays ELEMENT-wise, not byte-wise:
+          // +0 and -0 have different bytes but are ==, and loose equality
+          // says they match. (Strict stays byte-wise, where they differ --
+          // which is the whole distinction between the two APIs.)
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+        } else {
+          const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+          const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+          if (ua.length !== ub.length) return false;
+          for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+        }
         // Extra own enumerable (non-index) properties still count. Symbols are
         // compared only in strict mode (loose deepEqual ignores symbol keys).
         const extraKeys = (o) =>
@@ -5363,6 +5389,13 @@
         return true;
       }
       if (anyArrayBuffer(a)) {
+        // An ArrayBuffer and a SharedArrayBuffer are DIFFERENT types even
+        // with identical bytes -- one is shareable across threads and the
+        // other is not, which is exactly the distinction a test comparing
+        // them cares about. Comparing bytes alone called them equal.
+        const shared = (v) =>
+          typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer;
+        if (shared(a) !== shared(b)) return false;
         if (a.byteLength !== b.byteLength) return false;
         const ua = new Uint8Array(a);
         const ub = new Uint8Array(b);
@@ -7360,12 +7393,14 @@
       return expectsNoError("doesNotReject", "rejection", await waitForActual(promiseFn), args[0], args[1]);
     }
 
+    // DEP0094 fires at most once per process, like Node's `warned` flag.
+    let assertFailWarned = false;
     const assert = Object.assign(ok, {
       AssertionError,
       ok,
       fail: (...failArgs) => {
         const argsLen = failArgs.length;
-        const [actual, expected, message, operator] = failArgs;
+        const [actual, expected, message, operator, stackStartFn] = failArgs;
         // assert.fail() / assert.fail(null) -- Node's `internalMessage` path:
         // the literal message "Failed" but still generatedMessage === true.
         if (actual == null && argsLen <= 1) {
@@ -7390,11 +7425,27 @@
         }
         if (expected instanceof Error) throw expected;
         if (message instanceof Error) throw message;
+        // DEP0094, emitted ONCE: the multi-argument form reads like an
+        // equality assertion but never compares anything, so Node steers
+        // callers to strictEqual.
+        if (!assertFailWarned) {
+          assertFailWarned = true;
+          process.emitWarning(
+            "assert.fail() with more than one argument is deprecated. " +
+              "Please use assert.strictEqual() instead or only pass a message.",
+            "DeprecationWarning",
+            "DEP0094",
+          );
+        }
         throw new AssertionError({
           actual,
           expected,
           message,
-          operator: operator || "fail",
+          // EXACTLY two arguments means "these differ", so the operator is
+          // '!=' and the message reads "'a' != 'b'". Defaulting to 'fail'
+          // produced the nonsense "'first' fail 'second'".
+          operator: operator || (argsLen === 2 ? "!=" : "fail"),
+          stackStartFn: stackStartFn || undefined,
         });
       },
       // The whole equality family validates arity: Node throws ERR_MISSING_ARGS
@@ -10405,6 +10456,10 @@
       const chunks = [];
       let total = 0;
       for await (const chunk of streamLike) {
+        // Permissive on purpose: blob/arrayBuffer/buffer route through
+        // Blob in Node, which STRINGIFIES a non-buffer chunk (an
+        // object-mode stream really does yield "[object Object]" bytes).
+        // Only text/json validate -- see textOf.
         const bytes =
           chunk instanceof Uint8Array
             ? chunk
@@ -10420,14 +10475,50 @@
       }
       return out;
     }
+    /// text() and json() are STRICT where the byte collectors are not: a
+    /// chunk that is neither a string nor a view has no sane text reading,
+    /// and silently yielding "[object Object]" hides a mis-shaped stream
+    /// from the caller. An incomplete multi-byte tail still flushes to
+    /// U+FFFD, because the whole byte run is decoded in one pass.
+    async function textOf(streamLike) {
+      const parts = [];
+      let total = 0;
+      for await (const chunk of streamLike) {
+        let bytes;
+        if (typeof chunk === "string") {
+          bytes = globalThis.Buffer.from(chunk, "utf8");
+        } else if (ArrayBuffer.isView(chunk)) {
+          bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        } else {
+          throw new codes.ERR_INVALID_ARG_TYPE(
+            "chunk",
+            ["string", "ArrayBufferView"],
+            chunk,
+          );
+        }
+        parts.push(bytes);
+        total += bytes.length;
+      }
+      const all = new Uint8Array(total);
+      let at = 0;
+      for (const p of parts) {
+        all.set(p, at);
+        at += p.length;
+      }
+      return new TextDecoder().decode(all);
+    }
     return {
       arrayBuffer: async (s) => (await bytesOf(s)).buffer,
       buffer: async (s) => {
         const bytes = await bytesOf(s);
         return globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
       },
-      text: async (s) => new TextDecoder().decode(await bytesOf(s)),
-      json: async (s) => JSON.parse(new TextDecoder().decode(await bytesOf(s))),
+      text: (s) => textOf(s),
+      json: async (s) => JSON.parse(await textOf(s)),
+      // Node exports blob() alongside the rest; it was simply missing here,
+      // so `import { blob } from 'node:stream/consumers'` yielded undefined
+      // and failed at the call site rather than at import.
+      blob: async (s) => new globalThis.Blob([await bytesOf(s)]),
     };
   };
 

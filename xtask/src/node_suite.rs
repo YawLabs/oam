@@ -431,6 +431,11 @@ const SUPPORTED_FLAGS: &[&str] = &[
     "--env-file",
     "--env-file-if-exists",
     "--input-type",
+    // Forwarded to V8 verbatim.
+    "--allow-natives-syntax",
+    "--js-float16array",
+    "--zero-fill-buffers",
+    "--title",
 ];
 
 fn classify_flags(path: &Path) -> FlagSupport {
