@@ -9705,9 +9705,26 @@
       // would require('stream') at factory time, re-entering the init cycle
       // documented at the factory top.
       // Legacy process.binding: node v22 still ships it (deprecated but
-      // present) and real packages feature-detect through it. Only the
-      // 'util' binding is modeled -- its 16 type predicates, taken BY
-      // IDENTITY off util.types (probe-verified: all 16 are ===).
+      // present) and real packages feature-detect through it -- older
+      // graceful-fs read process.binding('constants'), older supports-color
+      // read process.binding('tty_wrap').isTTY.
+      //
+      // Only bindings oam can back with the REAL thing are modeled, and every
+      // member is taken BY IDENTITY off the public surface that already
+      // implements it, so the binding cannot drift from the module. Members
+      // oam does not have are omitted, and the other 20 names on node's
+      // allowlist keep throwing.
+      //
+      // That last part is deliberate, and it is why
+      // test-process-binding-internalbinding-allowlist does not pass: it
+      // asserts all 24 names are truthy, and most of them are libuv handle
+      // classes (TCP, UDP, Pipe, JSStream, FSEvent) that oam has no
+      // implementation behind. Returning `{}` would claim them. It is also
+      // worse for the caller than throwing -- a package that feature-detects
+      // process.binding('tcp_wrap'), gets an empty object, and proceeds hits
+      // a TypeError deep in its own code, where the throw sends it straight
+      // to the fallback branch that is correct for oam.
+      //
       // Resolved lazily to avoid the process<->util factory cycle.
       binding(module) {
         // Node contract (probe-verified against v22.22.2): String()-coerce
@@ -9718,20 +9735,38 @@
         // the returned object is FRESH per call, not memoized -- no cache
         // property is stored on process.
         const name = String(module);
-        if (name !== "util") {
-          throw new Error(`No such module: ${name}`);
+        if (name === "util") {
+          const types = registry.get("util").types;
+          const out = {};
+          for (const k of [
+            "isAnyArrayBuffer", "isArrayBuffer", "isArrayBufferView", "isAsyncFunction",
+            "isDataView", "isDate", "isExternal", "isMap", "isMapIterator",
+            "isNativeError", "isPromise", "isRegExp", "isSet", "isSetIterator",
+            "isTypedArray", "isUint8Array",
+          ]) {
+            if (typeof types[k] === "function") out[k] = types[k];
+          }
+          return out;
         }
-        const types = registry.get("util").types;
-        const out = {};
-        for (const k of [
-          "isAnyArrayBuffer", "isArrayBuffer", "isArrayBufferView", "isAsyncFunction",
-          "isDataView", "isDate", "isExternal", "isMap", "isMapIterator",
-          "isNativeError", "isPromise", "isRegExp", "isSet", "isSetIterator",
-          "isTypedArray", "isUint8Array",
-        ]) {
-          if (typeof types[k] === "function") out[k] = types[k];
+        if (name === "constants") {
+          // Data only. node also publishes os.dlopen (RTLD_*),
+          // os.UV_UDP_REUSEADDR, and the `trace` and `internal` namespaces;
+          // oam has no dlopen, no UDP handle and no tracing subsystem, so
+          // those are left out rather than given invented values.
+          const os = registry.get("os").constants;
+          return {
+            os: { errno: os.errno, signals: os.signals, priority: os.priority },
+            fs: registry.get("fs").constants,
+            crypto: registry.get("crypto").constants,
+            zlib: registry.get("zlib").constants,
+          };
         }
-        return out;
+        if (name === "tty_wrap") {
+          // node also exposes the TTY handle class, which is a libuv stream
+          // wrapper oam has nothing behind. isTTY is the half that is real.
+          return { isTTY: registry.get("tty").isatty };
+        }
+        throw new Error(`No such module: ${name}`);
       },
       getBuiltinModule(id) {
         // Node contract (probe-verified against v22.22.2): non-string ids

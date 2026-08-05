@@ -378,6 +378,7 @@ entries below were executed on both runtimes unless marked.
 
 | API | oam | Node |
 |---|---|---|
+| `process.binding(name)` | **Three of node's 24 allowlisted bindings, and they are real: `util`, `constants`, `tty_wrap`.** Every member is taken by identity off the module that implements it, and members oam lacks are omitted (`constants` has no `os.dlopen`, `trace` or `internal`; `tty_wrap` has no `TTY` class). The other 21 names throw `No such module: x`, which is deliberate: most are libuv handle classes (`TCP`, `UDP`, `Pipe`, `JSStream`, `FSEvent`) with nothing behind them, and an empty object would both claim the binding and send a feature-detecting caller past its own fallback into a later TypeError. | All 24, backed by real C++ bindings. Deprecated (DEP0111). |
 | `async_hooks.createHook` | **Init-observer only.** `init` fires for the resource kinds oam models — currently `TickObject` — and `before`/`after`/`destroy`/`promiseResolve` never fire. | `init` for `Timeout`, `PROMISE`, `Immediate`, ... plus the full lifecycle callbacks. |
 | `async_hooks.executionAsyncId` / `triggerAsyncId` | Always `0` — there is no async-id plumbing. | Real ids. |
 | `async_hooks.asyncWrapProviders` | Absent. | Present. |
