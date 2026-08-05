@@ -17586,7 +17586,9 @@
         this.identifier = opts.identifier ?? `vm:module(${moduleSequence++})`;
         this.context = opts.context;
         // Compiles now, so a syntax error throws from the constructor.
-        this[kModuleId] = natives.vmModuleCompile(source, this.identifier);
+        // The context travels to the native side: a module compiled outside
+        // the context it claims to belong to would write to the HOST global.
+        this[kModuleId] = natives.vmModuleCompile(source, this.identifier, this.context);
         this._linkedOnce = false;
         if (releaseModule) releaseModule.register(this, this[kModuleId]);
       }

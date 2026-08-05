@@ -7,7 +7,7 @@
     "minPass": 429,
     "minPassByHost": {
       "linux-x86_64": 436,
-      "macos-aarch64": 437,
+      "macos-aarch64": 438,
       "windows-aarch64": 429
     }
   },

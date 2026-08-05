@@ -47,6 +47,17 @@ fn proxy_of<'s>(
     v8::Local::<v8::Object>::try_from(value).ok()
 }
 
+/// The context a contextified sandbox owns, or `None` if it was never
+/// contextified. Used by `vm.SourceTextModule` to compile and run a module
+/// inside the context the caller named.
+pub(crate) fn context_of_sandbox<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    sandbox: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Context>> {
+    let proxy = proxy_of(scope, sandbox)?;
+    proxy.get_creation_context(scope)
+}
+
 /// The sandbox behind the object an interceptor fired on.
 ///
 /// Keyed off the holder's *creation* context rather than the isolate's current

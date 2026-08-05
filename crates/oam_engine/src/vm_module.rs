@@ -18,10 +18,22 @@
 
 use std::collections::HashMap;
 
+/// A module plus the context it belongs to.
+///
+/// The context is not decoration: a module compiles, instantiates and
+/// evaluates in ONE context, and it must be the one the caller asked for.
+/// Accepting `{ context }` and then working in the host context would let a
+/// module that believes it is sandboxed write to the real global.
+struct ModuleEntry {
+    module: v8::Global<v8::Module>,
+    /// `None` means the host context.
+    context: Option<v8::Global<v8::Context>>,
+}
+
 /// Modules created by `new vm.SourceTextModule`, by the id handed to JS.
 #[derive(Default)]
 pub(crate) struct VmModules {
-    by_id: HashMap<u32, v8::Global<v8::Module>>,
+    by_id: HashMap<u32, ModuleEntry>,
     /// Identity hash -> ids. A hash can collide, so the resolve callback
     /// narrows the candidates by comparing module identity.
     ids_by_hash: HashMap<i32, Vec<u32>>,
@@ -32,25 +44,50 @@ pub(crate) struct VmModules {
 }
 
 impl VmModules {
-    fn insert(&mut self, hash: i32, module: v8::Global<v8::Module>) -> u32 {
+    fn insert(
+        &mut self,
+        hash: i32,
+        module: v8::Global<v8::Module>,
+        context: Option<v8::Global<v8::Context>>,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.by_id.insert(id, module);
+        self.by_id.insert(id, ModuleEntry { module, context });
         self.ids_by_hash.entry(hash).or_default().push(id);
         id
     }
 }
 
-fn with_modules<'s, T>(
-    scope: &mut v8::PinScope<'s, '_>,
+/// Runs `f` with the module, in the module's OWN context.
+///
+/// `f` returns a Global because anything minted inside the entered context
+/// would dangle once the inner scope closes.
+fn with_modules<T: 'static>(
+    scope: &mut v8::PinScope<'_, '_>,
     id: u32,
-    f: impl FnOnce(&mut v8::PinScope<'s, '_>, v8::Local<'s, v8::Module>) -> T,
-) -> Option<T> {
-    // The global is cloned out before any Local is made, so the slot borrow
+    f: impl for<'i> FnOnce(
+        &mut v8::PinScope<'i, '_>,
+        v8::Local<'i, v8::Module>,
+    ) -> Option<v8::Global<T>>,
+) -> Option<Option<v8::Global<T>>> {
+    // Globals are cloned out before any Local is made, so the slot borrow
     // never overlaps use of the scope.
-    let global = scope.get_slot::<VmModules>()?.by_id.get(&id)?.clone();
-    let module = v8::Local::new(scope, &global);
-    Some(f(scope, module))
+    let (module, context) = {
+        let entry = scope.get_slot::<VmModules>()?.by_id.get(&id)?;
+        (entry.module.clone(), entry.context.clone())
+    };
+    match context {
+        Some(context) => {
+            let context = v8::Local::new(scope, &context);
+            v8::scope_with_context!(let inner, scope, context);
+            let module = v8::Local::new(inner, &module);
+            Some(f(inner, module))
+        }
+        None => {
+            let module = v8::Local::new(scope, &module);
+            Some(f(scope, module))
+        }
+    }
 }
 
 fn arg_u32(
@@ -79,6 +116,12 @@ pub(crate) fn op_vm_module_compile<'s>(
         scope.throw_exception(error);
         return;
     };
+    // The context the caller named, if any. Compiling elsewhere and then
+    // calling the module part of that context is the isolation bug this
+    // whole option exists to avoid.
+    let requested_context = v8::Local::<v8::Object>::try_from(args.get(2))
+        .ok()
+        .and_then(|sandbox| crate::vm_context::context_of_sandbox(scope, sandbox));
     let identifier = args.get(1);
     let origin = v8::ScriptOrigin::new(
         scope, identifier, 0, 0, false, 0, None, false, false,
@@ -86,19 +129,44 @@ pub(crate) fn op_vm_module_compile<'s>(
         // import/export is a syntax error.
         true, None,
     );
-    let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
-    // No TryCatch: a syntax error is left pending, which is what should reach
-    // `new SourceTextModule(...)`.
-    let Some(module) = v8::script_compiler::compile_module(scope, &mut source) else {
+    let context_global = requested_context.map(|context| v8::Global::new(scope, context));
+    // No TryCatch either way: a syntax error is left pending, which is what
+    // should reach `new SourceTextModule(...)`.
+    let compiled = match &context_global {
+        Some(context) => {
+            let context = v8::Local::new(scope, context);
+            v8::scope_with_context!(let inner, scope, context);
+            let source_text = v8::Local::new(inner, source_text);
+            let identifier = v8::Local::new(inner, identifier);
+            let origin = v8::ScriptOrigin::new(
+                inner, identifier, 0, 0, false, 0, None, false, false, true, None,
+            );
+            let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
+            v8::script_compiler::compile_module(inner, &mut source).map(|module| {
+                (
+                    module.get_identity_hash().get(),
+                    v8::Global::new(inner, module),
+                )
+            })
+        }
+        None => {
+            let mut source = v8::script_compiler::Source::new(source_text, Some(&origin));
+            v8::script_compiler::compile_module(scope, &mut source).map(|module| {
+                (
+                    module.get_identity_hash().get(),
+                    v8::Global::new(scope, module),
+                )
+            })
+        }
+    };
+    let Some((hash, global)) = compiled else {
         return;
     };
-    let hash = module.get_identity_hash().get();
-    let global = v8::Global::new(scope, module);
     let id = match scope.get_slot_mut::<VmModules>() {
-        Some(modules) => modules.insert(hash, global),
+        Some(modules) => modules.insert(hash, global, context_global),
         None => {
             let mut modules = VmModules::default();
-            let id = modules.insert(hash, global);
+            let id = modules.insert(hash, global, context_global);
             scope.set_slot(modules);
             id
         }
@@ -125,10 +193,14 @@ pub(crate) fn op_vm_module_requests<'s>(
             };
             out.push(v8::Local::<v8::Value>::from(request.get_specifier()));
         }
-        v8::Array::new_with_elements(scope, &out)
+        let array = v8::Array::new_with_elements(scope, &out);
+        Some(v8::Global::new(scope, array))
     });
-    match specifiers {
-        Some(array) => rv.set(array.into()),
+    match specifiers.flatten() {
+        Some(array) => {
+            let array = v8::Local::new(scope, &array);
+            rv.set(array.into());
+        }
         None => throw_unknown_module(scope),
     }
 }
@@ -192,7 +264,7 @@ fn resolve_vm_module<'s>(
             .ids_by_hash
             .get(&referrer.get_identity_hash().get())?;
         ids.iter()
-            .filter_map(|id| modules.by_id.get(id).map(|m| (*id, m.clone())))
+            .filter_map(|id| modules.by_id.get(id).map(|e| (*id, e.module.clone())))
             .collect()
     };
     let referrer_id = candidates.into_iter().find_map(|(id, global)| {
@@ -203,7 +275,7 @@ fn resolve_vm_module<'s>(
     let target = {
         let modules = scope.get_slot::<VmModules>()?;
         let target_id = modules.links.get(&(referrer_id, specifier))?;
-        modules.by_id.get(target_id)?.clone()
+        modules.by_id.get(target_id)?.module.clone()
     };
     Some(v8::Local::new(scope, &target))
 }
@@ -218,9 +290,14 @@ pub(crate) fn op_vm_module_instantiate<'s>(
     // Instantiation failure leaves an exception pending, which is the answer
     // the caller wants; `Some(false)` without one should not look like success.
     let done = with_modules(scope, id, |scope, module| {
-        module.instantiate_module(scope, resolve_vm_module)
+        let linked = module.instantiate_module(scope, resolve_vm_module);
+        let flag = v8::Boolean::new(scope, linked.unwrap_or(true));
+        Some(v8::Global::new(scope, flag))
     });
-    match done {
+    let outcome = done
+        .as_ref()
+        .map(|inner| inner.as_ref().map(|f| v8::Local::new(scope, f).is_true()));
+    match outcome {
         Some(Some(true)) | Some(None) => {}
         Some(Some(false)) => {
             if !scope.is_execution_terminating() {
@@ -240,8 +317,16 @@ pub(crate) fn op_vm_module_evaluate<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = arg_u32(scope, &args, 0);
-    match with_modules(scope, id, |scope, module| module.evaluate(scope)) {
-        Some(Some(value)) => rv.set(value),
+    let evaluated = with_modules(scope, id, |scope, module| {
+        module
+            .evaluate(scope)
+            .map(|value| v8::Global::new(scope, value))
+    });
+    match evaluated {
+        Some(Some(value)) => {
+            let value = v8::Local::new(scope, &value);
+            rv.set(value);
+        }
         // Evaluation threw; the exception is already pending.
         Some(None) => {}
         None => throw_unknown_module(scope),
@@ -255,8 +340,14 @@ pub(crate) fn op_vm_module_namespace<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = arg_u32(scope, &args, 0);
-    match with_modules(scope, id, |_scope, module| module.get_module_namespace()) {
-        Some(namespace) => rv.set(namespace),
+    let namespace = with_modules(scope, id, |scope, module| {
+        Some(v8::Global::new(scope, module.get_module_namespace()))
+    });
+    match namespace.flatten() {
+        Some(namespace) => {
+            let namespace = v8::Local::new(scope, &namespace);
+            rv.set(namespace);
+        }
         None => throw_unknown_module(scope),
     }
 }
@@ -269,16 +360,22 @@ pub(crate) fn op_vm_module_status<'s>(
 ) {
     let id = arg_u32(scope, &args, 0);
     // node's vocabulary, not V8's: a caller reads `module.status`.
-    let status = with_modules(scope, id, |_scope, module| match module.get_status() {
-        v8::ModuleStatus::Uninstantiated => "unlinked",
-        v8::ModuleStatus::Instantiating => "linking",
-        v8::ModuleStatus::Instantiated => "linked",
-        v8::ModuleStatus::Evaluating => "evaluating",
-        v8::ModuleStatus::Evaluated => "evaluated",
-        v8::ModuleStatus::Errored => "errored",
+    let status = with_modules(scope, id, |scope, module| {
+        let name = match module.get_status() {
+            v8::ModuleStatus::Uninstantiated => "unlinked",
+            v8::ModuleStatus::Instantiating => "linking",
+            v8::ModuleStatus::Instantiated => "linked",
+            v8::ModuleStatus::Evaluating => "evaluating",
+            v8::ModuleStatus::Evaluated => "evaluated",
+            v8::ModuleStatus::Errored => "errored",
+        };
+        v8::String::new(scope, name).map(|text| v8::Global::new(scope, text))
     });
-    match status.and_then(|s| v8::String::new(scope, s)) {
-        Some(text) => rv.set(text.into()),
+    match status.flatten() {
+        Some(text) => {
+            let text = v8::Local::new(scope, &text);
+            rv.set(text.into());
+        }
         None => throw_unknown_module(scope),
     }
 }
@@ -290,12 +387,16 @@ pub(crate) fn op_vm_module_error<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = arg_u32(scope, &args, 0);
-    let error = with_modules(scope, id, |_scope, module| {
-        (module.get_status() == v8::ModuleStatus::Errored).then(|| module.get_exception())
+    let error = with_modules(scope, id, |scope, module| {
+        (module.get_status() == v8::ModuleStatus::Errored)
+            .then(|| v8::Global::new(scope, module.get_exception()))
     });
-    match error {
-        Some(Some(value)) => rv.set(value),
-        _ => {
+    match error.flatten() {
+        Some(value) => {
+            let value = v8::Local::new(scope, &value);
+            rv.set(value);
+        }
+        None => {
             let undefined = v8::undefined(scope);
             rv.set(undefined.into());
         }
