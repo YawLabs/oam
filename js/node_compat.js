@@ -14179,7 +14179,33 @@
     function makeAbortError(cause) {
       return cause !== undefined ? new AbortError(undefined, { cause }) : new AbortError();
     }
+    // Node validates every argument BEFORE scheduling and surfaces the
+    // failure as a REJECTION (these are async functions there), so a typo
+    // like `{ signl: sig }` or a string delay fails loudly instead of
+    // scheduling a timer nobody can cancel. Returns an Error to reject
+    // with, or null when the arguments are fine.
+    function validateTimerArgs(delay, options) {
+      if (delay !== undefined && typeof delay !== "number") {
+        return new codes.ERR_INVALID_ARG_TYPE("delay", "number", delay);
+      }
+      if (options === null || typeof options !== "object") {
+        return new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
+      const { signal, ref } = options;
+      if (
+        signal !== undefined &&
+        (signal === null || typeof signal !== "object" || !("aborted" in signal))
+      ) {
+        return new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      if (ref !== undefined && typeof ref !== "boolean") {
+        return new codes.ERR_INVALID_ARG_TYPE("options.ref", "boolean", ref);
+      }
+      return null;
+    }
     function promisedTimeout(delay, value, options = {}) {
+      const invalid = validateTimerArgs(delay, options);
+      if (invalid) return Promise.reject(invalid);
       const signal = options.signal;
       // Already-aborted: reject immediately, never schedule (Node).
       if (signal?.aborted) {
@@ -14196,6 +14222,10 @@
           fn(arg);
         };
         const id = globalThis.setTimeout(() => done(resolve, value), delay ?? 1);
+        // ref:false means "do not hold the process open for this". Ignoring
+        // it kept the event loop alive for the full delay, so a program
+        // that asked for a non-blocking timer waited it out anyway.
+        if (options.ref === false && typeof id?.unref === "function") id.unref();
         if (signal?.addEventListener) {
           onAbort = () => {
             globalThis.clearTimeout(id);
@@ -14205,8 +14235,32 @@
         }
       });
     }
-    function promisedImmediate(value) {
-      return new Promise((resolve) => globalThis.setTimeout(() => resolve(value), 0));
+    function promisedImmediate(value, options = {}) {
+      // setImmediate(value, { signal, ref }) is abortable in Node. oam
+      // ignored options entirely, so an abort never fired and the caller's
+      // signal did nothing at all.
+      const invalid = validateTimerArgs(undefined, options);
+      if (invalid) return Promise.reject(invalid);
+      const signal = options.signal;
+      if (signal?.aborted) {
+        return Promise.reject(makeAbortError(signal.reason));
+      }
+      return new Promise((resolve, reject) => {
+        let onAbort;
+        const done = (fn, arg) => {
+          if (onAbort) signal?.removeEventListener?.("abort", onAbort);
+          fn(arg);
+        };
+        const id = globalThis.setImmediate(() => done(resolve, value));
+        if (options.ref === false && typeof id?.unref === "function") id.unref();
+        if (signal?.addEventListener) {
+          onAbort = () => {
+            globalThis.clearImmediate(id);
+            done(reject, makeAbortError(signal.reason));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
     }
     async function* intervalIterator(delay, value, options) {
       const signal = options?.signal;

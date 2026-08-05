@@ -2244,16 +2244,21 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             (Some(dir), file)
         }
     };
-    // -p evaluates through INDIRECT eval, which yields the completion value
+    // -p evaluates through a DIRECT eval, which yields the completion value
     // of a statement list the way node's script evaluation does
-    // (`-p "a(); b"` prints b). A plain expression works identically. The
-    // user source stays the FIRST thing in the file so a leading
+    // (`-p "a(); b"` prints b) AND inherits the enclosing module scope. It
+    // used to be an indirect `(0, eval)`, whose scope is the GLOBAL one --
+    // so `oam -pe "require('assert')"` died with "require is not defined"
+    // while the identical `-e` worked, because require is a parameter of
+    // the CJS module wrapper, not a global.
+    //
+    // The user source stays the FIRST thing in the file so a leading
     // 'use strict' keeps its directive-prologue position and line numbers
     // are not shifted; the builtin-globals prelude runs separately, before
     // this file (see EVAL_PRELUDE at the call site).
     let body = if print {
         format!(
-            "console.log((0, eval)({}));\n",
+            "console.log(eval({}));\n",
             serde_json::to_string(source).expect("encode eval source")
         )
     } else {
