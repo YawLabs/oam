@@ -143,6 +143,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("vmIsContext", op_vm_is_context),
         ("vmRunInContext", op_vm_run_in_context),
         ("vmRunInThisContext", op_vm_run_in_this_context),
+        ("v8Is", op_v8_is),
         ("posixGetId", op_posix_get_id),
         ("posixSetId", op_posix_set_id),
         ("posixGetGroups", op_posix_get_groups),
@@ -953,6 +954,43 @@ fn op_tty_get_win_size(
 /// define them there either).
 ///
 /// `which`: 0=uid 1=gid 2=euid 3=egid.
+/// `op_v8_is(value, kind) -> boolean`
+///
+/// V8's own answer to "what kind of value is this", for the `util.types`
+/// predicates JS cannot decide honestly. `.constructor` and
+/// `Symbol.toStringTag` are both forgeable -- node's util.types are V8 checks
+/// precisely so a plain function wearing `AsyncFunction` as its constructor
+/// does not pass as an async one -- and a prototype comparison would be
+/// realm-bound. Unknown kinds answer false rather than throwing, so adding a
+/// predicate JS-side cannot break an older binary.
+fn op_v8_is(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let value = args.get(0);
+    let Some(kind) = arg_string(scope, &args, 1) else {
+        rv.set_bool(false);
+        return;
+    };
+    let answer = match kind.as_str() {
+        "asyncFunction" => value.is_async_function(),
+        "generatorFunction" => value.is_generator_function(),
+        "generatorObject" => value.is_generator_object(),
+        "promise" => value.is_promise(),
+        "proxy" => value.is_proxy(),
+        "mapIterator" => value.is_map_iterator(),
+        "setIterator" => value.is_set_iterator(),
+        "moduleNamespaceObject" => value.is_module_namespace_object(),
+        "external" => value.is_external(),
+        "argumentsObject" => value.is_arguments_object(),
+        "weakMap" => value.is_weak_map(),
+        "weakSet" => value.is_weak_set(),
+        _ => false,
+    };
+    rv.set_bool(answer);
+}
+
 fn op_posix_get_id(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

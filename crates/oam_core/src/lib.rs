@@ -1098,6 +1098,34 @@ pub mod ops {
         } else {
             "file"
         };
+        // `mode` was hardcoded to 0, which quietly broke every permission and
+        // file-type test a caller might run on it (`mode & 0o111`, `mode &
+        // S_IFMT`) -- and 0 is not "unknown", it reads as a real answer.
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        };
+        #[cfg(windows)]
+        let mode = {
+            // Windows has no POSIX mode, so libuv synthesizes one from the
+            // read-only attribute plus the file type, and node reports that.
+            // Verified against node on win32: writable file 0o100666,
+            // read-only file 0o100444, directory 0o40666 (no execute bits).
+            let permission_bits: u32 = if meta.permissions().readonly() {
+                0o444
+            } else {
+                0o666
+            };
+            let type_bits: u32 = if meta.is_symlink() {
+                0o120000
+            } else if meta.is_dir() {
+                0o040000
+            } else {
+                0o100000
+            };
+            type_bits | permission_bits
+        };
         serde_json::json!({
             "kind": kind,
             "size": meta.len(),
@@ -1106,7 +1134,7 @@ pub mod ops {
             // ctime not available on stable Rust; approximating with mtime
             "ctimeMs": ms(meta.modified()),
             "birthtimeMs": ms(meta.created()),
-            "mode": 0,
+            "mode": mode,
         })
         .to_string()
     }

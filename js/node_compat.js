@@ -5254,7 +5254,10 @@
     const customPromisifyArgs = Symbol.for("nodejs.util.promisify.customArgs");
     function promisify(original) {
       if (typeof original !== "function") {
-        throw new TypeError('The "original" argument must be of type function');
+        // node's validateFunction: a coded ERR_INVALID_ARG_TYPE carrying the
+        // "Received ..." tail, not a bare TypeError. Callers branch on the
+        // code, and the tail is what names the value that was actually passed.
+        throw new codes.ERR_INVALID_ARG_TYPE("original", "Function", original);
       }
       if (original[customPromisify]) {
         const fn = original[customPromisify];
@@ -5273,6 +5276,17 @@
         });
         return fn;
       }
+      // DEP0174: promisifying something that already returns a promise is
+      // almost always a mistake -- the wrapper's promise resolves with
+      // whatever the callback got, which is nothing. Asked of V8, not of
+      // `original.constructor`, which any function can be given.
+      if (natives.v8Is(original, "asyncFunction")) {
+        process.emitWarning(
+          "Calling promisify on a function that returns a Promise is likely a mistake.",
+          "DeprecationWarning",
+          "DEP0174",
+        );
+      }
       const argNames = original[customPromisifyArgs];
       function promisified(...args) {
         return new Promise((resolve, reject) => {
@@ -5281,7 +5295,11 @@
               reject(err);
               return;
             }
-            if (Array.isArray(argNames)) {
+            // The named-object form is for callbacks that hand back SEVERAL
+            // values (fs.read's bytesRead + buffer). A lone value stays the
+            // value -- wrapping it would change the shape of what the promise
+            // resolves to, which is a wrong answer rather than a missing one.
+            if (argNames !== undefined && values.length > 1) {
               const obj = {};
               for (let i = 0; i < argNames.length; i++) obj[argNames[i]] = values[i];
               resolve(obj);
@@ -5291,8 +5309,30 @@
           });
         });
       }
-      Object.defineProperty(promisified, "name", { value: original.name });
-      return promisified;
+      // The wrapper stands in for the original, so it inherits the original's
+      // prototype rather than this realm's Function.prototype. That is
+      // load-bearing across a realm boundary: promisifying a function from a
+      // `vm` context must not silently re-home it into ours.
+      Object.setPrototypeOf(promisified, Object.getPrototypeOf(original));
+      // Mark the generated wrapper as its own promisified form, so promisify
+      // is idempotent on it the same way it already is on a custom one.
+      Object.defineProperty(promisified, customPromisify, {
+        value: promisified,
+        enumerable: false,
+        writable: false,
+        configurable: true,
+      });
+      // Carry over EVERY own property, not just `name` -- `length`, and
+      // whatever the original was decorated with, are part of standing in for
+      // it. Descriptors are copied so non-enumerable stays non-enumerable.
+      const descriptors = Object.getOwnPropertyDescriptors(original);
+      // Node null-prototypes each descriptor first so a mutated
+      // %Object.prototype% cannot smuggle in `get`/`set`/`writable` keys that
+      // defineProperties would then honor.
+      for (const key of Reflect.ownKeys(descriptors)) {
+        Object.setPrototypeOf(descriptors[key], null);
+      }
+      return Object.defineProperties(promisified, descriptors);
     }
     promisify.custom = customPromisify;
 
@@ -6555,7 +6595,7 @@
         isDate: (v) => isRealDate(v),
         isRegExp: (v) => isRealRegExp(v),
         isNativeError: (v) => isNativeErrorValue(v),
-        isPromise: (v) => v instanceof Promise,
+        isPromise: (v) => natives.v8Is(v, "promise"),
         isMap: (v) => isRealMap(v),
         isSet: (v) => isRealSet(v),
         isWeakMap: (v) => isRealWeakMap(v),
@@ -6566,25 +6606,26 @@
         isTypedArray: (v) => typedArrayName(v) !== undefined,
         isUint8Array: (v) => typedArrayName(v) === "Uint8Array",
         isDataView: (v) => isRealDataView(v),
-        isAsyncFunction: (v) =>
-          typeof v === "function" && v.constructor?.name === "AsyncFunction",
-        isGeneratorFunction: (v) =>
-          typeof v === "function" && v.constructor?.name === "GeneratorFunction",
-        isProxy: () => false,
+        // Asked of V8 rather than inferred: `.constructor` is writable, so a
+        // plain function decorated with AsyncFunction's constructor used to
+        // read as async here, and isProxy could not be answered at all.
+        isAsyncFunction: (v) => natives.v8Is(v, "asyncFunction"),
+        isGeneratorFunction: (v) => natives.v8Is(v, "generatorFunction"),
+        isProxy: (v) => natives.v8Is(v, "proxy"),
         isArrayBufferView: (v) => ArrayBuffer.isView(v),
-        isUint8ClampedArray: (v) => v instanceof Uint8ClampedArray,
-        isUint16Array: (v) => v instanceof Uint16Array,
-        isUint32Array: (v) => v instanceof Uint32Array,
-        isInt8Array: (v) => v instanceof Int8Array,
-        isInt16Array: (v) => v instanceof Int16Array,
-        isInt32Array: (v) => v instanceof Int32Array,
-        isFloat32Array: (v) => v instanceof Float32Array,
-        isFloat64Array: (v) => v instanceof Float64Array,
-        isBigInt64Array: (v) => typeof BigInt64Array !== "undefined" && v instanceof BigInt64Array,
-        isBigUint64Array: (v) => typeof BigUint64Array !== "undefined" && v instanceof BigUint64Array,
-        isMapIterator: (v) => { try { Map.prototype.has.call(v); return false; } catch { return String(v) === "[object Map Iterator]"; } },
-        isSetIterator: (v) => { try { Set.prototype.has.call(v); return false; } catch { return String(v) === "[object Set Iterator]"; } },
-        isGeneratorObject: (v) => v != null && typeof v.next === "function" && typeof v.throw === "function" && typeof v[Symbol.iterator] === "function",
+        isUint8ClampedArray: (v) => typedArrayName(v) === "Uint8ClampedArray",
+        isUint16Array: (v) => typedArrayName(v) === "Uint16Array",
+        isUint32Array: (v) => typedArrayName(v) === "Uint32Array",
+        isInt8Array: (v) => typedArrayName(v) === "Int8Array",
+        isInt16Array: (v) => typedArrayName(v) === "Int16Array",
+        isInt32Array: (v) => typedArrayName(v) === "Int32Array",
+        isFloat32Array: (v) => typedArrayName(v) === "Float32Array",
+        isFloat64Array: (v) => typedArrayName(v) === "Float64Array",
+        isBigInt64Array: (v) => typedArrayName(v) === "BigInt64Array",
+        isBigUint64Array: (v) => typedArrayName(v) === "BigUint64Array",
+        isMapIterator: (v) => natives.v8Is(v, "mapIterator"),
+        isSetIterator: (v) => natives.v8Is(v, "setIterator"),
+        isGeneratorObject: (v) => natives.v8Is(v, "generatorObject"),
         isWeakRef: (v) => v instanceof WeakRef,
         isModuleNamespaceObject: () => false,
         isExternal: () => false,
@@ -8046,21 +8087,43 @@
   };
 
   // ------------------------------------------------------------------- fs
+  // node's fs.Stats carries its predicates on the PROTOTYPE. That is what lets
+  // two stats of the same file compare equal: as own properties they are
+  // distinct function objects, so `assert.deepStrictEqual(statSync(f),
+  // statSync(f))` failed on every pair, and inspect printed seven [Function]
+  // members node does not show.
+  class Stats {
+    constructor(raw) {
+      this.size = raw.size;
+      this.mode = raw.mode;
+      this.atimeMs = raw.atimeMs;
+      this.mtimeMs = raw.mtimeMs;
+      this.ctimeMs = raw.ctimeMs;
+      this.birthtimeMs = raw.birthtimeMs;
+      this.atime = new Date(raw.atimeMs);
+      this.mtime = new Date(raw.mtimeMs);
+      this.ctime = new Date(raw.ctimeMs);
+      this.birthtime = new Date(raw.birthtimeMs);
+      // oam-internal, not part of node's Stats: the predicates read it because
+      // `mode` does not yet carry the S_IFMT type bits. Non-enumerable so it
+      // stays out of deepStrictEqual, JSON.stringify and inspect.
+      Object.defineProperty(this, "kind", {
+        value: raw.kind,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    isFile() { return this.kind === "file"; }
+    isDirectory() { return this.kind === "dir"; }
+    isSymbolicLink() { return this.kind === "symlink"; }
+    isBlockDevice() { return false; }
+    isCharacterDevice() { return false; }
+    isFIFO() { return false; }
+    isSocket() { return false; }
+  }
+
   function wrapStat(raw) {
-    return {
-      ...raw,
-      isFile: () => raw.kind === "file",
-      isDirectory: () => raw.kind === "dir",
-      isSymbolicLink: () => raw.kind === "symlink",
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
-      mtime: new Date(raw.mtimeMs),
-      atime: new Date(raw.atimeMs),
-      ctime: new Date(raw.ctimeMs),
-      birthtime: new Date(raw.birthtimeMs),
-    };
+    return new Stats(raw);
   }
 
   class Dirent {
@@ -8848,7 +8911,9 @@
     };
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
-    fs.Stats = function Stats() {};
+    // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
+    // placeholder no stat object was ever an instance of.
+    fs.Stats = Stats;
     // Real constructors (lazy) with a `.prototype`, exposed as configurable
     // getters so graceful-fs can read fs.ReadStream.prototype AND later
     // redefine fs.ReadStream with its own wrapper.
