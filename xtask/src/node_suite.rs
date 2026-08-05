@@ -455,6 +455,14 @@ const SUPPORTED_FLAGS: &[&str] = &[
     // runs on. Tests needing an internal oam does not have reclassify as
     // unrunnable (see missing_builtin), not as failures.
     "--expose-internals",
+    // Node's permission model: --permission denies everything, the --allow-*
+    // flags grant back.
+    "--permission",
+    "--allow-fs-read",
+    "--allow-fs-write",
+    "--allow-child-process",
+    "--allow-worker",
+    "--allow-addons",
 ];
 
 fn classify_flags(path: &Path) -> FlagSupport {

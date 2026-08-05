@@ -6,8 +6,8 @@
     "maxKnownIssues": 0,
     "minPass": 428,
     "minPassByHost": {
-      "linux-x86_64": 433,
-      "macos-aarch64": 435,
+      "linux-x86_64": 436,
+      "macos-aarch64": 437,
       "windows-aarch64": 428
     }
   },

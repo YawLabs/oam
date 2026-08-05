@@ -1300,6 +1300,15 @@ fn op_process_execve(
             rv.set(msg.into());
             return;
         };
+        // Checked BEFORE anything is handed to execve: on success this call
+        // never returns, so a permission consulted afterwards would never be
+        // consulted at all. Replacing the image is a child-process operation
+        // in node's model -- whatever runs next is outside this permission set
+        // entirely.
+        if let Err(denial) = get_permissions(scope).check_child(&path) {
+            throw_permission_denied(scope, &denial);
+            return;
+        }
         let to_cstrings = |scope: &mut v8::PinScope<'_, '_>, idx: i32| -> Option<Vec<CString>> {
             let arr = v8::Local::<v8::Array>::try_from(args.get(idx)).ok()?;
             let mut out = Vec::with_capacity(arr.length() as usize);

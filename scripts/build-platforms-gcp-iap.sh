@@ -122,71 +122,73 @@ IAP_TUNNEL_LOG="$(mktemp -t oam-iap-tunnel-XXXXXX.log)"
 IAP_TUNNEL_PID=""
 IAP_TUNNEL_PORT=""
 IAP_SSH_KEY="${HOME}/.ssh/google_compute_engine"
+# Returns 0 once the tunnel is bound AND accepting; non-zero for every failure
+# mode, so start_iap_tunnel can retry all of them identically.
+iap_tunnel_serving() {
+  local waited=0
+  while ! grep -q "Listening on port" "$IAP_TUNNEL_LOG" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 15 ]; then
+      warn "gcloud did not log 'Listening on port' within 15s -- falling back to port-reachability probe"
+      break
+    fi
+    kill -0 "$IAP_TUNNEL_PID" 2>/dev/null || return 1
+  done
+  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Listening on port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  if [ -n "$IAP_TUNNEL_PORT" ]; then
+    ok "IAP tunnel up: localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22 (waited ${waited}s)"
+    return 0
+  fi
+  # Some gcloud versions hang in their internal tunnel self-test while the port
+  # already serves fine, so a bound-but-unlogged port still counts as up.
+  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Picking local unused port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  [ -n "$IAP_TUNNEL_PORT" ] || return 1
+  local port_waited=0
+  while ! timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$IAP_TUNNEL_PORT" 2>/dev/null; do
+    sleep 1
+    port_waited=$((port_waited + 1))
+    [ "$port_waited" -ge 60 ] && return 1
+    kill -0 "$IAP_TUNNEL_PID" 2>/dev/null || return 1
+  done
+  ok "IAP tunnel up (port-reachability): localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22"
+  return 0
+}
+
 start_iap_tunnel() {
   # sshd is NOT up the instant `instances start` returns: the guest keeps
-  # booting for ~30-60s, IAP reports 4003 'failed to connect to backend',
-  # and gcloud EXITS rather than retrying. Respawn the tunnel across the
-  # boot window (observed 2026-08-04: two consecutive leg failures from
-  # this race, then first-try success ~60s after boot).
-  local attempt=1 max_attempts=8 waited=0
+  # booting for ~30-60s, IAP reports 4003 'failed to connect to backend', and
+  # gcloud EXITS rather than retrying.
+  #
+  # EVERY failure mode retries, which is the whole point. The boot race does
+  # not always kill the tunnel inside the first 15s -- it can survive that,
+  # fail its self-test, and die during the port probe instead. That path used
+  # to abort the leg outright, so a race the retry loop existed for took the
+  # one branch that did not retry (observed twice, 2026-08-05).
+  local attempt=1 max_attempts=8
   while :; do
     ok "starting IAP tunnel to $INSTANCE (gcloud start-iap-tunnel, attempt $attempt/$max_attempts)..."
     : >"$IAP_TUNNEL_LOG"
-    gcloud compute start-iap-tunnel "$INSTANCE" 22 \
-      --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT" \
-      >"$IAP_TUNNEL_LOG" 2>&1 &
+    gcloud compute start-iap-tunnel "$INSTANCE" 22       --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT"       >"$IAP_TUNNEL_LOG" 2>&1 &
     IAP_TUNNEL_PID=$!
-    # Wait for "Listening on port [NNNN]." -- the canonical bound-and-serving
-    # signal -- with a 15s ceiling, then fall back to a port-reachability probe
-    # ("Picking local unused port [NNNN]" + TCP connect poll). Some gcloud
-    # versions hang in their internal tunnel self-test while the port already
-    # serves fine.
-    local died=0
-    waited=0
-    while ! grep -q "Listening on port" "$IAP_TUNNEL_LOG" 2>/dev/null; do
-      sleep 1
-      waited=$((waited + 1))
-      if [ "$waited" -ge 15 ]; then
-        warn "gcloud did not log 'Listening on port' within 15s -- falling back to port-reachability probe"
-        break
-      fi
-      if ! kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
-        died=1
-        break
-      fi
-    done
-    if [ "$died" = "1" ]; then
-      if [ "$attempt" -ge "$max_attempts" ]; then
-        # Inline the log tail: cleanup rm's the file, so a path alone
-        # destroys the evidence the operator needs.
-        fail "IAP tunnel process exited before listening on all $max_attempts attempts. Last output: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr '\n' ' ')"
-      fi
-      warn "tunnel process exited before listening (sshd likely still booting) -- retrying in 15s"
-      attempt=$((attempt + 1))
-      sleep 15
-      continue
+    if iap_tunnel_serving; then
+      return 0
     fi
-    break
+    # Never leave a half-open tunnel behind for the next attempt to trip on.
+    if kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
+      kill "$IAP_TUNNEL_PID" 2>/dev/null || true
+      wait "$IAP_TUNNEL_PID" 2>/dev/null || true
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      # Inline the log tail: cleanup rm's the file, so a path alone destroys
+      # the evidence the operator needs.
+      fail "IAP tunnel never served on any of $max_attempts attempts. Last output: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr '
+' ' ')"
+    fi
+    warn "tunnel attempt $attempt did not serve (sshd likely still booting) -- retrying in 15s"
+    attempt=$((attempt + 1))
+    sleep 15
   done
-  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Listening on port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
-  if [ -z "$IAP_TUNNEL_PORT" ]; then
-    IAP_TUNNEL_PORT=$(awk -F'[][]' '/Picking local unused port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
-    [ -n "$IAP_TUNNEL_PORT" ] || fail "could not parse port from $IAP_TUNNEL_LOG"
-    local port_waited=0
-    while ! timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$IAP_TUNNEL_PORT" 2>/dev/null; do
-      sleep 1
-      port_waited=$((port_waited + 1))
-      if [ "$port_waited" -ge 60 ]; then
-        fail "IAP tunnel port $IAP_TUNNEL_PORT did not become reachable within 60s. Log: $IAP_TUNNEL_LOG"
-      fi
-      if ! kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
-        fail "IAP tunnel process exited before port became reachable. Log: $IAP_TUNNEL_LOG"
-      fi
-    done
-    ok "IAP tunnel up (port-reachability): localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22"
-  else
-    ok "IAP tunnel up: localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22 (waited ${waited}s)"
-  fi
 }
 stop_iap_tunnel() {
   if [ -n "$IAP_TUNNEL_PID" ] && kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then

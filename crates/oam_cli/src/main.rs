@@ -305,6 +305,21 @@ fn main() -> ExitCode {
             } else if arg == "--permission" {
                 flags.permission = true;
                 i += 1;
+            } else if let Some(list) = arg.strip_prefix("--allow-fs-read=") {
+                flags.allow_fs_read = Some(list.to_string());
+                i += 1;
+            } else if let Some(list) = arg.strip_prefix("--allow-fs-write=") {
+                flags.allow_fs_write = Some(list.to_string());
+                i += 1;
+            } else if arg == "--allow-child-process" {
+                flags.allow_child_process = true;
+                i += 1;
+            } else if arg == "--allow-worker" {
+                flags.allow_worker = true;
+                i += 1;
+            } else if arg == "--allow-addons" {
+                flags.allow_addons = true;
+                i += 1;
             } else if arg == "--expose-gc" {
                 flags.expose_gc = true;
                 i += 1;
@@ -2067,6 +2082,13 @@ struct NodeFlags {
     pending_deprecation: bool,
     expose_gc: bool,
     permission: bool,
+    /// Node's granular grants. Only meaningful under `--permission`, which
+    /// denies everything first.
+    allow_fs_read: Option<String>,
+    allow_fs_write: Option<String>,
+    allow_child_process: bool,
+    allow_worker: bool,
+    allow_addons: bool,
     /// `--env-file=P` (required) and `--env-file-if-exists=P` (optional), in
     /// command-line order -- Node applies them left to right, later files
     /// winning.
@@ -2166,12 +2188,31 @@ impl NodeFlags {
         if !self.permission {
             return None;
         }
+        // `--allow-fs-read=*` is "everything"; anything else is a
+        // comma-separated allow-list, which is how node spells it.
+        fn grant(list: &Option<String>) -> oam_engine::BoolOrList {
+            match list {
+                None => oam_engine::BoolOrList::Bool(false),
+                Some(spec) if spec == "*" => oam_engine::BoolOrList::Bool(true),
+                Some(spec) => oam_engine::BoolOrList::List(
+                    spec.split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            }
+        }
         Some(oam_engine::PermissionsOptions {
-            read: oam_engine::BoolOrList::Bool(false),
-            write: oam_engine::BoolOrList::Bool(false),
+            read: grant(&self.allow_fs_read),
+            write: grant(&self.allow_fs_write),
             net: oam_engine::BoolOrList::Bool(false),
             env: oam_engine::BoolOrList::Bool(false),
-            ffi: oam_engine::BoolOrList::Bool(false),
+            // --allow-addons is node's name for loading native addons, which
+            // is what oam's `ffi` permission gates.
+            ffi: oam_engine::BoolOrList::Bool(self.allow_addons),
+            // A worker can spawn, so --allow-worker implies the same grant.
+            child: oam_engine::BoolOrList::Bool(self.allow_child_process || self.allow_worker),
         })
     }
 
@@ -2187,6 +2228,21 @@ impl NodeFlags {
         }
         if self.permission {
             out.push("--permission".into());
+        }
+        if let Some(list) = &self.allow_fs_read {
+            out.push(format!("--allow-fs-read={list}"));
+        }
+        if let Some(list) = &self.allow_fs_write {
+            out.push(format!("--allow-fs-write={list}"));
+        }
+        if self.allow_child_process {
+            out.push("--allow-child-process".into());
+        }
+        if self.allow_worker {
+            out.push("--allow-worker".into());
+        }
+        if self.allow_addons {
+            out.push("--allow-addons".into());
         }
         if self.no_warnings {
             out.push("--no-warnings".into());

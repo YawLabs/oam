@@ -57,6 +57,7 @@ pub struct Permissions {
     pub net: PermValue,
     pub env: PermValue,
     pub ffi: PermValue,
+    pub child: PermValue,
 }
 
 impl Default for Permissions {
@@ -67,6 +68,7 @@ impl Default for Permissions {
             net: PermValue::All,
             env: PermValue::All,
             ffi: PermValue::All,
+            child: PermValue::All,
         }
     }
 }
@@ -84,6 +86,7 @@ impl Permissions {
             net: from_bool_or_list(o.net),
             env: from_bool_or_list(o.env),
             ffi: from_bool_or_list(o.ffi),
+            child: from_bool_or_list(o.child),
         }
     }
 
@@ -123,6 +126,18 @@ impl Permissions {
         }
     }
 
+    /// Returns `Err(denial)` when spawning or replacing the process is denied.
+    pub fn check_child(&self, resource: &str) -> Result<(), PermissionDenial> {
+        if self.child.allows(resource) {
+            Ok(())
+        } else {
+            Err(PermissionDenial {
+                permission: "ChildProcess",
+                resource: resource.to_string(),
+            })
+        }
+    }
+
     /// Returns `Err(denial)` when `env` is denied.
     pub fn check_env(&self, key: &str) -> Result<(), PermissionDenial> {
         if self.env.allows(key) {
@@ -143,6 +158,7 @@ impl Permissions {
             "write" => &self.write,
             "net" => &self.net,
             "env" => &self.env,
+            "child" => &self.child,
             "ffi" => &self.ffi,
             _ => return "denied",
         };
@@ -188,6 +204,11 @@ pub struct PermissionsOptions {
     pub net: BoolOrList,
     pub env: BoolOrList,
     pub ffi: BoolOrList,
+    /// Spawning, or REPLACING, this process. Node gates both behind
+    /// `--allow-child-process`, because either one hands control to a binary
+    /// the permission set does not describe: once the image is replaced, no
+    /// restriction here applies to what runs next.
+    pub child: BoolOrList,
 }
 
 /// `true` | `false` | list of allowed strings.
@@ -228,6 +249,7 @@ mod tests {
             net: BoolOrList::Bool(false),
             env: BoolOrList::Bool(false),
             ffi: BoolOrList::Bool(false),
+            child: BoolOrList::Bool(false),
         }
     }
 
@@ -238,6 +260,7 @@ mod tests {
             net: BoolOrList::List(list.iter().map(|s| s.to_string()).collect()),
             env: BoolOrList::Bool(false),
             ffi: BoolOrList::Bool(false),
+            child: BoolOrList::Bool(false),
         }
     }
 
