@@ -9,7 +9,8 @@ surprises you, check here first; if the surprise is not here, it is a bug and we
 report.
 
 **Verified against:** oam 0.8.0 vs Node v22.22.2, on windows-aarch64, with a
-suite-level cross-platform sweep on macos-aarch64 and linux-x86_64 (2026-08-04).
+suite-level cross-platform sweep on macos-aarch64 (2026-08-05) and linux-x86_64
+(2026-08-05, at an earlier commit).
 Items marked _(source)_ were read out of oam's implementation rather than executed on
 every platform; items marked _(Windows-verified)_ were measured on Windows and that
 specific measurement has not been repeated on Linux/macOS.
@@ -22,29 +23,35 @@ Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scor
 
 ## The conformance number, qualified
 
-oam passes **414/416 (99.5%)** of the vendored Node core tests it can run on
-windows-aarch64, **420/423 (99.3%)** on macos-aarch64, and **421/424 (99.3%)**
-on linux-x86_64. Read those with the denominator in view:
+oam passes **428/430 (99.5%)** of the vendored Node core tests it can run on
+windows-aarch64 and **435/437 (99.5%)** on macos-aarch64. linux-x86_64 last
+measured **433/437 (99.1%)** at an older commit; its two remaining failures are
+the same deliberate pair, but the number itself predates the most recent work.
+Read those with the denominator in view:
 
 - **The corpus is a subset.** It currently covers `assert`, `buffer`, `events`, `path`,
   `process`, `querystring`, `stream`, `string_decoder`, `timers`, `url`, and `util`. The
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
-  **414/476 (87.0%)**: 17 tests skip themselves at runtime and 43 are unrunnable by the
-  harness. Of those 43, **37 need `--expose-internals`** — they reach into
-  `node:internal/*` modules oam does not have, and inventing them to score would be the
-  same fabrication refused for `process.versions`.
+  **428/476 (89.9%)**: 20 tests skip themselves at runtime and 26 are unrunnable by the
+  harness. Of those 26, **20 need a `node:internal/*` module oam does not have** — 14 of
+  them `internal/test/binding`, Node's C++ test hooks. Inventing those to score would be
+  the same fabrication refused for `process.versions`.
+- **13 of the 20 runtime skips are not oam gaps at all** — real Node, run against the
+  same vendored tree on the same host, skips them identically (the POSIX-only `execve`
+  tests on Windows, `styletext` without a TTY, `process-config` without a `config.gypi`).
+  Four of the rest skip on `common.hasCrypto`, which is `Boolean(process.versions.openssl)`
+  — they are skipped by the refusal to publish an OpenSSL version, not by missing crypto.
 - **Windows runs the FEWEST tests of the three platforms**, so its ratio alone is not
   the picture; the POSIX hosts carry larger denominators because they run the POSIX-only
   tests Windows skips. See "POSIX-only gaps" near the end.
-- **Every remaining failure on every platform is deliberate or architectural** —
-  `process-versions` everywhere, `execve-abort` on POSIX, and
-  `internalbinding-allowlist` (which wants `internalBinding('async_wrap')`). There are
-  no known open correctness bugs in the suite on any platform.
+- **Both remaining failures on every platform are deliberate** — `process-versions`
+  and `internalbinding-allowlist` (which wants `internalBinding('async_wrap')` and 20
+  other bindings that are libuv handle classes oam has nothing behind). There are no
+  known open correctness bugs in the suite on any platform.
   (The denominator in these ratios is pass+fail — the tests that reached a verdict.
-  Self-skips are excluded from it and counted separately, which is why 405+3 = 408
-  rather than the 418 that includes macOS's 10 runtime skips.)
+  Self-skips are excluded from it and counted separately.)
 - **The oracle is exit 0.** Node core tests self-assert; a test "passes" when it runs to
   completion without throwing. That is Node's own bar, but it is a coarser signal than a
   golden-output diff. The [Node differential suite](../CONFORMANCE.md) (55 cases,
@@ -103,8 +110,8 @@ fabrication like any other.
 not a Node build you have installed. Packages feature-detect on it, so it has to be a
 real Node version; treat it as a compatibility claim, not an identity.
 
-`node:process`'s `test-process-versions.js` fails for this reason, on purpose. It is the
-single remaining failure in the windows-aarch64 scorecard.
+`node:process`'s `test-process-versions.js` fails for this reason, on purpose. It is one
+of the two remaining failures in every platform's scorecard.
 
 ### 2. `process.dlopen` exists but cannot load a native addon
 
