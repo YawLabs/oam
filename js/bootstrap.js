@@ -47,7 +47,32 @@
   // returning !defaultPrevented.
   class Event {
     constructor(type, init = {}) {
-      this.type = String(type);
+      // `type` is a REQUIRED argument per spec; without the arity check
+      // `new Event()` quietly produced an event of type "undefined".
+      // (A Symbol type throws from String() below, as it should.)
+      if (arguments.length === 0) {
+        throw new TypeError(
+          "Failed to construct 'Event': 1 argument required, but only 0 present.",
+        );
+      }
+      // Template-literal coercion, NOT String(): the two differ on exactly
+      // one input, and it is the one that matters here. String(symbol) is
+      // special-cased to return "Symbol(desc)", so a Symbol type silently
+      // became a usable event name; implicit coercion throws TypeError,
+      // which is what the spec (and Node) do.
+      // A non-object `options` is a mistake, not something to read
+      // properties off: `new Event('x', 'once')` silently produced an
+      // event with every option false instead of telling the caller.
+      if (init !== undefined && init !== null && typeof init !== "object") {
+        const err = new TypeError(
+          `The "options" argument must be of type object. Received ${
+            typeof init === "string" ? `type string ('${init}')` : `type ${typeof init} (${init})`
+          }`,
+        );
+        err.code = "ERR_INVALID_ARG_TYPE";
+        throw err;
+      }
+      this.type = `${type}`;
       this.bubbles = init.bubbles === true;
       this.cancelable = init.cancelable === true;
       this.defaultPrevented = false;
@@ -55,9 +80,26 @@
       this.currentTarget = null;
       this._stopImmediate = false;
       this.timeStamp = 0;
+      // DOM-compatibility surface. Node exposes all of these on its Event
+      // and real code feature-detects on them; oam left them undefined,
+      // which reads as "not an Event" to anything checking.
+      this.composed = init.composed === true;
+      this.isTrusted = false;
+      this.eventPhase = 0;
+      this.cancelBubble = false;
+    }
+    // Legacy alias for !defaultPrevented, still widely read.
+    get returnValue() {
+      return !this.defaultPrevented;
     }
     preventDefault() {
       if (this.cancelable) this.defaultPrevented = true;
+    }
+    // The propagation path: empty unless the event is mid-dispatch, and a
+    // single-element path in this non-DOM EventTarget (no tree to bubble
+    // through). Was missing entirely, so composedPath() threw.
+    composedPath() {
+      return this.currentTarget ? [this.currentTarget] : [];
     }
     stopPropagation() {}
     stopImmediatePropagation() {
@@ -65,6 +107,37 @@
     }
   }
   globalThis.Event = Event;
+
+  // CustomEvent: the standard way to carry a payload on an event, and a
+  // global in every other runtime (Node has had it unflagged since v22).
+  // oam simply did not define it, so `new CustomEvent('x', { detail })`
+  // -- the documented way to pass data through an EventTarget -- threw
+  // ReferenceError.
+  class CustomEvent extends Event {
+    constructor(type, init = {}) {
+      // Checked HERE as well as in Event: the super() call below always
+      // passes two arguments, so the base class's arity check can never
+      // see that the caller supplied none.
+      if (arguments.length === 0) {
+        throw new TypeError(
+          "Failed to construct 'CustomEvent': 1 argument required, but only 0 present.",
+        );
+      }
+      super(type, init);
+      // `detail` is readonly per spec and defaults to null, not undefined.
+      Object.defineProperty(this, "detail", {
+        value: init.detail === undefined ? null : init.detail,
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  Object.defineProperty(CustomEvent.prototype, Symbol.toStringTag, {
+    value: "CustomEvent",
+    configurable: true,
+  });
+  globalThis.CustomEvent = CustomEvent;
 
   class EventTarget {
     constructor() {
