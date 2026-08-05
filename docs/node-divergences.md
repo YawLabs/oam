@@ -34,9 +34,12 @@ windows-aarch64**. Read that with the denominator in view:
   harness (they need `// Flags:` support or fixtures the vendored subset does not carry).
 - **Windows runs the FEWEST tests of the three platforms**, so its ratio is not the
   whole picture. The POSIX hosts carry larger denominators (they run the POSIX-only
-  tests Windows skips) and now measure **405/418 (99.3%) on macos-aarch64** and
-  **407/418 (99.5%) on linux-x86_64**. See "POSIX-only gaps" near the end for what
+  tests Windows skips) and measure **405/408 (99.3%) on macos-aarch64** and
+  **407/409 (99.5%) on linux-x86_64**. See "POSIX-only gaps" near the end for what
   remains there; quoting only the Windows figure would flatter the runtime.
+  (The denominator in these ratios is pass+fail — the tests that reached a verdict.
+  Self-skips are excluded from it and counted separately, which is why 405+3 = 408
+  rather than the 418 that includes macOS's 10 runtime skips.)
 - **The oracle is exit 0.** Node core tests self-assert; a test "passes" when it runs to
   completion without throwing. That is Node's own bar, but it is a coarser signal than a
   golden-output diff. The [Node differential suite](../CONFORMANCE.md) (55 cases,
@@ -476,8 +479,8 @@ unchanged because these tests never ran there):
   through a symlink, Node reports the symlink's target and keeps the invoked
   name in `process.argv0`; oam returned `argv[0]` for both.
 
-With those, the POSIX hosts measure **405/418 (99.3%) on macos-aarch64 and
-407/418 (99.5%) on linux-x86_64**, up from 392 each. Every remaining failure
+With those, the POSIX hosts measure **405/408 (99.3%) on macos-aarch64 and
+407/409 (99.5%) on linux-x86_64**, up from 392 each. Every remaining failure
 on both is deliberate and listed below — there are no known open bugs in the
 suite on Linux.
 

@@ -89,10 +89,17 @@ pub(crate) fn run(release: bool) -> Result<()> {
 
         let outcome = if let Some(reason) = manifest.skips.get(&format!("parallel/{name}")) {
             Outcome::Unrunnable(reason.clone())
-        } else if let Some(flags) = read_flags_header(test) {
-            Outcome::Unrunnable(format!("// Flags:{flags}"))
         } else {
-            run_test(&oam, test, &vendor, &cache)
+            // A `// Flags:` header is only disqualifying when oam cannot
+            // honor the flags. Excluding EVERY flagged test shrank the
+            // denominator with tests oam runs correctly -- a measurement
+            // that flatters the runtime for free. Pass through what we
+            // support; exclude only the genuinely unsupported.
+            match classify_flags(test) {
+                FlagSupport::None => run_test(&oam, test, &vendor, &cache, &[]),
+                FlagSupport::Supported(flags) => run_test(&oam, test, &vendor, &cache, &flags),
+                FlagSupport::Unsupported(raw) => Outcome::Unrunnable(format!("// Flags:{raw}")),
+            }
         };
 
         let slot = by_module.entry(module).or_insert([0; 4]);
@@ -228,16 +235,23 @@ fn ratchet_violation(
 /// Node repo root, and the vendored tree is our stand-in for it (same
 /// `test/`, `lib/`, package.json layout). A handful of tests read
 /// `process.cwd()` directly.
-fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path) -> Outcome {
+fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path, flags: &[String]) -> Outcome {
     let mut last = Outcome::Fail("no attempt".to_string());
     for _ in 0..3 {
+        // Node-level flags go BEFORE the file, in the bare `oam <flags>
+        // <file>` form -- that is the shape oam's node-style parser reads,
+        // and it is what `node --no-warnings test.js` looks like.
+        let mut cmd = Command::new(oam);
+        for f in flags {
+            cmd.arg(f);
+        }
+        if flags.is_empty() {
+            cmd.arg("run").arg(test).arg("--no-check");
+        } else {
+            cmd.arg(test);
+        }
         let out = match run_with_timeout(
-            Command::new(oam)
-                .arg("run")
-                .arg(test)
-                .arg("--no-check")
-                .env("OAM_CACHE_DIR", cache)
-                .current_dir(cwd),
+            cmd.env("OAM_CACHE_DIR", cache).current_dir(cwd),
             // 60s was below the honest debug-build runtime of the slowest
             // vendored tests (test-util-inspect-long-running takes ~90s here),
             // which made their result depend on machine load rather than on
@@ -391,6 +405,47 @@ fn load_manifest(path: &Path) -> Manifest {
         }
     }
     m
+}
+
+/// What a test's `// Flags:` header means for runnability.
+enum FlagSupport {
+    /// No header at all.
+    None,
+    /// Every flag is one oam implements: pass them through and RUN it.
+    Supported(Vec<String>),
+    /// At least one flag oam does not implement; carries the raw header.
+    Unsupported(String),
+}
+
+/// Node flags oam implements (see the node-style parser in oam_cli's main).
+/// Deliberately conservative: a flag belongs here only when oam actually
+/// honors it, because passing an ignored flag would let a test "pass" while
+/// silently not testing what it names.
+const SUPPORTED_FLAGS: &[&str] = &[
+    "--no-warnings",
+    "--no-deprecation",
+    "--pending-deprecation",
+    "--expose-gc",
+    "--redirect-warnings",
+    "--disable-warning",
+    "--env-file",
+    "--env-file-if-exists",
+    "--input-type",
+];
+
+fn classify_flags(path: &Path) -> FlagSupport {
+    let Some(raw) = read_flags_header(path) else {
+        return FlagSupport::None;
+    };
+    let flags: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+    let all_supported = flags
+        .iter()
+        .all(|f| SUPPORTED_FLAGS.contains(&f.split('=').next().unwrap_or(f)));
+    if all_supported && !flags.is_empty() {
+        FlagSupport::Supported(flags)
+    } else {
+        FlagSupport::Unsupported(raw)
+    }
 }
 
 /// Read the `// Flags: ...` preamble (Node scans the first ~1.5KB).

@@ -8,7 +8,7 @@
     "minPassByHost": {
       "linux-x86_64": 407,
       "macos-aarch64": 405,
-      "windows-aarch64": 400
+      "windows-aarch64": 406
     }
   },
   "tests": {

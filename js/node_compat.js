@@ -8848,6 +8848,24 @@
         // assignment expression but stores nothing (probe: reads back
         // undefined). Silently ignore rather than throw.
         if (prop === "") return true;
+        // DEP0104, under --pending-deprecation only: anything other than a
+        // string/number/boolean is String()-coerced on the way in, and the
+        // coercion is rarely what the caller meant (an object becomes
+        // "[object Object]"). Node warns rather than change the behavior.
+        if (
+          globalThis.__oamPendingDeprecation &&
+          typeof value !== "string" &&
+          typeof value !== "number" &&
+          typeof value !== "boolean"
+        ) {
+          process.emitWarning(
+            "Assigning any value other than a string, number, or boolean to a " +
+              "process.env property is deprecated. Please make sure to convert the " +
+              "value to a string before setting process.env with it.",
+            "DeprecationWarning",
+            "DEP0104",
+          );
+        }
         const store = ensureEnv();
         const key = envResolveKey(store, prop);
         store[key] = String(value);
@@ -9439,6 +9457,12 @@
           }
           if (typeof typeOrOptions.ctor === "function") ctor = typeOrOptions.ctor;
           if (typeof typeOrOptions.detail === "string") detail = typeOrOptions.detail;
+        } else if (typeof typeOrOptions === "function") {
+          // emitWarning(msg, ctor): a FUNCTION in the type position is the
+          // constructor used to trim the stack, not a type name. Node
+          // shifts it and leaves type at 'Warning'; oam used to throw
+          // ERR_INVALID_ARG_TYPE and reject a documented call form.
+          ctor = typeOrOptions;
         } else {
           if (typeOrOptions !== undefined) {
             if (typeof typeOrOptions !== "string") {
