@@ -495,14 +495,15 @@ bug in the suite.
 
 **Still open:**
 
-- **`test-process-execve-abort` is a deliberate non-pass.** oam produces
-  Node's exact failure message (`process.execve failed with error code
-  ENOENT`), and the test's first assertion passes. Its second requires the
-  stack to contain `execve (node:internal/process/per_thread` — a module oam
-  does not have (see divergence 3: no `node:internal/…` frames). Passing it
-  would mean fabricating a frame pointing at a file that does not exist,
-  sending anyone who reads the trace to the wrong place. Same call as
-  `process.versions`: the number stays honest.
+- **`test-process-execve-abort` now passes, without fabricating anything.**
+  It was a deliberate non-pass while every oam builtin frame rendered as
+  `<anonymous>`: the test wants the stack to contain
+  `execve (node:internal/process/per_thread`, and inventing that frame would
+  have pointed readers at a file that did not exist. The fix was to make the
+  frame TRUE instead — builtins are compiled with real script origins, and
+  execve moved into a module genuinely named `internal/process/per_thread`
+  (js/internal/process/per_thread.js). The trace now resolves to a module that
+  is really in the builtin registry, at the line the throw is really on.
 
 These were gaps to close, not documented behavior, and they are recorded here
 because the alternative — quoting the Windows figure and staying quiet about

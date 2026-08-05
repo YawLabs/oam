@@ -1974,16 +1974,26 @@
   const RealBuffer = Buffer;
   let buffer_dep0005_warned = false;
   // Node suppresses DEP0005 when the CALLER sits inside node_modules
-  // (isInsideNodeModules: the innermost stack frame with a real user
-  // filename decides). Snapshot frames render as <anonymous> and eval
-  // wrappers as [eval] -- both skipped. --pending-deprecation overrides.
+  // (isInsideNodeModules: the innermost stack frame with a real USER filename
+  // decides). Runtime frames are not user frames and must all be skipped:
+  // `oam:` and `node:` are builtins, `[eval]` is the eval wrapper, and
+  // `<anonymous>` covers anything still unnamed. --pending-deprecation
+  // overrides.
   function isCallerInsideNodeModules() {
     try {
       const lines = (new Error().stack || "").split("\n");
       for (let i = 1; i < lines.length; i++) {
         const m = /\(([^)]+):\d+:\d+\)/.exec(lines[i]) || / at ([^( ][^ ]*):\d+:\d+/.exec(lines[i]);
         const file = m && (m[1] || m[2]);
-        if (!file || file === "<anonymous>" || file === "[eval]" || file.startsWith("node:")) continue;
+        if (
+          !file ||
+          file === "<anonymous>" ||
+          file === "[eval]" ||
+          file.startsWith("node:") ||
+          file.startsWith("oam:")
+        ) {
+          continue;
+        }
         return /[\\/]node_modules[\\/]/.test(file);
       }
     } catch { /* fall through: treat as app code */ }
@@ -2707,6 +2717,21 @@
     }
 
     function getEventListeners(emitter, name) {
+      // Validate before touching it. A non-emitter used to reach the property
+      // reads below and come back as `[]` -- "nothing is listening" is a
+      // plausible-looking answer to a question that was never askable, and a
+      // typo'd argument silently passed a leak check.
+      if (
+        emitter === null ||
+        (typeof emitter !== "object" && typeof emitter !== "function") ||
+        (typeof emitter.listeners !== "function" && !emitter._listeners)
+      ) {
+        throw new codes.ERR_INVALID_ARG_TYPE(
+          "emitter",
+          ["EventEmitter", "EventTarget"],
+          emitter,
+        );
+      }
       if (typeof emitter.listeners === "function") return emitter.listeners(name);
       // EventTarget (AbortSignal and friends) has no .listeners(): read the
       // internal registry the bootstrap EventTarget keeps. Without this the
@@ -2715,7 +2740,13 @@
       // "none attached" no matter what was actually registered.
       const registry = emitter?._listeners;
       if (registry && typeof registry.get === "function") {
-        return (registry.get(name) ?? []).map((e) => e.fn);
+        // Entry shape is bootstrap's EventTarget: `fn` when held strongly,
+        // `ref` (a WeakRef) when registered with kWeakHandler. A weak listener
+        // that has already been collected is reported as gone rather than as
+        // an `undefined` sitting in the array.
+        return (registry.get(name) ?? [])
+          .map((e) => (e.ref ? e.ref.deref() : e.fn))
+          .filter((fn) => fn !== undefined);
       }
       return [];
     }
@@ -8974,6 +9005,11 @@
 
   // -------------------------------------------------------------- process
   registry.factories.process = (natives) => {
+    // One-shot handoff: the module defines itself on globalThis so it can be a
+    // separate script (and so carry its own origin), and is cleared right away
+    // rather than left as an oam-only global on the runtime context.
+    const perThread = globalThis.__oamPerThread(natives, codes, applyNodeErrorShape);
+    delete globalThis.__oamPerThread;
     const EventEmitter = registry.get("events");
     // Streams are consumed LAZILY (stdio getters below), never at factory
     // time: this factory runs inside installRuntimeGlobals BEFORE
@@ -10146,67 +10182,9 @@
         if (sig !== 0 && !VALID.includes(sig)) return -22; // EINVAL before touching the sandbox
         try { natives.processKill(pid, sig); return 0; } catch { return -1; }
       },
-      execve(execPath, args, env) {
-        // execve(2) REPLACES the current process image: on success nothing
-        // after this call ever runs -- no 'exit' handlers, no unwind, no
-        // flush (the op flushes first for that reason). Node has it on
-        // POSIX only.
-        if (natives.platform === "win32") {
-          throw applyNodeErrorShape(
-            new TypeError("process.execve is unavailable on the current platform"),
-            "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
-          );
-        }
-        // A worker replacing the image would take its siblings with it.
-        if (
-          typeof natives.workerIsMainThread === "function" &&
-          !natives.workerIsMainThread()
-        ) {
-          throw applyNodeErrorShape(
-            new TypeError("process.execve() is not available in workers"),
-            "ERR_WORKER_UNSUPPORTED_OPERATION",
-          );
-        }
-        if (typeof execPath !== "string") {
-          throw new codes.ERR_INVALID_ARG_TYPE("execPath", "string", execPath);
-        }
-        if (!Array.isArray(args)) {
-          throw new codes.ERR_INVALID_ARG_TYPE("args", "Array", args);
-        }
-        // Everything crosses into C as a NUL-terminated string, so an
-        // embedded NUL would silently TRUNCATE the value. Node refuses
-        // rather than pass a shortened argv, and names the bad index.
-        const NUL = String.fromCharCode(0);
-        const clean = (v) => typeof v === "string" && !v.includes(NUL);
-        for (let i = 0; i < args.length; i++) {
-          if (!clean(args[i])) {
-            throw new codes.ERR_INVALID_ARG_VALUE(
-              `args[${i}]`,
-              args[i],
-              "must be a string without null bytes",
-            );
-          }
-        }
-        if (env === null || typeof env !== "object") {
-          throw new codes.ERR_INVALID_ARG_TYPE("env", "object", env);
-        }
-        for (const key of Object.keys(env)) {
-          if (!clean(key) || !clean(env[key])) {
-            throw new codes.ERR_INVALID_ARG_VALUE(
-              "env",
-              env,
-              "must be an object with string keys and values without null bytes",
-            );
-          }
-        }
-        const envp = Object.keys(env).map((k) => `${k}=${env[k]}`);
-        const errnoName = natives.processExecve(execPath, args, envp);
-        // Only reachable when execve FAILED -- success never returns.
-        throw applyNodeErrorShape(
-          new Error(`process.execve failed with error code ${errnoName}`),
-          "ERR_OPERATION_FAILED",
-        );
-      },
+      // Lives in js/internal/process/per_thread.js so its stack frame names
+      // the module node core names. Bound once here; see that file.
+      execve: perThread.execve,
       umask(mask) {
         const prev = process._umask ?? 0;
         if (mask === undefined) return prev;
@@ -11371,6 +11349,15 @@
     URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
 
     class URL {
+      // Un-forgeable brand. `_href` is an ordinary property, so nothing about
+      // a URL was distinguishable from a duck-typed copy -- and the legacy
+      // url.parse() result carries href/protocol/path, so every href-shaped
+      // object read as a URL. A private field can only exist on an object this
+      // constructor produced, and `#brand in value` asks that without throwing.
+      #brand = true;
+      static [Symbol.for("oam.isURL")](value) {
+        return value !== null && typeof value === "object" && #brand in value;
+      }
       constructor(input, base) {
         this._href = globalThis.__oam.node.urlParseHref(String(input), base ?? undefined);
         this._c = null;
@@ -20559,7 +20546,10 @@
         .filter((line) => {
           const t = line.trim();
           if (!t.startsWith("at ")) return true; // keep the header + message
-          return !t.includes("<anonymous>");
+          // Runtime-internal frames are noise in a user-facing report. They
+          // carry real origins now, so identifying them by "<anonymous>"
+          // alone would let every oam: and node: frame through.
+          return !t.includes("<anonymous>") && !t.includes("oam:") && !t.includes("node:");
         })
         .join("\n");
       log("  ---");

@@ -209,7 +209,10 @@
     }
 
     module.exports = {
-      kWeakHandler: Symbol("kWeak"),
+      // REGISTERED, not a fresh symbol: bootstrap's EventTarget reads the
+      // same key to decide whether to hold the listener weakly. A private
+      // symbol here meant the flag never reached the implementation.
+      kWeakHandler: Symbol.for("oam.kWeakHandler"),
       kResistStopPropagation: Symbol.for("oam.kResistStopPropagation"),
       kEvents,
       NodeEventTarget,
@@ -241,6 +244,19 @@
           },
         };
       },
+    };
+  });
+
+  d("internal/url", (require, module) => {
+    // A brand check, not an instanceof: node's isURL answers "does this carry
+    // a URL's internal state", so a plain object holding href/protocol/path --
+    // or the legacy url.parse() result, which holds all three -- is correctly
+    // false. The brand is a private field on URL itself (node_compat.js).
+    module.exports = {
+      get URL() {
+        return globalThis.URL;
+      },
+      isURL: (value) => globalThis.URL[Symbol.for("oam.isURL")](value),
     };
   });
 

@@ -162,6 +162,31 @@ fn lock_package_versions(lock: &str, package: &str) -> Vec<String> {
 /// `oam_engine::RUNTIME_CONTEXT_INDEX`; the two must not drift.
 const RUNTIME_CONTEXT_INDEX: usize = 0;
 
+/// The name a builtin script reports in stack traces.
+///
+/// Every one of these used to compile with NO ScriptOrigin, so the whole
+/// runtime -- assert, util, streams, the compat layer -- surfaced in traces as
+/// `<anonymous>:10206`, which tells a reader nothing and cannot be opened.
+///
+/// A module vendored from node's lib/, or one implementing a node internal
+/// under node's own id, reports that id: the name resolves to a real entry in
+/// the builtin registry, so the frame points at the module it says it does.
+/// Everything else is oam's own and says so.
+fn origin_name(path: &str, wrap: Option<&str>) -> String {
+    if let Some(id) = wrap {
+        return format!("node:{id}");
+    }
+    let relative = path
+        .replace(std::path::MAIN_SEPARATOR, "/")
+        .rsplit_once("/js/")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| path.to_string());
+    match relative.strip_prefix("internal/") {
+        Some(rest) => format!("node:internal/{}", rest.trim_end_matches(".js")),
+        None => format!("oam:{relative}"),
+    }
+}
+
 fn main() {
     println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
 
@@ -199,6 +224,14 @@ fn main() {
     let js_files: &[(&str, Option<&str>)] = &[
         (
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../js/bootstrap.js"),
+            None,
+        ),
+        // Before node_compat.js, which picks the factory up off globalThis.
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../js/internal/process/per_thread.js"
+            ),
             None,
         ),
         (
@@ -440,6 +473,7 @@ fn main() {
         "internal/abort_controller",
         "internal/events/abort_listener",
         "internal/blob",
+        "internal/url",
         "internal/assert",
         "internal/webstreams/adapters",
     ];
@@ -482,7 +516,7 @@ fn main() {
                 ),
                 None => text,
             };
-            (path.to_string(), text)
+            (origin_name(path, *wrap), text)
         })
         .collect();
 
@@ -506,14 +540,29 @@ fn main() {
         let context = v8::Context::new(scope, v8::ContextOptions::default());
         {
             let scope = &mut v8::ContextScope::new(scope, context);
-            for (path, text) in &sources {
+            for (name, text) in &sources {
                 let source = v8::String::new(scope, text)
-                    .unwrap_or_else(|| panic!("{path}: too long for V8 string"));
-                let script = v8::Script::compile(scope, source, None)
-                    .unwrap_or_else(|| panic!("{path}: does not compile"));
+                    .unwrap_or_else(|| panic!("{name}: too long for V8 string"));
+                let resource_name = v8::String::new(scope, name)
+                    .unwrap_or_else(|| panic!("{name}: not a V8 string"));
+                let origin = v8::ScriptOrigin::new(
+                    scope,
+                    resource_name.into(),
+                    0,
+                    0,
+                    false,
+                    0,
+                    None,
+                    false,
+                    false,
+                    false,
+                    None,
+                );
+                let script = v8::Script::compile(scope, source, Some(&origin))
+                    .unwrap_or_else(|| panic!("{name}: does not compile"));
                 script
                     .run(scope)
-                    .unwrap_or_else(|| panic!("{path}: failed to evaluate"));
+                    .unwrap_or_else(|| panic!("{name}: failed to evaluate"));
             }
         }
         let index = scope.add_context(context);

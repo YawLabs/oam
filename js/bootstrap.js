@@ -200,6 +200,17 @@
   defineEventPhases(CustomEvent);
   globalThis.CustomEvent = CustomEvent;
 
+  // Drops a weakly-held listener's entry once the listener is collected, so a
+  // long-lived target does not accumulate dead slots.
+  const collectedListeners = typeof FinalizationRegistry === "function"
+    ? new FinalizationRegistry(({ target, type, entry }) => {
+        const owner = target.deref();
+        if (!owner) return;
+        const list = owner._listeners.get(type);
+        if (list) owner._listeners.set(type, list.filter((e) => e !== entry));
+      })
+    : null;
+
   class EventTarget {
     constructor() {
       this._listeners = new Map(); // type -> [{ fn, once }]
@@ -213,15 +224,30 @@
       // listener called stopImmediatePropagation().
       const resist = options !== true && options != null &&
         options[Symbol.for("oam.kResistStopPropagation")] === true;
+      // Node-internal weak flag (kWeakHandler): the listener must NOT keep
+      // itself -- or its closure -- alive. Honouring it takes a real WeakRef;
+      // accepting the option and storing a strong reference anyway would
+      // retain exactly what the caller asked to be droppable, which is the
+      // opposite of what it was set for.
+      const weak = options !== true && options != null &&
+        options[Symbol.for("oam.kWeakHandler")] != null;
       const list = this._listeners.get(type) ?? [];
-      if (!list.some((e) => e.fn === listener)) {
-        list.push({ fn: listener, once, resist });
+      if (!list.some((e) => listenerOf(e) === listener)) {
+        const entry = weak
+          ? { ref: new WeakRef(listener), once, resist }
+          : { fn: listener, once, resist };
+        list.push(entry);
         this._listeners.set(type, list);
+        if (weak && collectedListeners) {
+          // The registry must not become the thing that keeps the target
+          // alive, so it holds the target weakly too.
+          collectedListeners.register(listener, { target: new WeakRef(this), type, entry });
+        }
       }
     }
     removeEventListener(type, listener) {
       const list = this._listeners.get(type);
-      if (list) this._listeners.set(type, list.filter((e) => e.fn !== listener));
+      if (list) this._listeners.set(type, list.filter((e) => listenerOf(e) !== listener));
     }
     dispatchEvent(event) {
       event.target = this;
@@ -236,15 +262,18 @@
           // Resist-marked listeners (Node's kResistStopPropagation) still run
           // after stopImmediatePropagation; everything else is skipped.
           if (event._stopImmediate && !entry.resist) continue;
-          if (entry.once) this.removeEventListener(event.type, entry.fn);
+          // A weak listener whose target has been collected is simply gone.
+          const fn = listenerOf(entry);
+          if (fn === undefined) continue;
+          if (entry.once) this.removeEventListener(event.type, fn);
           // A plain function listener is called with the TARGET as `this`;
           // an object listener is called with the LISTENER OBJECT, so
           // `handleEvent` can reach its own state. Both were getting the
           // target, which broke the object form's whole point.
-          if (typeof entry.fn === "function") {
-            entry.fn.call(this, event);
+          if (typeof fn === "function") {
+            fn.call(this, event);
           } else {
-            entry.fn.handleEvent.call(entry.fn, event);
+            fn.handleEvent.call(fn, event);
           }
         }
       } finally {
@@ -255,6 +284,11 @@
       }
       return !event.defaultPrevented;
     }
+  }
+  // A registered entry holds its listener either strongly (`fn`) or weakly
+  // (`ref`); undefined means a weak one has been collected.
+  function listenerOf(entry) {
+    return entry.ref ? entry.ref.deref() : entry.fn;
   }
   globalThis.EventTarget = EventTarget;
 

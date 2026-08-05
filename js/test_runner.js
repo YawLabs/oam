@@ -617,7 +617,8 @@
         .split("\n")
         .filter(
           (line) =>
-            !line.includes("oam:test") &&
+            !line.includes("oam:") &&
+            !line.includes("node:") &&
             !line.includes("test_runner") &&
             !(line.trim().startsWith("at ") && line.includes("<anonymous>")),
         )
