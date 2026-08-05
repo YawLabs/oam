@@ -1211,9 +1211,28 @@ pub(crate) fn pump_event_loop(
         } else {
             std::time::Instant::now()
         };
-        let due = tc
-            .get_slot_mut::<crate::timers::TimerQueue>()
-            .and_then(|queue| queue.pop_due(now));
+        // Node runs a due timer only while SOMETHING keeps the loop alive.
+        // When the only work left is unref'd timers the loop exits and they
+        // never fire -- which for a 0ms timer (that is what setImmediate is
+        // here) is always the interesting case, since it is due the instant
+        // it is created. Draining unconditionally meant
+        // `setImmediate(...).unref()` still ran at exit, so `-p` printed the
+        // promise AND then executed work node would have dropped.
+        let only_unref_timers_left = {
+            let has_ref = tc
+                .get_slot::<crate::timers::TimerQueue>()
+                .is_some_and(|queue| queue.has_ref_timers());
+            let has_inflight = tc
+                .get_slot::<oam_core::CoreRuntime>()
+                .is_some_and(|core| core.has_inflight());
+            !has_ref && !has_inflight && !has_pending_ticks(tc)
+        };
+        let due = if only_unref_timers_left {
+            None
+        } else {
+            tc.get_slot_mut::<crate::timers::TimerQueue>()
+                .and_then(|queue| queue.pop_due(now))
+        };
         if let Some((callback, extra)) = due {
             let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
             let callback = v8::Local::new(tc, &callback);
