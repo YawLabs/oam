@@ -22,21 +22,26 @@ Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scor
 
 ## The conformance number, qualified
 
-oam passes **400/401 (99.8%)** of the vendored Node core tests it can run **on
-windows-aarch64**. Read that with the denominator in view:
+oam passes **414/416 (99.5%)** of the vendored Node core tests it can run on
+windows-aarch64, **420/423 (99.3%)** on macos-aarch64, and **421/424 (99.3%)**
+on linux-x86_64. Read those with the denominator in view:
 
 - **The corpus is a subset.** It currently covers `assert`, `buffer`, `events`, `path`,
   `process`, `querystring`, `stream`, `string_decoder`, `timers`, `url`, and `util`. The
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
-- **400/401 is pass/runnable, not pass/total.** Against every vendored file it is
-  **400/476 (84.0%)**: 17 tests skip themselves at runtime and 58 are unrunnable by the
-  harness (they need `// Flags:` support or fixtures the vendored subset does not carry).
-- **Windows runs the FEWEST tests of the three platforms**, so its ratio is not the
-  whole picture. The POSIX hosts carry larger denominators (they run the POSIX-only
-  tests Windows skips) and measure **405/408 (99.3%) on macos-aarch64** and
-  **407/409 (99.5%) on linux-x86_64**. See "POSIX-only gaps" near the end for what
-  remains there; quoting only the Windows figure would flatter the runtime.
+- **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
+  **414/476 (87.0%)**: 17 tests skip themselves at runtime and 43 are unrunnable by the
+  harness. Of those 43, **37 need `--expose-internals`** — they reach into
+  `node:internal/*` modules oam does not have, and inventing them to score would be the
+  same fabrication refused for `process.versions`.
+- **Windows runs the FEWEST tests of the three platforms**, so its ratio alone is not
+  the picture; the POSIX hosts carry larger denominators because they run the POSIX-only
+  tests Windows skips. See "POSIX-only gaps" near the end.
+- **Every remaining failure on every platform is deliberate or architectural** —
+  `process-versions` everywhere, `execve-abort` on POSIX, and
+  `internalbinding-allowlist` (which wants `internalBinding('async_wrap')`). There are
+  no known open correctness bugs in the suite on any platform.
   (The denominator in these ratios is pass+fail — the tests that reached a verdict.
   Self-skips are excluded from it and counted separately, which is why 405+3 = 408
   rather than the 418 that includes macOS's 10 runtime skips.)
@@ -402,10 +407,9 @@ entries below were executed on both runtimes unless marked.
 
 ## Known failures in the vendored suite
 
-The one failure behind the 400/401 **on windows-aarch64**, triaged honestly.
+The two failures behind the 414/416 **on windows-aarch64**, triaged honestly.
 Per-platform numbers differ because the harness skips POSIX-only tests on
-Windows — see "POSIX-only gaps" below, which is where the other platforms'
-failures live.
+Windows — see "POSIX-only gaps" below, where the third POSIX failure lives.
 
 | Test | Status |
 |---|---|
@@ -479,10 +483,12 @@ unchanged because these tests never ran there):
   through a symlink, Node reports the symlink's target and keeps the invoked
   name in `process.argv0`; oam returned `argv[0]` for both.
 
-With those, the POSIX hosts measure **405/408 (99.3%) on macos-aarch64 and
-407/409 (99.5%) on linux-x86_64**, up from 392 each. Every remaining failure
-on both is deliberate and listed below — there are no known open bugs in the
-suite on Linux.
+With those — and the harness change that stopped excluding flagged tests
+oam can run — the POSIX hosts finished the day at **420/423 (99.3%) on
+macos-aarch64 and 421/424 (99.3%) on linux-x86_64**, from 392 each that
+morning, against denominators ~15 larger. Every remaining failure on both is
+deliberate or architectural; neither platform has a known open correctness
+bug in the suite.
 
 **Still open:**
 
@@ -495,10 +501,10 @@ suite on Linux.
   sending anyone who reads the trace to the wrong place. Same call as
   `process.versions`: the number stays honest.
 
-These are gaps to close, not documented behavior. They are listed here
-because the alternative — quoting 400/401 and staying quiet about two
-platforms measuring 392 — would make the headline number mean less than it
-claims.
+These were gaps to close, not documented behavior, and they are recorded here
+because the alternative — quoting the Windows figure and staying quiet about
+two platforms measuring 392 — would have made the headline number mean less
+than it claimed.
 
 ---
 
