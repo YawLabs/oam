@@ -14440,55 +14440,63 @@
         // specific reason could not tell why it was aborted.
         throw makeAbortError(signal.reason);
       }
-      // Own the timer id so we can clearTimeout on abort -- promisedTimeout
-      // does not expose its handle, and a fire-and-forget timer per tick
-      // would retain a slot until natural expiry on every aborted interval.
-      let timerId = null;
+      // A REPEATING timer, counting ticks independently of how fast the
+      // consumer drains them. Restarting a one-shot after each `yield`
+      // silently drops every tick that lands while the consumer is working,
+      // so a 10ms interval feeding a consumer that takes 40ms yielded once
+      // per 50ms where node yields four -- the interval degraded into
+      // "delay between iterations" instead of a rate.
+      let ticks = 0;
+      // Resolver for the pass that is waiting on the next tick, or null when
+      // the consumer is busy and nothing is awaiting. ONE abort listener for
+      // the whole iterator, not one per tick: the per-tick add/remove churned
+      // the signal's listener list and left nothing attached between ticks.
+      let notify = null;
+      let timer = null;
       let abortListener = null;
-      // ONE abort listener for the whole iterator, not one per tick. The
-      // per-tick add/remove churned the signal's listener list on every
-      // iteration and left NOTHING attached between ticks, so a caller
-      // inspecting the signal mid-iteration saw no listener at all -- and
-      // an abort landing between ticks had nothing to fire.
-      let notifyAbort = null;
-      // The FLAG matters as much as the callback: an abort can land while
-      // the consumer is working on a yielded value, when nothing is
-      // awaiting. Recording it means the next loop pass still sees it
-      // instead of the abort being dropped and the interval running on.
-      let sawAbort = false;
-      if (signal?.addEventListener) {
-        abortListener = () => {
-          sawAbort = true;
-          if (notifyAbort) notifyAbort();
-        };
-        signal.addEventListener("abort", abortListener, { once: true });
-      }
-      try {
-        for (;;) {
-          if (sawAbort) throw makeAbortError(signal.reason);
-          const aborted = await new Promise((resolve) => {
-            timerId = globalThis.setTimeout(() => {
-              timerId = null;
-              resolve(false);
-            }, delay);
-            notifyAbort = () => resolve(true);
-            // Aborted between the flag check above and the listener being
-            // wired here: settle immediately rather than wait out a tick.
-            if (sawAbort) resolve(true);
-          });
-          notifyAbort = null;
-          if (aborted) {
-            if (timerId !== null) {
-              globalThis.clearTimeout(timerId);
-              timerId = null;
-            }
-            throw makeAbortError(signal.reason);
-          }
-          yield value;
+      const wake = () => {
+        if (notify) {
+          const resolve = notify;
+          notify = null;
+          resolve();
         }
+      };
+      try {
+        timer = globalThis.setInterval(() => {
+          ticks++;
+          wake();
+        }, delay);
+        // `ref: false` has to reach the real handle: the whole point is a
+        // process that exits with the interval still pending.
+        if (options?.ref === false) timer?.unref?.();
+        if (signal?.addEventListener) {
+          abortListener = () => {
+            globalThis.clearInterval(timer);
+            timer = null;
+            // Ends the WAIT; the loop below re-reads the signal and stops.
+            wake();
+          };
+          signal.addEventListener("abort", abortListener, { once: true });
+        }
+        while (!signal?.aborted) {
+          if (ticks === 0) {
+            await new Promise((resolve) => {
+              notify = resolve;
+            });
+          }
+          // Ticks already counted are still delivered after an abort -- the
+          // abort stops the waiting, not the backlog. A consumer that aborts
+          // from inside its own callback still receives the iterations that
+          // had already come due, which is what node does and what callers
+          // depend on to finish in-flight work.
+          for (; ticks > 0; ticks--) {
+            yield value;
+          }
+        }
+        throw makeAbortError(signal.reason);
       } finally {
-        if (timerId !== null) {
-          globalThis.clearTimeout(timerId);
+        if (timer !== null) {
+          globalThis.clearInterval(timer);
         }
         // Optional call: validation accepts any duck-typed signal (anything
         // carrying `aborted`), which need not have the removal half.
