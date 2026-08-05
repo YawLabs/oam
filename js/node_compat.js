@@ -2489,11 +2489,40 @@
     }
 
     function on(emitter, event, options) {
+      // Same validation contract as once(): a plain object, a bad options
+      // bag, or a non-AbortSignal signal used to surface as whatever
+      // TypeError happened to fall out first ("emitter.on is not a
+      // function"), with no code for a caller to branch on.
+      if (
+        options !== undefined &&
+        (options === null || typeof options !== "object" || Array.isArray(options))
+      ) {
+        throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+      }
       var signal = options && options.signal;
+      if (
+        signal !== undefined &&
+        (signal === null || typeof signal !== "object" || !("aborted" in signal))
+      ) {
+        throw new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+      }
+      if (
+        typeof emitter?.on !== "function" &&
+        typeof emitter?.addEventListener !== "function"
+      ) {
+        throw new codes.ERR_INVALID_ARG_TYPE(
+          "emitter",
+          ["EventEmitter", "EventTarget"],
+          emitter,
+        );
+      }
       var unconsumed = [];
       var waiting = [];
       var error = null;
       var done = false;
+      // An error is reported to exactly one consumer; after that the
+      // iterator simply reads as finished.
+      var errorDelivered = false;
 
       function eventHandler() {
         var args = [];
@@ -2507,23 +2536,75 @@
 
       function errorHandler(err) {
         error = err;
+        // The iterator is finished the moment it errors: unhook now rather
+        // than waiting for a return() the consumer will never make.
+        cleanup();
         var w = waiting.slice();
         waiting.length = 0;
-        for (var i = 0; i < w.length; i++) w[i].reject(err);
+        // The error is delivered ONCE, to the FIRST waiter; everyone else
+        // sees a finished iterator. Rejecting every pending next() with the
+        // same error made three concurrent next() calls produce three
+        // rejections where node produces one rejection and two dones.
+        for (var i = 0; i < w.length; i++) {
+          if (i === 0 && !errorDelivered) {
+            errorDelivered = true;
+            w[i].reject(err);
+          } else {
+            w[i].resolve({ value: undefined, done: true });
+          }
+        }
+        done = true;
       }
 
-      function abortHandler() {
+      function makeAbortErrorForOn(reason) {
         var err = new Error("The operation was aborted");
         err.code = "ABORT_ERR";
         err.name = "AbortError";
-        errorHandler(err);
+        if (reason !== undefined) err.cause = reason;
+        return err;
+      }
+      function abortHandler() {
+        errorHandler(makeAbortErrorForOn(signal && signal.reason));
       }
 
-      emitter.on(event, eventHandler);
-      if (event !== "error") emitter.on("error", errorHandler);
+      // ONE teardown for every way this iterator can finish. It used to
+      // live only in return()/throw(), and a rejected next() does NOT
+      // trigger return() -- so the ERROR path left both listeners attached
+      // to the emitter forever. The signal's abort listener was never
+      // removed on any path.
+      // EventTarget has no .on/.removeListener. on() only ever spoke the
+      // EventEmitter dialect, so passing an EventTarget (an AbortSignal,
+      // say) died with "emitter.on is not a function" -- even though the
+      // async-iterator contract is identical for both.
+      var isTarget = typeof emitter.on !== "function";
+      var attach = isTarget
+        ? function (type, fn) { emitter.addEventListener(type, fn); }
+        : function (type, fn) { emitter.on(type, fn); };
+      var detach = isTarget
+        ? function (type, fn) { emitter.removeEventListener(type, fn); }
+        : function (type, fn) { emitter.removeListener(type, fn); };
+
+      var cleanedUp = false;
+      function cleanup() {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        detach(event, eventHandler);
+        if (event !== "error") detach("error", errorHandler);
+        if (signal) signal.removeEventListener?.("abort", abortHandler);
+      }
+
+      attach(event, eventHandler);
+      if (event !== "error") attach("error", errorHandler);
       if (signal) {
-        if (signal.aborted) { abortHandler(); }
-        else { signal.addEventListener("abort", abortHandler, { once: true }); }
+        if (signal.aborted) {
+          // Already aborted: throw SYNCHRONOUSLY. Routing it through the
+          // async error path handed back an iterator that looked usable
+          // and only failed on first next(), so `assert.throws(() => on(...))`
+          // saw nothing thrown.
+          cleanup();
+          throw makeAbortErrorForOn(signal.reason);
+        }
+        signal.addEventListener("abort", abortHandler, { once: true });
       }
 
       var iterator = {
@@ -2531,11 +2612,11 @@
           if (unconsumed.length > 0) {
             return Promise.resolve({ value: unconsumed.shift(), done: false });
           }
-          if (error) {
-            var e = error;
-            return Promise.reject(e);
+          if (error && !errorDelivered) {
+            errorDelivered = true;
+            return Promise.reject(error);
           }
-          if (done) {
+          if (done || error) {
             return Promise.resolve({ value: undefined, done: true });
           }
           return new Promise(function(resolve, reject) {
@@ -2544,18 +2625,31 @@
         },
         return: function() {
           done = true;
-          emitter.removeListener(event, eventHandler);
-          if (event !== "error") emitter.removeListener("error", errorHandler);
+          cleanup();
           var w = waiting.slice();
           waiting.length = 0;
           for (var i = 0; i < w.length; i++) w[i].resolve({ value: undefined, done: true });
           return Promise.resolve({ value: undefined, done: true });
         },
         throw: function(err) {
-          error = err;
-          emitter.removeListener(event, eventHandler);
-          if (event !== "error") emitter.removeListener("error", errorHandler);
-          return Promise.reject(err);
+          // throw() takes an ERROR. Accepting undefined finished the
+          // iterator with a rejection nobody could interpret; node
+          // validates synchronously and says what it wanted.
+          if (!(err instanceof Error)) {
+            throw new codes.ERR_INVALID_ARG_TYPE(
+              "EventEmitter.AsyncIterator",
+              "Error",
+              err,
+            );
+          }
+          // Route through the SAME error path a real 'error' event takes:
+          // that is what rejects the already-pending next(), which is how
+          // the for-await consumer actually observes the throw. Setting
+          // `error` and returning a rejected promise left the pending
+          // waiter hanging (and produced a rejection nobody was there to
+          // handle). Returns undefined, as node's does.
+          errorHandler(err);
+          return undefined;
         },
       };
       iterator[Symbol.asyncIterator] = function() { return iterator; };
