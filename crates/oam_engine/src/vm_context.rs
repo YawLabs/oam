@@ -18,6 +18,111 @@
 //! every `runInContext` takes it), so a Rust-side registry would pin every
 //! context ever created for the life of the isolate.
 
+/// Terminates a runaway script after `timeout` ms.
+///
+/// `timeout` is the one `vm` option that cannot be politely ignored: a caller
+/// setting it is bounding UNTRUSTED code, and silently running forever is the
+/// failure it was written to prevent. V8 can only be stopped from another
+/// thread, so this parks one on a condvar -- which also means the common case
+/// (script finishes first) wakes it immediately instead of sleeping out the
+/// full duration.
+struct Watchdog {
+    finished: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(handle: v8::IsolateHandle, timeout_ms: u64) -> Self {
+        let finished =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let finished = std::sync::Arc::clone(&finished);
+            let fired = std::sync::Arc::clone(&fired);
+            std::thread::spawn(move || {
+                let (lock, cvar) = &*finished;
+                let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (guard, timed_out) = cvar
+                    .wait_timeout_while(
+                        guard,
+                        std::time::Duration::from_millis(timeout_ms),
+                        |done| !*done,
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                drop(guard);
+                if timed_out.timed_out() {
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    handle.terminate_execution();
+                }
+            })
+        };
+        Self {
+            finished,
+            fired,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops the watchdog and reports whether it fired.
+    fn finish(mut self) -> bool {
+        {
+            let (lock, cvar) = &*self.finished;
+            let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            cvar.notify_all();
+        }
+        // Joined, not detached: the thread touches an IsolateHandle, so it must
+        // be known dead before the caller can go on to tear the isolate down.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Throws node's `ERR_SCRIPT_EXECUTION_TIMEOUT`, clearing the termination
+/// first -- while it stands, V8 refuses to run any JS, including the throw.
+pub(crate) fn throw_timeout(scope: &mut v8::PinScope<'_, '_>, timeout_ms: u64) {
+    scope.cancel_terminate_execution();
+    let text = format!("Script execution timed out after {timeout_ms}ms");
+    let message = v8::String::new(scope, &text).unwrap();
+    let error = v8::Exception::error(scope, message);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(error)
+        && let (Some(key), Some(value)) = (
+            v8::String::new(scope, "code"),
+            v8::String::new(scope, "ERR_SCRIPT_EXECUTION_TIMEOUT"),
+        )
+    {
+        object.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(error);
+}
+
+/// Runs `f` under a watchdog when `timeout_ms` is set. `None` means the
+/// watchdog fired.
+///
+/// It reports rather than throws, deliberately: the caller runs inside a
+/// TryCatch, and a timeout raised there would be caught as if the script had
+/// thrown it -- swallowed, and indistinguishable from ordinary failure. The
+/// throw belongs outside, once the TryCatch has closed.
+pub(crate) fn with_timeout<'s, T>(
+    scope: &mut v8::PinScope<'s, '_>,
+    timeout_ms: u64,
+    f: impl FnOnce(&mut v8::PinScope<'s, '_>) -> T,
+) -> Option<T> {
+    if timeout_ms == 0 {
+        return Some(f(scope));
+    }
+    let watchdog = Watchdog::start(scope.thread_safe_handle(), timeout_ms);
+    let result = f(scope);
+    if watchdog.finish() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 /// Embedder-data slot on a contextified context, holding its sandbox.
 ///
 /// rusty_v8 offsets every embedder slot past its own internal ones, so 0 is the
@@ -457,16 +562,34 @@ pub(crate) fn op_vm_is_context<'s>(
 ///
 /// The result and any exception cross the inner handle scope as globals: a
 /// `Local` minted inside would dangle the moment the scope closes.
+/// Everything `run` needs about the script itself, as opposed to where it runs.
+struct ScriptSpec<'a> {
+    code: v8::Local<'a, v8::String>,
+    origin_name: v8::Local<'a, v8::Value>,
+    line_offset: i32,
+    column_offset: i32,
+    timeout_ms: u64,
+}
+
 fn run(
     scope: &mut v8::PinScope<'_, '_>,
     context: v8::Local<'_, v8::Context>,
-    code: v8::Local<'_, v8::String>,
-    origin_name: v8::Local<'_, v8::Value>,
-    line_offset: i32,
-    column_offset: i32,
+    spec: ScriptSpec<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let outcome = {
+    let ScriptSpec {
+        code,
+        origin_name,
+        line_offset,
+        column_offset,
+        timeout_ms,
+    } = spec;
+    enum Outcome {
+        Value(v8::Global<v8::Value>),
+        Threw(v8::Global<v8::Value>),
+        TimedOut,
+    }
+    let outcome = (|| {
         v8::scope_with_context!(let inner, scope, context);
         v8::tc_scope!(let tc, inner);
         let code = v8::Local::new(tc, code);
@@ -484,22 +607,34 @@ fn run(
             false,
             None,
         );
-        let value = v8::Script::compile(tc, code, Some(&origin)).and_then(|script| script.run(tc));
+        // Compilation is not timed -- node bounds EXECUTION -- and a script
+        // that never compiles never runs.
+        let compiled = v8::Script::compile(tc, code, Some(&origin));
+        let value = match compiled {
+            Some(script) => match with_timeout(tc, timeout_ms, |tc| script.run(tc)) {
+                Some(value) => value,
+                None => return Outcome::TimedOut,
+            },
+            None => None,
+        };
         match value {
-            Some(value) => Ok(v8::Global::new(tc, value)),
+            Some(value) => Outcome::Value(v8::Global::new(tc, value)),
             None => {
                 // A compile error and a thrown exception arrive the same way.
                 let error = tc.exception().unwrap_or_else(|| v8::undefined(tc).into());
-                Err(v8::Global::new(tc, error))
+                Outcome::Threw(v8::Global::new(tc, error))
             }
         }
-    };
+    })();
     match outcome {
-        Ok(value) => rv.set(v8::Local::new(scope, &value)),
-        Err(error) => {
+        Outcome::Value(value) => rv.set(v8::Local::new(scope, &value)),
+        Outcome::Threw(error) => {
             let error = v8::Local::new(scope, &error);
             scope.throw_exception(error);
         }
+        // Raised out here: inside the TryCatch above it would have been caught
+        // and reported as if the script itself had thrown.
+        Outcome::TimedOut => throw_timeout(scope, timeout_ms),
     }
 }
 
@@ -543,13 +678,17 @@ pub(crate) fn op_vm_run_in_context<'s>(
     let origin_name = args.get(2);
     let line_offset = args.get(3).int32_value(scope).unwrap_or(0);
     let column_offset = args.get(4).int32_value(scope).unwrap_or(0);
+    let timeout_ms = args.get(5).integer_value(scope).unwrap_or(0).max(0) as u64;
     run(
         scope,
         context,
-        code,
-        origin_name,
-        line_offset,
-        column_offset,
+        ScriptSpec {
+            code,
+            origin_name,
+            line_offset,
+            column_offset,
+            timeout_ms,
+        },
         rv,
     );
 }
@@ -573,14 +712,18 @@ pub(crate) fn op_vm_run_in_this_context<'s>(
     let origin_name = args.get(1);
     let line_offset = args.get(2).int32_value(scope).unwrap_or(0);
     let column_offset = args.get(3).int32_value(scope).unwrap_or(0);
+    let timeout_ms = args.get(4).integer_value(scope).unwrap_or(0).max(0) as u64;
     let context = scope.get_current_context();
     run(
         scope,
         context,
-        code,
-        origin_name,
-        line_offset,
-        column_offset,
+        ScriptSpec {
+            code,
+            origin_name,
+            line_offset,
+            column_offset,
+            timeout_ms,
+        },
         rv,
     );
 }

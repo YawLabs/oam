@@ -317,11 +317,28 @@ pub(crate) fn op_vm_module_evaluate<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = arg_u32(scope, &args, 0);
-    let evaluated = with_modules(scope, id, |scope, module| {
-        module
-            .evaluate(scope)
-            .map(|value| v8::Global::new(scope, value))
-    });
+    let timeout_ms = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let mut timed_out = false;
+    let evaluated = with_modules(
+        scope,
+        id,
+        |scope, module| match crate::vm_context::with_timeout(scope, timeout_ms, |scope| {
+            module.evaluate(scope)
+        }) {
+            Some(value) => value.map(|value| v8::Global::new(scope, value)),
+            None => {
+                timed_out = true;
+                None
+            }
+        },
+    );
+    if timed_out {
+        // Raised out here, past the entered context: while the termination
+        // stands V8 will not run ANY JS, so returning quietly would leave the
+        // isolate refusing everything with no error to explain why.
+        crate::vm_context::throw_timeout(scope, timeout_ms);
+        return;
+    }
     match evaluated {
         Some(Some(value)) => {
             let value = v8::Local::new(scope, &value);

@@ -90,10 +90,33 @@ else
 fi
 
 # --- summary ----------------------------------------------------------------------
+# The committed scorecard travels to each remote in the source tarball, so a
+# leg whose node-suite never wrote one pulls THAT file back and reports the
+# local numbers under a remote platform's name -- a green leg measuring
+# nothing. The host field is the receipt: it must name the platform the leg
+# ran on, or the result is this box's and gets rejected.
+expected_host_for() {
+  case "$1" in
+    linux-x64)   echo "linux-x86_64" ;;
+    mac-arm64)   echo "macos-aarch64" ;;
+    local)       echo "" ;;
+    *)           echo "" ;;
+  esac
+}
+
 step "Node-suite pass rates"
 found=0
+stale=0
 for sc in "$STAGE_DIR"/*/node-suite-scorecard.json; do
   [ -f "$sc" ] || continue
+  leg="$(basename "$(dirname "$sc")")"
+  want="$(expected_host_for "$leg")"
+  got="$(node -p 'require(process.argv[1]).host' "$sc" 2>/dev/null || echo "")"
+  if [ -n "$want" ] && [ "$want" != "$got" ]; then
+    warn "$leg staged a scorecard for host '$got', not '$want' -- its node-suite did not write one, so this is the LOCAL scorecard round-tripping. Discarding."
+    stale=1
+    continue
+  fi
   found=1
   node -e '
     const s = require(process.argv[1]);
@@ -101,6 +124,7 @@ for sc in "$STAGE_DIR"/*/node-suite-scorecard.json; do
   ' "$sc" >&2 || warn "could not summarize $sc"
 done
 [ "$found" = "1" ] || warn "no scorecards staged -- every leg failed or was skipped"
+[ "$stale" = "0" ] || warn "at least one leg reported success while measuring nothing -- treat its floor as UNCHANGED"
 
 ok "scorecards staged under $STAGE_DIR"
 # LAST stdout line = the stage dir.

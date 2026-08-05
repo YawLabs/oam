@@ -17500,6 +17500,27 @@
     // `Array.prototype` inside a context no longer reaches the host, and a
     // write to `globalThis` no longer lands on the runtime's real global.
 
+    // node's validateInt32(timeout, 'options.timeout', 1): a non-number is a
+    // type error, and 0 / negative / fractional are out of range. Returns 0
+    // for "no timeout", which is what the native side treats as unbounded.
+    function timeoutOf(options) {
+      if (options == null || typeof options !== "object") return 0;
+      const timeout = options.timeout;
+      if (timeout === undefined) return 0;
+      if (typeof timeout !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("options.timeout", "number", timeout);
+      }
+      if (!Number.isInteger(timeout) || timeout < 1) {
+        throw applyNodeErrorShape(
+          new RangeError(
+            `The value of "options.timeout" is out of range. It must be a positive integer. Received ${timeout}`,
+          ),
+          "ERR_OUT_OF_RANGE",
+        );
+      }
+      return timeout;
+    }
+
     class Script {
       constructor(code, options) {
         this._code = String(code);
@@ -17516,15 +17537,16 @@
         // the recompile at run time cheap.
         natives.vmCompile(this._code, this._filename, this._lineOffset, this._columnOffset);
       }
-      runInThisContext(_options) {
+      runInThisContext(options) {
         return natives.vmRunInThisContext(
           this._code,
           this._filename,
           this._lineOffset,
           this._columnOffset,
+          timeoutOf(options),
         );
       }
-      runInContext(contextifiedObject, _options) {
+      runInContext(contextifiedObject, options) {
         if (!isContext(contextifiedObject)) {
           throw new codes.ERR_INVALID_ARG_TYPE(
             "contextifiedObject",
@@ -17538,6 +17560,7 @@
           this._filename,
           this._lineOffset,
           this._columnOffset,
+          timeoutOf(options),
         );
       }
       runInNewContext(sandbox, options) {
@@ -17651,7 +17674,8 @@
         natives.vmModuleLink(this[kModuleId], specifiers, resolvedIds);
         natives.vmModuleInstantiate(this[kModuleId]);
       }
-      async evaluate(_options) {
+      async evaluate(options) {
+        const timeout = timeoutOf(options);
         const status = this.status;
         if (status !== "linked" && status !== "evaluated" && status !== "errored") {
           throw applyNodeErrorShape(
@@ -17659,7 +17683,7 @@
             "ERR_VM_MODULE_STATUS",
           );
         }
-        await natives.vmModuleEvaluate(this[kModuleId]);
+        await natives.vmModuleEvaluate(this[kModuleId], timeout);
         return undefined;
       }
     }
