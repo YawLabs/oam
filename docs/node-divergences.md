@@ -9,8 +9,7 @@ surprises you, check here first; if the surprise is not here, it is a bug and we
 report.
 
 **Verified against:** oam 0.8.0 vs Node v22.22.2, on windows-aarch64, with a
-suite-level cross-platform sweep on macos-aarch64 (2026-08-05) and linux-x86_64
-(2026-08-05, at an earlier commit).
+suite-level cross-platform sweep on macos-aarch64 and linux-x86_64 (2026-08-05).
 Items marked _(source)_ were read out of oam's implementation rather than executed on
 every platform; items marked _(Windows-verified)_ were measured on Windows and that
 specific measurement has not been repeated on Linux/macOS.
@@ -23,10 +22,9 @@ Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scor
 
 ## The conformance number, qualified
 
-oam passes **428/430 (99.5%)** of the vendored Node core tests it can run on
-windows-aarch64 and **435/437 (99.5%)** on macos-aarch64. linux-x86_64 last
-measured **433/437 (99.1%)** at an older commit; its two remaining failures are
-the same deliberate pair, but the number itself predates the most recent work.
+oam passes **429/431 (99.5%)** of the vendored Node core tests it can run on
+windows-aarch64, **438/440 (99.5%)** on macos-aarch64, and **439/441 (99.5%)**
+on linux-x86_64 — every platform down to the same two deliberate failures.
 Read those with the denominator in view:
 
 - **The corpus is a subset.** It currently covers `assert`, `buffer`, `events`, `path`,
@@ -34,7 +32,7 @@ Read those with the denominator in view:
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
-  **428/476 (89.9%)**: 20 tests skip themselves at runtime and 26 are unrunnable by the
+  **429/476 (90.1%)**: 20 tests skip themselves at runtime and 26 are unrunnable by the
   harness. Of those 26, **20 need a `node:internal/*` module oam does not have** — 14 of
   them `internal/test/binding`, Node's C++ test hooks. Inventing those to score would be
   the same fabrication refused for `process.versions`.
