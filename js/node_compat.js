@@ -2046,8 +2046,41 @@
     //   _activeTimers:   installed by the timers block (id -> Timeout handle).
     _activeHandles: new Map(),
     _activeRequests: new Set(),
+    /// Re-entry guard for internal/* resolution (see get()).
+    _internalResolving: new Set(),
     get(name) {
       if (registry.cache.has(name)) return registry.cache.get(name);
+      // internal/* (only reachable under --expose-internals; the resolver
+      // refuses the specifier otherwise) comes from the vendored internal
+      // registry -- the SAME modules the streams port runs on, not a
+      // parallel set written to satisfy tests. A name that registry does
+      // not define throws, which is the honest answer for an internal oam
+      // genuinely does not have.
+      // NOTE the order: a registered factory WINS. `node:internal/errors`
+      // already resolved to node_compat's own codes, and intercepting
+      // internal/* ahead of the factory lookup silently swapped it for the
+      // vendored shim's class-based codes -- same names, different calling
+      // convention, so existing callers broke.
+      if (name.startsWith("internal/") && !registry.factories[name]) {
+        const vendor = globalThis.__oamVendor;
+        if (!vendor || typeof vendor.require !== "function") {
+          throw new Error(`Cannot find module '${name}'`);
+        }
+        // The vendor loader falls back to THIS function for ids it has no
+        // factory for, so a name neither side defines would bounce between
+        // them until the stack blew. The guard turns that into the honest
+        // "Cannot find module", which is also what the suite reclassifies
+        // on.
+        if (registry._internalResolving.has(name)) {
+          throw new Error(`Cannot find module '${name}'`);
+        }
+        registry._internalResolving.add(name);
+        try {
+          return vendor.require(name);
+        } finally {
+          registry._internalResolving.delete(name);
+        }
+      }
       const factory = registry.factories[name];
       if (!factory) {
         throw new Error(`oam internal: no builtin factory registered for '${name}'`);
@@ -5077,16 +5110,47 @@
     }
 
     const customPromisify = Symbol.for("nodejs.util.promisify.custom");
+    // Node's kCustomPromisifyArgs: names for a callback that yields MORE
+    // than one value, so the promise resolves an object instead of
+    // silently dropping every argument after the first (this is how
+    // promisified child_process.exec resolves { stdout, stderr }).
+    const customPromisifyArgs = Symbol.for("nodejs.util.promisify.customArgs");
     function promisify(original) {
       if (typeof original !== "function") {
         throw new TypeError('The "original" argument must be of type function');
       }
-      if (original[customPromisify]) return original[customPromisify];
+      if (original[customPromisify]) {
+        const fn = original[customPromisify];
+        if (typeof fn !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("util.promisify.custom", "Function", fn);
+        }
+        // Mark the custom function as its OWN promisified form, so
+        // promisify() is idempotent: promisify(promisify(fn)) === fn.
+        // Without it the second call wrapped the custom function again and
+        // returned a different object than the first call did.
+        Object.defineProperty(fn, customPromisify, {
+          value: fn,
+          enumerable: false,
+          writable: false,
+          configurable: true,
+        });
+        return fn;
+      }
+      const argNames = original[customPromisifyArgs];
       function promisified(...args) {
         return new Promise((resolve, reject) => {
-          original.call(this, ...args, (err, value) => {
-            if (err) reject(err);
-            else resolve(value);
+          original.call(this, ...args, (err, ...values) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            if (Array.isArray(argNames)) {
+              const obj = {};
+              for (let i = 0; i < argNames.length; i++) obj[argNames[i]] = values[i];
+              resolve(obj);
+              return;
+            }
+            resolve(values[0]);
           });
         });
       }

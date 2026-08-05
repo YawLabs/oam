@@ -371,6 +371,14 @@ pub(crate) fn resolve_bare(
         ));
     }
 
+    // `internal/...` under --expose-internals: a virtual path like any other
+    // builtin, resolved from the snapshot's internal registry. Whether the
+    // NAME actually exists is decided there, not here -- an unknown one
+    // throws from the registry with the same shape Node gives.
+    if crate::is_exposed_internal(specifier) {
+        return Ok(PathBuf::from(format!("node:{specifier}")));
+    }
+
     if specifier.starts_with("node:") || is_node_builtin(specifier) {
         let name = specifier.strip_prefix("node:").unwrap_or(specifier);
         if SUPPORTED_BUILTINS.contains(&name) {

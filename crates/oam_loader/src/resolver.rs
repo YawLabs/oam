@@ -177,6 +177,7 @@ impl Resolver {
             if specifier.starts_with("node:")
                 || specifier.starts_with("oam:")
                 || crate::npm::is_node_builtin(specifier)
+                || crate::is_exposed_internal(specifier)
             {
                 return crate::npm::resolve_bare(
                     specifier,

@@ -308,6 +308,9 @@ fn main() -> ExitCode {
             } else if arg == "--expose-gc" {
                 flags.expose_gc = true;
                 i += 1;
+            } else if arg == "--expose-internals" {
+                flags.expose_internals = true;
+                i += 1;
             } else if arg == "--allow-natives-syntax" {
                 flags.allow_natives_syntax = true;
                 i += 1;
@@ -395,6 +398,14 @@ fn main() -> ExitCode {
         }
         // V8 flags must be set before V8::initialize, i.e. before any
         // JsRuntime is constructed.
+        // The loader decides whether `internal/...` resolves, and it reads
+        // this rather than taking a plumbed argument: resolution happens in
+        // several places (require, dynamic import, the ESM path) and a
+        // process-wide toggle keeps them from disagreeing.
+        if flags.expose_internals {
+            // SAFETY: single-threaded startup, before any runtime exists.
+            unsafe { std::env::set_var("OAM_EXPOSE_INTERNALS", "1") };
+        }
         // Collect every node flag that is really a V8 flag: they all have to
         // go in ONE call, because V8::initialize runs on the first one and
         // later calls are ignored.
@@ -2075,6 +2086,9 @@ struct NodeFlags {
     zero_fill_buffers: bool,
     /// `--title=x`: the initial process.title.
     title: Option<String>,
+    /// `--expose-internals`: make `require('internal/...')` resolve. A
+    /// test/debug surface in Node too -- never listed in builtinModules.
+    expose_internals: bool,
 }
 
 impl NodeFlags {

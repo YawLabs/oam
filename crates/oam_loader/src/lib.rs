@@ -37,6 +37,17 @@ pub fn is_builtin_specifier(specifier: &str) -> bool {
     specifier.starts_with("node:")
         || specifier.starts_with("oam:")
         || npm::is_node_builtin(specifier)
+        || is_exposed_internal(specifier)
+}
+
+/// `internal/...` resolves as a builtin ONLY under `--expose-internals`
+/// (the CLI sets OAM_EXPOSE_INTERNALS for the loader). Node gates these the
+/// same way, and they stay out of `builtinModules` in both runtimes: they
+/// are a test/debug surface, never public API. Without the flag the
+/// specifier keeps failing exactly as before -- as a missing package.
+pub fn is_exposed_internal(specifier: &str) -> bool {
+    specifier.starts_with("internal/")
+        && std::env::var("OAM_EXPOSE_INTERNALS").as_deref() == Ok("1")
 }
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;

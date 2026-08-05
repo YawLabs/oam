@@ -308,6 +308,17 @@ fn missing_builtin(out: &Captured) -> Option<String> {
             return Some(rest[..end].to_string());
         }
     }
+    // Same class for an `internal/...` module oam does not provide under
+    // --expose-internals (Node C++ bindings, libuv stream wrappers). The
+    // test never reaches an assertion about oam's behavior, so counting it
+    // as a correctness failure would be as wrong as counting a missing
+    // node: builtin -- and counting it as a PASS would be worse.
+    if let Some(idx) = hay.find("Cannot find module 'internal/") {
+        let rest = &hay[idx + "Cannot find module '".len()..];
+        if let Some(end) = rest.find('\'') {
+            return Some(rest[..end].to_string());
+        }
+    }
     None
 }
 
@@ -436,6 +447,10 @@ const SUPPORTED_FLAGS: &[&str] = &[
     "--js-float16array",
     "--zero-fill-buffers",
     "--title",
+    // Resolves internal/* from the SAME registry the vendored streams port
+    // runs on. Tests needing an internal oam does not have reclassify as
+    // unrunnable (see missing_builtin), not as failures.
+    "--expose-internals",
 ];
 
 fn classify_flags(path: &Path) -> FlagSupport {
