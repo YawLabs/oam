@@ -8087,6 +8087,17 @@
   };
 
   // ------------------------------------------------------------------- fs
+  // POSIX file-type bits of `st_mode`. Identical on every platform oam
+  // targets, and synthesized to match on Windows (see stat_to_json).
+  const S_IFMT = 0o170000;
+  const S_IFIFO = 0o010000;
+  const S_IFCHR = 0o020000;
+  const S_IFDIR = 0o040000;
+  const S_IFBLK = 0o060000;
+  const S_IFREG = 0o100000;
+  const S_IFLNK = 0o120000;
+  const S_IFSOCK = 0o140000;
+
   // node's fs.Stats carries its predicates on the PROTOTYPE. That is what lets
   // two stats of the same file compare equal: as own properties they are
   // distinct function objects, so `assert.deepStrictEqual(statSync(f),
@@ -8094,32 +8105,61 @@
   // members node does not show.
   class Stats {
     constructor(raw) {
+      // node's own field order, so inspect output lines up with it.
+      // Conditionally defined: if a platform could not supply one, it stays
+      // ABSENT rather than becoming an own property holding undefined, which
+      // deepStrictEqual and JSON.stringify would both treat as an answer.
+      for (const key of ["dev", "mode", "nlink", "uid", "gid", "rdev", "blksize"]) {
+        if (raw[key] !== undefined) this[key] = raw[key];
+      }
+      if (raw.ino !== undefined) this.ino = raw.ino;
       this.size = raw.size;
-      this.mode = raw.mode;
+      if (raw.blocks !== undefined) this.blocks = raw.blocks;
       this.atimeMs = raw.atimeMs;
       this.mtimeMs = raw.mtimeMs;
       this.ctimeMs = raw.ctimeMs;
       this.birthtimeMs = raw.birthtimeMs;
-      this.atime = new Date(raw.atimeMs);
-      this.mtime = new Date(raw.mtimeMs);
-      this.ctime = new Date(raw.ctimeMs);
-      this.birthtime = new Date(raw.birthtimeMs);
-      // oam-internal, not part of node's Stats: the predicates read it because
-      // `mode` does not yet carry the S_IFMT type bits. Non-enumerable so it
-      // stays out of deepStrictEqual, JSON.stringify and inspect.
-      Object.defineProperty(this, "kind", {
-        value: raw.kind,
-        enumerable: false,
-        configurable: true,
-      });
     }
-    isFile() { return this.kind === "file"; }
-    isDirectory() { return this.kind === "dir"; }
-    isSymbolicLink() { return this.kind === "symlink"; }
-    isBlockDevice() { return false; }
-    isCharacterDevice() { return false; }
-    isFIFO() { return false; }
-    isSocket() { return false; }
+    // node exposes the Date views as lazy getters on the PROTOTYPE, not as own
+    // properties. As own properties they showed up in Object.keys, JSON and
+    // inspect where node shows none of them, and they cost four Date
+    // allocations on every stat for callers that only read the *Ms numbers.
+    // Cached in PRIVATE fields so the memo stays invisible to
+    // getOwnPropertySymbols and cannot make two stats of one file unequal.
+    #atime;
+    #mtime;
+    #ctime;
+    #birthtime;
+    get atime() { return (this.#atime ??= new Date(this.atimeMs)); }
+    get mtime() { return (this.#mtime ??= new Date(this.mtimeMs)); }
+    get ctime() { return (this.#ctime ??= new Date(this.ctimeMs)); }
+    get birthtime() { return (this.#birthtime ??= new Date(this.birthtimeMs)); }
+    // Derived from the S_IFMT bits of `mode`, as node does. While `mode` was
+    // hardcoded to 0 these had to read an oam-only `kind` string, which could
+    // only ever answer file/dir/symlink -- the other four were hardcoded false,
+    // so a POSIX character device, block device, FIFO or socket all reported
+    // themselves as none of those.
+    _checkModeProperty(bits) { return (this.mode & S_IFMT) === bits; }
+    isDirectory() { return this._checkModeProperty(S_IFDIR); }
+    isFile() { return this._checkModeProperty(S_IFREG); }
+    isBlockDevice() { return this._checkModeProperty(S_IFBLK); }
+    isCharacterDevice() { return this._checkModeProperty(S_IFCHR); }
+    isSymbolicLink() { return this._checkModeProperty(S_IFLNK); }
+    isFIFO() { return this._checkModeProperty(S_IFIFO); }
+    isSocket() { return this._checkModeProperty(S_IFSOCK); }
+  }
+
+  // Class members are non-enumerable; node builds Stats.prototype by
+  // assignment, so ITS members are enumerable -- observable through `for...in`
+  // over a stat object, which must list the same names in the same order.
+  for (const name of [
+    "atime", "mtime", "ctime", "birthtime",
+    "_checkModeProperty", "isDirectory", "isFile", "isBlockDevice",
+    "isCharacterDevice", "isSymbolicLink", "isFIFO", "isSocket",
+  ]) {
+    const descriptor = Object.getOwnPropertyDescriptor(Stats.prototype, name);
+    descriptor.enumerable = true;
+    Object.defineProperty(Stats.prototype, name, descriptor);
   }
 
   function wrapStat(raw) {

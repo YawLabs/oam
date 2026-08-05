@@ -1082,9 +1082,190 @@ pub mod ops {
         }
     }
 
+    /// Where the fields `std::fs::Metadata` does not carry can be read from.
+    ///
+    /// POSIX has all of them on the metadata already. Windows needs a file
+    /// HANDLE -- either one the caller is already holding (fstat) or one opened
+    /// from the path.
+    pub enum StatSource<'a> {
+        Path(&'a str),
+        File(&'a std::fs::File),
+    }
+
+    /// The stat fields node reports that `std::fs::Metadata` does not expose.
+    struct StatExtras {
+        dev: u64,
+        ino: u64,
+        nlink: u64,
+        uid: u64,
+        gid: u64,
+        rdev: u64,
+        blksize: u64,
+        blocks: u64,
+        /// Inode-change time in ms, or None if it could not be read.
+        ctime_ms: Option<f64>,
+    }
+
+    #[cfg(unix)]
+    fn stat_extras(meta: &std::fs::Metadata, _source: StatSource<'_>) -> Option<StatExtras> {
+        use std::os::unix::fs::MetadataExt;
+        Some(StatExtras {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            nlink: meta.nlink(),
+            uid: u64::from(meta.uid()),
+            gid: u64::from(meta.gid()),
+            rdev: meta.rdev(),
+            blksize: meta.blksize(),
+            blocks: meta.blocks(),
+            // st_ctim is the inode-change time and is NOT mtime: chmod moves it
+            // and leaves mtime alone.
+            ctime_ms: Some(meta.ctime() as f64 * 1000.0 + meta.ctime_nsec() as f64 / 1_000_000.0),
+        })
+    }
+
+    /// FILETIME (100ns ticks since 1601-01-01) to milliseconds since the epoch.
+    #[cfg(windows)]
+    fn filetime_to_ms(ticks: i64) -> f64 {
+        const TICKS_PER_MS: f64 = 10_000.0;
+        const EPOCH_DIFFERENCE_MS: f64 = 11_644_473_600_000.0;
+        ticks as f64 / TICKS_PER_MS - EPOCH_DIFFERENCE_MS
+    }
+
+    #[cfg(windows)]
+    fn stat_extras(meta: &std::fs::Metadata, source: StatSource<'_>) -> Option<StatExtras> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_STANDARD_INFO, FileBasicInfo,
+            FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        };
+
+        let opened;
+        let file = match source {
+            StatSource::File(file) => file,
+            // Without OPEN_REPARSE_POINT an lstat on a symlink would open --
+            // and then describe -- the target instead of the link itself.
+            StatSource::Path(path) => {
+                opened = open_for_stat(path, meta.is_symlink()).ok()?;
+                &opened
+            }
+        };
+        let handle = file.as_raw_handle().cast::<std::ffi::c_void>();
+
+        // Rust's Metadata does carry these when it came from a File, but only
+        // behind the unstable `windows_by_handle` feature, and oam builds on
+        // stable -- so the call is made explicitly rather than reaching for a
+        // nightly accessor.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` is owned by a live File for the whole call, and
+        // `info` is a correctly sized, writable BY_HANDLE_FILE_INFORMATION.
+        if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+            return None;
+        }
+
+        let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        // `blocks` counts 512-byte units of ALLOCATED space, which is not
+        // ceil(size / 512): a small file resident in the MFT allocates none,
+        // and node duly reports 0 blocks for it.
+        // SAFETY: as above; the size passed matches the struct written.
+        let blocks = if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        } != 0
+        {
+            (standard.AllocationSize as u64) >> 9
+        } else {
+            0
+        };
+
+        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let ctime_ms = if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        } != 0
+        {
+            Some(filetime_to_ms(basic.ChangeTime))
+        } else {
+            None
+        };
+
+        Some(StatExtras {
+            dev: u64::from(info.dwVolumeSerialNumber),
+            ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            nlink: u64::from(info.nNumberOfLinks),
+            // Windows has no POSIX ownership or device numbers; libuv reports
+            // zeros here and node passes them straight through.
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            blocks,
+            ctime_ms,
+        })
+    }
+
+    /// Opens a handle suitable for stat: attributes only, and able to open a
+    /// DIRECTORY (which needs BACKUP_SEMANTICS) or a symlink itself rather than
+    /// its target (OPEN_REPARSE_POINT).
+    #[cfg(windows)]
+    fn open_for_stat(path: &str, keep_reparse_point: bool) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if keep_reparse_point {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        std::fs::OpenOptions::new()
+            // Attributes only. Asking for read access would fail on a file the
+            // caller is allowed to stat but not to read.
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(flags)
+            .open(path)
+    }
+
+    /// stat/lstat of a path as the JSON payload the JS side consumes.
+    ///
+    /// Blocking; async callers must run it on a blocking thread.
+    pub fn stat_path_json(path: &str, lstat: bool) -> std::io::Result<String> {
+        // On Windows a plain stat reads EVERYTHING off one handle. Calling
+        // std::fs::metadata first and then opening again for dev/ino/blocks
+        // meant two opens per stat -- measured at 2x the cost -- because
+        // std::fs::metadata opens the very same kind of handle internally.
+        //
+        // lstat keeps std's symlink_metadata as the source of truth for the
+        // file kind and reopens for the extras. Symlinks cannot be created on
+        // the machine this was written on, so the single-handle reparse-point
+        // path is unverified, and one syscall is not worth guessing with.
+        #[cfg(windows)]
+        if !lstat {
+            let file = open_for_stat(path, false)?;
+            let meta = file.metadata()?;
+            return Ok(stat_to_json(&meta, StatSource::File(&file)));
+        }
+        let meta = if lstat {
+            std::fs::symlink_metadata(path)?
+        } else {
+            std::fs::metadata(path)?
+        };
+        Ok(stat_to_json(&meta, StatSource::Path(path)))
+    }
+
     /// stat/lstat payload, shared with the sync native in oam_engine for a
     /// single wire shape ({kind, size, mtimeMs, ...}).
-    pub fn stat_to_json(meta: &std::fs::Metadata) -> String {
+    pub fn stat_to_json(meta: &std::fs::Metadata, source: StatSource<'_>) -> String {
         fn ms(time: std::io::Result<std::time::SystemTime>) -> f64 {
             time.ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1126,17 +1307,39 @@ pub mod ops {
             };
             type_bits | permission_bits
         };
-        serde_json::json!({
+        let extras = stat_extras(meta, source);
+        let mut payload = serde_json::json!({
             "kind": kind,
             "size": meta.len(),
             "mtimeMs": ms(meta.modified()),
             "atimeMs": ms(meta.accessed()),
-            // ctime not available on stable Rust; approximating with mtime
-            "ctimeMs": ms(meta.modified()),
+            // Falls back to mtime only when the real change time could not be
+            // read; the two genuinely differ (chmod moves ctime, not mtime).
+            "ctimeMs": extras
+                .as_ref()
+                .and_then(|extras| extras.ctime_ms)
+                .unwrap_or_else(|| ms(meta.modified())),
             "birthtimeMs": ms(meta.created()),
             "mode": mode,
-        })
-        .to_string()
+        });
+        if let Some(extras) = extras {
+            let fields = payload
+                .as_object_mut()
+                .expect("json! macro built an object literal");
+            for (name, value) in [
+                ("dev", extras.dev),
+                ("ino", extras.ino),
+                ("nlink", extras.nlink),
+                ("uid", extras.uid),
+                ("gid", extras.gid),
+                ("rdev", extras.rdev),
+                ("blksize", extras.blksize),
+                ("blocks", extras.blocks),
+            ] {
+                fields.insert(name.to_string(), value.into());
+            }
+        }
+        payload.to_string()
     }
 
     pub fn readdir_to_json(path: &str) -> std::io::Result<String> {
@@ -1234,14 +1437,19 @@ pub mod ops {
     }
 
     pub async fn fs_stat(path: String, lstat: bool) -> OpOutcome {
-        let meta = if lstat {
-            tokio::fs::symlink_metadata(&path).await
-        } else {
-            tokio::fs::metadata(&path).await
-        };
-        match meta {
-            Ok(meta) => OpOutcome::Json(stat_to_json(&meta)),
-            Err(e) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
+        // One hop to a blocking thread for the whole operation. Awaiting
+        // tokio's metadata and THEN opening a handle here would do the second
+        // (blocking) open on a runtime thread.
+        let owned = path.clone();
+        let result = tokio::task::spawn_blocking(move || stat_path_json(&owned, lstat)).await;
+        match result {
+            Ok(Ok(json)) => OpOutcome::Json(json),
+            Ok(Err(e)) => node_fail(e, if lstat { "lstat" } else { "stat" }, &path),
+            Err(e) => node_fail(
+                std::io::Error::other(e.to_string()),
+                if lstat { "lstat" } else { "stat" },
+                &path,
+            ),
         }
     }
 

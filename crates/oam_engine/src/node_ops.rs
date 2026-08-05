@@ -2671,13 +2671,8 @@ fn op_fs_stat_sync(
         return;
     }
     let lstat = args.get(1).is_true();
-    let meta = if lstat {
-        std::fs::symlink_metadata(&path)
-    } else {
-        std::fs::metadata(&path)
-    };
-    match meta {
-        Ok(meta) => return_json(scope, &mut rv, &oam_core::ops::stat_to_json(&meta)),
+    match oam_core::ops::stat_path_json(&path, lstat) {
+        Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_node_error(scope, if lstat { "lstat" } else { "stat" }, &path, &e),
     }
 }
@@ -3536,14 +3531,17 @@ fn op_fs_fstat_sync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    let meta = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(&fd).map(|f| f.metadata())
-    };
-    match meta {
+    // Held across the whole read: fstat has no path to reopen from, so the
+    // extra fields have to come off the descriptor the caller already owns.
+    let guard = files.lock().unwrap_or_else(|e| e.into_inner());
+    let payload = guard.get(&fd).map(|file| {
+        file.metadata()
+            .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(file)))
+    });
+    match payload {
         None => throw_ebadf(scope, "fstat"),
         Some(Err(e)) => throw_node_error(scope, "fstat", "", &e),
-        Some(Ok(meta)) => return_json(scope, &mut rv, &oam_core::ops::stat_to_json(&meta)),
+        Some(Ok(json)) => return_json(scope, &mut rv, &json),
     }
 }
 

@@ -397,7 +397,7 @@ entries below were executed on both runtimes unless marked.
 | `worker_threads.moveMessagePortToContext` | Throws `not supported in oam`. | Supported. |
 | `http.Server.setTimeout(ms, cb)` | Stores the value; the callback never fires and no `'timeout'` is emitted. The native HTTP layer owns connection sockets. | Fires. |
 | `server.closeIdleConnections()` / `closeAllConnections()` | Present, no-ops. | Close connections. |
-| `fs.Stats` fields | `mode` is real (POSIX `st_mode`; on Windows, libuv's synthesized value — verified equal to node's for files, read-only files and directories). Still missing: `dev`, `ino`, `nlink`, `uid`, `gid`, `rdev`, `blksize`, `blocks` — absent rather than zeroed, so a caller cannot mistake a placeholder for an answer. `ctimeMs` aliases `mtimeMs`. `bigint: true` is not supported. | All fields populated. |
+| `fs.Stats` | **Complete.** Every field node reports is populated — `dev`, `ino`, `nlink`, `uid`, `gid`, `rdev`, `blksize`, `blocks`, `mode`, `ctimeMs` — from `st_*` on POSIX and from the file handle on Windows (`uid`/`gid`/`rdev` are 0 there, as they are in node). Verified byte-identical to node on win32 for values, key order, `for...in`, inspect and `JSON.stringify`. The only gap left is `bigint: true`, which is not supported — an `ino` past 2^53 loses precision, exactly as it does in node's non-bigint form. | Same, plus `bigint: true`. |
 | `os.cpus()[n].times` | All zeroes. | Real tick counters. |
 | `os.loadavg()` | Always `[0, 0, 0]` _(source)_. Matches Node on Windows; diverges on Linux/macOS. | Real load average on POSIX. |
 | `node:v8` `serialize`/`deserialize` | JSON under a V8-shaped header — a `Map` does not round-trip as a `Map`. | Real structured serialization. |
