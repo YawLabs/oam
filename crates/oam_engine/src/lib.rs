@@ -30,6 +30,7 @@ pub mod permissions;
 pub mod replay;
 mod timers;
 mod vm_context;
+mod vm_module;
 mod worker;
 pub use crash::install_panic_hook;
 pub use modules::ModuleHost;

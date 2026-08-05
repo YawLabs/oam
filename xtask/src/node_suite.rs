@@ -455,6 +455,7 @@ const SUPPORTED_FLAGS: &[&str] = &[
     // runs on. Tests needing an internal oam does not have reclassify as
     // unrunnable (see missing_builtin), not as failures.
     "--expose-internals",
+    "--experimental-vm-modules",
     // Node's permission model: --permission denies everything, the --allow-*
     // flags grant back.
     "--permission",

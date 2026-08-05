@@ -5100,6 +5100,10 @@
             prefix = inspectPrefix(ctor, tg, "Object");
           }
         }
+        // A module namespace is `[Module: null prototype]`, not
+        // `[Object: null prototype] [Module]`: the tag IS the type here.
+        const namespaceObject = natives.v8Is(v, "moduleNamespaceObject");
+        if (namespaceObject) prefix = inspectPrefix(undefined, "", "Module");
         const keys = getKeys(v, showHidden);
         const protoProps = nullProto ? undefined : protoPropsFor(v, level);
         if (keys.length === 0 && protoProps === undefined) return `${prefix}{}`;
@@ -5108,7 +5112,26 @@
         ictx.currentDepth = level + 1;
         const items = [];
         try {
-          for (const k of keys) items.push(formatProperty(v, k, undefined, level + 1, false, v));
+          for (const k of keys) {
+            if (namespaceObject) {
+              // Reading an export that is still in its temporal dead zone
+              // THROWS -- so does asking for its descriptor. That is a state
+              // to report, not an inspection failure: a linked-but-not-yet-
+              // evaluated module legitimately has uninitialized bindings.
+              try {
+                items.push(formatProperty(v, k, undefined, level + 1, false, v));
+              } catch (err) {
+                if (!(err instanceof ReferenceError)) throw err;
+                // Formatted through a stand-in so the key styling, quoting and
+                // line breaking stay identical to every other entry.
+                const placeholder = formatProperty({ [k]: "" }, k, undefined, level + 1, false, v);
+                const cut = placeholder.lastIndexOf(" ");
+                items.push(placeholder.slice(0, cut + 1) + stylize("<uninitialized>", "special"));
+              }
+              continue;
+            }
+            items.push(formatProperty(v, k, undefined, level + 1, false, v));
+          }
           if (protoProps !== undefined) items.push(...protoProps);
         } finally {
           seen.pop();
@@ -6658,7 +6681,9 @@
         isSetIterator: (v) => natives.v8Is(v, "setIterator"),
         isGeneratorObject: (v) => natives.v8Is(v, "generatorObject"),
         isWeakRef: (v) => v instanceof WeakRef,
-        isModuleNamespaceObject: () => false,
+        // Was hardcoded false, so a real module namespace -- which
+        // vm.SourceTextModule now hands out -- answered no.
+        isModuleNamespaceObject: (v) => natives.v8Is(v, "moduleNamespaceObject"),
         isExternal: () => false,
         isArgumentsObject: (v) => Object.prototype.toString.call(v) === "[object Arguments]",
         isBooleanObject: (v) => v instanceof Boolean,
@@ -17523,6 +17548,124 @@
       }
     }
 
+    // ------------------------------------------------ vm.SourceTextModule
+    // Gated on --experimental-vm-modules, as in node. The flag is read lazily
+    // because this factory runs inside the snapshot, long before argv exists.
+    let vmModulesEnabled;
+    function requireVmModulesFlag() {
+      vmModulesEnabled ??= natives.env().OAM_EXPERIMENTAL_VM_MODULES === "1";
+      if (!vmModulesEnabled) {
+        throw applyNodeErrorShape(
+          new Error(
+            "Experimental vm.SourceTextModule is not enabled. Run with --experimental-vm-modules",
+          ),
+          "ERR_VM_MODULE_NOT_ENABLED",
+        );
+      }
+    }
+
+    // A v8::Module is not a JS value, so it cannot be hung off the wrapper and
+    // left to the GC the way a vm context is. The wrapper's collection is what
+    // releases the native entry; without this every module ever compiled would
+    // be pinned for the life of the isolate.
+    const releaseModule =
+      typeof FinalizationRegistry === "function"
+        ? new FinalizationRegistry((id) => natives.vmModuleRelease(id))
+        : null;
+
+    const kModuleId = Symbol("oam.vmModuleId");
+    let moduleSequence = 0;
+
+    class SourceTextModule {
+      constructor(source, options) {
+        requireVmModulesFlag();
+        if (typeof source !== "string") {
+          throw new codes.ERR_INVALID_ARG_TYPE("code", "string", source);
+        }
+        const opts = options != null && typeof options === "object" ? options : {};
+        this.identifier = opts.identifier ?? `vm:module(${moduleSequence++})`;
+        this.context = opts.context;
+        // Compiles now, so a syntax error throws from the constructor.
+        this[kModuleId] = natives.vmModuleCompile(source, this.identifier);
+        this._linkedOnce = false;
+        if (releaseModule) releaseModule.register(this, this[kModuleId]);
+      }
+      get status() {
+        return natives.vmModuleStatus(this[kModuleId]);
+      }
+      get dependencySpecifiers() {
+        return natives.vmModuleRequests(this[kModuleId]);
+      }
+      get namespace() {
+        if (this.status === "unlinked") {
+          throw applyNodeErrorShape(
+            new Error("Module status must not be unlinked"),
+            "ERR_VM_MODULE_STATUS",
+          );
+        }
+        return natives.vmModuleNamespace(this[kModuleId]);
+      }
+      get error() {
+        if (this.status !== "errored") {
+          throw applyNodeErrorShape(
+            new Error("Module status must be errored"),
+            "ERR_VM_MODULE_STATUS",
+          );
+        }
+        return natives.vmModuleError(this[kModuleId]);
+      }
+      /// Resolves the whole graph in JS BEFORE instantiating: V8's resolve
+      /// callback is synchronous and cannot await, but a linker may return a
+      /// promise. Node splits it the same way.
+      async link(linker) {
+        if (typeof linker !== "function") {
+          throw new codes.ERR_INVALID_ARG_TYPE("linker", "function", linker);
+        }
+        if (this._linkedOnce || this.status !== "unlinked") {
+          throw applyNodeErrorShape(
+            new Error("Module status must be unlinked"),
+            "ERR_VM_MODULE_STATUS",
+          );
+        }
+        this._linkedOnce = true;
+        const specifiers = this.dependencySpecifiers;
+        const resolvedIds = [];
+        for (const specifier of specifiers) {
+          const dependency = await linker(specifier, this, { attributes: {} });
+          if (!(dependency instanceof SourceTextModule)) {
+            throw applyNodeErrorShape(
+              new Error("Linker must return a Module object"),
+              "ERR_VM_MODULE_NOT_MODULE",
+            );
+          }
+          // Depth-first, and only once per module: a cycle would otherwise
+          // recurse forever, and diamond imports would link a shared
+          // dependency twice.
+          if (dependency.status === "unlinked" && !dependency._linkedOnce) {
+            await dependency.link(linker);
+          }
+          resolvedIds.push(dependency[kModuleId]);
+        }
+        natives.vmModuleLink(this[kModuleId], specifiers, resolvedIds);
+        natives.vmModuleInstantiate(this[kModuleId]);
+      }
+      async evaluate(_options) {
+        const status = this.status;
+        if (status !== "linked" && status !== "evaluated" && status !== "errored") {
+          throw applyNodeErrorShape(
+            new Error(`Module status must be one of linked, evaluated, or errored`),
+            "ERR_VM_MODULE_STATUS",
+          );
+        }
+        await natives.vmModuleEvaluate(this[kModuleId]);
+        return undefined;
+      }
+    }
+    Object.defineProperty(SourceTextModule.prototype, Symbol.toStringTag, {
+      value: "SourceTextModule",
+      configurable: true,
+    });
+
     function createContext(sandbox, _options) {
       if (sandbox !== undefined && (sandbox === null || typeof sandbox !== "object")) {
         throw new codes.ERR_INVALID_ARG_TYPE("contextObject", "object", sandbox);
@@ -17568,7 +17711,7 @@
     }
 
     return {
-      Script, createContext, isContext, createScript,
+      Script, createContext, isContext, createScript, SourceTextModule,
       runInThisContext, runInNewContext, runInContext,
       compileFunction, measureMemory,
     };

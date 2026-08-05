@@ -326,6 +326,9 @@ fn main() -> ExitCode {
             } else if arg == "--expose-internals" {
                 flags.expose_internals = true;
                 i += 1;
+            } else if arg == "--experimental-vm-modules" {
+                flags.experimental_vm_modules = true;
+                i += 1;
             } else if arg == "--allow-natives-syntax" {
                 flags.allow_natives_syntax = true;
                 i += 1;
@@ -420,6 +423,12 @@ fn main() -> ExitCode {
         if flags.expose_internals {
             // SAFETY: single-threaded startup, before any runtime exists.
             unsafe { std::env::set_var("OAM_EXPOSE_INTERNALS", "1") };
+        }
+        // Same reason: the `vm` module is built inside the snapshot, long
+        // before argv is parsed, so the gate has to be readable at call time.
+        if flags.experimental_vm_modules {
+            // SAFETY: single-threaded startup, before any runtime exists.
+            unsafe { std::env::set_var("OAM_EXPERIMENTAL_VM_MODULES", "1") };
         }
         // Collect every node flag that is really a V8 flag: they all have to
         // go in ONE call, because V8::initialize runs on the first one and
@@ -2111,6 +2120,7 @@ struct NodeFlags {
     /// `--expose-internals`: make `require('internal/...')` resolve. A
     /// test/debug surface in Node too -- never listed in builtinModules.
     expose_internals: bool,
+    experimental_vm_modules: bool,
 }
 
 impl NodeFlags {
@@ -2225,6 +2235,9 @@ impl NodeFlags {
         }
         if self.expose_gc {
             out.push("--expose-gc".into());
+        }
+        if self.experimental_vm_modules {
+            out.push("--experimental-vm-modules".into());
         }
         if self.permission {
             out.push("--permission".into());

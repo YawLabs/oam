@@ -26,6 +26,11 @@ use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
 };
+use crate::vm_module::{
+    op_vm_module_compile, op_vm_module_error, op_vm_module_evaluate, op_vm_module_instantiate,
+    op_vm_module_link, op_vm_module_namespace, op_vm_module_release, op_vm_module_requests,
+    op_vm_module_status,
+};
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -139,6 +144,15 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // branches on `getuid() === 0`). Absent on Windows, where Node does
         // not define these at all.
         ("vmCompile", op_vm_compile),
+        ("vmModuleCompile", op_vm_module_compile),
+        ("vmModuleRequests", op_vm_module_requests),
+        ("vmModuleLink", op_vm_module_link),
+        ("vmModuleInstantiate", op_vm_module_instantiate),
+        ("vmModuleEvaluate", op_vm_module_evaluate),
+        ("vmModuleNamespace", op_vm_module_namespace),
+        ("vmModuleStatus", op_vm_module_status),
+        ("vmModuleError", op_vm_module_error),
+        ("vmModuleRelease", op_vm_module_release),
         ("vmCreateContext", op_vm_create_context),
         ("vmIsContext", op_vm_is_context),
         ("vmRunInContext", op_vm_run_in_context),
