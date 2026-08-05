@@ -2329,12 +2329,52 @@
     EventEmitter.errorMonitor = errorMonitor;
 
     function once(emitter, type, options) {
+      // Node's once() is an async function, so a bad `options` surfaces as a
+      // REJECTION, never a synchronous throw -- callers write
+      // `await rejects(once(ee, 'x', 1), ...)`. Anything non-object (and
+      // null, and arrays) is rejected rather than silently ignored, which is
+      // what oam did: `once(ee, 'x', {signl: sig})` typo'd its way into a
+      // promise that never settled.
+      if (
+        options !== undefined &&
+        (options === null || typeof options !== "object" || Array.isArray(options))
+      ) {
+        return Promise.reject(
+          new codes.ERR_INVALID_ARG_TYPE("options", "Object", options),
+        );
+      }
       const signal = options ? options.signal : undefined;
+      // Node's validateAbortSignal, and it runs BEFORE the aborted check:
+      // duck-typed on 'aborted' rather than instanceof, so a signal from
+      // another realm still works while `{}` or a stray number does not.
+      if (
+        signal !== undefined &&
+        (signal === null || typeof signal !== "object" || !("aborted" in signal))
+      ) {
+        return Promise.reject(
+          new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal),
+        );
+      }
       if (signal && signal.aborted) {
         return Promise.reject(
           new (globalThis.DOMException ?? Error)(
             "The operation was aborted",
             "AbortError",
+          ),
+        );
+      }
+      // The emitter has to be one or the other. An AbortController, say,
+      // is neither (its SIGNAL is the target), and oam used to return a
+      // promise that simply never settled.
+      if (
+        typeof emitter?.once !== "function" &&
+        typeof emitter?.addEventListener !== "function"
+      ) {
+        return Promise.reject(
+          new codes.ERR_INVALID_ARG_TYPE(
+            "emitter",
+            ["EventEmitter", "EventTarget"],
+            emitter,
           ),
         );
       }
@@ -2346,19 +2386,31 @@
         typeof emitter.once !== "function" &&
         typeof emitter.addEventListener === "function";
       return new Promise((resolve, reject) => {
-        const onEvent = (...args) => {
+        // EVERY settle path has to unhook EVERYTHING -- the event listener,
+        // the error listener, and the signal's 'abort' listener. Leaving the
+        // abort listener attached kept the promise's closure (and the
+        // emitter) reachable from a long-lived AbortSignal for as long as
+        // the signal itself lived: a leak for any caller that reuses one
+        // signal across many once() calls, which is the normal pattern.
+        let onAbort;
+        const cleanup = () => {
           if (isEventTarget) {
-            if (type !== "error" && typeof emitter.removeEventListener === "function") {
+            emitter.removeEventListener(type, onEvent);
+            if (typeof emitter.removeEventListener === "function") {
               emitter.removeEventListener("error", onError);
             }
           } else {
+            emitter.removeListener(type, onEvent);
             emitter.removeListener("error", onError);
           }
+          if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+        };
+        const onEvent = (...args) => {
+          cleanup();
           resolve(args);
         };
         const onError = (err) => {
-          if (isEventTarget) emitter.removeEventListener(type, onEvent);
-          else emitter.removeListener(type, onEvent);
+          cleanup();
           reject(err);
         };
         if (isEventTarget) {
@@ -2368,20 +2420,23 @@
           if (type !== "error") emitter.once("error", onError);
         }
         if (signal) {
-          signal.addEventListener(
-            "abort",
-            () => {
-              if (isEventTarget) emitter.removeEventListener(type, onEvent);
-              else emitter.removeListener(type, onEvent);
-              reject(
-                new (globalThis.DOMException ?? Error)(
-                  "The operation was aborted",
-                  "AbortError",
-                ),
-              );
-            },
-            { once: true },
-          );
+          onAbort = () => {
+            cleanup();
+            reject(
+              new (globalThis.DOMException ?? Error)(
+                "The operation was aborted",
+                "AbortError",
+              ),
+            );
+          };
+          // kResistStopPropagation: an UNRELATED abort listener calling
+          // stopImmediatePropagation must not starve this one -- otherwise
+          // the promise never settles and the caller hangs forever. Node
+          // marks its own internal abort listeners the same way.
+          signal.addEventListener("abort", onAbort, {
+            once: true,
+            [Symbol.for("oam.kResistStopPropagation")]: true,
+          });
         }
       });
     }
@@ -2462,6 +2517,15 @@
 
     function getEventListeners(emitter, name) {
       if (typeof emitter.listeners === "function") return emitter.listeners(name);
+      // EventTarget (AbortSignal and friends) has no .listeners(): read the
+      // internal registry the bootstrap EventTarget keeps. Without this the
+      // function silently returned [] for EVERY EventTarget, so callers
+      // auditing listener counts -- leak checks especially -- were told
+      // "none attached" no matter what was actually registered.
+      const registry = emitter?._listeners;
+      if (registry && typeof registry.get === "function") {
+        return (registry.get(name) ?? []).map((e) => e.fn);
+      }
       return [];
     }
 
