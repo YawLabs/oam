@@ -11892,14 +11892,30 @@ fn vm_create_context_is_context() {
         const ctx = vm.createContext({ a: 1 });
         console.log('isCtx=' + vm.isContext(ctx));
         console.log('plainObj=' + vm.isContext({ b: 2 }));
-        console.log('nullCheck=' + vm.isContext(null));
+        // node validates the argument rather than answering false for a
+        // non-object, and it does NOT tag a context object -- both were oam
+        // inventions before vm ran on real V8 contexts.
+        let nullCode = 'none';
+        try { vm.isContext(null); } catch (e) { nullCode = e.code; }
+        console.log('nullCheck=' + nullCode);
         console.log('tag=' + Object.prototype.toString.call(ctx));
+        // The real test of a real context: the write must not reach the host.
+        vm.runInContext('globalThis.escaped = 1', ctx);
+        console.log('leaked=' + (typeof globalThis.escaped));
+        console.log('landed=' + ctx.escaped);
+        console.log('ownIntrinsics=' + vm.runInNewContext('Object === o', { o: Object }));
     "#,
     );
     assert!(stdout.contains("isCtx=true"), "{stdout}");
     assert!(stdout.contains("plainObj=false"), "{stdout}");
-    assert!(stdout.contains("nullCheck=false"), "{stdout}");
-    assert!(stdout.contains("tag=[object Context]"), "{stdout}");
+    assert!(
+        stdout.contains("nullCheck=ERR_INVALID_ARG_TYPE"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("tag=[object Object]"), "{stdout}");
+    assert!(stdout.contains("leaked=undefined"), "{stdout}");
+    assert!(stdout.contains("landed=1"), "{stdout}");
+    assert!(stdout.contains("ownIntrinsics=false"), "{stdout}");
 }
 
 #[test]

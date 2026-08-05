@@ -904,6 +904,56 @@
     return false;
   }
 
+  // Brand checks for the built-ins whose identity has to survive a realm
+  // boundary. `instanceof` compares against THIS realm's constructor, so a Map
+  // handed back from a `vm` context fails it and gets treated as a plain
+  // object -- wrong for deepEqual, util.types and inspect alike. Calling the
+  // original accessor works instead: it only succeeds on the real internal
+  // slot, so it is both realm-agnostic and un-spoofable by a borrowed
+  // prototype or a faked Symbol.toStringTag.
+  function slotProbe(accessor, ...args) {
+    return (v) => {
+      if (v === null || typeof v !== "object") return false;
+      try {
+        accessor.call(v, ...args);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+  }
+  const isRealDate = slotProbe(Date.prototype.getTime);
+  const isRealRegExp = slotProbe(
+    Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get,
+  );
+  const isRealMap = slotProbe(Object.getOwnPropertyDescriptor(Map.prototype, "size").get);
+  const isRealSet = slotProbe(Object.getOwnPropertyDescriptor(Set.prototype, "size").get);
+  // has() is the only WeakMap/WeakSet method that brand-checks without
+  // mutating; the probe key is discarded either way.
+  const isRealWeakMap = slotProbe(WeakMap.prototype.has, {});
+  const isRealWeakSet = slotProbe(WeakSet.prototype.has, {});
+  const isRealDataView = slotProbe(
+    Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get,
+  );
+  const isSharedArrayBufferValue =
+    typeof SharedArrayBuffer === "function"
+      ? slotProbe(Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get)
+      : () => false;
+  // %TypedArray%.prototype[Symbol.toStringTag] reads the [[TypedArrayName]]
+  // slot, so it names a foreign typed array and answers undefined for anything
+  // that merely looks like one.
+  const TYPED_ARRAY_TAG = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype),
+    Symbol.toStringTag,
+  ).get;
+  function typedArrayName(v) {
+    try {
+      return TYPED_ARRAY_TAG.call(v);
+    } catch {
+      return undefined;
+    }
+  }
+
   // Node's validateInteger: number-typed integer >= min (copyBytesFrom offsets).
   function validateInteger(value, name, min) {
     if (typeof value !== "number") {
@@ -1130,11 +1180,11 @@
 
     static byteLength(value, encoding) {
       if (typeof value !== "string") {
-        if (
-          ArrayBuffer.isView(value) ||
-          value instanceof ArrayBuffer ||
-          (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer)
-        ) {
+        // instanceof is realm-bound, and an ArrayBuffer handed over from a
+        // `vm` context is a genuine cross-realm object. Both checks here are
+        // brand checks instead: ArrayBuffer.isView is a V8-level test, and
+        // isAnyArrayBuffer calls the byteLength getter.
+        if (ArrayBuffer.isView(value) || isAnyArrayBuffer(value)) {
           return value.byteLength;
         }
         throw applyNodeErrorShape(
@@ -4218,13 +4268,10 @@
           return false;
         }
       };
-      const DATE_GETTIME = Date.prototype.getTime;
-      const REGEXP_SOURCE = Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get;
+      // isRealDate / isRealRegExp / isRealMap / isRealSet / isRealDataView are
+      // the module-level probes -- shared so inspect and deepEqual agree on
+      // what a foreign Map is.
       const AB_BYTELENGTH = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
-      const MAP_SIZE = Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
-      const SET_SIZE = Object.getOwnPropertyDescriptor(Set.prototype, "size").get;
-      const isRealDate = (v) => v instanceof Date && hasSlot(DATE_GETTIME, v);
-      const isRealRegExp = (v) => v instanceof RegExp && hasSlot(REGEXP_SOURCE, v);
       // SharedArrayBuffer has its OWN byteLength getter -- ArrayBuffer's throws
       // on it -- so both slots must be probed.
       const SAB_BYTELENGTH =
@@ -4233,10 +4280,6 @@
           : null;
       const isRealArrayBuffer = (v) =>
         hasSlot(AB_BYTELENGTH, v) || (SAB_BYTELENGTH !== null && hasSlot(SAB_BYTELENGTH, v));
-      const isRealMap = (v) => v instanceof Map && hasSlot(MAP_SIZE, v);
-      const isRealSet = (v) => v instanceof Set && hasSlot(SET_SIZE, v);
-      const DV_BYTELENGTH = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
-      const isRealDataView = (v) => hasSlot(DV_BYTELENGTH, v);
       function tagOf(v) {
         // Port of Node's formatRaw tag gate: only surface Symbol.toStringTag
         // when it is a string AND not an own (enumerable) property, otherwise
@@ -5495,17 +5538,17 @@
       ) {
         return false;
       }
-      if (a instanceof Date !== b instanceof Date) return false;
-      if (a instanceof RegExp !== b instanceof RegExp) return false;
+      if (isRealDate(a) !== isRealDate(b)) return false;
+      if (isRealRegExp(a) !== isRealRegExp(b)) return false;
       if (isNativeErrorValue(a) !== isNativeErrorValue(b)) return false;
-      if (a instanceof Map !== b instanceof Map) return false;
-      if (a instanceof Set !== b instanceof Set) return false;
+      if (isRealMap(a) !== isRealMap(b)) return false;
+      if (isRealSet(a) !== isRealSet(b)) return false;
       if (ArrayBuffer.isView(a) !== ArrayBuffer.isView(b)) return false;
       if (anyArrayBuffer(a) !== anyArrayBuffer(b)) return false;
       // WeakMap/WeakSet cannot be compared by content; only reference equality
       // (already handled by the `a === b` check above) -- distinct => not equal.
       if (a instanceof WeakMap || a instanceof WeakSet) return false;
-      if (a instanceof Date) {
+      if (isRealDate(a)) {
         // Read the internal [[DateValue]] via the original getTime so an
         // overridden own `getTime` cannot fool the comparison; a non-Date
         // receiver (a fake clone with Date.prototype) throws => not equal.
@@ -5522,7 +5565,7 @@
         }
         if (!Object.is(ta, tb)) return false;
         // fall through to own-key comparison (extra props still count)
-      } else if (a instanceof RegExp) {
+      } else if (isRealRegExp(a)) {
         try {
           if (
             a.source !== b.source ||
@@ -5605,7 +5648,7 @@
         // symbol keys are all checked like Node. Index values are compared by
         // the bottom key loop.
       }
-      if (a instanceof Map) {
+      if (isRealMap(a)) {
         if (a.size !== b.size) return false;
         const entries = [...b];
         const used = new Array(entries.length).fill(false);
@@ -5624,7 +5667,7 @@
         }
         // fall through: own enumerable props on the Map object are compared too
       }
-      if (a instanceof Set) {
+      if (isRealSet(a)) {
         if (a.size !== b.size) return false;
         const items = [...b];
         const used = new Array(items.length).fill(false);
@@ -5708,10 +5751,10 @@
       // ...and, because Symbol.toStringTag / the prototype can both be spoofed,
       // the same un-spoofable internal-type battery deepEqualImpl uses.
       if (Array.isArray(actual) !== Array.isArray(expected)) return false;
-      if (actual instanceof Date !== expected instanceof Date) return false;
-      if (actual instanceof RegExp !== expected instanceof RegExp) return false;
-      if (actual instanceof Map !== expected instanceof Map) return false;
-      if (actual instanceof Set !== expected instanceof Set) return false;
+      if (isRealDate(actual) !== isRealDate(expected)) return false;
+      if (isRealRegExp(actual) !== isRealRegExp(expected)) return false;
+      if (isRealMap(actual) !== isRealMap(expected)) return false;
+      if (isRealSet(actual) !== isRealSet(expected)) return false;
       if (ArrayBuffer.isView(actual) !== ArrayBuffer.isView(expected)) return false;
       if (anyArrayBuffer(actual) !== anyArrayBuffer(expected)) return false;
       if (ArrayBuffer.isView(actual) && taKind(actual) !== taKind(expected)) return false;
@@ -5759,19 +5802,19 @@
         return partialKeyEquiv(actual, expected, memo, false);
       }
 
-      if (expected instanceof Set) {
-        if (!(actual instanceof Set) || actual.size < expected.size) return false;
+      if (isRealSet(expected)) {
+        if (!isRealSet(actual) || actual.size < expected.size) return false;
         if (!partialSetEquiv(actual, expected, memo)) return false;
         return partialKeyEquiv(actual, expected, memo, false);
       }
 
-      if (expected instanceof Map) {
-        if (!(actual instanceof Map) || actual.size < expected.size) return false;
+      if (isRealMap(expected)) {
+        if (!isRealMap(actual) || actual.size < expected.size) return false;
         if (!partialMapEquiv(actual, expected, memo)) return false;
         return partialKeyEquiv(actual, expected, memo, false);
       }
 
-      if (expected instanceof Date) {
+      if (isRealDate(expected)) {
         // Read [[DateValue]] through the original getTime so an own override
         // cannot fool the check; a fake clone carrying Date.prototype throws.
         let ta, tb;
@@ -5785,12 +5828,12 @@
         return partialKeyEquiv(actual, expected, memo, false);
       }
 
-      if (expected instanceof RegExp) {
+      if (isRealRegExp(expected)) {
         // `source`/`flags` are prototype accessors: a fake clone wearing
         // RegExp.prototype throws instead of comparing, so treat that as
         // "not equal" rather than letting the TypeError escape.
         try {
-          if (!(actual instanceof RegExp) || actual.source !== expected.source || actual.flags !== expected.flags) {
+          if (!isRealRegExp(actual) || actual.source !== expected.source || actual.flags !== expected.flags) {
             return false;
           }
         } catch {
@@ -6507,23 +6550,22 @@
       isUndefined: (v) => v === undefined,
       isSymbol: (v) => typeof v === "symbol",
       types: {
-        isDate: (v) => v instanceof Date,
-        isRegExp: (v) => v instanceof RegExp,
+        // These are V8-level checks in node and are documented to work across
+        // realms, so they probe internal slots rather than compare prototypes.
+        isDate: (v) => isRealDate(v),
+        isRegExp: (v) => isRealRegExp(v),
         isNativeError: (v) => isNativeErrorValue(v),
         isPromise: (v) => v instanceof Promise,
-        isMap: (v) => v instanceof Map,
-        isSet: (v) => v instanceof Set,
-        isWeakMap: (v) => v instanceof WeakMap,
-        isWeakSet: (v) => v instanceof WeakSet,
-        isArrayBuffer: (v) => v instanceof ArrayBuffer,
-        isSharedArrayBuffer: (v) =>
-          typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer,
-        isAnyArrayBuffer: (v) =>
-          v instanceof ArrayBuffer ||
-          (typeof SharedArrayBuffer !== "undefined" && v instanceof SharedArrayBuffer),
-        isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
-        isUint8Array: (v) => v instanceof Uint8Array,
-        isDataView: (v) => v instanceof DataView,
+        isMap: (v) => isRealMap(v),
+        isSet: (v) => isRealSet(v),
+        isWeakMap: (v) => isRealWeakMap(v),
+        isWeakSet: (v) => isRealWeakSet(v),
+        isArrayBuffer: (v) => isAnyArrayBuffer(v) && !isSharedArrayBufferValue(v),
+        isSharedArrayBuffer: (v) => isSharedArrayBufferValue(v),
+        isAnyArrayBuffer: (v) => isAnyArrayBuffer(v),
+        isTypedArray: (v) => typedArrayName(v) !== undefined,
+        isUint8Array: (v) => typedArrayName(v) === "Uint8Array",
+        isDataView: (v) => isRealDataView(v),
         isAsyncFunction: (v) =>
           typeof v === "function" && v.constructor?.name === "AsyncFunction",
         isGeneratorFunction: (v) =>
@@ -17290,8 +17332,13 @@
   // NOTE: this uses the with(this){...} pattern for sandboxing, which is
   // NOT true V8 context isolation -- it shares the same global heap.
   // Sufficient for template engines, config eval, and most bundler use.
-  registry.factories.vm = () => {
-    const _vmContexts = new WeakSet();
+  registry.factories.vm = (natives) => {
+    // Every entry point here runs on a real v8::Context (see
+    // crates/oam_engine/src/vm_context.rs). The script therefore gets its own
+    // intrinsics and its own global, which is what separates `vm` from the
+    // `with (sandbox) { ... }` closure this module used to be: patching
+    // `Array.prototype` inside a context no longer reaches the host, and a
+    // write to `globalThis` no longer lands on the runtime's real global.
 
     class Script {
       constructor(code, options) {
@@ -17304,83 +17351,71 @@
         }
         this._lineOffset = Number(opts.lineOffset) || 0;
         this._columnOffset = Number(opts.columnOffset) || 0;
-        this._fn = null;
-      }
-      _compile() {
-        if (this._fn) return this._fn;
-        const code = this._code;
-        // sourceURL stamps the script's filename into V8 stack frames --
-        // the closest pure-JS equivalent of a real ScriptOrigin. Node code
-        // keys behavior off vm frame filenames (e.g. the Buffer DEP0005
-        // node_modules suppression walks the stack).
-        //
-        // The filename is spliced into compiled source, so it MUST NOT be
-        // able to terminate the comment or inject code: strip every
-        // ECMAScript LineTerminator (LF, CR, U+2028, U+2029). V8 also
-        // rejects a magic comment whose value contains whitespace, which
-        // would silently void the stamp -- percent-encode those instead
-        // (frame text stays readable and the node_modules check still
-        // matches).
-        const tag = `\n//# sourceURL=${String(this._filename)
-          .replace(/[\n\r\u2028\u2029]/g, "")
-          .replace(/\s/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0"))}`;
-        // Try expression form first so that 'x + 1' works without explicit
-        // return.  Fall back to statement form on SyntaxError.
-        try {
-          // eslint-disable-next-line no-new-func
-          this._fn = new Function(`with(this){return(${code})}${tag}`);
-        } catch (_e) {
-          // eslint-disable-next-line no-new-func
-          this._fn = new Function(`with(this){${code}}${tag}`);
-        }
-        return this._fn;
+        // Node surfaces a syntax error from the constructor, not from the first
+        // run, so compile here and let it throw. V8's compilation cache makes
+        // the recompile at run time cheap.
+        natives.vmCompile(this._code, this._filename, this._lineOffset, this._columnOffset);
       }
       runInThisContext(_options) {
-        return this._compile().call(globalThis);
+        return natives.vmRunInThisContext(
+          this._code,
+          this._filename,
+          this._lineOffset,
+          this._columnOffset,
+        );
       }
-      runInContext(ctx, _options) {
-        return this._compile().call(ctx != null ? ctx : globalThis);
+      runInContext(contextifiedObject, _options) {
+        if (!isContext(contextifiedObject)) {
+          throw new codes.ERR_INVALID_ARG_TYPE(
+            "contextifiedObject",
+            "vm.Context",
+            contextifiedObject,
+          );
+        }
+        return natives.vmRunInContext(
+          contextifiedObject,
+          this._code,
+          this._filename,
+          this._lineOffset,
+          this._columnOffset,
+        );
       }
-      runInNewContext(sandbox, _options) {
-        const ctx = createContext(sandbox || {});
-        return this._compile().call(ctx);
+      runInNewContext(sandbox, options) {
+        return this.runInContext(createContext(sandbox), options);
       }
-      createCachedData() { return new Uint8Array(0); }
+      createCachedData() {
+        return new Uint8Array(0);
+      }
     }
 
     function createContext(sandbox, _options) {
       if (sandbox !== undefined && (sandbox === null || typeof sandbox !== "object")) {
-        throw new TypeError("The 'sandbox' argument must be of type object. Received " + typeof sandbox);
+        throw new codes.ERR_INVALID_ARG_TYPE("contextObject", "object", sandbox);
       }
-      const obj = sandbox != null ? sandbox : Object.create(null);
-      if (!_vmContexts.has(obj)) {
-        _vmContexts.add(obj);
-        // Tag the context unless the caller already set Symbol.toStringTag.
-        const desc = Object.getOwnPropertyDescriptor(obj, Symbol.toStringTag);
-        if (!desc) {
-          Object.defineProperty(obj, Symbol.toStringTag, {
-            value: "Context",
-            writable: false,
-            enumerable: false,
-            configurable: true,
-          });
-        }
-      }
+      const obj = sandbox != null ? sandbox : {};
+      // Idempotent on the native side: a second call hands back the context the
+      // sandbox already carries.
+      natives.vmCreateContext(obj);
       return obj;
     }
 
     function isContext(value) {
-      return value !== null && typeof value === "object" && _vmContexts.has(value);
+      // Node rejects a non-object outright rather than answering false, and a
+      // function counts as a non-object here.
+      if (value === null || typeof value !== "object") {
+        throw new codes.ERR_INVALID_ARG_TYPE("object", "Object", value);
+      }
+      return natives.vmIsContext(value);
     }
 
-    function runInThisContext(code, _options) {
-      return new Script(code, _options).runInThisContext();
+    function runInThisContext(code, options) {
+      return new Script(code, options).runInThisContext(options);
     }
-    function runInNewContext(code, sandbox, _options) {
-      return new Script(code, _options).runInNewContext(sandbox);
+    function runInNewContext(code, sandbox, options) {
+      return new Script(code, options).runInNewContext(sandbox, options);
     }
-    function runInContext(code, ctx, _options) {
-      return new Script(code, _options).runInContext(ctx);
+    function runInContext(code, contextifiedObject, options) {
+      return new Script(code, options).runInContext(contextifiedObject, options);
     }
     function compileFunction(code, params, options) {
       const p = params || [];

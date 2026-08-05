@@ -22,6 +22,10 @@ use crate::crypto_ops::{
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
 use crate::timers::{timer_ref, timer_unref};
+use crate::vm_context::{
+    op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
+    op_vm_run_in_this_context,
+};
 use oam_core::{node_error_code, node_error_message};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -134,6 +138,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // the process is root, which is both false and load-bearing (code
         // branches on `getuid() === 0`). Absent on Windows, where Node does
         // not define these at all.
+        ("vmCompile", op_vm_compile),
+        ("vmCreateContext", op_vm_create_context),
+        ("vmIsContext", op_vm_is_context),
+        ("vmRunInContext", op_vm_run_in_context),
+        ("vmRunInThisContext", op_vm_run_in_this_context),
         ("posixGetId", op_posix_get_id),
         ("posixSetId", op_posix_set_id),
         ("posixGetGroups", op_posix_get_groups),

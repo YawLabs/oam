@@ -158,6 +158,10 @@ fn lock_package_versions(lock: &str, package: &str) -> Vec<String> {
     versions
 }
 
+/// Index of the runtime context inside the snapshot blob. Mirrored by
+/// `oam_engine::RUNTIME_CONTEXT_INDEX`; the two must not drift.
+const RUNTIME_CONTEXT_INDEX: usize = 0;
+
 fn main() {
     println!("cargo:rustc-env=OAM_DEP_VERSIONS={}", dep_versions_json());
 
@@ -489,6 +493,16 @@ fn main() {
     let mut isolate = v8::Isolate::snapshot_creator(None, None);
     {
         v8::scope!(let scope, &mut isolate);
+        // The DEFAULT context is deliberately left pristine, holding nothing
+        // but V8's own intrinsics. Every `Context::New` in a snapshotted
+        // isolate deserializes the default context, so anything installed here
+        // would surface inside every `vm.createContext` sandbox -- and node's
+        // vm contexts carry intrinsics and nothing else. The runtime's own
+        // context, with bootstrap.js already evaluated, rides along as an
+        // extra context and is deserialized by index at startup.
+        let pristine = v8::Context::new(scope, v8::ContextOptions::default());
+        scope.set_default_context(pristine);
+
         let context = v8::Context::new(scope, v8::ContextOptions::default());
         {
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -502,7 +516,11 @@ fn main() {
                     .unwrap_or_else(|| panic!("{path}: failed to evaluate"));
             }
         }
-        scope.set_default_context(context);
+        let index = scope.add_context(context);
+        assert_eq!(
+            index, RUNTIME_CONTEXT_INDEX,
+            "runtime context must land at the index the loader deserializes"
+        );
     }
     let blob = isolate
         .create_blob(v8::FunctionCodeHandling::Keep)

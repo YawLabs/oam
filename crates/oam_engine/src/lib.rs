@@ -29,6 +29,7 @@ mod ops;
 pub mod permissions;
 pub mod replay;
 mod timers;
+mod vm_context;
 mod worker;
 pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
@@ -38,6 +39,10 @@ pub use replay::ReplayMode;
 static V8_INIT: Once = Once::new();
 
 /// Build-time startup snapshot: js/bootstrap.js pre-parsed, pre-evaluated,
+/// Index of the runtime context inside the startup snapshot. Must match
+/// `RUNTIME_CONTEXT_INDEX` in build.rs.
+pub(crate) const RUNTIME_CONTEXT_INDEX: usize = 0;
+
 /// compiled code retained. Every Context::new materializes a fresh context
 /// from this template; natives are installed after restore (the blob holds
 /// pure JS only — see build.rs).
@@ -258,9 +263,14 @@ impl JsRuntime {
         )));
         let context = {
             v8::scope!(let scope, &mut isolate);
-            // Deserializes the snapshot's default context: bootstrap.js is
-            // already evaluated in here — no JS parsing at startup.
-            let context = v8::Context::new(scope, v8::ContextOptions::default());
+            // Deserializes the snapshot's runtime context: bootstrap.js is
+            // already evaluated in here — no JS parsing at startup. The
+            // snapshot's DEFAULT context is a pristine one reserved for
+            // `node:vm`, so this has to name its index rather than take the
+            // default (see build.rs).
+            let context =
+                v8::Context::from_snapshot(scope, RUNTIME_CONTEXT_INDEX, Default::default())
+                    .expect("snapshot carries the runtime context");
             let global = v8::Global::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
             // install_console is intentionally omitted: the M0 console it

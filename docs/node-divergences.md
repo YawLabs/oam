@@ -382,7 +382,9 @@ entries below were executed on both runtimes unless marked.
 | `async_hooks.executionAsyncId` / `triggerAsyncId` | Always `0` — there is no async-id plumbing. | Real ids. |
 | `async_hooks.asyncWrapProviders` | Absent. | Present. |
 | `AsyncLocalStorage` | **Fully supported** (rides V8's continuation-preserved embedder data). This is what real code uses; `createHook` is the legacy diagnostics API. | Same. |
-| `vm.createContext` / `runInNewContext` | **Not a real V8 context.** A `with`-scoped sandbox on the same global heap: `runInContext('globalThis.X = 42')` is visible on the host's `globalThis`. | True context isolation. |
+| `vm.Script` compilation | **Recompiled per run.** The constructor compiles once so a syntax error throws from `new vm.Script(...)` as it does in Node, then each run compiles again in its target context (V8's compilation cache absorbs most of it). Node keeps an `UnboundScript` and rebinds it. Observable only as CPU on a hot re-run loop. | Compiled once, rebound per context. |
+| `vm.compileFunction` | `parsingContext` is ignored — the function is compiled in the calling context. | Compiles in the given context. |
+| `vm` timeouts | `timeout` and `breakOnSigint` are accepted and ignored; a runaway script runs to completion. | Terminates the execution. |
 | `util.inspect(promise)` | `Promise {}` for every promise. | `Promise { <pending> }` / `Promise { 1 }` / `Promise { <rejected> Error... }`. |
 | `crypto.createHash` | `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512`. Anything else throws with the supported list in the message. | Also `sha3-*`, `blake2*`, `shake*`, `ripemd160`, ... |
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`. EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `x25519`, `ed448`, `x448`; all named curves. |
