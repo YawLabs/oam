@@ -14186,15 +14186,23 @@
         return Promise.reject(makeAbortError(signal.reason));
       }
       return new Promise((resolve, reject) => {
-        const id = globalThis.setTimeout(() => resolve(value), delay ?? 1);
-        signal?.addEventListener?.(
-          "abort",
-          () => {
+        // The abort listener has to come OFF when the timer fires normally.
+        // Leaving it attached meant a long-lived AbortSignal reused across
+        // many waits accumulated one listener per call, each retaining this
+        // promise's closure -- a leak that grows with the loop around it.
+        let onAbort;
+        const done = (fn, arg) => {
+          if (onAbort) signal?.removeEventListener?.("abort", onAbort);
+          fn(arg);
+        };
+        const id = globalThis.setTimeout(() => done(resolve, value), delay ?? 1);
+        if (signal?.addEventListener) {
+          onAbort = () => {
             globalThis.clearTimeout(id);
-            reject(makeAbortError(signal.reason));
-          },
-          { once: true },
-        );
+            done(reject, makeAbortError(signal.reason));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
       });
     }
     function promisedImmediate(value) {
@@ -14264,6 +14272,12 @@
     }
     const scheduler = Object.create(Scheduler.prototype);
 
+    // Node's timers/promises functions carry the PUBLIC names, and that is
+    // observable: promisify(setImmediate).name must read 'setImmediate',
+    // not whatever the internal function happened to be called.
+    Object.defineProperty(promisedTimeout, "name", { value: "setTimeout" });
+    Object.defineProperty(promisedImmediate, "name", { value: "setImmediate" });
+    Object.defineProperty(intervalIterator, "name", { value: "setInterval" });
     return {
       setTimeout: promisedTimeout,
       setImmediate: promisedImmediate,
@@ -16272,12 +16286,36 @@
       };
     }
 
+    // Node tags the callback-style timers with promisify.custom so
+    // `promisify(setTimeout)` yields the timers/promises version -- which
+    // resolves the VALUE and accepts an AbortSignal -- instead of a generic
+    // wrapper that would treat the timer id as an error argument.
+    const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+    const tagPromises = (fn, name) => {
+      Object.defineProperty(fn, promisifyCustom, {
+        get() {
+          return registry.get("timers/promises")[name];
+        },
+        enumerable: false,
+        configurable: true,
+      });
+      return fn;
+    };
     return {
-      setTimeout: (fn, ms, ...args) => _setTimeout(fn, ms, ...args),
+      setTimeout: tagPromises(
+        (fn, ms, ...args) => _setTimeout(fn, ms, ...args),
+        "setTimeout",
+      ),
       clearTimeout: (id) => _clearTimeout(id),
-      setInterval: (fn, ms, ...args) => _setInterval(fn, ms, ...args),
+      setInterval: tagPromises(
+        (fn, ms, ...args) => _setInterval(fn, ms, ...args),
+        "setInterval",
+      ),
       clearInterval: (id) => _clearInterval(id),
-      setImmediate: (fn, ...args) => _setImmediate(fn, ...args),
+      setImmediate: tagPromises(
+        (fn, ...args) => _setImmediate(fn, ...args),
+        "setImmediate",
+      ),
       clearImmediate: (id) => _clearImmediate(id),
       enroll: deprecatedOnce(enroll, "timers.enroll() is deprecated. Please use setTimeout instead.", "DEP0095"),
       unenroll: deprecatedOnce(unenroll, "timers.unenroll() is deprecated. Please use clearTimeout instead.", "DEP0096"),

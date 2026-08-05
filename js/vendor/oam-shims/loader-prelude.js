@@ -123,9 +123,99 @@
     // does not exist here); kResistStopPropagation is the SHARED registered
     // symbol the bootstrap EventTarget honors, so vendored stream operators'
     // resist-flagged abort listeners survive stopImmediatePropagation().
+    //
+    // The rest is reachable only under --expose-internals, and every entry
+    // is oam's REAL machinery under Node's internal name: Event/EventTarget/
+    // CustomEvent are the very globals user code sees.
+    const kEvents = Symbol("kEvents");
+    // oam stores listeners as Map<type, Array<{fn, once, resist}>>; Node's
+    // kEvents is Map<type, {size}> and consumers read
+    // `target[kEvents].get(type).size` to check for listener LEAKS. This
+    // read-only view answers that off the live arrays -- one source of
+    // truth, and the dispatch path keeps its array.
+    const ET = globalThis.EventTarget;
+    if (ET && !Object.getOwnPropertyDescriptor(ET.prototype, kEvents)) {
+      Object.defineProperty(ET.prototype, kEvents, {
+        get() {
+          const view = new Map();
+          const live = this._listeners;
+          if (live && typeof live.forEach === "function") {
+            live.forEach((entries, type) => {
+              view.set(type, new Set(entries.map((e) => e.fn)));
+            });
+          }
+          return view;
+        },
+        enumerable: false,
+        configurable: true,
+      });
+    }
+
+    // Node's NodeEventTarget: an EventTarget that also answers to the
+    // EventEmitter vocabulary. Both halves share ONE listener set.
+    class NodeEventTarget extends ET {
+      static defaultMaxListeners = 10;
+      constructor() {
+        super();
+        this._maxListeners = NodeEventTarget.defaultMaxListeners;
+      }
+      setMaxListeners(n) {
+        this._maxListeners = n;
+        return this;
+      }
+      getMaxListeners() {
+        return this._maxListeners;
+      }
+      eventNames() {
+        const out = [];
+        this._listeners?.forEach((entries, type) => {
+          if (entries.length > 0) out.push(type);
+        });
+        return out;
+      }
+      listenerCount(type) {
+        return (this._listeners?.get(type) ?? []).length;
+      }
+      addListener(type, listener) {
+        this.addEventListener(type, listener, {});
+        return this;
+      }
+      on(type, listener) {
+        return this.addListener(type, listener);
+      }
+      once(type, listener) {
+        this.addEventListener(type, listener, { once: true });
+        return this;
+      }
+      removeListener(type, listener) {
+        this.removeEventListener(type, listener);
+        return this;
+      }
+      off(type, listener) {
+        return this.removeListener(type, listener);
+      }
+      removeAllListeners(type) {
+        if (type === undefined) this._listeners?.clear();
+        else this._listeners?.delete(type);
+        return this;
+      }
+      emit(type, arg) {
+        const had = this.listenerCount(type) > 0;
+        const event = new globalThis.Event(type);
+        event.detail = arg;
+        this.dispatchEvent(event);
+        return had;
+      }
+    }
+
     module.exports = {
       kWeakHandler: Symbol("kWeak"),
       kResistStopPropagation: Symbol.for("oam.kResistStopPropagation"),
+      kEvents,
+      NodeEventTarget,
+      Event: globalThis.Event,
+      EventTarget: ET,
+      CustomEvent: globalThis.CustomEvent,
     };
   });
 
