@@ -5225,6 +5225,9 @@
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
     }
 
+    // Codes that have already warned, shared across every deprecate() call:
+    // Node warns once per CODE, not once per wrapper.
+    const deprecationCodesWarned = new Set();
     function deprecate(fn, msg, code) {
       if (code !== undefined && typeof code !== "string") {
         throw new codes.ERR_INVALID_ARG_TYPE("code", "string", code);
@@ -5233,9 +5236,38 @@
       function deprecated(...args) {
         if (!warned) {
           warned = true;
-          if (globalThis.console) globalThis.console.warn(`DeprecationWarning: ${msg}`);
+          // process.emitWarning, NOT console.warn: this is what makes
+          // --no-deprecation suppress it, --throw-deprecation turn it
+          // fatal, and process.on('warning') see it. Writing straight to
+          // the console bypassed all three.
+          if (code !== undefined) {
+            if (!deprecationCodesWarned.has(code)) {
+              deprecationCodesWarned.add(code);
+              process.emitWarning(msg, "DeprecationWarning", code, deprecated);
+            }
+          } else {
+            process.emitWarning(msg, "DeprecationWarning", deprecated);
+          }
         }
-        return fn.apply(this, args);
+        // A deprecated CONSTRUCTOR must still construct: applying it would
+        // lose new.target and return the wrong thing entirely.
+        if (new.target) return Reflect.construct(fn, args, new.target);
+        return Reflect.apply(fn, this, args);
+      }
+      // Node copies the wrapped function's arity onto the wrapper; the rest
+      // parameter above otherwise reports length 0, and callers do inspect
+      // fn.length to decide how to call things.
+      Object.defineProperty(deprecated, "length", {
+        value: fn.length,
+        configurable: true,
+      });
+      Object.setPrototypeOf(deprecated, fn);
+      if (fn.prototype) {
+        // ASSIGNED, not defineProperty'd: a function declaration's
+        // `prototype` is non-configurable, so redefining it throws. Sharing
+        // it is what makes an instance from the wrapper still read as an
+        // instanceof the wrapped constructor.
+        deprecated.prototype = fn.prototype;
       }
       return deprecated;
     }
@@ -14262,42 +14294,59 @@
         }
       });
     }
-    async function* intervalIterator(delay, value, options) {
+    async function* intervalIterator(delay, value, options = {}) {
+      const invalid = validateTimerArgs(delay, options);
+      if (invalid) throw invalid;
       const signal = options?.signal;
       if (signal?.aborted) {
-        const e = new Error("AbortError");
-        e.name = "AbortError";
-        throw e;
+        // makeAbortError carries the signal's REASON through as `cause`;
+        // the bare Error here dropped it, so a caller that aborted with a
+        // specific reason could not tell why it was aborted.
+        throw makeAbortError(signal.reason);
       }
       // Own the timer id so we can clearTimeout on abort -- promisedTimeout
       // does not expose its handle, and a fire-and-forget timer per tick
       // would retain a slot until natural expiry on every aborted interval.
       let timerId = null;
       let abortListener = null;
+      // ONE abort listener for the whole iterator, not one per tick. The
+      // per-tick add/remove churned the signal's listener list on every
+      // iteration and left NOTHING attached between ticks, so a caller
+      // inspecting the signal mid-iteration saw no listener at all -- and
+      // an abort landing between ticks had nothing to fire.
+      let notifyAbort = null;
+      // The FLAG matters as much as the callback: an abort can land while
+      // the consumer is working on a yielded value, when nothing is
+      // awaiting. Recording it means the next loop pass still sees it
+      // instead of the abort being dropped and the interval running on.
+      let sawAbort = false;
+      if (signal?.addEventListener) {
+        abortListener = () => {
+          sawAbort = true;
+          if (notifyAbort) notifyAbort();
+        };
+        signal.addEventListener("abort", abortListener, { once: true });
+      }
       try {
         for (;;) {
+          if (sawAbort) throw makeAbortError(signal.reason);
           const aborted = await new Promise((resolve) => {
             timerId = globalThis.setTimeout(() => {
               timerId = null;
               resolve(false);
             }, delay);
-            if (signal) {
-              abortListener = () => resolve(true);
-              signal.addEventListener("abort", abortListener, { once: true });
-            }
+            notifyAbort = () => resolve(true);
+            // Aborted between the flag check above and the listener being
+            // wired here: settle immediately rather than wait out a tick.
+            if (sawAbort) resolve(true);
           });
-          if (signal && abortListener) {
-            signal.removeEventListener("abort", abortListener);
-            abortListener = null;
-          }
+          notifyAbort = null;
           if (aborted) {
             if (timerId !== null) {
               globalThis.clearTimeout(timerId);
               timerId = null;
             }
-            const e = new Error("AbortError");
-            e.name = "AbortError";
-            throw e;
+            throw makeAbortError(signal.reason);
           }
           yield value;
         }
@@ -14305,8 +14354,10 @@
         if (timerId !== null) {
           globalThis.clearTimeout(timerId);
         }
-        if (signal && abortListener) {
-          signal.removeEventListener("abort", abortListener);
+        // Optional call: validation accepts any duck-typed signal (anything
+        // carrying `aborted`), which need not have the removal half.
+        if (abortListener) {
+          signal?.removeEventListener?.("abort", abortListener);
         }
       }
     }
