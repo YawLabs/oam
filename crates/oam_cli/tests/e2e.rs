@@ -1821,6 +1821,7 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
     let stdout = run_ok(
         "http_harden.mjs",
         "import http from 'node:http';\n\
+         import net from 'node:net';\n\
          // Graceful close: a request in flight when close() fires still\n\
          // completes (Node semantics), not connection-reset.\n\
          let slowArrived;\n\
@@ -1854,24 +1855,47 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          // budget itself was charged on neither. Shedding is asserted for\n\
          // real in http_body_budget_sheds_when_the_ceiling_is_reached, which\n\
          // sets a ceiling low enough to actually reach.\n\
+         // The clients are raw sockets that write in 64KB chunks and wait for\n\
+         // 'drain', so the FLOOD costs the client ~120*64KB. fetch() with an\n\
+         // 8MB body buffers all 8MB per request, and since client and server\n\
+         // share this process that put ~960MB of CLIENT buffers into the RSS\n\
+         // being measured -- the reading was of the test, not the server.\n\
          const server2 = http.createServer((req, res) => setTimeout(() => res.end('ok'), 400));\n\
          await new Promise((r) => server2.listen(0, r));\n\
-         const base2 = `http://127.0.0.1:${server2.address().port}`;\n\
-         const big = 'x'.repeat(8 * 1024 * 1024);\n\
-         let ok = 0, busy = 0, shed = 0;\n\
-         await Promise.all(Array.from({ length: 120 }, () =>\n\
-           fetch(`${base2}/up`, { method: 'POST', body: big })\n\
-             .then((r) => { if (r.status === 200) ok++; else if (r.status === 503) busy++; else shed++; })\n\
-             .catch(() => shed++),\n\
-         ));\n\
-         // Every request accounted for, and the process survived the flood.\n\
-         console.log(ok + busy + shed === 120, process.memoryUsage().rss < 900 * 1024 * 1024);\n\
+         const port2 = server2.address().port;\n\
+         const chunk = 'x'.repeat(64 * 1024);\n\
+         const PROMISED = 8 * 1024 * 1024;\n\
+         const deadline = Date.now() + 3000;\n\
+         const floods = Array.from({ length: 120 }, () => new Promise((resolve) => {\n\
+           const s = net.connect(port2, '127.0.0.1');\n\
+           s.on('error', () => resolve());\n\
+           s.on('close', () => resolve());\n\
+           s.on('data', () => {});\n\
+           s.on('connect', () => {\n\
+             s.write(`POST /up HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: ${PROMISED}\\r\\n\\r\\n`);\n\
+             let sent = 0;\n\
+             const pump = () => {\n\
+               while (sent < PROMISED && Date.now() < deadline) {\n\
+                 sent += chunk.length;\n\
+                 if (!s.write(chunk)) { s.once('drain', pump); return; }\n\
+               }\n\
+               s.end(); // stalled by backpressure or done -- either is the point\n\
+             };\n\
+             pump();\n\
+           });\n\
+         }));\n\
+         await Promise.all(floods);\n\
+         // 120 clients each promised 8MB the server never reads. Backpressure\n\
+         // must keep that off our heap: measure AFTER a gc-eligible tick.\n\
+         await new Promise((r) => setTimeout(r, 100));\n\
+         const rss = process.memoryUsage().rss;\n\
+         console.log(floods.length === 120, rss < 500 * 1024 * 1024, `rss=${Math.round(rss / 1048576)}MB`);\n\
          server2.close();",
     );
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], "slow-done");
-    assert_eq!(
-        lines[1], "true true",
+    assert!(
+        lines[1].starts_with("true true "),
         "a 960MB unread-upload flood must be bounded by backpressure, not buffered: {stdout}"
     );
 }
@@ -14994,5 +15018,62 @@ fn client_disconnect_mid_upload_does_not_kill_the_server() {
     assert!(
         stdout.contains("alive"),
         "an unlistened request-stream error must not be fatal: {stdout}"
+    );
+}
+
+/// `socket.write()` must report backpressure, and 'drain' must follow.
+///
+/// Writes queue on an internal chain, and write() returned true unconditionally
+/// while 'drain' never fired -- so the documented contract ("stop writing until
+/// drain") could not be honoured by any producer, and bytes handed over faster
+/// than the socket flushed piled up in-process without bound. Measured against
+/// a peer that does not read: 960MB sent buffered ~1.2GB in oam versus 52MB in
+/// Node v22, which signalled backpressure 14662 times to oam's zero.
+#[test]
+fn socket_write_signals_backpressure_and_drains() {
+    let stdout = run_ok(
+        "socket_backpressure.mjs",
+        "import net from 'node:net';\n\
+         // The peer accepts but does not read, so the writer's queue grows.\n\
+         let gotPeer;\n\
+         const peerP = new Promise((r) => { gotPeer = r; });\n\
+         const server = net.createServer((s) => { s.pause(); gotPeer(s); });\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const sock = net.connect(server.address().port, '127.0.0.1');\n\
+         sock.on('error', () => {});\n\
+         await new Promise((r) => sock.on('connect', r));\n\
+         const chunk = 'x'.repeat(64 * 1024);\n\
+         let pushed = 0, sawFalse = false;\n\
+         // Bounded: stop at the first backpressure signal, or give up at 64MB\n\
+         // so a regression fails the assertion instead of hanging.\n\
+         while (pushed < 1024) {\n\
+           pushed++;\n\
+           if (!sock.write(chunk)) { sawFalse = true; break; }\n\
+         }\n\
+         console.log('backpressure', sawFalse);\n\
+         console.log('queued', sock.writableLength > 0, sock.bufferSize === sock.writableLength);\n\
+         // Once the peer drains it, 'drain' must fire -- that is the signal a\n\
+         // correct producer waits on before resuming.\n\
+         const drained = new Promise((r) => sock.once('drain', () => r('drain')));\n\
+         const peer = await peerP;\n\
+         peer.on('data', () => {});\n\
+         peer.resume();\n\
+         let t;\n\
+         const which = await Promise.race([drained, new Promise((r) => { t = setTimeout(() => r('timeout'), 10000); })]);\n\
+         clearTimeout(t);\n\
+         console.log('event', which);\n\
+         sock.destroy(); server.close();",
+    );
+    assert!(
+        stdout.contains("backpressure true"),
+        "write() must return false once the queue passes the high-water mark: {stdout}"
+    );
+    assert!(
+        stdout.contains("queued true true"),
+        "unflushed bytes must be visible as writableLength/bufferSize: {stdout}"
+    );
+    assert!(
+        stdout.contains("event drain"),
+        "'drain' must fire once the peer consumes the backlog: {stdout}"
     );
 }

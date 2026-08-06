@@ -16012,6 +16012,7 @@
           finalCalled: false, pendingcb: 0, prefinished: false, writable: true,
         };
         this._paused = false;
+        this._readLoopActive = false;
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
@@ -16112,6 +16113,24 @@
         if (this._timeoutMs > 0) this._resetTimeout();
         const bytes = toBytes(data, encoding);
         this.bytesWritten += bytes.length;
+        // Writes queue on _chain, so bytes handed over faster than the socket
+        // drains stay alive in that chain. Without accounting, write() always
+        // returned true, 'drain' never fired, and a producer that respects
+        // backpressure (the documented contract) had nothing to respect: a
+        // 960MB send buffered ~1.2GB in-process, where Node held 52MB.
+        // Count the outstanding bytes and report them the way Node does.
+        this._writableState.length += bytes.length;
+        this.bufferSize = this._writableState.length;
+        const settle = () => {
+          this._writableState.length -= bytes.length;
+          this.bufferSize = this._writableState.length;
+          // Node emits 'drain' only when the buffer fully empties AND a write
+          // previously returned false -- not on every partial flush.
+          if (this._writableState.needDrain && this._writableState.length === 0) {
+            this._writableState.needDrain = false;
+            if (!this.destroyed) this.emit("drain");
+          }
+        };
         this._chain = this._chain.then(() => {
           if (this.destroyed) {
             // Node invokes queued write callbacks with the socket-closed
@@ -16128,14 +16147,35 @@
               );
               process.nextTick(() => cb(err));
             }
+            settle();
             return;
           }
           return natives.tcpWrite(this._handle, bytes).then(
-            () => { if (cb) cb(); },
-            (err) => { if (cb) cb(err); else this.emit("error", err); },
+            () => { settle(); if (cb) cb(); },
+            (err) => { settle(); if (cb) cb(err); else this.emit("error", err); },
           );
         });
+        // Node: false once the queue is at or past the high-water mark. The
+        // write is still accepted -- false is advisory, asking the producer to
+        // wait for 'drain'.
+        if (this._writableState.length >= this.writableHighWaterMark) {
+          this._writableState.needDrain = true;
+          return false;
+        }
         return true;
+      }
+
+      // Node's default for a net.Socket. Settable, as Node allows via options.
+      get writableHighWaterMark() {
+        return this._writableHighWaterMark ?? 16384;
+      }
+      set writableHighWaterMark(v) {
+        this._writableHighWaterMark = v;
+      }
+
+      /** Node parity: bytes accepted but not yet flushed to the socket. */
+      get writableLength() {
+        return this._writableState.length;
       }
 
       end(data, encoding, cb) {
@@ -16215,6 +16255,22 @@
       }
 
       async _readLoop() {
+        // One pump per handle. pause() only takes effect at the top of the
+        // next iteration, so a pause/resume while a read is in flight left the
+        // original loop awaiting tcpRead and started a second one -- two
+        // concurrent reads of the same handle, and the loser rejects with
+        // "read handle is gone". The in-flight loop sees _paused cleared and
+        // simply carries on, which is what resume() wants anyway.
+        if (this._readLoopActive) return;
+        this._readLoopActive = true;
+        try {
+          await this._readLoopBody();
+        } finally {
+          this._readLoopActive = false;
+        }
+      }
+
+      async _readLoopBody() {
         while (!this.destroyed) {
           if (this._paused) return;
           let chunk;
