@@ -40,7 +40,10 @@ hand-edited:
 - [CONFORMANCE.md](CONFORMANCE.md) — WPT URL percentages, a Node differential suite (same
   script, both runtimes, byte-identical stdout), and builtin surface coverage.
 
-See [ROADMAP.md](ROADMAP.md).
+See [ROADMAP.md](ROADMAP.md), [docs/why-oam.md](docs/why-oam.md) (how oam compares to
+Node, Deno and Bun, and when to pick one of those instead), and
+[docs/cli-reference.md](docs/cli-reference.md) (commands, Node-compat flags, environment
+variables).
 
 ```
 oam run hello.ts        # strip + execute instantly, types stream concurrently
