@@ -34,7 +34,10 @@
 # Host config (env):
 #   OAM_GCP_PROJECT           yaw-labs-prod      (default)
 #   OAM_GCP_BUILDER_INSTANCE  yaw-linux-builder  (default)
-#   OAM_GCP_BUILDER_ZONE      us-central1-a      (default)
+#   OAM_GCP_BUILDER_ZONE      us-west1-b         (default -- moved from
+#                                                us-central1-a 2026-08-06, that
+#                                                region had no e2-highmem-4
+#                                                capacity in ANY zone)
 #   OAM_LINUX_USER            jeff               (default -- gcloud IAM user)
 #   OAM_REMOTE_DIR            oam-build          (default -- under remote $HOME)
 #   OAM_KEEP_VM=1             leave the VM running on exit even if this
@@ -65,7 +68,7 @@ done
 
 PROJECT="${OAM_GCP_PROJECT:-yaw-labs-prod}"
 INSTANCE="${OAM_GCP_BUILDER_INSTANCE:-yaw-linux-builder}"
-ZONE="${OAM_GCP_BUILDER_ZONE:-us-central1-a}"
+ZONE="${OAM_GCP_BUILDER_ZONE:-us-west1-b}"
 LINUX_USER="${OAM_LINUX_USER:-jeff}"
 REMOTE_DIR="${OAM_REMOTE_DIR:-oam-build}"
 LINUX_FAST="${OAM_LINUX_FAST:-0}"

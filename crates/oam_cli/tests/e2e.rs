@@ -238,59 +238,70 @@ fn missing_package_is_odif_mod0002() {
 
 /// One hand-written node_modules tree covering the resolution matrix.
 fn write_npm_fixtures() -> PathBuf {
+    // Each call gets its OWN project dir. write_temp's RUN_DIR is a
+    // process-wide OnceLock, so every test in this binary shares one
+    // directory -- and three tests write this same fixture tree. fs::write
+    // truncates before writing, so a test resolving `greeter/...` could read
+    // a package.json another test was mid-rewrite of, and fail with an
+    // unrelated resolver error. It surfaced as a one-test failure under
+    // parallel load on a new build host, passing in isolation.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = format!("npmproj{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let root = root.as_str();
     write_temp(
-        "npmproj/node_modules/greeter/package.json",
+        &format!("{root}/node_modules/greeter/package.json"),
         "{\"name\": \"greeter\", \"type\": \"module\", \"exports\": {\".\": {\"import\": \"./dist/index.js\"}, \"./extra\": \"./dist/extra.js\", \"./features/*\": \"./dist/features/*.js\"}}",
     );
     write_temp(
-        "npmproj/node_modules/greeter/dist/index.js",
+        &format!("{root}/node_modules/greeter/dist/index.js"),
         "import { scoped } from '@scope/pkg';\nexport function greet() { return 'greeter+' + scoped(); }",
     );
     write_temp(
-        "npmproj/node_modules/greeter/dist/extra.js",
+        &format!("{root}/node_modules/greeter/dist/extra.js"),
         "export const extra = 'extra';",
     );
     write_temp(
-        "npmproj/node_modules/greeter/dist/features/fast.js",
+        &format!("{root}/node_modules/greeter/dist/features/fast.js"),
         "export const feature = 'fast';",
     );
     write_temp(
-        "npmproj/node_modules/@scope/pkg/package.json",
+        &format!("{root}/node_modules/@scope/pkg/package.json"),
         "{\"name\": \"@scope/pkg\", \"type\": \"module\", \"exports\": \"./main.js\"}",
     );
     write_temp(
-        "npmproj/node_modules/@scope/pkg/main.js",
+        &format!("{root}/node_modules/@scope/pkg/main.js"),
         "export function scoped() { return 'scoped'; }",
     );
     write_temp(
-        "npmproj/node_modules/dualpkg/package.json",
+        &format!("{root}/node_modules/dualpkg/package.json"),
         "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
     );
     write_temp(
-        "npmproj/node_modules/dualpkg/esm.mjs",
+        &format!("{root}/node_modules/dualpkg/esm.mjs"),
         "export const flavor = 'esm';",
     );
     write_temp(
-        "npmproj/node_modules/dualpkg/cjs.cjs",
+        &format!("{root}/node_modules/dualpkg/cjs.cjs"),
         "module.exports = { flavor: 'cjs' };",
     );
     write_temp(
-        "npmproj/node_modules/legacy-esm/package.json",
+        &format!("{root}/node_modules/legacy-esm/package.json"),
         "{\"name\": \"legacy-esm\", \"type\": \"module\", \"main\": \"lib/entry.js\"}",
     );
     write_temp(
-        "npmproj/node_modules/legacy-esm/lib/entry.js",
+        &format!("{root}/node_modules/legacy-esm/lib/entry.js"),
         "export const legacy = 'legacy';",
     );
     write_temp(
-        "npmproj/node_modules/cjs-only/package.json",
+        &format!("{root}/node_modules/cjs-only/package.json"),
         "{\"name\": \"cjs-only\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "npmproj/node_modules/cjs-only/index.js",
+        &format!("{root}/node_modules/cjs-only/index.js"),
         "module.exports = { nope: true };",
     );
-    write_temp("npmproj/.anchor", "")
+    write_temp(&format!("{root}/.anchor"), "")
         .parent()
         .unwrap()
         .to_path_buf()
