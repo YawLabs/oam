@@ -1668,7 +1668,8 @@ fn op_http_request_body_read(
         match next {
             Some(Ok(chunk)) => {
                 state.put_body_stream(id, rx);
-                oam_core::OpOutcome::Bytes(chunk)
+                // into_data releases the chunk's budget reservation.
+                oam_core::OpOutcome::Bytes(chunk.into_data())
             }
             Some(Err(e)) => {
                 state.cancel_body_stream(id);

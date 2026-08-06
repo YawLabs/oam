@@ -48,6 +48,7 @@ Notable ones:
 |---|---|
 | `OAM_ENABLE_NATIVE_ADDONS=1` | Enable N-API addon loading. **Off by default and alpha**: an addon compiled against `node.exe` can deadlock the OS loader inside oam, before any oam code runs, so the default is a clean throw that lets a package's JS fallback take over. |
 | `OAM_MAX_HEAP_MB` | Cap the V8 heap. Set this to match a container memory limit. |
+| `OAM_MAX_BODY_BYTES` | Aggregate cap on queued HTTP request-body bytes across all in-flight requests (default 512MB). Past it, excess uploads are shed rather than buffered. Per-request backpressure is the first line of defence; this bounds the total once concurrency is high. |
 | `OAM_CODE_CACHE` | Control V8 code-cache reuse across runs. |
 | `OAM_CACHE_DIR` | Where oam keeps its caches. |
 | `OAM_IO_URING` | Opt into the Linux io_uring FS path. Off by default — it benchmarked as not a win. |

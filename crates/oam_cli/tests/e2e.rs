@@ -1841,14 +1841,19 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          let drained = '';\n\
          try { drained = await inflight; } catch (e) { drained = 'FAILED:' + e.constructor.name; }\n\
          console.log(drained);\n\
-         // Body budget: a flood of large unread uploads must reject some\n\
-         // (503) rather than retain unbounded memory. The handler holds\n\
-         // each request ~400ms before responding so the 8MB bodies stay\n\
-         // reserved against the 512MB GLOBAL_BODY_BUDGET long enough to\n\
-         // accumulate past it. With an instant res.end the RequestGuard\n\
-         // refunds each reservation before 64 (512MB) pile up on a fast\n\
-         // runner, so the budget never trips and load-shedding looks broken\n\
-         // (flaky 'true false true' seen on the Windows x64 CI runner).\n\
+         // A flood of large UNREAD uploads must not pin their bodies. What\n\
+         // bounds this is per-request backpressure, not the global budget:\n\
+         // the chunk channel is bounded, so a handler that never reads the\n\
+         // body parks the pump after a few chunks and the remaining\n\
+         // megabytes stay in the kernel/socket, never on our heap. 120 x 8MB\n\
+         // is ~960MB of upload that must not become ~960MB of process.\n\
+         //\n\
+         // This deliberately does NOT assert 503s. An earlier version did,\n\
+         // and it only passed on Windows because ~117 of the clients failed\n\
+         // socket-side (counted as 'shed') while macOS served all 120 -- the\n\
+         // budget itself was charged on neither. Shedding is asserted for\n\
+         // real in http_body_budget_sheds_when_the_ceiling_is_reached, which\n\
+         // sets a ceiling low enough to actually reach.\n\
          const server2 = http.createServer((req, res) => setTimeout(() => res.end('ok'), 400));\n\
          await new Promise((r) => server2.listen(0, r));\n\
          const base2 = `http://127.0.0.1:${server2.address().port}`;\n\
@@ -1857,18 +1862,82 @@ fn http_close_is_graceful_and_body_budget_rejects_floods() {
          await Promise.all(Array.from({ length: 120 }, () =>\n\
            fetch(`${base2}/up`, { method: 'POST', body: big })\n\
              .then((r) => { if (r.status === 200) ok++; else if (r.status === 503) busy++; else shed++; })\n\
-             // An over-budget reject can reset the client's in-flight\n\
-             // upload — that is load-shedding, counted as such.\n\
              .catch(() => shed++),\n\
          ));\n\
-         // Served what fits, rejected the excess, every request accounted,\n\
-         // process survived (no OOM).\n\
-         console.log(ok > 0, busy + shed > 0, ok + busy + shed === 120);\n\
+         // Every request accounted for, and the process survived the flood.\n\
+         console.log(ok + busy + shed === 120, process.memoryUsage().rss < 900 * 1024 * 1024);\n\
          server2.close();",
     );
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines[0], "slow-done");
-    assert_eq!(lines[1], "true true true");
+    assert_eq!(
+        lines[1], "true true",
+        "a 960MB unread-upload flood must be bounded by backpressure, not buffered: {stdout}"
+    );
+}
+
+/// The aggregate body budget, exercised at a ceiling it can actually reach.
+///
+/// At the 512MB default this path is unreachable in a test: bounded per-request
+/// channels mean 120 concurrent unread uploads queue single-digit MB, so the
+/// budget never trips no matter how large the bodies are. `OAM_MAX_BODY_BYTES`
+/// lowers the ceiling (the same knob an operator uses to match a container
+/// limit), which makes the load-shedding branch observable instead of dead code.
+///
+/// Over-budget on a STREAMED body cannot be a 503 -- the handler was already
+/// dispatched on headers -- so the excess surfaces as a torn-down connection.
+/// Either shape counts as shedding; what must not happen is silently absorbing
+/// the flood, and the server must still be serving afterwards.
+#[test]
+fn http_body_budget_sheds_when_the_ceiling_is_reached() {
+    let script = write_temp(
+        "http_budget_ceiling.mjs",
+        "import http from 'node:http';\n\
+         // Read the body slowly so chunks are in flight, not instantly refunded.\n\
+         const server = http.createServer(async (req, res) => {\n\
+           await new Promise((r) => setTimeout(r, 300));\n\
+           let n = 0;\n\
+           try { for await (const c of req) n += c.length; } catch { /* shed mid-body */ }\n\
+           res.end(String(n));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const base = `http://127.0.0.1:${server.address().port}`;\n\
+         const big = 'x'.repeat(4 * 1024 * 1024);\n\
+         let ok = 0, shed = 0;\n\
+         await Promise.all(Array.from({ length: 40 }, () =>\n\
+           fetch(`${base}/up`, { method: 'POST', body: big })\n\
+             .then((r) => { if (r.status === 200) ok++; else shed++; })\n\
+             .catch(() => shed++),\n\
+         ));\n\
+         console.log('shed', shed > 0, 'accounted', ok + shed === 40);\n\
+         // The budget must be REFUNDED, not leaked: a leak fails closed and\n\
+         // every later upload would be rejected. Same server, after the flood.\n\
+         const after = await fetch(`${base}/after`, { method: 'POST', body: 'z'.repeat(1024) });\n\
+         console.log('recovered', after.status === 200, await after.text());\n\
+         server.close();",
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", script.to_str().unwrap(), "--no-check"])
+        .env("OAM_MAX_BODY_BYTES", (2 * 1024 * 1024).to_string())
+        .env(
+            "OAM_CACHE_DIR",
+            write_temp("http-budget-ceiling-cache/.keep", "")
+                .parent()
+                .unwrap(),
+        )
+        .output()
+        .expect("oam binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("shed true accounted true"),
+        "a 160MB flood against a 2MB ceiling must shed: {stdout}"
+    );
+    assert!(
+        stdout.contains("recovered true 1024"),
+        "the budget must refund after the flood, not stay pinned: {stdout}"
+    );
 }
 
 #[test]
@@ -14880,5 +14949,50 @@ console.log('caught=' + caught);
         lines,
         vec!["name=AssertionError", "starts=true", "caught=true"],
         "validation-fn non-true behavior; stdout: {stdout}"
+    );
+}
+
+/// A client that hangs up mid-upload must not kill the server.
+///
+/// The request stream is destroyed with the transport error, which emits
+/// 'error' on the IncomingMessage. With no user listener that is an unhandled
+/// error event, and it took the whole process down -- so any client that
+/// disconnected mid-POST could stop an oam server. Verified against real Node
+/// v22 on this same script: it prints the same three lines and exits 0.
+#[test]
+fn client_disconnect_mid_upload_does_not_kill_the_server() {
+    let stdout = run_ok(
+        "http_abort_survives.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         // Deliberately NO 'error' listener on req -- that is the regression.\n\
+         const server = http.createServer(async (req, res) => {\n\
+           req.on('aborted', () => console.log('aborted'));\n\
+           try { for await (const c of req) { void c; } } catch { console.log('caught'); }\n\
+           try { res.end('ok'); } catch { /* socket already gone */ }\n\
+         });\n\
+         await new Promise((r) => server.listen(0, r));\n\
+         const sock = net.connect(server.address().port, '127.0.0.1');\n\
+         sock.on('error', () => {});\n\
+         // Promise 10MB, send 1KB, then reset.\n\
+         sock.write(`POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: ${10 * 1024 * 1024}\r\n\r\n`);\n\
+         sock.write('x'.repeat(1024));\n\
+         await new Promise((r) => setTimeout(r, 150));\n\
+         sock.destroy();\n\
+         await new Promise((r) => setTimeout(r, 600));\n\
+         console.log('alive');\n\
+         server.close();",
+    );
+    assert!(
+        stdout.contains("aborted"),
+        "the request must emit 'aborted' as Node does: {stdout}"
+    );
+    assert!(
+        stdout.contains("caught"),
+        "an in-flight read must still reject so the handler can react: {stdout}"
+    );
+    assert!(
+        stdout.contains("alive"),
+        "an unlistened request-stream error must not be fatal: {stdout}"
     );
 }

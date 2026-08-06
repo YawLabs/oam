@@ -15201,6 +15201,16 @@
                   this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0));
                 } else {
                   const req = new IncomingMessage(meta);
+                  // Node's server keeps a request-stream error from becoming
+                  // an unhandled 'error' that kills the process: a client that
+                  // hangs up mid-upload, or a body the server sheds under
+                  // load, destroys the request stream, and with no listener
+                  // that would be fatal. Node delivers such an error to a
+                  // user listener and to an in-flight `for await`, but a
+                  // server with neither stays up (verified against Node
+                  // v22: process exits 0 on a mid-upload RST). This default
+                  // listener is additive -- req.on('error') still fires.
+                  req.on("error", () => {});
                   const res = new ServerResponse(meta.requestId);
                   // Node exposes the pair on each other; res end() uses
                   // req via _dumpReq() (resOnFinish parity).

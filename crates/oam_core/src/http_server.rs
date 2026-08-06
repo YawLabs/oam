@@ -42,10 +42,31 @@ const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 const DRAIN_BUDGET: usize = 16 * 1024 * 1024; // 16 MB post-cap drain
 /// Aggregate cap on RETAINED request-body bytes across all in-flight
 /// requests of the run — bounds the body-buffer memory a flood of uploads
-/// can pin. (Per-request transient during collection is bounded by the
-/// connection cap; truly bounding it needs streaming request bodies, the
-/// next wave.)
-const GLOBAL_BODY_BUDGET: usize = 512 * 1024 * 1024;
+/// can pin.
+///
+/// This is the SECOND line of defence, not the first. Streaming bodies are
+/// bounded per-request by the chunk channel's capacity, so N concurrent
+/// unread uploads pin N * capacity chunks regardless of how large the
+/// bodies are. The budget is what bounds the AGGREGATE once N itself grows
+/// large. Both are needed: backpressure alone scales with connection count,
+/// and `MAX_CONNECTIONS` alone says nothing about bytes.
+const DEFAULT_GLOBAL_BODY_BUDGET: usize = 512 * 1024 * 1024;
+
+/// Parse `OAM_MAX_BODY_BYTES` into the aggregate body budget.
+///
+/// Same shape as `OAM_MAX_HEAP_MB`: unset, empty, non-numeric or `0` means
+/// "use the default". Set it to match a container memory limit, or low to
+/// exercise the load-shedding path.
+fn global_body_budget() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("OAM_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_GLOBAL_BODY_BUDGET)
+    })
+}
 /// Concurrent-connection cap per server. New connections past this are
 /// dropped (refused), not queued — a flood can't spawn unbounded tasks or
 /// buffer unbounded bodies.
@@ -73,6 +94,40 @@ pub struct IncomingRequest {
 /// `Full`, so behavior is unchanged. The variant exists so the streaming
 /// path has a seam to land on -- `Stream` will carry a chunk receiver and
 /// the handler will be dispatched on headers rather than on last byte.
+/// A queued request-body chunk that carries its own reservation against
+/// GLOBAL_BODY_BUDGET and refunds it when dropped.
+///
+/// A drop guard rather than manual refunds: a chunk leaves the queue several
+/// ways -- read by JS, discarded by `_dump`, dropped when the consumer
+/// cancels, or dropped with the whole channel when the connection dies -- and
+/// a refund missed on any one path leaks budget until the process restarts,
+/// which fails CLOSED (every later upload rejected as busy).
+pub struct BudgetedChunk {
+    data: Vec<u8>,
+    /// Held separately: `into_data` moves `data` out, and Drop still has to
+    /// refund the original size.
+    len: usize,
+    state: std::sync::Arc<HttpState>,
+}
+
+impl BudgetedChunk {
+    fn new(data: Vec<u8>, state: std::sync::Arc<HttpState>) -> Self {
+        let len = data.len();
+        Self { data, len, state }
+    }
+
+    /// Take the bytes. The reservation is still refunded when the husk drops.
+    pub fn into_data(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.data)
+    }
+}
+
+impl Drop for BudgetedChunk {
+    fn drop(&mut self) {
+        self.state.body_bytes.fetch_sub(self.len, Ordering::AcqRel);
+    }
+}
+
 pub enum RequestBody {
     /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
     Full(Vec<u8>),
@@ -83,7 +138,7 @@ pub enum RequestBody {
     /// Taken out for the duration of each read await and reinserted after,
     /// the same remove-await-reinsert the accept queue uses; the JS side is
     /// the single consumer.
-    Stream(mpsc::Receiver<Result<Vec<u8>, String>>),
+    Stream(mpsc::Receiver<Result<BudgetedChunk, String>>),
     /// The receiver is checked out by an in-flight read. The entry STAYS in
     /// the registry so a miss can be told apart from "no such body" -- a
     /// bare removal made a checked-out stream look absent, and the buffered
@@ -93,7 +148,7 @@ pub enum RequestBody {
 
 /// Outcome of checking out a streamed body receiver.
 pub enum BodyCheckout {
-    Ready(mpsc::Receiver<Result<Vec<u8>, String>>),
+    Ready(mpsc::Receiver<Result<BudgetedChunk, String>>),
     /// Another read holds it; the caller must NOT treat this as EOF.
     InFlight,
     /// No streamed body for this id (buffered, or already finished).
@@ -201,7 +256,7 @@ impl HttpState {
 
     /// Reinsert a receiver taken by `take_body_stream`. Dropped silently if
     /// the request finished while the read was in flight.
-    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<Vec<u8>, String>>) {
+    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<BudgetedChunk, String>>) {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
         // Reinsert ONLY onto the StreamPending marker left by
         // take_body_stream. A missing entry means the body was cancelled or
@@ -660,7 +715,8 @@ fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
 /// the reader sees as EOF.
 async fn pump_request_body(
     mut body: hyper::body::Incoming,
-    chunk_tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    chunk_tx: mpsc::Sender<Result<BudgetedChunk, String>>,
+    state: std::sync::Arc<HttpState>,
 ) {
     use http_body_util::BodyExt;
     let mut total: usize = 0;
@@ -682,9 +738,32 @@ async fn pump_request_body(
                 .await;
             return;
         }
+        // Charge the GLOBAL budget for the bytes about to be queued. This is
+        // the per-chunk accounting the buffered path's comment promised and
+        // that did not exist: streaming is always on, so the buffered
+        // reservation was never reached and GLOBAL_BODY_BUDGET was charged
+        // NOWHERE. Each request was capped at MAX_REQUEST_BODY, but N
+        // concurrent uploads were bounded only by N.
+        let len = data.len();
+        let prev = state.body_bytes.fetch_add(len, Ordering::AcqRel);
+        if prev + len > global_body_budget() {
+            state.body_bytes.fetch_sub(len, Ordering::AcqRel);
+            // The handler was dispatched on headers, so 503 is no longer
+            // available; the consumer sees the error instead.
+            let _ = chunk_tx.send(Err("server is busy".to_string())).await;
+            return;
+        }
         // send() awaits when the channel is full: that IS the backpressure.
-        // Err means the consumer is gone, so stop reading the socket.
-        if chunk_tx.send(Ok(data.to_vec())).await.is_err() {
+        // Err means the consumer is gone, so stop reading the socket -- the
+        // chunk drops here and refunds itself.
+        if chunk_tx
+            .send(Ok(BudgetedChunk::new(
+                data.to_vec(),
+                std::sync::Arc::clone(&state),
+            )))
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -784,7 +863,7 @@ async fn handle_request(
     // chunk instead, so a prompt consumer is not billed for the whole upload.
     let body_len = collected.len();
     let prev = state.body_bytes.fetch_add(body_len, Ordering::AcqRel);
-    if prev + body_len > GLOBAL_BODY_BUDGET {
+    if prev + body_len > global_body_budget() {
         state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
         return Ok(status_body(503, b"server is busy"));
     }
@@ -815,13 +894,17 @@ async fn handle_request(
         // Bounded: an unconsumed body applies backpressure to hyper rather
         // than growing without limit. This is the memory ceiling that
         // replaces the buffered path's byte reservation.
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Vec<u8>, String>>(8);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<BudgetedChunk, String>>(8);
         state
             .bodies
             .lock()
             .expect("http bodies lock")
             .insert(id, RequestBody::Stream(chunk_rx));
-        tokio::spawn(pump_request_body(body, chunk_tx));
+        tokio::spawn(pump_request_body(
+            body,
+            chunk_tx,
+            std::sync::Arc::clone(&state),
+        ));
     } else {
         state
             .bodies
@@ -1216,5 +1299,72 @@ pub async fn http_body_push(
             state.end_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The global body budget is the only thing bounding queued request-body
+    /// bytes ACROSS requests -- per-request backpressure caps each channel at
+    /// 8 chunks, but nothing capped the aggregate. These assert the accounting
+    /// the streaming path now performs, because the failure modes are silent
+    /// in both directions: under-charging leaves the flood protection off (how
+    /// it shipped), and a missed refund fails CLOSED, rejecting every later
+    /// upload as "busy" until the process restarts.
+    fn state() -> std::sync::Arc<HttpState> {
+        std::sync::Arc::new(HttpState::default())
+    }
+
+    #[test]
+    fn chunk_charges_on_create_and_refunds_on_drop() {
+        let state = state();
+        assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
+        // The pump charges before constructing; the chunk owns the refund.
+        state.body_bytes.fetch_add(1024, Ordering::AcqRel);
+        let chunk = BudgetedChunk::new(vec![7u8; 1024], std::sync::Arc::clone(&state));
+        assert_eq!(state.body_bytes.load(Ordering::Acquire), 1024);
+        drop(chunk);
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            0,
+            "dropping a queued chunk must refund its reservation"
+        );
+    }
+
+    #[test]
+    fn into_data_yields_the_bytes_and_still_refunds() {
+        let state = state();
+        state.body_bytes.fetch_add(4, Ordering::AcqRel);
+        let chunk = BudgetedChunk::new(vec![1, 2, 3, 4], std::sync::Arc::clone(&state));
+        let data = chunk.into_data();
+        assert_eq!(data, vec![1, 2, 3, 4], "the reader must get the real bytes");
+        assert_eq!(
+            state.body_bytes.load(Ordering::Acquire),
+            0,
+            "into_data moves the bytes out; the husk still refunds"
+        );
+    }
+
+    #[test]
+    fn budget_rejects_only_past_the_ceiling() {
+        let state = state();
+        // Just under: admitted.
+        let under = global_body_budget() - 1;
+        let prev = state.body_bytes.fetch_add(under, Ordering::AcqRel);
+        assert!(
+            prev + under <= global_body_budget(),
+            "under budget is admitted"
+        );
+        // The next byte crosses it, which is what the pump refuses.
+        let prev = state.body_bytes.fetch_add(2, Ordering::AcqRel);
+        assert!(
+            prev + 2 > global_body_budget(),
+            "crossing GLOBAL_BODY_BUDGET must be detectable by the pump"
+        );
+        state.body_bytes.fetch_sub(2, Ordering::AcqRel);
+        state.body_bytes.fetch_sub(under, Ordering::AcqRel);
+        assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
     }
 }
