@@ -183,8 +183,13 @@ gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
 # moving a published tag would orphan the assets built from it.
 # `git rev-parse <tag>` and the API's object.sha agree for both lightweight
 # (commit SHA) and annotated (tag-object SHA) tags, so compare like with like.
-local_tag_obj="$(git rev-parse "$TAG" 2>/dev/null || true)"
-local_tag_commit="$(git rev-parse "${TAG}^{commit}" 2>/dev/null || true)"
+# --verify --quiet is load-bearing: plain `git rev-parse <unknown-ref>` ECHOES
+# the argument on stdout as well as failing, so these came back as the literal
+# strings "v0.8.1" and "v0.8.1^{commit}" for a tag that did not exist. Non-empty
+# meant "tag exists", so a first-time tag took the re-point branch and then died
+# trying to delete a tag that was never there -- breaking every NEW release tag.
+local_tag_obj="$(git rev-parse --verify --quiet "$TAG" 2>/dev/null || true)"
+local_tag_commit="$(git rev-parse --verify --quiet "${TAG}^{commit}" 2>/dev/null || true)"
 remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)"
 
 if [ "$local_tag_commit" = "$head_sha" ] \
