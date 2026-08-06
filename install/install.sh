@@ -1,7 +1,7 @@
 #!/bin/sh
-# oam installer (Linux / macOS). Canonical home: https://oam.sh/install.sh
+# oam installer (Linux / macOS). Canonical home: https://oamjs.org/install.sh
 #
-#   curl -fsSL https://oam.sh/install.sh | sh
+#   curl -fsSL https://oamjs.org/install.sh | sh
 #
 # Downloads the release binary for this OS/arch from GitHub Releases, verifies
 # it against the published SHA256SUMS, and installs it to ~/.oam/bin. No sudo,
@@ -11,7 +11,7 @@
 #   OAM_VERSION       install a specific tag (e.g. v0.7.0); default: latest
 #   OAM_INSTALL_DIR   install location; default: $HOME/.oam/bin
 #   OAM_INSTALL_BASE  asset base URL; default: GitHub Releases
-#                     (oam.sh sets this to proxy downloads through the CDN)
+#                     (oamjs.org sets this to proxy downloads through the CDN)
 #   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
 #                     also accepted). Needed on headless hosts -- CI, Docker, a
 #                     fresh VM -- that have a token but no gh CLI. While the
@@ -145,7 +145,7 @@ gh_dl() {
     --output "$2" --clobber 2>/dev/null
 }
 
-# Direct first (public releases + the oam.sh CDN), then token, then gh CLI.
+# Direct first (public releases + the oamjs.org CDN), then token, then gh CLI.
 fetch_asset() {
   dl "${base}/$1" "$2" && return 0
   if [ -n "$TOKEN" ]; then

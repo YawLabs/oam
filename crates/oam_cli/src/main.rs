@@ -156,7 +156,7 @@ enum Command {
         minify: bool,
     },
     /// Update oam in place to the latest release by running the canonical
-    /// oam.sh installer (verifies via the published SHA256SUMS). Updates the
+    /// oamjs.org installer (verifies via the published SHA256SUMS). Updates the
     /// currently-running binary's location.
     SelfUpdate {
         /// Install a specific tag (e.g. v0.7.0) instead of the latest.
@@ -675,7 +675,7 @@ fn build_self_update_cmd(is_windows: bool, url: &str) -> (&'static str, Vec<Stri
     }
 }
 
-/// `oam self-update`: re-run the canonical oam.sh installer to replace the
+/// `oam self-update`: re-run the canonical oamjs.org installer to replace the
 /// running binary in place. Delegating keeps ONE source of download +
 /// checksum-verify + running-exe-replace logic. We point the installer at the
 /// CURRENT binary's directory (via OAM_INSTALL_DIR) so it updates oam where it
@@ -696,10 +696,12 @@ fn self_update_command(version: Option<&str>, dry_run: bool) -> ExitCode {
         },
     };
 
+    // oamjs.org is the canonical home; it serves both installers as
+    // text/plain, which is what makes `| sh` and `| iex` work.
     let default_url = if cfg!(target_os = "windows") {
-        "https://oam.sh/install.ps1"
+        "https://oamjs.org/install.ps1"
     } else {
-        "https://oam.sh/install.sh"
+        "https://oamjs.org/install.sh"
     };
     let url = std::env::var("OAM_SELF_UPDATE_URL").unwrap_or_else(|_| default_url.to_string());
     let (program, args) = build_self_update_cmd(cfg!(target_os = "windows"), &url);
@@ -1922,7 +1924,7 @@ fn run_file_with_flags(
                 // Node prints these two lines to stderr; tooling scrapes the
                 // first for the WebSocket URL.
                 eprintln!("Debugger listening on {url}");
-                eprintln!("For help, see: https://oam.sh/docs/inspector");
+                eprintln!("For help, see: https://oamjs.org/docs/inspector");
             }
             Err(e) => {
                 return Err(err_exit(vec![Diagnostic::new(
@@ -2460,7 +2462,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
         match rt.attach_inspector(addr, brk) {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");
-                eprintln!("For help, see: https://oam.sh/docs/inspector");
+                eprintln!("For help, see: https://oamjs.org/docs/inspector");
             }
             Err(e) => {
                 eprintln!("could not start inspector: {e}");
@@ -2631,17 +2633,20 @@ mod tests {
 
     #[test]
     fn self_update_cmd_unix_pipes_installer_to_sh() {
-        let (prog, args) = build_self_update_cmd(false, "https://oam.sh/install.sh");
+        let (prog, args) = build_self_update_cmd(false, "https://oamjs.org/install.sh");
         assert_eq!(prog, "sh");
         assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "curl -fsSL https://oam.sh/install.sh | sh");
+        assert_eq!(args[1], "curl -fsSL https://oamjs.org/install.sh | sh");
     }
 
     #[test]
     fn self_update_cmd_windows_pipes_installer_to_iex() {
-        let (prog, args) = build_self_update_cmd(true, "https://oam.sh/install.ps1");
+        let (prog, args) = build_self_update_cmd(true, "https://oamjs.org/install.ps1");
         assert_eq!(prog, "powershell");
-        assert_eq!(args.last().unwrap(), "irm https://oam.sh/install.ps1 | iex");
+        assert_eq!(
+            args.last().unwrap(),
+            "irm https://oamjs.org/install.ps1 | iex"
+        );
         assert!(args.contains(&"-NoProfile".to_string()));
     }
 

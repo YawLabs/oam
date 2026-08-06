@@ -298,3 +298,44 @@ gh release create "$TAG" "$RELEASE_DIR"/* \
 gh release edit "$TAG" --repo "$REPO" --draft=false
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
+
+# --- publish the installers to oamjs.org -----------------------------------------
+# `oam self-update` fetches https://oamjs.org/install.{sh,ps1} and pipes the
+# result into sh / iex. Those files are COPIES of install/ served by a separate
+# repo, so without this step the site can silently drift from the release that
+# ships with it -- and the failure lands in a user's shell, not in CI.
+#
+# Skipped rather than fatal when the site checkout is absent: a release is still
+# valid without it, and the verification below says loudly if the live site is
+# stale.
+step "Publish installers to oamjs.org"
+SITE_DIR="${OAM_SITE_DIR:-$REPO_DIR/../oamjs.org}"
+if [ ! -d "$SITE_DIR/public" ]; then
+  warn "no site checkout at $SITE_DIR -- installers NOT republished (clone YawLabs/oamjs.org, or set OAM_SITE_DIR)"
+else
+  cp "$REPO_DIR/install/install.sh" "$SITE_DIR/public/install.sh"
+  cp "$REPO_DIR/install/install.ps1" "$SITE_DIR/public/install.ps1"
+  if git -C "$SITE_DIR" diff --quiet -- public/install.sh public/install.ps1; then
+    ok "oamjs.org installers already match this release"
+  else
+    git -C "$SITE_DIR" add public/install.sh public/install.ps1
+    git -C "$SITE_DIR" commit -q -m "Sync installers from oam $TAG"
+    git -C "$SITE_DIR" push -q
+    ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 )       && ok "oamjs.org installers republished"       || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
+  fi
+fi
+
+# Verify what the SITE actually serves, not what we just uploaded: a stale CDN
+# copy is exactly the failure this step exists to prevent, and it is invisible
+# from the filesystem.
+step "Verify oamjs.org serves this release's installers"
+for f in install.sh install.ps1; do
+  live="$(curl -fsSL --max-time 30 "https://oamjs.org/$f" 2>/dev/null || true)"
+  if [ -z "$live" ]; then
+    warn "https://oamjs.org/$f did not fetch -- self-update is BROKEN until it does"
+  elif [ "$live" = "$(cat "$REPO_DIR/install/$f")" ]; then
+    ok "https://oamjs.org/$f matches install/$f"
+  else
+    warn "https://oamjs.org/$f DIFFERS from install/$f -- self-update will run the stale copy"
+  fi
+done

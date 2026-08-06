@@ -1,6 +1,6 @@
-# oam installer (Windows). Canonical home: https://oam.sh/install.ps1
+# oam installer (Windows). Canonical home: https://oamjs.org/install.ps1
 #
-#   irm https://oam.sh/install.ps1 | iex
+#   irm https://oamjs.org/install.ps1 | iex
 #
 # Downloads the release binary for this arch from GitHub Releases, verifies it
 # against the published SHA256SUMS, installs it to %LOCALAPPDATA%\oam\bin, and
@@ -11,7 +11,7 @@
 #   OAM_VERSION       install a specific tag (e.g. v0.7.0); default: latest
 #   OAM_INSTALL_DIR   install location; default: %LOCALAPPDATA%\oam\bin
 #   OAM_INSTALL_BASE  asset base URL; default: GitHub Releases
-#                     (oam.sh sets this to proxy downloads through the CDN)
+#                     (oamjs.org sets this to proxy downloads through the CDN)
 #   GH_TOKEN          GitHub token for private-repo installs (GITHUB_TOKEN is
 #                     also accepted). Needed on headless hosts -- CI, a fresh
 #                     VM -- that have a token but no gh CLI. While the repo is
@@ -93,7 +93,7 @@ try {
     } catch { return $false }
   }
 
-  # Direct first (public releases + the oam.sh CDN), then token, then gh CLI.
+  # Direct first (public releases + the oamjs.org CDN), then token, then gh CLI.
   function Get-Asset($assetName, $outFile) {
     try { Invoke-WebRequest -Uri "$base/$assetName" -OutFile $outFile -UseBasicParsing; return $true } catch { }
     if ($token) {

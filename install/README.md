@@ -1,18 +1,18 @@
 # Installing oam
 
-The canonical installer and update channel serve from **https://oam.sh**
-(see the repo README). These scripts are the source of truth oam.sh serves.
+The canonical installer and update channel serve from **https://oamjs.org**
+(see the repo README). These scripts are the source of truth oamjs.org serves.
 
 ## Linux / macOS
 
 ```sh
-curl -fsSL https://oam.sh/install.sh | sh
+curl -fsSL https://oamjs.org/install.sh | sh
 ```
 
 ## Windows (PowerShell)
 
 ```powershell
-irm https://oam.sh/install.ps1 | iex
+irm https://oamjs.org/install.ps1 | iex
 ```
 
 Both scripts: detect your OS/arch, download the matching release binary from
@@ -26,7 +26,7 @@ No admin/sudo. Re-running upgrades in place.
 |-----|--------|---------|
 | `OAM_VERSION` | install a specific tag, e.g. `v0.7.0` | latest |
 | `OAM_INSTALL_DIR` | install location | `~/.oam/bin` / `%LOCALAPPDATA%\oam\bin` |
-| `OAM_INSTALL_BASE` | asset base URL (oam.sh sets this to proxy via CDN) | GitHub Releases |
+| `OAM_INSTALL_BASE` | asset base URL (oamjs.org sets this to proxy via CDN) | GitHub Releases |
 
 ## Release assets (the naming contract)
 
