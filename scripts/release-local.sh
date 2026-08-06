@@ -44,8 +44,17 @@
 #     -- the node-suite ratchet was node-compat.yml's ubuntu GATING job)
 #   - gate+test on the Mac (inside mac-release)
 #
-# Usage -- the tag is managed for you. Bump Cargo.toml, commit, push, then:
+# Usage -- the tag AND the version are managed for you:
 #   ./scripts/release-local.sh v0.8.0
+#
+# The tag is the request. If the workspace version does not already match it,
+# preflight bumps Cargo.toml to <tag> minus the leading v, refreshes Cargo.lock
+# (`cargo update --workspace --offline` -- workspace members only, no
+# third-party drift), commits and pushes to main -- exactly the manual step this
+# note used to prescribe. Guarded: forward-only (never downgrades), plain
+# vMAJOR.MINOR.PATCH tags only, requires HEAD == origin/main on main so the
+# commit fast-forwards, and refuses if the bump touched anything but
+# Cargo.toml + Cargo.lock. OAM_NO_AUTO_BUMP=1 restores the old hard-fail.
 #
 # Preflight creates <tag> at HEAD, or RE-POINTS it to HEAD if it already exists
 # somewhere else (a stale tag from an abandoned attempt is the common case), and
@@ -56,6 +65,8 @@
 # publish an unpushed local commit.
 #
 # Env knobs:
+#   OAM_NO_AUTO_BUMP=1      never write Cargo.toml; hard-fail on a version
+#                           mismatch the way this script used to
 #   OAM_SKIP_LOCAL_GATE=1   skip the local ci-local.sh run
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
@@ -63,7 +74,10 @@
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
 #   OAM_DRY_RUN=1           build + checksum everything, publish nothing
-#                           (release.yml's workflow_dispatch dry-run)
+#                           (release.yml's workflow_dispatch dry-run). Preflight
+#                           still runs in full -- it bumps, commits and tags, so
+#                           the dry-run builds the binaries the real release
+#                           would; only the upload is skipped.
 #
 # The two remote legs run sequentially (simpler failure attribution). If
 # release wall-time becomes a problem, they are independent and could run as
@@ -157,26 +171,101 @@ restore_gate_artifacts "preflight"
 [ -z "$(git status --porcelain)" ] \
   || fail "working tree is dirty (untracked files count -- the remote legs ship the working tree) -- release from a clean tree"
 
-# The binaries report the workspace version -- a v0.7.0 tag over a 0.6.1
-# Cargo.toml would ship assets that self-identify wrong.
-crate_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-[ "v$crate_version" = "$TAG" ] \
-  || fail "tag $TAG != workspace version $crate_version (Cargo.toml) -- bump the version first"
+# origin/main is load-bearing for BOTH the auto-bump (which pushes a commit
+# onto it) and the ancestor check further down, so refresh it before either.
+git fetch -q origin main 2>/dev/null || true
 
+# A PUBLISHED tag is immutable: whatever the release assets were built from must
+# keep pointing there forever. So check for the release FIRST -- before the
+# auto-bump commits anything or the tag reconciliation moves anything.
+gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
+  && fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
+
+# The binaries report the workspace version -- a v0.7.0 tag over a 0.6.1
+# Cargo.toml would ship assets that self-identify wrong. The tag IS the
+# request, so reconcile the version TO it instead of making the caller
+# remember a separate bump-commit-push step and re-run.
+crate_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+[ -n "$crate_version" ] || fail "could not read the workspace version from Cargo.toml"
+tag_version="${TAG#v}"
+
+if [ "$tag_version" = "$crate_version" ]; then
+  ok "workspace version already $crate_version"
+elif [ "${OAM_NO_AUTO_BUMP:-0}" = "1" ]; then
+  fail "tag $TAG != workspace version $crate_version (Cargo.toml) -- bump the version first (OAM_NO_AUTO_BUMP=1 disables the auto-bump)"
+else
+  # Guards. Each one is a way the bump could do something the caller did not
+  # ask for, so each fails rather than improvises.
+  #
+  # 1. Only a plain vMAJOR.MINOR.PATCH tag maps onto a Cargo version by
+  #    stripping the v. Prerelease/build metadata never shipped here; guessing
+  #    what it should mean is worse than handing it back.
+  printf '%s' "$tag_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || fail "$TAG is not a plain vMAJOR.MINOR.PATCH tag -- set the version in Cargo.toml yourself, commit, push, and re-run"
+  # 2. Forward only. sort -V puts the lower version first, so if that is not
+  #    the current one, the tag is BEHIND the tree. Version sort, not string
+  #    comparison, which would call 0.8.10 older than 0.8.2.
+  [ "$(printf '%s\n%s\n' "$crate_version" "$tag_version" | sort -V | head -1)" = "$crate_version" ] \
+    || fail "tag $TAG is BEHIND the workspace version $crate_version -- refusing to downgrade Cargo.toml"
+  # 3. The bump becomes a commit on main that the tag will point at, so it has
+  #    to fast-forward: on main, and exactly AT origin/main. The ancestor check
+  #    below tolerates a HEAD that is merely behind origin/main; committing on
+  #    top of one would diverge and the push would be rejected.
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$branch" = "main" ] \
+    || fail "auto-bump commits to main, but HEAD is on '$branch' -- switch to main (or bump Cargo.toml yourself and re-run)"
+  origin_main="$(git rev-parse --verify --quiet origin/main || true)"
+  [ -n "$origin_main" ] || fail "no origin/main locally -- run 'git fetch origin main' first"
+  [ "$(git rev-parse HEAD)" = "$origin_main" ] \
+    || fail "main is not level with origin/main -- the bump commit would not fast-forward; pull/push first"
+
+  warn "workspace version $crate_version != $TAG -- bumping Cargo.toml to $tag_version"
+  # First `^version = "` line only -- that is [workspace.package], which every
+  # member inherits via version.workspace = true. Rewritten through a temp file
+  # OUTSIDE the repo, so a failed rewrite cannot leave an untracked file behind
+  # to trip the clean-tree check on the next run.
+  bump_tmp="$(mktemp)"
+  awk -v new="$tag_version" 'BEGIN{d=0} /^version = "/ && !d {sub(/"[^"]*"/, "\"" new "\""); d=1} {print}' \
+    Cargo.toml > "$bump_tmp" || { rm -f "$bump_tmp"; fail "could not rewrite Cargo.toml"; }
+  cp "$bump_tmp" Cargo.toml
+  rm -f "$bump_tmp"
+  # Re-read from disk rather than trusting the rewrite.
+  bumped_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+  [ "$bumped_version" = "$tag_version" ] \
+    || fail "Cargo.toml still reads '$bumped_version' after the bump -- fix it by hand"
+
+  # The lock pins every workspace member's version too. Leaving it stale means
+  # the first cargo build rewrites it and dirties the tree the remote legs tar
+  # -- and process.versions is published FROM Cargo.lock at build time.
+  # --workspace --offline: local members only, no registry access, so a release
+  # can never quietly drag third-party deps forward as a side effect.
+  cargo update --workspace --offline >&2 \
+    || fail "could not refresh Cargo.lock ('cargo update --workspace --offline') -- fix and re-run"
+
+  # The tree was clean coming in, so the bump's footprint should be exactly
+  # these two paths. Anything else means something ran that should not have.
+  bump_paths="$(git status --porcelain | awk '{print $2}' | sort | tr '\n' ' ')"
+  [ "$bump_paths" = "Cargo.lock Cargo.toml " ] \
+    || fail "the bump touched unexpected paths ($bump_paths) -- inspect the tree and commit yourself"
+
+  git add Cargo.toml Cargo.lock || fail "could not stage the version bump"
+  git commit -q -m "chore(release): bump workspace version to $tag_version" \
+    || fail "could not commit the version bump"
+  # Pushed here, not left local: the tag push below drags the tagged commit
+  # along with it, and a release must never point at a commit that only exists
+  # on this box.
+  git push -q origin main || fail "could not push the bump to origin/main"
+  ok "bumped $crate_version -> $tag_version, committed and pushed to main"
+fi
+
+# Re-read HEAD from git rather than reusing anything captured before the bump.
 head_sha="$(git rev-parse HEAD)"
 
 # HEAD must already be on origin/main. This script creates the tag below, and
 # `git push origin <tag>` drags the tagged commit along with it -- so without
 # this an unpushed local commit could be published as a release.
-git fetch -q origin main 2>/dev/null || true
 git merge-base --is-ancestor "$head_sha" origin/main 2>/dev/null \
   || fail "HEAD ($head_sha) is not on origin/main -- push your commits first"
-
-# A PUBLISHED tag is immutable: whatever the release assets were built from must
-# keep pointing there forever. So check for the release FIRST, before the tag
-# reconciliation below can move anything.
-gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
-  && fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
 
 # Reconcile the tag to HEAD, creating or re-pointing as needed. Safe only
 # because the release-exists check above already proved this tag is unpublished;
