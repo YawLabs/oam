@@ -97,7 +97,27 @@ VM_STATUS="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --proj
   || fail "instance $INSTANCE not found in $ZONE ($PROJECT)"
 if [ "$VM_STATUS" != "RUNNING" ]; then
   step "Start VM $INSTANCE (status: $VM_STATUS)"
-  gcloud compute instances start "$INSTANCE" --zone="$ZONE" --project="$PROJECT" >&2
+  # `instances start` can fail with a zone-level `resource_availability` error
+  # ("does not have enough resources available"), which is TRANSIENT -- the
+  # same start succeeds minutes later. The old code neither retried nor
+  # checked: it printed "VM started" unconditionally and the run then died in
+  # the tunnel step with a misleading connection error. Retry with backoff,
+  # and confirm RUNNING before believing it.
+  VM_START_OK=0
+  for VM_ATTEMPT in 1 2 3 4 5 6; do
+    if gcloud compute instances start "$INSTANCE" --zone="$ZONE" --project="$PROJECT" >&2 2>/dev/null; then
+      if [ "$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+              --format='value(status)' 2>/dev/null)" = "RUNNING" ]; then
+        VM_START_OK=1
+        break
+      fi
+    fi
+    [ "$VM_ATTEMPT" -lt 6 ] && {
+      warn "VM start failed (attempt $VM_ATTEMPT/6) -- usually zone capacity for $(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" --format='value(machineType.basename())' 2>/dev/null). Retrying in 60s..."
+      sleep 60
+    }
+  done
+  [ "$VM_START_OK" = "1" ] || fail "could not start $INSTANCE in $ZONE after 6 attempts -- the zone is out of capacity for this machine type. Wait and re-run, or move the builder to another zone."
   WE_STARTED_VM=1
   ok "VM started"
 else
@@ -290,6 +310,22 @@ for IAP_PROBE_ATTEMPT in 1 2 3 4 5 6 7 8 9 10; do
 done
 if [ "$IAP_PROBE_OK" -eq 1 ]; then
   ok "IAP SSH roundtrip ok (tunnel localhost:$IAP_TUNNEL_PORT)"
+  # Disk headroom. A full builder does not fail fast: cargo runs for ~20
+  # minutes and then dies with `rustc-LLVM ERROR: IO failure on output
+  # stream` / `os error 28`, which reads like a compiler bug. One clean
+  # debug+release build of this tree needs ~7GB, and target/debug accretes
+  # incremental cache across runs (observed: 20GB, filling a 40GB disk).
+  # Check before spending the time, and say exactly what to delete.
+  DISK_FREE_GB="$(gcp_ssh "df -BG --output=avail / | tail -1 | tr -dc '0-9'" 2>/dev/null)"
+  if [ -n "$DISK_FREE_GB" ]; then
+    if [ "$DISK_FREE_GB" -lt 10 ]; then
+      fail "builder has ${DISK_FREE_GB}GB free on / -- a build needs ~7GB and will die mid-compile with a misleading LLVM IO error. Free space first: ssh in and 'rm -rf ~/${REMOTE_DIR}/target/debug' (rebuildable cache), or grow the boot disk."
+    elif [ "$DISK_FREE_GB" -lt 20 ]; then
+      warn "builder has only ${DISK_FREE_GB}GB free on / -- enough for this run, but 'rm -rf ~/${REMOTE_DIR}/target/debug' would give it room"
+    else
+      ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"
+    fi
+  fi
 else
   fail "IAP tunnel is up (port $IAP_TUNNEL_PORT) but ssh 'true' failed after 10 attempts. Check (1) $IAP_SSH_KEY exists, (2) OS Login accepted the key for $LINUX_USER, (3) google_compute_known_hosts is not stale."
 fi
