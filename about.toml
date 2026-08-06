@@ -28,10 +28,14 @@ ignore-dev-dependencies = true
 # workspace sets for every internal crate.
 private = { ignore = true }
 
-# Every license appearing in the runtime graph. GPL-2.0-only and
-# LGPL-2.1-or-later are listed ONLY because self_cell and r-efi offer them as
-# one arm of a disjunction; `accepted` is order-sensitive, so the permissive
-# arms above them are what actually gets selected.
+# Every license appearing in the runtime graph, permissive only.
+#
+# `accepted` is ORDER-SENSITIVE: for a disjunctive expression cargo-about takes
+# the first id here that satisfies it. Crates offering a copyleft arm
+# (self_cell's and r-efi's GPL/LGPL options) resolve to their permissive arm
+# because only the permissive one is listed -- deliberately. Do NOT add a
+# copyleft id to "make a crate resolve"; if one ever fails to resolve, that
+# means it has no permissive arm and the dependency itself needs revisiting.
 accepted = [
     "Apache-2.0",
     "MIT",
