@@ -9307,9 +9307,18 @@ console.log('posix_identity=' + (badId.length === 0 ? 'ok' : 'BAD:' + badId.join
 if (win) {
   console.log('posix_identity_calls=ok');
 } else {
-  process.setuid(0);
-  process.setgid(0);
-  console.log('posix_identity_calls=' + (typeof process.getuid() === 'number' && Array.isArray(process.getgroups()) ? 'ok' : 'BAD'));
+  // setuid(0) as non-root MUST fail with EPERM -- node does exactly this.
+  // Asserting success only held while oam's setuid was a silent no-op.
+  let verdict;
+  try {
+    process.setuid(0);
+    verdict = process.getuid() === 0 ? 'ok' : 'BAD:setuid-silently-did-nothing';
+  } catch (e) {
+    verdict = e.code === 'EPERM' ? 'ok' : 'BAD:setuid-threw-' + e.code;
+  }
+  console.log('posix_identity_calls=' + (
+    verdict === 'ok' && typeof process.getuid() === 'number' && Array.isArray(process.getgroups())
+      ? 'ok' : 'BAD:' + verdict));
 }
 "#,
     );
