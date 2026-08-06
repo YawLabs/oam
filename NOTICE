@@ -84,14 +84,63 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Node.js
 ================================================================================
 
-oam vendors portions of Node.js (lib/stream.js, lib/stream/promises.js, and
-lib/internal/streams/*, at js/vendor/node-streams/), distributed under the MIT
-license. Copyright Node.js contributors; portions copyright Joyent, Inc. and
-other Node contributors (per-file headers retained in the vendored sources).
-The full MIT text is reproduced in THIRD_PARTY_LICENSES.md ("Node.js" section).
-Like V8's, this notice is hand-maintained: the vendored files are not a cargo
-dependency and cannot be collected by `cargo about`. The upstream tag, per-file
-checksums, and refresh procedure live in js/vendor/node-streams/UPSTREAM.
+oam vendors Node.js in two separate places, both under the MIT license.
+Copyright Node.js contributors; portions copyright Joyent, Inc. and other Node
+contributors (per-file headers retained in the vendored sources). Like V8's,
+this notice is hand-maintained: neither tree is a cargo dependency, so neither
+can be collected by `cargo about`.
+
+  1. js/vendor/node-streams/ -- SHIPPED IN THE BINARY. lib/stream.js,
+     lib/stream/promises.js and lib/internal/streams/*, compiled into the
+     startup snapshot. The upstream tag, per-file checksums and refresh
+     procedure live in js/vendor/node-streams/UPSTREAM.
+
+  2. conformance/vendor/node/ -- REPOSITORY ONLY, not in the binary. A pinned
+     v22.22.2 snapshot of a subset of nodejs/node (lib/, deps/, test/), used by
+     the node-suite conformance harness. Node's own LICENSE ships alongside it
+     at conformance/vendor/node/LICENSE; provenance is in the README there.
+
+The full MIT text is reproduced in THIRD_PARTY_LICENSES.md ("Node.js" section)
+and at conformance/vendor/node/LICENSE.
+
+================================================================================
+web-platform-tests
+================================================================================
+
+oam vendors two WPT test-data files (url/urltestdata.json and
+url/setters_tests.json, at conformance/vendor/wpt/url/) consumed by the WPT URL
+conformance runner. Repository only -- not compiled into the binary.
+
+The 3-clause BSD license below requires that redistributions RETAIN the notice
+and conditions, which a link cannot do, so the text is reproduced in full.
+Provenance and refresh procedure are in conformance/vendor/wpt/url/README.md.
+
+# The 3-Clause BSD License
+
+Copyright © web-platform-tests contributors
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Rust dependencies
