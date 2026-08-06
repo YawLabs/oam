@@ -18,6 +18,8 @@
 #                                     Rosetta 2
 #   oam-x86_64-unknown-linux-gnu      GCP Linux VM (IAP), native
 #   SHA256SUMS
+#   LICENSE, NOTICE, THIRD_PARTY_LICENSES.md   (attribution travels with the
+#                                               binaries -- see the staging step)
 #
 # Why "HOST toolchain under emulation" for the x64 legs: oam cannot
 # cross-compile (crates/oam_engine/build.rs -- the V8 startup snapshot must be
@@ -275,7 +277,23 @@ fi
 
 # --- assemble + publish ----------------------------------------------------------
 step "Assemble release assets + SHA256SUMS"
+# Checksums cover the BINARIES only -- the license files are staged after this
+# so they do not appear in a manifest install.sh verifies per-asset.
 ( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )
+
+# A released binary is a BINARY REDISTRIBUTION of V8 (BSD-3), ICU (Unicode),
+# the Node streams port (MIT) and ~380 Rust crates -- every one of which
+# requires its notice travel with the distribution. Apache-2.0 section 4(a)
+# says the same about oam's own license. Shipping bare binaries met none of
+# that, while NOTICE itself asserted the obligation applies to "every released
+# oam binary". These three files are small next to a 57MB binary and are the
+# difference between the claim and the fact.
+step "Stage license + attribution alongside the binaries"
+for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
+  [ -f "$REPO_DIR/$f" ] || fail "$f missing from the repo -- it must ship with the release"
+  cp "$REPO_DIR/$f" "$RELEASE_DIR/$f"
+done
+ok "LICENSE, NOTICE and THIRD_PARTY_LICENSES.md staged"
 
 if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
   # release.yml's workflow_dispatch dry-run: build + checksum, publish nothing.

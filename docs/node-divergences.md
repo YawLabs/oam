@@ -32,11 +32,11 @@ Read those with the denominator in view:
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
-  **429/476 (90.1%)**: 20 tests skip themselves at runtime and 26 are unrunnable by the
-  harness. Of those 26, **20 need a `node:internal/*` module oam does not have** — 14 of
-  them `internal/test/binding`, Node's C++ test hooks. Inventing those to score would be
+  **429/476 (90.1%)**: 22 tests skip themselves at runtime and 23 are unrunnable by the
+  harness. Most of the 23 need a `node:internal/*` module oam does not have — 14 of them
+  `internal/test/binding`, Node's C++ test hooks. Inventing those to score would be
   the same fabrication refused for `process.versions`.
-- **13 of the 20 runtime skips are not oam gaps at all** — real Node, run against the
+- **Most of the runtime skips are not oam gaps at all** — real Node, run against the
   same vendored tree on the same host, skips them identically (the POSIX-only `execve`
   tests on Windows, `styletext` without a TTY, `process-config` without a `config.gypi`).
   Four of the rest skip on `common.hasCrypto`, which is `Boolean(process.versions.openssl)`
@@ -174,9 +174,12 @@ carrying `permission` and `resource`.
 
 Two differences from Node's model:
 
-- **oam's `--permission` is all-or-nothing today.** Node pairs it with grant flags
-  (`--allow-fs-read=`, `--allow-fs-write=`, `--allow-child-process`, ...). oam does not
-  expose those on the CLI yet, so `--permission` denies everything.
+- **Node's grant flags are implemented**: `--allow-fs-read=`, `--allow-fs-write=`,
+  `--allow-child-process`, `--allow-worker` and `--allow-addons`. `*` grants everything,
+  anything else is a comma-separated allow-list, and they round-trip through
+  `process.execArgv`. `process.execve` is gated on the ChildProcess permission, since
+  replacing the process image hands control to a binary this permission set does not
+  describe.
 - **`process.permission` is not implemented.** Node exposes `process.permission.has()`
   for runtime introspection; in oam it is `undefined` with or without the flag.
 
@@ -416,7 +419,7 @@ entries below were executed on both runtimes unless marked.
 
 ## Known failures in the vendored suite
 
-The two failures behind the 414/416 **on windows-aarch64**, triaged honestly.
+The two failures behind the windows-aarch64 number, triaged honestly.
 Per-platform numbers differ because the harness skips POSIX-only tests on
 Windows — see "POSIX-only gaps" below, where the third POSIX failure lives.
 
@@ -436,8 +439,8 @@ and GET/HEAD writes follow Node's dispatch-on-first-write shape
 
 The Windows number is not the whole story, and this is the honest rest of
 it. A cross-platform sweep on the real release hosts measured
-**392 passing on macos-aarch64 (of 408 runnable) and 392 on linux-x86_64
-(of 409)** versus 400/401 on windows-aarch64. The denominators differ
+**438/440 on macos-aarch64 and 439/441 on linux-x86_64** versus 429/431 on
+windows-aarch64. The denominators differ
 because Windows skips POSIX-only tests the other hosts actually run, and
 that is where every extra failure sat — all in `process`, `path`, and
 `url`, none in `stream`, `http`, or `buffer`.

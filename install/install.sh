@@ -181,6 +181,30 @@ chmod +x "${tmp}/${asset}"
 mv -f "${tmp}/${asset}" "${INSTALL_DIR}/oam"
 say "installed oam to ${INSTALL_DIR}/oam"
 
+# The binary is a binary redistribution of V8, ICU, the Node streams port and
+# ~380 Rust crates, whose licenses require their notices travel with it. Put
+# them beside the binary so the copy on THIS machine carries its attribution,
+# not just the repo it came from. Best-effort: a missing notice is not worth
+# failing an otherwise good install over, and it is reported rather than
+# swallowed.
+got_licenses=0
+mkdir -p "${INSTALL_DIR}/licenses"
+for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do
+  if fetch_asset "$f" "${tmp}/$f" 2>/dev/null; then
+    mv -f "${tmp}/$f" "${INSTALL_DIR}/licenses/$f"
+    got_licenses=1
+  fi
+done
+if [ "$got_licenses" = "1" ]; then
+  say "license and attribution files in ${INSTALL_DIR}/licenses"
+else
+  # Releases before v0.8.1 shipped no license assets. Leaving an empty
+  # directory behind would imply they were installed, so remove it and say
+  # plainly where to read them instead.
+  rmdir "${INSTALL_DIR}/licenses" 2>/dev/null || true
+  say "note: this release ships no license assets; see https://github.com/${OWNER_REPO}"
+fi
+
 # PATH guidance: only nudge if the install dir isn't already on PATH.
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;

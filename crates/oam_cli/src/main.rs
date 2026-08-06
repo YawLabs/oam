@@ -2624,6 +2624,13 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
             out_abs.display()
         ),
     }
+    // The output embeds the whole oam runtime -- V8 (BSD-3), ICU (Unicode),
+    // the Node streams port (MIT) and ~380 Rust crates. Whoever ships that
+    // binary inherits their notice obligations, and would have no way to know
+    // it from a success line that only reports byte counts.
+    eprintln!(
+        "oam compile: the output embeds oam's runtime (V8, ICU and others);          if you redistribute it, ship the notices from LICENSE, NOTICE and          THIRD_PARTY_LICENSES.md with it"
+    );
     ExitCode::SUCCESS
 }
 

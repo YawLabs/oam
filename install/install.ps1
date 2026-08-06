@@ -133,6 +133,30 @@ try {
   Remove-Item -Path "$dest.old" -Force -ErrorAction SilentlyContinue
   Say "installed oam to $dest"
 
+  # The binary is a binary redistribution of V8, ICU, the Node streams port and
+  # ~380 Rust crates, whose licenses require their notices travel with it. Put
+  # them beside the binary so the copy on THIS machine carries its attribution,
+  # not just the repo it came from. Best-effort: a missing notice is not worth
+  # failing an otherwise good install over, and it is reported, not swallowed.
+  $licenseDir = Join-Path $installDir 'licenses'
+  New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+  $gotLicenses = $false
+  foreach ($f in @('LICENSE', 'NOTICE', 'THIRD_PARTY_LICENSES.md')) {
+    try {
+      Get-Asset $f (Join-Path $licenseDir $f)
+      $gotLicenses = $true
+    } catch {
+      # Releases before v0.8.1 ship no license assets.
+    }
+  }
+  if ($gotLicenses) {
+    Say "license and attribution files in $licenseDir"
+  } else {
+    # An empty directory would imply they were installed.
+    Remove-Item -Path $licenseDir -Force -ErrorAction SilentlyContinue
+    Say "note: this release ships no license assets; see https://github.com/$ownerRepo"
+  }
+
   # Add install dir to the USER PATH (persistent) if it isn't already there.
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (-not $userPath) { $userPath = '' }
