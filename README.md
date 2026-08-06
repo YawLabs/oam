@@ -62,20 +62,7 @@ Both installers pick the binary for your OS/arch, verify it against the publishe
 `SHA256SUMS`, and install per-user (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no
 admin. Binaries are unsigned and checksummed. `oam self-update` re-runs the same installer.
 
-**While this repo is private, unauthenticated asset URLs 404.** Supply a GitHub token with
-repo access, or have the `gh` CLI installed and authenticated:
-
-```
-curl -fsSL https://oamjs.org/install.sh | GH_TOKEN=ghp_... sh    # Linux / macOS
-$env:GH_TOKEN='ghp_...'; irm https://oamjs.org/install.ps1 | iex  # Windows
-```
-
-Note where the variable goes: in a pipeline, `GH_TOKEN=... curl ... | sh` sets it on **curl**,
-not on the `sh` that runs the script, so the installer never sees it. Put it on `sh` as above,
-or `export GH_TOKEN` first.
-
-`GITHUB_TOKEN` is accepted too. The token path uses the GitHub API directly, so it works on
-headless hosts (CI, containers, a fresh VM) that have a token but no `gh` CLI. Other knobs:
+Knobs:
 `OAM_VERSION` pins a tag, `OAM_INSTALL_DIR` moves the target directory, `OAM_GH_API` points
 at a GitHub Enterprise host.
 
