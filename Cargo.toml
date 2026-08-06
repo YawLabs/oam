@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 # Internal crates: oam ships BINARIES, nothing here goes to crates.io.
 # Also lets `cargo about` filter them out of THIRD_PARTY_LICENSES.md.
 publish = false
