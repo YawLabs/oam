@@ -327,8 +327,14 @@ fn process_rss_bytes(pid: u32) -> Option<u64> {
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
-        // Find the last quoted field (mem usage) e.g. "12,345 K"
-        let field = text.split(',').rev().take(2).collect::<Vec<_>>().concat();
+        // The memory field embeds a thousands separator, so splitting the line
+        // on ',' cuts THAT FIELD in half. The previous version did exactly
+        // that and rejoined the halves in reverse -- "22,220 K" parsed as
+        // 22022 -- so every RSS figure this ever reported on Windows was
+        // scrambled, plausibly enough to go unnoticed. Take the last QUOTED
+        // field instead, which is separator-agnostic.
+        let line = text.lines().find(|l| l.contains('"'))?;
+        let field = line.rsplit('"').nth(1)?;
         let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
         let kb: u64 = digits.parse().ok()?;
         Some(kb * 1024)
@@ -1240,4 +1246,50 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
         code,
         timed_out,
     })
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod rss_parse_tests {
+    /// The parse under test, kept in lockstep with `process_rss_bytes`'s
+    /// Windows arm. Extracted so it can be exercised without spawning a
+    /// process (the real function needs a live PID).
+    fn parse_tasklist_rss_kb(text: &str) -> Option<u64> {
+        let line = text.lines().find(|l| l.contains('"'))?;
+        let field = line.rsplit('"').nth(1)?;
+        let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    #[test]
+    fn thousands_separator_does_not_scramble_the_value() {
+        // Verbatim `tasklist /FO CSV /NH` output. The memory field carries a
+        // thousands separator, which the previous splitn-on-',' parse cut in
+        // half and rejoined backwards: 22,220 K came out as 22022.
+        let real = r#""System","4","Services","0","22,220 K""#;
+        assert_eq!(parse_tasklist_rss_kb(real), Some(22220));
+
+        // Bigger values are where the old parse went furthest wrong: this one
+        // reported 79284 (77.4 MB) for a process actually holding 82.8 MB.
+        let big = r#""oam.exe","31448","Console","1","84,792 K""#;
+        assert_eq!(parse_tasklist_rss_kb(big), Some(84792));
+
+        // Millions carry two separators -- the old parse kept only two of the
+        // three fragments and dropped the leading digits entirely.
+        let huge = r#""chrome.exe","9012","Console","1","1,234,567 K""#;
+        assert_eq!(parse_tasklist_rss_kb(huge), Some(1234567));
+
+        // Under 1000 K there is no separator at all, which is the ONLY shape
+        // the old parse got right -- hence it looked like it worked.
+        let small = r#""tiny.exe","7","Console","1","840 K""#;
+        assert_eq!(parse_tasklist_rss_kb(small), Some(840));
+    }
+
+    #[test]
+    fn a_dead_pid_yields_none_rather_than_a_bogus_number() {
+        // tasklist prints this to stdout when the filter matches nothing. It
+        // must not parse as a memory figure.
+        let gone = "INFO: No tasks are running which match the specified criteria.";
+        assert_eq!(parse_tasklist_rss_kb(gone), None);
+        assert_eq!(parse_tasklist_rss_kb(""), None);
+    }
 }
