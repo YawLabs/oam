@@ -157,6 +157,36 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
   return 0
 }
 
+# free_locked_binary <path>
+# Windows refuses to DELETE or overwrite a RUNNING .exe, so cargo's link step
+# dies with "failed to remove file <path>: Access is denied (os error 5)". It
+# does allow RENAMING one: the running processes keep their handle to the
+# renamed file and carry on, and the name is free for the new build.
+#
+# This used to be `taskkill //F //IM oam.exe`, which is both hostile and racy.
+# The release binary is what live typed-cli sessions run
+# (`target/release/oam.exe run ~/.config/typed/typed-cli/cli.mjs -- --resume`),
+# so the kill took out the operator's OTHER agent panes -- and they come back
+# on --resume within seconds, re-locking the file before the link step reached
+# it. Observed on the v0.8.2 attempt: three sessions all restarted at 16:40:22
+# and the build failed anyway. A rename kills nothing and cannot lose that race.
+free_locked_binary() {
+  local path="$1" parked
+  [ -f "$path" ] || return 0
+  parked="$path.inuse-$(date +%s)"
+  mv "$path" "$parked" 2>/dev/null || true
+  # Best effort: Windows will not unlink it while a process still has the image
+  # mapped, and that is fine -- a parked copy is some MB inside gitignored
+  # target/, and the sweep below reaps it on a later run once the holder exits.
+  rm -f "$parked" 2>/dev/null || true
+  rm -f "$path".inuse-* 2>/dev/null || true
+  if [ -f "$path" ]; then
+    fail "could not free $path -- something holds it that a rename cannot dislodge (check: Get-Process oam | Select-Object Id,Path)"
+  fi
+  ok "parked the in-use $(basename "$path") (live sessions left running)"
+  return 0
+}
+
 # push_bump_to_main <commit-subject> <expected-version>
 # main carries a ruleset (verified signatures + PR-only). This account holds
 # bypass, so a direct push lands and GitHub just prints "Bypassed rule
@@ -367,9 +397,10 @@ fi
 
 # --- local Windows legs ---------------------------------------------------------
 step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
-# The resident type-check daemon holds oam.exe open; kill before rebuild.
-# (Same precedent as scripts/release-upload-local-arm64.sh.)
-taskkill //F //IM oam.exe 2>/dev/null || true
+# Live processes run this exact file -- typed-cli sessions, the resident
+# type-check daemon. Park it rather than killing them (see free_locked_binary;
+# scripts/release-upload-local-arm64.sh still has the old taskkill).
+free_locked_binary target/release/oam.exe
 cargo build --release -p oam_cli
 cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
