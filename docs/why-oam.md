@@ -56,13 +56,14 @@ its own module ecosystem. Those are not goals here.
 ## vs Bun
 
 Bun is faster than oam at several things and the benchmark table says so
-plainly — it wins `url-parse`, `http-throughput`, `fs-read` and `crypto-hash`
-on the same hardware. If raw single-process throughput is what you are
-optimising, benchmark Bun.
+plainly — it wins `url-parse`, `http-throughput` and `crypto-hash` on the same
+hardware, the last of them by 5x. If raw single-process throughput is what you
+are optimising, benchmark Bun. (Node, not Bun, is the one to beat on `fs-read`,
+and it does — narrowly.)
 
 oam wins where the workload is **spawn-heavy and short-lived**, which is exactly
-the MCP sidecar shape: `mcp-cold-start` 28ms vs Bun's 328ms, `mcp-idle-rss` 41MB
-vs 75MB, `mcp-first-call-latency` 0.32ms vs 3.63ms. A broker that starts a dozen
+the MCP sidecar shape: `mcp-cold-start` 35ms vs Bun's 339ms, `mcp-idle-rss` 25MB
+vs 97MB, `mcp-first-call-latency` 0.30ms vs 3.53ms. A broker that starts a dozen
 sidecars pays those costs a dozen times.
 
 Bun is also a bundler, test runner, and package manager. oam is not trying to be
