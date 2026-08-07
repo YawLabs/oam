@@ -111,6 +111,9 @@ SKIP_MAC="${OAM_SKIP_MAC:-0}"
 SKIP_LINUX="${OAM_SKIP_LINUX:-0}"
 
 RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
+# Separate from RELEASE_DIR on purpose: `gh release create "$RELEASE_DIR"/*`
+# uploads everything in there, so the stamp stash cannot live inside it.
+STAMP_STASH="$(mktemp -d -t oam-stamps-"$TAG"-XXXXXX)"
 
 # smoke <oam-binary>: ci.yml's smoke assertion, run on every staged binary
 # this box can execute (win-arm64 native; win-x64 under the OS emulation).
@@ -121,7 +124,11 @@ smoke() {
   # Guarded capture: under set -e a crash inside $() would kill the script
   # with no diagnostic and leak $d. 5-min ceiling = ci.yml's
   # timeout-minutes: 5 on the smoke step.
-  if ! out="$(timeout 300 "$bin" run "$d/smoke.js")"; then
+  #
+  # OAM_DAEMON_IDLE_MS: a type-check daemon spawned here would detach and idle
+  # for THIRTY MINUTES holding this very file -- the asset the release is about
+  # to checksum and upload. Cap it; smoke never needs a warm daemon.
+  if ! out="$(OAM_DAEMON_IDLE_MS=1500 timeout 300 "$bin" run "$d/smoke.js")"; then
     rm -rf "$d"
     fail "smoke run failed (crash or 5-min hang) for $bin"
   fi
@@ -137,18 +144,26 @@ smoke() {
 # regenerated, reproducible by re-running xtask at this commit, and
 # restoring keeps the tree the remote legs tar byte-identical to the tag.
 CONFORMANCE_ARTIFACTS=(CONFORMANCE.md CONFORMANCE-NODE.md conformance/scorecard.json conformance/node-suite-scorecard.json)
-restore_gate_artifacts() {  # restore_gate_artifacts <context>
-  local dirty line path only_artifacts=1
+# only_stamps_dirty -- 0 when every dirty path (if any) is one of the four
+# gate-regenerated conformance artifacts. Here-string, not a pipe, so the
+# early `return 1` leaves the FUNCTION rather than a subshell.
+only_stamps_dirty() {
+  local dirty line path
   dirty="$(git status --porcelain)"
   [ -n "$dirty" ] || return 0
   while IFS= read -r line; do
     path="${line:3}"
     case "$path" in
       CONFORMANCE.md | CONFORMANCE-NODE.md | conformance/scorecard.json | conformance/node-suite-scorecard.json) ;;
-      *) only_artifacts=0 ;;
+      *) return 1 ;;
     esac
   done <<<"$dirty"
-  if [ "$only_artifacts" = "1" ]; then
+  return 0
+}
+
+restore_gate_artifacts() {  # restore_gate_artifacts <context>
+  [ -n "$(git status --porcelain)" ] || return 0
+  if only_stamps_dirty; then
     warn "$1: discarding gate-regenerated conformance artifacts (reproducible via xtask at this commit)"
     # HEAD explicitly (a bare `checkout --` restores from the INDEX and
     # would leave a staged artifact change dirty behind the warn).
@@ -157,37 +172,26 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
   return 0
 }
 
-# free_locked_binary <path>
-# Windows refuses to DELETE or overwrite a RUNNING .exe, so cargo's link step
-# dies with "failed to remove file <path>: Access is denied (os error 5)". It
-# does allow RENAMING one: the running processes keep their handle to the
-# renamed file and carry on, and the name is free for the new build.
-#
-# This used to be `taskkill //F //IM oam.exe`, which is both hostile and racy.
-# The release binary is what live typed-cli sessions run
-# (`target/release/oam.exe run ~/.config/typed/typed-cli/cli.mjs -- --resume`),
-# so the kill took out the operator's OTHER agent panes -- and they come back
-# on --resume within seconds, re-locking the file before the link step reached
-# it. Observed on the v0.8.2 attempt: three sessions all restarted at 16:40:22
-# and the build failed anyway. A rename kills nothing and cannot lose that race.
+# A build output cannot be replaced while something is mid-launch from it, and
+# oam self-spawns detached daemons that keep re-entering that window.
+# scripts/lib/build-locks.sh carries the measurements and the reason parking
+# beats killing here: the release binary is what the operator's live typed-cli
+# panes execute, and killing them makes them all restart into that same window.
+# shellcheck source=lib/build-locks.sh
+. "$SCRIPT_DIR/lib/build-locks.sh"
+
+# free_locked_binary <path> -- park it, or die with something actionable.
 free_locked_binary() {
-  local path="$1" parked
-  [ -f "$path" ] || return 0
-  parked="$path.inuse-$(date +%s)"
-  mv "$path" "$parked" 2>/dev/null || true
-  # Best effort: Windows will not unlink it while a process still has the image
-  # mapped, and that is fine -- a parked copy is some MB inside gitignored
-  # target/, and the sweep below reaps it on a later run once the holder exits.
-  rm -f "$parked" 2>/dev/null || true
-  rm -f "$path".inuse-* 2>/dev/null || true
-  if [ -f "$path" ]; then
-    fail "could not free $path -- something holds it that a rename cannot dislodge (check: Get-Process oam | Select-Object Id,Path)"
-  fi
+  local path="$1"
+  oam_reap_parked "$(dirname "$path")"
+  [ -e "$path" ] || return 0
+  oam_park_file "$path" \
+    || fail "could not free $path -- something holds it that a rename cannot dislodge (find it: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath)"
   ok "parked the in-use $(basename "$path") (live sessions left running)"
   return 0
 }
 
-# push_bump_to_main <commit-subject> <expected-version>
+# land_on_main <commit-subject> <expected-version>
 # main carries a ruleset (verified signatures + PR-only). This account holds
 # bypass, so a direct push lands and GitHub just prints "Bypassed rule
 # violations" -- that notice is the NORMAL path here, not a failure, and
@@ -200,30 +204,30 @@ free_locked_binary() {
 # end to end and unattended -- branch, PR, `gh pr merge --admin` (the
 # documented override for a ruleset-gated merge) -- then realign local main to
 # whatever origin ended up with, because a squash merge mints a new SHA.
-push_bump_to_main() {
+land_on_main() {
   local subject="$1" want_version="$2" branch_name merged_sha
   if git push origin main; then
-    ok "bump pushed to main"
+    ok "landed on main: $subject"
     return 0
   fi
   warn "direct push to main rejected (no rule bypass in play) -- routing through a PR with --admin"
-  branch_name="release/bump-$(git rev-parse --short HEAD)"
+  branch_name="release/land-$(git rev-parse --short HEAD)"
   git push -q origin "HEAD:refs/heads/$branch_name" \
     || fail "could not push $branch_name -- the bump commit is local-only; land it by hand and re-run"
   gh pr create --repo "$REPO" --base main --head "$branch_name" \
-    --title "$subject" --body "Automated version bump from scripts/release-local.sh." >/dev/null \
-    || fail "could not open the bump PR for $branch_name"
+    --title "$subject" --body "Automated release-flow commit from scripts/release-local.sh." >/dev/null \
+    || fail "could not open the PR for $branch_name"
   gh pr merge "$branch_name" --repo "$REPO" --squash --admin --delete-branch >/dev/null \
-    || fail "could not merge the bump PR even with --admin -- this account may not hold bypass; merge $branch_name by hand and re-run"
+    || fail "could not merge $branch_name even with --admin -- this account may not hold bypass; merge it by hand and re-run"
   git fetch -q origin main || fail "could not fetch origin/main after the merge"
   merged_sha="$(git rev-parse origin/main)"
-  # Discards exactly one thing: the local bump commit, now superseded by the
-  # squashed equivalent on origin. The tree was clean before the bump, and the
-  # version assertion below proves the content survived the round trip.
+  # Discards exactly one thing: the local commit, now superseded by its squashed
+  # equivalent on origin. The tree was clean before it, and the assertion below
+  # proves the release version survived the round trip.
   git reset --hard "$merged_sha" >/dev/null || fail "could not realign local main to origin/main"
   [ "$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)" = "$want_version" ] \
-    || fail "origin/main does not carry the $want_version bump after the merge -- inspect $REPO"
-  ok "bump merged via PR (--admin), local main realigned to $merged_sha"
+    || fail "origin/main is not at version $want_version after the merge -- inspect $REPO"
+  ok "landed via PR (--admin): $subject; local main realigned to $merged_sha"
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -323,8 +327,8 @@ else
   # Pushed here, not left local: the tag push below drags the tagged commit
   # along with it, and a release must never point at a commit that only exists
   # on this box. Rule bypass (or --admin, if the bypass is not in play) is the
-  # expected path -- see push_bump_to_main.
-  push_bump_to_main "chore(release): bump workspace version to $tag_version" "$tag_version"
+  # expected path -- see land_on_main.
+  land_on_main "chore(release): bump workspace version to $tag_version" "$tag_version"
   ok "bumped $crate_version -> $tag_version and landed on main"
 fi
 
@@ -379,6 +383,18 @@ remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev
 [ "$remote_tag_obj" = "$(git rev-parse "$TAG")" ] \
   || fail "remote tag $TAG ($remote_tag_obj) != local tag -- origin disagrees after push"
 
+# Advisory only. cargo never GCs hash-named build outputs, so target/ grows
+# without bound -- 115GB across the three trees on 2026-08-06, of which
+# scripts/gc-target.sh found 101GB superseded. What actually breaks a release
+# is the DISK filling, and a release writes three target trees plus a full x64
+# rebuild, so check free space rather than target/ size: `du -s target` walks
+# ~700k files and costs ~30s, which is not a price an advisory should charge
+# every run. df is O(1).
+free_gb="$(df -k . 2>/dev/null | awk 'NR==2 {print int($4 / 1024 / 1024); exit}')"
+if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
+  warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; prune with scripts/gc-target.sh"
+fi
+
 [ "$SKIP_MAC" = "1" ]   || [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
 ok "preflight ok (tag on remote, HEAD == $TAG, tree clean)"
@@ -389,9 +405,15 @@ if [ "$SKIP_LOCAL_GATE" = "1" ]; then
 else
   step "Local CI gate (scripts/ci-local.sh)"
   bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
-  # The gate just refreshed the conformance stamps; restore them so the
-  # remote legs build from a tree byte-identical to the tag and the release
-  # ends with a clean tree (no post-release stamp-refresh commit needed).
+  # The gate just refreshed the conformance stamps AT THIS VERSION AND COMMIT.
+  # They still cannot ship in the build -- the remote legs tar the working tree
+  # and it must stay byte-identical to the tag -- so stash them, restore the
+  # tree, and commit them after the release publishes. Without that last step
+  # the committed scorecards keep reporting the PREVIOUS release's version
+  # forever, which is exactly what they did up to v0.8.1.
+  for f in "${CONFORMANCE_ARTIFACTS[@]}"; do
+    if [ -f "$f" ]; then cp "$f" "$STAMP_STASH/${f//\//_}"; fi
+  done
   restore_gate_artifacts "post-gate"
 fi
 
@@ -528,6 +550,28 @@ else
     git -C "$SITE_DIR" push -q
     ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 )       && ok "oamjs.org installers republished"       || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
   fi
+fi
+
+# The gate regenerated these at this version and commit; restore_gate_artifacts
+# then threw them away so the remote legs would build a tree byte-identical to
+# the tag. Land them NOW, after the release is published, so the committed
+# scorecards describe the release that exists instead of the one before it.
+# Deliberately last-ish and non-fatal in spirit: the release is already out, and
+# a stamp commit that cannot land is a documentation gap, not a bad release.
+step "Land the conformance stamps the gate regenerated"
+for f in "${CONFORMANCE_ARTIFACTS[@]}"; do
+  stash="$STAMP_STASH/${f//\//_}"
+  if [ -f "$stash" ]; then cp "$stash" "$f"; fi
+done
+if git diff --quiet -- "${CONFORMANCE_ARTIFACTS[@]}"; then
+  ok "conformance stamps already describe $TAG"
+elif ! only_stamps_dirty; then
+  warn "tree carries non-stamp changes -- leaving the refreshed stamps uncommitted for you to review"
+else
+  git add "${CONFORMANCE_ARTIFACTS[@]}" || fail "could not stage the conformance stamps"
+  git commit -q -m "chore(release): refresh conformance stamps for $TAG" \
+    || fail "could not commit the conformance stamps"
+  land_on_main "chore(release): refresh conformance stamps for $TAG" "$tag_version"
 fi
 
 # Verify what the SITE actually serves, not what we just uploaded: a stale CDN

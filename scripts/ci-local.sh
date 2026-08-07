@@ -69,6 +69,23 @@ ok()  { echo -e "${GRN}  [ok]${NC} $*"; }
 warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
 ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 
+# A build output cannot be replaced while a process is mid-launch from it, and
+# oam leaves detached self-spawned daemons behind that keep re-entering that
+# window (mechanism + measurements in the lib's header).
+# shellcheck source=lib/build-locks.sh
+. scripts/lib/build-locks.sh
+
+# Leftovers under target/debug are, by definition, orphans of an earlier run:
+# nothing a human uses long-term runs out of the debug tree. Clearing them
+# before a step that relinks is what keeps LNK1104 from surfacing at the worst
+# possible moment (mid-release). Scoped to target/debug BY PATH, so a live
+# `target/release/oam.exe` typed-cli session is out of reach by construction.
+clear_debug_holders() {
+  oam_kill_under "$PWD/target/debug"
+  oam_reap_parked target/debug
+  oam_reap_parked target/debug/deps
+}
+
 # ONE EXIT trap for the whole script: a second `trap ... EXIT` silently REPLACES
 # the first, so every temp path registers here instead of installing its own.
 CLEANUP_PATHS=()
@@ -95,6 +112,12 @@ else
 fi
 
 say "3/9 Build (cargo build --workspace)"
+clear_debug_holders
+# Fallback for a holder the kill could not reach (elevated process, AV handle):
+# renaming works where deleting does not, and re-uplifting the binary from
+# deps/ is near-free -- cargo hardlinks it, it does not relink.
+oam_park_file target/debug/oam.exe \
+  || ko "target/debug/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
 if cargo build --workspace; then
   ok "build ok"
 else
@@ -107,16 +130,32 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
     || warn "tsgo not on PATH -- oam-check tests will self-skip (npm install -g @typescript/native-preview)"
+  # The harnesses cargo is about to relink are exactly the images a previous
+  # run's orphans are still executing.
+  clear_debug_holders
   # ci.yml bounded a hung test at 15 min (the deadlocked/lingering test
   # class). Git Bash ships coreutils timeout; macOS needs brew coreutils
   # (gtimeout) -- unbounded as the last resort.
+  #
+  # -k 30 matters as much as the ceiling: plain `timeout` TERMs CARGO only.
+  # The test binaries cargo already launched, and the detached daemons THOSE
+  # spawned, sit in other process groups and survive -- which is how one hung
+  # run poisons the NEXT run's link step. KILL after 30s, then reap by image
+  # path below whatever the outcome was.
+  test_status=0
   if command -v timeout >/dev/null 2>&1; then
-    timeout 900 cargo test --workspace || ko "tests failed (or hit the 15-min hang ceiling)"
+    timeout -k 30 900 cargo test --workspace || test_status=$?
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout 900 cargo test --workspace || ko "tests failed (or hit the 15-min hang ceiling)"
+    gtimeout -k 30 900 cargo test --workspace || test_status=$?
   else
-    cargo test --workspace || ko "tests failed"
+    cargo test --workspace || test_status=$?
   fi
+  # Unconditional, and BEFORE the failure exit: a failed or timed-out run leaks
+  # more orphans than a clean one, and the smoke step below executes
+  # target/debug/oam.
+  clear_debug_holders
+  [ "$test_status" -eq 0 ] \
+    || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
   say "4/9 Tests SKIPPED (--no-tests)"
@@ -128,10 +167,16 @@ CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
 # Guarded capture (a crash inside $() under set -e dies without a message)
 # + ci.yml's 5-min smoke ceiling where a timeout tool exists.
+#
+# OAM_DAEMON_IDLE_MS: without it the type-check daemon this run may spawn idles
+# for THIRTY MINUTES (crates/oam_ts/src/daemon.rs), detached, holding
+# target/debug/oam.exe -- long enough to break the next gate's link step. The
+# e2e suite already pins 45s for the same reason; the smoke step never needs a
+# warm daemon at all.
 if command -v timeout >/dev/null 2>&1; then
-  out=$(timeout 300 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
+  out=$(OAM_DAEMON_IDLE_MS=1500 timeout 300 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crash or 5-min hang)"
 else
-  out=$(./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
+  out=$(OAM_DAEMON_IDLE_MS=1500 ./target/debug/oam run "$SMOKE_DIR/smoke.js") || ko "smoke run failed (crashed)"
 fi
 if [ "$out" = "ci smoke 42" ]; then
   ok "smoke ok"

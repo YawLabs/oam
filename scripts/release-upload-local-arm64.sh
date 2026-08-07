@@ -17,7 +17,10 @@ REPO="YawLabs/oam"
 TARGET="aarch64-pc-windows-msvc"
 ASSET="oam-${TARGET}.exe"
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+# shellcheck source=lib/build-locks.sh
+. "$SCRIPT_DIR/lib/build-locks.sh"
 
 # The uploaded binary must be built from the tag's commit, not whatever the
 # working tree happens to hold.
@@ -42,8 +45,16 @@ if [ "$remote_tag_obj" != "$local_tag_obj" ]; then
   exit 1
 fi
 
-# The resident type-check daemon holds oam.exe open; kill before rebuild.
-taskkill //F //IM oam.exe 2>/dev/null || true
+# Live typed-cli sessions run this exact file. `taskkill //F //IM oam.exe`
+# (what this used to do) killed the operator's other agent panes AND made the
+# failure MORE likely: every killed session restarts on --resume, and a process
+# mid-launch is precisely what denies the link step this path. Renaming frees
+# it without touching a single process -- see scripts/lib/build-locks.sh.
+oam_reap_parked target/release
+if ! oam_park_file target/release/oam.exe; then
+  echo "error: target/release/oam.exe is locked and a rename could not free it" >&2
+  exit 1
+fi
 cargo build --release -p oam_cli
 
 tmp="$(mktemp -d)"
