@@ -13,6 +13,32 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ### Added
 
+- **`--allow-net` and `--allow-env` grants**, with env access actually enforced,
+  and **`--carrier` for cross-target `oam compile`** — the compile step can now
+  be handed a carrier binary for a target other than the build host.
+
+### Fixed
+
+- **The benchmark harness timed a binary `cargo` could replace mid-run.** `oam`
+  is now staged out of `target/` before timing, so a concurrent build cannot
+  swap the file underneath a measurement. This invalidated earlier published
+  numbers.
+
+## [0.8.2] - 2026-08-06
+
+Release tooling and benchmark measurement only; no runtime behavior change.
+
+### Fixed
+
+- The release flow parks an in-use `oam.exe` by renaming it instead of killing
+  whatever process holds it, and lands the version bump on `main` unattended.
+- The Windows RSS parser no longer scrambles every reading; benchmarks were
+  republished against 0.8.1 with the working parser.
+
+## [0.8.1] - 2026-08-05
+
+### Added
+
 - **Node's own streams.** `require('node:stream')` is now served by a vendored
   copy of Node v22's `internal/streams` sources running over a shim prelude,
   replacing oam's in-house implementation, which was deleted.
@@ -174,7 +200,9 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/YawLabs/oam/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/YawLabs/oam/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/YawLabs/oam/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/YawLabs/oam/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/YawLabs/oam/releases/tag/v0.6.1
