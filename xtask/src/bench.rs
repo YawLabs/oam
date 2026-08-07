@@ -80,27 +80,28 @@ impl Drop for StagedBinary {
 /// any timing starts.
 ///
 /// WHY THIS EXISTS
-/// On Windows an on-access virus scanner rescans a binary living in a build
-/// output directory on EVERY exec, while `node.exe` and `bun.exe` are
-/// installed, signed, and long since cached. Benchmarking the two against each
-/// other then measures the scanner, not the runtime -- and the whole penalty
-/// lands on oam, the one binary under test.
+/// `target/` is not a stable place to measure from. Its contents change
+/// underneath a running benchmark: a concurrent `cargo build` -- another
+/// terminal, an editor checking on save, a sibling agent -- replaces the binary
+/// mid-run, and freshly-written bytes are cold where the installed `node.exe`
+/// and `bun.exe` they are compared against are warm. The asymmetry lands
+/// entirely on oam, the one binary under test.
 ///
-/// Measured on a windows-aarch64 host with McAfee active (Defender passive),
-/// identical bytes, interleaved runs of `--version`:
+/// CORRECTION, recorded because the first version of this comment was wrong.
+/// It claimed an on-access scanner rescans build outputs on EVERY exec and
+/// cited 306 ms from `target/` against 61 ms staged -- a 5.0x handicap. That
+/// does NOT reproduce: the same interleaved comparison on a settled tree
+/// measures 1.03x. The original numbers were taken while a concurrent session
+/// was rebuilding oam, so each exec hit different bytes -- mtime and size both
+/// moved during the run. It was a moving file, not a permanent per-exec scan.
 ///
-///   target/release/oam.exe ... 306 ms median
-///   staged copy ..............  61 ms median   (after one warming exec)
+/// The mitigation is unchanged and still correct: a private copy is stable for
+/// the duration of the run no matter what cargo does to `target/`. But it
+/// defends against a moving target rather than a scanner, and the magnitude is
+/// situational rather than a fixed 5x.
 ///
-/// A 5.0x handicap applied to oam and to nothing it is compared against. The
-/// first exec of the staged copy took 2366 ms -- that is the one-time scan,
-/// which is exactly what the warming call below absorbs.
-///
-/// Staging puts oam in the same on-disk situation as the other runtimes: an
-/// ordinary file in an ordinary directory the scanner has already seen. It
-/// disables nothing and needs no privileges. On a host with no scanner, or one
-/// where the build directory is already excluded, this is a file copy and a
-/// warming exec that change no result.
+/// Staging disables nothing and needs no privileges. Where nothing is
+/// rebuilding concurrently it is a file copy that changes no result.
 ///
 /// Failure is non-fatal -- a bench run with a warning beats no bench run.
 fn stage_for_benchmark(oam: &Path) -> Result<(PathBuf, StagedBinary)> {
@@ -619,8 +620,8 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
 pub fn run(release: bool, compare: bool) -> Result<()> {
     let repo = repo_root()?;
     let oam = ensure_oam_built(&repo, release)?;
-    // Time an ordinary file in an ordinary directory, not a build artifact a
-    // virus scanner re-examines on every exec. See stage_for_benchmark.
+    // Time a file nothing else is writing to, not a build artifact `cargo` may
+    // replace mid-run. See stage_for_benchmark.
     // `_staged` must stay alive for the whole run: dropping it deletes the copy.
     let (oam, _staged) = match stage_for_benchmark(&oam) {
         Ok((path, guard)) => (path, Some(guard)),
@@ -1111,15 +1112,14 @@ fn build_markdown(
         "cargo run -p xtask -- bench --compare  # also node and bun, when on PATH\n",
         "```\n\n",
         "The oam binary is copied out of `target/` and exec'd once before timing starts. ",
-        "On Windows an on-access virus scanner rescans a binary in a build output ",
-        "directory on every exec, while `node.exe` and `bun.exe` are installed, signed ",
-        "and long since cached -- so timing them against each other measures the scanner, ",
-        "and the entire penalty lands on the one binary under test. Observed on a ",
-        "windows-aarch64 host with McAfee active: identical bytes, 306ms median out of ",
-        "`target/release/` versus 61ms staged, a 5.0x handicap. Staging is a file copy, ",
-        "needs no privileges, and is a no-op where no scanner interferes. If you compare ",
-        "these numbers against a hand-rolled `target/release/oam` invocation, that is ",
-        "why yours will look slower.\n\n",
+        "A build directory is not a stable place to measure from: a concurrent `cargo ",
+        "build` replaces the binary mid-run, and fresh bytes are cold where the installed ",
+        "`node.exe` and `bun.exe` they are compared against are warm -- an asymmetry that ",
+        "lands entirely on the one binary under test. Staging gives the run a private copy ",
+        "nothing else is writing to. It is a file copy, needs no privileges, and changes no ",
+        "result when nothing is rebuilding concurrently. If you hand-roll a ",
+        "`target/release/oam` invocation while a build is running, that is why yours will ",
+        "disagree.\n\n",
         "Each case is timed in-process by the harness rather than by a shell wrapper, ",
         "except `cold-start` and `mcp-cold-start`, which are wall-clock from process ",
         "spawn and can only be measured from outside. A runtime that is not on PATH is ",
