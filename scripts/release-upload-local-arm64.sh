@@ -37,8 +37,19 @@ fi
 
 # Local tag must match the remote tag -- otherwise this clobbers a good asset
 # with a binary built from a commit users' tag will never resolve to.
-remote_tag_obj="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null)" \
-  || { echo "error: tag ${TAG} is not on the remote -- push it first" >&2; exit 1; }
+#
+# Read through git's transport, not `gh api .../git/ref/tags/<tag>`: the REST
+# read path lags a push and 404s on a tag that is demonstrably on origin (see
+# origin_tag_object in release-local.sh for the run that cost). ls-remote also
+# separates "no such tag" (exit 0, empty) from "origin unreachable" (non-zero),
+# which the API form collapsed into one misleading "push it first".
+if ! remote_ls="$(git ls-remote --tags origin "refs/tags/${TAG}" 2>/dev/null)"; then
+  echo "error: could not reach origin to read tag ${TAG}" >&2; exit 1
+fi
+remote_tag_obj="$(printf '%s\n' "$remote_ls" | awk -v r="refs/tags/${TAG}" '$2 == r {print $1; exit}')"
+if [ -z "$remote_tag_obj" ]; then
+  echo "error: tag ${TAG} is not on the remote -- push it first" >&2; exit 1
+fi
 local_tag_obj="$(git rev-parse "$TAG")"
 if [ "$remote_tag_obj" != "$local_tag_obj" ]; then
   echo "error: remote tag ${TAG} (${remote_tag_obj}) != local tag (${local_tag_obj}) -- local and origin disagree" >&2

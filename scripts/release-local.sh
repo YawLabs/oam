@@ -105,6 +105,37 @@ warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
 fail(){ echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 step(){ echo -e "\n${CYA}=== $* ===${NC}" >&2; }
 
+# origin_tag_object <tag>: the tag OBJECT sha on origin -- the annotated tag
+# object for an annotated tag, the commit for a lightweight one. That is
+# exactly what `git rev-parse <tag>` yields locally, so the two sides compare
+# like with like.
+#
+# Asks git's own transport, NOT `gh api repos/<repo>/git/ref/tags/<tag>`, which
+# is what every caller here used to do. The REST read path lags the git push,
+# and deleting the same ref immediately before makes the stale 404 stick for
+# seconds: the v0.8.3 run pushed the tag fine, read it back through the API one
+# statement later, got a 404, and died on "tag is not on the remote after push"
+# with the tag sitting on origin the entire time. ls-remote queries the same
+# server the push just finished talking to, so it cannot disagree with the push.
+#
+# Prints the sha (EMPTY when the tag is absent) and returns 0; returns non-zero
+# ONLY when origin was unreachable. Callers must keep those apart -- the old
+# `|| true` collapsed them, so a transient blip read as "no remote tag", skipped
+# the remote-tag delete below, and surfaced as an unexplained rejected push.
+origin_tag_object() {
+  local tag="$1" out attempt
+  for attempt in 1 2 3; do
+    if out="$(git ls-remote --tags origin "refs/tags/$tag" 2>/dev/null)"; then
+      # An annotated tag can also emit a "<ref>^{}" peeled line; match the ref
+      # exactly so the unpeeled object is what comes back.
+      printf '%s\n' "$out" | awk -v r="refs/tags/$tag" '$2 == r {print $1; exit}'
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then sleep 2; fi
+  done
+  return 1
+}
+
 SKIP_LOCAL_GATE="${OAM_SKIP_LOCAL_GATE:-0}"
 SKIP_WIN_X64="${OAM_SKIP_WIN_X64:-0}"
 SKIP_MAC="${OAM_SKIP_MAC:-0}"
@@ -344,7 +375,7 @@ git merge-base --is-ancestor "$head_sha" origin/main 2>/dev/null \
 # Reconcile the tag to HEAD, creating or re-pointing as needed. Safe only
 # because the release-exists check above already proved this tag is unpublished;
 # moving a published tag would orphan the assets built from it.
-# `git rev-parse <tag>` and the API's object.sha agree for both lightweight
+# `git rev-parse <tag>` and origin_tag_object agree for both lightweight
 # (commit SHA) and annotated (tag-object SHA) tags, so compare like with like.
 # --verify --quiet is load-bearing: plain `git rev-parse <unknown-ref>` ECHOES
 # the argument on stdout as well as failing, so these came back as the literal
@@ -353,7 +384,11 @@ git merge-base --is-ancestor "$head_sha" origin/main 2>/dev/null \
 # trying to delete a tag that was never there -- breaking every NEW release tag.
 local_tag_obj="$(git rev-parse --verify --quiet "$TAG" 2>/dev/null || true)"
 local_tag_commit="$(git rev-parse --verify --quiet "${TAG}^{commit}" 2>/dev/null || true)"
-remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null || true)"
+# Hard-fail rather than `|| true` on an unreachable origin: an empty answer
+# here decides whether the remote tag gets deleted below, and guessing "absent"
+# when the truth is "unknown" is what turns a network blip into a rejected push.
+remote_tag_obj="$(origin_tag_object "$TAG")" \
+  || fail "could not reach origin to read tag $TAG -- check the network and re-run"
 
 if [ "$local_tag_commit" = "$head_sha" ] \
    && [ -n "$remote_tag_obj" ] && [ "$remote_tag_obj" = "$local_tag_obj" ]; then
@@ -378,8 +413,9 @@ fi
 # Re-read both sides from disk/remote rather than trusting what we just wrote.
 tag_sha="$(git rev-parse "${TAG}^{commit}" 2>/dev/null)" || fail "tag $TAG missing after reconciliation"
 [ "$tag_sha" = "$head_sha" ] || fail "tag $TAG ($tag_sha) still is not HEAD ($head_sha)"
-remote_tag_obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null)" \
-  || fail "tag $TAG is not on the remote after push"
+remote_tag_obj="$(origin_tag_object "$TAG")" \
+  || fail "could not reach origin to verify tag $TAG after push"
+[ -n "$remote_tag_obj" ] || fail "tag $TAG is not on the remote after push"
 [ "$remote_tag_obj" = "$(git rev-parse "$TAG")" ] \
   || fail "remote tag $TAG ($remote_tag_obj) != local tag -- origin disagrees after push"
 
