@@ -324,12 +324,20 @@ fn main() -> ExitCode {
             } else if arg == "--allow-net" {
                 // Bare form grants everything, stored as the same "*" the list
                 // form uses so `grant()` below needs no extra case.
+                if let Some(msg) = space_form_hint("--allow-net", raw.get(i + 1)) {
+                    eprintln!("{msg}");
+                    return ExitCode::from(9);
+                }
                 flags.allow_net = Some("*".to_string());
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-env=") {
                 flags.allow_env = Some(list.to_string());
                 i += 1;
             } else if arg == "--allow-env" {
+                if let Some(msg) = space_form_hint("--allow-env", raw.get(i + 1)) {
+                    eprintln!("{msg}");
+                    return ExitCode::from(9);
+                }
                 flags.allow_env = Some("*".to_string());
                 i += 1;
             } else if arg == "--allow-child-process" {
@@ -2044,6 +2052,44 @@ fn ends_with_compile_magic(bytes: &[u8]) -> bool {
     tail == COMPILE_MAGIC.as_slice() || tail == COMPILE_MAGIC_V2.as_slice()
 }
 
+/// Catch the space-separated grant form (`--allow-net 127.0.0.1:5432`) that
+/// Deno accepts and oam does not.
+///
+/// A bare `--allow-net` consumes only itself, so the next token falls through
+/// as the script path -- and the run dies with "cannot find module
+/// 127.0.0.1:5432", which points at the wrong thing entirely. The test is
+/// "the next token is not a flag AND does not exist on disk": the script must
+/// exist for the run to succeed at all, so a non-existent non-flag there is
+/// always a mistake, whether a space-form grant or a typo'd path. Returns the
+/// message to print, or None when the argument is fine.
+///
+/// `--allow-fs-read` has no bare form, so this ambiguity is unique to the two
+/// grants that do.
+fn space_form_hint(flag: &str, next: Option<&String>) -> Option<String> {
+    let next = next?;
+    if next.starts_with('-') || Path::new(next).exists() {
+        return None;
+    }
+    Some(format!(
+        "oam: `{flag} {next}` -- {flag} takes its list with '=' (e.g. {flag}={next}), not a space.\n\
+         A bare {flag} grants everything; as written, '{next}' was taken as the script path and does not exist."
+    ))
+}
+
+/// Same check against a file, reading only its final 8 bytes. A carrier is a
+/// whole oam binary (tens of MB), so this must not slurp the file.
+fn file_ends_with_compile_magic(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    if f.metadata()?.len() < 8 {
+        return Ok(false);
+    }
+    let mut magic = [0u8; 8];
+    f.seek(SeekFrom::End(-8))?;
+    f.read_exact(&mut magic)?;
+    Ok(ends_with_compile_magic(&magic))
+}
+
 /// Inspect the tail of the current executable for an embedded payload.
 /// Returns `Some((source, bytecode))` where `bytecode` is `Some` only for a
 /// v2 binary that carries embedded V8 bytecode; `None` for a normal CLI
@@ -2627,8 +2673,12 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
             // a previous compile output would nest payloads, and the loader
             // reads the LAST magic footer -- so it would silently run the
             // older embedded program instead of this one.
-            match std::fs::read(p) {
-                Ok(bytes) if ends_with_compile_magic(&bytes) => {
+            //
+            // Read only the trailing 8 bytes. A carrier is a whole oam binary
+            // (~64 MB); slurping it to inspect a footer would allocate the
+            // entire file for an 8-byte check. Mirrors extract_embedded above.
+            match file_ends_with_compile_magic(p) {
+                Ok(true) => {
                     eprintln!(
                         "oam compile: carrier {} is already a compiled output (it ends with the \
                          payload magic). Pass a plain oam binary.",
@@ -2636,7 +2686,7 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
                     );
                     return ExitCode::FAILURE;
                 }
-                Ok(_) => {}
+                Ok(false) => {}
                 Err(e) => {
                     eprintln!("oam compile: could not read carrier {}: {e}", p.display());
                     return ExitCode::FAILURE;
@@ -2823,6 +2873,52 @@ mod tests {
         let mut v2 = b"a plain binary".to_vec();
         v2.extend_from_slice(super::COMPILE_MAGIC_V2);
         assert!(super::ends_with_compile_magic(&v2));
+    }
+
+    #[test]
+    fn file_magic_check_reads_only_the_tail() {
+        let dir = std::env::temp_dir().join(format!("oam-carrier-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = dir.join("plain.bin");
+        std::fs::write(&plain, vec![0u8; 4096]).unwrap();
+        assert!(!super::file_ends_with_compile_magic(&plain).unwrap());
+
+        let compiled = dir.join("compiled.bin");
+        let mut bytes = vec![0u8; 4096];
+        bytes.extend_from_slice(super::COMPILE_MAGIC_V2);
+        std::fs::write(&compiled, bytes).unwrap();
+        assert!(super::file_ends_with_compile_magic(&compiled).unwrap());
+
+        // Shorter than the magic must not error or panic on the seek.
+        let tiny = dir.join("tiny.bin");
+        std::fs::write(&tiny, b"abc").unwrap();
+        assert!(!super::file_ends_with_compile_magic(&tiny).unwrap());
+
+        // A missing carrier surfaces as Err, not a false negative.
+        assert!(super::file_ends_with_compile_magic(&dir.join("nope.bin")).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn space_form_hint_fires_only_on_a_nonexistent_non_flag() {
+        // The space form a Deno user would reach for.
+        assert!(
+            super::space_form_hint("--allow-net", Some(&"127.0.0.1:5432".to_string())).is_some()
+        );
+        assert!(super::space_form_hint("--allow-env", Some(&"DATABASE_URL".to_string())).is_some());
+
+        // A real script path is the legitimate next token -- must not fire.
+        let script = std::env::temp_dir().join(format!("oam-sfh-{}.mjs", std::process::id()));
+        std::fs::write(&script, "").unwrap();
+        let as_str = script.to_string_lossy().to_string();
+        assert!(super::space_form_hint("--allow-net", Some(&as_str)).is_none());
+        std::fs::remove_file(&script).ok();
+
+        // Another flag, or nothing at all, is fine.
+        assert!(super::space_form_hint("--allow-net", Some(&"--permission".to_string())).is_none());
+        assert!(super::space_form_hint("--allow-net", None).is_none());
     }
 
     #[test]
