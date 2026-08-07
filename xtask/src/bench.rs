@@ -112,7 +112,8 @@ fn stage_for_benchmark(oam: &Path) -> Result<(PathBuf, StagedBinary)> {
     // PID-suffixed so two runs on one machine cannot collide.
     let dir = std::env::temp_dir().join(format!("oam-bench-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating staging dir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating staging dir {}", dir.display()))?;
     let staged = dir.join(file_name);
     // fs::copy carries permission bits, so the exec bit survives on unix.
     std::fs::copy(oam, &staged)
@@ -203,56 +204,119 @@ fn stats(samples: &[f64]) -> (f64, f64, f64, f64, f64) {
     (p50, sorted[0], sorted[n - 1], p95, p99)
 }
 
-fn run_timed_case(
+/// Sample every runtime for one case, INTERLEAVED: one iteration of each
+/// runtime per round, round-robin, rather than one runtime's whole block
+/// before the next runtime starts.
+///
+/// Why this matters more than it looks. Blocked sampling makes the comparison
+/// hostage to whatever else the machine is doing: a load spike that lands
+/// during runtime A's block inflates A's median and never touches B's, so the
+/// ratio the table reports is drift, not a difference between the runtimes.
+/// The failure is silent -- every individual timing is real, the run reports no
+/// error, and the conclusion is simply wrong.
+///
+/// That is not hypothetical here. Measuring under contention on this project
+/// produced three separate wrong conclusions in one session ("oam is a
+/// cold-start regression", later a claimed 5.0x scanner penalty), each of which
+/// took a deliberate re-measurement to overturn. Interleaving spreads any spike
+/// across every runtime in the same round, so drift largely cancels in the
+/// comparison instead of being attributed to one side.
+///
+/// A failing runtime is recorded and skipped for the remaining rounds rather
+/// than aborting the case, so one broken runtime cannot destroy the others'
+/// samples. `stage_for_benchmark` handles the orthogonal problem of the binary
+/// being replaced mid-run.
+fn run_timed_case_interleaved(
     case_name: &str,
-    rt: &Runtime,
+    runtimes: &[Runtime],
     script: &Path,
     iters: usize,
     extra_args: &[String],
-) -> Result<CaseResult> {
-    print!("  {}/{case_name}: ", rt.name);
-    let mut samples = Vec::with_capacity(iters);
+) -> Vec<(String, Result<CaseResult>)> {
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(iters); runtimes.len()];
+    let mut failed: Vec<Option<String>> = vec![None; runtimes.len()];
+
+    // One line per case rather than per runtime: the rounds interleave, so
+    // per-runtime progress lines would interleave too and read as noise.
+    let names: Vec<&str> = runtimes.iter().map(|r| r.name.as_str()).collect();
+    print!("  {case_name} [{}]: ", names.join(" "));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     for i in 0..iters {
-        let out = run_with_timeout(&mut rt.build_cmd(script, extra_args), CASE_TIMEOUT)?;
-        if out.timed_out {
-            bail!("{}/{case_name}: iteration {i} timed out", rt.name);
+        for (idx, rt) in runtimes.iter().enumerate() {
+            if failed[idx].is_some() {
+                continue;
+            }
+            match sample_once(case_name, rt, script, extra_args, i) {
+                Ok(v) => samples[idx].push(v),
+                Err(e) => failed[idx] = Some(e.to_string()),
+            }
         }
-        if out.code != 0 {
-            bail!(
-                "{}/{case_name}: iteration {i} exit {}; stderr: {}",
-                rt.name,
-                out.code,
-                out.stderr.chars().take(200).collect::<String>()
-            );
-        }
-        let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).with_context(|| {
-            format!(
-                "{}/{case_name}: iter {i} parse failed: {}",
-                rt.name,
-                out.stdout.chars().take(100).collect::<String>()
-            )
-        })?;
-        let value = v["elapsed_ms"].as_f64().context("missing elapsed_ms")?;
-        samples.push(value);
         print!(".");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     println!(" done");
 
-    let (p50, min, max, p95, p99) = stats(&samples);
-    Ok(CaseResult {
-        runtime: rt.name.clone(),
-        name: case_name.to_string(),
-        median: p50,
-        min,
-        max,
-        p50,
-        p95,
-        p99,
-        unit: "ms".to_string(),
-        iterations: iters,
-        warmup_iterations: 0,
-        samples,
-    })
+    runtimes
+        .iter()
+        .enumerate()
+        .map(|(idx, rt)| {
+            let name = rt.name.clone();
+            if let Some(err) = &failed[idx] {
+                return (name, Err(anyhow::anyhow!("{err}")));
+            }
+            let s = std::mem::take(&mut samples[idx]);
+            let (p50, min, max, p95, p99) = stats(&s);
+            (
+                rt.name.clone(),
+                Ok(CaseResult {
+                    runtime: rt.name.clone(),
+                    name: case_name.to_string(),
+                    median: p50,
+                    min,
+                    max,
+                    p50,
+                    p95,
+                    p99,
+                    unit: "ms".to_string(),
+                    iterations: s.len(),
+                    warmup_iterations: 0,
+                    samples: s,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// One timed iteration. Split out of the sampling loop so the interleaved
+/// driver can take a single sample per runtime per round.
+fn sample_once(
+    case_name: &str,
+    rt: &Runtime,
+    script: &Path,
+    extra_args: &[String],
+    i: usize,
+) -> Result<f64> {
+    let out = run_with_timeout(&mut rt.build_cmd(script, extra_args), CASE_TIMEOUT)?;
+    if out.timed_out {
+        bail!("{}/{case_name}: iteration {i} timed out", rt.name);
+    }
+    if out.code != 0 {
+        bail!(
+            "{}/{case_name}: iteration {i} exit {}; stderr: {}",
+            rt.name,
+            out.code,
+            out.stderr.chars().take(200).collect::<String>()
+        );
+    }
+    let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).with_context(|| {
+        format!(
+            "{}/{case_name}: iter {i} parse failed: {}",
+            rt.name,
+            out.stdout.chars().take(100).collect::<String>()
+        )
+    })?;
+    v["elapsed_ms"].as_f64().context("missing elapsed_ms")
 }
 
 fn run_cold_start(rt: &Runtime, script: &Path) -> Result<CaseResult> {
@@ -673,26 +737,38 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
 
     for case_name in &case_names {
         println!("{case_name}:");
+
+        // The script-driven timed cases sample every runtime round-robin, so
+        // background load cannot bias one runtime's block relative to another's.
+        // The remaining cases (cold-start and the mcp-* trio) drive a runtime
+        // differently per runtime and keep the per-runtime path below.
+        let timed: Option<(&Path, usize, Vec<String>)> = match *case_name {
+            "url-parse" => Some((scripts.url_parse.as_path(), TIMED_ITERS, vec![])),
+            "http-throughput" => Some((scripts.http_throughput.as_path(), HTTP_ITERS, vec![])),
+            "fs-read" => Some((
+                scripts.fs_read.as_path(),
+                TIMED_ITERS,
+                vec![scripts.data_file.to_string_lossy().to_string()],
+            )),
+            "json-parse" => Some((scripts.json_parse.as_path(), TIMED_ITERS, vec![])),
+            "crypto-hash" => Some((scripts.crypto_hash.as_path(), TIMED_ITERS, vec![])),
+            _ => None,
+        };
+        if let Some((script, iters, extra)) = timed {
+            for (rt_name, result) in
+                run_timed_case_interleaved(case_name, &runtimes, script, iters, &extra)
+            {
+                match result {
+                    Ok(r) => all_results.push(r),
+                    Err(e) => println!("  {rt_name}/{case_name}: FAILED -- {e}"),
+                }
+            }
+            continue;
+        }
+
         for rt in &runtimes {
             let result = match *case_name {
                 "cold-start" => run_cold_start(rt, &scripts.cold_start),
-                "url-parse" => run_timed_case(case_name, rt, &scripts.url_parse, TIMED_ITERS, &[]),
-                "http-throughput" => {
-                    run_timed_case(case_name, rt, &scripts.http_throughput, HTTP_ITERS, &[])
-                }
-                "fs-read" => run_timed_case(
-                    case_name,
-                    rt,
-                    &scripts.fs_read,
-                    TIMED_ITERS,
-                    &[scripts.data_file.to_string_lossy().to_string()],
-                ),
-                "json-parse" => {
-                    run_timed_case(case_name, rt, &scripts.json_parse, TIMED_ITERS, &[])
-                }
-                "crypto-hash" => {
-                    run_timed_case(case_name, rt, &scripts.crypto_hash, TIMED_ITERS, &[])
-                }
                 "mcp-cold-start" => {
                     if rt.name == "oam" {
                         run_mcp_cold_start(rt, &scripts.mcp_server)
