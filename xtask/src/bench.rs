@@ -65,6 +65,66 @@ impl Runtime {
     }
 }
 
+/// Removes the staging directory when the benchmark run ends.
+struct StagedBinary {
+    dir: PathBuf,
+}
+
+impl Drop for StagedBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy the just-built oam binary out of `target/`, then exec it once before
+/// any timing starts.
+///
+/// WHY THIS EXISTS
+/// On Windows an on-access virus scanner rescans a binary living in a build
+/// output directory on EVERY exec, while `node.exe` and `bun.exe` are
+/// installed, signed, and long since cached. Benchmarking the two against each
+/// other then measures the scanner, not the runtime -- and the whole penalty
+/// lands on oam, the one binary under test.
+///
+/// Measured on a windows-aarch64 host with McAfee active (Defender passive),
+/// identical bytes, interleaved runs of `--version`:
+///
+///   target/release/oam.exe ... 306 ms median
+///   staged copy ..............  61 ms median   (after one warming exec)
+///
+/// A 5.0x handicap applied to oam and to nothing it is compared against. The
+/// first exec of the staged copy took 2366 ms -- that is the one-time scan,
+/// which is exactly what the warming call below absorbs.
+///
+/// Staging puts oam in the same on-disk situation as the other runtimes: an
+/// ordinary file in an ordinary directory the scanner has already seen. It
+/// disables nothing and needs no privileges. On a host with no scanner, or one
+/// where the build directory is already excluded, this is a file copy and a
+/// warming exec that change no result.
+///
+/// Failure is non-fatal -- a bench run with a warning beats no bench run.
+fn stage_for_benchmark(oam: &Path) -> Result<(PathBuf, StagedBinary)> {
+    let file_name = oam
+        .file_name()
+        .context("oam binary path has no file name")?
+        .to_owned();
+    // PID-suffixed so two runs on one machine cannot collide.
+    let dir = std::env::temp_dir().join(format!("oam-bench-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating staging dir {}", dir.display()))?;
+    let staged = dir.join(file_name);
+    // fs::copy carries permission bits, so the exec bit survives on unix.
+    std::fs::copy(oam, &staged)
+        .with_context(|| format!("copying {} to {}", oam.display(), staged.display()))?;
+    // Absorb the one-time scan here, outside every measured iteration.
+    let _ = Command::new(&staged)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok((staged, StagedBinary { dir }))
+}
+
 fn discover_runtimes(oam: PathBuf, oam_version: &str) -> Vec<Runtime> {
     let mut runtimes = vec![Runtime {
         name: "oam".to_string(),
@@ -559,6 +619,19 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
 pub fn run(release: bool, compare: bool) -> Result<()> {
     let repo = repo_root()?;
     let oam = ensure_oam_built(&repo, release)?;
+    // Time an ordinary file in an ordinary directory, not a build artifact a
+    // virus scanner re-examines on every exec. See stage_for_benchmark.
+    // `_staged` must stay alive for the whole run: dropping it deletes the copy.
+    let (oam, _staged) = match stage_for_benchmark(&oam) {
+        Ok((path, guard)) => (path, Some(guard)),
+        Err(err) => {
+            eprintln!(
+                "  warning: could not stage the oam binary out of target/ ({err}).\n  \
+                 Timings may include per-exec virus-scanner overhead that node/bun do not pay."
+            );
+            (oam, None)
+        }
+    };
     let profile = if release { "release" } else { "debug" };
     let oam_version = capture_version(&oam, &["--version"]);
     let commit = git_short_commit(&repo);
@@ -1037,6 +1110,16 @@ fn build_markdown(
         "cargo run -p xtask -- bench            # oam only\n",
         "cargo run -p xtask -- bench --compare  # also node and bun, when on PATH\n",
         "```\n\n",
+        "The oam binary is copied out of `target/` and exec'd once before timing starts. ",
+        "On Windows an on-access virus scanner rescans a binary in a build output ",
+        "directory on every exec, while `node.exe` and `bun.exe` are installed, signed ",
+        "and long since cached -- so timing them against each other measures the scanner, ",
+        "and the entire penalty lands on the one binary under test. Observed on a ",
+        "windows-aarch64 host with McAfee active: identical bytes, 306ms median out of ",
+        "`target/release/` versus 61ms staged, a 5.0x handicap. Staging is a file copy, ",
+        "needs no privileges, and is a no-op where no scanner interferes. If you compare ",
+        "these numbers against a hand-rolled `target/release/oam` invocation, that is ",
+        "why yours will look slower.\n\n",
         "Each case is timed in-process by the harness rather than by a shell wrapper, ",
         "except `cold-start` and `mcp-cold-start`, which are wall-clock from process ",
         "spawn and can only be measured from outside. A runtime that is not on PATH is ",
