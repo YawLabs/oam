@@ -151,6 +151,13 @@ enum Command {
         /// Output binary path.
         #[arg(short, long)]
         output: PathBuf,
+        /// Carrier binary to embed into, instead of the running oam. Point it
+        /// at an oam release binary for another OS/arch to cross-compile --
+        /// the payload is platform-independent, only the carrier is not.
+        /// Without this, compile always produces a binary for the platform it
+        /// runs on, so shipping N targets needed N machines.
+        #[arg(long, value_name = "PATH")]
+        carrier: Option<PathBuf>,
         /// Reserved for future use (minify the embedded source).
         #[arg(long)]
         minify: bool,
@@ -310,6 +317,20 @@ fn main() -> ExitCode {
                 i += 1;
             } else if let Some(list) = arg.strip_prefix("--allow-fs-write=") {
                 flags.allow_fs_write = Some(list.to_string());
+                i += 1;
+            } else if let Some(list) = arg.strip_prefix("--allow-net=") {
+                flags.allow_net = Some(list.to_string());
+                i += 1;
+            } else if arg == "--allow-net" {
+                // Bare form grants everything, stored as the same "*" the list
+                // form uses so `grant()` below needs no extra case.
+                flags.allow_net = Some("*".to_string());
+                i += 1;
+            } else if let Some(list) = arg.strip_prefix("--allow-env=") {
+                flags.allow_env = Some(list.to_string());
+                i += 1;
+            } else if arg == "--allow-env" {
+                flags.allow_env = Some("*".to_string());
                 i += 1;
             } else if arg == "--allow-child-process" {
                 flags.allow_child_process = true;
@@ -639,8 +660,9 @@ fn dispatch(cli: Cli) -> ExitCode {
         Command::Compile {
             entry,
             output,
+            carrier,
             minify: _,
-        } => compile_command(entry, output),
+        } => compile_command(entry, output, carrier.as_deref()),
         Command::SelfUpdate { version, dry_run } => {
             self_update_command(version.as_deref(), *dry_run)
         }
@@ -2010,6 +2032,18 @@ fn err_exit(diagnostics: Vec<Diagnostic>) -> (Vec<Diagnostic>, u8) {
 const COMPILE_MAGIC: &[u8; 8] = b"OAMEXEC\0";
 const COMPILE_MAGIC_V2: &[u8; 8] = b"OAMEXC2\0";
 
+/// True when `bytes` already ends with either compile trailer magic, i.e. it
+/// is itself a compile output rather than a plain oam binary. Used to reject
+/// such a file as a `--carrier`: appending onto it would nest payloads, and
+/// since the loader reads the LAST trailer it would silently keep running the
+/// older embedded program.
+fn ends_with_compile_magic(bytes: &[u8]) -> bool {
+    let Some(tail) = bytes.get(bytes.len().wrapping_sub(8)..) else {
+        return false;
+    };
+    tail == COMPILE_MAGIC.as_slice() || tail == COMPILE_MAGIC_V2.as_slice()
+}
+
 /// Inspect the tail of the current executable for an embedded payload.
 /// Returns `Some((source, bytecode))` where `bytecode` is `Some` only for a
 /// v2 binary that carries embedded V8 bytecode; `None` for a normal CLI
@@ -2097,6 +2131,23 @@ struct NodeFlags {
     /// denies everything first.
     allow_fs_read: Option<String>,
     allow_fs_write: Option<String>,
+    /// `--allow-net[=list]` and `--allow-env[=list]`. Bare form grants
+    /// everything (stored as `Some("*")`); `=a,b` grants a list.
+    ///
+    /// Without these, `permissions()` hardcoded net and env closed, so
+    /// `--permission` denied all network access with no way to open it. That
+    /// made the whole permission model unusable for any server: a process
+    /// that cannot open a socket has nothing left to do.
+    ///
+    /// Both are enforced end to end. `Permissions::check_env` already existed
+    /// (oam_engine/src/permissions.rs:142) but nothing called it -- `op_env`
+    /// copied the whole environment unconditionally, so env reads succeeded
+    /// under `--permission` regardless of any grant. `op_env` now filters
+    /// through it, so a denied variable is absent from `process.env` rather
+    /// than throwing: it is a snapshot object with no per-property hook, and
+    /// an exception would leak the names of variables the script may not see.
+    allow_net: Option<String>,
+    allow_env: Option<String>,
     allow_child_process: bool,
     allow_worker: bool,
     allow_addons: bool,
@@ -2218,8 +2269,8 @@ impl NodeFlags {
         Some(oam_engine::PermissionsOptions {
             read: grant(&self.allow_fs_read),
             write: grant(&self.allow_fs_write),
-            net: oam_engine::BoolOrList::Bool(false),
-            env: oam_engine::BoolOrList::Bool(false),
+            net: grant(&self.allow_net),
+            env: grant(&self.allow_env),
             // --allow-addons is node's name for loading native addons, which
             // is what oam's `ffi` permission gates.
             ffi: oam_engine::BoolOrList::Bool(self.allow_addons),
@@ -2249,6 +2300,23 @@ impl NodeFlags {
         }
         if let Some(list) = &self.allow_fs_write {
             out.push(format!("--allow-fs-write={list}"));
+        }
+        // Round-trip the bare form as bare: a script reading process.execArgv
+        // to re-spawn itself should get back the flags it was given, not a
+        // `=*` spelling node never produces.
+        if let Some(list) = &self.allow_net {
+            out.push(if list == "*" {
+                "--allow-net".into()
+            } else {
+                format!("--allow-net={list}")
+            });
+        }
+        if let Some(list) = &self.allow_env {
+            out.push(if list == "*" {
+                "--allow-env".into()
+            } else {
+                format!("--allow-env={list}")
+            });
         }
         if self.allow_child_process {
             out.push("--allow-child-process".into());
@@ -2525,7 +2593,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
 /// `oam compile <entry> --output <path>`: read the JS source, copy the
 /// current oam binary, and append the JS payload with a magic trailer.
-fn compile_command(entry: &Path, output: &Path) -> ExitCode {
+fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitCode {
     // 1. Read the entry JS file.
     let source = match std::fs::read(entry) {
         Ok(bytes) => bytes,
@@ -2544,13 +2612,45 @@ fn compile_command(entry: &Path, output: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 2. Copy the current oam binary to the output path.
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("oam compile: could not locate own executable: {e}");
-            return ExitCode::FAILURE;
+    // 2. Copy the carrier binary to the output path. Defaults to the running
+    //    oam; `--carrier` points at a different one so a release binary for
+    //    another OS/arch can be used, which is what makes cross-compiling
+    //    possible. The payload appended below is platform-independent -- only
+    //    the carrier decides the output's platform.
+    let exe = match carrier {
+        Some(p) => {
+            if !p.is_file() {
+                eprintln!("oam compile: carrier {} is not a file", p.display());
+                return ExitCode::FAILURE;
+            }
+            // Refuse a carrier that already carries a payload. Compiling onto
+            // a previous compile output would nest payloads, and the loader
+            // reads the LAST magic footer -- so it would silently run the
+            // older embedded program instead of this one.
+            match std::fs::read(p) {
+                Ok(bytes) if ends_with_compile_magic(&bytes) => {
+                    eprintln!(
+                        "oam compile: carrier {} is already a compiled output (it ends with the \
+                         payload magic). Pass a plain oam binary.",
+                        p.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("oam compile: could not read carrier {}: {e}", p.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+            p.to_path_buf()
         }
+        None => match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("oam compile: could not locate own executable: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -2710,5 +2810,127 @@ mod tests {
         assert_eq!(super::COMPILE_MAGIC, b"OAMEXEC\0");
         assert_eq!(super::COMPILE_MAGIC_V2.len(), 8);
         assert_eq!(super::COMPILE_MAGIC_V2, b"OAMEXC2\0");
+    }
+
+    // --- `--carrier` guard ------------------------------------------------
+
+    #[test]
+    fn ends_with_compile_magic_detects_both_trailer_versions() {
+        let mut v1 = b"a plain binary".to_vec();
+        v1.extend_from_slice(super::COMPILE_MAGIC);
+        assert!(super::ends_with_compile_magic(&v1));
+
+        let mut v2 = b"a plain binary".to_vec();
+        v2.extend_from_slice(super::COMPILE_MAGIC_V2);
+        assert!(super::ends_with_compile_magic(&v2));
+    }
+
+    #[test]
+    fn ends_with_compile_magic_rejects_plain_and_short_input() {
+        assert!(!super::ends_with_compile_magic(b"not a compile output"));
+        // The magic must be at the END, not merely present.
+        let mut leading = super::COMPILE_MAGIC.to_vec();
+        leading.extend_from_slice(b"trailing bytes");
+        assert!(!super::ends_with_compile_magic(&leading));
+        // Shorter than the magic: must not panic on the subtraction.
+        assert!(!super::ends_with_compile_magic(b""));
+        assert!(!super::ends_with_compile_magic(b"abc"));
+    }
+
+    // --- `--allow-net` / `--allow-env` ------------------------------------
+
+    fn perms_for(flags: &super::NodeFlags) -> oam_engine::PermissionsOptions {
+        flags.permissions().expect("--permission was set")
+    }
+
+    fn is_denied(g: &oam_engine::BoolOrList) -> bool {
+        matches!(g, oam_engine::BoolOrList::Bool(false))
+    }
+
+    #[test]
+    fn permission_without_net_or_env_grants_denies_both() {
+        // The pre-existing posture, now reachable only when the grants are
+        // actually absent rather than hardcoded.
+        let flags = super::NodeFlags {
+            permission: true,
+            ..Default::default()
+        };
+        let p = perms_for(&flags);
+        assert!(is_denied(&p.net));
+        assert!(is_denied(&p.env));
+    }
+
+    #[test]
+    fn bare_allow_net_and_allow_env_grant_everything() {
+        let flags = super::NodeFlags {
+            permission: true,
+            allow_net: Some("*".into()),
+            allow_env: Some("*".into()),
+            ..Default::default()
+        };
+        let p = perms_for(&flags);
+        assert!(matches!(p.net, oam_engine::BoolOrList::Bool(true)));
+        assert!(matches!(p.env, oam_engine::BoolOrList::Bool(true)));
+    }
+
+    #[test]
+    fn list_form_grants_only_the_listed_entries() {
+        let flags = super::NodeFlags {
+            permission: true,
+            allow_net: Some("127.0.0.1:5432, example.com".into()),
+            allow_env: Some("DATABASE_URL".into()),
+            ..Default::default()
+        };
+        let p = perms_for(&flags);
+        match p.net {
+            // Whitespace around list entries is trimmed, so a human-spaced
+            // list behaves the same as a tight one.
+            oam_engine::BoolOrList::List(ref v) => {
+                assert_eq!(
+                    v,
+                    &["127.0.0.1:5432".to_string(), "example.com".to_string()]
+                );
+            }
+            _ => panic!("expected a list grant, got {:?}", p.net),
+        }
+        match p.env {
+            oam_engine::BoolOrList::List(ref v) => assert_eq!(v, &["DATABASE_URL".to_string()]),
+            _ => panic!("expected a list grant, got {:?}", p.env),
+        }
+    }
+
+    #[test]
+    fn grants_are_inert_without_permission() {
+        // Node's grants only mean anything under --permission; asking for one
+        // without it must not silently enable the restrictive mode.
+        let flags = super::NodeFlags {
+            permission: false,
+            allow_net: Some("*".into()),
+            ..Default::default()
+        };
+        assert!(flags.permissions().is_none());
+    }
+
+    #[test]
+    fn exec_argv_round_trips_bare_and_list_forms() {
+        // A script re-spawning itself from process.execArgv must get back what
+        // it was given -- bare stays bare, a list stays a list.
+        let bare = super::NodeFlags {
+            permission: true,
+            allow_net: Some("*".into()),
+            allow_env: Some("*".into()),
+            ..Default::default()
+        };
+        let argv = bare.exec_argv();
+        assert!(argv.contains(&"--allow-net".to_string()));
+        assert!(argv.contains(&"--allow-env".to_string()));
+        assert!(!argv.iter().any(|a| a.contains("=*")));
+
+        let listed = super::NodeFlags {
+            permission: true,
+            allow_net: Some("a,b".into()),
+            ..Default::default()
+        };
+        assert!(listed.exec_argv().contains(&"--allow-net=a,b".to_string()));
     }
 }

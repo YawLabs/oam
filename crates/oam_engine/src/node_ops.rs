@@ -626,8 +626,22 @@ fn op_env(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    // Filter by the `env` permission rather than throwing on a denied read.
+    // process.env is handed to JS as a snapshot object, so there is no
+    // per-property hook to throw from; a denied variable is simply absent and
+    // reads as undefined. That also avoids leaking the names of variables the
+    // script may not see, which an exception message would do.
+    //
+    // Collected before the object is built because get_permissions borrows the
+    // scope immutably while v8::String::new needs it mutably.
+    let allowed: Vec<(String, String)> = {
+        let perms = get_permissions(scope);
+        std::env::vars()
+            .filter(|(name, _)| perms.check_env(name).is_ok())
+            .collect()
+    };
     let env = v8::Object::new(scope);
-    for (name, value) in std::env::vars() {
+    for (name, value) in allowed {
         let Some(key) = v8::String::new(scope, &name) else {
             continue;
         };
