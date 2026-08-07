@@ -15088,3 +15088,120 @@ fn socket_write_signals_backpressure_and_drains() {
         "'drain' must fire once the peer consumes the backlog: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------- permissions
+
+/// Run the compiled binary with an explicit environment, bypassing the shared
+/// `oam()` helper so the child's env is controlled per-test rather than
+/// inherited. `--permission` gates are only observable against a known var.
+fn oam_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
+    let cache = write_temp("oam-perm-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.args(args).env("OAM_CACHE_DIR", cache);
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("oam binary runs")
+}
+
+/// `process.env` must respect the `env` permission.
+///
+/// Regression: `op_env` copied the whole environment unconditionally, so
+/// `--permission` denied nothing -- a script could read every secret in the
+/// environment while nominally sandboxed. A denied variable is now absent
+/// (undefined) rather than throwing: process.env is a snapshot object with no
+/// per-property hook, and an exception would leak the names of variables the
+/// script is not allowed to see.
+#[test]
+fn process_env_respects_the_env_permission() {
+    let script = write_temp(
+        "env_permission.mjs",
+        "console.log('SECRET=' + (process.env.PERM_SECRET ?? 'ABSENT'));\n\
+         console.log('OTHER=' + (process.env.PERM_OTHER ?? 'ABSENT'));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let vars = [("PERM_SECRET", "s3cret"), ("PERM_OTHER", "other")];
+
+    // No --permission: unrestricted, both readable.
+    let out = oam_with_env(&["run", &path], &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SECRET=s3cret") && stdout.contains("OTHER=other"),
+        "without --permission every variable must be readable: {stdout}"
+    );
+
+    // --permission with no grant: everything denied.
+    let out = oam_with_env(&["--permission", &path], &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SECRET=ABSENT") && stdout.contains("OTHER=ABSENT"),
+        "--permission without --allow-env must hide every variable: {stdout}"
+    );
+
+    // Bare --allow-env: everything granted.
+    let out = oam_with_env(&["--permission", "--allow-env", &path], &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SECRET=s3cret") && stdout.contains("OTHER=other"),
+        "bare --allow-env must grant every variable: {stdout}"
+    );
+
+    // Scoped list: only the named variable, and the grant is not allow-all.
+    let out = oam_with_env(&["--permission", "--allow-env=PERM_SECRET", &path], &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SECRET=s3cret"),
+        "a listed variable must be readable: {stdout}"
+    );
+    assert!(
+        stdout.contains("OTHER=ABSENT"),
+        "an unlisted variable must stay hidden -- a list grant is not allow-all: {stdout}"
+    );
+}
+
+/// `--allow-net` must scope by host, not merely toggle networking on.
+#[test]
+fn allow_net_list_is_scoped_to_the_listed_host() {
+    let addr = spawn_echo_server();
+    // Report the FAILURE KIND, not just success/failure: a permission denial
+    // and an ordinary connect error both reject, and conflating them would let
+    // a broken test pass for the wrong reason.
+    let script = write_temp(
+        "net_permission.mjs",
+        "import net from 'node:net';
+         const [host, port] = process.argv[2].split('|');
+         try {
+           await new Promise((res, rej) => { const s = net.createConnection({host, port: Number(port)}, () => { s.end(); res(); }); s.on('error', rej); });
+           console.log('NET=ALLOWED');
+         } catch (e) { console.log('NET=ERR:' + e.message); }",
+    );
+    let path = script.to_string_lossy().to_string();
+    let target = format!("{}|{}", addr.ip(), addr.port());
+    let matching = format!("--allow-net={}:{}", addr.ip(), addr.port());
+
+    let out = oam_with_env(&["--permission", &matching, &path, &target], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("NET=ALLOWED"),
+        "the listed host must be reachable: {stdout} / {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-net=example.invalid:443",
+            &path,
+            &target,
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("NET=ERR:") && stdout.contains("restricted"),
+        "a host outside the list must be denied by the PERMISSION layer, not merely fail to connect: {stdout}"
+    );
+}

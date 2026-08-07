@@ -172,7 +172,7 @@ are denied unless granted, enforced in the native ops rather than in JavaScript,
 monkey-patching `fs` does not route around it. Denials throw Node's `ERR_ACCESS_DENIED`
 carrying `permission` and `resource`.
 
-Two differences from Node's model:
+Differences from Node's model:
 
 - **Node's grant flags are implemented**: `--allow-fs-read=`, `--allow-fs-write=`,
   `--allow-child-process`, `--allow-worker` and `--allow-addons`. `*` grants everything,
@@ -180,6 +180,24 @@ Two differences from Node's model:
   `process.execArgv`. `process.execve` is gated on the ChildProcess permission, since
   replacing the process image hands control to a binary this permission set does not
   describe.
+- **oam adds two grants Node does not have**: `--allow-net[=list]` and
+  `--allow-env[=list]`, in the Deno spelling — bare grants everything, `=a,b` grants a
+  list. They exist because the environment is the primary secrets carrier in the
+  workloads oam targets (agent sandboxes; MCP servers whose entire authentication is a
+  `DATABASE_URL`), and a model that gates the filesystem but not the environment does not
+  address the realistic threat of a dependency reading `process.env`. Node's permission
+  model has no equivalent, so **`process.execArgv` can carry a token real `node`
+  rejects**: a script that re-spawns itself from `execArgv` under `node` fails with a
+  bad-option error. That is the cost of the grant, and it is deliberate. Both take their
+  list with `=`, not a space; the space form is rejected with a hint rather than being
+  read as the script path.
+- **A denied environment read is silent; every other denial throws.** Filesystem,
+  network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
+  variable denied by `--allow-env` is instead simply absent from `process.env` and reads
+  as `undefined`. `process.env` is a snapshot taken at first access with no per-property
+  hook to throw from, and an exception would leak the names of variables the script is
+  not permitted to see. Worth knowing: under a too-narrow `--allow-env` a program fails
+  later, wherever it uses the missing value, rather than at the point of denial.
 - **`process.permission` is not implemented.** Node exposes `process.permission.has()`
   for runtime introspection; in oam it is `undefined` with or without the flag.
 
