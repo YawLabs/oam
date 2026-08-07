@@ -499,20 +499,6 @@ fn main() -> ExitCode {
             // vendored suite's `"${process.execPath}" "${__filename}" child`).
             // A real SUBCOMMAND always wins, so `oam test` still runs the
             // test runner even if a file named `test` sits in the cwd.
-            const SUBCOMMANDS: &[&str] = &[
-                "run",
-                "test",
-                "repl",
-                "check",
-                "daemon",
-                "mcp",
-                "serve",
-                "install",
-                "trust",
-                "compile",
-                "self-update",
-                "help",
-            ];
             if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && Path::new(flag).is_file() {
                 let file = PathBuf::from(flag);
                 return match run_file_with_flags(
@@ -2052,6 +2038,27 @@ fn ends_with_compile_magic(bytes: &[u8]) -> bool {
     tail == COMPILE_MAGIC.as_slice() || tail == COMPILE_MAGIC_V2.as_slice()
 }
 
+/// clap subcommand names. Lifted to module scope because TWO places need the
+/// same list and they must not drift: the bare-script dispatch (a real
+/// subcommand wins over a same-named file in the cwd) and `space_form_hint`
+/// (a subcommand after a bare grant is a legitimate shape, not a mis-typed
+/// list). Duplicating it once already produced a regression that broke
+/// `oam --permission --allow-env help`.
+const SUBCOMMANDS: &[&str] = &[
+    "run",
+    "test",
+    "repl",
+    "check",
+    "daemon",
+    "mcp",
+    "serve",
+    "install",
+    "trust",
+    "compile",
+    "self-update",
+    "help",
+];
+
 /// Catch the space-separated grant form (`--allow-net 127.0.0.1:5432`) that
 /// Deno accepts and oam does not.
 ///
@@ -2067,7 +2074,11 @@ fn ends_with_compile_magic(bytes: &[u8]) -> bool {
 /// grants that do.
 fn space_form_hint(flag: &str, next: Option<&String>) -> Option<String> {
     let next = next?;
-    if next.starts_with('-') || Path::new(next).exists() {
+    // A subcommand after node-style flags is a legitimate shape -- the
+    // dispatch below lets a real subcommand win -- and subcommand names are
+    // neither flags nor files, so without this they read as mis-typed grant
+    // lists and `oam --permission --allow-env help` dies instead of running.
+    if next.starts_with('-') || SUBCOMMANDS.contains(&next.as_str()) || Path::new(next).exists() {
         return None;
     }
     Some(format!(
@@ -2919,6 +2930,16 @@ mod tests {
         // Another flag, or nothing at all, is fine.
         assert!(super::space_form_hint("--allow-net", Some(&"--permission".to_string())).is_none());
         assert!(super::space_form_hint("--allow-net", None).is_none());
+
+        // EVERY subcommand is a legitimate token after a bare grant. Asserting
+        // the whole list, not a sample, so adding a subcommand without
+        // updating this cannot silently start rejecting it.
+        for sub in super::SUBCOMMANDS {
+            assert!(
+                super::space_form_hint("--allow-env", Some(&sub.to_string())).is_none(),
+                "`--allow-env {sub}` must dispatch to the subcommand, not be read as a grant list"
+            );
+        }
     }
 
     #[test]
