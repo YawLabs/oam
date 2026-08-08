@@ -18493,6 +18493,11 @@
     const STDIO_IGNORE = 0;
     const STDIO_INHERIT = 1;
     const STDIO_PIPE = 2;
+    // spawnExtra's codes run 0-3 (ignore/inherit/child-read/child-write), so a
+    // descriptor is offset past them rather than encoded as a bare number --
+    // otherwise fd 2 and "child-read" would be the same code. Must match
+    // DESCRIPTOR_CODE_BASE in node_ops.rs.
+    const STDIO_EXTRA_DESCRIPTOR_BASE = 1000;
 
     // One entry of node's `stdio` option -> a direction code. 'inherit', a
     // numeric fd and a stream all mean "hand the child the parent's fd" for
@@ -18734,7 +18739,24 @@
         if (fd === 1 || fd === 2) return 3;
         return fd === 3 ? 2 : 3;
       }
-      // 'inherit', a numeric fd, or a stream: inherit the parent's fd.
+      // A DESCRIPTOR the caller named, by number or via a stream that owns one.
+      // Encoded as base+fd because the low codes are already dispositions; the
+      // native side resolves it and hands the child a dup. Left as plain
+      // 'inherit', an extra slot got whatever the parent held at that index --
+      // on Windows literally STD_ERROR_HANDLE for every fd above 2, so
+      // `stdio: [..., logFd]` silently gave the child stderr.
+      //
+      // 0/1/2 still mean inherit: naming our own std fds is what that is.
+      const descriptor =
+        typeof entry === "number"
+          ? entry
+          : entry && typeof entry.fd === "number"
+            ? entry.fd
+            : null;
+      if (descriptor !== null && Number.isInteger(descriptor) && descriptor > 2) {
+        return STDIO_EXTRA_DESCRIPTOR_BASE + descriptor;
+      }
+      // 'inherit', fd 0/1/2, or a stream with nothing behind it.
       return 1;
     }
 

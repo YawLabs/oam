@@ -22,8 +22,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-    SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -35,8 +35,9 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 
 use super::OpOutcome;
@@ -64,6 +65,13 @@ pub enum StdioFd {
     ChildRead,
     /// Pipe the child WRITES (parent reads). e.g. stdout/stderr, CDP-out (fd 4).
     ChildWrite,
+    /// A descriptor the CALLER named -- `stdio: ['ignore','pipe','pipe', logFd]`.
+    /// Carried as a raw HANDLE value (isize) so the variant stays `Send`.
+    ///
+    /// Without this a numbered slot fell through to `Inherit`, whose fd>2 arm
+    /// hands the child STD_ERROR_HANDLE -- so the child quietly got stderr where
+    /// the caller asked for a file.
+    Descriptor(isize),
 }
 
 /// Parent-side end of one piped fd.
@@ -229,6 +237,31 @@ pub fn spawn_extra(
                         _ => GetStdHandle(STD_ERROR_HANDLE),
                     };
                     child_handles.push(h);
+                }
+                StdioFd::Descriptor(raw) => {
+                    // Re-duplicated as INHERITABLE: the caller's handle is not,
+                    // and the child's CRT fd table can only receive handles
+                    // marked for inheritance. The dup is ours, so it lands in
+                    // child_close and the caller's descriptor is untouched.
+                    let mut dup: HANDLE = std::ptr::null_mut();
+                    if DuplicateHandle(
+                        GetCurrentProcess(),
+                        *raw as HANDLE,
+                        GetCurrentProcess(),
+                        &mut dup,
+                        0,
+                        1, // inheritable
+                        DUPLICATE_SAME_ACCESS,
+                    ) == 0
+                    {
+                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        return Err(format!(
+                            "DuplicateHandle(fd{fd}) failed: {}",
+                            GetLastError()
+                        ));
+                    }
+                    child_close.push(dup);
+                    child_handles.push(dup);
                 }
                 StdioFd::ChildRead => {
                     // child reads -> child gets READ end; parent WRITES.

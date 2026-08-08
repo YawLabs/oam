@@ -4379,7 +4379,16 @@ fn op_spawn_extra(
         Some(pairs)
     });
 
-    // stdio codes (arg 3): one number per fd.
+    // stdio codes (arg 3): one number per fd. 0-3 are dispositions; anything
+    // at or above DESCRIPTOR_CODE_BASE is `base + <descriptor number>`, the
+    // `stdio: ['ignore','pipe','pipe', logFd]` form. The offset encoding keeps
+    // the two meanings from overlapping -- a bare number would collide with the
+    // disposition codes.
+    const DESCRIPTOR_CODE_BASE: u32 = 1000;
+    let files = core_runtime!(scope).sync_files();
+    // Dups stay alive until spawn_extra has handed copies to the child; drop
+    // closes ours and leaves the caller's descriptor untouched.
+    let mut held: Vec<std::fs::File> = Vec::new();
     let mut stdio: Vec<StdioFd> = Vec::new();
     if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(3)) {
         for i in 0..arr.length() {
@@ -4387,6 +4396,35 @@ fn op_spawn_extra(
                 .get_index(scope, i)
                 .map(|v| v.uint32_value(scope).unwrap_or(0))
                 .unwrap_or(0);
+            if code >= DESCRIPTOR_CODE_BASE {
+                let target = u64::from(code - DESCRIPTOR_CODE_BASE);
+                oam_core::adopt_inherited_fd(&files, target);
+                let dup = files
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&target)
+                    .and_then(|f| f.try_clone().ok());
+                match dup {
+                    Some(file) => {
+                        #[cfg(windows)]
+                        let raw = {
+                            use std::os::windows::io::AsRawHandle;
+                            file.as_raw_handle() as isize
+                        };
+                        #[cfg(unix)]
+                        let raw = {
+                            use std::os::fd::AsRawFd;
+                            file.as_raw_fd()
+                        };
+                        held.push(file);
+                        stdio.push(StdioFd::Descriptor(raw));
+                    }
+                    // Unresolvable descriptor: same inherit fallback the 0/1/2
+                    // path takes, rather than silently giving the child NUL.
+                    None => stdio.push(StdioFd::Inherit),
+                }
+                continue;
+            }
             stdio.push(match code {
                 1 => StdioFd::Inherit,
                 2 => StdioFd::ChildRead,

@@ -1,5 +1,5 @@
 {
-  "commit": "4a1a6b7",
+  "commit": "61af3f6",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.8.3",
@@ -278,10 +278,14 @@
         {
           "case": "68-child-stdio-numbered-fd.mjs",
           "status": "pass"
+        },
+        {
+          "case": "69-child-extra-fd-descriptor.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 68,
-      "total": 68
+      "pass": 69,
+      "total": 69
     },
     "surface": {
       "globals": {
