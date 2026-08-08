@@ -543,6 +543,53 @@ pub async fn stdin_read() -> OpOutcome {
     }
 }
 
+/// Node's `err.errno` -- the libuv error NUMBER (negative). On Unix it is just
+/// `-errno` (libuv UV_E* == -E*). On Windows libuv uses its own -4000-range
+/// table (verified against node: ENOENT -4058, EISDIR -4068, EEXIST -4075,
+/// ENOTEMPTY -4051); codes not in the table fall back to `-raw_os_error` so the
+/// property is at least present + negative.
+///
+/// Lives here rather than in oam_engine so the child-spawn failure body can
+/// carry it too: node emits the errno as the `code` argument of the 'close'
+/// event for a child that never started, so a spawn error without it cannot
+/// reproduce node's shape.
+pub fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        let uv = match code {
+            "EPERM" => -4048,
+            "ENOENT" => -4058,
+            "EACCES" => -4092,
+            "EEXIST" => -4075,
+            "ENOTDIR" => -4052,
+            "EISDIR" => -4068,
+            "EINVAL" => -4071,
+            "EMFILE" => -4066,
+            "ENFILE" => -4061,
+            "ENOSPC" => -4055,
+            "EROFS" => -4043,
+            "EBUSY" => -4082,
+            "ENOTEMPTY" => -4051,
+            "ENAMETOOLONG" => -4064,
+            "ELOOP" => -4067,
+            "EXDEV" => -4037,
+            "EBADF" => -4083,
+            "EAGAIN" => -4088,
+            "EPIPE" => -4047,
+            "EFBIG" => -4036,
+            "ENXIO" => -4033,
+            "EMLINK" => -4032,
+            _ => return error.raw_os_error().map(|e| -e),
+        };
+        Some(uv)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = code;
+        error.raw_os_error().map(|e| -e)
+    }
+}
+
 /// Map an I/O error to the Node errno code ecosystem code branches on.
 /// Shared by the async fs ops below and oam_engine's sync fs natives.
 pub fn node_error_code(error: &std::io::Error) -> &'static str {

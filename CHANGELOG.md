@@ -19,6 +19,50 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ### Fixed
 
+- **`child_process` ignored the `stdio` option entirely — `'inherit'` and
+  `'ignore'` both behaved as `'pipe'`.** A child's output went into pipes the
+  parent never forwarded and its stdin was a pipe nobody fed. This broke any
+  launcher script that hands its own stdio to a grandchild, which is the shape
+  every npm `bin` shim uses: an MCP sidecar started through one booted and then
+  sat mute forever, with the launcher still reporting success. `'inherit'` is
+  now a real OS-level handle hand-off, so nothing is copied through the parent.
+- **`fork()` swallowed a non-silent child's output.** Node inherits stdio unless
+  `silent: true`; oam piped it and dropped it, so `console.log` from a forked
+  child vanished. An explicit `stdio` option on `fork()` is honored too.
+- **A failed `spawn()` reported no `err.code` and used a raw JSON blob as its
+  message.** It now produces node's shape — `spawn <cmd> ENOENT` with
+  `.code`/`.syscall`/`.path` set — which is what `execa`, `cross-spawn` and
+  every `which`-style resolver branch on.
+- **A `spawn()` failure with an `'ipc'` slot hung the process forever.** The
+  loopback channel kept listening because `'exit'` never fires for a child that
+  never started. Relatedly, an `'ipc'` slot combined with numbered fds above 2
+  silently produced a child with no IPC channel at all — that combination now
+  works, but only with `'ipc'` LAST; anywhere else it throws
+  `ERR_INVALID_ARG_VALUE` rather than renumbering the child's fds behind your
+  back (new divergence 20).
+- **A failed `spawn()` emitted no `'close'`, and a failed `fork()` still
+  reported the raw native error blob.** Node follows `'error'` with `'close'`
+  for a child that never started, so consumers whose completion path is
+  `'close'` stalled instead of taking their error branch. Spawn errors now also
+  carry `errno`, matching node.
+- **`execFile()` ran its arguments through a shell.** It joined argv into one
+  string and handed it to `exec()`, so arguments were re-split on whitespace and
+  shell metacharacters inside an argument were executed. Node's `execFile` is
+  shell-free by design and passes argv verbatim; oam's now does too.
+- **Writing to a failed child's stdin killed the process.** The spawn error was
+  routed into the stdin stream's error channel, where nothing listens, so
+  `cp.on('error', h); cp.stdin.end(payload)` died on an uncaught error despite
+  the caller handling the failure correctly.
+- **`exec()`'s `maxBuffer` was enforced on stdout only, and measured
+  quadratically.** stderr could grow without limit, and the stdout check
+  re-concatenated everything accumulated so far on every chunk — gigabytes of
+  copying at the 50MB default. Overflow now reports
+  `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`, as node does.
+- **Smaller `child_process` parity fixes.** `exec()` no longer forwards `stdio`
+  to `spawn` (node's `exec`/`execFile` deliberately own their pipes);
+  `spawnSync`'s `input` no longer overrides an explicit `'ignore'`/`'inherit'`
+  in slot 0 (node's docs say it does, its implementation does not); non-piped
+  slots read back as `null` rather than empty buffers.
 - **The benchmark harness timed a binary `cargo` could replace mid-run.** `oam`
   is now staged out of `target/` before timing, so a concurrent build cannot
   swap the file underneath a measurement. This invalidated earlier published

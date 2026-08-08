@@ -1,8 +1,8 @@
 {
-  "commit": "f0ee092",
+  "commit": "d679b39",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.8.2",
+  "oamVersion": "oam 0.8.3",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -226,10 +226,46 @@
         {
           "case": "55-next-tick-fifo.mjs",
           "status": "pass"
+        },
+        {
+          "case": "56-child-stdio-inherit.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "57-exec-maxbuffer.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "58-child-extra-fd-ipc.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "59-child-spawn-error-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "60-child-stdio-forms.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "61-child-exec-nonpiped.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "62-child-ipc-fork-stdio.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "63-child-extra-fd-null-slot.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "64-child-failure-path.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 55,
-      "total": 55
+      "pass": 64,
+      "total": 64
     },
     "surface": {
       "globals": {

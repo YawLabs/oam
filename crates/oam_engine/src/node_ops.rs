@@ -454,46 +454,10 @@ macro_rules! core_runtime_mut {
 }
 
 /// Throw an Error with Node's `.code` / `.syscall` / `.path` properties.
-/// Node's `err.errno` -- the libuv error NUMBER (negative). On Unix it is just
-/// `-errno` (libuv UV_E* == -E*). On Windows libuv uses its own -4000-range
-/// table (verified against node: ENOENT -4058, EISDIR -4068, EEXIST -4075,
-/// ENOTEMPTY -4051); codes not in the table fall back to `-raw_os_error` so the
-/// property is at least present + negative.
+/// Node's `err.errno`. Single source of truth lives in oam_core so the
+/// child-spawn failure body can use the same table; see its doc comment.
 fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
-    #[cfg(windows)]
-    {
-        let uv = match code {
-            "EPERM" => -4048,
-            "ENOENT" => -4058,
-            "EACCES" => -4092,
-            "EEXIST" => -4075,
-            "ENOTDIR" => -4052,
-            "EISDIR" => -4068,
-            "EINVAL" => -4071,
-            "EMFILE" => -4066,
-            "ENFILE" => -4061,
-            "ENOSPC" => -4055,
-            "EROFS" => -4043,
-            "EBUSY" => -4082,
-            "ENOTEMPTY" => -4051,
-            "ENAMETOOLONG" => -4064,
-            "ELOOP" => -4067,
-            "EXDEV" => -4037,
-            "EBADF" => -4083,
-            "EAGAIN" => -4088,
-            "EPIPE" => -4047,
-            "EFBIG" => -4036,
-            "ENXIO" => -4033,
-            "EMLINK" => -4032,
-            _ => return error.raw_os_error().map(|e| -e),
-        };
-        Some(uv)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = code;
-        error.raw_os_error().map(|e| -e)
-    }
+    oam_core::node_errno(code, error)
 }
 
 fn throw_node_error(
@@ -3990,6 +3954,8 @@ fn op_spawn_sync(
         Some(pairs)
     });
 
+    let stdio = arg_stdio_spec(scope, opts);
+
     let result = oam_core::child::spawn_sync(
         &command,
         &child_args,
@@ -4000,6 +3966,7 @@ fn op_spawn_sync(
         clear_env,
         timeout_ms,
         max_buffer,
+        stdio,
     );
 
     let obj = v8::Object::new(scope);
@@ -4125,6 +4092,8 @@ fn op_spawn_async(
         Some(pairs)
     });
 
+    let stdio = arg_stdio_spec(scope, opts);
+
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
 
@@ -4136,7 +4105,7 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env)
+        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env, stdio)
     };
     match spawned {
         Ok((child, pid)) => {
@@ -4169,6 +4138,32 @@ fn op_spawn_kill(
     let signal = arg_kill_signal(scope, &args, 1);
     let children = core_runtime!(scope).children();
     oam_core::child::child_kill(&children, handle, signal);
+}
+
+/// Read the `stdio` option: a 3-element array of direction codes
+/// (0=ignore, 1=inherit, 2=pipe) the JS layer derives from node's `stdio`
+/// option. Absent or malformed means node's default, all three piped.
+fn arg_stdio_spec(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> oam_core::child::StdioSpec {
+    let mut spec = oam_core::child::STDIO_PIPE_ALL;
+    let Some(arr) = opts.and_then(|o| {
+        let key = v8::String::new(scope, "stdio")?;
+        let val = o.get(scope, key.into())?;
+        v8::Local::<v8::Array>::try_from(val).ok()
+    }) else {
+        return spec;
+    };
+    for (fd, slot) in spec.iter_mut().enumerate() {
+        if let Some(v) = arr.get_index(scope, fd as u32)
+            && let Some(code) = v.number_value(scope)
+            && code.is_finite()
+        {
+            *slot = oam_core::child::StdioMode::from_code(code as u8);
+        }
+    }
+    spec
 }
 
 /// Extract an optional signal-name string argument (e.g. "SIGTERM").

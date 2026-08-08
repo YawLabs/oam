@@ -6471,7 +6471,7 @@
           throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
         }
         // Node's ANSI matcher (lib/internal/util/colors.js): covers CSI
-        // escapes AND OSC sequences (]8;; hyperlinks terminated by BEL),
+        // escapes AND OSC sequences (\u001b]8;; hyperlinks terminated by BEL),
         // which the old CSI-only regex left behind.
         const ESC = String.fromCharCode(0x1b);
         const CSI8 = String.fromCharCode(0x9b);
@@ -6542,7 +6542,7 @@
           bgMagentaBright: [105, 49], bgCyanBright: [106, 49],
           bgWhiteBright: [107, 49],
         };
-        const escapeStyleCode = (code) => `[${code}m`;
+        const escapeStyleCode = (code) => `\u001b[${code}m`;
 
         const opts = options || {};
         const validateStream = opts.validateStream === undefined ? true : opts.validateStream;
@@ -6748,14 +6748,14 @@
         } catch {
           hasColors = false;
         }
-        colors.blue = hasColors ? "[34m" : "";
-        colors.green = hasColors ? "[32m" : "";
-        colors.white = hasColors ? "[39m" : "";
-        colors.yellow = hasColors ? "[33m" : "";
-        colors.red = hasColors ? "[31m" : "";
-        colors.gray = hasColors ? "[90m" : "";
-        colors.clear = hasColors ? "c" : "";
-        colors.reset = hasColors ? "[0m" : "";
+        colors.blue = hasColors ? "\u001b[34m" : "";
+        colors.green = hasColors ? "\u001b[32m" : "";
+        colors.white = hasColors ? "\u001b[39m" : "";
+        colors.yellow = hasColors ? "\u001b[33m" : "";
+        colors.red = hasColors ? "\u001b[31m" : "";
+        colors.gray = hasColors ? "\u001b[90m" : "";
+        colors.clear = hasColors ? "\u001bc" : "";
+        colors.reset = hasColors ? "\u001b[0m" : "";
         colors.hasColors = hasColors;
       },
     };
@@ -18462,6 +18462,75 @@
       return Buffer.from(buf).toString(encoding);
     }
 
+    // The native spawn ops throw a JSON body {code,message} on failure
+    // (child.rs / child_win.rs / child_unix.rs). Lift it into the error shape
+    // node produces -- `spawn <cmd> ENOENT` with .code/.syscall/.path set --
+    // because `err.code === 'ENOENT'` is what execa, cross-spawn and every
+    // which-style resolver branch on. Left opaque, callers see an unparsed
+    // blob as the message and `undefined` as the code.
+    function spawnFailureError(err, command, args) {
+      const e = typeof err === "string" ? new Error(err) : err;
+      const raw = typeof err === "string" ? err : (e && e.message) || "";
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return e; // message was not the JSON body: pass it through unchanged
+      }
+      if (!parsed || !parsed.code) return e;
+      const shaped = new Error(`spawn ${command} ${parsed.code}`);
+      // node orders errno first on this error; the key order shows up in
+      // util.inspect output, which people paste into bug reports.
+      if (typeof parsed.errno === "number") shaped.errno = parsed.errno;
+      shaped.code = parsed.code;
+      shaped.syscall = `spawn ${command}`;
+      shaped.path = command;
+      shaped.spawnargs = args ? args.slice() : [];
+      return shaped;
+    }
+
+    // Native per-fd stdio direction codes, shared with spawnExtra's stdioCode.
+    const STDIO_IGNORE = 0;
+    const STDIO_INHERIT = 1;
+    const STDIO_PIPE = 2;
+
+    // One entry of node's `stdio` option -> a direction code. 'inherit', a
+    // numeric fd and a stream all mean "hand the child the parent's fd" for
+    // slots 0/1/2, which is inherit; a null/undefined slot takes the default
+    // for its fd ('pipe' for 0/1/2, 'ignore' beyond -- node's documented rule).
+    function stdioEntryCode(entry, fd) {
+      if (entry === "pipe" || entry === "overlapped") return STDIO_PIPE;
+      if (entry === "inherit") return STDIO_INHERIT;
+      if (entry === "ignore") return STDIO_IGNORE;
+      if (entry === null || entry === undefined) {
+        return fd <= 2 ? STDIO_PIPE : STDIO_IGNORE;
+      }
+      return STDIO_INHERIT;
+    }
+
+    // node's `stdio` option -> the three direction codes spawn_child maps to
+    // Stdio::null()/inherit()/piped(). Accepts the string shorthands ('pipe',
+    // 'inherit', 'ignore', 'overlapped'), the array form, and absence (node's
+    // default: all piped).
+    //
+    // Honouring 'inherit' is what lets a launcher script hand its OWN stdio to
+    // a grandchild -- the npm `bin` shim shape -- instead of the child writing
+    // into pipes the launcher never forwards.
+    function stdioModes(stdio) {
+      if (typeof stdio === "string") {
+        const code = stdioEntryCode(stdio, 0);
+        return [code, code, code];
+      }
+      if (Array.isArray(stdio)) {
+        return [
+          stdioEntryCode(stdio[0], 0),
+          stdioEntryCode(stdio[1], 1),
+          stdioEntryCode(stdio[2], 2),
+        ];
+      }
+      return [STDIO_PIPE, STDIO_PIPE, STDIO_PIPE];
+    }
+
     function spawnSync(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
@@ -18480,13 +18549,19 @@
           ? (typeof opts.input === "string" ? Buffer.from(opts.input, opts.encoding || "utf8") : opts.input)
           : undefined,
       };
+      const modes = stdioModes(opts.stdio);
+      nativeOpts.stdio = modes;
       const result = natives.spawnSync(norm.command, norm.args, nativeOpts);
       const encoding = opts.encoding || "buffer";
+      // node reports null -- not an empty buffer -- for a slot it never piped,
+      // so `spawnSync(..., {stdio: 'inherit'}).stdout === null`.
+      const slot = (buf, fd) =>
+        modes[fd] === STDIO_PIPE ? decodeOutput(buf, encoding) : null;
       return {
         pid: result.pid,
-        output: [null, decodeOutput(result.stdout, encoding), decodeOutput(result.stderr, encoding)],
-        stdout: decodeOutput(result.stdout, encoding),
-        stderr: decodeOutput(result.stderr, encoding),
+        output: [null, slot(result.stdout, 1), slot(result.stderr, 2)],
+        stdout: slot(result.stdout, 1),
+        stderr: slot(result.stderr, 2),
         status: result.status,
         signal: result.signal,
         error: result.error
@@ -18500,7 +18575,8 @@
       const result = spawnSync(command, [], opts);
       if (result.error) throw result.error;
       if (result.status !== 0) {
-        const err = new Error(`Command failed: ${command}\n${result.stderr}`);
+        // stderr is null when the caller inherited or ignored it.
+        const err = new Error(`Command failed: ${command}\n${result.stderr ?? ""}`);
         err.status = result.status;
         err.signal = result.signal;
         err.stdout = result.stdout;
@@ -18558,6 +18634,15 @@
     // the spawn fails -- whichever happens first. Prevents deferred stdin
     // write/final callbacks from dangling forever on a spawn error.
     function deferUntilSpawn(cp, onReady, callback) {
+      // 'spawnfail' is ONE-SHOT, so a waiter registered after the failure has
+      // already fired -- a write issued from inside the child's own 'error'
+      // handler, the natural place to do cleanup -- would park on an event that
+      // can never fire again and its callback would dangle forever. The latch
+      // is what makes the late registration settle.
+      if (cp._spawnFailure) {
+        callback(cp._spawnFailure);
+        return;
+      }
       var done = false;
       var onSpawn = function() {
         if (done) return; done = true;
@@ -18580,8 +18665,15 @@
     // pipe-transport convention (Chromium reads commands on 3, writes on 4).
     // Anonymous pipes are unidirectional, so extra fds carry one direction;
     // full-duplex extra fds (named pipes) are a future enhancement.
+    // (The ordinary 0/1/2-only path uses `stdioModes` above; these codes are a
+    // different, richer encoding read by a different native op.)
     function stdioCode(entry, fd) {
-      if (entry === "ignore" || entry === null || entry === undefined) return 0;
+      if (entry === "ignore") return 0;
+      if (entry === null || entry === undefined) {
+        // Default by fd, node's rule: 'pipe' for 0/1/2, 'ignore' beyond.
+        if (fd > 2) return 0;
+        entry = "pipe";
+      }
       if (entry === "pipe" || entry === "overlapped") {
         if (fd === 0) return 2;
         if (fd === 1 || fd === 2) return 3;
@@ -18595,7 +18687,7 @@
     // --remote-debugging-pipe needs fds 3/4 for CDP). Synchronous like Node's
     // spawn(); exposes cp.stdio[n] as Readable/Writable streams. The native
     // backend is Windows (CreateProcessW) or Unix (Command+pre_exec dup2).
-    function spawnExtra(norm, stdioArr) {
+    function spawnExtra(norm, stdioArr, wantsIpc, ipcIndex) {
       const opts = norm.options;
       const cp = new ChildProcess();
       cp._extra = true;
@@ -18611,28 +18703,29 @@
       };
 
       cp.stdio = new Array(stdioArr.length).fill(null);
+
+      // Deferred, matching spawn()'s shape: an 'ipc' slot has to bind its
+      // loopback channel and inject the port BEFORE exec. With no ipc slot
+      // this runs synchronously, so pid stays readable the instant spawn()
+      // returns (node parity, and what the CDP callers rely on).
+      const launch = (extraEnv) => {
+      if (extraEnv) {
+        nativeOpts.env = Object.assign(
+          {},
+          opts.env || globalThis.process.env,
+          extraEnv,
+        );
+      }
       let info;
       try {
         info = JSON.parse(natives.spawnExtra(norm.command, norm.args, nativeOpts, codes));
       } catch (err) {
-        // The native op throws with a JSON body {code,message} on spawn failure
-        // (child_win.rs / child_unix.rs) so we can surface a Node-shaped error
-        // (err.code === "ENOENT" etc.) that ecosystem code branches on.
-        let e = typeof err === "string" ? new Error(err) : err;
-        const raw = typeof err === "string" ? err : (e && e.message) || "";
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed && parsed.code) {
-            e = new Error(parsed.message || raw);
-            e.code = parsed.code;
-            e.syscall = "spawn " + norm.command;
-            e.path = norm.command;
-          }
-        } catch {
-          /* message was not the JSON body: emit the original error unchanged */
-        }
+        const e = spawnFailureError(err, norm.command, norm.args);
+        // An ipc channel bound for this child would otherwise keep listening
+        // forever: 'exit' never fires for a child that never started.
+        if (cp._ipcTeardown) cp._ipcTeardown();
         queueMicrotask(() => cp.emit("error", e));
-        return cp;
+        return;
       }
       cp._handle = info.handle;
       cp.pid = info.pid;
@@ -18690,6 +18783,10 @@
           cp.emit("close", result.code, result.signal);
         });
       });
+      };
+
+      if (wantsIpc) attachIpcChannel(cp, launch, ipcIndex);
+      else launch(null);
 
       return cp;
     }
@@ -18699,7 +18796,7 @@
     // wires send/disconnect/'message' onto `cp`. The bind is async, so a
     // child started this way resolves its pid one tick later than a plain
     // spawn -- the same property fork() already has.
-    function attachIpcChannel(cp, launch) {
+    function attachIpcChannel(cp, launch, ipcIndex) {
       let ipcSocket = null;
       const pendingSends = [];
       cp.connected = true;
@@ -18731,8 +18828,16 @@
 
       const net = registry.get("net");
       const ipcServer = net.createServer();
-      // Node reports the ipc slot as null in child.stdio.
-      if (Array.isArray(cp.stdio)) cp.stdio[3] = null;
+      // Node reports the ipc slot as null in child.stdio, at the index the
+      // caller put 'ipc' at -- only 3 in the common case, so hardcoding 3
+      // clobbered a REAL extra fd on the numbered-fd path.
+      //
+      // Guarded to indices at or above 3: below that the splice has already
+      // renumbered the surviving fds, so slot 0/1/2 now holds a live, actively
+      // pumped stream and nulling it would leave child.stdio[n] disagreeing
+      // with child.stdout/stderr about the same fd.
+      const slot = ipcIndex ?? 3;
+      if (Array.isArray(cp.stdio) && slot >= 3) cp.stdio[slot] = null;
 
       ipcServer.on("connection", (socket) => {
         ipcSocket = socket;
@@ -18768,15 +18873,38 @@
         launch({ OAM_FORK_IPC_PORT: String(ipcServer.address().port) });
       });
 
-      // Never leave the listener or socket holding the loop open.
-      cp.on("exit", () => {
+      // Never leave the listener or socket holding the loop open. Exposed on
+      // `cp` because a spawn that FAILS emits 'error' and never 'exit', so the
+      // launch-failure paths have to tear this down explicitly -- and they
+      // cannot do it by listening for 'error' here, since an internal listener
+      // would swallow node's throw-on-unhandled-'error'.
+      cp._ipcTeardown = () => {
         try { ipcServer.close(); } catch (_) { /* already closed */ }
+        // Unconditional: on the FAILED-spawn path -- the case this was added
+        // for -- no socket ever connected, so gating this on `ipcSocket` left
+        // `connected` true. cp.send() then kept returning true and queueing
+        // into pendingSends forever, with every callback unsettled.
+        cp.connected = false;
         if (ipcSocket) {
           const sock = ipcSocket;
           ipcSocket = null;
-          cp.connected = false;
           try { sock.destroy(); } catch (_) { /* already gone */ }
         }
+        // Settle anything queued before the channel died; node delivers EPIPE
+        // to a send callback on a closed channel rather than dropping it.
+        if (pendingSends.length > 0) {
+          const queued = pendingSends.splice(0, pendingSends.length);
+          for (const p of queued) {
+            if (p.callback) {
+              const err = new Error("channel closed");
+              err.code = "EPIPE";
+              p.callback(err);
+            }
+          }
+        }
+      };
+      cp.on("exit", () => {
+        cp._ipcTeardown();
       });
     }
 
@@ -18787,8 +18915,9 @@
       // sets up. Splice the slot out FIRST so a 4-entry array does not get
       // misrouted to the extra-fd path below; Node reports stdio[3] as null.
       let wantsIpc = false;
+      let ipcIndex = -1;
       if (Array.isArray(opts.stdio)) {
-        const ipcIndex = opts.stdio.indexOf("ipc");
+        ipcIndex = opts.stdio.indexOf("ipc");
         if (ipcIndex !== -1) {
           wantsIpc = true;
           opts.stdio = opts.stdio.slice();
@@ -18805,13 +18934,29 @@
           natives.platform === "linux" ||
           natives.platform === "darwin")
       ) {
-        return spawnExtra(norm, opts.stdio);
+        // oam carries the ipc channel over a loopback socket rather than an fd,
+        // so splicing the slot out renumbers every fd after it. That is a no-op
+        // when 'ipc' was last (the shape everyone writes) and a silent
+        // off-by-one on the child's numbered fds otherwise -- refuse loudly
+        // instead, since a mis-numbered CDP pipe fails far from its cause.
+        if (wantsIpc && ipcIndex < opts.stdio.length) {
+          const err = new Error(
+            "stdio: 'ipc' before a numbered fd above 2 is not supported -- put 'ipc' last",
+          );
+          err.code = "ERR_INVALID_ARG_VALUE";
+          throw err;
+        }
+        return spawnExtra(norm, opts.stdio, wantsIpc, ipcIndex);
       }
       const cp = new ChildProcess();
+      const modes = stdioModes(opts.stdio);
 
-      cp.stdout = new Readable({ read() {} });
-      cp.stderr = new Readable({ read() {} });
-      cp.stdin = new Writable({
+      // Only a PIPED slot gets a stream. node reports null for 'inherit' and
+      // 'ignore' -- and a Readable we never push to would otherwise sit
+      // un-ended forever, so the shape and the plumbing agree here.
+      cp.stdout = modes[1] === STDIO_PIPE ? new Readable({ read() {} }) : null;
+      cp.stderr = modes[2] === STDIO_PIPE ? new Readable({ read() {} }) : null;
+      cp.stdin = modes[0] !== STDIO_PIPE ? null : new Writable({
         write(chunk, encoding, callback) {
           const data = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
           const doWrite = () => natives.spawnWrite(cp._handle, data).then(() => callback(), (err) => callback(err));
@@ -18832,8 +18977,12 @@
           doFinal();
         },
       });
+      // node exposes the same three objects as child.stdio; the ipc slot, when
+      // one is attached, lands at [3] as null.
+      cp.stdio = [cp.stdin, cp.stdout, cp.stderr];
 
       const nativeOpts = {
+        stdio: modes,
         cwd: opts.cwd || undefined,
         // No explicit env: hand the child the LIVE process.env view, not the
         // pristine OS environment. node's process.env writes through to the
@@ -18894,8 +19043,12 @@
         queueMicrotask(() => {
         cp.emit("spawn");
 
-        const stdoutDone = readStdout(info.handle);
-        const stderrDone = readStderr(info.handle);
+        // An inherited or ignored slot has no pipe to drain: the child owns
+        // the parent's fd directly, so there is nothing for this process to
+        // pump and no read to wait on before 'close'.
+        const pumps = [];
+        if (cp.stdout) pumps.push(readStdout(info.handle));
+        if (cp.stderr) pumps.push(readStderr(info.handle));
 
         natives.spawnWait(info.handle).then((result) => {
           cp._exited = true;
@@ -18907,7 +19060,7 @@
           // 'data' listener attached in the 'spawn' handler still sees all
           // output before 'close' -- otherwise stdout capture races the
           // close emit and is intermittently empty.
-          Promise.allSettled([stdoutDone, stderrDone]).then(() => {
+          Promise.allSettled(pumps).then(() => {
             cp.emit("close", result.code, result.signal);
           });
         });
@@ -18915,18 +19068,52 @@
       }
       };
       if (wantsIpc) {
-        attachIpcChannel(cp, launch);
+        attachIpcChannel(cp, launch, ipcIndex);
       } else {
         launch(null);
       }
       function handleSpawnFailure(err) {
-        const e = typeof err === "string" ? new Error(err) : err;
+        const e = spawnFailureError(err, norm.command, norm.args);
+        // The stdin side gets a STREAM-shaped error, not the child's ENOENT:
+        // node settles the write that was already in flight with EPIPE, then
+        // destroys the stream so anything written later fails with
+        // ERR_STREAM_DESTROYED. Handing the spawn error to a write callback
+        // reports the wrong failure to the wrong layer.
+        const pipeErr = new Error("write EPIPE");
+        pipeErr.code = "EPIPE";
+        pipeErr.syscall = "write";
+        // Latched so a waiter that registers AFTER this point still settles --
+        // 'spawnfail' below is one-shot. See deferUntilSpawn.
+        cp._spawnFailure = pipeErr;
+        // An ipc channel bound for this child would otherwise keep listening
+        // forever: 'exit' never fires for a child that never started.
+        if (cp._ipcTeardown) cp._ipcTeardown();
+        // The pending stdin write is settled by handing this error to its
+        // write callback, which ERRORS the stream. node settles the callback
+        // but never surfaces a spawn failure as a stdin 'error', and callers
+        // listen on the CHILD -- so without this guard the most ordinary shape
+        // (`cp.on('error', h); cp.stdin.end(payload)`) died on an uncaught
+        // stream error even though the caller handled everything correctly.
+        // Attached only on this path, so a real EPIPE still propagates.
+        if (cp.stdin) cp.stdin.on("error", () => {});
         // Settle deferred stdin write/final waiters, then end the read streams
         // so consumers awaiting completion don't hang on a failed spawn.
-        cp.emit("spawnfail", e);
-        cp.stdout.push(null);
-        cp.stderr.push(null);
-        queueMicrotask(() => cp.emit("error", e));
+        cp.emit("spawnfail", pipeErr);
+        // Destroyed AFTER the in-flight write is settled, so a later write gets
+        // ERR_STREAM_DESTROYED from the stream itself -- node's exact split.
+        if (cp.stdin) cp.stdin.destroy();
+        if (cp.stdout) cp.stdout.push(null);
+        if (cp.stderr) cp.stderr.push(null);
+        queueMicrotask(() => {
+          cp.emit("error", e);
+          // node follows 'error' with 'close' (code = the libuv errno) for a
+          // child that never started. Consumers whose completion path is
+          // 'close' -- the shape every run-a-tool-then-continue wrapper uses --
+          // otherwise stall instead of taking their error branch.
+          queueMicrotask(() => {
+            cp.emit("close", typeof e.errno === "number" ? e.errno : null, null);
+          });
+        });
       }
 
       return cp;
@@ -18938,20 +19125,70 @@
         options = {};
       }
       const opts = Object.assign({ shell: true }, options);
-      const cp = spawn(command, [], opts);
+      // node's exec/execFile hand spawn an explicit option WHITELIST (cwd, env,
+      // gid, shell, signal, uid, windowsHide, windowsVerbatimArguments) and drop
+      // `stdio` on the floor -- exec owns the pipes, because collecting stdout
+      // for the callback is the whole contract. Forwarding it would make
+      // `exec(cmd, {stdio:'inherit'})` hand back null streams where node hands
+      // back real ones. (execSync/spawnSync DO honor stdio; only async exec
+      // does not -- `execSync(cmd, {stdio:'inherit'})` is a normal idiom.)
+      const spawnOpts = Object.assign({}, opts);
+      delete spawnOpts.stdio;
+      return collectExec(spawn(command, [], spawnOpts), command, opts, callback);
+    }
+
+    // The collector half of exec()/execFile(). Both own their pipes and deliver
+    // (err, stdout, stderr) to a callback; they differ ONLY in how the child is
+    // launched -- exec through a shell, execFile emphatically not -- so the
+    // buffering, maxBuffer accounting and error shaping live here once.
+    function collectExec(cp, command, opts, callback) {
       const stdout = [];
       const stderr = [];
       const maxBuffer = opts.maxBuffer || 50 * 1024 * 1024;
+      let stdoutLen = 0;
+      let stderrLen = 0;
+      let maxBufferError = null;
+
+      // Running totals, NOT Buffer.concat(...).length per chunk: concatenating
+      // everything accumulated so far on every chunk is quadratic, and at the
+      // 50MB default that is gigabytes of copying for one noisy command. node
+      // keeps the same two counters.
+      //
+      // On overflow node delivers EXACTLY maxBuffer bytes: the chunk that
+      // crosses the limit is TRUNCATED to the remaining allowance and kept,
+      // then the child is killed. Dropping that chunk whole instead hands the
+      // caller whatever the pipe happened to coalesce -- a shorter, run-
+      // dependent prefix -- and the prefix is the point, since it is what
+      // diagnostics print when output was too big to keep.
+      const overflow = (which) => {
+        if (maxBufferError) return;
+        maxBufferError = new Error(`${which} maxBuffer length exceeded`);
+        maxBufferError.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+        cp.kill();
+      };
 
       cp.on("spawn", () => {
-        cp.stdout.on("data", (chunk) => {
-          stdout.push(chunk);
-          if (Buffer.concat(stdout).length > maxBuffer) {
-            cp.kill();
-          }
+        // Null when the caller passed stdio:'inherit'/'ignore' through: there
+        // is no pipe to collect from, and node's exec guards the same way.
+        cp.stdout?.on("data", (chunk) => {
+          const used = stdoutLen;
+          stdoutLen += chunk.length;
+          if (stdoutLen > maxBuffer) {
+            const room = maxBuffer - used;
+            if (room > 0) stdout.push(chunk.subarray(0, room));
+            overflow("stdout");
+          } else stdout.push(chunk);
         });
-        cp.stderr.on("data", (chunk) => {
-          stderr.push(chunk);
+        // maxBuffer binds BOTH streams in node. Enforcing it on stdout alone
+        // let a child that only spews to stderr grow this array without limit.
+        cp.stderr?.on("data", (chunk) => {
+          const used = stderrLen;
+          stderrLen += chunk.length;
+          if (stderrLen > maxBuffer) {
+            const room = maxBuffer - used;
+            if (room > 0) stderr.push(chunk.subarray(0, room));
+            overflow("stderr");
+          } else stderr.push(chunk);
         });
       });
       cp.on("close", (code, signal) => {
@@ -18960,7 +19197,12 @@
         const enc = opts.encoding || "utf8";
         const out = enc === "buffer" ? stdoutBuf : stdoutBuf.toString(enc);
         const errOut = enc === "buffer" ? stderrBuf : stderrBuf.toString(enc);
-        if (code !== 0 && callback) {
+        // A maxBuffer kill wins over the generic "Command failed": the child
+        // died because WE killed it, so the signal-shaped failure below would
+        // describe the symptom rather than the cause.
+        if (maxBufferError && callback) {
+          callback(maxBufferError, out, errOut);
+        } else if (code !== 0 && callback) {
           const err = new Error(`Command failed: ${command}\n${errOut}`);
           err.code = code;
           err.signal = signal;
@@ -18985,7 +19227,24 @@
         options = {};
       }
       const norm = normalizeArgs(file, args, options);
-      return exec(norm.command + " " + norm.args.join(" "), norm.options, callback);
+      const opts = norm.options || {};
+      // node's execFile runs WITHOUT a shell and passes argv VERBATIM -- that is
+      // the whole reason it sits next to exec(). Joining argv into one string
+      // and shelling out re-splits arguments on whitespace (so a path or value
+      // containing a space breaks) and EXECUTES shell metacharacters that
+      // happen to appear inside an argument. `shell` stays honored if the
+      // caller explicitly asks for one, which node also supports.
+      const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
+      delete spawnOpts.stdio;
+      const display = norm.args.length
+        ? `${norm.command} ${norm.args.join(" ")}`
+        : norm.command;
+      return collectExec(
+        spawn(norm.command, norm.args, spawnOpts),
+        display,
+        opts,
+        callback,
+      );
     }
 
     function fork(modulePath, args, options) {
@@ -19002,9 +19261,26 @@
       const cp = new ChildProcess();
       cp.connected = true;
 
-      cp.stdout = silent ? new Readable({ read() {} }) : null;
-      cp.stderr = silent ? new Readable({ read() {} }) : null;
+      // node's fork default is 'inherit' -- a forked child's console output
+      // shows up on the PARENT's stdout -- and only `silent: true` pipes it.
+      // An explicit `stdio` option overrides both. The 'ipc' slot is dropped
+      // here because oam carries the fork channel over a loopback socket
+      // rather than an inherited fd.
+      const forkStdio = Array.isArray(opts.stdio)
+        ? opts.stdio.filter((e) => e !== "ipc")
+        : opts.stdio;
+      const modes =
+        forkStdio === undefined
+          ? (silent
+              ? [STDIO_PIPE, STDIO_PIPE, STDIO_PIPE]
+              : [STDIO_INHERIT, STDIO_INHERIT, STDIO_INHERIT])
+          : stdioModes(forkStdio);
+
+      cp.stdout = modes[1] === STDIO_PIPE ? new Readable({ read() {} }) : null;
+      cp.stderr = modes[2] === STDIO_PIPE ? new Readable({ read() {} }) : null;
+      // stdin is wired after the spawn resolves (below), like the pid.
       cp.stdin = null;
+      cp.stdio = [null, cp.stdout, cp.stderr, null];
 
       let ipcSocket = null;
       const pendingSends = [];
@@ -19054,6 +19330,7 @@
 
         const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
         const nativeOpts = {
+          stdio: modes,
           cwd: opts.cwd || undefined,
           env: childEnv,
           shell: false,
@@ -19099,14 +19376,28 @@
           info = JSON.parse(natives.spawnAsync(execPath, spawnArgs, nativeOpts));
         } catch (err) {
           ipcServer.close();
-          queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+          // Same Node-shaped error as spawn()/spawnExtra(): this catch was
+          // missed when the others were converted, so a failed fork still
+          // surfaced the raw native JSON body with err.code undefined.
+          const e = spawnFailureError(err, execPath, spawnArgs);
+          cp.connected = false;
+          // End the piped streams and follow node's error -> close ordering, so
+          // a consumer awaiting either does not hang on a fork that never ran.
+          if (cp.stdout) cp.stdout.push(null);
+          if (cp.stderr) cp.stderr.push(null);
+          queueMicrotask(() => {
+            cp.emit("error", e);
+            queueMicrotask(() => {
+              cp.emit("close", typeof e.errno === "number" ? e.errno : null, null);
+            });
+          });
         }
         if (info) {
           cp._handle = info.handle;
           cp.pid = info.pid;
           queueMicrotask(() => {
 
-          if (silent) {
+          if (modes[0] === STDIO_PIPE) {
             cp.stdin = new Writable({
               write(chunk, encoding, callback) {
                 natives.spawnWrite(info.handle, typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk)
@@ -19117,6 +19408,7 @@
                 callback();
               },
             });
+            cp.stdio[0] = cp.stdin;
           }
 
           cp.emit("spawn");
@@ -19141,8 +19433,11 @@
               if (cp.stderr) cp.stderr.push(Buffer.from(chunk));
             }
           };
-          const stdoutDone = readStdout(info.handle);
-          const stderrDone = readStderr(info.handle);
+          // Nothing to drain for an inherited or ignored slot -- the child
+          // holds the parent's fd directly.
+          const pumps = [];
+          if (cp.stdout) pumps.push(readStdout(info.handle));
+          if (cp.stderr) pumps.push(readStderr(info.handle));
 
           natives.spawnWait(info.handle).then((result) => {
             cp._exited = true;
@@ -19158,7 +19453,7 @@
             cp.emit("exit", result.code, result.signal);
             // 'close' waits for stdio EOF, not just process exit (Node parity;
             // see spawn() above -- avoids the stdout-capture race on 'close').
-            Promise.allSettled([stdoutDone, stderrDone]).then(() => {
+            Promise.allSettled(pumps).then(() => {
               cp.emit("close", result.code, result.signal);
             });
           });
