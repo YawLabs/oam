@@ -11,6 +11,42 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ## [Unreleased]
 
+### Fixed (child_process parity follow-ups)
+
+- **`spawn()` mutated the caller's options object.** It spliced the `'ipc'`
+  entry out of `options.stdio` in place, so reusing one options literal to
+  spawn a pool of workers gave the first child a channel and every later one
+  none — `child.send` simply undefined, with no error raised anywhere.
+- **`kill()` was a silent no-op while the native handle was still resolving** —
+  the window an `'ipc'` child has, because its channel must bind before exec.
+  It returned `true`, `killed` stayed `false`, and the child kept running. The
+  signal is now held and delivered as soon as the handle lands.
+- **`exec()` accepted `timeout` and ignored it**, so the standard way to bound a
+  shell-out did not bound it: a child that hung hung the caller forever. The
+  callback now reports `killed: true` with the signal, as node does.
+- **`execSync()`'s thrown error had no `.output`** — the 3-slot
+  `[null, stdout, stderr]` array harnesses read to get both streams from one
+  throw — and its message appended a newline node only appends when stderr is
+  non-empty.
+- **`fork()` accepted an explicit `stdio` array with no `'ipc'` entry.** Node
+  throws `ERR_CHILD_PROCESS_IPC_REQUIRED`; oam built the channel anyway, which
+  let code be written and tested here that is fatal the moment it runs on node.
+- **`spawnSync()`'s `timeout` returned `ETIMEDOUT` without killing the child.**
+  The child was moved into a worker thread that owned it, so nothing was left to
+  kill: `spawnSync` returned while the child ran on holding its port, its lock
+  and — now that `stdio: 'inherit'` is honored — the parent's console.
+- **`spawnSync()` truncated at `maxBuffer` and reported success.** A caller got
+  a short result that looked complete (a half JSON document that still parses)
+  while every node-shaped check had nothing to branch on. It now reports
+  `ENOBUFS` with a null status, as node does.
+
+### Fixed (release)
+
+- **The MCP sidecar matrix ran AFTER the GitHub release went live.** Its "do not
+  ship" branch fired on a build `install.sh` and `oam self-update` could already
+  resolve, so the gate was reporting a verdict on something it could no longer
+  stop. It now runs before the release is cut.
+
 ### Added
 
 - **`--allow-net` and `--allow-env` grants**, with env access actually enforced,

@@ -525,6 +525,34 @@ if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
+# --- sidecar regression matrix --------------------------------------------------
+# Yaw MCP ships `defaultRuntime: "oam"`, so a release that breaks a sidecar
+# breaks the broker for real users. Gating here is the difference between
+# catching it and shipping it. Network- and npm-dependent, so a failure to RUN
+# the matrix warns; a sidecar that actually fails is fatal.
+#
+# BEFORE the release is cut, deliberately. This ran after `gh release edit
+# --draft=false`, so its "do NOT ship" branch fired on a build that install.sh
+# and `oam self-update` could already resolve -- the gate reported a verdict on
+# something it could no longer stop. The assets it needs exist from "Assemble
+# release assets" onward, so nothing forces it downstream of publishing.
+step "MCP sidecar regression matrix"
+if ! command -v node >/dev/null 2>&1; then
+  warn "node not on PATH -- sidecar matrix skipped (it hosts the harness, not the test)"
+else
+  set +e
+  # The freshly built NATIVE asset -- the matrix must exercise the binary this
+  # release actually ships, not whatever oam happens to be on PATH.
+  OAM_BIN="$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe" node "$REPO_DIR/scripts/mcp-sidecar-matrix.mjs"
+  matrix_status=$?
+  set -e
+  case "$matrix_status" in
+    0) ok "every oam-hosted sidecar served its tools" ;;
+    1) fail "a sidecar failed on this build -- see above; nothing has been published" ;;
+    *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean" ;;
+  esac
+fi
+
 step "Cut GitHub Release $TAG"
 # Draft-first publish: assets upload while the release is still a draft, and
 # it goes live -- atomically, one API call -- only once every asset is up. A
@@ -549,28 +577,6 @@ ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 # Skipped rather than fatal when the site checkout is absent: a release is still
 # valid without it, and the verification below says loudly if the live site is
 # stale.
-# --- sidecar regression matrix --------------------------------------------------
-# Yaw MCP ships `defaultRuntime: "oam"`, so a release that breaks a sidecar
-# breaks the broker for real users. Gating here is the difference between
-# catching it and shipping it. Network- and npm-dependent, so a failure to RUN
-# the matrix warns; a sidecar that actually fails is fatal.
-step "MCP sidecar regression matrix"
-if ! command -v node >/dev/null 2>&1; then
-  warn "node not on PATH -- sidecar matrix skipped (it hosts the harness, not the test)"
-else
-  set +e
-  # The freshly built NATIVE asset -- the matrix must exercise the binary this
-  # release actually ships, not whatever oam happens to be on PATH.
-  OAM_BIN="$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe" node "$REPO_DIR/scripts/mcp-sidecar-matrix.mjs"
-  matrix_status=$?
-  set -e
-  case "$matrix_status" in
-    0) ok "every oam-hosted sidecar served its tools" ;;
-    1) fail "a sidecar failed on this build -- see above; do NOT ship" ;;
-    *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean" ;;
-  esac
-fi
-
 step "Publish installers to oamjs.org"
 SITE_DIR="${OAM_SITE_DIR:-$REPO_DIR/../oamjs.org}"
 if [ ! -d "$SITE_DIR/public" ]; then

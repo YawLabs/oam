@@ -330,29 +330,85 @@ pub fn spawn_sync(
     drop(child.stdin.take());
 
     let output = if timeout_ms > 0 {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let result = child.wait_with_output();
-            let _ = tx.send(result);
+        // The child stays REACHABLE here rather than being moved into a worker
+        // that owns it. `wait_with_output()` consumes the Child, so the old
+        // shape had nothing left to kill when the deadline passed: spawnSync
+        // returned ETIMEDOUT while the child ran on holding its port, its lock
+        // and -- now that `stdio: 'inherit'` is honored -- the parent's console.
+        // The worker was also left parked on a wait that might never return.
+        //
+        // Pipes are drained on their own threads so a child that fills one
+        // cannot deadlock against our wait, which is the reason
+        // `wait_with_output` exists in the first place.
+        use std::io::Read;
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = out_pipe.as_mut() {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
         });
-        match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
-            Ok(result) => {
-                let _ = thread.join();
-                result
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(p) = err_pipe.as_mut() {
+                let _ = p.read_to_end(&mut buf);
             }
-            Err(_) => {
-                return SpawnSyncResult {
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    status: None,
-                    signal: Some("SIGTERM".to_string()),
-                    pid,
-                    error: Some(SpawnSyncError {
-                        code: "ETIMEDOUT".to_string(),
-                        message: format!("spawnSync timed out after {timeout_ms}ms"),
-                    }),
-                };
+            buf
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut timed_out = false;
+        let mut wait_err = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        // Reap it, so the timeout path leaves no zombie.
+                        let _ = child.wait();
+                        timed_out = true;
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    wait_err = Some(e);
+                    break None;
+                }
             }
+        };
+        // The pipes close when the child dies, so these joins cannot outlive it.
+        let mut stdout = out_thread.join().unwrap_or_default();
+        let mut stderr = err_thread.join().unwrap_or_default();
+
+        if timed_out {
+            // node hands back whatever the child managed to emit before the
+            // deadline, not an empty pair.
+            stdout.truncate(max_buffer);
+            stderr.truncate(max_buffer);
+            return SpawnSyncResult {
+                stdout,
+                stderr,
+                status: None,
+                signal: Some("SIGTERM".to_string()),
+                pid,
+                error: Some(SpawnSyncError {
+                    code: "ETIMEDOUT".to_string(),
+                    message: format!("spawnSync timed out after {timeout_ms}ms"),
+                }),
+            };
+        }
+        match (status, wait_err) {
+            (Some(status), _) => Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }),
+            (None, Some(e)) => Err(e),
+            (None, None) => Err(std::io::Error::other("spawnSync: child never exited")),
         }
     } else {
         child.wait_with_output()
@@ -362,11 +418,29 @@ pub fn spawn_sync(
         Ok(output) => {
             let mut stdout = output.stdout;
             let mut stderr = output.stderr;
-            if stdout.len() > max_buffer {
-                stdout.truncate(max_buffer);
-            }
-            if stderr.len() > max_buffer {
-                stderr.truncate(max_buffer);
+            // Blowing maxBuffer is an ERROR, not a quiet trim. Truncating and
+            // reporting status 0 handed callers a short result that looked
+            // complete -- a half JSON document that parses as valid, a log tail
+            // that reads as the whole log -- while every node-shaped caller
+            // (`if (result.error) throw`, or execSync's throw) saw nothing to
+            // branch on. node terminates the child and reports ENOBUFS with a
+            // null status; the output it kept is read-granularity dependent, so
+            // the retained length is deliberately not part of the contract.
+            let overflowed = stdout.len() > max_buffer || stderr.len() > max_buffer;
+            stdout.truncate(max_buffer);
+            stderr.truncate(max_buffer);
+            if overflowed {
+                return SpawnSyncResult {
+                    stdout,
+                    stderr,
+                    status: None,
+                    signal: Some("SIGTERM".to_string()),
+                    pid,
+                    error: Some(SpawnSyncError {
+                        code: "ENOBUFS".to_string(),
+                        message: format!("spawnSync {command} ENOBUFS"),
+                    }),
+                };
             }
             let status = output.status.code();
             SpawnSyncResult {

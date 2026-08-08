@@ -18570,20 +18570,27 @@
       };
     }
 
+    /** node's checkExecSyncError: the message appends stderr only when there IS
+     *  stderr, and the WHOLE spawnSync result is assigned onto the error -- so
+     *  `err.output` is the 3-slot [null, stdout, stderr] array that test
+     *  harnesses and CI wrappers read to get both streams from one throw. */
+    function execSyncError(result, command) {
+      // Unconditionally appending left a trailing newline node never emits on
+      // every quiet-stderr failure -- and the literal text "null" whenever the
+      // caller inherited or ignored the stream.
+      let message = `Command failed: ${command}`;
+      if (result.stderr && result.stderr.length > 0) {
+        message += `\n${result.stderr}`;
+      }
+      const err = new Error(message);
+      return Object.assign(err, result);
+    }
+
     function execSync(command, options) {
       const opts = Object.assign({ shell: true }, options);
       const result = spawnSync(command, [], opts);
       if (result.error) throw result.error;
-      if (result.status !== 0) {
-        // stderr is null when the caller inherited or ignored it.
-        const err = new Error(`Command failed: ${command}\n${result.stderr ?? ""}`);
-        err.status = result.status;
-        err.signal = result.signal;
-        err.stdout = result.stdout;
-        err.stderr = result.stderr;
-        err.pid = result.pid;
-        throw err;
-      }
+      if (result.status !== 0) throw execSyncError(result, command);
       return result.stdout;
     }
 
@@ -18591,15 +18598,9 @@
       const norm = normalizeArgs(file, args, options);
       const result = spawnSync(norm.command, norm.args, norm.options);
       if (result.error) throw result.error;
-      if (result.status !== 0) {
-        const err = new Error(`Command failed: ${norm.command}`);
-        err.status = result.status;
-        err.signal = result.signal;
-        err.stdout = result.stdout;
-        err.stderr = result.stderr;
-        err.pid = result.pid;
-        throw err;
-      }
+      // Same error shape as execSync -- including `output` -- since callers
+      // branch on it identically.
+      if (result.status !== 0) throw execSyncError(result, norm.command);
       return result.stdout;
     }
 
@@ -18617,14 +18618,30 @@
         this._handle = null;
         this._exited = false;
         this._extra = false;
+        // A kill() issued before the native handle resolves parks here.
+        this._pendingKill = null;
       }
       kill(signal) {
-        if (this._handle != null) {
-          if (this._extra) natives.spawnExtraKill(this._handle, signal);
-          else natives.spawnKill(this._handle, signal);
-          this.killed = true;
+        if (this._handle == null) {
+          // node's spawn is synchronous, so this window does not exist there.
+          // It does here for an ipc-bound child, whose channel must bind before
+          // exec. Dropping the request left kill() returning true, `killed`
+          // false, and the child running -- with nothing the caller could
+          // observe. Hold it and deliver the moment the handle lands.
+          this._pendingKill = signal || "SIGTERM";
+          return true;
         }
+        if (this._extra) natives.spawnExtraKill(this._handle, signal);
+        else natives.spawnKill(this._handle, signal);
+        this.killed = true;
         return true;
+      }
+      /** Deliver a kill that arrived before the handle did. */
+      _flushPendingKill() {
+        if (this._pendingKill == null || this._handle == null) return;
+        const signal = this._pendingKill;
+        this._pendingKill = null;
+        this.kill(signal);
       }
       ref() { return this; }
       unref() { return this; }
@@ -18728,6 +18745,7 @@
         return;
       }
       cp._handle = info.handle;
+      cp._flushPendingKill();
       cp.pid = info.pid;
 
       const reads = [];
@@ -18914,22 +18932,28 @@
       // stdio: [..., 'ipc'] asks for a message channel, the same one fork()
       // sets up. Splice the slot out FIRST so a 4-entry array does not get
       // misrouted to the extra-fd path below; Node reports stdio[3] as null.
+      // Derived into a LOCAL, never written back onto `opts`: that object is the
+      // caller's, and reusing one options literal to spawn several children --
+      // the worker-pool shape -- meant the first spawn spliced 'ipc' out of it
+      // and every later child silently came up with no channel at all
+      // (cp.send undefined).
       let wantsIpc = false;
       let ipcIndex = -1;
-      if (Array.isArray(opts.stdio)) {
-        ipcIndex = opts.stdio.indexOf("ipc");
+      let stdioSpec = opts.stdio;
+      if (Array.isArray(stdioSpec)) {
+        ipcIndex = stdioSpec.indexOf("ipc");
         if (ipcIndex !== -1) {
           wantsIpc = true;
-          opts.stdio = opts.stdio.slice();
-          opts.stdio.splice(ipcIndex, 1);
+          stdioSpec = stdioSpec.slice();
+          stdioSpec.splice(ipcIndex, 1);
         }
       }
       // Extra-fd stdio (Chromium CDP pipe): an array with >3 entries routes to
       // the raw extra-fd spawn (CreateProcessW+lpReserved2 on Windows, Command+
       // pre_exec dup2 on Unix). Gated to platforms with a real native backend.
       if (
-        Array.isArray(opts.stdio) &&
-        opts.stdio.length > 3 &&
+        Array.isArray(stdioSpec) &&
+        stdioSpec.length > 3 &&
         (natives.platform === "win32" ||
           natives.platform === "linux" ||
           natives.platform === "darwin")
@@ -18939,17 +18963,17 @@
         // when 'ipc' was last (the shape everyone writes) and a silent
         // off-by-one on the child's numbered fds otherwise -- refuse loudly
         // instead, since a mis-numbered CDP pipe fails far from its cause.
-        if (wantsIpc && ipcIndex < opts.stdio.length) {
+        if (wantsIpc && ipcIndex < stdioSpec.length) {
           const err = new Error(
             "stdio: 'ipc' before a numbered fd above 2 is not supported -- put 'ipc' last",
           );
           err.code = "ERR_INVALID_ARG_VALUE";
           throw err;
         }
-        return spawnExtra(norm, opts.stdio, wantsIpc, ipcIndex);
+        return spawnExtra(norm, stdioSpec, wantsIpc, ipcIndex);
       }
       const cp = new ChildProcess();
-      const modes = stdioModes(opts.stdio);
+      const modes = stdioModes(stdioSpec);
 
       // Only a PIPED slot gets a stream. node reports null for 'inherit' and
       // 'ignore' -- and a Readable we never push to would otherwise sit
@@ -19038,6 +19062,7 @@
       }
       if (info) {
         cp._handle = info.handle;
+      cp._flushPendingKill();
         cp.pid = info.pid;
 
         queueMicrotask(() => {
@@ -19148,6 +19173,9 @@
       let stdoutLen = 0;
       let stderrLen = 0;
       let maxBufferError = null;
+      const timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : 0;
+      let timer = null;
+      let timedOut = false;
 
       // Running totals, NOT Buffer.concat(...).length per chunk: concatenating
       // everything accumulated so far on every chunk is quadratic, and at the
@@ -19190,8 +19218,19 @@
             overflow("stderr");
           } else stderr.push(chunk);
         });
+        // `timeout` was accepted and ignored, so the standard way to bound a
+        // shell-out (health checks, version probes, git calls) simply did not
+        // bound it: a child that hung hung the caller forever. node arms the
+        // timer once the child is running and kills with killSignal.
+        if (timeout > 0) {
+          timer = setTimeout(() => {
+            timedOut = true;
+            cp.kill(opts.killSignal || "SIGTERM");
+          }, timeout);
+        }
       });
       cp.on("close", (code, signal) => {
+        if (timer) clearTimeout(timer);
         const stdoutBuf = Buffer.concat(stdout);
         const stderrBuf = Buffer.concat(stderr);
         const enc = opts.encoding || "utf8";
@@ -19202,10 +19241,14 @@
         // describe the symptom rather than the cause.
         if (maxBufferError && callback) {
           callback(maxBufferError, out, errOut);
-        } else if (code !== 0 && callback) {
+        } else if ((code !== 0 || timedOut) && callback) {
           const err = new Error(`Command failed: ${command}\n${errOut}`);
           err.code = code;
-          err.signal = signal;
+          // node reports a timed-out child as killed, with the signal it sent,
+          // so `err.killed` is how callers tell "the command failed" from "we
+          // gave up waiting".
+          err.killed = timedOut || cp.killed;
+          err.signal = timedOut ? opts.killSignal || "SIGTERM" : signal;
           callback(err, out, errOut);
         } else if (callback) {
           callback(null, out, errOut);
@@ -19257,6 +19300,19 @@
       const execPath = opts.execPath || globalThis.process.execPath;
       const execArgv = opts.execArgv || globalThis.process.execArgv || [];
       const silent = !!opts.silent;
+
+      // An explicit stdio array must still declare its channel. oam builds one
+      // regardless (it rides a loopback socket, not an fd), so accepting the
+      // array without 'ipc' would let code be written and tested here that
+      // throws the moment it runs on node -- node's guard is the whole value,
+      // and silently succeeding is what removes it.
+      if (Array.isArray(opts.stdio) && !opts.stdio.includes("ipc")) {
+        const err = new TypeError(
+          "Forked processes must have an IPC channel, missing value 'ipc' in options.stdio",
+        );
+        err.code = "ERR_CHILD_PROCESS_IPC_REQUIRED";
+        throw err;
+      }
 
       const cp = new ChildProcess();
       cp.connected = true;
@@ -19394,6 +19450,7 @@
         }
         if (info) {
           cp._handle = info.handle;
+      cp._flushPendingKill();
           cp.pid = info.pid;
           queueMicrotask(() => {
 
