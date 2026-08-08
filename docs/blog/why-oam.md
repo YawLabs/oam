@@ -16,7 +16,7 @@ measurement.
 ## Conformance: 429/431, and what that ratio is over
 
 A vendored subset of Node's own test suite runs on every release. The current
-scorecard (`CONFORMANCE-NODE.md`, generated at commit `21b8181`, oam 0.8.0
+scorecard (`CONFORMANCE-NODE.md`, generated at commit `869aa9e`, oam 0.9.0
 against Node v22.22.2):
 
 - **429/431 (99.5%) on windows-aarch64**
@@ -111,8 +111,9 @@ protocol surface ships in the binary instead of being installed from npm.
 ## What will bite you
 
 - **Beta.** Breaking changes before 1.0 are still possible and are called out in
-  the changelog. There is no LTS yet. Do not put an operating production service
-  on this.
+  the changelog -- 0.9.0 changed `child_process` behavior you may have depended
+  on. There is no LTS yet, so this is not the runtime for a service you are
+  on-call for.
 - **Binaries are unsigned.** They are checksummed against a published
   `SHA256SUMS` and the installer verifies that, but there is no code signature.
 - **Native addons are alpha and off by default**, behind

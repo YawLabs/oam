@@ -115,5 +115,6 @@ sidecar, inspector) lands per the roadmap; crates are created when their workstr
 
 Domain: https://oamjs.org — the installer and update channel serve from there exclusively.
 
-Distribution: the install script is canonical; the npm package is **@yawlabs/oam** (bare `oam`
-on npm belongs to an unrelated project).
+Distribution: the install script is canonical. An npm package is planned under
+**@yawlabs/oam** — that name is not published yet, so install via the script above (bare
+`oam` on npm belongs to an unrelated project).
