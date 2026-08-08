@@ -5,7 +5,7 @@ TypeScript directly, including `.tsx`/`.jsx`, with no build step and no loader
 hook, and it is built to host MCP servers -- many short-lived processes, idle
 most of the time, each needing to answer its first request fast.
 
-It is pre-alpha. That word is doing real work here, and the specifics are near
+It is beta. That word is doing real work here, and the specifics are near
 the end.
 
 The thing worth arguing about is not speed. It is that every number below comes
@@ -110,8 +110,9 @@ protocol surface ships in the binary instead of being installed from npm.
 
 ## What will bite you
 
-- **Pre-alpha.** APIs can move. There is no LTS yet. Do not put an operating
-  production service on this.
+- **Beta.** Breaking changes before 1.0 are still possible and are called out in
+  the changelog. There is no LTS yet. Do not put an operating production service
+  on this.
 - **Binaries are unsigned.** They are checksummed against a published
   `SHA256SUMS` and the installer verifies that, but there is no code signature.
 - **Native addons are alpha and off by default**, behind

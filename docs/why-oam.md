@@ -37,7 +37,8 @@ Where Node is still the right answer:
 - **Anything needing the full ecosystem surface.** oam covers the `node:`
   builtins that real packages use; it is not a complete reimplementation, and
   the divergence list is public precisely so you can check before you commit.
-- **Long-lived production services you already operate.** oam is pre-alpha.
+- **Long-lived production services you already operate.** oam is beta, and there
+  is no LTS yet.
 
 ## vs Deno
 
@@ -83,7 +84,8 @@ gated on a matrix that boots each one and calls a real tool
 
 ## Honesty notes
 
-- **Pre-alpha.** APIs can move. There is no LTS yet.
+- **Beta.** Breaking changes before 1.0 are still possible and are called out in
+  the changelog. There is no LTS yet.
 - **The conformance number has a denominator.** 99.5% is *pass over tests that
   ran*; the corpus is a subset of Node's suite, and
   [node-divergences.md](node-divergences.md) explains what is excluded and why.
