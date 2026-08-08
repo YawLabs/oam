@@ -278,6 +278,69 @@ pub fn close_inherited_fd(fd: u64) {
     let _ = fd;
 }
 
+/// The descriptors that were already open when the process started -- i.e. the
+/// ones a PARENT handed us, snapshotted before oam can open anything of its own.
+static INHERITED_AT_START: std::sync::OnceLock<std::collections::HashSet<u64>> =
+    std::sync::OnceLock::new();
+
+/// Record which descriptors we were born holding. Call ONCE, as early in `main`
+/// as possible and before opening any file.
+///
+/// Adoption cannot be a plain "is this fd open?" test, because on unix there is
+/// a single descriptor space: a file oam opens for ITSELF lands on OS fd 3, and
+/// a later `writeSync(3)` would then adopt oam's own descriptor. Reads and
+/// writes through it happen to match Node (Node's fd 3 is that same file), but
+/// `closeSync(3)` would not: it closes the descriptor the registry entry at 64
+/// still owns, leaving a dangling `File` whose fd the OS is free to hand to the
+/// next `open`. Aliasing two unrelated files is a corruption bug, not a parity
+/// one.
+///
+/// Snapshotting at startup is what makes "the parent gave me this" decidable.
+/// Windows happens to be immune -- Rust's `File` holds a HANDLE and never takes
+/// a CRT fd slot, so only real inherited descriptors ever appear there -- but
+/// the invariant should not depend on that.
+pub fn snapshot_inherited_fds() {
+    let mut found = std::collections::HashSet::new();
+    for fd in 3..=MAX_INHERITED_FD {
+        if probe_open(fd) {
+            found.insert(fd);
+        }
+    }
+    let _ = INHERITED_AT_START.set(found);
+}
+
+/// Is this descriptor open right now? Cheapest available question per platform.
+fn probe_open(fd: u64) -> bool {
+    let Ok(raw) = i32::try_from(fd) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "C" {
+            fn _get_osfhandle(fd: i32) -> isize;
+            fn _set_thread_local_invalid_parameter_handler(
+                handler: Option<unsafe extern "C" fn()>,
+            ) -> Option<unsafe extern "C" fn()>;
+        }
+        unsafe extern "C" fn ignore_invalid_parameter() {}
+        unsafe {
+            let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
+            let h = _get_osfhandle(raw);
+            _set_thread_local_invalid_parameter_handler(prev);
+            h != -1
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = raw;
+        false
+    }
+}
+
 /// Adopt an fd the parent handed us into `registry`, so the ordinary fs ops can
 /// find it. No-op (returning true) if it is already there.
 ///
@@ -287,6 +350,16 @@ pub fn close_inherited_fd(fd: u64) {
 /// keys and nothing had ever put the inherited fd in the registry.
 pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
     if !(3..=MAX_INHERITED_FD).contains(&fd) {
+        return false;
+    }
+    // Only descriptors we were BORN holding. Without this an fd oam opened for
+    // itself after startup is indistinguishable from one the parent passed --
+    // see snapshot_inherited_fds. A missing snapshot means the entry point never
+    // took one, and adopting nothing is the safe answer.
+    if !INHERITED_AT_START
+        .get()
+        .is_some_and(|set| set.contains(&fd))
+    {
         return false;
     }
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
