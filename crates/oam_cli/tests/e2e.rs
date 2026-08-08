@@ -39,6 +39,56 @@ fn oam(args: &[&str]) -> Output {
         .expect("oam binary runs")
 }
 
+// bug: `oam -e` writes its source to a REAL file in the CWD (node's eval
+// resolves require() from there, so it cannot live in a tmpdir) and deleted it
+// only after the script RETURNED. `process.exit()` never returns -- V8 tears
+// the process down from inside the op -- so the artifact was left sitting in
+// whatever directory the user happened to run from. Every hard-exit path now
+// drains a cleanup registry first.
+#[test]
+fn eval_artifact_is_removed_even_when_the_script_calls_process_exit() {
+    let dir = write_temp("eval-artifact/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // CWD is the whole point: the artifact lands where the process was started.
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .current_dir(&dir)
+            .env("OAM_CACHE_DIR", &dir)
+            .output()
+            .expect("oam binary runs")
+    };
+    let leftovers = || -> Vec<String> {
+        std::fs::read_dir(&dir)
+            .expect("scratch dir readable")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".oam-eval-"))
+            .collect()
+    };
+
+    // The regression: a hard exit from inside the evaluated source.
+    let out = run(&["-e", "process.exit(7)"]);
+    assert_eq!(out.status.code(), Some(7));
+    assert!(
+        leftovers().is_empty(),
+        "process.exit left {:?}",
+        leftovers()
+    );
+
+    // The returning path and the ESM path must stay clean too -- the fix adds a
+    // second removal, and a double-remove must not resurrect anything.
+    let out = run(&["-e", "1 + 1"]);
+    assert!(out.status.success(), "plain eval failed");
+    assert!(leftovers().is_empty(), "plain eval left {:?}", leftovers());
+
+    let out = run(&["--input-type=module", "-e", "process.exit(3)"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(leftovers().is_empty(), "esm eval left {:?}", leftovers());
+}
+
 /// Minimal local HTTP/1.1 echo server so fetch tests never touch the
 /// network (CI determinism). Echoes {method, path, echo: body} as JSON.
 fn spawn_echo_server() -> std::net::SocketAddr {

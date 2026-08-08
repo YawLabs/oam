@@ -34,6 +34,9 @@ mod vm_module;
 mod worker;
 pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
+// Re-exported so the CLI can register its `-e` artifact without taking a direct
+// oam_core dependency; the hard-exit paths that drain it live in this crate.
+pub use oam_core::{exit_process, register_exit_cleanup, run_exit_cleanup};
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 pub use replay::ReplayMode;
 
@@ -152,7 +155,7 @@ unsafe extern "C" fn near_heap_limit_oom(
     let mut lock = stderr.lock();
     let _ = lock.write_all(banner.as_bytes());
     let _ = lock.flush();
-    std::process::exit(134);
+    oam_core::exit_process(134);
 }
 
 impl JsRuntime {

@@ -2440,6 +2440,11 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
             (Some(dir), file)
         }
     };
+    // The cleanup below only runs if the script RETURNS. `oam -e
+    // "process.exit(0)"` never does -- V8 exits from inside the op -- so the
+    // artifact was left in the user's working directory. Register it so the
+    // hard-exit path removes it too.
+    oam_engine::register_exit_cleanup(tmp_dir.clone().unwrap_or_else(|| tmp_file.clone()));
     // -p evaluates through a DIRECT eval, which yields the completion value
     // of a statement list the way node's script evaluation does
     // (`-p "a(); b"` prints b) AND inherits the enclosing module scope. It

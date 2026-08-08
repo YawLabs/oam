@@ -543,6 +543,47 @@ pub async fn stdin_read() -> OpOutcome {
     }
 }
 
+/// Artifacts the process must delete before a HARD exit.
+///
+/// `oam -e` writes its source to a REAL file, and that file has to sit in the
+/// CWD because node's eval resolves `require()` from there. The CLI deletes it
+/// once the script returns -- but a script that calls `process.exit()` never
+/// returns: V8 tears the process down from inside the op, so the file was left
+/// behind in whatever directory the user happened to be in. Every hard-exit
+/// path drains this list first.
+static EXIT_CLEANUP: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a path to remove on a hard exit. Directories are removed
+/// recursively; a path that no longer exists is ignored.
+pub fn register_exit_cleanup(path: std::path::PathBuf) {
+    let mut guard = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    guard.push(path);
+}
+
+/// Remove every registered artifact. Idempotent -- the list is taken, so a
+/// normal-path cleanup followed by an exit-path drain does no double work.
+pub fn run_exit_cleanup() {
+    let paths = {
+        let mut guard = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    for path in paths {
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// `std::process::exit`, with the artifact drain that a hard exit would
+/// otherwise skip. Every `process.exit()`, fatal banner and EPIPE bail routes
+/// through here rather than calling `std::process::exit` directly.
+pub fn exit_process(code: i32) -> ! {
+    run_exit_cleanup();
+    std::process::exit(code)
+}
+
 /// Node's `err.errno` -- the libuv error NUMBER (negative). On Unix it is just
 /// `-errno` (libuv UV_E* == -E*). On Windows libuv uses its own -4000-range
 /// table (verified against node: ENOENT -4058, EISDIR -4068, EEXIST -4075,
