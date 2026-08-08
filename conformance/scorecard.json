@@ -1,5 +1,5 @@
 {
-  "commit": "d679b39",
+  "commit": "14c7865",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.8.3",
@@ -262,10 +262,14 @@
         {
           "case": "64-child-failure-path.mjs",
           "status": "pass"
+        },
+        {
+          "case": "65-child-parity-followups.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 64,
-      "total": 64
+      "pass": 65,
+      "total": 65
     },
     "surface": {
       "globals": {
