@@ -46,15 +46,21 @@ impl ChildProcess {
 pub type ChildRegistry = Arc<Mutex<HashMap<u64, ChildProcess>>>;
 
 /// Per-fd disposition for a child's stdin/stdout/stderr, mirroring node's
-/// `stdio` option. A numeric fd or a stream in slot 0/1/2 means "hand the child
-/// the parent's fd", which is `Inherit`; the JS layer collapses those before
-/// they get here.
+/// `stdio` option.
 ///
 /// `Inherit` is a real OS-level handle hand-off, not a pump: the child writes
 /// straight to the parent's fd with no copy through this process, which is both
 /// node's semantics and the only way a grandchild's stdio survives an
 /// intermediate launcher (npm `bin` shims do exactly this).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+///
+/// `File` is the same idea for a slot the caller named by NUMBER -- the
+/// daemonize-into-a-logfile shape, `stdio: ['ignore', logFd, logFd]`. Those
+/// used to collapse to `Inherit`, so the output went to the parent's console
+/// instead of the file the caller asked for; the engine now resolves the fd
+/// against oam's descriptor registry and hands the child a dup.
+///
+/// NOT `Copy`: the `File` variant owns a descriptor.
+#[derive(Debug, Default)]
 pub enum StdioMode {
     /// `/dev/null` (NUL on Windows). Reads see EOF immediately; writes vanish.
     Ignore,
@@ -63,11 +69,15 @@ pub enum StdioMode {
     /// An anonymous pipe this process owns both ends of. Node's default.
     #[default]
     Pipe,
+    /// A descriptor resolved from a numeric stdio slot. Already a dup, so
+    /// handing it to the child does not disturb the caller's own fd.
+    File(std::fs::File),
 }
 
 impl StdioMode {
-    /// Decode the wire form shared with the JS layer and with `child_extra`'s
-    /// direction codes: 0=ignore, 1=inherit, anything else=pipe.
+    /// Decode the disposition wire form: 0=ignore, 1=inherit, anything else
+    /// =pipe. A numbered slot never arrives here -- the engine resolves it to
+    /// `File` before building the spec, because only it can reach the registry.
     pub fn from_code(code: u8) -> Self {
         match code {
             0 => StdioMode::Ignore,
@@ -76,12 +86,17 @@ impl StdioMode {
         }
     }
 
-    fn to_stdio(self) -> std::process::Stdio {
+    fn into_stdio(self) -> std::process::Stdio {
         match self {
             StdioMode::Ignore => std::process::Stdio::null(),
             StdioMode::Inherit => std::process::Stdio::inherit(),
             StdioMode::Pipe => std::process::Stdio::piped(),
+            StdioMode::File(file) => std::process::Stdio::from(file),
         }
+    }
+
+    fn is_pipe(&self) -> bool {
+        matches!(self, StdioMode::Pipe)
     }
 }
 
@@ -89,7 +104,9 @@ impl StdioMode {
 pub type StdioSpec = [StdioMode; 3];
 
 /// Node's default when `stdio` is absent: all three piped.
-pub const STDIO_PIPE_ALL: StdioSpec = [StdioMode::Pipe; 3];
+pub fn stdio_pipe_all() -> StdioSpec {
+    [StdioMode::Pipe, StdioMode::Pipe, StdioMode::Pipe]
+}
 
 /// Spawn a child and return it with its pid. SYNCHRONOUS: node's uv_spawn is
 /// synchronous, so `child.pid` must be readable the instant `spawn()` returns
@@ -160,9 +177,12 @@ pub fn spawn_child(
     }
     #[cfg(not(windows))]
     cmd.args(&final_args);
-    cmd.stdin(stdio[0].to_stdio());
-    cmd.stdout(stdio[1].to_stdio());
-    cmd.stderr(stdio[2].to_stdio());
+    // Destructured, not indexed: a slot can now OWN a descriptor, so the spec
+    // is consumed rather than copied.
+    let [slot0, slot1, slot2] = stdio;
+    cmd.stdin(slot0.into_stdio());
+    cmd.stdout(slot1.into_stdio());
+    cmd.stderr(slot2.into_stdio());
 
     if clear_env {
         cmd.env_clear();
@@ -277,12 +297,14 @@ pub fn spawn_sync(
     // "EOF by another route": the child's fd 0 becomes a character device, so
     // `fstatSync(0).isCharacterDevice()` flips and 'pipe' stops being
     // distinguishable from 'ignore' to a child that inspects its own stdin.
-    cmd.stdin(match stdio[0] {
-        StdioMode::Pipe => std::process::Stdio::piped(),
-        other => other.to_stdio(),
+    let [slot0, slot1, slot2] = stdio;
+    cmd.stdin(if slot0.is_pipe() {
+        std::process::Stdio::piped()
+    } else {
+        slot0.into_stdio()
     });
-    cmd.stdout(stdio[1].to_stdio());
-    cmd.stderr(stdio[2].to_stdio());
+    cmd.stdout(slot1.into_stdio());
+    cmd.stderr(slot2.into_stdio());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

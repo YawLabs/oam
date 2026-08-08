@@ -152,6 +152,157 @@ pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 /// run, so leaked fds are reclaimed per-run.
 pub type SyncFileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, std::fs::File>>>;
 
+/// First id the runtime hands out for its OWN descriptors.
+///
+/// oam's fds are synthetic -- registry keys, not OS descriptors -- and the
+/// counter used to start at 3. That is exactly where a parent's inherited
+/// descriptors live: a launcher that spawns us with
+/// `stdio: [...,'pipe','pipe']` hands us real OS fds 3 and 4, and oam's first
+/// `openSync` claimed key 3 and shadowed one of them. Starting above the
+/// inheritable window keeps the two spaces disjoint, so an unknown low fd is
+/// unambiguously "the parent gave me this" rather than "not open yet".
+///
+/// 0/1/2 never reach the registry -- the JS layer routes them to the process
+/// std sinks -- so the window is 3..OWN_FD_BASE.
+pub const OWN_FD_BASE: u64 = 64;
+
+/// Largest fd oam will try to adopt from its parent. Above this a miss is a
+/// genuine EBADF. The CDP pipe convention uses 3 and 4; nothing real goes
+/// anywhere near the ceiling.
+pub const MAX_INHERITED_FD: u64 = OWN_FD_BASE - 1;
+
+/// Duplicate a descriptor the PARENT owns into one we own.
+///
+/// Deliberately a dup rather than `from_raw_fd(fd)`: the inherited descriptor
+/// still belongs to the parent's plumbing (on Windows the CRT fd table owns
+/// the HANDLE), so taking it would double-close at exit. The dup is ours to
+/// close whenever the JS side closes its fd.
+///
+/// Returns None when the descriptor is not open, which is the EBADF the caller
+/// should surface.
+#[cfg(unix)]
+fn dup_inherited(fd: u64) -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let raw = i32::try_from(fd).ok()?;
+    // F_GETFD is the cheapest "is this open" question; dup would also tell us,
+    // but only by allocating a descriptor we would have to put back.
+    if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
+        return None;
+    }
+    // FD_CLOEXEC on the dup: an fd the parent handed US is not automatically
+    // something our own children should receive.
+    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup == -1 {
+        return None;
+    }
+    Some(unsafe { std::fs::File::from_raw_fd(dup) })
+}
+
+#[cfg(windows)]
+fn dup_inherited(fd: u64) -> Option<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe extern "C" {
+        // The CRT fd table is not enumerable, so this is the only way to ask
+        // whether a numbered fd is backed by anything.
+        fn _get_osfhandle(fd: i32) -> isize;
+        // _get_osfhandle invokes the invalid-parameter handler on a bad fd,
+        // which ABORTS under a debug CRT. Swapping in a no-op handler for the
+        // duration turns the probe back into a plain -1 return.
+        fn _set_thread_local_invalid_parameter_handler(
+            handler: Option<unsafe extern "C" fn()>,
+        ) -> Option<unsafe extern "C" fn()>;
+    }
+    unsafe extern "C" fn ignore_invalid_parameter() {}
+
+    let raw = i32::try_from(fd).ok()?;
+    let handle = unsafe {
+        let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
+        let h = _get_osfhandle(raw);
+        _set_thread_local_invalid_parameter_handler(prev);
+        h
+    };
+    if handle == -1 || handle as HANDLE == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut dup: HANDLE = std::ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle as HANDLE,
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            0, // not inheritable: see the FD_CLOEXEC note on the unix arm
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 || dup.is_null() {
+        return None;
+    }
+    Some(unsafe { std::fs::File::from_raw_handle(dup) })
+}
+
+/// Close the PARENT's original descriptor, after our dup of it is dropped.
+///
+/// Closing only our dup would leave the real descriptor open, and for a pipe
+/// that is the difference between the peer seeing EOF and hanging forever --
+/// a CDP child closing fd 4 is exactly how it says "no more messages". The CRT
+/// (Windows) / kernel (unix) marks its own entry closed here, so nothing
+/// double-closes it at exit.
+pub fn close_inherited_fd(fd: u64) {
+    #[cfg(unix)]
+    if let Ok(raw) = i32::try_from(fd) {
+        unsafe { libc::close(raw) };
+    }
+    #[cfg(windows)]
+    if let Ok(raw) = i32::try_from(fd) {
+        unsafe extern "C" {
+            fn _close(fd: i32) -> i32;
+            fn _set_thread_local_invalid_parameter_handler(
+                handler: Option<unsafe extern "C" fn()>,
+            ) -> Option<unsafe extern "C" fn()>;
+        }
+        unsafe extern "C" fn ignore_invalid_parameter() {}
+        unsafe {
+            let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
+            _close(raw);
+            _set_thread_local_invalid_parameter_handler(prev);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = fd;
+}
+
+/// Adopt an fd the parent handed us into `registry`, so the ordinary fs ops can
+/// find it. No-op (returning true) if it is already there.
+///
+/// This is the receive half of extra-fd stdio: oam could always SPAWN a child
+/// with numbered fds above 2 (the CDP pipe transport), but a child that WAS one
+/// hit EBADF on `fs.writeSync(4, ...)` because its descriptors are registry
+/// keys and nothing had ever put the inherited fd in the registry.
+pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
+    if !(3..=MAX_INHERITED_FD).contains(&fd) {
+        return false;
+    }
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.contains_key(&fd) {
+        return true;
+    }
+    // Held across the dup so two ops racing on the same fd cannot both adopt.
+    match dup_inherited(fd) {
+        Some(file) => {
+            guard.insert(fd, file);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Incremental zlib/brotli stream state. Each entry is an encoder or decoder
 /// that accepts chunks one at a time. The JS Transform wires _transform to
 /// zlibStreamWrite and _flush to zlibStreamFlush.
@@ -277,7 +428,8 @@ impl CoreRuntime {
             children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(any(windows, unix))]
             raw_children: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3)),
+            // Starts above the inheritable-fd window, not at 3: see OWN_FD_BASE.
+            next_body: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(OWN_FD_BASE)),
             outbound_bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }

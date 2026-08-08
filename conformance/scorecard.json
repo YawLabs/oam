@@ -1,5 +1,5 @@
 {
-  "commit": "aa0784e",
+  "commit": "8649d51",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.8.3",
@@ -266,10 +266,22 @@
         {
           "case": "65-child-parity-followups.mjs",
           "status": "pass"
+        },
+        {
+          "case": "66-child-ipc-slot-position.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "67-child-extra-fd-self-host.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "68-child-stdio-numbered-fd.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 65,
-      "total": 65
+      "pass": 68,
+      "total": 68
     },
     "surface": {
       "globals": {
