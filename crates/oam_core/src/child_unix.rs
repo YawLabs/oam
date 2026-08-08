@@ -49,6 +49,12 @@ pub enum StdioFd {
     ChildRead,
     /// Pipe the child WRITES (parent reads). e.g. stdout/stderr, CDP-out (fd 4).
     ChildWrite,
+    /// A descriptor the CALLER named -- `stdio: ['ignore','pipe','pipe', logFd]`.
+    ///
+    /// Without this a numbered slot fell through to `Inherit`, which leaves the
+    /// child holding whatever the parent had at that index rather than the
+    /// descriptor the caller asked for.
+    Descriptor(RawFd),
 }
 
 /// Parent-side end of one piped fd. `RawFd` is `Send`/`Copy`, so no wrapper is
@@ -248,6 +254,22 @@ pub fn spawn_extra(
                         readable: true,
                     },
                 );
+            }
+            StdioFd::Descriptor(src) => {
+                // Duplicated before relocating, so the caller keeps its own
+                // descriptor: `relocate` consumes what it is handed.
+                let copy = unsafe { libc::dup(*src) };
+                if copy == -1 {
+                    bail!(; format!("dup(fd{fd}) failed: {}", std::io::Error::last_os_error()));
+                }
+                // Above every target for the same reason the pipe ends are:
+                // a source sitting on another slot's target index would be
+                // clobbered mid-plan.
+                let high = match relocate(copy, base) {
+                    Ok(h) => h,
+                    Err(e) => bail!(; e),
+                };
+                dup_plan.push((high, target));
             }
         }
     }
