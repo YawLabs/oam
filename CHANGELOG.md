@@ -11,6 +11,34 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **oam can now BE the child of an extra-fd spawn**, not only the parent of one.
+  A descriptor the parent hands us is adopted into the runtime's registry the
+  first time an `fs` call names it, so `readSync(3, …)` / `writeSync(4, …)`
+  behave as they do on Node instead of throwing `EBADF`, and `closeSync(4)`
+  closes the *parent's* descriptor so the peer sees EOF rather than hanging.
+  This was the receive half of the CDP pipe transport (divergence 19).
+- **A numbered descriptor in a `stdio` slot is honored.**
+  `stdio: ['ignore', logFd, logFd]` — the daemonize-into-a-logfile shape — now
+  resolves the fd against the registry and hands the child a dup, so the output
+  reaches the file. It used to collapse to `'inherit'`, sending the child's
+  output to the parent's console while `child.stdout === null` made the
+  redirect look like it had worked (divergence 18).
+
+### Fixed
+
+- **oam's own descriptors could collide with the parent's.** The id counter
+  started at 3 — exactly where a launcher's inherited fd 3 lands — so oam's
+  first `openSync` could shadow a descriptor the parent had handed it. Runtime
+  descriptors now start above the inheritable window, making an unknown low fd
+  unambiguously "the parent gave me this".
+- **An `'ipc'` slot anywhere but last silently renumbered the child's fds.**
+  oam carries the channel on a loopback socket, so the entry is spliced out of
+  the array; Node instead makes that very slot the channel. The unsupportable
+  positions now throw `ERR_INVALID_ARG_VALUE` naming the fix rather than
+  guessing, and `fork()` enforces the same rule as `spawn()` (divergence 20).
+
 ### Fixed (child_process parity follow-ups)
 
 - **`spawn()` mutated the caller's options object.** It spliced the `'ipc'`

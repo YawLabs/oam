@@ -252,41 +252,49 @@ slot and numbered fds above 2: the streams exist from the `'spawn'` event onward
 an `'ipc'` slot there is nothing to bind, so the extra fds are populated synchronously
 exactly as Node does.
 
-### 19. oam cannot be the CHILD of an extra-fd spawn
+### 19. Inherited descriptors above fd 63 are not adopted
 
 ```js
 // parent (either runtime), child on oam:
 spawn(oam, [script], { stdio: ['ignore','pipe','pipe','pipe','pipe'] })
 // inside the child:
-fs.writeSync(4, 'hi')   // Node child: writes to the inherited fd.
-                        //  oam child: throws EBADF: bad file descriptor, write
+fs.writeSync(4, 'hi')   // works — the inherited descriptor is adopted on use
+fs.writeSync(200, 'hi') // throws EBADF; Node would write
 ```
 
-oam **spawns** extra-fd children correctly — that is the CDP pipe transport Playwright and
-Puppeteer ride on, and it is exercised on Windows, Linux and macOS. What it does not yet do
-is *receive* numbered fds above 2: an oam child's `fs` descriptors are runtime handles, so
-an inherited OS fd 3/4 has no entry in its table and `writeSync(4, …)` fails `EBADF`.
+oam both **spawns** extra-fd children (the CDP pipe transport Playwright and Puppeteer
+ride on) and **is** one: a descriptor the parent handed us is adopted into the registry
+the first time an `fs` call names it, so `readSync(3, …)` / `writeSync(4, …)` behave as
+they do on Node, and `closeSync(4)` closes the *parent's* descriptor so the peer sees
+EOF rather than hanging.
 
-In practice the child in this shape is a browser (Chromium), never oam, so this has not
-bitten a real workload. It matters if you nest oam inside an extra-fd launcher.
+The adoption window is fds **3 through 63**. oam's own descriptors are registry keys
+rather than OS fds, and the allocator starts at 64 precisely so the two spaces cannot
+collide — an unknown fd below 64 is unambiguously "the parent gave me this". A parent
+passing a descriptor at 64 or above is outside that contract and gets `EBADF`; nothing
+real goes near it (the CDP convention uses 3 and 4).
 
-### 18. A numeric fd or a stream in a `stdio` slot is treated as `'inherit'`
+### 18. An unrecognized `stdio` value is treated as `'inherit'`, not rejected
 
 ```js
-spawn(exe, args, { stdio: ['ignore', 1, 2] })        // same as Node
-spawn(exe, args, { stdio: ['ignore', logFd, logFd] })
-//   Node: the child's output goes to that file.
-//    oam: the child's output goes to oam's own stdout/stderr.
+spawn(exe, args, { stdio: ['ignore', logFd, logFd] })   // same as Node
+spawn(exe, args, { stdio: ['ignore', 1, 2] })           // same as Node
+spawn(exe, args, { stdio: 'inhert' })                   // typo
+//   Node: throws ERR_INVALID_ARG_VALUE.
+//    oam: runs, with the child inheriting this process's stdio.
 ```
 
-`'pipe'`, `'overlapped'`, `'inherit'`, `'ignore'` and the `'ipc'` slot are exact. A slot
-holding a *number* or a *stream* collapses to `'inherit'` — exact for the common
-`stdio: [0, 1, 2]` form, wrong for the daemonize-into-a-logfile form above.
+`'pipe'`, `'overlapped'`, `'inherit'`, `'ignore'`, the `'ipc'` slot, and a slot holding
+a **descriptor** — a number, or a stream carrying an `fd` — are all exact. A numbered
+slot is resolved against oam's descriptor registry and the child is handed a dup, so
+the daemonize-into-a-logfile form writes to the file. `0`/`1`/`2` stay `'inherit'`,
+which is what naming this process's own std fds means.
 
-The collapse is a **catch-all**, not a whitelist: any value oam does not recognize,
-including ones Node rejects outright with `ERR_INVALID_ARG_VALUE`, is treated as
-`'inherit'` rather than throwing. A typo'd shorthand (`stdio: 'inhert'`) is a loud
-error on Node and a silent behavior change here.
+What remains divergent is the **fallback**: a value oam does not recognize is treated
+as `'inherit'` rather than throwing. A typo'd shorthand or a stray object is a loud
+`ERR_INVALID_ARG_VALUE` on Node and a silent behavior change here. A stream with no
+descriptor behind it (a `PassThrough`, a socket) also falls back — there is no fd to
+hand over.
 
 The extra numbered fds past 2 (`stdio[3]`/`stdio[4]`, the CDP pipe transport) carry
 **one direction each** — fd 3 parent-writable, fd 4 parent-readable, which is the
@@ -294,25 +302,64 @@ convention Chromium's `--remote-debugging-pipe` uses. Node exposes both as duple
 Sockets, so code that reads back on `stdio[3]` or writes to `stdio[4]` works on Node
 and fails here. Full-duplex extra fds would need named pipes and are not implemented.
 
-oam's descriptors are runtime handles, not OS fds, so pointing a child at one means
-threading the underlying OS handle out of oam's file registry. Until that exists,
-inheriting is the approximation that loses the least: the output still lands somewhere
-the operator can see, rather than in a pipe nobody drains.
-
-### 20. `'ipc'` must be the LAST stdio entry when extra fds are present
+### 20. `'ipc'` must be the LAST stdio entry, at index 3 or above
 
 ```js
+spawn(exe, args, { stdio: ['pipe','pipe','pipe','ipc'] })                  // fine
+spawn(exe, args, { stdio: ['ignore','pipe','pipe','pipe','pipe','ipc'] })  // fine
+
+spawn(exe, args, { stdio: ['pipe','ipc','pipe'] })
+//   Node: works -- fd 1 IS the channel, so the child has no ordinary stdout.
+//    oam: throws ERR_INVALID_ARG_VALUE
+
 spawn(exe, args, { stdio: ['ignore','pipe','pipe','ipc','pipe'] })
 //   Node: works -- the ipc slot occupies index 3, the extra fd is 4.
 //    oam: throws ERR_INVALID_ARG_VALUE
-//         "stdio: 'ipc' before a numbered fd above 2 is not supported -- put 'ipc' last"
 ```
 
-oam carries the IPC channel over a loopback socket rather than an fd, so the `'ipc'`
-entry is spliced out of the array — which renumbers every fd after it. With `'ipc'`
-last (the shape everyone writes) that is a no-op. Anywhere else it would silently
-hand the child its numbered fds one slot off, which surfaces as a CDP transport that
-fails far from its cause, so the combination is refused loudly instead.
+The message, with the offending index filled in:
+
+```
+stdio: 'ipc' must be the LAST entry, at index 3 or above -- got index 1 of 3 entries.
+oam carries the IPC channel on a loopback socket rather than an fd, so an 'ipc' slot
+anywhere else renumbers the fds after it (Node instead makes that slot itself the
+channel). Use stdio: ['pipe','pipe','pipe','ipc']
+```
+
+Node turns the slot the caller put `'ipc'` at *into* the channel fd. oam carries the
+channel over a loopback socket and so has no fd to place anywhere; it removes the
+`'ipc'` entry from the array instead — which renumbers every fd after it. With `'ipc'`
+last at index 3 or above nothing follows it, the three standard slots keep their
+numbers, and the removal is invisible. That is the only placement oam can serve
+honestly, so it is the only one accepted.
+
+Every other placement used to be accepted and silently renumbered. Two flavors, both
+now refused:
+
+- **`'ipc'` below index 3** (`['pipe','ipc','pipe']`, `['pipe','pipe','ipc']`, `['ipc']`).
+  Not a numbering slip but a different program. On Node the child's fd 1 *is* the
+  channel, so a child that writes plain text to stdout kills the **parent**:
+  `SyntaxError: Unexpected token 'h', "hello from stdout" is not valid JSON` out of
+  `parseChannelMessages`. oam used to hand that child an ordinary, working stdout. There
+  is nothing to fix here — oam's channel cannot be an fd at all — so the shape is
+  unmodelable rather than unimplemented.
+- **`'ipc'` before a numbered fd above 2** (`['ignore','pipe','pipe','ipc','pipe']`).
+  The child's extra fds land one slot off, which surfaces as a CDP transport that fails
+  far from its cause.
+
+The refusal is deliberately a little wider than the divergence: `['pipe','pipe','ipc']`
+has nothing after it to renumber, but the slot it names would still have to become the
+channel, so it is rejected with the rest rather than quietly doing something else.
+
+Conformance case `66-child-ipc-slot-position.mjs` pins the accepted placements from both
+sides. The refusals are not in it and cannot be: these are shapes Node **accepts**, so a
+differential case would have to assert a disagreement rather than a parity.
+
+`fork()` is **not** covered by this guard, which is scoped to `spawn()`. Its
+explicit-`stdio` path filters the `'ipc'` entry out wherever it sits, so
+`fork(mod, [], { stdio: ['pipe','ipc','pipe'] })` still renumbers silently: Node reports
+`child.stdout === null` and routes fd 1 to the channel, oam hands back a live stdout
+stream. Same bug, same fix, still open.
 
 ---
 

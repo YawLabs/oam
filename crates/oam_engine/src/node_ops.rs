@@ -3421,6 +3421,10 @@ fn op_fs_read_sync(
     };
 
     let files = core_runtime!(scope).sync_files();
+    // A low fd missing from the registry cannot be one oam allocated -- the
+    // counter starts above the inheritable window -- so it is the parent's to
+    // adopt. This is what lets oam BE the child of an extra-fd spawn.
+    oam_core::adopt_inherited_fd(&files, fd);
     let mut tmp = vec![0u8; length];
     let read_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
@@ -3483,6 +3487,10 @@ fn op_fs_write_sync(
         None
     };
     let files = core_runtime!(scope).sync_files();
+    // A low fd missing from the registry cannot be one oam allocated -- the
+    // counter starts above the inheritable window -- so it is the parent's to
+    // adopt. This is what lets oam BE the child of an extra-fd spawn.
+    oam_core::adopt_inherited_fd(&files, fd);
     let write_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&fd) {
@@ -3514,6 +3522,10 @@ fn op_fs_close_sync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
+    // A low fd missing from the registry cannot be one oam allocated -- the
+    // counter starts above the inheritable window -- so it is the parent's to
+    // adopt. This is what lets oam BE the child of an extra-fd spawn.
+    oam_core::adopt_inherited_fd(&files, fd);
     let removed = files
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3521,6 +3533,14 @@ fn op_fs_close_sync(
         .is_some();
     if !removed {
         throw_ebadf(scope, "close");
+        return;
+    }
+    // An adopted fd (below OWN_FD_BASE) is a DUP of the parent's descriptor;
+    // dropping it above closed only our copy. Close the original too, or the
+    // peer of an inherited pipe never sees EOF -- which is precisely how a CDP
+    // child says "no more messages" on fd 4.
+    if fd < oam_core::OWN_FD_BASE {
+        oam_core::close_inherited_fd(fd);
     }
 }
 
@@ -3533,6 +3553,10 @@ fn op_fs_fstat_sync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
+    // A low fd missing from the registry cannot be one oam allocated -- the
+    // counter starts above the inheritable window -- so it is the parent's to
+    // adopt. This is what lets oam BE the child of an extra-fd spawn.
+    oam_core::adopt_inherited_fd(&files, fd);
     // Held across the whole read: fstat has no path to reopen from, so the
     // extra fields have to come off the descriptor the caller already owns.
     let guard = files.lock().unwrap_or_else(|e| e.into_inner());
@@ -3954,7 +3978,7 @@ fn op_spawn_sync(
         Some(pairs)
     });
 
-    let stdio = arg_stdio_spec(scope, opts);
+    let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
     let result = oam_core::child::spawn_sync(
         &command,
@@ -4092,7 +4116,7 @@ fn op_spawn_async(
         Some(pairs)
     });
 
-    let stdio = arg_stdio_spec(scope, opts);
+    let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
@@ -4140,14 +4164,27 @@ fn op_spawn_kill(
     oam_core::child::child_kill(&children, handle, signal);
 }
 
-/// Read the `stdio` option: a 3-element array of direction codes
-/// (0=ignore, 1=inherit, 2=pipe) the JS layer derives from node's `stdio`
-/// option. Absent or malformed means node's default, all three piped.
+/// Read the `stdio` option: a 3-element array the JS layer derives from node's
+/// `stdio` option, where 0=ignore, 1=inherit, 2=pipe and **anything >= 3 is a
+/// DESCRIPTOR NUMBER** -- the `stdio: ['ignore', logFd, logFd]` shape.
+///
+/// A numbered slot is resolved here rather than in oam_core because only the
+/// engine can reach the descriptor registry. Those slots used to collapse to
+/// `inherit`, which sent the child's output to the parent's console instead of
+/// the file the caller named. An fd that resolves to nothing keeps the old
+/// inherit fallback -- it is the same descriptor oam would EBADF on, and a
+/// silent inherit is a smaller lie than a dead slot.
+///
+/// Absent or malformed means node's default, all three piped.
+/// `files` is passed in rather than taken from the scope: `core_runtime!`
+/// early-returns `()` on failure, so it cannot be used in a function that
+/// returns a value.
 fn arg_stdio_spec(
     scope: &mut v8::PinScope<'_, '_>,
     opts: Option<v8::Local<'_, v8::Object>>,
+    files: &oam_core::SyncFileRegistry,
 ) -> oam_core::child::StdioSpec {
-    let mut spec = oam_core::child::STDIO_PIPE_ALL;
+    let mut spec = oam_core::child::stdio_pipe_all();
     let Some(arr) = opts.and_then(|o| {
         let key = v8::String::new(scope, "stdio")?;
         let val = o.get(scope, key.into())?;
@@ -4156,12 +4193,32 @@ fn arg_stdio_spec(
         return spec;
     };
     for (fd, slot) in spec.iter_mut().enumerate() {
-        if let Some(v) = arr.get_index(scope, fd as u32)
-            && let Some(code) = v.number_value(scope)
-            && code.is_finite()
-        {
-            *slot = oam_core::child::StdioMode::from_code(code as u8);
-        }
+        let Some(code) = arr
+            .get_index(scope, fd as u32)
+            .and_then(|v| v.number_value(scope))
+            .filter(|c| c.is_finite())
+        else {
+            continue;
+        };
+        *slot = if code >= 3.0 {
+            let target = code as u64;
+            // The parent may have handed US this descriptor; adopt it first so
+            // a pass-through of an inherited fd resolves like any other.
+            oam_core::adopt_inherited_fd(files, target);
+            let dup = files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&target)
+                // A dup, so handing it to the child leaves the caller's fd
+                // usable and independently closable.
+                .and_then(|f| f.try_clone().ok());
+            match dup {
+                Some(file) => oam_core::child::StdioMode::File(file),
+                None => oam_core::child::StdioMode::Inherit,
+            }
+        } else {
+            oam_core::child::StdioMode::from_code(code as u8)
+        };
     }
     spec
 }

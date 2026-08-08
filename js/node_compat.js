@@ -18505,6 +18505,27 @@
       if (entry === null || entry === undefined) {
         return fd <= 2 ? STDIO_PIPE : STDIO_IGNORE;
       }
+      // A DESCRIPTOR -- named by number, or by a stream that owns one
+      // (fs.createWriteStream exposes `.fd`). Any code >= 3 IS the descriptor
+      // number; the native side resolves it against oam's registry and hands
+      // the child a dup. Everything used to collapse to 'inherit' here, so the
+      // daemonize shape `stdio: ['ignore', logFd, logFd]` wrote to the parent's
+      // console instead of the log file the caller opened.
+      //
+      // 0/1/2 stay 'inherit': naming this process's own std fds is exactly what
+      // inherit means, and it keeps the common `stdio: [0, 1, 2]` on the cheap
+      // path rather than dup'ing three descriptors to say the same thing.
+      const descriptor =
+        typeof entry === "number"
+          ? entry
+          : entry && typeof entry.fd === "number"
+            ? entry.fd
+            : null;
+      if (descriptor !== null && Number.isInteger(descriptor) && descriptor >= 0) {
+        return descriptor <= 2 ? STDIO_INHERIT : descriptor;
+      }
+      // A stream with no descriptor behind it (a PassThrough, a socket) cannot
+      // be handed to a child as an fd; inherit remains the closest thing.
       return STDIO_INHERIT;
     }
 
@@ -18516,6 +18537,23 @@
     // Honouring 'inherit' is what lets a launcher script hand its OWN stdio to
     // a grandchild -- the npm `bin` shim shape -- instead of the child writing
     // into pipes the launcher never forwards.
+    /** Shared by spawn() and fork(): both splice the 'ipc' entry out, so both
+     *  have to refuse the positions where that silently renumbers fds. One
+     *  implementation because two copies drift -- fork carried the bug for a
+     *  while after spawn was fixed. */
+    function assertIpcSlotSupported(stdioArr, ipcIndex) {
+      if (ipcIndex >= 3 && ipcIndex === stdioArr.length - 1) return;
+      const err = new Error(
+        "stdio: 'ipc' must be the LAST entry, at index 3 or above -- got " +
+          `index ${ipcIndex} of ${stdioArr.length} entries. oam carries the ` +
+          "IPC channel on a loopback socket rather than an fd, so an 'ipc' " +
+          "slot anywhere else renumbers the fds after it (Node instead makes " +
+          "that slot itself the channel). Use stdio: ['pipe','pipe','pipe','ipc']",
+      );
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+
     function stdioModes(stdio) {
       if (typeof stdio === "string") {
         const code = stdioEntryCode(stdio, 0);
@@ -18944,6 +18982,25 @@
         ipcIndex = stdioSpec.indexOf("ipc");
         if (ipcIndex !== -1) {
           wantsIpc = true;
+          // Node turns the slot the caller put 'ipc' AT into the channel fd:
+          // stdio:['pipe','ipc','pipe'] means the child's fd 1 IS the channel,
+          // so the child's stdout writes arrive as IPC frames and take the
+          // parent down on a JSON parse. oam cannot model that at all -- its
+          // channel rides a loopback socket, never an fd -- so the entry has to
+          // come out of the array, and removing it RENUMBERS every fd after it.
+          //
+          // The renumbering is a no-op in exactly one shape: 'ipc' LAST, at
+          // index 3 or above, where nothing follows it and the three standard
+          // slots keep their numbers. Anywhere else the removal is a silently
+          // wrong answer -- a mis-numbered CDP pipe that fails far from its
+          // cause, or a child handed an ordinary stdout where Node would have
+          // handed it the channel -- so refuse loudly rather than guess.
+          //
+          // Checked here, before the splice and against the CALLER's array, so
+          // it covers every array form. It used to sit inside the extra-fd
+          // branch below, which left an 'ipc' below index 3 -- the ordinary
+          // 3-slot path -- renumbering in silence.
+          assertIpcSlotSupported(stdioSpec, ipcIndex);
           stdioSpec = stdioSpec.slice();
           stdioSpec.splice(ipcIndex, 1);
         }
@@ -18958,18 +19015,10 @@
           natives.platform === "linux" ||
           natives.platform === "darwin")
       ) {
-        // oam carries the ipc channel over a loopback socket rather than an fd,
-        // so splicing the slot out renumbers every fd after it. That is a no-op
-        // when 'ipc' was last (the shape everyone writes) and a silent
-        // off-by-one on the child's numbered fds otherwise -- refuse loudly
-        // instead, since a mis-numbered CDP pipe fails far from its cause.
-        if (wantsIpc && ipcIndex < stdioSpec.length) {
-          const err = new Error(
-            "stdio: 'ipc' before a numbered fd above 2 is not supported -- put 'ipc' last",
-          );
-          err.code = "ERR_INVALID_ARG_VALUE";
-          throw err;
-        }
+        // No 'ipc' position check here: the guard above already rejected every
+        // placement that would renumber these extra fds, so anything reaching
+        // this line has 'ipc' last (or none at all) and `stdioSpec` is already
+        // the correctly-numbered array.
         return spawnExtra(norm, stdioSpec, wantsIpc, ipcIndex);
       }
       const cp = new ChildProcess();
@@ -19306,6 +19355,12 @@
       // array without 'ipc' would let code be written and tested here that
       // throws the moment it runs on node -- node's guard is the whole value,
       // and silently succeeding is what removes it.
+      if (Array.isArray(opts.stdio) && opts.stdio.includes("ipc")) {
+        // fork splices the entry out exactly as spawn does, so it owes the
+        // caller the same refusal: an 'ipc' below index 3 renumbers the child's
+        // fds, and Node would have made that very slot the channel.
+        assertIpcSlotSupported(opts.stdio, opts.stdio.indexOf("ipc"));
+      }
       if (Array.isArray(opts.stdio) && !opts.stdio.includes("ipc")) {
         const err = new TypeError(
           "Forked processes must have an IPC channel, missing value 'ipc' in options.stdio",

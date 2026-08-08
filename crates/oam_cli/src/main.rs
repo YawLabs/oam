@@ -227,6 +227,11 @@ fn main() -> ExitCode {
     // oam cache dir on any Rust panic or V8 OOM (internal diagnostics, not
     // public telemetry). Installed before anything can panic.
     oam_engine::install_panic_hook();
+    // Before anything opens a file: the descriptors we hold RIGHT NOW are, by
+    // definition, the ones a parent handed us. Taken this early because on unix
+    // a file oam opens for itself would otherwise be indistinguishable from an
+    // inherited one -- see oam_core::snapshot_inherited_fds.
+    oam_engine::snapshot_inherited_fds();
     register_worker_host();
     // Internal self-test hook (undocumented, env-gated): exercises the crash
     // path deterministically in CI without needing a JS-reachable panic.
