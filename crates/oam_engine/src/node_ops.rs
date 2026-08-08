@@ -678,7 +678,7 @@ fn op_exit(
 ) {
     let code = args.get(0).int32_value(scope).unwrap_or(0);
     // Immediate exit, documented divergence (no 'exit' event flush).
-    std::process::exit(code);
+    oam_core::exit_process(code);
 }
 
 fn op_stdout_write(
@@ -705,7 +705,7 @@ fn op_stdout_write(
         if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
             && e.kind() == std::io::ErrorKind::BrokenPipe
         {
-            std::process::exit(0);
+            oam_core::exit_process(0);
         }
     }
 }
@@ -722,7 +722,7 @@ fn op_stderr_write(
         if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
             && e.kind() == std::io::ErrorKind::BrokenPipe
         {
-            std::process::exit(0);
+            oam_core::exit_process(0);
         }
     }
 }
