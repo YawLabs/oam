@@ -11,6 +11,21 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-08
+
+A `child_process` release. The module had no differential coverage against Node
+until now, so nearly everything on a failure or option-edge path was untested —
+and most of what follows was found by reading it properly for the first time
+rather than by anything failing.
+
+**Minor, not patch, because several of these change behavior you may depend on:**
+`stdio` is honored at all now (`'inherit'`/`'ignore'` used to behave as
+`'pipe'`); `execFile` no longer runs through a shell; `spawnSync` reports
+`ENOBUFS` where it used to truncate and report success; `exec`/`execFile` now
+enforce `timeout`, so a child that used to run forever gets killed; `fork` and a
+misplaced `'ipc'` slot now throw; and `fs.openSync` descriptors start at 64
+rather than 3.
+
 ### Added
 
 - **oam can now BE the child of an extra-fd spawn**, not only the parent of one.
@@ -39,8 +54,6 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
   positions now throw `ERR_INVALID_ARG_VALUE` naming the fix rather than
   guessing, and `fork()` enforces the same rule as `spawn()` (divergence 20).
 
-### Fixed (child_process parity follow-ups)
-
 - **`spawn()` mutated the caller's options object.** It spliced the `'ipc'`
   entry out of `options.stdio` in place, so reusing one options literal to
   spawn a pool of workers gave the first child a channel and every later one
@@ -68,21 +81,10 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
   while every node-shaped check had nothing to branch on. It now reports
   `ENOBUFS` with a null status, as node does.
 
-### Fixed (release)
-
 - **The MCP sidecar matrix ran AFTER the GitHub release went live.** Its "do not
   ship" branch fired on a build `install.sh` and `oam self-update` could already
   resolve, so the gate was reporting a verdict on something it could no longer
   stop. It now runs before the release is cut.
-
-### Added
-
-- **`--allow-net` and `--allow-env` grants**, with env access actually enforced,
-  and **`--carrier` for cross-target `oam compile`** — the compile step can now
-  be handed a carrier binary for a target other than the build host.
-
-### Fixed
-
 - **`child_process` ignored the `stdio` option entirely — `'inherit'` and
   `'ignore'` both behaved as `'pipe'`.** A child's output went into pipes the
   parent never forwarded and its stdin was a pipe nobody fed. This broke any
@@ -127,6 +129,17 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
   `spawnSync`'s `input` no longer overrides an explicit `'ignore'`/`'inherit'`
   in slot 0 (node's docs say it does, its implementation does not); non-piped
   slots read back as `null` rather than empty buffers.
+
+## [0.8.3] - 2026-08-07
+
+### Added
+
+- **`--allow-net` and `--allow-env` grants**, with env access actually enforced,
+  and **`--carrier` for cross-target `oam compile`** — the compile step can now
+  be handed a carrier binary for a target other than the build host.
+
+### Fixed
+
 - **The benchmark harness timed a binary `cargo` could replace mid-run.** `oam`
   is now staged out of `target/` before timing, so a concurrent build cannot
   swap the file underneath a measurement. This invalidated earlier published
