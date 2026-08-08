@@ -45,6 +45,52 @@ impl ChildProcess {
 
 pub type ChildRegistry = Arc<Mutex<HashMap<u64, ChildProcess>>>;
 
+/// Per-fd disposition for a child's stdin/stdout/stderr, mirroring node's
+/// `stdio` option. A numeric fd or a stream in slot 0/1/2 means "hand the child
+/// the parent's fd", which is `Inherit`; the JS layer collapses those before
+/// they get here.
+///
+/// `Inherit` is a real OS-level handle hand-off, not a pump: the child writes
+/// straight to the parent's fd with no copy through this process, which is both
+/// node's semantics and the only way a grandchild's stdio survives an
+/// intermediate launcher (npm `bin` shims do exactly this).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StdioMode {
+    /// `/dev/null` (NUL on Windows). Reads see EOF immediately; writes vanish.
+    Ignore,
+    /// The child gets the parent's own fd for this slot.
+    Inherit,
+    /// An anonymous pipe this process owns both ends of. Node's default.
+    #[default]
+    Pipe,
+}
+
+impl StdioMode {
+    /// Decode the wire form shared with the JS layer and with `child_extra`'s
+    /// direction codes: 0=ignore, 1=inherit, anything else=pipe.
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            0 => StdioMode::Ignore,
+            1 => StdioMode::Inherit,
+            _ => StdioMode::Pipe,
+        }
+    }
+
+    fn to_stdio(self) -> std::process::Stdio {
+        match self {
+            StdioMode::Ignore => std::process::Stdio::null(),
+            StdioMode::Inherit => std::process::Stdio::inherit(),
+            StdioMode::Pipe => std::process::Stdio::piped(),
+        }
+    }
+}
+
+/// stdin/stdout/stderr dispositions, in fd order.
+pub type StdioSpec = [StdioMode; 3];
+
+/// Node's default when `stdio` is absent: all three piped.
+pub const STDIO_PIPE_ALL: StdioSpec = [StdioMode::Pipe; 3];
+
 /// Spawn a child and return it with its pid. SYNCHRONOUS: node's uv_spawn is
 /// synchronous, so `child.pid` must be readable the instant `spawn()` returns
 /// (execa, tree-kill and pidusage all read it immediately). There are no
@@ -59,6 +105,7 @@ pub fn spawn_child(
     env: Option<Vec<(String, String)>>,
     shell: bool,
     clear_env: bool,
+    stdio: StdioSpec,
 ) -> Result<(tokio::process::Child, u32), String> {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -113,9 +160,9 @@ pub fn spawn_child(
     }
     #[cfg(not(windows))]
     cmd.args(&final_args);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(stdio[0].to_stdio());
+    cmd.stdout(stdio[1].to_stdio());
+    cmd.stderr(stdio[2].to_stdio());
 
     if clear_env {
         cmd.env_clear();
@@ -156,6 +203,7 @@ pub fn spawn_sync(
     clear_env: bool,
     timeout_ms: u64,
     max_buffer: usize,
+    stdio: StdioSpec,
 ) -> SpawnSyncResult {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -203,13 +251,28 @@ pub fn spawn_sync(
     }
     #[cfg(not(windows))]
     cmd.args(&final_args);
-    if input.is_some() {
-        cmd.stdin(std::process::Stdio::piped());
-    } else {
-        cmd.stdin(std::process::Stdio::null());
-    }
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    // `input` is pumped ONLY into a slot that is already pipe-shaped.
+    //
+    // Node's docs say `input` "will override stdio[0]", but v22 does not
+    // implement that sentence: it attaches the buffer to the slot-0 descriptor
+    // and leaves the descriptor's TYPE alone, and the sync spawn only feeds
+    // slots typed 'pipe'. So an explicit 'ignore'/'inherit' wins and the bytes
+    // are never delivered. Measured, same script both runtimes:
+    //   stdio omitted / 'pipe'        -> child reads "HELLO"
+    //   stdio ['ignore','pipe','pipe'] -> child reads "" on node
+    // Parity is with the implementation, not with the sentence -- the
+    // conformance suite diffs against real node, and matching the doc here
+    // would be a divergence that only looks like correctness.
+    cmd.stdin(match stdio[0] {
+        StdioMode::Pipe if input.is_some() => std::process::Stdio::piped(),
+        // A pipe nobody writes to closes immediately, so the child sees EOF --
+        // the same observable as null, and the historical default for a
+        // spawnSync child with no input.
+        StdioMode::Pipe => std::process::Stdio::null(),
+        other => other.to_stdio(),
+    });
+    cmd.stdout(stdio[1].to_stdio());
+    cmd.stderr(stdio[2].to_stdio());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

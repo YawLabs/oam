@@ -3990,6 +3990,8 @@ fn op_spawn_sync(
         Some(pairs)
     });
 
+    let stdio = arg_stdio_spec(scope, opts);
+
     let result = oam_core::child::spawn_sync(
         &command,
         &child_args,
@@ -4000,6 +4002,7 @@ fn op_spawn_sync(
         clear_env,
         timeout_ms,
         max_buffer,
+        stdio,
     );
 
     let obj = v8::Object::new(scope);
@@ -4125,6 +4128,8 @@ fn op_spawn_async(
         Some(pairs)
     });
 
+    let stdio = arg_stdio_spec(scope, opts);
+
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
 
@@ -4136,7 +4141,7 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env)
+        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env, stdio)
     };
     match spawned {
         Ok((child, pid)) => {
@@ -4169,6 +4174,32 @@ fn op_spawn_kill(
     let signal = arg_kill_signal(scope, &args, 1);
     let children = core_runtime!(scope).children();
     oam_core::child::child_kill(&children, handle, signal);
+}
+
+/// Read the `stdio` option: a 3-element array of direction codes
+/// (0=ignore, 1=inherit, 2=pipe) the JS layer derives from node's `stdio`
+/// option. Absent or malformed means node's default, all three piped.
+fn arg_stdio_spec(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> oam_core::child::StdioSpec {
+    let mut spec = oam_core::child::STDIO_PIPE_ALL;
+    let Some(arr) = opts.and_then(|o| {
+        let key = v8::String::new(scope, "stdio")?;
+        let val = o.get(scope, key.into())?;
+        v8::Local::<v8::Array>::try_from(val).ok()
+    }) else {
+        return spec;
+    };
+    for (fd, slot) in spec.iter_mut().enumerate() {
+        if let Some(v) = arr.get_index(scope, fd as u32)
+            && let Some(code) = v.number_value(scope)
+            && code.is_finite()
+        {
+            *slot = oam_core::child::StdioMode::from_code(code as u8);
+        }
+    }
+    spec
 }
 
 /// Extract an optional signal-name string argument (e.g. "SIGTERM").

@@ -67,12 +67,12 @@
       "unrunnable": 4
     }
   },
-  "commit": "f0ee092",
+  "commit": "225ecfd",
   "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
   "fail": 2,
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.8.2",
+  "oamVersion": "oam 0.8.3",
   "pass": 429,
   "passOverRunnable": "99.5%",
   "passOverTotal": "90.1%",

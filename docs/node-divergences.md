@@ -238,6 +238,7 @@ Consistent with Node, `NODE_OPTIONS`-sourced flags are excluded from `process.ex
 spawn(exe, args, { stdio: 'ignore' }).pid              // number, synchronously (same as Node)
 spawn(exe, args, { stdio: [...,'ipc'] }).pid           // null in oam; number in Node
 fork(module).pid                                       // null in oam; number in Node
+spawn(exe, args, { stdio: [...,'pipe','ipc'] }).stdio[4]  // null in oam; stream in Node
 ```
 
 The value arrives on the next tick and is correct from then on. The IPC channel has to
@@ -245,6 +246,48 @@ bind before the child handle is complete, and oam does that asynchronously. If y
 `.pid` immediately after `fork()` — process supervisors and test harnesses do — read it
 from a `setImmediate`, or from the `'spawn'` event, which is what Node's own docs
 recommend anyway.
+
+The same one-tick lateness applies to `child.stdio[n]` when the child has BOTH an `'ipc'`
+slot and numbered fds above 2: the streams exist from the `'spawn'` event onward. Without
+an `'ipc'` slot there is nothing to bind, so the extra fds are populated synchronously
+exactly as Node does.
+
+### 19. oam cannot be the CHILD of an extra-fd spawn
+
+```js
+// parent (either runtime), child on oam:
+spawn(oam, [script], { stdio: ['ignore','pipe','pipe','pipe','pipe'] })
+// inside the child:
+fs.writeSync(4, 'hi')   // Node child: writes to the inherited fd.
+                        //  oam child: throws EBADF: bad file descriptor, write
+```
+
+oam **spawns** extra-fd children correctly — that is the CDP pipe transport Playwright and
+Puppeteer ride on, and it is exercised on Windows, Linux and macOS. What it does not yet do
+is *receive* numbered fds above 2: an oam child's `fs` descriptors are runtime handles, so
+an inherited OS fd 3/4 has no entry in its table and `writeSync(4, …)` fails `EBADF`.
+
+In practice the child in this shape is a browser (Chromium), never oam, so this has not
+bitten a real workload. It matters if you nest oam inside an extra-fd launcher.
+
+### 18. A numeric fd or a stream in a `stdio` slot is treated as `'inherit'`
+
+```js
+spawn(exe, args, { stdio: ['ignore', 1, 2] })        // same as Node
+spawn(exe, args, { stdio: ['ignore', logFd, logFd] })
+//   Node: the child's output goes to that file.
+//    oam: the child's output goes to oam's own stdout/stderr.
+```
+
+`'pipe'`, `'overlapped'`, `'inherit'`, `'ignore'` and the `'ipc'` slot are exact, as are
+the extra numbered fds past 2 (`stdio[3]`/`stdio[4]`, the CDP pipe transport). A slot
+holding a *number* or a *stream* collapses to `'inherit'` — exact for the common
+`stdio: [0, 1, 2]` form, wrong for the daemonize-into-a-logfile form above.
+
+oam's descriptors are runtime handles, not OS fds, so pointing a child at one means
+threading the underlying OS handle out of oam's file registry. Until that exists,
+inheriting is the approximation that loses the least: the output still lands somewhere
+the operator can see, rather than in a pipe nobody drains.
 
 ---
 
