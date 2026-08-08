@@ -18479,6 +18479,9 @@
       }
       if (!parsed || !parsed.code) return e;
       const shaped = new Error(`spawn ${command} ${parsed.code}`);
+      // node orders errno first on this error; the key order shows up in
+      // util.inspect output, which people paste into bug reports.
+      if (typeof parsed.errno === "number") shaped.errno = parsed.errno;
       shaped.code = parsed.code;
       shaped.syscall = `spawn ${command}`;
       shaped.path = command;
@@ -18631,6 +18634,15 @@
     // the spawn fails -- whichever happens first. Prevents deferred stdin
     // write/final callbacks from dangling forever on a spawn error.
     function deferUntilSpawn(cp, onReady, callback) {
+      // 'spawnfail' is ONE-SHOT, so a waiter registered after the failure has
+      // already fired -- a write issued from inside the child's own 'error'
+      // handler, the natural place to do cleanup -- would park on an event that
+      // can never fire again and its callback would dangle forever. The latch
+      // is what makes the late registration settle.
+      if (cp._spawnFailure) {
+        callback(cp._spawnFailure);
+        return;
+      }
       var done = false;
       var onSpawn = function() {
         if (done) return; done = true;
@@ -18816,10 +18828,16 @@
 
       const net = registry.get("net");
       const ipcServer = net.createServer();
-      // Node reports the ipc slot as null in child.stdio -- at the index the
-      // caller put 'ipc' at, which is only 3 in the common case. Hardcoding 3
+      // Node reports the ipc slot as null in child.stdio, at the index the
+      // caller put 'ipc' at -- only 3 in the common case, so hardcoding 3
       // clobbered a REAL extra fd on the numbered-fd path.
-      if (Array.isArray(cp.stdio)) cp.stdio[ipcIndex ?? 3] = null;
+      //
+      // Guarded to indices at or above 3: below that the splice has already
+      // renumbered the surviving fds, so slot 0/1/2 now holds a live, actively
+      // pumped stream and nulling it would leave child.stdio[n] disagreeing
+      // with child.stdout/stderr about the same fd.
+      const slot = ipcIndex ?? 3;
+      if (Array.isArray(cp.stdio) && slot >= 3) cp.stdio[slot] = null;
 
       ipcServer.on("connection", (socket) => {
         ipcSocket = socket;
@@ -18862,11 +18880,27 @@
       // would swallow node's throw-on-unhandled-'error'.
       cp._ipcTeardown = () => {
         try { ipcServer.close(); } catch (_) { /* already closed */ }
+        // Unconditional: on the FAILED-spawn path -- the case this was added
+        // for -- no socket ever connected, so gating this on `ipcSocket` left
+        // `connected` true. cp.send() then kept returning true and queueing
+        // into pendingSends forever, with every callback unsettled.
+        cp.connected = false;
         if (ipcSocket) {
           const sock = ipcSocket;
           ipcSocket = null;
-          cp.connected = false;
           try { sock.destroy(); } catch (_) { /* already gone */ }
+        }
+        // Settle anything queued before the channel died; node delivers EPIPE
+        // to a send callback on a closed channel rather than dropping it.
+        if (pendingSends.length > 0) {
+          const queued = pendingSends.splice(0, pendingSends.length);
+          for (const p of queued) {
+            if (p.callback) {
+              const err = new Error("channel closed");
+              err.code = "EPIPE";
+              p.callback(err);
+            }
+          }
         }
       };
       cp.on("exit", () => {
@@ -19040,15 +19074,46 @@
       }
       function handleSpawnFailure(err) {
         const e = spawnFailureError(err, norm.command, norm.args);
+        // The stdin side gets a STREAM-shaped error, not the child's ENOENT:
+        // node settles the write that was already in flight with EPIPE, then
+        // destroys the stream so anything written later fails with
+        // ERR_STREAM_DESTROYED. Handing the spawn error to a write callback
+        // reports the wrong failure to the wrong layer.
+        const pipeErr = new Error("write EPIPE");
+        pipeErr.code = "EPIPE";
+        pipeErr.syscall = "write";
+        // Latched so a waiter that registers AFTER this point still settles --
+        // 'spawnfail' below is one-shot. See deferUntilSpawn.
+        cp._spawnFailure = pipeErr;
         // An ipc channel bound for this child would otherwise keep listening
         // forever: 'exit' never fires for a child that never started.
         if (cp._ipcTeardown) cp._ipcTeardown();
+        // The pending stdin write is settled by handing this error to its
+        // write callback, which ERRORS the stream. node settles the callback
+        // but never surfaces a spawn failure as a stdin 'error', and callers
+        // listen on the CHILD -- so without this guard the most ordinary shape
+        // (`cp.on('error', h); cp.stdin.end(payload)`) died on an uncaught
+        // stream error even though the caller handled everything correctly.
+        // Attached only on this path, so a real EPIPE still propagates.
+        if (cp.stdin) cp.stdin.on("error", () => {});
         // Settle deferred stdin write/final waiters, then end the read streams
         // so consumers awaiting completion don't hang on a failed spawn.
-        cp.emit("spawnfail", e);
+        cp.emit("spawnfail", pipeErr);
+        // Destroyed AFTER the in-flight write is settled, so a later write gets
+        // ERR_STREAM_DESTROYED from the stream itself -- node's exact split.
+        if (cp.stdin) cp.stdin.destroy();
         if (cp.stdout) cp.stdout.push(null);
         if (cp.stderr) cp.stderr.push(null);
-        queueMicrotask(() => cp.emit("error", e));
+        queueMicrotask(() => {
+          cp.emit("error", e);
+          // node follows 'error' with 'close' (code = the libuv errno) for a
+          // child that never started. Consumers whose completion path is
+          // 'close' -- the shape every run-a-tool-then-continue wrapper uses --
+          // otherwise stall instead of taking their error branch.
+          queueMicrotask(() => {
+            cp.emit("close", typeof e.errno === "number" ? e.errno : null, null);
+          });
+        });
       }
 
       return cp;
@@ -19069,7 +19134,14 @@
       // does not -- `execSync(cmd, {stdio:'inherit'})` is a normal idiom.)
       const spawnOpts = Object.assign({}, opts);
       delete spawnOpts.stdio;
-      const cp = spawn(command, [], spawnOpts);
+      return collectExec(spawn(command, [], spawnOpts), command, opts, callback);
+    }
+
+    // The collector half of exec()/execFile(). Both own their pipes and deliver
+    // (err, stdout, stderr) to a callback; they differ ONLY in how the child is
+    // launched -- exec through a shell, execFile emphatically not -- so the
+    // buffering, maxBuffer accounting and error shaping live here once.
+    function collectExec(cp, command, opts, callback) {
       const stdout = [];
       const stderr = [];
       const maxBuffer = opts.maxBuffer || 50 * 1024 * 1024;
@@ -19082,9 +19154,12 @@
       // 50MB default that is gigabytes of copying for one noisy command. node
       // keeps the same two counters.
       //
-      // The chunk that crosses the limit is dropped rather than stored, and the
-      // child is killed -- node's exact behavior, including the error code that
-      // ecosystem code branches on.
+      // On overflow node delivers EXACTLY maxBuffer bytes: the chunk that
+      // crosses the limit is TRUNCATED to the remaining allowance and kept,
+      // then the child is killed. Dropping that chunk whole instead hands the
+      // caller whatever the pipe happened to coalesce -- a shorter, run-
+      // dependent prefix -- and the prefix is the point, since it is what
+      // diagnostics print when output was too big to keep.
       const overflow = (which) => {
         if (maxBufferError) return;
         maxBufferError = new Error(`${which} maxBuffer length exceeded`);
@@ -19096,16 +19171,24 @@
         // Null when the caller passed stdio:'inherit'/'ignore' through: there
         // is no pipe to collect from, and node's exec guards the same way.
         cp.stdout?.on("data", (chunk) => {
+          const used = stdoutLen;
           stdoutLen += chunk.length;
-          if (stdoutLen > maxBuffer) overflow("stdout");
-          else stdout.push(chunk);
+          if (stdoutLen > maxBuffer) {
+            const room = maxBuffer - used;
+            if (room > 0) stdout.push(chunk.subarray(0, room));
+            overflow("stdout");
+          } else stdout.push(chunk);
         });
         // maxBuffer binds BOTH streams in node. Enforcing it on stdout alone
         // let a child that only spews to stderr grow this array without limit.
         cp.stderr?.on("data", (chunk) => {
+          const used = stderrLen;
           stderrLen += chunk.length;
-          if (stderrLen > maxBuffer) overflow("stderr");
-          else stderr.push(chunk);
+          if (stderrLen > maxBuffer) {
+            const room = maxBuffer - used;
+            if (room > 0) stderr.push(chunk.subarray(0, room));
+            overflow("stderr");
+          } else stderr.push(chunk);
         });
       });
       cp.on("close", (code, signal) => {
@@ -19144,7 +19227,24 @@
         options = {};
       }
       const norm = normalizeArgs(file, args, options);
-      return exec(norm.command + " " + norm.args.join(" "), norm.options, callback);
+      const opts = norm.options || {};
+      // node's execFile runs WITHOUT a shell and passes argv VERBATIM -- that is
+      // the whole reason it sits next to exec(). Joining argv into one string
+      // and shelling out re-splits arguments on whitespace (so a path or value
+      // containing a space breaks) and EXECUTES shell metacharacters that
+      // happen to appear inside an argument. `shell` stays honored if the
+      // caller explicitly asks for one, which node also supports.
+      const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
+      delete spawnOpts.stdio;
+      const display = norm.args.length
+        ? `${norm.command} ${norm.args.join(" ")}`
+        : norm.command;
+      return collectExec(
+        spawn(norm.command, norm.args, spawnOpts),
+        display,
+        opts,
+        callback,
+      );
     }
 
     function fork(modulePath, args, options) {
@@ -19276,7 +19376,21 @@
           info = JSON.parse(natives.spawnAsync(execPath, spawnArgs, nativeOpts));
         } catch (err) {
           ipcServer.close();
-          queueMicrotask(() => cp.emit("error", typeof err === "string" ? new Error(err) : err));
+          // Same Node-shaped error as spawn()/spawnExtra(): this catch was
+          // missed when the others were converted, so a failed fork still
+          // surfaced the raw native JSON body with err.code undefined.
+          const e = spawnFailureError(err, execPath, spawnArgs);
+          cp.connected = false;
+          // End the piped streams and follow node's error -> close ordering, so
+          // a consumer awaiting either does not hang on a fork that never ran.
+          if (cp.stdout) cp.stdout.push(null);
+          if (cp.stderr) cp.stderr.push(null);
+          queueMicrotask(() => {
+            cp.emit("error", e);
+            queueMicrotask(() => {
+              cp.emit("close", typeof e.errno === "number" ? e.errno : null, null);
+            });
+          });
         }
         if (info) {
           cp._handle = info.handle;

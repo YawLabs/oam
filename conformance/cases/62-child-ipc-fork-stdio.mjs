@@ -123,9 +123,15 @@ writeFileSync(forkChild, childBody("B"));
 {
   // An array here overrides fork's inherit default outright, so slot 1 being
   // 'pipe' is what routes the child's stdout onto child.stdout -- the same
-  // observable `silent: true` produces, reached by a different option. The
-  // 'ipc' entry is mandatory on this form: Node throws if an explicit fork
-  // stdio array has no channel in it.
+  // observable `silent: true` produces, reached by a different option.
+  //
+  // The 'ipc' entry is present because NODE requires it: it throws
+  // ERR_CHILD_PROCESS_IPC_REQUIRED when an explicit fork stdio array has no
+  // channel in it. oam does NOT enforce that -- its fork channel rides a
+  // loopback socket and is built regardless of the array -- so the omitted
+  // case is a live divergence, deliberately not asserted here rather than
+  // asserted as though both runtimes agreed. Including 'ipc' keeps this probe
+  // on the shape both accept.
   const cp = fork(forkChild, ["ARG-B"], {
     stdio: ["pipe", "pipe", "pipe", "ipc"],
   });

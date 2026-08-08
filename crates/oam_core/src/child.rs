@@ -183,8 +183,14 @@ pub fn spawn_child(
 
     let child = cmd.spawn().map_err(|e| {
         let code = super::node_error_code(&e);
+        // errno rides along: node emits it as the `code` argument of the
+        // 'close' event for a child that never started, so the JS layer cannot
+        // reproduce node's failure shape without it.
+        let errno = super::node_errno(code, &e)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string());
         format!(
-            "{{\"code\":\"{code}\",\"message\":\"{}\"}}",
+            "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"{}\"}}",
             e.to_string().replace('"', "\\\"")
         )
     })?;
@@ -263,12 +269,16 @@ pub fn spawn_sync(
     // Parity is with the implementation, not with the sentence -- the
     // conformance suite diffs against real node, and matching the doc here
     // would be a divergence that only looks like correctness.
+    //
+    // A pipe-shaped slot stays a real PIPE even with no input to write: the
+    // `drop(child.stdin.take())` below closes the write end immediately, so the
+    // child still sees EOF -- but over a pipe, as node gives it. Substituting
+    // the null device here would have been observably different, not merely
+    // "EOF by another route": the child's fd 0 becomes a character device, so
+    // `fstatSync(0).isCharacterDevice()` flips and 'pipe' stops being
+    // distinguishable from 'ignore' to a child that inspects its own stdin.
     cmd.stdin(match stdio[0] {
-        StdioMode::Pipe if input.is_some() => std::process::Stdio::piped(),
-        // A pipe nobody writes to closes immediately, so the child sees EOF --
-        // the same observable as null, and the historical default for a
-        // spawnSync child with no input.
-        StdioMode::Pipe => std::process::Stdio::null(),
+        StdioMode::Pipe => std::process::Stdio::piped(),
         other => other.to_stdio(),
     });
     cmd.stdout(stdio[1].to_stdio());

@@ -435,7 +435,18 @@ for (const s of selected) {
     process.stderr.write(`\r  ${s.name.padEnd(12)} PASS  ${r.tools.length} tools\n`);
     results.push({ ...s, state: "pass", tools: r.tools.length });
   } else {
-    const tail = (r.stderr || "").trim().split("\n").pop() ?? "";
+    // Same tail-picking trap npmInstall had: an oam fatal report ends with the
+    // `oam v0.8.3` version footer, so `.pop()` showed the operator a version
+    // string instead of the error. This is the only clue the gate emits when a
+    // sidecar breaks, so lead with the first line that looks like a diagnosis.
+    const lines = (r.stderr || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !/^oam v\d/.test(l));
+    const tail =
+      lines.find((l) => /^([A-Za-z]*Error|Uncaught|panicked|oam:|npm error)/.test(l)) ??
+      lines[0] ??
+      "";
     process.stderr.write(`\r  ${s.name.padEnd(12)} FAIL  ${r.why}\n`);
     if (tail) process.stderr.write(`  ${"".padEnd(12)}       ${tail.slice(0, 120)}\n`);
     results.push({ ...s, state: "fail", why: r.why });

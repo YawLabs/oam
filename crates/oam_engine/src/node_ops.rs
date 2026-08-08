@@ -454,46 +454,10 @@ macro_rules! core_runtime_mut {
 }
 
 /// Throw an Error with Node's `.code` / `.syscall` / `.path` properties.
-/// Node's `err.errno` -- the libuv error NUMBER (negative). On Unix it is just
-/// `-errno` (libuv UV_E* == -E*). On Windows libuv uses its own -4000-range
-/// table (verified against node: ENOENT -4058, EISDIR -4068, EEXIST -4075,
-/// ENOTEMPTY -4051); codes not in the table fall back to `-raw_os_error` so the
-/// property is at least present + negative.
+/// Node's `err.errno`. Single source of truth lives in oam_core so the
+/// child-spawn failure body can use the same table; see its doc comment.
 fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
-    #[cfg(windows)]
-    {
-        let uv = match code {
-            "EPERM" => -4048,
-            "ENOENT" => -4058,
-            "EACCES" => -4092,
-            "EEXIST" => -4075,
-            "ENOTDIR" => -4052,
-            "EISDIR" => -4068,
-            "EINVAL" => -4071,
-            "EMFILE" => -4066,
-            "ENFILE" => -4061,
-            "ENOSPC" => -4055,
-            "EROFS" => -4043,
-            "EBUSY" => -4082,
-            "ENOTEMPTY" => -4051,
-            "ENAMETOOLONG" => -4064,
-            "ELOOP" => -4067,
-            "EXDEV" => -4037,
-            "EBADF" => -4083,
-            "EAGAIN" => -4088,
-            "EPIPE" => -4047,
-            "EFBIG" => -4036,
-            "ENXIO" => -4033,
-            "EMLINK" => -4032,
-            _ => return error.raw_os_error().map(|e| -e),
-        };
-        Some(uv)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = code;
-        error.raw_os_error().map(|e| -e)
-    }
+    oam_core::node_errno(code, error)
 }
 
 fn throw_node_error(

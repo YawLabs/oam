@@ -32,7 +32,12 @@ const runExec = (which) =>
   new Promise((done) => {
     // Quote the exe: on Windows it lives under a path with spaces.
     const cmd = `"${process.execPath}" ${JSON.stringify(noisy)} ${which} 65536`;
-    exec(cmd, { maxBuffer: 4096 }, (err, stdout, stderr) => {
+    // 4000, NOT 4096: the child writes in 1024-byte chunks, so a limit that is
+    // a multiple of the chunk size is reached exactly on a boundary and
+    // "truncate the crossing chunk" and "drop the crossing chunk" produce the
+    // SAME byte count. 4000 puts the limit mid-chunk, where they differ
+    // (4000 vs 3072) and the assertion below can actually tell them apart.
+    exec(cmd, { maxBuffer: 4000 }, (err, stdout, stderr) => {
       done({
         code: err && err.code,
         message: err && err.message,
@@ -44,12 +49,16 @@ const runExec = (which) =>
 
 for (const which of ["stdout", "stderr"]) {
   const r = await runExec(which);
-  // The collector must be capped, not merely reported: a stream that blew the
-  // limit must not have accumulated the whole 64KB.
-  const capped = which === "stdout" ? r.outLen <= 4096 : r.errLen <= 4096;
   console.log(`${which} code`, r.code);
   console.log(`${which} message`, JSON.stringify(r.message));
-  console.log(`${which} capped`, capped);
+  // The EXACT byte count, not a `<= maxBuffer` bound. node delivers precisely
+  // maxBuffer bytes on overflow: it truncates the chunk that crosses the limit
+  // and keeps the prefix. An implementation that instead DROPS that whole chunk
+  // also satisfies `<=`, while handing back a shorter, run-dependent prefix --
+  // so the bound was satisfied by both behaviors and could not see the
+  // difference. maxBuffer is deliberately not a multiple of the child's 1024-
+  // byte write, so a dropped chunk cannot coincidentally land on the limit.
+  console.log(`${which} delivered`, which === "stdout" ? r.outLen : r.errLen);
 }
 
 // Under the limit the command still succeeds and delivers its output intact.

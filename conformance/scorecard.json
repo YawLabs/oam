@@ -1,5 +1,5 @@
 {
-  "commit": "225ecfd",
+  "commit": "d679b39",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.8.3",
@@ -258,10 +258,14 @@
         {
           "case": "63-child-extra-fd-null-slot.mjs",
           "status": "pass"
+        },
+        {
+          "case": "64-child-failure-path.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 63,
-      "total": 63
+      "pass": 64,
+      "total": 64
     },
     "surface": {
       "globals": {

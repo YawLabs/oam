@@ -36,7 +36,23 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 - **A `spawn()` failure with an `'ipc'` slot hung the process forever.** The
   loopback channel kept listening because `'exit'` never fires for a child that
   never started. Relatedly, an `'ipc'` slot combined with numbered fds above 2
-  silently produced a child with no IPC channel at all.
+  silently produced a child with no IPC channel at all — that combination now
+  works, but only with `'ipc'` LAST; anywhere else it throws
+  `ERR_INVALID_ARG_VALUE` rather than renumbering the child's fds behind your
+  back (new divergence 20).
+- **A failed `spawn()` emitted no `'close'`, and a failed `fork()` still
+  reported the raw native error blob.** Node follows `'error'` with `'close'`
+  for a child that never started, so consumers whose completion path is
+  `'close'` stalled instead of taking their error branch. Spawn errors now also
+  carry `errno`, matching node.
+- **`execFile()` ran its arguments through a shell.** It joined argv into one
+  string and handed it to `exec()`, so arguments were re-split on whitespace and
+  shell metacharacters inside an argument were executed. Node's `execFile` is
+  shell-free by design and passes argv verbatim; oam's now does too.
+- **Writing to a failed child's stdin killed the process.** The spawn error was
+  routed into the stdin stream's error channel, where nothing listens, so
+  `cp.on('error', h); cp.stdin.end(payload)` died on an uncaught error despite
+  the caller handling the failure correctly.
 - **`exec()`'s `maxBuffer` was enforced on stdout only, and measured
   quadratically.** stderr could grow without limit, and the stdout check
   re-concatenated everything accumulated so far on every chunk — gigabytes of

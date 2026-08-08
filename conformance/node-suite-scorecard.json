@@ -67,7 +67,7 @@
       "unrunnable": 4
     }
   },
-  "commit": "225ecfd",
+  "commit": "d679b39",
   "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
   "fail": 2,
   "host": "windows-aarch64",
