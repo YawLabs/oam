@@ -577,20 +577,48 @@ ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 # Skipped rather than fatal when the site checkout is absent: a release is still
 # valid without it, and the verification below says loudly if the live site is
 # stale.
-step "Publish installers to oamjs.org"
+step "Publish installers + downloads page to oamjs.org"
 SITE_DIR="${OAM_SITE_DIR:-$REPO_DIR/../oamjs.org}"
 if [ ! -d "$SITE_DIR/public" ]; then
-  warn "no site checkout at $SITE_DIR -- installers NOT republished (clone YawLabs/oamjs.org, or set OAM_SITE_DIR)"
+  warn "no site checkout at $SITE_DIR -- site NOT republished (clone YawLabs/oamjs.org, or set OAM_SITE_DIR)"
 else
   cp "$REPO_DIR/install/install.sh" "$SITE_DIR/public/install.sh"
   cp "$REPO_DIR/install/install.ps1" "$SITE_DIR/public/install.ps1"
-  if git -C "$SITE_DIR" diff --quiet -- public/install.sh public/install.ps1; then
-    ok "oamjs.org installers already match this release"
+  # Reads the PUBLISHED release for its sizes and hashes, so this must run after
+  # the "Cut GitHub Release" step above. Non-fatal for the same reason as the
+  # rest of this step: the release is already out, and the verification below
+  # says loudly if the live page is stale.
+  if [ -x "$SITE_DIR/scripts/refresh-downloads.sh" ]; then
+    "$SITE_DIR/scripts/refresh-downloads.sh" "$TAG" >/dev/null 2>&1 \
+      && ok "downloads page regenerated for $TAG" \
+      || warn "refresh-downloads.sh failed -- downloads page still advertises the previous release"
   else
-    git -C "$SITE_DIR" add public/install.sh public/install.ps1
-    git -C "$SITE_DIR" commit -q -m "Sync installers from oam $TAG"
+    warn "no scripts/refresh-downloads.sh in $SITE_DIR -- downloads page NOT regenerated"
+  fi
+  # Every version-specific file the site serves for a release. The downloads page
+  # inlines the tag, asset sizes and per-asset hashes, so it rots on EVERY
+  # release -- and unlike the installers it cannot be right by accident, because
+  # none of those values survive a version bump.
+  #
+  # Built by existence rather than hardcoded: `git add` on a path that is not
+  # there is FATAL, and under `set -e` that would abort the run after the
+  # release is already published. An older site checkout without a downloads
+  # page must degrade to installer-only, not blow up the release.
+  SITE_PATHS=()
+  for p in public/install.sh public/install.ps1 public/downloads/index.html; do
+    if [ -f "$SITE_DIR/$p" ]; then SITE_PATHS+=("$p"); fi
+  done
+  # Gate on ALL of them. Checking only the installers is what let a
+  # two-releases-stale downloads page ship: installers are byte-identical across
+  # most releases, so the "already match" branch short-circuited the commit AND
+  # the deploy, and the page never went out.
+  if git -C "$SITE_DIR" diff --quiet -- "${SITE_PATHS[@]}"; then
+    ok "oamjs.org already matches this release"
+  else
+    git -C "$SITE_DIR" add "${SITE_PATHS[@]}"
+    git -C "$SITE_DIR" commit -q -m "Sync installers + downloads page from oam $TAG"
     git -C "$SITE_DIR" push -q
-    ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 )       && ok "oamjs.org installers republished"       || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
+    ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 )       && ok "oamjs.org republished"       || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
   fi
 fi
 
@@ -619,7 +647,7 @@ fi
 # Verify what the SITE actually serves, not what we just uploaded: a stale CDN
 # copy is exactly the failure this step exists to prevent, and it is invisible
 # from the filesystem.
-step "Verify oamjs.org serves this release's installers"
+step "Verify oamjs.org serves this release"
 for f in install.sh install.ps1; do
   live="$(curl -fsSL --max-time 30 "https://oamjs.org/$f" 2>/dev/null || true)"
   if [ -z "$live" ]; then
@@ -630,3 +658,26 @@ for f in install.sh install.ps1; do
     warn "https://oamjs.org/$f DIFFERS from install/$f -- self-update will run the stale copy"
   fi
 done
+
+# The other half of what the site serves, and the half that cannot be right by
+# accident: /downloads inlines the tag and the per-asset hashes. Verifying only
+# the installers is why a page pinned two releases back passed this step
+# silently. A WRONG published hash is worse than no hash -- it trains people to
+# ignore a mismatch -- so check the hashes, not just the tag.
+live_dl="$(curl -fsSL --max-time 30 "https://oamjs.org/downloads/" 2>/dev/null || true)"
+if [ -z "$live_dl" ]; then
+  warn "https://oamjs.org/downloads/ did not fetch -- cannot verify the published checksums"
+elif ! printf '%s' "$live_dl" | grep -q "$TAG"; then
+  warn "https://oamjs.org/downloads/ does not mention $TAG -- it still advertises the previous release"
+else
+  dl_missing=0
+  while read -r h _; do
+    [ -n "$h" ] || continue
+    printf '%s' "$live_dl" | grep -q "$h" || dl_missing=$((dl_missing + 1))
+  done < "$RELEASE_DIR/SHA256SUMS"
+  if [ "$dl_missing" -eq 0 ]; then
+    ok "https://oamjs.org/downloads/ serves $TAG with matching checksums"
+  else
+    warn "https://oamjs.org/downloads/ names $TAG but $dl_missing checksum(s) DIFFER from the release -- a wrong published hash is worse than none"
+  fi
+fi
