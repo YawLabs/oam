@@ -6,7 +6,7 @@
 //! without blocking each other. The closed set prevents handle
 //! resurrection when a close races an in-flight read/write.
 
-use crate::{OpOutcome, node_error_code, node_error_message};
+use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -87,10 +87,15 @@ fn addr_to_json(addr: std::net::SocketAddr) -> serde_json::Value {
 /// Map an IO error to a NodeFailed outcome with the appropriate syscall.
 fn tcp_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
     let code = node_error_code(&error);
-    OpOutcome::NodeFailed {
-        code: code.to_string(),
-        message: node_error_message(code, syscall, target, &error),
-    }
+    // syscall + errno, but no `path`: a host:port is not a filesystem path,
+    // and node does not put one on a net error.
+    OpOutcome::node_failed_at(
+        code,
+        node_error_message(code, syscall, target, &error),
+        syscall,
+        "",
+        node_errno(code, &error),
+    )
 }
 
 /// net.connect / net.createConnection: establish a TCP client connection.

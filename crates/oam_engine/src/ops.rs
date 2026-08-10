@@ -541,13 +541,40 @@ pub(crate) fn settle_completion(
             let exception = v8::Exception::error(tc, message);
             resolver.reject(tc, exception);
         }
-        OpOutcome::NodeFailed { code, message } => {
+        OpOutcome::NodeFailed {
+            code,
+            message,
+            syscall,
+            path,
+            errno,
+        } => {
             let message = v8::String::new(tc, &message)
                 .unwrap_or_else(|| v8::String::new(tc, &code).unwrap());
             let exception = v8::Exception::error(tc, message);
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let key = v8::String::new(tc, "code").unwrap();
-                if let Some(value) = v8::String::new(tc, &code) {
+                // The same four properties throw_node_error sets on the SYNC
+                // path. Without syscall/path/errno an async rejection was
+                // distinguishable from its sync twin, and ecosystem code that
+                // reads err.syscall / err.path got undefined.
+                let strings = [
+                    ("code", Some(code.as_str())),
+                    ("syscall", syscall.as_deref()),
+                    ("path", path.as_deref()),
+                ];
+                for (name, value) in strings {
+                    let Some(value) = value else { continue };
+                    let (Some(key), Some(value)) =
+                        (v8::String::new(tc, name), v8::String::new(tc, value))
+                    else {
+                        continue;
+                    };
+                    obj.set(tc, key.into(), value.into());
+                }
+                // errno is a Number (node's negative libuv code), not a string.
+                if let Some(errno) = errno
+                    && let Some(key) = v8::String::new(tc, "errno")
+                {
+                    let value = v8::Integer::new(tc, errno);
                     obj.set(tc, key.into(), value.into());
                 }
             }
@@ -580,6 +607,14 @@ fn op_fork_spawn(
         return;
     };
     let script_path = script_path.to_rust_string_lossy(scope);
+
+    // oam.fork() starts a child ISOLATE -- same class as worker_threads, and
+    // gated by the same permission. The child inherits `permissions` below,
+    // so this is a gate on starting one at all, not on what it may do.
+    if !crate::node_ops::check_worker_perm(scope, &script_path) {
+        return;
+    }
+    let permissions = crate::node_ops::permissions_of(scope);
 
     let worker_data = if args.get(1).is_null_or_undefined() {
         None
@@ -645,6 +680,7 @@ fn op_fork_spawn(
                     pipe_stderr: false,
                     exec_argv: Vec::new(),
                 },
+                permissions,
             );
         }
     }

@@ -2453,6 +2453,42 @@ pub(crate) fn catch_to_diagnostic(
         "OAM-RT0001",
         Severity::Error,
         Origin::Runtime,
-        err.to_string(),
+        annotate_missing_builtin_export(&err.to_string()),
+    )
+}
+
+/// Turn V8's bare "does not provide an export named X" into something the
+/// reader can act on, when the module in question is a `node:` builtin.
+///
+/// A builtin's ESM named exports are its module object's own enumerable keys,
+/// so an export oam has not implemented fails at LINK time and takes the whole
+/// program with it -- even when the importer never calls the function. On its
+/// own the V8 message reads like the user's mistake and gives no next step;
+/// this says whose gap it is and where the tracked list lives.
+///
+/// Deliberately scoped to `node:` specifiers. The identical error for a
+/// userland module is the user's own bug, and pointing them at oam's
+/// divergence list would send them somewhere useless.
+fn annotate_missing_builtin_export(message: &str) -> String {
+    const MARKER: &str = "does not provide an export named";
+    if !message.contains(MARKER) {
+        return message.to_string();
+    }
+    // "The requested module 'node:fs' does not provide an export named 'x'"
+    let Some(rest) = message.split_once("requested module '").map(|(_, r)| r) else {
+        return message.to_string();
+    };
+    let Some((specifier, _)) = rest.split_once('\'') else {
+        return message.to_string();
+    };
+    if !specifier.starts_with("node:") {
+        return message.to_string();
+    }
+    format!(
+        "{message}\n  {specifier} is a Node builtin oam implements only in part, and a \
+         missing name fails at import time even if it is never called. See \
+         docs/node-divergences.md (\"Builtin export names\") for the tracked list, or \
+         conformance/surface-gaps.json for the machine-readable one. If the name is not \
+         listed there, it is a bug worth reporting."
     )
 }

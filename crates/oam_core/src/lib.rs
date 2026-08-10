@@ -81,15 +81,63 @@ pub enum OpOutcome {
     /// A failure carrying a Node errno code (ENOENT, EACCES, ...). The
     /// engine rejects with an Error whose `.code` property is set —
     /// ecosystem code branches on err.code constantly (graceful-fs et al).
+    ///
+    /// `syscall`/`path`/`errno` complete the shape node puts on a system
+    /// error. They were absent, so every ASYNC fs rejection carried `code`
+    /// alone while its sync twin (throw_node_error) set all four —
+    /// `fs.promises.stat("missing")` gave `syscall: undefined`, and the
+    /// packages that branch on `err.syscall === "open"` or read `err.path`
+    /// (graceful-fs, chokidar, rimraf) saw nothing. Optional because the
+    /// non-fs producers (dns/net/tls) have no path to report.
     NodeFailed {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        syscall: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        errno: Option<i32>,
     },
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
     /// maps it to `process.emit(name)` rather than resolving a promise. serde-
     /// derived so it survives worker IPC, but workers never produce it.
     Signal(String),
+}
+
+impl OpOutcome {
+    /// A coded failure with no filesystem context (dns / net / tls).
+    pub fn node_failed(code: impl Into<String>, message: impl Into<String>) -> Self {
+        OpOutcome::NodeFailed {
+            code: code.into(),
+            message: message.into(),
+            syscall: None,
+            path: None,
+            errno: None,
+        }
+    }
+
+    /// A coded failure carrying node's full system-error shape. Use this
+    /// wherever a syscall name and path are known -- it is what makes an
+    /// async rejection indistinguishable from its sync twin.
+    pub fn node_failed_at(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        syscall: &str,
+        path: &str,
+        errno: Option<i32>,
+    ) -> Self {
+        OpOutcome::NodeFailed {
+            code: code.into(),
+            message: message.into(),
+            syscall: Some(syscall.to_string()),
+            // node omits `path` entirely for fd-based calls rather than
+            // reporting an empty string.
+            path: (!path.is_empty()).then(|| path.to_string()),
+            errno,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -945,12 +993,20 @@ pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io
 /// requires the file not be read-only — Node throws EPERM on Windows for
 /// W_OK against a read-only file, and programs gate writes on exactly this
 /// call. X_OK is approximated as existence (wave 1). Err is (code, message).
-pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String)> {
+/// Node's `fs.access`. On failure returns (code, message, errno).
+///
+/// The errno rides along because both callers need it to build node's system-
+/// error shape and only this function still holds the `io::Error` it came
+/// from. Without it `fs.access`/`fs.promises.access` rejected with no `errno`
+/// at all (and the async form with no `syscall` or `path` either), where every
+/// sibling fs op carries all four.
+pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option<i32>)> {
     let meta = std::fs::metadata(path).map_err(|e| {
         let code = node_error_code(&e);
         (
             code.to_string(),
             node_error_message(code, "access", path, &e),
+            node_errno(code, &e),
         )
     })?;
     if mode & 2 != 0 && meta.permissions().readonly() {
@@ -958,6 +1014,9 @@ pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String)> {
         return Err((
             code.to_string(),
             format!("{code}: operation not permitted, access '{path}'"),
+            // Synthesised (no io::Error behind it): the libuv numbers node
+            // reports for these two.
+            Some(if cfg!(windows) { -4048 } else { -13 }),
         ));
     }
     Ok(())
@@ -1389,10 +1448,13 @@ pub mod ops {
 
     fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
-        OpOutcome::NodeFailed {
-            code: code.to_string(),
-            message: super::node_error_message(code, syscall, path, &error),
-        }
+        OpOutcome::node_failed_at(
+            code,
+            super::node_error_message(code, syscall, path, &error),
+            syscall,
+            path,
+            super::node_errno(code, &error),
+        )
     }
 
     /// Where the fields `std::fs::Metadata` does not carry can be read from.
@@ -1574,6 +1636,191 @@ pub mod ops {
             std::fs::metadata(path)?
         };
         Ok(stat_to_json(&meta, StatSource::Path(path)))
+    }
+
+    /// statfs payload: the seven `uv_statfs_t` fields node's `fs.StatFs`
+    /// carries, each as a DECIMAL STRING.
+    ///
+    /// Strings, not JSON numbers, because `fs.statfs(path, {bigint: true})`
+    /// promises exact u64s. A JSON number is a double, so a filesystem with
+    /// more than 2^53 blocks (or an f_type magic above it) would round on the
+    /// way through and the BigInt built from it would be quietly wrong --
+    /// which is precisely the case bigint mode exists to serve. The JS side
+    /// picks `Number(s)` or `BigInt(s)`; both are exact from the string, and
+    /// the non-bigint form rounds identically to node's own double.
+    fn statfs_fields_json(
+        f_type: u64,
+        bsize: u64,
+        blocks: u64,
+        bfree: u64,
+        bavail: u64,
+        files: u64,
+        ffree: u64,
+    ) -> String {
+        format!(
+            "{{\"type\":\"{f_type}\",\"bsize\":\"{bsize}\",\"blocks\":\"{blocks}\",\
+             \"bfree\":\"{bfree}\",\"bavail\":\"{bavail}\",\"files\":\"{files}\",\
+             \"ffree\":\"{ffree}\"}}"
+        )
+    }
+
+    #[cfg(test)]
+    mod statfs_wire_tests {
+        use super::statfs_fields_json;
+
+        /// The decimal-string wire format is the whole reason
+        /// `statfs(path, {bigint: true})` can be trusted. As JSON NUMBERS
+        /// these would be doubles: 2^53+1 and u64::MAX both round on the way
+        /// through, and the BigInt built from a rounded value is silently
+        /// wrong -- precisely the case bigint mode exists to serve.
+        ///
+        /// No filesystem available to a test reports block counts that large,
+        /// so the serializer is the only place this is checkable at all.
+        #[test]
+        fn fields_past_2_pow_53_survive_exactly() {
+            let big = (1u64 << 53) + 1; // first integer a f64 cannot represent
+            let json = statfs_fields_json(u64::MAX, 4096, big, big - 1, 0, u64::MAX - 1, 7);
+
+            let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+            let field = |name: &str| parsed[name].as_str().expect("string").parse::<u64>();
+            assert_eq!(field("type").unwrap(), u64::MAX);
+            assert_eq!(field("blocks").unwrap(), big);
+            assert_eq!(field("bfree").unwrap(), big - 1);
+            assert_eq!(field("files").unwrap(), u64::MAX - 1);
+
+            // The rounding this format exists to avoid, demonstrated.
+            assert_eq!(big as f64 as u64, big - 1);
+        }
+
+        /// Pins the payload contract the JS `StatFs` constructor reads by
+        /// name: all seven fields present, none emitted as a bare number.
+        #[test]
+        fn payload_carries_all_seven_fields_as_strings() {
+            assert_eq!(
+                statfs_fields_json(0, 1, 2, 3, 4, 5, 6),
+                r#"{"type":"0","bsize":"1","blocks":"2","bfree":"3","bavail":"4","files":"5","ffree":"6"}"#
+            );
+        }
+    }
+
+    /// statfs of the filesystem `path` lives on, as the JSON payload the JS
+    /// side consumes. Blocking; async callers must run it on a blocking thread.
+    ///
+    /// Field-for-field what libuv's `uv_fs_statfs` reports, because that is
+    /// what node hands to `fs.StatFs` verbatim.
+    #[cfg(windows)]
+    pub fn statfs_json(path: &str) -> std::io::Result<String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+
+        /// ERROR_DIRECTORY: "the directory name is invalid" -- what
+        /// GetDiskFreeSpaceW answers when handed a path to a FILE.
+        const ERROR_DIRECTORY: i32 = 267;
+
+        fn query(dir: &std::path::Path) -> std::io::Result<(u32, u32, u32, u32)> {
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let (mut spc, mut bps, mut free, mut total) = (0u32, 0u32, 0u32, 0u32);
+            // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives
+            // the call, and the four out-params are live u32s the API only
+            // writes on success.
+            let ok = unsafe {
+                GetDiskFreeSpaceW(wide.as_ptr(), &mut spc, &mut bps, &mut free, &mut total)
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((spc, bps, free, total))
+        }
+
+        // An empty path is "no such file" to node, on every platform. Left to
+        // std::path::absolute it comes back InvalidInput -> EINVAL, where the
+        // POSIX branch gets ENOENT straight from the kernel.
+        if path.is_empty() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+
+        // GetDiskFreeSpaceW wants a DIRECTORY, but node accepts any path on
+        // the volume. Resolve to absolute first: a bare relative path like
+        // "Cargo.toml" has no parent to fall back to, and node answers it
+        // from the cwd's volume.
+        let absolute = std::path::absolute(path)?;
+        let (sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters) =
+            match query(&absolute) {
+                Ok(values) => values,
+                // Retry against the parent ONLY for "you gave me a file".
+                // Retrying on every error would turn a missing path into the
+                // stats of its parent's volume, where node reports ENOENT.
+                Err(e) if e.raw_os_error() == Some(ERROR_DIRECTORY) => {
+                    let parent = absolute.parent().ok_or(e)?;
+                    query(parent)?
+                }
+                Err(e) => return Err(e),
+            };
+
+        Ok(statfs_fields_json(
+            // Windows exposes no filesystem type id here; libuv reports 0.
+            0,
+            u64::from(bytes_per_sector) * u64::from(sectors_per_cluster),
+            u64::from(total_clusters),
+            u64::from(free_clusters),
+            // No per-user quota view from this API, so free == available.
+            u64::from(free_clusters),
+            // Inode counts do not exist on NTFS/FAT; libuv reports zeros.
+            0,
+            0,
+        ))
+    }
+
+    /// statfs of the filesystem `path` lives on (see the windows twin).
+    #[cfg(unix)]
+    pub fn statfs_json(path: &str) -> std::io::Result<String> {
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+
+        // Linux and macOS both have the BSD `statfs`, which carries the
+        // filesystem type id (`f_type`) node reports. The remaining unix
+        // targets only have POSIX `statvfs`, which has no type field --
+        // libuv reports 0 there, so this does too rather than invent one.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // SAFETY: `buf` is a live, correctly-sized `statfs` and `c_path`
+            // is a NUL-terminated C string that outlives the call. The value
+            // is only read after a 0 (success) return.
+            let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(statfs_fields_json(
+                buf.f_type as u64,
+                buf.f_bsize as u64,
+                buf.f_blocks as u64,
+                buf.f_bfree as u64,
+                buf.f_bavail as u64,
+                buf.f_files as u64,
+                buf.f_ffree as u64,
+            ))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // SAFETY: as above, for the POSIX `statvfs` shape.
+            let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(statfs_fields_json(
+                0,
+                buf.f_bsize as u64,
+                buf.f_blocks as u64,
+                buf.f_bfree as u64,
+                buf.f_bavail as u64,
+                buf.f_files as u64,
+                buf.f_ffree as u64,
+            ))
+        }
     }
 
     /// stat/lstat payload, shared with the sync native in oam_engine for a
@@ -1766,6 +2013,33 @@ pub mod ops {
         }
     }
 
+    /// fstat of an already-open descriptor, off the loop thread.
+    ///
+    /// Takes an OWNED (try_clone'd) handle rather than the registry so the
+    /// caller never holds the file-registry lock across the blocking read.
+    pub async fn fs_fstat(file: std::fs::File) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            file.metadata()
+                .map(|meta| stat_to_json(&meta, StatSource::File(&file)))
+        })
+        .await;
+        match result {
+            Ok(Ok(json)) => OpOutcome::Json(json),
+            Ok(Err(e)) => node_fail(e, "fstat", ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fstat", ""),
+        }
+    }
+
+    pub async fn fs_statfs(path: String) -> OpOutcome {
+        let owned = path.clone();
+        let result = tokio::task::spawn_blocking(move || statfs_json(&owned)).await;
+        match result {
+            Ok(Ok(json)) => OpOutcome::Json(json),
+            Ok(Err(e)) => node_fail(e, "statfs", &path),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "statfs", &path),
+        }
+    }
+
     pub async fn fs_readdir(path: String) -> OpOutcome {
         match tokio::task::spawn_blocking({
             let path = path.clone();
@@ -1829,7 +2103,9 @@ pub mod ops {
     pub async fn fs_access(path: String, mode: i32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
-            Err((code, message)) => OpOutcome::NodeFailed { code, message },
+            Err((code, message, errno)) => {
+                OpOutcome::node_failed_at(code, message, "access", &path, errno)
+            }
         })
         .await;
         result.unwrap_or_else(|e| OpOutcome::Failed(format!("access: {e}")))
@@ -1842,15 +2118,27 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_mkdtemp(prefix: String) -> OpOutcome {
-        let dir = std::env::temp_dir().join(format!(
+    /// The directory `mkdtemp(prefix)` will create. Exposed so the op layer
+    /// can permission-check the path that is actually written rather than the
+    /// caller's prefix -- with a relative prefix the two differ (the prefix
+    /// resolves under the system temp dir), so checking the prefix denied
+    /// writes inside a correctly-granted temp dir and vice versa.
+    pub fn mkdtemp_target(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
             "{}{}",
             prefix,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    /// `dir` comes from `mkdtemp_target(&prefix)`, resolved ONCE by the op
+    /// layer so the path it permission-checked is the path created here.
+    /// Resolving it again would mint a fresh timestamp, leaving the checked
+    /// path and the created path different strings.
+    pub async fn fs_mkdtemp(dir: std::path::PathBuf, prefix: String) -> OpOutcome {
         match tokio::fs::create_dir(&dir).await {
             Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
             Err(e) => node_fail(e, "mkdtemp", &prefix),
@@ -1923,9 +2211,9 @@ pub mod ops {
         match tokio::fs::OpenOptions::new().write(true).open(&path).await {
             Ok(f) => match f.set_len(len).await {
                 Ok(()) => OpOutcome::Done,
-                Err(e) => node_fail(e, "truncate", &path),
+                Err(e) => node_fail(e, "ftruncate", &path),
             },
-            Err(e) => node_fail(e, "truncate", &path),
+            Err(e) => node_fail(e, "open", &path),
         }
     }
 

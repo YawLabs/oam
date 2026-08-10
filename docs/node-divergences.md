@@ -548,6 +548,95 @@ entries below were executed on both runtimes unless marked.
 | `node:repl`, `node:readline` | Minimal: enough to import, construct, and iterate lines. | Full. |
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
 
+### `err.syscall` on `fs.realpath` and `fs.opendir`
+
+Node's own sync and async forms disagree on these two, and oam is
+self-consistent where node is not:
+
+| call | node | oam |
+|---|---|---|
+| `realpathSync(missing)` | `syscall: "lstat"` (its path-walk uses lstat) | `syscall: "realpath"` |
+| `realpath(missing)` | `syscall: "realpath"` | `syscall: "realpath"` |
+| `opendirSync(missing)` | `syscall: "opendir"`, no `path` | `syscall: "scandir"`, `path` set |
+| `opendir(missing)` | `syscall: "opendir"`, `path` set | `syscall: "scandir"`, `path` set |
+
+Everything else — `code`, `errno`, the message — matches. These are the only
+two fs calls excluded from the async/sync error-parity case
+(`conformance/cases/72-*`), because asserting node's behaviour there would mean
+encoding its inconsistency into a case whose purpose is the rule.
+
+### `fs.realpath` under `--permission` — oam is stricter
+
+Measured against Node v22.22.2: with `--permission` and no grants, node allows
+`fs.realpathSync()` on any path, including absolute paths outside the cwd. Every other
+path-based `fs` op it denies. oam requires a read grant for `realpath` like the rest of
+the read family — a sandbox that answers "does this path exist, and where does it
+resolve to" is leaking the thing the sandbox is for. This is the one place oam is
+deliberately *tighter* than node's permission model, so code that relies on node's
+carve-out needs `--allow-fs-read` for that path on oam.
+
+### Builtin export names
+
+A builtin's ESM named exports are its module object's own enumerable keys — oam derives
+them in `cjs.rs::facade_with_prelude`, Node from `BuiltinModule`'s export keys. So a name
+oam does not carry is **not** a lazy failure at the call site: `import { x } from
+"node:fs"` fails at LINK time with `does not provide an export named 'x'`, and the whole
+program dies before a line of it runs. A bundled CLI imports the union of everything its
+dependency tree touches, so one absent name takes down a program that would never have
+called it. (This is exactly how `statfsSync` — added to Node in v18.15 — killed a CLI on
+oam that never called it.)
+
+Measured on all three release platforms:
+
+| host | export names present | missing by name | in absent modules | modules absent |
+|---|---|---|---|---|
+| windows-aarch64 (Node v22.22.2) | 938 / 1386 | 349 | 99 | 12 |
+| linux-x64 (Node v22.23.1) | 984 / 1389 | 306 | 99 | 12 |
+| darwin-arm64 (Node v22.23.1) | 984 / 1385 | 302 | 99 | 12 |
+
+"Present" subtracts both columns: the per-name gaps *and* the 99 export names living
+inside the 12 modules oam does not register at all (`sys` alone accounts for 49). The
+Node versions differ between hosts, which is part of why the totals do — the gate prints
+a note when a section's recorded Node does not match the one it is running against, so a
+version bump does not get read as an oam regression.
+
+Windows is the worst of the three by ~45 names, and all of that difference is
+`node:constants`: Windows Node publishes the 113-name `WSA*` errno block, which has no
+POSIX counterpart. Outside `constants` the three platforms have the *same* gaps, name for
+name — including `node:process`, whose POSIX-only `getuid`/`setgid`/`initgroups` family
+oam implements in full.
+
+Every absent name is enumerated in
+[`conformance/surface-gaps.json`](../conformance/surface-gaps.json), which **gates**:
+`cargo run -p xtask -- conformance` fails on a missing name that is not on the list, and
+also on a listed name oam has since implemented, so the list can only shrink.
+
+The file is keyed by platform, because Node's own surface is: `node:constants` publishes
+the `WSA*` errnos on Windows and the POSIX signal set elsewhere, and `node:process` only
+carries `getuid`/`setgid`/… on POSIX. `node scripts/gen-surface-gaps.mjs` rewrites **only
+the section for the host it runs on** and leaves the others intact, so regenerating on
+Linux cannot wipe the Windows baseline — run it on each release host and commit the
+result. On a platform with no section yet the gate measures and reports but does not
+gate, and says so loudly. It also refuses to record a section whose gap count has *grown*
+unless you pass `--allow-regression`, since laundering a regression into "known debt" is
+the one thing the ratchet exists to prevent.
+
+Twelve modules are absent outright rather than partial: the six `_http_*` legacy internals,
+`_stream_wrap`, `_tls_common`, `_tls_wrap`, `inspector/promises`, `sys` (the deprecated
+`util` alias), and `wasi`.
+
+The largest per-module gaps (counts from windows-aarch64), all tracked in that file:
+
+| Module | Missing | Shape of the gap |
+|---|---|---|
+| `constants` | 113 (70 linux / 66 darwin) | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `O_DIRECT`/`O_NOCTTY`/`RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
+| `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
+| `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
+| `fs` | 29 | Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `glob`/`globSync`, `openAsBlob`. Each needs a syscall oam does not yet wrap; they are the top of the backlog. |
+| `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
+| `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
+| `v8` | 9 | `DefaultSerializer`/`DefaultDeserializer`, `getHeapSnapshot`, `GCProfiler`, `promiseHooks`, `queryObjects`. |
+
 ---
 
 ## Known failures in the vendored suite

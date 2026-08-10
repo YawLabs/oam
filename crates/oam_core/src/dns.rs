@@ -30,18 +30,15 @@ pub async fn dns_lookup(hostname: String, family: i32, all: bool) -> OpOutcome {
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&lookup).await {
         Ok(iter) => iter.collect(),
         Err(_) => {
-            return OpOutcome::NodeFailed {
-                code: "ENOTFOUND".to_string(),
-                message: format!("getaddrinfo ENOTFOUND {hostname}"),
-            };
+            return OpOutcome::node_failed(
+                "ENOTFOUND",
+                format!("getaddrinfo ENOTFOUND {hostname}"),
+            );
         }
     };
 
     if addrs.is_empty() {
-        return OpOutcome::NodeFailed {
-            code: "ENOTFOUND".to_string(),
-            message: format!("getaddrinfo ENOTFOUND {hostname}"),
-        };
+        return OpOutcome::node_failed("ENOTFOUND", format!("getaddrinfo ENOTFOUND {hostname}"));
     }
 
     let filtered: Vec<_> = addrs
@@ -54,10 +51,7 @@ pub async fn dns_lookup(hostname: String, family: i32, all: bool) -> OpOutcome {
         .collect();
 
     if filtered.is_empty() {
-        return OpOutcome::NodeFailed {
-            code: "ENOTFOUND".to_string(),
-            message: format!("getaddrinfo ENOTFOUND {hostname}"),
-        };
+        return OpOutcome::node_failed("ENOTFOUND", format!("getaddrinfo ENOTFOUND {hostname}"));
     }
 
     if all {
@@ -281,10 +275,7 @@ pub async fn dns_reverse(ip_str: String) -> OpOutcome {
     let ip: IpAddr = match ip_str.parse() {
         Ok(ip) => ip,
         Err(_) => {
-            return OpOutcome::NodeFailed {
-                code: "EINVAL".to_string(),
-                message: format!("reverse EINVAL {ip_str}"),
-            };
+            return OpOutcome::node_failed("EINVAL", format!("reverse EINVAL {ip_str}"));
         }
     };
 
@@ -300,10 +291,10 @@ pub async fn dns_reverse(ip_str: String) -> OpOutcome {
                 })
                 .collect();
             if names.is_empty() {
-                OpOutcome::NodeFailed {
-                    code: "ENOTFOUND".to_string(),
-                    message: format!("reverse ENOTFOUND {ip_str}"),
-                }
+                OpOutcome::node_failed(
+                    "ENOTFOUND".to_string(),
+                    format!("reverse ENOTFOUND {ip_str}"),
+                )
             } else {
                 OpOutcome::Json(serde_json::json!(names).to_string())
             }
@@ -318,8 +309,5 @@ fn dns_err(query: &str, e: &hickory_resolver::net::NetError) -> OpOutcome {
         NetError::Dns(DnsError::NoRecordsFound(_)) => "ENOTFOUND",
         _ => "ESERVFAIL",
     };
-    OpOutcome::NodeFailed {
-        code: code.to_string(),
-        message: format!("{code} {query}: {e}"),
-    }
+    OpOutcome::node_failed(code.to_string(), format!("{code} {query}: {e}"))
 }
