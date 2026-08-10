@@ -8,10 +8,11 @@ Machine-readable twin: [`bench/results.json`](bench/results.json).
 These are from one machine and are not a leaderboard -- run them on yours:
 
 ```sh
-cargo build --release                  # compare release against release
-cargo run -p xtask -- bench            # oam only
-cargo run -p xtask -- bench --compare  # also node and bun, when on PATH
+cargo run -p xtask -- bench --release            # oam only
+cargo run -p xtask -- bench --release --compare  # also node and bun, on PATH
 ```
+
+`--release` is load-bearing, and a prior `cargo build --release` does not imply it: without the flag the harness builds and measures the DEBUG oam binary against release `node.exe` and `bun.exe`, which is not a comparison. Every run stamps its profile on the `Commit ... | <profile> | host ...` line below -- if that reads `debug`, discard the numbers and re-run with `--release`.
 
 The oam binary is copied out of `target/` and exec'd once before timing starts. A build directory is not a stable place to measure from: a concurrent `cargo build` replaces the binary mid-run, and fresh bytes are cold where the installed `node.exe` and `bun.exe` they are compared against are warm -- an asymmetry that lands entirely on the one binary under test. Staging gives the run a private copy nothing else is writing to. It is a file copy, needs no privileges, and changes no result when nothing is rebuilding concurrently. If you hand-roll a `target/release/oam` invocation while a build is running, that is why yours will disagree.
 
@@ -19,11 +20,11 @@ Each case is timed in-process by the harness rather than by a shell wrapper, exc
 
 Where another runtime wins, the table says so -- see [docs/why-oam.md](docs/why-oam.md) for the workloads oam is and is not aimed at.
 
-Commit `f096b5d` | release | host windows-aarch64
+Commit `acec008` | release | host windows-aarch64
 
 ## Runtimes
 
-- **oam** oam 0.8.2
+- **oam** oam 0.9.0
 - **node** v22.22.2
 - **bun** 1.3.14
 
@@ -33,15 +34,15 @@ All times in milliseconds. Lower is better.
 
 | Case | oam | node | bun | vs node |
 |---|--:|--:|--:|--:|
-| cold-start | 124.83 | 168.84 | 513.54 | 0.74x |
-| url-parse | 6.34 | 6.89 | 4.83 | 0.92x |
-| http-throughput | 55.17 | 86.10 | 31.12 | 0.64x |
-| fs-read | 23.45 | 40.25 | 36.08 | 0.58x |
-| json-parse | 55.04 | 84.12 | 67.51 | 0.65x |
-| crypto-hash | 150.67 | 207.40 | 26.91 | 0.73x |
-| mcp-cold-start | 56.81 | 232.38 | 509.45 | 0.24x |
-| mcp-idle-rss | 25.32 | 68.75 | 95.91 | 0.37x |
-| mcp-first-call-latency | 0.48 | 3.56 | 3.25 | 0.13x |
+| cold-start | 59.58 | 113.42 | 307.97 | 0.53x |
+| url-parse | 6.53 | 9.30 | 5.43 | 0.70x |
+| http-throughput | 47.78 | 107.75 | 33.98 | 0.44x |
+| fs-read | 30.05 | 28.91 | 38.73 | 1.04x |
+| json-parse | 74.50 | 115.99 | 91.15 | 0.64x |
+| crypto-hash | 223.89 | 292.29 | 38.99 | 0.77x |
+| mcp-cold-start | 35.00 | 250.87 | 483.19 | 0.14x |
+| mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
+| mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
 
 ## Cases
 

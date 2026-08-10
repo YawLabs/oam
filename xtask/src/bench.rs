@@ -17,6 +17,8 @@
 //! Outputs: bench/results.json (machine) and BENCHMARKS.md (human),
 //! both COMMITTED -- the receipt is in the repo.
 
+use crate::conformance::{capture_version, ensure_oam_built, git_short_commit, repo_root};
+
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,9 +26,28 @@ use std::time::{Duration, Instant};
 
 // ------------------------------------------------------------------ config
 
-const COLD_START_ITERS: usize = 10;
-const TIMED_ITERS: usize = 5;
-const HTTP_ITERS: usize = 3;
+// Sample counts: how many times each case is run, with the MEDIAN published.
+//
+// These were 10 / 5 / 3 and that was too few to publish. Three runs of
+// UNCHANGED code disagreed by up to 40%, and each one was an outlier somewhere
+// different -- `f096b5d` on cold-start (node 168.84ms against ~113ms in the runs
+// either side), `acec008` on crypto-hash (node 292.29ms against ~205ms). Node's
+// binary was byte-identical across all three, so every bit of that spread was
+// sampling noise being published as measurement, and it made the tables look
+// like oam had regressed when nothing about oam had changed.
+//
+// A median over n=5 is not a stable statistic. n=15 costs about 3x the wall
+// clock on a run that already takes minutes, which is cheap for a number that
+// goes in the README and gets quoted at people. Raise these before trusting a
+// tighter comparison, not after.
+//
+// Load still matters more than n: do not measure on a busy machine. The
+// interleaving in `run_timed_case` protects the RATIOS from uniform drift, but
+// nothing protects the absolutes from a test suite running alongside.
+const COLD_START_ITERS: usize = 20;
+const TIMED_ITERS: usize = 15;
+const HTTP_ITERS: usize = 10;
+/// Per-sample, not per-case -- each sample is its own process spawn.
 const CASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ----------------------------------------------------------------- runtime
@@ -102,6 +123,26 @@ impl Drop for StagedBinary {
 ///
 /// Staging disables nothing and needs no privileges. Where nothing is
 /// rebuilding concurrently it is a file copy that changes no result.
+///
+/// KNOWN ASYMMETRY, and it favours oam. The pre-exec below absorbs a
+/// first-execution cost -- notably an on-access malware scan of the image --
+/// once, outside the timed loop. node and bun get no equivalent: they are
+/// exec'd from their install directories on every iteration, so if a scanner is
+/// scanning per exec, they pay it every time and oam does not. Measured on this
+/// machine 2026-08-10 with McAfee on-access active: `node --version`, which
+/// exits before node's own bootstrap, took 770-850ms against a historical
+/// ~113ms cold-start, while `cmd /c exit` (small, in System32, trusted) stayed
+/// at 42ms. A run taken in that state reported oam at 0.04x node on
+/// `mcp-cold-start` -- roughly an order of magnitude better than every
+/// neighbouring run -- and was discarded rather than published.
+///
+/// So: `cold-start`, `mcp-cold-start` and `mcp-first-call-latency` are only
+/// trustworthy on a machine with no per-exec scanning, and the in-process cases
+/// (`url-parse`, `json-parse`, `crypto-hash`) are the ones that stay honest when
+/// it is present -- they were within a few percent of the previous run in the
+/// same discarded measurement. Sanity-check a spawn-bound result against the
+/// others before believing it; if the compute cases match history and the spawn
+/// cases moved by multiples, the machine moved, not the runtime.
 ///
 /// Failure is non-fatal -- a bench run with a warning beats no bench run.
 fn stage_for_benchmark(oam: &Path) -> Result<(PathBuf, StagedBinary)> {
@@ -1183,10 +1224,14 @@ fn build_markdown(
         "## Reproducing this\n\n",
         "These are from one machine and are not a leaderboard -- run them on yours:\n\n",
         "```sh\n",
-        "cargo build --release                  # compare release against release\n",
-        "cargo run -p xtask -- bench            # oam only\n",
-        "cargo run -p xtask -- bench --compare  # also node and bun, when on PATH\n",
+        "cargo run -p xtask -- bench --release            # oam only\n",
+        "cargo run -p xtask -- bench --release --compare  # also node and bun, on PATH\n",
         "```\n\n",
+        "`--release` is load-bearing, and a prior `cargo build --release` does not imply ",
+        "it: without the flag the harness builds and measures the DEBUG oam binary against ",
+        "release `node.exe` and `bun.exe`, which is not a comparison. Every run stamps its ",
+        "profile on the `Commit ... | <profile> | host ...` line below -- if that reads ",
+        "`debug`, discard the numbers and re-run with `--release`.\n\n",
         "The oam binary is copied out of `target/` and exec'd once before timing starts. ",
         "A build directory is not a stable place to measure from: a concurrent `cargo ",
         "build` replaces the binary mid-run, and fresh bytes are cold where the installed ",
@@ -1201,6 +1246,15 @@ fn build_markdown(
         "spawn and can only be measured from outside. A runtime that is not on PATH is ",
         "skipped, never estimated. The profile and host are recorded in the line below, ",
         "because a debug build against release Node is not a comparison.\n\n",
+        "Every figure is a MEDIAN over repeated process runs, and the per-case sample ",
+        "count sits in the `iterations` field of [`bench/results.json`](bench/results.json) ",
+        "alongside min/max/p95/p99 and the raw samples -- read those before drawing a ",
+        "conclusion from a gap of a few percent. Runtimes are interleaved within a run, so ",
+        "background load that drifts over the run lands on all of them rather than on ",
+        "whichever was measured last; the ratios survive it, the absolute numbers do not. ",
+        "Do not compare absolute figures across two runs on a machine that was doing ",
+        "different things each time -- compare the ratios, or re-measure both on a quiet ",
+        "box.\n\n",
         "Where another runtime wins, the table says so -- see ",
         "[docs/why-oam.md](docs/why-oam.md) for the workloads oam is and is not aimed ",
         "at.\n\n",
@@ -1294,45 +1348,16 @@ fn build_markdown(
 
 // -------------------------------------------------------- shared helpers
 
-fn repo_root() -> Result<PathBuf> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    Ok(manifest
-        .parent()
-        .context("xtask manifest has a parent")?
-        .to_path_buf())
-}
-
-fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
-    let profile = if release { "release" } else { "debug" };
-    let exe = repo
-        .join(format!("target/{profile}"))
-        .join(format!("oam{}", std::env::consts::EXE_SUFFIX));
-    if !exe.is_file() {
-        println!("building oam ({profile})...");
-        let mut args = vec!["build", "-p", "oam_cli"];
-        if release {
-            args.push("--release");
-        }
-        let status = Command::new("cargo")
-            .args(&args)
-            .current_dir(repo)
-            .status()?;
-        if !status.success() {
-            bail!("cargo build -p oam_cli failed");
-        }
-    }
-    Ok(exe)
-}
-
-fn capture_version(exe: &Path, args: &[&str]) -> String {
-    Command::new(exe)
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
+// `repo_root`, `ensure_oam_built`, `capture_version` and `git_short_commit`
+// live in `conformance` and are imported at the top of this file rather than
+// re-declared here. They used to be copy-pasted into both modules, and the
+// copies DIVERGED: on 2026-08-04 conformance's `ensure_oam_built` was fixed to
+// always invoke cargo (an existing-but-stale binary was silently measured for
+// weeks), and bench's copy kept the `if !exe.is_file()` guard the fix removed.
+// A bench run therefore measured whatever binary happened to be sitting in
+// target/ and stamped it with today's HEAD -- a plausible number attributed to
+// code it did not come from, which is worse than a loud failure. One
+// definition means the next fix cannot land in only half the callers.
 
 /// ISO 8601 UTC timestamp via shell `date`, no chrono dependency.
 fn chrono_utc_now() -> String {
@@ -1343,17 +1368,6 @@ fn chrono_utc_now() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_default()
-}
-
-fn git_short_commit(repo: &Path) -> String {
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 struct Captured {
@@ -1405,6 +1419,89 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
         code,
         timed_out,
     })
+}
+
+/// Every document that quotes the benchmark table must name the run that
+/// produced `bench/results.json`.
+///
+/// `BENCHMARKS.md` is generated from that file, but `docs/why-oam.md` and
+/// `docs/blog/why-oam.md` re-state the same numbers in hand-written prose, and
+/// nothing forced the three to agree. On 2026-08-10 they carried numbers from
+/// three DIFFERENT runs simultaneously: the blog said "the committed table in
+/// `BENCHMARKS.md` is generated ... at commit `b078584`" and then printed a
+/// table that was not the one in `BENCHMARKS.md` -- which was `f096b5d`, a
+/// different oam version, and measured under load (its cold-start was ~2x both
+/// neighbouring runs, against a ~10% within-run spread). A reader who checked
+/// the cited source found it contradicted the citation.
+///
+/// Comparing against `results.json` rather than against git HEAD is deliberate.
+/// The invariant is "every doc describes the run it quotes", which stays true
+/// across later commits that do not re-run the bench; gating on HEAD would go
+/// red on the next unrelated commit and train people to ignore it.
+#[cfg(test)]
+mod bench_doc_stamp {
+    use serde_json::Value;
+
+    const RESULTS: &str = include_str!("../../bench/results.json");
+
+    /// Every doc that quotes the table, with its contents baked in so the test
+    /// needs no filesystem and no repo-root discovery.
+    const DOCS: &[(&str, &str)] = &[
+        ("BENCHMARKS.md", include_str!("../../BENCHMARKS.md")),
+        ("docs/why-oam.md", include_str!("../../docs/why-oam.md")),
+        (
+            "docs/blog/why-oam.md",
+            include_str!("../../docs/blog/why-oam.md"),
+        ),
+    ];
+
+    fn results() -> Value {
+        serde_json::from_str(RESULTS).expect("bench/results.json parses as JSON")
+    }
+
+    #[test]
+    fn every_bench_doc_names_the_run_it_quotes() {
+        let results = results();
+        let commit = results["commit"]
+            .as_str()
+            .expect("bench/results.json carries a `commit` field");
+        assert!(
+            !commit.is_empty() && commit != "unknown",
+            "bench/results.json records commit `{commit}`, which names no run. \
+             Regenerate: cargo run -p xtask -- bench --release --compare",
+        );
+
+        let needle = format!("`{commit}`");
+        let stale: Vec<&str> = DOCS
+            .iter()
+            .filter(|(_, body)| !body.contains(&needle))
+            .map(|(path, _)| *path)
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "bench/results.json is from commit `{commit}`, but these docs do not \
+             cite it: {stale:?}.\nThey quote the benchmark table, so each one has to \
+             say which run the numbers came from -- otherwise they drift apart \
+             silently, which is exactly what happened on 2026-08-10.\nFix by \
+             re-running `cargo run -p xtask -- bench --release --compare` (that \
+             rewrites BENCHMARKS.md) and hand-updating the prose docs to match.",
+        );
+    }
+
+    #[test]
+    fn quoted_numbers_come_from_a_release_build() {
+        let profile = results()["profile"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            profile, "release",
+            "bench/results.json was measured on a `{profile}` build. A debug oam \
+             against release node.exe and bun.exe is not a comparison, and these \
+             numbers are published. Re-run with --release.",
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
