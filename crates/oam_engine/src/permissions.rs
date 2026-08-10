@@ -58,6 +58,13 @@ pub struct Permissions {
     pub env: PermValue,
     pub ffi: PermValue,
     pub child: PermValue,
+    /// Starting a worker_threads Worker or an `oam.fork()` isolate.
+    ///
+    /// Separate from `child` now that a child isolate INHERITS this
+    /// permission set: while workers ran all-granted, `--allow-worker` had to
+    /// imply `--allow-child-process` (a worker could just spawn its way out),
+    /// which over-granted every caller that only wanted a worker.
+    pub worker: PermValue,
 }
 
 impl Default for Permissions {
@@ -69,6 +76,7 @@ impl Default for Permissions {
             env: PermValue::All,
             ffi: PermValue::All,
             child: PermValue::All,
+            worker: PermValue::All,
         }
     }
 }
@@ -87,6 +95,7 @@ impl Permissions {
             env: from_bool_or_list(o.env),
             ffi: from_bool_or_list(o.ffi),
             child: from_bool_or_list(o.child),
+            worker: from_bool_or_list(o.worker),
         }
     }
 
@@ -122,6 +131,20 @@ impl Permissions {
             Err(PermissionDenial {
                 permission: "Net",
                 resource: host.to_string(),
+            })
+        }
+    }
+
+    /// Returns `Err(denial)` when starting a worker / forked isolate is
+    /// denied. The child inherits this same permission set, so a worker is
+    /// not a way around the parent's restrictions.
+    pub fn check_worker(&self, resource: &str) -> Result<(), PermissionDenial> {
+        if self.worker.allows(resource) {
+            Ok(())
+        } else {
+            Err(PermissionDenial {
+                permission: "WorkerThreads",
+                resource: resource.to_string(),
             })
         }
     }
@@ -209,6 +232,9 @@ pub struct PermissionsOptions {
     /// the permission set does not describe: once the image is replaced, no
     /// restriction here applies to what runs next.
     pub child: BoolOrList,
+    /// Starting a worker / forked isolate. A child inherits the parent's
+    /// permissions, so this no longer has to imply `child`.
+    pub worker: BoolOrList,
 }
 
 /// `true` | `false` | list of allowed strings.
@@ -250,6 +276,7 @@ mod tests {
             env: BoolOrList::Bool(false),
             ffi: BoolOrList::Bool(false),
             child: BoolOrList::Bool(false),
+            worker: BoolOrList::Bool(false),
         }
     }
 
@@ -261,6 +288,7 @@ mod tests {
             env: BoolOrList::Bool(false),
             ffi: BoolOrList::Bool(false),
             child: BoolOrList::Bool(false),
+            worker: BoolOrList::Bool(false),
         }
     }
 

@@ -42,7 +42,9 @@
 #     node-suite) on this box            [OAM_SKIP_LOCAL_GATE=1 to skip]
 #   - gate+test+conformance+node-suite on the Linux VM (inside --mode=release
 #     -- the node-suite ratchet was node-compat.yml's ubuntu GATING job)
-#   - gate+test on the Mac (inside mac-release)
+#   - gate+test+conformance on the Mac (inside mac-release) -- conformance
+#     carries the builtin export-parity ratchet, and darwin has native code
+#     (fs statfs) that no other leg executes
 #
 # Usage -- the tag AND the version are managed for you:
 #   ./scripts/release-local.sh v0.8.0

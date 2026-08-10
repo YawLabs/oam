@@ -293,6 +293,59 @@
     return err;
   }
 
+  /// A SYNTHESISED system error carrying node's full shape: code, syscall,
+  /// path, errno and node's message wording.
+  ///
+  /// For failures oam decides itself rather than reading off a syscall --
+  /// rmdir refusing a non-directory is the case that needs it. Those used
+  /// makeNodeError, which sets `code` alone, so `err.syscall`/`errno`/`path`
+  /// came back undefined where every syscall-backed error in the runtime
+  /// sets all four.
+  ///
+  /// The errno table is deliberately tiny: only the codes actually raised
+  /// this way, with libuv's negative numbering (the Windows block is offset,
+  /// POSIX is plain -errno) to match what the Rust side reports.
+  function makeSystemError(code, syscall, path) {
+    const isWin = globalThis.__oam.node.platform === "win32";
+    const ERRNO = isWin
+      ? { ENOENT: -4058, ENOTDIR: -4052, EEXIST: -4075, EPERM: -4048 }
+      : { ENOENT: -2, ENOTDIR: -20, EEXIST: -17, EPERM: -1 };
+    const TEXT = {
+      ENOENT: "no such file or directory",
+      ENOTDIR: "not a directory",
+      EEXIST: "file already exists",
+      EPERM: "operation not permitted",
+    };
+    const err = new Error(`${code}: ${TEXT[code] ?? code}, ${syscall} '${path}'`);
+    err.code = code;
+    err.syscall = syscall;
+    err.path = String(path);
+    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
+    return err;
+  }
+
+  /// ERR_INVALID_ARG_TYPE and friends are TypeErrors in node, not plain
+  /// Errors -- `instanceof TypeError` and assert.throws({ name: "TypeError" })
+  /// both key off that, so makeNodeError (which builds an Error) is the wrong
+  /// tool for an argument-validation failure.
+  function nodeTypeError(message, code) {
+    var err = new TypeError(message);
+    applyNodeErrorShape(err, code ?? "ERR_INVALID_ARG_TYPE");
+    return err;
+  }
+
+  /// node's "Received ..." tail on an ERR_INVALID_ARG_TYPE message.
+  function describeArg(value) {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    if (typeof value === "object") {
+      var name = value.constructor && value.constructor.name;
+      return `an instance of ${name || "Object"}`;
+    }
+    if (typeof value === "string") return `type string ('${value}')`;
+    return `type ${typeof value} (${String(value)})`;
+  }
+
   // Apply Node's coded-error shape to an Error instance: `.code` is set, `.name`
   // stays the plain base name (RangeError/TypeError -- assert.throws({name})
   // compares it strictly), and `.toString()`/`.stack` show "BaseName [CODE]: msg"
@@ -8222,6 +8275,31 @@
     return new Stats(raw);
   }
 
+  // node's fs.StatFs. Seven own fields in node's order and NOTHING on the
+  // prototype but the constructor, which is the whole observable surface --
+  // node builds it the same way, so inspect/JSON/deepStrictEqual line up.
+  // Deliberately NOT exported from node:fs: node keeps the class internal and
+  // only ever hands back instances (verified against v22.22.2).
+  class StatFs {
+    constructor(raw, bigint) {
+      // The native sends every field as a decimal STRING so bigint mode is
+      // exact (see statfs_fields_json in oam_core). Number() reproduces
+      // node's double for the default form; BigInt() the exact u64.
+      const cast = bigint ? BigInt : Number;
+      this.type = cast(raw.type);
+      this.bsize = cast(raw.bsize);
+      this.blocks = cast(raw.blocks);
+      this.bfree = cast(raw.bfree);
+      this.bavail = cast(raw.bavail);
+      this.files = cast(raw.files);
+      this.ffree = cast(raw.ffree);
+    }
+  }
+
+  function wrapStatFs(raw, options) {
+    return new StatFs(raw, readOptions(options).bigint === true);
+  }
+
   class Dirent {
     constructor(name, parentPath, kind) {
       this.name = name;
@@ -8236,6 +8314,93 @@
     isCharacterDevice() { return false; }
     isFIFO() { return false; }
     isSocket() { return false; }
+  }
+
+  // node's fs.Dir. Was two ad-hoc object literals (one per opendir form),
+  // which left `fs.Dir` unexported and gave each form only half the method
+  // set -- an opendirSync() handle had no read()/close(), an opendir() handle
+  // no readSync()/closeSync(), where node's single class carries all four.
+  // Entries are snapshotted at open, as both literals already did.
+  class Dir {
+    #entries;
+    #index = 0;
+    #closed = false;
+    constructor(path, entries) {
+      this.path = path;
+      this.#entries = entries;
+    }
+    #next() {
+      // node tracks the handle's closed state and throws on ANY later
+      // operation -- including a second close() -- rather than reporting
+      // end-of-directory. Returning null here instead made a use-after-close
+      // bug look like an empty directory.
+      if (this.#closed) {
+        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+      }
+      if (this.#index >= this.#entries.length) return null;
+      return makeDirent(this.path, this.#entries[this.#index++]);
+    }
+    readSync() { return this.#next(); }
+    closeSync() {
+      if (this.#closed) {
+        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+      }
+      this.#closed = true;
+    }
+    // Both forms accept node's optional callback as well as returning a
+    // promise (node's Dir#read/#close are dual-shaped).
+    //
+    // How a CLOSED handle is reported differs between the two, and it differs
+    // between read and close -- measured against v22.22.2, not assumed:
+    //   read(cb)  -> throws SYNCHRONOUSLY   read()  -> rejects
+    //   close(cb) -> calls back with err    close() -> rejects
+    // node's #readImpl runs inline when a callback is supplied, so its guard
+    // throws out of the call itself; close routes its guard through the
+    // callback instead.
+    read(callback) {
+      if (typeof callback === "function") {
+        // Deliberately UNGUARDED: a closed handle must throw out of this call.
+        const value = this.#next();
+        callback(null, value);
+        return undefined;
+      }
+      try { return Promise.resolve(this.#next()); } catch (e) { return Promise.reject(e); }
+    }
+    close(callback) {
+      try { this.closeSync(); } catch (e) {
+        if (typeof callback === "function") { callback(e); return undefined; }
+        return Promise.reject(e);
+      }
+      if (typeof callback === "function") { callback(null); return undefined; }
+      return Promise.resolve();
+    }
+    // Iterating to the end CLOSES the handle, and so does abandoning the loop
+    // early (`break` / `throw` runs the iterator's return()). That is node's
+    // behavior -- `await dir.close()` after a for-await rejects there with
+    // ERR_DIR_CLOSED -- and without it a loop leaves the handle open, so the
+    // close() that node rejects would quietly succeed here.
+    #finish() {
+      if (!this.#closed) this.#closed = true;
+      return { done: true, value: undefined };
+    }
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          const value = this.#next();
+          return value === null ? this.#finish() : { done: false, value };
+        },
+        return: async () => this.#finish(),
+      };
+    }
+    [Symbol.iterator]() {
+      return {
+        next: () => {
+          const value = this.#next();
+          return value === null ? this.#finish() : { done: false, value };
+        },
+        return: () => this.#finish(),
+      };
+    }
   }
 
   function wrapDirents(parent, entries, withFileTypes) {
@@ -8285,6 +8450,7 @@
         natives.fsWriteFile(String(path), encodeWrite(data, options), true),
       stat: async (path) => wrapStat(await natives.fsStat(String(path), false)),
       lstat: async (path) => wrapStat(await natives.fsStat(String(path), true)),
+      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(String(path)), options),
       readdir: async (path, options) => {
         const { withFileTypes } = readOptions(options);
         const entries = await natives.fsReaddir(String(path));
@@ -8298,13 +8464,19 @@
       },
       rmdir: async (path) => {
         // Node never deletes a FILE through rmdir (code-probing callers
-        // depend on the throw); kind-check first.
-        const raw = await natives.fsStat(String(path), true);
+        // depend on the throw); kind-check first. The probe is an internal
+        // detail -- node reports `rmdir` as the failing syscall, so relabel
+        // rather than leaking `lstat` (same as the sync twin).
+        let raw;
+        try {
+          raw = await natives.fsStat(String(path), true);
+        } catch (e) {
+          if (e && e.syscall === "lstat") e.syscall = "rmdir";
+          throw e;
+        }
         if (raw.kind !== "dir") {
-          throw makeNodeError(
-            isWin ? "ENOENT" : "ENOTDIR",
-            `${isWin ? "ENOENT" : "ENOTDIR"}: not a directory, rmdir '${path}'`,
-          );
+          // As in the sync twin: node's full system-error shape.
+          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", path);
         }
         await natives.fsRm(String(path), false, false);
       },
@@ -8321,27 +8493,7 @@
       truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
       opendir: async function (path) {
         var dirPath = String(path);
-        var entries = await natives.fsReaddir(dirPath);
-        var idx = 0;
-        var dir = {
-          path: dirPath,
-          read: async function () {
-            if (idx >= entries.length) return null;
-            var entry = entries[idx++];
-            return makeDirent(dirPath, entry);
-          },
-          close: async function () { idx = entries.length; },
-          [Symbol.asyncIterator]: function () {
-            return {
-              next: async function () {
-                var d = await dir.read();
-                if (d === null) return { done: true, value: undefined };
-                return { done: false, value: d };
-              }
-            };
-          }
-        };
-        return dir;
+        return new Dir(dirPath, await natives.fsReaddir(dirPath));
       },
       cp: async function cpRecursive(src, dest, options) {
         var srcStr = String(src);
@@ -8524,10 +8676,47 @@
       return watcher;
     }
 
+    // filename -> [{ listener, stop }] for every live watchFile poller, so
+    // unwatchFile can find and stop them. Without this registry watchFile
+    // handed back a watcher and there was no way to cancel it by path, which
+    // is the only way node's unwatchFile addresses it.
+    const watchFilePollers = new Map();
+
+    // `match` decides which entries go: a function matches by listener
+    // identity, undefined means "every poller on this path" (node's
+    // unwatchFile with no listener). Callers that own ONE entry pass a
+    // predicate instead, so they cannot take their siblings down with them.
+    function stopWatchEntries(filePath, match) {
+      const entries = watchFilePollers.get(filePath);
+      if (!entries) return;
+      const remaining = entries.filter((entry) => {
+        if (!match(entry)) return true;
+        entry.stop();
+        return false;
+      });
+      if (remaining.length) watchFilePollers.set(filePath, remaining);
+      else watchFilePollers.delete(filePath);
+    }
+
+    function fsUnwatchFile(filename, listener) {
+      stopWatchEntries(
+        String(filename),
+        // No listener means "stop watching this path entirely" (node).
+        listener === undefined ? () => true : (entry) => entry.listener === listener,
+      );
+    }
+
     function fsWatchFile(filename, options, listener) {
       if (typeof options === "function") {
         listener = options;
         options = {};
+      }
+      // node REQUIRES the listener and rejects anything else; accepting a
+      // missing one handed back a poller that could never report a change.
+      if (typeof listener !== "function") {
+        throw nodeTypeError(
+          `The "listener" argument must be of type function. Received ${describeArg(listener)}`,
+        );
       }
       var opts = options || {};
       var filePath = String(filename);
@@ -8547,8 +8736,16 @@
           }
         }, function () {});
       }, interval);
+      var stop = function () { clearInterval(poll); };
+      var self = { listener: listener, stop: stop };
+      var entries = watchFilePollers.get(filePath);
+      if (entries) entries.push(self);
+      else watchFilePollers.set(filePath, [self]);
       return {
-        close: function () { clearInterval(poll); },
+        // Drop THIS entry only, matched by identity. Routing through
+        // fsUnwatchFile(path, listener) stopped every sibling poller whenever
+        // the listener was not unique to this watcher.
+        close: function () { stopWatchEntries(filePath, function (entry) { return entry === self; }); },
         ref: function () { return this; },
         unref: function () { return this; },
       };
@@ -8734,6 +8931,12 @@
         COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
         UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
       },
+      // node re-exports the four access-mode constants at the TOP level of
+      // node:fs as well as under fs.constants, and code destructures them
+      // from the module (`const { R_OK } = require("fs")`) -- as named ESM
+      // imports those were link-time failures.
+      F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+      Dir,
 
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
@@ -8752,6 +8955,7 @@
       existsSync: (path) => natives.fsExistsSync(String(path)),
       statSync: (path) => wrapStat(natives.fsStatSync(String(path), false)),
       lstatSync: (path) => wrapStat(natives.fsStatSync(String(path), true)),
+      statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(String(path)), options),
       readdirSync: (path, options) => {
         const { withFileTypes } = readOptions(options);
         return wrapDirents(
@@ -8767,12 +8971,23 @@
         natives.fsRmSync(String(path), options.recursive === true, options.force === true);
       },
       rmdirSync: (path) => {
-        const raw = natives.fsStatSync(String(path), true);
+        // The kind probe is an implementation detail: node reports `rmdir` as
+        // the failing syscall, so an ENOENT from this internal lstat must not
+        // surface as `syscall: "lstat"`.
+        let raw;
+        try {
+          raw = natives.fsStatSync(String(path), true);
+        } catch (e) {
+          if (e && e.syscall === "lstat") e.syscall = "rmdir";
+          throw e;
+        }
         if (raw.kind !== "dir") {
-          const isWin = natives.platform === "win32";
-          throw makeNodeError(
-            isWin ? "ENOENT" : "ENOTDIR",
-            `${isWin ? "ENOENT" : "ENOTDIR"}: not a directory, rmdir '${path}'`,
+          // Full system-error shape, not just a code: node sets syscall/path/
+          // errno here as it does on any other rmdir failure.
+          throw makeSystemError(
+            natives.platform === "win32" ? "ENOENT" : "ENOTDIR",
+            "rmdir",
+            path,
           );
         }
         natives.fsRmSync(String(path), false, false);
@@ -8826,26 +9041,7 @@
       },
       opendirSync: function (path) {
         var dirPath = String(path);
-        var entries = natives.fsReaddirSync(dirPath);
-        var idx = 0;
-        return {
-          path: dirPath,
-          readSync: function () {
-            if (idx >= entries.length) return null;
-            return makeDirent(dirPath, entries[idx++]);
-          },
-          closeSync: function () { idx = entries.length; },
-          [Symbol.iterator]: function () {
-            return {
-              next: function () {
-                var d = this.outer.readSync();
-                if (d === null) return { done: true, value: undefined };
-                return { done: false, value: d };
-              },
-              outer: this
-            };
-          }
-        };
+        return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
       cpSync: function cpSyncRecursive(src, dest, options) {
         var srcStr = String(src);
@@ -8871,6 +9067,7 @@
       appendFile: callbackify1(promises.appendFile),
       stat: callbackify1(promises.stat),
       lstat: callbackify1(promises.lstat),
+      statfs: callbackify1(promises.statfs),
       readdir: callbackify1(promises.readdir),
       mkdir: callbackify1(promises.mkdir),
       rm: callbackify1(promises.rm),
@@ -9004,6 +9201,47 @@
       createWriteStream: (path, options) => new (rwStreams().WriteStream)(path, options),
       watch: fsWatch,
       watchFile: fsWatchFile,
+      unwatchFile: fsUnwatchFile,
+      // fd-based stat, callback form. fstatSync already existed; only the
+      // async spelling was missing, and it is the one promisify() reaches for.
+      fstat: function (fd, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        var token = fsReqStart();
+        // The ASYNC native, not fsFstatSync: reading metadata inline and then
+        // deferring only the callback still blocked the loop for the whole
+        // stat, which is the one thing the callback form exists to avoid.
+        var p;
+        try {
+          p = natives.fsFstat(fd);
+        } catch (e) {
+          // A bad fd throws out of the op before a promise exists; node
+          // reports it through the callback, never synchronously.
+          fsReqEnd(token);
+          queueMicrotask(function () { cb(e); });
+          return;
+        }
+        p.then(
+          function (raw) { fsReqEnd(token); queueMicrotask(function () { cb(null, wrapStat(raw)); }); },
+          function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
+        );
+      },
+      // node's internal time coercion, exported (unprefixed by convention but
+      // public enough that utimes wrappers in the wild call it).
+      _toUnixTimestamp: function _toUnixTimestamp(time, name) {
+        if (typeof time === "string" && Number(time) === Number(time)) return Number(time);
+        if (typeof time === "number" && Number.isFinite(time)) {
+          // A negative time means "now" in node, not a pre-epoch date.
+          return time < 0 ? Date.now() / 1000 : time;
+        }
+        if (time instanceof Date) return time.getTime() / 1000;
+        // node's wording verbatim, odd article and all ("or an Time in
+        // seconds"), because assert.throws({ message }) compares it exactly.
+        throw nodeTypeError(
+          `The "${name ?? "time"}" argument must be an instance of Date or an Time in seconds. ` +
+            `Received ${describeArg(time)}`,
+        );
+      },
     };
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
@@ -14722,8 +14960,26 @@
         this.error = this.warn;
       }
     }
-    const mod = Object.create(globalThis.console);
+    // node's `require("node:console")` IS globalThis.console (identity holds),
+    // with Console hung off it as an own property. This used to be
+    // Object.create(globalThis.console), which put every method on the
+    // PROTOTYPE -- so the module's own enumerable keys were just ["Console"]
+    // and the ESM facade (own keys -> named exports) could export nothing
+    // else. `import { log } from "node:console"` was a link-time SyntaxError.
+    const mod = globalThis.console;
     mod.Console = Console;
+    // node's console.context(name) hands back a console-shaped object; the
+    // name only tags output for an attached inspector, so with none the
+    // methods are the global console's own.
+    mod.context = (_name) => {
+      const ctx = {};
+      for (const key of Object.keys(mod)) {
+        if (typeof mod[key] === "function" && key !== "Console" && key !== "context") {
+          ctx[key] = mod[key];
+        }
+      }
+      return ctx;
+    };
     return mod;
   };
 
@@ -20880,7 +21136,17 @@
     class Worker extends EventEmitter {
       constructor(filename, opts = {}) {
         super();
-        if (typeof filename !== "string") throw new TypeError("Worker requires a filename");
+        // node accepts a string path OR a URL (the `new Worker(new URL("./w.js",
+        // import.meta.url))` idiom its own docs use); only a string was taken
+        // here, so the documented ESM spelling threw.
+        if (filename instanceof URL || (typeof filename === "string" && filename.startsWith("file:"))) {
+          filename = registry.get("url").fileURLToPath(filename);
+        } else if (typeof filename !== "string") {
+          throw nodeTypeError(
+            "The \"filename\" argument must be of type string or an instance of URL. " +
+              `Received ${describeArg(filename)}`,
+          );
+        }
         const resolved = pathMod.resolve(filename);
         const wd = opts.workerData !== undefined ? JSON.stringify(opts.workerData) : null;
 
@@ -21962,7 +22228,6 @@
         if (!cond) writeErr([`Assertion failed${args.length ? ": " + fmt(args) : ""}`]);
       },
       dir: (obj, options) => writeOut([util.inspect(obj, options ?? { depth: 2 })]),
-      table: (data) => writeOut([util.inspect(data)]),
       time: (label = "default") => timers.set(label, natives.nowMs()),
       timeEnd: (label = "default") => {
         const start = timers.get(label);
@@ -22019,6 +22284,22 @@
         }
       },
       clear: () => {},
+      // node's dirxml is a DISTINCT function that forwards to log (it is not
+      // `console.log` itself -- `console.dirxml === console.log` is false).
+      dirxml: (...args) => writeOut(args),
+      // Inspector-only APIs. With no inspector session attached node's own
+      // implementations do nothing and return undefined, which is the case
+      // every non-debugged run takes -- so a no-op here is node's observable
+      // behavior, not a stub standing in for missing work. Under
+      // --inspect these should reach the CDP Profiler domain; that is
+      // recorded in docs/node-divergences.md.
+      profile: () => {},
+      profileEnd: () => {},
+      timeStamp: () => {},
+      // Async-context task tagging for devtools. node returns an object whose
+      // run(fn) invokes fn and returns its result; without an inspector the
+      // tagging is all it adds, so run() IS the observable contract.
+      createTask: (_name) => ({ run: (fn, ...args) => fn(...args) }),
     };
 
     // Match Node's globalThis property attributes. Node defines web globals

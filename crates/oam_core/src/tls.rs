@@ -9,7 +9,7 @@
 //! acceptor before handing it to hyper. The request/response lifecycle
 //! is identical to plain HTTP (shared HttpState, same ops).
 
-use crate::{OpOutcome, node_error_code, node_error_message};
+use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::sync::Arc;
@@ -70,10 +70,15 @@ fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: TlsWriter) -> bo
 
 fn tls_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
     let code = node_error_code(&error);
-    OpOutcome::NodeFailed {
-        code: code.to_string(),
-        message: node_error_message(code, syscall, target, &error),
-    }
+    // syscall + errno, but no `path`: a host:port is not a filesystem path,
+    // and node does not put one on a net error.
+    OpOutcome::node_failed_at(
+        code,
+        node_error_message(code, syscall, target, &error),
+        syscall,
+        "",
+        node_errno(code, &error),
+    )
 }
 
 /// Build a rustls ClientConfig from optional PEM-encoded CA certs.

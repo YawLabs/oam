@@ -1,5 +1,5 @@
 {
-  "commit": "869aa9e",
+  "commit": "acec008",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -282,12 +282,261 @@
         {
           "case": "69-child-extra-fd-descriptor.mjs",
           "status": "pass"
+        },
+        {
+          "case": "70-fs-statfs-console-surface.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "71-fs-async-error-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "72-fs-async-sync-error-parity.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 69,
-      "total": 69
+      "pass": 72,
+      "total": 72
     },
     "surface": {
+      "exports": {
+        "absentModules": [],
+        "extra": [
+          {
+            "module": "constants",
+            "names": [
+              "EDQUOT",
+              "EMULTIHOP",
+              "ESTALE",
+              "O_DIRECTORY",
+              "O_NOFOLLOW",
+              "O_SYNC",
+              "RSA_PKCS1_SHA256_PADDING",
+              "SIGALRM",
+              "SIGBUS",
+              "SIGCHLD",
+              "SIGCONT",
+              "SIGINFO",
+              "SIGIO",
+              "SIGPIPE",
+              "SIGPROF",
+              "SIGSTOP",
+              "SIGSYS",
+              "SIGTRAP",
+              "SIGTSTP",
+              "SIGTTIN",
+              "SIGTTOU",
+              "SIGURG",
+              "SIGUSR1",
+              "SIGUSR2",
+              "SIGVTALRM",
+              "SIGXCPU",
+              "SIGXFSZ",
+              "S_IFBLK",
+              "S_IFSOCK",
+              "S_IRGRP",
+              "S_IROTH",
+              "S_IWGRP",
+              "S_IWOTH",
+              "S_IXGRP",
+              "S_IXOTH",
+              "S_IXUSR"
+            ]
+          },
+          {
+            "module": "crypto",
+            "names": [
+              "prng",
+              "pseudoRandomBytes",
+              "rng"
+            ]
+          },
+          {
+            "module": "fs/promises",
+            "names": [
+              "Dirent"
+            ]
+          },
+          {
+            "module": "global:AbortSignal.prototype",
+            "names": [
+              "_fire"
+            ]
+          },
+          {
+            "module": "global:Blob.prototype",
+            "names": [
+              "toString"
+            ]
+          },
+          {
+            "module": "global:Event.prototype",
+            "names": [
+              "AT_TARGET",
+              "BUBBLING_PHASE",
+              "CAPTURING_PHASE",
+              "NONE"
+            ]
+          },
+          {
+            "module": "global:FormData.prototype",
+            "names": [
+              "_normalizeValue"
+            ]
+          },
+          {
+            "module": "global:ReadableStream.prototype",
+            "names": [
+              "_cancelInternal",
+              "_maybePull"
+            ]
+          },
+          {
+            "module": "global:URL.prototype",
+            "names": [
+              "_ensure",
+              "_setSearchFromParams",
+              "_update"
+            ]
+          },
+          {
+            "module": "global:URLSearchParams.prototype",
+            "names": [
+              "_parse",
+              "_sync"
+            ]
+          },
+          {
+            "module": "global:WebSocket.prototype",
+            "names": [
+              "_fireClose",
+              "_recvLoop"
+            ]
+          },
+          {
+            "module": "global:WritableStream.prototype",
+            "names": [
+              "_controllerFor"
+            ]
+          },
+          {
+            "module": "global:crypto",
+            "names": [
+              "getRandomValues",
+              "randomUUID",
+              "subtle"
+            ]
+          },
+          {
+            "module": "global:performance",
+            "names": [
+              "clearMarks",
+              "clearMeasures",
+              "clearResourceTimings",
+              "getEntries",
+              "getEntriesByName",
+              "getEntriesByType",
+              "mark",
+              "measure",
+              "now",
+              "timeOrigin",
+              "toJSON"
+            ]
+          },
+          {
+            "module": "global:process",
+            "names": [
+              "connected"
+            ]
+          },
+          {
+            "module": "https",
+            "names": [
+              "ClientRequest",
+              "IncomingMessage",
+              "METHODS",
+              "OutgoingMessage",
+              "STATUS_CODES",
+              "ServerResponse",
+              "maxHeaderSize",
+              "validateHeaderName",
+              "validateHeaderValue"
+            ]
+          },
+          {
+            "module": "perf_hooks",
+            "names": [
+              "PerformanceNodeTiming",
+              "nodeTiming"
+            ]
+          },
+          {
+            "module": "process",
+            "names": [
+              "connected"
+            ]
+          },
+          {
+            "module": "repl",
+            "names": [
+              "builtinModules"
+            ]
+          },
+          {
+            "module": "test",
+            "names": [
+              "default"
+            ]
+          },
+          {
+            "module": "util",
+            "names": [
+              "_deepEqual",
+              "_partialDeepEqual"
+            ]
+          },
+          {
+            "module": "util/types",
+            "names": [
+              "isWeakRef"
+            ]
+          },
+          {
+            "module": "v8",
+            "names": [
+              "constants"
+            ]
+          },
+          {
+            "module": "vm",
+            "names": [
+              "SourceTextModule"
+            ]
+          },
+          {
+            "module": "zlib",
+            "names": [
+              "Z_DEFAULT_CHUNK",
+              "Z_FINISH",
+              "Z_FULL_FLUSH",
+              "Z_MAX_CHUNK",
+              "Z_MIN_CHUNK",
+              "Z_NO_FLUSH",
+              "Z_PARTIAL_FLUSH",
+              "Z_SYNC_FLUSH"
+            ]
+          }
+        ],
+        "knownMissing": 448,
+        "newMissing": [],
+        "noBaseline": false,
+        "nodeTotal": 1874,
+        "platform": "win32",
+        "skipped": false,
+        "staleAbsentModules": [],
+        "staleRatchet": []
+      },
       "globals": {
         "detail": {
           "AbortController": true,

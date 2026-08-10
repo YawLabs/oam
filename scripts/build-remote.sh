@@ -17,6 +17,8 @@
 #     gate         -- cargo fmt --check + clippy -D warnings   (ci.yml parity)
 #     test         -- cargo build --workspace + cargo test --workspace
 #                     (15-min ceiling where `timeout` exists) + debug smoke
+#     surface-gaps -- node scripts/gen-surface-gaps.mjs (records THIS host's
+#                     section of the builtin export-parity ratchet)
 #     conformance  -- cargo run -p xtask -- conformance  (node-differential
 #                     gate; needs node on PATH)
 #     node-suite   -- cargo run -p xtask -- node-suite   (ratchet + scorecard)
@@ -53,7 +55,7 @@
 # =============================================================================
 set -euo pipefail
 
-DISPATCH="${1:?dispatch: prep | gate | test | conformance | node-suite | build | bench | io-uring-ab | mac-release | mac-measure | mac-bench}"
+DISPATCH="${1:?dispatch: prep | gate | test | conformance | surface-gaps | node-suite | build | bench | io-uring-ab | mac-release | mac-measure | mac-bench}"
 
 # Non-interactive ssh does not source ~/.profile, and rustup installs into
 # ~/.cargo -- pull its env in explicitly so every dispatch finds cargo.
@@ -163,6 +165,22 @@ run_conformance() {
   cargo run -p xtask -- conformance
 }
 
+# Record THIS host's section of the builtin export-parity ratchet.
+#
+# The ratchet is per-platform because node's own builtin surface is (WSA*
+# errnos on Windows, getuid/setgid on POSIX), and the generator merges -- it
+# rewrites only platforms[process.platform] and leaves the other hosts'
+# sections alone. So the flow is: run this on each host, pull the file back,
+# and the accumulated result covers every platform the gate runs on.
+# Until a host has a section the gate MEASURES but does not GATE there.
+run_surface_gaps() {
+  command -v node >/dev/null 2>&1 || die "surface-gaps needs node on PATH (parity oracle)"
+  # The generator shells out to `cargo build` before probing; without this the
+  # failure surfaces as a bare "cargo: not found" from inside a Node script.
+  command -v cargo >/dev/null 2>&1 || die "surface-gaps needs cargo on PATH (run the prep dispatch first)"
+  node scripts/gen-surface-gaps.mjs
+}
+
 run_node_suite() {
   command -v node >/dev/null 2>&1 || die "node-suite needs node on PATH"
   cargo run -p xtask -- node-suite
@@ -228,6 +246,7 @@ case "$DISPATCH" in
   gate)         run_gate ;;
   test)         run_test ;;
   conformance)  run_conformance ;;
+  surface-gaps) run_surface_gaps ;;
   node-suite)   run_node_suite ;;
   build)        build_host_release ;;
   bench)        run_bench ;;
@@ -236,6 +255,12 @@ case "$DISPATCH" in
     remote_prep
     run_gate
     run_test
+    # Conformance on the mac leg too, not just the Linux one. run_gate is
+    # fmt+clippy only, so without this the differential corpus and the builtin
+    # export-parity gate never execute on darwin -- and darwin-only native
+    # code (fs statfs uses a DIFFERENT struct layout from linux) would ship
+    # compile-checked but never run.
+    run_conformance
     build_host_release
     if [ "${OAM_SKIP_MAC_X64:-0}" = "1" ]; then
       warn "OAM_SKIP_MAC_X64=1 -- mac-x64 asset dropped this run"

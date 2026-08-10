@@ -2336,8 +2336,13 @@ impl NodeFlags {
             // --allow-addons is node's name for loading native addons, which
             // is what oam's `ffi` permission gates.
             ffi: oam_engine::BoolOrList::Bool(self.allow_addons),
-            // A worker can spawn, so --allow-worker implies the same grant.
-            child: oam_engine::BoolOrList::Bool(self.allow_child_process || self.allow_worker),
+            child: oam_engine::BoolOrList::Bool(self.allow_child_process),
+            // Separate from `child` now that a worker INHERITS this permission
+            // set. --allow-worker used to imply --allow-child-process because
+            // an all-granted worker could spawn its way out; with inheritance
+            // that is no longer true, and conflating them over-granted every
+            // caller that only wanted a worker.
+            worker: oam_engine::BoolOrList::Bool(self.allow_worker),
         })
     }
 

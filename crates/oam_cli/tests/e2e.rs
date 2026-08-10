@@ -15255,3 +15255,420 @@ fn allow_net_list_is_scoped_to_the_listed_host() {
         "a host outside the list must be denied by the PERMISSION layer, not merely fail to connect: {stdout}"
     );
 }
+
+// ------------------------------------------------- fs.watchFile / unwatchFile
+//
+// Timing-dependent (the poller is an interval), so these live here rather than
+// in the node-differential corpus, where a byte-identical stdout comparison
+// would be flaky. They assert oam's own behavior.
+
+/// The watchFile poller must actually fire, and `watcher.close()` must stop
+/// ONLY that watcher.
+///
+/// Regression: close() routed through unwatchFile(path, listener), so two
+/// watchers sharing one listener function took each other down -- closing the
+/// first silently stopped the second.
+#[test]
+fn watch_file_fires_and_close_stops_only_that_watcher() {
+    let script = write_temp(
+        "watchfile_isolation.mjs",
+        "import fs from 'node:fs';\n\
+         import { join } from 'node:path';\n\
+         const dir = join(process.env.TEMP || process.env.TMPDIR || '/tmp', 'oam-watch-' + process.pid);\n\
+         fs.mkdirSync(dir, { recursive: true });\n\
+         const file = join(dir, 'watched.txt');\n\
+         fs.writeFileSync(file, 'a');\n\
+         let hits = 0;\n\
+         const shared = () => { hits++; };\n\
+         const first = fs.watchFile(file, { interval: 20 }, shared);\n\
+         const second = fs.watchFile(file, { interval: 20 }, shared);\n\
+         first.close();\n\
+         setTimeout(() => fs.writeFileSync(file, 'bbbbbb'), 60);\n\
+         setTimeout(() => {\n\
+           console.log('surviving_watcher_fired:', hits > 0);\n\
+           second.close();\n\
+           const after = hits;\n\
+           setTimeout(() => {\n\
+             fs.writeFileSync(file, 'cccccccccc');\n\
+             setTimeout(() => {\n\
+               console.log('closed_watcher_silent:', hits === after);\n\
+               fs.rmSync(dir, { recursive: true, force: true });\n\
+             }, 120);\n\
+           }, 40);\n\
+         }, 400);",
+    );
+    let out = oam(&["run", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "watchFile isolation script failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("surviving_watcher_fired: true"),
+        "closing one watcher must leave its sibling polling: {stdout}"
+    );
+    assert!(
+        stdout.contains("closed_watcher_silent: true"),
+        "a closed watcher must stop firing: {stdout}"
+    );
+}
+
+/// `unwatchFile(path)` with no listener stops every poller on that path, and
+/// unwatching a path that was never watched is a no-op rather than a throw.
+/// Also covers watchFile on a path that does not exist YET -- the case the API
+/// mostly exists for, and the branch that seeds a zero stat as `prev`.
+#[test]
+fn unwatch_file_stops_all_and_tolerates_unknown_paths() {
+    let script = write_temp(
+        "unwatchfile_all.mjs",
+        "import fs from 'node:fs';\n\
+         import { join } from 'node:path';\n\
+         const dir = join(process.env.TEMP || process.env.TMPDIR || '/tmp', 'oam-unwatch-' + process.pid);\n\
+         fs.mkdirSync(dir, { recursive: true });\n\
+         fs.unwatchFile(join(dir, 'never-watched.txt'));\n\
+         console.log('unwatch_unknown_ok:', true);\n\
+         const late = join(dir, 'appears-later.txt');\n\
+         let lateHits = 0;\n\
+         fs.watchFile(late, { interval: 20 }, () => { lateHits++; });\n\
+         setTimeout(() => fs.writeFileSync(late, 'now i exist'), 60);\n\
+         setTimeout(() => {\n\
+           console.log('late_create_seen:', lateHits > 0);\n\
+           let a = 0, b = 0;\n\
+           const file = join(dir, 'two.txt');\n\
+           fs.writeFileSync(file, 'a');\n\
+           fs.watchFile(file, { interval: 20 }, () => { a++; });\n\
+           fs.watchFile(file, { interval: 20 }, () => { b++; });\n\
+           fs.unwatchFile(file);\n\
+           setTimeout(() => fs.writeFileSync(file, 'changed!!'), 40);\n\
+           setTimeout(() => {\n\
+             console.log('unwatch_all_stopped_both:', a === 0 && b === 0);\n\
+             fs.unwatchFile(late);\n\
+             fs.rmSync(dir, { recursive: true, force: true });\n\
+           }, 160);\n\
+         }, 400);",
+    );
+    let out = oam(&["run", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "unwatchFile script failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for expected in [
+        "unwatch_unknown_ok: true",
+        "late_create_seen: true",
+        "unwatch_all_stopped_both: true",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}`: {stdout}");
+    }
+}
+
+/// `fs.Dir` carries a SYNC iterator, which node's Dir does not.
+///
+/// Deliberately kept: it predates the Dir class (the old opendirSync returned
+/// a literal with Symbol.iterator) and dropping it would break callers. It
+/// cannot be covered by the node-differential corpus for exactly that reason,
+/// so it is pinned here as an intentional oam extra.
+#[test]
+fn dir_sync_iterator_is_an_intentional_oam_extra() {
+    let script = write_temp(
+        "dir_sync_iter.mjs",
+        "import fs from 'node:fs';\n\
+         import { join } from 'node:path';\n\
+         const dir = join(process.env.TEMP || process.env.TMPDIR || '/tmp', 'oam-diriter-' + process.pid);\n\
+         fs.mkdirSync(dir, { recursive: true });\n\
+         fs.writeFileSync(join(dir, 'a.txt'), '1');\n\
+         fs.writeFileSync(join(dir, 'b.txt'), '2');\n\
+         const handle = fs.opendirSync(dir);\n\
+         const names = [];\n\
+         for (const entry of handle) names.push(entry.name);\n\
+         console.log('sync_iter_count:', names.length === 2);\n\
+         console.log('sync_iter_names:', names.sort().join(',') === 'a.txt,b.txt');\n\
+         let closedAfterIteration = false;\n\
+         try { handle.readSync(); } catch (e) { closedAfterIteration = e.code === 'ERR_DIR_CLOSED'; }\n\
+         console.log('sync_iter_closes:', closedAfterIteration);\n\
+         fs.rmSync(dir, { recursive: true, force: true });",
+    );
+    let out = oam(&["run", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "Dir sync-iterator script failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for expected in [
+        "sync_iter_count: true",
+        "sync_iter_names: true",
+        "sync_iter_closes: true",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}`: {stdout}");
+    }
+}
+
+/// `statfs` must respect the `fs.read` permission.
+///
+/// It is one of the few fs ops that DOES check, and most of its siblings do
+/// not -- so without a test, "fixing" the inconsistency by deleting the check
+/// would look like a cleanup and pass CI.
+#[test]
+fn statfs_respects_the_fs_read_permission() {
+    let script = write_temp(
+        "statfs_permission.mjs",
+        "import fs from 'node:fs';\n\
+         try {\n\
+           const s = fs.statfsSync('.');\n\
+           console.log('SYNC=' + (s.bsize > 0 ? 'ALLOWED' : 'ODD'));\n\
+         } catch (e) { console.log('SYNC=DENIED:' + e.code); }\n\
+         try {\n\
+           await fs.promises.statfs('.');\n\
+           console.log('ASYNC=ALLOWED');\n\
+         } catch (e) { console.log('ASYNC=DENIED:' + e.code); }",
+    );
+    let path = script.to_string_lossy().to_string();
+
+    // No --permission: unrestricted.
+    let out = oam(&["run", &path]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SYNC=ALLOWED") && stdout.contains("ASYNC=ALLOWED"),
+        "without --permission statfs must work: {stdout}"
+    );
+
+    // --permission with no grant: both forms denied.
+    let out = oam_with_env(&["--permission", &path], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("SYNC=DENIED:ERR_ACCESS_DENIED"),
+        "statfsSync must be denied under --permission: {stdout}"
+    );
+    assert!(
+        stdout.contains("ASYNC=DENIED:ERR_ACCESS_DENIED"),
+        "fs.promises.statfs must be denied under --permission: {stdout}"
+    );
+}
+
+/// Every PATH-based fs op must respect the `--permission` model, on BOTH the
+/// sync and the promise form.
+///
+/// Regression, and a serious one: only 9 of 47 fs ops checked. Under
+/// `--permission` with no grants, `fs.unlinkSync` DELETED the file,
+/// `fs.promises.rename`/`mkdir`/`chmod` all succeeded, and
+/// `fs.promises.stat`/`readdir` enumerated the filesystem -- the sandbox was
+/// advisory for everything except readFile/writeFile/open/stat-sync.
+///
+/// fd-based ops (read/write/close/fstat) are deliberately NOT listed: the fd
+/// can only have come from `open`, which is checked, so the capability is
+/// already gated. Node draws the line in the same place.
+#[test]
+fn every_path_fs_op_respects_the_permission_model() {
+    let script = write_temp(
+        "fs_permission_matrix.mjs",
+        "import fs from 'node:fs';\n\
+         import { join } from 'node:path';\n\
+         const dir = process.argv[2];\n\
+         const p = (f) => join(dir, f);\n\
+         const t = async (label, fn) => {\n\
+           try { await fn(); console.log(label + '=ALLOWED'); }\n\
+           catch (e) { console.log(label + '=' + e.code); }\n\
+         };\n\
+         await t('existsSync', () => { if (!fs.existsSync(p('secret.txt'))) throw new Error('missing'); });\n\
+         await t('statSync', () => fs.statSync(p('secret.txt')));\n\
+         await t('lstatSync', () => fs.lstatSync(p('secret.txt')));\n\
+         await t('readdirSync', () => fs.readdirSync(dir));\n\
+         await t('accessSync', () => fs.accessSync(p('secret.txt')));\n\
+         await t('realpathSync', () => fs.realpathSync(p('secret.txt')));\n\
+         await t('promisesStat', () => fs.promises.stat(p('secret.txt')));\n\
+         await t('promisesReaddir', () => fs.promises.readdir(dir));\n\
+         await t('promisesRealpath', () => fs.promises.realpath(p('secret.txt')));\n\
+         await t('mkdirSync', () => fs.mkdirSync(p('newdir')));\n\
+         await t('unlinkSync', () => fs.unlinkSync(p('victim.txt')));\n\
+         await t('renameSync', () => fs.renameSync(p('victim2.txt'), p('renamed.txt')));\n\
+         await t('copyFileSync', () => fs.copyFileSync(p('secret.txt'), p('copy.txt')));\n\
+         await t('chmodSync', () => fs.chmodSync(p('secret.txt'), 0o644));\n\
+         await t('truncateSync', () => fs.truncateSync(p('victim3.txt'), 0));\n\
+         await t('mkdtempSync', () => fs.mkdtempSync(join(dir, 'tmp-')));\n\
+         await t('promisesMkdir', () => fs.promises.mkdir(p('newdir2')));\n\
+         await t('promisesUnlink', () => fs.promises.unlink(p('victim4.txt')));\n\
+         await t('promisesRename', () => fs.promises.rename(p('victim5.txt'), p('renamed2.txt')));\n\
+         await t('promisesChmod', () => fs.promises.chmod(p('secret.txt'), 0o644));\n\
+         await t('promisesCopyFile', () => fs.promises.copyFile(p('secret.txt'), p('copy2.txt')));",
+    );
+    let script = script.to_string_lossy().to_string();
+
+    // A scratch dir this test owns, recreated per phase so the destructive
+    // ops have something to destroy.
+    let seed = || {
+        let dir = write_temp("fs_perm_target/.keep", "")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for f in [
+            "secret.txt",
+            "victim.txt",
+            "victim2.txt",
+            "victim3.txt",
+            "victim4.txt",
+            "victim5.txt",
+        ] {
+            std::fs::write(dir.join(f), "contents").unwrap();
+        }
+        dir.to_string_lossy().to_string()
+    };
+
+    const OPS: [&str; 21] = [
+        "existsSync",
+        "statSync",
+        "lstatSync",
+        "readdirSync",
+        "accessSync",
+        "realpathSync",
+        "promisesStat",
+        "promisesReaddir",
+        "promisesRealpath",
+        "mkdirSync",
+        "unlinkSync",
+        "renameSync",
+        "copyFileSync",
+        "chmodSync",
+        "truncateSync",
+        "mkdtempSync",
+        "promisesMkdir",
+        "promisesUnlink",
+        "promisesRename",
+        "promisesChmod",
+        "promisesCopyFile",
+    ];
+
+    // --permission, no grants: EVERY op denied.
+    let dir = seed();
+    // No `--` separator: it is NOT stripped from argv (node behaves the same),
+    // so passing one would put the literal "--" in argv[2] and every path
+    // would resolve under it. The denial phase cannot catch that -- it denies
+    // before resolving -- which is exactly why the granted phase below exists.
+    let out = oam(&["--permission", &script, &dir]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for op in OPS {
+        assert!(
+            stdout.contains(&format!("{op}=ERR_ACCESS_DENIED")),
+            "{op} must be denied under --permission with no grants:\n{stdout}"
+        );
+    }
+    // ...and the destructive ones must not have LANDED, denial message or not.
+    for f in ["victim.txt", "victim2.txt", "victim4.txt", "victim5.txt"] {
+        assert!(
+            std::path::Path::new(&dir).join(f).exists(),
+            "{f} was destroyed despite --permission:\n{stdout}"
+        );
+    }
+
+    // Fully granted: every op works again (the checks must not over-block).
+    let dir = seed();
+    let out = oam(&[
+        "--permission",
+        "--allow-fs-read=*",
+        "--allow-fs-write=*",
+        &script,
+        &dir,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for op in OPS {
+        assert!(
+            stdout.contains(&format!("{op}=ALLOWED")),
+            "{op} must succeed once fs read+write are granted:\n{stdout}"
+        );
+    }
+}
+
+/// The `worker` and `child` permissions must stay SEPARATE.
+///
+/// `--allow-worker` used to imply `--allow-child-process`, because a worker
+/// ran all-granted and could spawn its way out anyway. Workers now inherit the
+/// parent's permissions, so the implication is pure over-granting -- and if
+/// someone reinstates it, `--allow-worker` silently hands out process spawning
+/// again.
+#[test]
+fn allow_worker_does_not_imply_child_process() {
+    let script = write_temp(
+        "worker_implies_child.mjs",
+        "import { execSync } from 'node:child_process';\n\
+         try { execSync('echo spawned'); console.log('spawn=ALLOWED'); }\n\
+         catch (e) { console.log('spawn=' + e.code); }",
+    );
+    let out = oam(&["--permission", "--allow-worker", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("spawn=ERR_ACCESS_DENIED"),
+        "--allow-worker must NOT grant child_process:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `child_process` and child isolates must respect `--permission`.
+///
+/// Both were complete sandbox escapes: under `--permission` with no grants a
+/// script could `execSync` anything, and a `new Worker(...)` ran all-granted
+/// because the child isolate never inherited the parent's permission set. A
+/// file written through either route proves the whole model bypassed.
+#[test]
+fn child_process_and_workers_cannot_escape_the_sandbox() {
+    let dir = write_temp("escape_target/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let marker = dir.join("escaped.txt");
+    let _ = std::fs::remove_file(&marker);
+    let marker_js = marker.to_string_lossy().replace('\\', "/");
+
+    // 1. child_process
+    let script = write_temp(
+        "escape_via_child.mjs",
+        &format!(
+            "import {{ execSync }} from 'node:child_process';\n\
+             // execSync runs through a shell already (cmd.exe / sh), so no\n\
+             // platform prefix: with a Windows-only `cmd /c`, a REGRESSION on\n\
+             // POSIX would surface as ENOENT and read like something other\n\
+             // than the sandbox escape it actually is.\n\
+             try {{ execSync('echo x > \"{marker_js}\"'); console.log('spawn=RAN'); }}\n\
+             catch (e) {{ console.log('spawn=' + e.code); }}"
+        ),
+    );
+    let out = oam(&["--permission", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("spawn=ERR_ACCESS_DENIED"),
+        "child_process must be denied under --permission:\n{stdout}"
+    );
+    assert!(
+        !marker.exists(),
+        "a child process wrote through the sandbox:\n{stdout}"
+    );
+
+    // 2. worker_threads -- the worker must INHERIT the denial, not run
+    //    all-granted. Granting --allow-worker isolates this to the
+    //    inheritance question rather than the spawn gate.
+    let body = write_temp(
+        "escape_worker_body.mjs",
+        &format!(
+            "import fs from 'node:fs';\n\
+             try {{ fs.writeFileSync('{marker_js}', 'x'); }} catch {{}}"
+        ),
+    );
+    let script = write_temp(
+        "escape_via_worker.mjs",
+        &format!(
+            "import {{ Worker }} from 'node:worker_threads';\n\
+             const w = new Worker('{}');\n\
+             w.on('exit', () => console.log('worker=DONE'));",
+            body.to_string_lossy().replace('\\', "/")
+        ),
+    );
+    let out = oam(&["--permission", "--allow-worker", script.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !marker.exists(),
+        "a worker wrote through the sandbox -- it did not inherit the parent's \
+         permissions:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

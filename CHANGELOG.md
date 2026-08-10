@@ -11,6 +11,89 @@ omitted. oam is pre-1.0: breaking changes can land in a minor release.
 
 ## [Unreleased]
 
+A builtin **export-surface** release. `import { statfsSync } from "node:fs"` used to kill
+a program on oam before it ran a line — a builtin's ESM named exports are its module
+object's own enumerable keys, so a name oam had not implemented failed at *link* time,
+taking down bundled CLIs that never called the function. Measuring the whole surface
+found 384 such names across 41 builtins; the ones below are closed and the rest are now
+tracked by a gate instead of waiting to be discovered by a crash.
+
+### Added
+
+- `fs.statfs`, `fs.statfsSync` and `fsPromises.statfs`, backed by a real syscall
+  (`GetDiskFreeSpaceW` on Windows, `statfs(2)` on Linux/macOS, `statvfs` elsewhere), with
+  the `StatFs` shape, the `bigint: true` option, and Node's `ENOENT`/`statfs` error shape.
+  Values cross the native boundary as decimal strings so bigint mode is exact rather than
+  rounded through a double.
+- `node:console` now exports its full surface. It was built with
+  `Object.create(globalThis.console)`, which left every method on the prototype, so the
+  module's only named export was `Console` and `import { log } from "node:console"` was a
+  hard failure. The module is now the global console itself, as it is in Node, and gained
+  `dirxml`, `profile`, `profileEnd`, `timeStamp`, `createTask` and `context`.
+- `fs.Dir` is a real exported class shared by `opendir` and `opendirSync`; each form
+  previously returned an ad-hoc object with only half the method set. Closed handles now
+  throw `ERR_DIR_CLOSED`, and iterating (or `break`ing out of) a `for await` closes the
+  handle, both matching Node.
+- `fs.fstat` (the async callback form), `fs.unwatchFile`, `fs._toUnixTimestamp`, and the
+  top-level `F_OK`/`R_OK`/`W_OK`/`X_OK` re-exports.
+
+### Security
+
+- **`--permission` is enforced across the whole `fs` surface.** Only 9 of 47 fs ops
+  checked it: under `--permission` with no grants, `fs.unlinkSync` deleted the file,
+  `fs.promises.rename`/`mkdir`/`chmod` succeeded, and `fs.promises.stat`/`readdir`
+  enumerated the filesystem. Every path-based op now checks, with read/write classified
+  to match Node's own model (`copyFile` reads the source and writes the destination;
+  `rename` writes both; `link` reads the existing name and writes the new one).
+  fd-based ops (`read`/`write`/`close`/`fstat`) are intentionally unchecked — the
+  descriptor can only have come from `open`, which is checked, so the capability is
+  already gated. **One deliberate divergence:** oam also gates `fs.realpath`, which Node
+  permits without a read grant; a sandbox should not leak path existence.
+- **`child_process` and `worker_threads` no longer escape `--permission`.** Neither
+  consulted the permission model: `execSync` ran anything, and a `Worker` (or an
+  `oam.fork()` isolate) was constructed with all-granted permissions regardless of the
+  parent's flags, so either was a one-line bypass of every fs and net restriction. Spawn
+  now checks `child` (including the extra-fd spawn path), starting an isolate checks the
+  new `worker` permission, and a child isolate INHERITS the parent's set. Because of that
+  inheritance, `--allow-worker` no longer implies `--allow-child-process`; node keeps them
+  separate too.
+- A source-level test now fails the build if any op that touches the filesystem, spawns a
+  process, or starts an isolate ships without a permission check or an explicit,
+  reasoned exemption. It caught a second spawn entry point while being written.
+
+### Fixed
+
+- Async `fs` rejections carry node's full system-error shape. `OpOutcome::NodeFailed`
+  held only `{code, message}`, so every promise-form failure had `syscall`, `errno` and
+  `path` undefined while its sync twin set all four — packages that branch on
+  `err.syscall === "open"` or read `err.path` (graceful-fs, chokidar, rimraf) saw
+  nothing there.
+- `fs.truncate`/`truncateSync` reported `syscall: "truncate"`; node reports the syscall
+  that actually failed, so a missing path is `open` and a failed resize is `ftruncate`.
+- `watcher.close()` on a `fs.watchFile` handle stopped *every* watcher on that path when
+  the listener was shared or absent; it now removes only its own entry. `fs.watchFile`
+  also rejects a missing listener with `ERR_INVALID_ARG_TYPE` instead of returning a
+  poller that could never fire.
+- `fs.fstat` performed its stat synchronously and merely deferred the callback, blocking
+  the loop for the whole call; it now runs on a blocking thread off an owned handle.
+- `fs.statfsSync("")` reported `EINVAL` where Node reports `ENOENT`.
+- Argument-validation failures out of `fs` raise a real `TypeError`, not a plain `Error`
+  carrying an `ERR_*` code.
+- A missing builtin export now explains itself: the error names the module, says the gap
+  is oam's, and points at the tracked list, instead of only repeating V8's bare
+  "does not provide an export named X".
+
+### Changed
+
+- `cargo run -p xtask -- conformance` gains a **builtin export-parity gate**. It runs the
+  surface probe under both oam and the installed Node and fails on any missing export not
+  recorded in `conformance/surface-gaps.json`, on a recorded name oam has since
+  implemented (so the list can only shrink), and on an unrecorded absent module. The
+  ratchet is keyed by platform because Node's own surface is; a host with no section is
+  measured and reported but not gated. See `docs/node-divergences.md`.
+- The macOS release leg now runs conformance. It previously ran fmt/clippy and tests
+  only, so the differential corpus never executed on darwin.
+
 ## [0.9.0] - 2026-08-08
 
 A `child_process` release. The module had no differential coverage against Node

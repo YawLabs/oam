@@ -203,6 +203,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsWriteFileSync", op_fs_write_file_sync),
         ("fsExistsSync", op_fs_exists_sync),
         ("fsStatSync", op_fs_stat_sync),
+        ("fsStatfsSync", op_fs_statfs_sync),
         ("fsReaddirSync", op_fs_readdir_sync),
         ("fsMkdirSync", op_fs_mkdir_sync),
         ("fsRmSync", op_fs_rm_sync),
@@ -215,6 +216,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadFile", op_fs_read_file),
         ("fsWriteFile", op_fs_write_file),
         ("fsStat", op_fs_stat),
+        ("fsFstat", op_fs_fstat),
+        ("fsStatfs", op_fs_statfs),
         ("fsReaddir", op_fs_readdir),
         ("fsMkdir", op_fs_mkdir),
         ("fsRm", op_fs_rm),
@@ -2657,6 +2660,9 @@ fn op_fs_exists_sync(
         rv.set_bool(false);
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     rv.set_bool(std::path::Path::new(&path).exists());
 }
 
@@ -2676,6 +2682,24 @@ fn op_fs_stat_sync(
     match oam_core::ops::stat_path_json(&path, lstat) {
         Ok(json) => return_json(scope, &mut rv, &json),
         Err(e) => throw_node_error(scope, if lstat { "lstat" } else { "stat" }, &path, &e),
+    }
+}
+
+fn op_fs_statfs_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "statfsSync requires a path");
+        return;
+    };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
+    match oam_core::ops::statfs_json(&path) {
+        Ok(json) => return_json(scope, &mut rv, &json),
+        Err(e) => throw_node_error(scope, "statfs", &path, &e),
     }
 }
 
@@ -2706,6 +2730,9 @@ fn op_fs_mkdir_sync(
         throw_type_error(scope, "mkdirSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let recursive = args.get(1).is_true();
     let result = if recursive {
         std::fs::create_dir_all(&path)
@@ -2726,6 +2753,9 @@ fn op_fs_rm_sync(
         throw_type_error(scope, "rmSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let recursive = args.get(1).is_true();
     let force = args.get(2).is_true();
     match oam_core::remove_path(&path, recursive) {
@@ -2744,6 +2774,12 @@ fn op_fs_rename_sync(
         throw_type_error(scope, "renameSync requires from and to paths");
         return;
     };
+    if !check_write_perm(scope, &from) {
+        return;
+    }
+    if !check_write_perm(scope, &to) {
+        return;
+    }
     if let Err(e) = std::fs::rename(&from, &to) {
         throw_node_error(scope, "rename", &from, &e);
     }
@@ -2758,6 +2794,12 @@ fn op_fs_copy_file_sync(
         throw_type_error(scope, "copyFileSync requires from and to paths");
         return;
     };
+    if !check_read_perm(scope, &from) {
+        return;
+    }
+    if !check_write_perm(scope, &to) {
+        return;
+    }
     if let Err(e) = std::fs::copy(&from, &to) {
         throw_node_error(scope, "copyfile", &from, &e);
     }
@@ -2772,6 +2814,9 @@ fn op_fs_unlink_sync(
         throw_type_error(scope, "unlinkSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     if let Err(e) = std::fs::remove_file(&path) {
         throw_node_error(scope, "unlink", &path, &e);
     }
@@ -2786,10 +2831,13 @@ fn op_fs_access_sync(
         throw_type_error(scope, "accessSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     let mode = args.get(1).int32_value(scope).unwrap_or(0);
     match oam_core::check_access(&path, mode) {
         Ok(()) => {}
-        Err((code, message)) => {
+        Err((code, message, errno)) => {
             // EPERM/EACCES with the path attached, same shape as
             // throw_node_error but with the access-specific code.
             let message_v8 = v8::String::new(scope, &message)
@@ -2803,6 +2851,14 @@ fn op_fs_access_sync(
                     if let Some(value) = v8::String::new(scope, value) {
                         obj.set(scope, key.into(), value.into());
                     }
+                }
+                // errno completes node's system-error shape; it was the one
+                // field this hand-rolled error left off.
+                if let Some(errno) = errno
+                    && let Some(key) = v8::String::new(scope, "errno")
+                {
+                    let value = v8::Integer::new(scope, errno);
+                    obj.set(scope, key.into(), value.into());
                 }
             }
             scope.throw_exception(exception);
@@ -2819,6 +2875,9 @@ fn op_fs_realpath_sync(
         throw_type_error(scope, "realpathSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     match std::fs::canonicalize(PathBuf::from(&path)) {
         Ok(real) => {
             let text = oam_core::strip_unc_prefix(&real);
@@ -2881,8 +2940,58 @@ fn op_fs_stat(
         throw_type_error(scope, "stat requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     let lstat = args.get(1).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_stat(path, lstat));
+}
+
+fn op_fs_fstat(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    // Same adoption rule as the sync twin: a low fd we never allocated is the
+    // parent's, passed in at spawn.
+    oam_core::adopt_inherited_fd(&files, fd);
+    // Clone the handle under the lock and drop the lock immediately -- the
+    // metadata read then happens on a blocking thread with nothing held, so a
+    // slow device cannot stall every other fd op.
+    let cloned = {
+        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&fd) {
+            None => {
+                throw_ebadf(scope, "fstat");
+                return;
+            }
+            Some(file) => match file.try_clone() {
+                Ok(cloned) => cloned,
+                Err(e) => {
+                    throw_node_error(scope, "fstat", "", &e);
+                    return;
+                }
+            },
+        }
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(cloned));
+}
+
+fn op_fs_statfs(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "statfs requires a path");
+        return;
+    };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_statfs(path));
 }
 
 fn op_fs_readdir(
@@ -2894,6 +3003,9 @@ fn op_fs_readdir(
         throw_type_error(scope, "readdir requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readdir(path));
 }
 
@@ -2906,6 +3018,9 @@ fn op_fs_mkdir(
         throw_type_error(scope, "mkdir requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let recursive = args.get(1).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdir(path, recursive));
 }
@@ -2919,6 +3034,9 @@ fn op_fs_rm(
         throw_type_error(scope, "rm requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let recursive = args.get(1).is_true();
     let force = args.get(2).is_true();
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_rm(path, recursive, force));
@@ -2933,6 +3051,12 @@ fn op_fs_rename(
         throw_type_error(scope, "rename requires from and to paths");
         return;
     };
+    if !check_write_perm(scope, &from) {
+        return;
+    }
+    if !check_write_perm(scope, &to) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_rename(from, to));
 }
 
@@ -2945,6 +3069,12 @@ fn op_fs_copy_file(
         throw_type_error(scope, "copyFile requires from and to paths");
         return;
     };
+    if !check_read_perm(scope, &from) {
+        return;
+    }
+    if !check_write_perm(scope, &to) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_copy_file(from, to));
 }
 
@@ -2957,6 +3087,9 @@ fn op_fs_unlink(
         throw_type_error(scope, "unlink requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_unlink(path));
 }
 
@@ -2969,6 +3102,9 @@ fn op_fs_access(
         throw_type_error(scope, "access requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     let mode = args.get(1).int32_value(scope).unwrap_or(0);
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_access(path, mode));
 }
@@ -2982,6 +3118,9 @@ fn op_fs_realpath(
         throw_type_error(scope, "realpath requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_realpath(path));
 }
 
@@ -2991,7 +3130,14 @@ fn op_fs_mkdtemp(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(prefix));
+    // As in the sync twin: check the resolved target, not the prefix -- and
+    // hand that same resolved path to the op so the checked path IS the
+    // created path (resolving twice would mint two different timestamps).
+    let dir = oam_core::ops::mkdtemp_target(&prefix);
+    if !check_write_perm(scope, &dir.to_string_lossy()) {
+        return;
+    }
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(dir, prefix));
 }
 
 fn op_fs_symlink(
@@ -3007,6 +3153,9 @@ fn op_fs_symlink(
         throw_type_error(scope, "symlink requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_symlink(target, path));
 }
 
@@ -3019,6 +3168,9 @@ fn op_fs_readlink(
         throw_type_error(scope, "readlink requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_readlink(path));
 }
 
@@ -3035,6 +3187,12 @@ fn op_fs_link(
         throw_type_error(scope, "link requires a new path");
         return;
     };
+    if !check_read_perm(scope, &existing) {
+        return;
+    }
+    if !check_write_perm(scope, &new_path) {
+        return;
+    }
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_link(existing, new_path));
 }
 
@@ -3047,6 +3205,9 @@ fn op_fs_chmod(
         throw_type_error(scope, "chmod requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_chmod(path, mode));
 }
@@ -3060,6 +3221,9 @@ fn op_fs_truncate(
         throw_type_error(scope, "truncate requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_truncate(path, len));
 }
@@ -3077,6 +3241,9 @@ fn op_fs_symlink_sync(
         throw_type_error(scope, "symlinkSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     #[cfg(windows)]
     let result = {
         let is_dir = std::fs::metadata(&target)
@@ -3104,6 +3271,9 @@ fn op_fs_readlink_sync(
         throw_type_error(scope, "readlinkSync requires a path");
         return;
     };
+    if !check_read_perm(scope, &path) {
+        return;
+    }
     match std::fs::read_link(&path) {
         Ok(target) => {
             let text = oam_core::strip_unc_prefix(&target);
@@ -3128,6 +3298,12 @@ fn op_fs_link_sync(
         throw_type_error(scope, "linkSync requires a new path");
         return;
     };
+    if !check_read_perm(scope, &existing) {
+        return;
+    }
+    if !check_write_perm(scope, &new_path) {
+        return;
+    }
     if let Err(e) = std::fs::hard_link(&existing, &new_path) {
         throw_node_error(scope, "link", &new_path, &e);
     }
@@ -3142,6 +3318,9 @@ fn op_fs_chmod_sync(
         throw_type_error(scope, "chmodSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     #[cfg(unix)]
     {
@@ -3175,14 +3354,19 @@ fn op_fs_truncate_sync(
         throw_type_error(scope, "truncateSync requires a path");
         return;
     };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    // Which syscall actually failed, as node reports it: open + ftruncate,
+    // so a missing path is `open` (see the async twin in oam_core).
     match std::fs::OpenOptions::new().write(true).open(&path) {
         Ok(f) => {
             if let Err(e) = f.set_len(len) {
-                throw_node_error(scope, "truncate", &path, &e);
+                throw_node_error(scope, "ftruncate", &path, &e);
             }
         }
-        Err(e) => throw_node_error(scope, "truncate", &path, &e),
+        Err(e) => throw_node_error(scope, "open", &path, &e),
     }
 }
 
@@ -3192,14 +3376,14 @@ fn op_fs_mkdtemp_sync(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    let dir = std::env::temp_dir().join(format!(
-        "{}{}",
-        prefix,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    // Gate the directory that is actually created, not the prefix: with a
+    // relative prefix the two are different paths (the prefix resolves under
+    // the system temp dir), so checking the prefix denied writes inside a
+    // correctly-granted temp dir.
+    let dir = oam_core::ops::mkdtemp_target(&prefix);
+    if !check_write_perm(scope, &dir.to_string_lossy()) {
+        return;
+    }
     match std::fs::create_dir(&dir) {
         Ok(()) => {
             let text = oam_core::strip_unc_prefix(&dir);
@@ -3598,6 +3782,14 @@ pub(crate) fn throw_permission_denied(
     scope.throw_exception(exception);
 }
 
+/// The isolate's permission set, for code that needs to HAND IT to a child
+/// rather than check it (worker / fork spawn).
+pub(crate) fn permissions_of(
+    scope: &v8::PinScope<'_, '_>,
+) -> std::sync::Arc<crate::permissions::Permissions> {
+    get_permissions(scope)
+}
+
 fn get_permissions(
     scope: &v8::PinScope<'_, '_>,
 ) -> std::sync::Arc<crate::permissions::Permissions> {
@@ -3624,6 +3816,26 @@ fn check_read_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
 /// Check `write` permission for `path`.
 fn check_write_perm(scope: &mut v8::PinScope<'_, '_>, path: &str) -> bool {
     if let Err(denial) = get_permissions(scope).check_write(path) {
+        throw_permission_denied(scope, &denial);
+        false
+    } else {
+        true
+    }
+}
+
+/// Check `worker` permission (starting a worker / forked isolate).
+pub(crate) fn check_worker_perm(scope: &mut v8::PinScope<'_, '_>, resource: &str) -> bool {
+    if let Err(denial) = get_permissions(scope).check_worker(resource) {
+        throw_permission_denied(scope, &denial);
+        false
+    } else {
+        true
+    }
+}
+
+/// Check `child` permission (spawning or replacing the process).
+fn check_child_perm(scope: &mut v8::PinScope<'_, '_>, resource: &str) -> bool {
+    if let Err(denial) = get_permissions(scope).check_child(resource) {
         throw_permission_denied(scope, &denial);
         false
     } else {
@@ -3710,6 +3922,11 @@ fn op_worker_new(
         throw_type_error(scope, &format!("worker script not found: {script_path}"));
         return;
     }
+    // The worker INHERITS this isolate's permissions (see spawn_worker), so
+    // this gates starting one at all rather than what it may then do.
+    if !check_worker_perm(scope, &script_path) {
+        return;
+    }
 
     let core = core_runtime!(scope);
     let workers = core.workers();
@@ -3727,6 +3944,7 @@ fn op_worker_new(
         parent_to_worker_rx,
         worker_to_parent_tx,
         worker_options,
+        get_permissions(scope),
     );
 
     {
@@ -3883,6 +4101,12 @@ fn op_spawn_sync(
         throw_type_error(scope, "spawnSync: command required");
         return;
     };
+    // Spawning hands control to a binary this permission set does not
+    // describe, so it is gated in its own right -- without this, --permission
+    // was a one-line escape (spawn a shell, do anything).
+    if !check_child_perm(scope, &command) {
+        return;
+    }
 
     let args_val = args.get(1);
     let mut child_args: Vec<String> = Vec::new();
@@ -4052,6 +4276,12 @@ fn op_spawn_async(
         throw_type_error(scope, "spawn: command required");
         return;
     };
+    // Spawning hands control to a binary this permission set does not
+    // describe, so it is gated in its own right -- without this, --permission
+    // was a one-line escape (spawn a shell, do anything).
+    if !check_child_perm(scope, &command) {
+        return;
+    }
 
     let args_val = args.get(1);
     let mut child_args: Vec<String> = Vec::new();
@@ -4324,6 +4554,11 @@ fn op_spawn_extra(
         throw_type_error(scope, "spawnExtra: command required");
         return;
     };
+    // A spawn entry point in its own right (extra-fd stdio), not a helper on
+    // an already-permitted child -- so it carries the same gate.
+    if !check_child_perm(scope, &command) {
+        return;
+    }
     let mut child_args: Vec<String> = Vec::new();
     if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(1)) {
         for i in 0..arr.length() {
@@ -5550,4 +5785,146 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
         return Err(format!("kill({pid}, {signal}): {errno}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_audit {
+    // ---------------------------------------------------- permission-gate audit
+    //
+    // A SOURCE-LEVEL gate on the permission model. Every op that reaches the
+    // filesystem, spawns a process, or starts a child isolate must either perform
+    // a permission check or be listed below with the reason it does not need one.
+    //
+    // Why this exists rather than trusting review: the checks were added by hand
+    // and drifted badly -- 38 of 47 fs ops had none, and `child_process` had none
+    // at all, so `--permission` could be escaped with a single `execSync`. Nothing
+    // failed when an op was added without a check, which is precisely the shape of
+    // bug that ships. This test fails the moment a new op appears without one.
+    #[test]
+    fn every_sensitive_op_checks_permissions_or_is_explicitly_exempt() {
+        // fd-based ops are exempt BY CAPABILITY: the descriptor can only have come
+        // from `open`, which is checked, so re-checking a path here would be
+        // checking a path the caller no longer names. Node draws the line in the
+        // same place. Anything added to this list needs a reason of that quality.
+        const EXEMPT: &[(&str, &str)] = &[
+            ("op_fs_read_chunk", "fd from a checked open()"),
+            ("op_fs_write_chunk", "fd from a checked open()"),
+            ("op_fs_close", "fd from a checked open()"),
+            ("op_fs_read_sync", "fd from a checked open()"),
+            ("op_fs_write_sync", "fd from a checked open()"),
+            ("op_fs_close_sync", "fd from a checked open()"),
+            ("op_fs_fstat", "fd from a checked open()"),
+            ("op_fs_fstat_sync", "fd from a checked open()"),
+            (
+                "op_spawn_kill",
+                "signals a child already permitted at spawn",
+            ),
+            (
+                "op_spawn_read_stdout",
+                "reads a pipe of an already-spawned child",
+            ),
+            (
+                "op_spawn_read_stderr",
+                "reads a pipe of an already-spawned child",
+            ),
+            ("op_spawn_write", "writes stdin of an already-spawned child"),
+            (
+                "op_spawn_close_stdin",
+                "closes a pipe of an already-spawned child",
+            ),
+            ("op_spawn_wait", "awaits a child already permitted at spawn"),
+            (
+                "op_spawn_extra_read",
+                "reads a pipe of an already-spawned child",
+            ),
+            (
+                "op_spawn_extra_write",
+                "writes a pipe of an already-spawned child",
+            ),
+            (
+                "op_spawn_extra_close_fd",
+                "closes a pipe of an already-spawned child",
+            ),
+            (
+                "op_spawn_extra_wait",
+                "awaits a child already permitted at spawn",
+            ),
+            (
+                "op_spawn_extra_kill",
+                "signals a child already permitted at spawn",
+            ),
+        ];
+
+        let source = include_str!("node_ops.rs");
+        let mut offenders = Vec::new();
+
+        // Split on top-level `fn ` boundaries; each chunk is one op body.
+        let mut current: Option<&str> = None;
+        let mut body = String::new();
+        let check = |name: Option<&str>, body: &str, offenders: &mut Vec<String>| {
+            let Some(name) = name else { return };
+            let sensitive = name.starts_with("op_fs_")
+                || name.starts_with("op_spawn_")
+                || name.starts_with("op_process_exec");
+            if !sensitive || EXEMPT.iter().any(|(n, _)| *n == name) {
+                return;
+            }
+            // Only ops that actually PERFORM the operation need a gate. The
+            // `#[cfg(not(windows))]` twins are pure `throw_type_error("... only
+            // implemented on Windows")` stubs -- they touch nothing, so demanding
+            // a check of them would just be noise. Keyed on whether the body
+            // reaches an operation surface at all.
+            // The ONLY ops excused here are the `#[cfg(not(windows))]` twins:
+            // pure `throw_type_error("... only implemented on Windows")`
+            // stubs that touch nothing.
+            //
+            // Deliberately a denylist of that one shape rather than an
+            // allowlist of operation surfaces (`std::fs`, `oam_core::`, ...).
+            // The allowlist version silently skipped `op_fs_exists_sync`,
+            // which reaches the filesystem through `std::path::Path::exists`,
+            // and `op_fs_open_sync` -- both were checked at the time, so the
+            // gate looked green while covering neither. An allowlist of API
+            // surfaces can never be complete; the stub shape is a closed set.
+            let is_unsupported_stub = body.contains("throw_type_error")
+                && (body.contains("only implemented on") || body.contains("Windows only"));
+            if is_unsupported_stub {
+                return;
+            }
+            let checked = body.contains("check_read_perm")
+            || body.contains("check_write_perm")
+            || body.contains("check_child_perm")
+            || body.contains("check_worker_perm")
+            // Direct form: `get_permissions(scope).check_child(..)`.
+            || body.contains(".check_read(")
+            || body.contains(".check_write(")
+            || body.contains(".check_child(")
+            || body.contains(".check_worker(");
+            if !checked {
+                offenders.push(name.to_string());
+            }
+        };
+
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("fn ")
+                && let Some(name) = rest.split('(').next()
+            {
+                check(current, &body, &mut offenders);
+                current = Some(name);
+                body.clear();
+                continue;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        check(current, &body, &mut offenders);
+
+        assert!(
+            offenders.is_empty(),
+            "these ops touch the filesystem or spawn without a permission check:\n  {}\n\n\
+         Add the appropriate check_*_perm call, or -- if the op is safe by \
+         capability (it only handles an fd or child already gated at creation) \
+         -- add it to EXEMPT in this test with the reason.",
+            offenders.join("\n  ")
+        );
+    }
 }

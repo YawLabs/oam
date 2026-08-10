@@ -10,7 +10,8 @@
 #   3. cargo build --workspace
 #   4. cargo test --workspace          (15-min ceiling where `timeout` exists)
 #   5. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
-#   6. cargo run -p xtask -- conformance    (node-differential gate; GATING)
+#   6. cargo run -p xtask -- conformance    (node-differential gate + builtin
+#                                            export-parity ratchet; GATING)
 #   7. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
 #                                            advisory, only a ratchet violation
 #                                            fails -- node-compat.yml parity)

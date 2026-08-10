@@ -79,6 +79,7 @@ pub(crate) fn spawn_worker(
     parent_rx: mpsc::Receiver<Vec<u8>>,
     worker_tx: mpsc::Sender<WorkerEvent>,
     options: WorkerOptions,
+    permissions: std::sync::Arc<crate::permissions::Permissions>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("oam-worker-{worker_id}"))
@@ -90,6 +91,7 @@ pub(crate) fn spawn_worker(
                 parent_rx,
                 worker_tx.clone(),
                 options,
+                permissions,
             );
             let _ = worker_tx.send(WorkerEvent::Exit(exit_code));
         })
@@ -103,6 +105,7 @@ fn run_worker(
     from_parent: mpsc::Receiver<Vec<u8>>,
     to_parent: mpsc::Sender<WorkerEvent>,
     options: WorkerOptions,
+    permissions: std::sync::Arc<crate::permissions::Permissions>,
 ) -> i32 {
     let WorkerOptions {
         pipe_stdout,
@@ -113,7 +116,10 @@ fn run_worker(
     // path -- a worker that installed a pool would spawn prewarm threads that
     // each spawn more pools). A nested oam.fork() inside a worker cold-spawns
     // via op_fork_spawn's None branch.
-    let mut rt = super::JsRuntime::new_worker_runtime();
+    // INHERIT the spawning isolate's permissions: a worker used to run
+    // all-granted, which made `new Worker(...)` a one-line escape from
+    // --permission.
+    let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
     rt.set_process_argv(vec![
         "oam".to_string(),
         script_path.to_string_lossy().into_owned(),

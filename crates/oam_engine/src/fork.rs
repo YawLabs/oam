@@ -45,6 +45,9 @@ struct ForkSlot {
 pub struct ForkPool {
     pool: Mutex<Vec<ForkSlot>>,
     capacity: usize,
+    /// The spawning runtime's permissions, handed to every pre-warmed isolate
+    /// so a forked script cannot outrank its parent.
+    permissions: Arc<crate::permissions::Permissions>,
     /// Flipped true the first time `ensure_warm` spawns the prewarm threads,
     /// so warming happens exactly once across concurrent `fork()` calls.
     warm_started: AtomicBool,
@@ -54,10 +57,11 @@ impl ForkPool {
     /// Build the pool WITHOUT spawning any prewarm threads. Warming is
     /// deferred to the first `fork()` (see `ensure_warm`), so a runtime that
     /// never forks costs nothing -- no isolates, no snapshot deserialization.
-    pub fn new(capacity: usize) -> Arc<Self> {
+    pub fn new(capacity: usize, permissions: Arc<crate::permissions::Permissions>) -> Arc<Self> {
         Arc::new(Self {
             pool: Mutex::new(Vec::with_capacity(capacity)),
             capacity,
+            permissions,
             warm_started: AtomicBool::new(false),
         })
     }
@@ -84,6 +88,7 @@ impl ForkPool {
         // we have a ForkRequest without any extra buffering.
         let (tx, rx) = mpsc::sync_channel::<ForkRequest>(1);
         let pool_weak = Arc::downgrade(pool);
+        let permissions = pool.permissions.clone();
         std::thread::Builder::new()
             .name("oam-fork-prewarm".to_string())
             .spawn(move || {
@@ -92,7 +97,7 @@ impl ForkPool {
                 // isolate that installed its own pool would spawn more prewarm
                 // threads, recursing until the stack overflows.
                 super::init_platform();
-                let mut rt = super::JsRuntime::new_worker_runtime();
+                let mut rt = super::JsRuntime::new_worker_runtime_with(permissions);
 
                 // Block until a ForkRequest arrives or the pool drops (recv Err).
                 let req = match rx.recv() {
@@ -162,6 +167,7 @@ impl ForkPool {
                             req.worker_id,
                             req.msg_rx,
                             event_tx,
+                            self.permissions.clone(),
                         );
                     }
                     // Slot disconnected: the prewarm thread died (e.g. panicked
@@ -177,6 +183,7 @@ impl ForkPool {
                             req.worker_id,
                             req.msg_rx,
                             event_tx,
+                            self.permissions.clone(),
                         );
                         Self::add_slot(self);
                     }
@@ -184,7 +191,14 @@ impl ForkPool {
             }
             None => {
                 // Pool empty: cold spawn and let the refill path catch up.
-                cold_spawn(script, worker_data, worker_id, msg_rx, event_tx);
+                cold_spawn(
+                    script,
+                    worker_data,
+                    worker_id,
+                    msg_rx,
+                    event_tx,
+                    self.permissions.clone(),
+                );
             }
         }
     }
@@ -197,6 +211,7 @@ fn cold_spawn(
     worker_id: u64,
     msg_rx: mpsc::Receiver<Vec<u8>>,
     event_tx: mpsc::Sender<WorkerEvent>,
+    permissions: Arc<crate::permissions::Permissions>,
 ) {
     crate::worker::spawn_worker(
         script,
@@ -209,6 +224,7 @@ fn cold_spawn(
             pipe_stderr: false,
             exec_argv: Vec::new(),
         },
+        permissions,
     );
 }
 

@@ -167,25 +167,30 @@ impl JsRuntime {
     /// `None` -> all permissions granted (same as `new()`).
     pub fn new_with_permissions(opts: Option<permissions::PermissionsOptions>) -> Self {
         // Top-level runtime: install the oam.fork() pre-warm pool.
-        Self::new_inner(opts, true)
+        Self::new_inner(
+            std::sync::Arc::new(permissions::Permissions::from_opts(opts)),
+            true,
+        )
     }
 
-    /// Create a runtime for a worker / fork-prewarm thread: identical to
-    /// `new_with_permissions(None)` EXCEPT it does NOT install a `ForkPool`.
+    /// A worker / fork isolate that INHERITS the spawning isolate's
+    /// permissions.
     ///
-    /// This is load-bearing for correctness, not just an optimization: the
-    /// fork pool spawns `oam-fork-prewarm` threads that each call
-    /// `JsRuntime::new()`. If those nested runtimes also installed a pool,
-    /// each prewarm thread would spawn more prewarm threads without bound --
-    /// the recursion overflows the thread stack and exhausts memory (snapshot
-    /// deserialization per level), aborting the process. A worker isolate
-    /// never needs to host its own pool: `op_fork_spawn` handles a missing
-    /// pool by cold-spawning, so a nested `oam.fork()` still works.
-    pub(crate) fn new_worker_runtime() -> Self {
-        Self::new_inner(None, false)
+    /// Without this a child ran all-granted no matter what the parent was
+    /// launched with, so `new Worker(...)` (and `oam.fork()`) was a one-line
+    /// escape from `--permission`: the child could read, write and spawn
+    /// freely. Every path that creates a child isolate must use this and pass
+    /// the parent's set down.
+    pub(crate) fn new_worker_runtime_with(
+        permissions: std::sync::Arc<permissions::Permissions>,
+    ) -> Self {
+        Self::new_inner(permissions, false)
     }
 
-    fn new_inner(opts: Option<permissions::PermissionsOptions>, with_fork_pool: bool) -> Self {
+    fn new_inner(
+        permissions: std::sync::Arc<permissions::Permissions>,
+        with_fork_pool: bool,
+    ) -> Self {
         init_platform();
         // OAM_MAX_HEAP_MB: optional hard cap on the V8 heap (Node's
         // --max-old-space-size analogue). Applied at isolate creation so
@@ -258,13 +263,13 @@ impl JsRuntime {
         // that warms more prewarm threads, recursing until the stack overflows
         // and the process aborts.
         if with_fork_pool {
-            isolate.set_slot(fork::ForkPool::new(2));
+            // The pool's pre-warmed isolates run user code via oam.fork(), so
+            // they inherit this runtime's permissions too.
+            isolate.set_slot(fork::ForkPool::new(2, permissions.clone()));
         }
         // Permissions slot: all-granted by default so existing code needs
         // no changes.  Restricted runtimes pass Some(PermissionsOptions{..}).
-        isolate.set_slot(std::sync::Arc::new(permissions::Permissions::from_opts(
-            opts,
-        )));
+        isolate.set_slot(permissions);
         let context = {
             v8::scope!(let scope, &mut isolate);
             // Deserializes the snapshot's runtime context: bootstrap.js is

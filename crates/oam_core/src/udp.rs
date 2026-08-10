@@ -4,7 +4,7 @@
 //! concurrently without removing from the map. UDP is connectionless
 //! and tokio's send_to/recv_from take `&self`.
 
-use crate::{OpOutcome, node_error_code, node_error_message};
+use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::Ordering};
 
@@ -18,10 +18,15 @@ pub type UdpRegistry = Arc<std::sync::Mutex<UdpState>>;
 
 fn udp_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
     let code = node_error_code(&error);
-    OpOutcome::NodeFailed {
-        code: code.to_string(),
-        message: node_error_message(code, syscall, target, &error),
-    }
+    // syscall + errno, but no `path`: a host:port is not a filesystem path,
+    // and node does not put one on a net error.
+    OpOutcome::node_failed_at(
+        code,
+        node_error_message(code, syscall, target, &error),
+        syscall,
+        "",
+        node_errno(code, &error),
+    )
 }
 
 /// dgram.createSocket('udp4') + socket.bind(port, address):

@@ -1,0 +1,1676 @@
+{
+  "_comment": "Builtin export names oam does not provide, per platform, measured against the node named in each section. A builtin's ESM named exports are its module object's own enumerable keys, so every name here is a link-time SyntaxError ('does not provide an export named X') for any program that imports it -- even one that never calls it. Bundled CLIs import the union of their dependency tree, which is how a single unused name takes down a whole program. This list GATES: on a platform with a section, a missing name absent from it fails `cargo run -p xtask -- conformance`, and so does a listed name oam now has. It may only shrink. Sections are keyed by process.platform because Node's own surface is platform-conditional (WSA* errnos on Windows, getuid/setgid on POSIX). Regenerate the current platform's section with scripts/gen-surface-gaps.mjs; it merges and never touches the others.",
+  "platforms": {
+    "darwin": {
+      "generatedAgainst": "v22.23.1 on darwin-arm64",
+      "counts": {
+        "nodeExportNames": 1884,
+        "present": 1383,
+        "missing": 401,
+        "absentModules": 13,
+        "absentModuleExportNames": 100
+      },
+      "absentModules": [
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_wrap",
+        "_tls_common",
+        "_tls_wrap",
+        "global:fetch.prototype",
+        "inspector/promises",
+        "sys",
+        "wasi"
+      ],
+      "missingExports": {
+        "async_hooks": [
+          "asyncWrapProviders"
+        ],
+        "buffer": [
+          "resolveObjectURL",
+          "transcode"
+        ],
+        "child_process": [
+          "_forkChild"
+        ],
+        "cluster": [
+          "Worker",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "setupMaster",
+          "setupPrimary"
+        ],
+        "constants": [
+          "DH_CHECK_P_NOT_PRIME",
+          "DH_CHECK_P_NOT_SAFE_PRIME",
+          "DH_NOT_SUITABLE_GENERATOR",
+          "DH_UNABLE_TO_CHECK_GENERATOR",
+          "ENGINE_METHOD_ALL",
+          "ENGINE_METHOD_CIPHERS",
+          "ENGINE_METHOD_DH",
+          "ENGINE_METHOD_DIGESTS",
+          "ENGINE_METHOD_DSA",
+          "ENGINE_METHOD_EC",
+          "ENGINE_METHOD_NONE",
+          "ENGINE_METHOD_PKEY_ASN1_METHS",
+          "ENGINE_METHOD_PKEY_METHS",
+          "ENGINE_METHOD_RAND",
+          "ENGINE_METHOD_RSA",
+          "OPENSSL_VERSION_NUMBER",
+          "O_DSYNC",
+          "O_NOCTTY",
+          "O_NONBLOCK",
+          "O_SYMLINK",
+          "POINT_CONVERSION_HYBRID",
+          "RSA_PSS_SALTLEN_AUTO",
+          "RSA_PSS_SALTLEN_DIGEST",
+          "RSA_PSS_SALTLEN_MAX_SIGN",
+          "RSA_X931_PADDING",
+          "RTLD_GLOBAL",
+          "RTLD_LAZY",
+          "RTLD_LOCAL",
+          "RTLD_NOW",
+          "SIGIOT",
+          "SSL_OP_ALLOW_NO_DHE_KEX",
+          "SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION",
+          "SSL_OP_CIPHER_SERVER_PREFERENCE",
+          "SSL_OP_CISCO_ANYCONNECT",
+          "SSL_OP_COOKIE_EXCHANGE",
+          "SSL_OP_CRYPTOPRO_TLSEXT_BUG",
+          "SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS",
+          "SSL_OP_LEGACY_SERVER_CONNECT",
+          "SSL_OP_NO_COMPRESSION",
+          "SSL_OP_NO_ENCRYPT_THEN_MAC",
+          "SSL_OP_NO_QUERY_MTU",
+          "SSL_OP_NO_RENEGOTIATION",
+          "SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION",
+          "SSL_OP_NO_TICKET",
+          "SSL_OP_PRIORITIZE_CHACHA",
+          "SSL_OP_TLS_ROLLBACK_BUG",
+          "S_IRWXG",
+          "S_IRWXO",
+          "S_IRWXU",
+          "TLS1_1_VERSION",
+          "TLS1_2_VERSION",
+          "TLS1_3_VERSION",
+          "TLS1_VERSION",
+          "UV_DIRENT_BLOCK",
+          "UV_DIRENT_CHAR",
+          "UV_DIRENT_DIR",
+          "UV_DIRENT_FIFO",
+          "UV_DIRENT_FILE",
+          "UV_DIRENT_LINK",
+          "UV_DIRENT_SOCKET",
+          "UV_DIRENT_UNKNOWN",
+          "UV_FS_COPYFILE_EXCL",
+          "UV_FS_COPYFILE_FICLONE",
+          "UV_FS_COPYFILE_FICLONE_FORCE",
+          "UV_FS_O_FILEMAP",
+          "defaultCipherList"
+        ],
+        "crypto": [
+          "Cipher",
+          "Cipheriv",
+          "Decipher",
+          "Decipheriv",
+          "DiffieHellmanGroup",
+          "Hash",
+          "Hmac",
+          "createDiffieHellmanGroup",
+          "diffieHellman",
+          "getCipherInfo",
+          "randomFill",
+          "setEngine"
+        ],
+        "dgram": [
+          "_createSocketHandle"
+        ],
+        "dns": [
+          "getDefaultResultOrder",
+          "lookupService",
+          "resolveTlsa"
+        ],
+        "dns/promises": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "LOADIPHLPAPI",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "Resolver",
+          "SERVFAIL",
+          "TIMEOUT",
+          "getDefaultResultOrder",
+          "getServers",
+          "lookupService",
+          "resolveTlsa",
+          "setDefaultResultOrder",
+          "setServers"
+        ],
+        "domain": [
+          "_stack",
+          "createDomain"
+        ],
+        "events": [
+          "captureRejections",
+          "init",
+          "usingDomains"
+        ],
+        "fs": [
+          "chown",
+          "chownSync",
+          "fchmod",
+          "fchmodSync",
+          "fchown",
+          "fchownSync",
+          "fdatasync",
+          "fdatasyncSync",
+          "fsync",
+          "fsyncSync",
+          "ftruncate",
+          "ftruncateSync",
+          "futimes",
+          "futimesSync",
+          "glob",
+          "globSync",
+          "lchmod",
+          "lchmodSync",
+          "lchown",
+          "lchownSync",
+          "lutimes",
+          "lutimesSync",
+          "openAsBlob",
+          "readv",
+          "readvSync",
+          "utimes",
+          "utimesSync",
+          "writev",
+          "writevSync"
+        ],
+        "fs/promises": [
+          "chown",
+          "glob",
+          "lchmod",
+          "lchown",
+          "lutimes",
+          "utimes",
+          "watch"
+        ],
+        "global:AbortController.prototype": [
+          "signal"
+        ],
+        "global:AbortSignal.prototype": [
+          "aborted",
+          "onabort",
+          "reason"
+        ],
+        "global:BroadcastChannel.prototype": [
+          "name",
+          "onmessage",
+          "onmessageerror",
+          "ref",
+          "unref"
+        ],
+        "global:Buffer.prototype": [
+          "asciiSlice",
+          "base64Slice",
+          "base64Write",
+          "base64urlSlice",
+          "base64urlWrite",
+          "hexSlice",
+          "hexWrite",
+          "latin1Slice",
+          "subarray",
+          "ucs2Slice",
+          "ucs2Write",
+          "utf8Slice"
+        ],
+        "global:Event.prototype": [
+          "bubbles",
+          "cancelable",
+          "composed",
+          "currentTarget",
+          "defaultPrevented",
+          "eventPhase",
+          "initEvent",
+          "isTrusted",
+          "target",
+          "timeStamp",
+          "type"
+        ],
+        "global:Headers.prototype": [
+          "getSetCookie"
+        ],
+        "global:Request.prototype": [
+          "attribute",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "cache",
+          "credentials",
+          "destination",
+          "duplex",
+          "formData",
+          "headers",
+          "integrity",
+          "isHistoryNavigation",
+          "isReloadNavigation",
+          "keepalive",
+          "method",
+          "mode",
+          "redirect",
+          "referrer",
+          "referrerPolicy",
+          "signal",
+          "url"
+        ],
+        "global:Response": [
+          "error",
+          "redirect"
+        ],
+        "global:Response.prototype": [
+          "arrayBuffer",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "clone",
+          "formData",
+          "headers",
+          "ok",
+          "redirected",
+          "status",
+          "statusText",
+          "type",
+          "url"
+        ],
+        "global:TextDecoder.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM"
+        ],
+        "global:TextDecoderStream.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM",
+          "readable",
+          "writable"
+        ],
+        "global:TextEncoderStream.prototype": [
+          "encoding",
+          "readable",
+          "writable"
+        ],
+        "global:TransformStream.prototype": [
+          "readable",
+          "writable"
+        ],
+        "global:URL": [
+          "createObjectURL"
+        ],
+        "global:WebSocket.prototype": [
+          "onclose",
+          "onerror",
+          "onmessage",
+          "onopen"
+        ],
+        "global:fetch": [
+          "prototype"
+        ],
+        "global:process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "http": [
+          "CloseEvent",
+          "MessageEvent",
+          "WebSocket",
+          "_connectionListener",
+          "setMaxIdleHTTPParsers"
+        ],
+        "http2": [
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "performServerHandshake"
+        ],
+        "inspector": [
+          "Network",
+          "NetworkResources"
+        ],
+        "module": [
+          "SourceMap",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "constants",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "stripTypeScriptTypes"
+        ],
+        "net": [
+          "Stream",
+          "_createServerHandle",
+          "_normalizeArgs",
+          "_setSimultaneousAccepts",
+          "getDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamily"
+        ],
+        "os": [
+          "getPriority",
+          "setPriority"
+        ],
+        "path": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/posix": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/win32": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "perf_hooks": [
+          "Performance",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceResourceTiming",
+          "constants"
+        ],
+        "process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "punycode": [
+          "version"
+        ],
+        "querystring": [
+          "unescapeBuffer"
+        ],
+        "readline": [
+          "promises"
+        ],
+        "readline/promises": [
+          "Readline"
+        ],
+        "repl": [
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "Recoverable",
+          "isValidSyntax",
+          "writer"
+        ],
+        "stream/web": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TransformStreamDefaultController",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "test": [
+          "assert",
+          "run",
+          "snapshot"
+        ],
+        "tls": [
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "DEFAULT_CIPHERS",
+          "SecureContext",
+          "convertALPNProtocols",
+          "createSecurePair",
+          "getCACertificates",
+          "setDefaultCACertificates"
+        ],
+        "url": [
+          "domainToUnicode",
+          "fileURLToPathBuffer"
+        ],
+        "util": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "diff",
+          "getSystemErrorMessage",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
+        "util/types": [
+          "isBigIntObject",
+          "isFloat16Array"
+        ],
+        "v8": [
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapSnapshot",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "setHeapSnapshotNearHeapLimit"
+        ],
+        "vm": [
+          "constants"
+        ],
+        "worker_threads": [
+          "isInternalThread",
+          "isMarkedAsUntransferable",
+          "markAsUncloneable",
+          "postMessageToThread",
+          "threadName"
+        ],
+        "zlib": [
+          "ZstdCompress",
+          "ZstdDecompress",
+          "codes",
+          "crc32",
+          "createZstdCompress",
+          "createZstdDecompress",
+          "zstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "zstdDecompressSync"
+        ]
+      }
+    },
+    "linux": {
+      "generatedAgainst": "v22.23.1 on linux-x64",
+      "counts": {
+        "nodeExportNames": 1888,
+        "present": 1383,
+        "missing": 405,
+        "absentModules": 13,
+        "absentModuleExportNames": 100
+      },
+      "absentModules": [
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_wrap",
+        "_tls_common",
+        "_tls_wrap",
+        "global:fetch.prototype",
+        "inspector/promises",
+        "sys",
+        "wasi"
+      ],
+      "missingExports": {
+        "async_hooks": [
+          "asyncWrapProviders"
+        ],
+        "buffer": [
+          "resolveObjectURL",
+          "transcode"
+        ],
+        "child_process": [
+          "_forkChild"
+        ],
+        "cluster": [
+          "Worker",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "setupMaster",
+          "setupPrimary"
+        ],
+        "constants": [
+          "DH_CHECK_P_NOT_PRIME",
+          "DH_CHECK_P_NOT_SAFE_PRIME",
+          "DH_NOT_SUITABLE_GENERATOR",
+          "DH_UNABLE_TO_CHECK_GENERATOR",
+          "ENGINE_METHOD_ALL",
+          "ENGINE_METHOD_CIPHERS",
+          "ENGINE_METHOD_DH",
+          "ENGINE_METHOD_DIGESTS",
+          "ENGINE_METHOD_DSA",
+          "ENGINE_METHOD_EC",
+          "ENGINE_METHOD_NONE",
+          "ENGINE_METHOD_PKEY_ASN1_METHS",
+          "ENGINE_METHOD_PKEY_METHS",
+          "ENGINE_METHOD_RAND",
+          "ENGINE_METHOD_RSA",
+          "OPENSSL_VERSION_NUMBER",
+          "O_DIRECT",
+          "O_DSYNC",
+          "O_NOCTTY",
+          "O_NONBLOCK",
+          "POINT_CONVERSION_HYBRID",
+          "RSA_PSS_SALTLEN_AUTO",
+          "RSA_PSS_SALTLEN_DIGEST",
+          "RSA_PSS_SALTLEN_MAX_SIGN",
+          "RSA_X931_PADDING",
+          "RTLD_DEEPBIND",
+          "RTLD_GLOBAL",
+          "RTLD_LAZY",
+          "RTLD_LOCAL",
+          "RTLD_NOW",
+          "SIGIOT",
+          "SIGPOLL",
+          "SIGPWR",
+          "SIGSTKFLT",
+          "SSL_OP_ALLOW_NO_DHE_KEX",
+          "SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION",
+          "SSL_OP_CIPHER_SERVER_PREFERENCE",
+          "SSL_OP_CISCO_ANYCONNECT",
+          "SSL_OP_COOKIE_EXCHANGE",
+          "SSL_OP_CRYPTOPRO_TLSEXT_BUG",
+          "SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS",
+          "SSL_OP_LEGACY_SERVER_CONNECT",
+          "SSL_OP_NO_COMPRESSION",
+          "SSL_OP_NO_ENCRYPT_THEN_MAC",
+          "SSL_OP_NO_QUERY_MTU",
+          "SSL_OP_NO_RENEGOTIATION",
+          "SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION",
+          "SSL_OP_NO_TICKET",
+          "SSL_OP_PRIORITIZE_CHACHA",
+          "SSL_OP_TLS_ROLLBACK_BUG",
+          "S_IRWXG",
+          "S_IRWXO",
+          "S_IRWXU",
+          "TLS1_1_VERSION",
+          "TLS1_2_VERSION",
+          "TLS1_3_VERSION",
+          "TLS1_VERSION",
+          "UV_DIRENT_BLOCK",
+          "UV_DIRENT_CHAR",
+          "UV_DIRENT_DIR",
+          "UV_DIRENT_FIFO",
+          "UV_DIRENT_FILE",
+          "UV_DIRENT_LINK",
+          "UV_DIRENT_SOCKET",
+          "UV_DIRENT_UNKNOWN",
+          "UV_FS_COPYFILE_EXCL",
+          "UV_FS_COPYFILE_FICLONE",
+          "UV_FS_COPYFILE_FICLONE_FORCE",
+          "UV_FS_O_FILEMAP",
+          "defaultCipherList"
+        ],
+        "crypto": [
+          "Cipher",
+          "Cipheriv",
+          "Decipher",
+          "Decipheriv",
+          "DiffieHellmanGroup",
+          "Hash",
+          "Hmac",
+          "createDiffieHellmanGroup",
+          "diffieHellman",
+          "getCipherInfo",
+          "randomFill",
+          "setEngine"
+        ],
+        "dgram": [
+          "_createSocketHandle"
+        ],
+        "dns": [
+          "getDefaultResultOrder",
+          "lookupService",
+          "resolveTlsa"
+        ],
+        "dns/promises": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "LOADIPHLPAPI",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "Resolver",
+          "SERVFAIL",
+          "TIMEOUT",
+          "getDefaultResultOrder",
+          "getServers",
+          "lookupService",
+          "resolveTlsa",
+          "setDefaultResultOrder",
+          "setServers"
+        ],
+        "domain": [
+          "_stack",
+          "createDomain"
+        ],
+        "events": [
+          "captureRejections",
+          "init",
+          "usingDomains"
+        ],
+        "fs": [
+          "chown",
+          "chownSync",
+          "fchmod",
+          "fchmodSync",
+          "fchown",
+          "fchownSync",
+          "fdatasync",
+          "fdatasyncSync",
+          "fsync",
+          "fsyncSync",
+          "ftruncate",
+          "ftruncateSync",
+          "futimes",
+          "futimesSync",
+          "glob",
+          "globSync",
+          "lchmod",
+          "lchmodSync",
+          "lchown",
+          "lchownSync",
+          "lutimes",
+          "lutimesSync",
+          "openAsBlob",
+          "readv",
+          "readvSync",
+          "utimes",
+          "utimesSync",
+          "writev",
+          "writevSync"
+        ],
+        "fs/promises": [
+          "chown",
+          "glob",
+          "lchmod",
+          "lchown",
+          "lutimes",
+          "utimes",
+          "watch"
+        ],
+        "global:AbortController.prototype": [
+          "signal"
+        ],
+        "global:AbortSignal.prototype": [
+          "aborted",
+          "onabort",
+          "reason"
+        ],
+        "global:BroadcastChannel.prototype": [
+          "name",
+          "onmessage",
+          "onmessageerror",
+          "ref",
+          "unref"
+        ],
+        "global:Buffer.prototype": [
+          "asciiSlice",
+          "base64Slice",
+          "base64Write",
+          "base64urlSlice",
+          "base64urlWrite",
+          "hexSlice",
+          "hexWrite",
+          "latin1Slice",
+          "subarray",
+          "ucs2Slice",
+          "ucs2Write",
+          "utf8Slice"
+        ],
+        "global:Event.prototype": [
+          "bubbles",
+          "cancelable",
+          "composed",
+          "currentTarget",
+          "defaultPrevented",
+          "eventPhase",
+          "initEvent",
+          "isTrusted",
+          "target",
+          "timeStamp",
+          "type"
+        ],
+        "global:Headers.prototype": [
+          "getSetCookie"
+        ],
+        "global:Request.prototype": [
+          "attribute",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "cache",
+          "credentials",
+          "destination",
+          "duplex",
+          "formData",
+          "headers",
+          "integrity",
+          "isHistoryNavigation",
+          "isReloadNavigation",
+          "keepalive",
+          "method",
+          "mode",
+          "redirect",
+          "referrer",
+          "referrerPolicy",
+          "signal",
+          "url"
+        ],
+        "global:Response": [
+          "error",
+          "redirect"
+        ],
+        "global:Response.prototype": [
+          "arrayBuffer",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "clone",
+          "formData",
+          "headers",
+          "ok",
+          "redirected",
+          "status",
+          "statusText",
+          "type",
+          "url"
+        ],
+        "global:TextDecoder.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM"
+        ],
+        "global:TextDecoderStream.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM",
+          "readable",
+          "writable"
+        ],
+        "global:TextEncoderStream.prototype": [
+          "encoding",
+          "readable",
+          "writable"
+        ],
+        "global:TransformStream.prototype": [
+          "readable",
+          "writable"
+        ],
+        "global:URL": [
+          "createObjectURL"
+        ],
+        "global:WebSocket.prototype": [
+          "onclose",
+          "onerror",
+          "onmessage",
+          "onopen"
+        ],
+        "global:fetch": [
+          "prototype"
+        ],
+        "global:process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "http": [
+          "CloseEvent",
+          "MessageEvent",
+          "WebSocket",
+          "_connectionListener",
+          "setMaxIdleHTTPParsers"
+        ],
+        "http2": [
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "performServerHandshake"
+        ],
+        "inspector": [
+          "Network",
+          "NetworkResources"
+        ],
+        "module": [
+          "SourceMap",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "constants",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "stripTypeScriptTypes"
+        ],
+        "net": [
+          "Stream",
+          "_createServerHandle",
+          "_normalizeArgs",
+          "_setSimultaneousAccepts",
+          "getDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamily"
+        ],
+        "os": [
+          "getPriority",
+          "setPriority"
+        ],
+        "path": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/posix": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/win32": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "perf_hooks": [
+          "Performance",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceResourceTiming",
+          "constants"
+        ],
+        "process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "punycode": [
+          "version"
+        ],
+        "querystring": [
+          "unescapeBuffer"
+        ],
+        "readline": [
+          "promises"
+        ],
+        "readline/promises": [
+          "Readline"
+        ],
+        "repl": [
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "Recoverable",
+          "isValidSyntax",
+          "writer"
+        ],
+        "stream/web": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TransformStreamDefaultController",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "test": [
+          "assert",
+          "run",
+          "snapshot"
+        ],
+        "tls": [
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "DEFAULT_CIPHERS",
+          "SecureContext",
+          "convertALPNProtocols",
+          "createSecurePair",
+          "getCACertificates",
+          "setDefaultCACertificates"
+        ],
+        "url": [
+          "domainToUnicode",
+          "fileURLToPathBuffer"
+        ],
+        "util": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "diff",
+          "getSystemErrorMessage",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
+        "util/types": [
+          "isBigIntObject",
+          "isFloat16Array"
+        ],
+        "v8": [
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapSnapshot",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "setHeapSnapshotNearHeapLimit"
+        ],
+        "vm": [
+          "constants"
+        ],
+        "worker_threads": [
+          "isInternalThread",
+          "isMarkedAsUntransferable",
+          "markAsUncloneable",
+          "postMessageToThread",
+          "threadName"
+        ],
+        "zlib": [
+          "ZstdCompress",
+          "ZstdDecompress",
+          "codes",
+          "crc32",
+          "createZstdCompress",
+          "createZstdDecompress",
+          "zstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "zstdDecompressSync"
+        ]
+      }
+    },
+    "win32": {
+      "generatedAgainst": "v22.22.2 on win32-arm64",
+      "counts": {
+        "nodeExportNames": 1874,
+        "present": 1326,
+        "missing": 448,
+        "absentModules": 13,
+        "absentModuleExportNames": 100
+      },
+      "absentModules": [
+        "_http_agent",
+        "_http_client",
+        "_http_common",
+        "_http_incoming",
+        "_http_outgoing",
+        "_http_server",
+        "_stream_wrap",
+        "_tls_common",
+        "_tls_wrap",
+        "global:fetch.prototype",
+        "inspector/promises",
+        "sys",
+        "wasi"
+      ],
+      "missingExports": {
+        "async_hooks": [
+          "asyncWrapProviders"
+        ],
+        "buffer": [
+          "resolveObjectURL",
+          "transcode"
+        ],
+        "child_process": [
+          "_forkChild"
+        ],
+        "cluster": [
+          "Worker",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "setupMaster",
+          "setupPrimary"
+        ],
+        "constants": [
+          "DH_CHECK_P_NOT_PRIME",
+          "DH_CHECK_P_NOT_SAFE_PRIME",
+          "DH_NOT_SUITABLE_GENERATOR",
+          "DH_UNABLE_TO_CHECK_GENERATOR",
+          "ENGINE_METHOD_ALL",
+          "ENGINE_METHOD_CIPHERS",
+          "ENGINE_METHOD_DH",
+          "ENGINE_METHOD_DIGESTS",
+          "ENGINE_METHOD_DSA",
+          "ENGINE_METHOD_EC",
+          "ENGINE_METHOD_NONE",
+          "ENGINE_METHOD_PKEY_ASN1_METHS",
+          "ENGINE_METHOD_PKEY_METHS",
+          "ENGINE_METHOD_RAND",
+          "ENGINE_METHOD_RSA",
+          "OPENSSL_VERSION_NUMBER",
+          "POINT_CONVERSION_HYBRID",
+          "RSA_PSS_SALTLEN_AUTO",
+          "RSA_PSS_SALTLEN_DIGEST",
+          "RSA_PSS_SALTLEN_MAX_SIGN",
+          "RSA_X931_PADDING",
+          "SIGBREAK",
+          "SSL_OP_ALLOW_NO_DHE_KEX",
+          "SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION",
+          "SSL_OP_CIPHER_SERVER_PREFERENCE",
+          "SSL_OP_CISCO_ANYCONNECT",
+          "SSL_OP_COOKIE_EXCHANGE",
+          "SSL_OP_CRYPTOPRO_TLSEXT_BUG",
+          "SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS",
+          "SSL_OP_LEGACY_SERVER_CONNECT",
+          "SSL_OP_NO_COMPRESSION",
+          "SSL_OP_NO_ENCRYPT_THEN_MAC",
+          "SSL_OP_NO_QUERY_MTU",
+          "SSL_OP_NO_RENEGOTIATION",
+          "SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION",
+          "SSL_OP_NO_TICKET",
+          "SSL_OP_PRIORITIZE_CHACHA",
+          "SSL_OP_TLS_ROLLBACK_BUG",
+          "TLS1_1_VERSION",
+          "TLS1_2_VERSION",
+          "TLS1_3_VERSION",
+          "TLS1_VERSION",
+          "UV_DIRENT_BLOCK",
+          "UV_DIRENT_CHAR",
+          "UV_DIRENT_DIR",
+          "UV_DIRENT_FIFO",
+          "UV_DIRENT_FILE",
+          "UV_DIRENT_LINK",
+          "UV_DIRENT_SOCKET",
+          "UV_DIRENT_UNKNOWN",
+          "UV_FS_COPYFILE_EXCL",
+          "UV_FS_COPYFILE_FICLONE",
+          "UV_FS_COPYFILE_FICLONE_FORCE",
+          "UV_FS_O_FILEMAP",
+          "WSAEACCES",
+          "WSAEADDRINUSE",
+          "WSAEADDRNOTAVAIL",
+          "WSAEAFNOSUPPORT",
+          "WSAEALREADY",
+          "WSAEBADF",
+          "WSAECANCELLED",
+          "WSAECONNABORTED",
+          "WSAECONNREFUSED",
+          "WSAECONNRESET",
+          "WSAEDESTADDRREQ",
+          "WSAEDISCON",
+          "WSAEDQUOT",
+          "WSAEFAULT",
+          "WSAEHOSTDOWN",
+          "WSAEHOSTUNREACH",
+          "WSAEINPROGRESS",
+          "WSAEINTR",
+          "WSAEINVAL",
+          "WSAEINVALIDPROCTABLE",
+          "WSAEINVALIDPROVIDER",
+          "WSAEISCONN",
+          "WSAELOOP",
+          "WSAEMFILE",
+          "WSAEMSGSIZE",
+          "WSAENAMETOOLONG",
+          "WSAENETDOWN",
+          "WSAENETRESET",
+          "WSAENETUNREACH",
+          "WSAENOBUFS",
+          "WSAENOMORE",
+          "WSAENOPROTOOPT",
+          "WSAENOTCONN",
+          "WSAENOTEMPTY",
+          "WSAENOTSOCK",
+          "WSAEOPNOTSUPP",
+          "WSAEPFNOSUPPORT",
+          "WSAEPROCLIM",
+          "WSAEPROTONOSUPPORT",
+          "WSAEPROTOTYPE",
+          "WSAEPROVIDERFAILEDINIT",
+          "WSAEREFUSED",
+          "WSAEREMOTE",
+          "WSAESHUTDOWN",
+          "WSAESOCKTNOSUPPORT",
+          "WSAESTALE",
+          "WSAETIMEDOUT",
+          "WSAETOOMANYREFS",
+          "WSAEUSERS",
+          "WSAEWOULDBLOCK",
+          "WSANOTINITIALISED",
+          "WSASERVICE_NOT_FOUND",
+          "WSASYSCALLFAILURE",
+          "WSASYSNOTREADY",
+          "WSATYPE_NOT_FOUND",
+          "WSAVERNOTSUPPORTED",
+          "WSA_E_CANCELLED",
+          "WSA_E_NO_MORE",
+          "defaultCipherList"
+        ],
+        "crypto": [
+          "Cipher",
+          "Cipheriv",
+          "Decipher",
+          "Decipheriv",
+          "DiffieHellmanGroup",
+          "Hash",
+          "Hmac",
+          "createDiffieHellmanGroup",
+          "diffieHellman",
+          "getCipherInfo",
+          "randomFill",
+          "setEngine"
+        ],
+        "dgram": [
+          "_createSocketHandle"
+        ],
+        "dns": [
+          "getDefaultResultOrder",
+          "lookupService",
+          "resolveTlsa"
+        ],
+        "dns/promises": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "LOADIPHLPAPI",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "Resolver",
+          "SERVFAIL",
+          "TIMEOUT",
+          "getDefaultResultOrder",
+          "getServers",
+          "lookupService",
+          "resolveTlsa",
+          "setDefaultResultOrder",
+          "setServers"
+        ],
+        "domain": [
+          "_stack",
+          "createDomain"
+        ],
+        "events": [
+          "captureRejections",
+          "init",
+          "usingDomains"
+        ],
+        "fs": [
+          "chown",
+          "chownSync",
+          "fchmod",
+          "fchmodSync",
+          "fchown",
+          "fchownSync",
+          "fdatasync",
+          "fdatasyncSync",
+          "fsync",
+          "fsyncSync",
+          "ftruncate",
+          "ftruncateSync",
+          "futimes",
+          "futimesSync",
+          "glob",
+          "globSync",
+          "lchmod",
+          "lchmodSync",
+          "lchown",
+          "lchownSync",
+          "lutimes",
+          "lutimesSync",
+          "openAsBlob",
+          "readv",
+          "readvSync",
+          "utimes",
+          "utimesSync",
+          "writev",
+          "writevSync"
+        ],
+        "fs/promises": [
+          "chown",
+          "glob",
+          "lchmod",
+          "lchown",
+          "lutimes",
+          "utimes",
+          "watch"
+        ],
+        "global:AbortController.prototype": [
+          "signal"
+        ],
+        "global:AbortSignal.prototype": [
+          "aborted",
+          "onabort",
+          "reason"
+        ],
+        "global:BroadcastChannel.prototype": [
+          "name",
+          "onmessage",
+          "onmessageerror",
+          "ref",
+          "unref"
+        ],
+        "global:Buffer.prototype": [
+          "asciiSlice",
+          "base64Slice",
+          "base64Write",
+          "base64urlSlice",
+          "base64urlWrite",
+          "hexSlice",
+          "hexWrite",
+          "latin1Slice",
+          "subarray",
+          "ucs2Slice",
+          "ucs2Write",
+          "utf8Slice"
+        ],
+        "global:Event.prototype": [
+          "bubbles",
+          "cancelable",
+          "composed",
+          "currentTarget",
+          "defaultPrevented",
+          "eventPhase",
+          "initEvent",
+          "isTrusted",
+          "target",
+          "timeStamp",
+          "type"
+        ],
+        "global:Headers.prototype": [
+          "getSetCookie"
+        ],
+        "global:Request.prototype": [
+          "attribute",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "cache",
+          "credentials",
+          "destination",
+          "duplex",
+          "formData",
+          "headers",
+          "integrity",
+          "isHistoryNavigation",
+          "isReloadNavigation",
+          "keepalive",
+          "method",
+          "mode",
+          "redirect",
+          "referrer",
+          "referrerPolicy",
+          "signal",
+          "url"
+        ],
+        "global:Response": [
+          "error",
+          "redirect"
+        ],
+        "global:Response.prototype": [
+          "arrayBuffer",
+          "blob",
+          "bodyUsed",
+          "bytes",
+          "clone",
+          "formData",
+          "headers",
+          "ok",
+          "redirected",
+          "status",
+          "statusText",
+          "type",
+          "url"
+        ],
+        "global:TextDecoder.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM"
+        ],
+        "global:TextDecoderStream.prototype": [
+          "encoding",
+          "fatal",
+          "ignoreBOM",
+          "readable",
+          "writable"
+        ],
+        "global:TextEncoderStream.prototype": [
+          "encoding",
+          "readable",
+          "writable"
+        ],
+        "global:TransformStream.prototype": [
+          "readable",
+          "writable"
+        ],
+        "global:URL": [
+          "createObjectURL"
+        ],
+        "global:WebSocket.prototype": [
+          "onclose",
+          "onerror",
+          "onmessage",
+          "onopen"
+        ],
+        "global:fetch": [
+          "prototype"
+        ],
+        "global:process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "http": [
+          "CloseEvent",
+          "MessageEvent",
+          "WebSocket",
+          "_connectionListener",
+          "setMaxIdleHTTPParsers"
+        ],
+        "http2": [
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "performServerHandshake"
+        ],
+        "inspector": [
+          "Network",
+          "NetworkResources"
+        ],
+        "module": [
+          "SourceMap",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "constants",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "stripTypeScriptTypes"
+        ],
+        "net": [
+          "Stream",
+          "_createServerHandle",
+          "_normalizeArgs",
+          "_setSimultaneousAccepts",
+          "getDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamily"
+        ],
+        "os": [
+          "getPriority",
+          "setPriority"
+        ],
+        "path": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/posix": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "path/win32": [
+          "_makeLong",
+          "matchesGlob"
+        ],
+        "perf_hooks": [
+          "Performance",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceResourceTiming",
+          "constants"
+        ],
+        "process": [
+          "_debugEnd",
+          "_debugProcess",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "moduleLoadList",
+          "openStdin",
+          "sourceMapsEnabled"
+        ],
+        "punycode": [
+          "version"
+        ],
+        "querystring": [
+          "unescapeBuffer"
+        ],
+        "readline": [
+          "promises"
+        ],
+        "readline/promises": [
+          "Readline"
+        ],
+        "repl": [
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "Recoverable",
+          "isValidSyntax",
+          "writer"
+        ],
+        "stream/web": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TransformStreamDefaultController",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "test": [
+          "assert",
+          "run",
+          "snapshot"
+        ],
+        "tls": [
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "DEFAULT_CIPHERS",
+          "SecureContext",
+          "convertALPNProtocols",
+          "createSecurePair",
+          "getCACertificates",
+          "setDefaultCACertificates"
+        ],
+        "url": [
+          "domainToUnicode",
+          "fileURLToPathBuffer"
+        ],
+        "util": [
+          "MIMEParams",
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "diff",
+          "getSystemErrorMessage",
+          "setTraceSigInt",
+          "transferableAbortController",
+          "transferableAbortSignal"
+        ],
+        "util/types": [
+          "isBigIntObject",
+          "isFloat16Array"
+        ],
+        "v8": [
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapSnapshot",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "setHeapSnapshotNearHeapLimit"
+        ],
+        "vm": [
+          "constants"
+        ],
+        "worker_threads": [
+          "isInternalThread",
+          "isMarkedAsUntransferable",
+          "markAsUncloneable",
+          "postMessageToThread",
+          "threadName"
+        ],
+        "zlib": [
+          "ZstdCompress",
+          "ZstdDecompress",
+          "codes",
+          "crc32",
+          "createZstdCompress",
+          "createZstdDecompress",
+          "zstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "zstdDecompressSync"
+        ]
+      }
+    }
+  }
+}
