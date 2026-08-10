@@ -56,16 +56,29 @@ its own module ecosystem. Those are not goals here.
 
 ## vs Bun
 
+Every figure in this section comes from the committed run at commit `acec008`,
+release profile, host windows-aarch64. The full table is in
+[`BENCHMARKS.md`](../BENCHMARKS.md) and the raw samples are in
+[`bench/results.json`](../bench/results.json).
+
 Bun is faster than oam at several things and the benchmark table says so
 plainly — it wins `url-parse`, `http-throughput` and `crypto-hash` on the same
-hardware, the last of them by 5x. If raw single-process throughput is what you
-are optimising, benchmark Bun. (Node, not Bun, is the one to beat on `fs-read`,
-and it does — narrowly.)
+hardware, the last of them by nearly 6x. If raw single-process throughput is
+what you are optimising, benchmark Bun. (Node, not Bun, is the one to beat on
+`fs-read`, and it does — narrowly.)
 
 oam wins where the workload is **spawn-heavy and short-lived**, which is exactly
-the MCP sidecar shape: `mcp-cold-start` 35ms vs Bun's 339ms, `mcp-idle-rss` 25MB
-vs 97MB, `mcp-first-call-latency` 0.30ms vs 3.53ms. A broker that starts a dozen
+the MCP sidecar shape: `mcp-cold-start` 35ms vs Bun's 483ms, `mcp-idle-rss` 25MB
+vs 98MB, `mcp-first-call-latency` 0.34ms vs 5.04ms. A broker that starts a dozen
 sidecars pays those costs a dozen times.
+
+Treat the spawn-bound rows as the softest numbers in the set. `cold-start`,
+`mcp-cold-start` and `mcp-first-call-latency` are dominated by how fast the OS
+can get an executable running, which on-access malware scanning can multiply by
+5-10x — and the harness stages oam's binary to a temp directory and execs it
+once before timing, so oam absorbs that cost up front where node and bun pay it
+on every iteration. On a machine with such a scanner active, those three rows
+flatter oam. Measure on your own hardware before you rely on the margin.
 
 Bun is also a bundler, test runner, and package manager. oam is not trying to be
 those.

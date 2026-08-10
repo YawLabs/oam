@@ -674,8 +674,23 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
 
 pub(crate) fn ensure_oam_built(repo: &Path, release: bool) -> Result<PathBuf> {
     let profile = if release { "release" } else { "debug" };
-    let exe = repo
-        .join(format!("target/{profile}"))
+    // cargo honours CARGO_TARGET_DIR, so hard-coding `repo/target` looks in the
+    // wrong place the moment it is set: the build lands elsewhere and we probe
+    // a path holding either nothing or a stale binary from a previous layout.
+    // Relative values resolve against the repo, matching cargo's own rule.
+    let target_root = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) if !dir.is_empty() => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                repo.join(dir)
+            }
+        }
+        _ => repo.join("target"),
+    };
+    let exe = target_root
+        .join(profile)
         .join(format!("oam{}", std::env::consts::EXE_SUFFIX));
     // ALWAYS build, never gate on the binary existing: cargo's own freshness
     // check makes this a ~1s no-op when current, and an existing-but-STALE
@@ -710,7 +725,7 @@ fn which_node() -> Option<String> {
     }
 }
 
-fn capture_version(exe: &Path, args: &[&str]) -> String {
+pub(crate) fn capture_version(exe: &Path, args: &[&str]) -> String {
     Command::new(exe)
         .args(args)
         .output()
@@ -720,7 +735,7 @@ fn capture_version(exe: &Path, args: &[&str]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn git_short_commit(repo: &Path) -> String {
+pub(crate) fn git_short_commit(repo: &Path) -> String {
     Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(repo)
