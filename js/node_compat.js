@@ -19628,6 +19628,43 @@
       });
     }
 
+    // Resolve once a child's stdio Readable has actually FINISHED, for the
+    // 'close' ordering below.
+    //
+    // `push(null)` marks EOF; it is not the point the stream is done. The
+    // Readable emits 'end' from a process.nextTick, while the pump's promise
+    // continues on the microtask queue -- so a pump that resolves at push(null)
+    // leaves "does 'end' beat 'close'?" up to nextTick-vs-microtask draining.
+    // That held on Windows and macOS and inverted on a loaded Linux box, where
+    // the child's 'close' fired first and `stdout.on('end')` had not run.
+    // node's order is invariant when stdout is consumed (measured, 12B and
+    // 2MB): stdout 'end' -> stdout 'close' -> child 'exit' -> child 'close'.
+    //
+    // Waiting unconditionally would HANG the common ignore-the-output spawn: a
+    // Readable nobody reads never emits 'end', it just sits paused holding its
+    // buffer, and node still closes that child (measured: unconsumed 12B gives
+    // `exit close`). So wait only when something is really consuming -- a
+    // 'data' listener or a pipe (readableFlowing === true), or a 'readable'
+    // consumer / async iterator (which leaves flowing false, hence the
+    // listener check). 'close'/'error' are accepted as terminal too, so a
+    // destroyed stream cannot strand the child.
+    const readableFinished = (stream) =>
+      new Promise((resolve) => {
+        if (!stream || stream.readableEnded || stream.destroyed) {
+          resolve();
+          return;
+        }
+        const consuming =
+          stream.readableFlowing === true || stream.listenerCount("readable") > 0;
+        if (!consuming) {
+          resolve();
+          return;
+        }
+        stream.once("end", resolve);
+        stream.once("close", resolve);
+        stream.once("error", resolve);
+      });
+
     function spawn(command, args, options) {
       const norm = normalizeArgs(command, args, options);
       const opts = norm.options;
@@ -19739,6 +19776,8 @@
           }
           cp.stdout.push(Buffer.from(chunk));
         }
+        // NOT done at push(null) -- see readableFinished.
+        await readableFinished(cp.stdout);
       };
       const readStderr = async (handle) => {
         while (true) {
@@ -19749,6 +19788,7 @@
           }
           cp.stderr.push(Buffer.from(chunk));
         }
+        await readableFinished(cp.stderr);
       };
 
       // SYNCHRONOUS spawn (node parity): pid must be readable the instant
@@ -20198,6 +20238,7 @@
               }
               if (cp.stdout) cp.stdout.push(Buffer.from(chunk));
             }
+            await readableFinished(cp.stdout);
           };
           const readStderr = async (handle) => {
             while (true) {
@@ -20208,6 +20249,7 @@
               }
               if (cp.stderr) cp.stderr.push(Buffer.from(chunk));
             }
+            await readableFinished(cp.stderr);
           };
           // Nothing to drain for an inherited or ignored slot -- the child
           // holds the parent's fd directly.
