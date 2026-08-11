@@ -78,6 +78,8 @@ pub(crate) fn run(release: bool) -> Result<()> {
     // per-module tallies: [pass, fail, skip, unrunnable]
     let mut by_module: BTreeMap<String, [usize; 4]> = BTreeMap::new();
     let mut failures: Vec<(String, String)> = Vec::new();
+    // (name, first divergence, why it is intentional) -- see the Fail arm below.
+    let mut deliberate_failures: Vec<(String, String, String)> = Vec::new();
     let (mut pass, mut fail, mut skip, mut unrunnable) = (0usize, 0usize, 0usize, 0usize);
 
     for test in &tests {
@@ -117,8 +119,27 @@ pub(crate) fn run(release: bool) -> Result<()> {
             Outcome::Fail(detail) => {
                 fail += 1;
                 slot[1] += 1;
-                println!("  FAIL   {name}  {detail}");
-                failures.push((name.clone(), detail));
+                // A DELIBERATE divergence is still a failure in every number --
+                // it fails, it counts, it stays in the denominator. The manifest
+                // entry only records WHY, so the report stops filing a settled
+                // decision under "triage backlog" and the next reader does not
+                // re-litigate it. Reclassifying is ratcheted (maxDeliberate) so
+                // a real bug cannot be quietly relabelled as intentional.
+                let deliberate = manifest.deliberate.get(&format!("parallel/{name}"));
+                println!(
+                    "  {}   {name}  {detail}",
+                    if deliberate.is_some() {
+                        "XFAIL"
+                    } else {
+                        "FAIL "
+                    }
+                );
+                match deliberate {
+                    Some(reason) => {
+                        deliberate_failures.push((name.clone(), detail, reason.clone()))
+                    }
+                    None => failures.push((name.clone(), detail)),
+                }
             }
             Outcome::Unrunnable(reason) => {
                 unrunnable += 1;
@@ -144,7 +165,17 @@ pub(crate) fn run(release: bool) -> Result<()> {
     };
 
     write_scorecard(
-        &repo, &oam, &by_module, &failures, total, scored, pass, fail, skip, unrunnable,
+        &repo,
+        &oam,
+        &by_module,
+        &failures,
+        &deliberate_failures,
+        total,
+        scored,
+        pass,
+        fail,
+        skip,
+        unrunnable,
     )?;
 
     println!();
@@ -181,12 +212,35 @@ pub(crate) fn run(release: bool) -> Result<()> {
         .get(&host)
         .copied()
         .or(manifest.min_pass);
+    if !manifest.deliberate.is_empty() {
+        println!(
+            "deliberate divergences: {}/{} (ratchet ceiling) -- counted as failures, still in the denominator",
+            deliberate_failures.len(),
+            manifest
+                .max_deliberate
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    // A manifest entry that no longer fails is stale: the divergence was fixed
+    // (or the test moved) and the annotation now describes nothing. Say so
+    // rather than let it rot into a claim about a test that passes.
+    for name in manifest.deliberate.keys() {
+        let still_failing = deliberate_failures
+            .iter()
+            .any(|(n, _, _)| format!("parallel/{n}") == *name);
+        if !still_failing {
+            println!("  STALE  {name} is marked deliberate but did not fail -- drop the entry");
+        }
+    }
     if let Some(msg) = ratchet_violation(
         manifest_skips,
         manifest.known_issues,
+        deliberate_failures.len(),
         pass,
         manifest.max_skips,
         manifest.max_known_issues,
+        manifest.max_deliberate,
         min_pass,
     ) {
         bail!("{msg}");
@@ -195,15 +249,22 @@ pub(crate) fn run(release: bool) -> Result<()> {
 }
 
 /// Pure ratchet check (extracted for unit testing): returns Some(message) when
-/// the discretionary skip count or known-issues count exceeds its ceiling, OR
-/// the pass count falls below its floor. None = all within limits / unset.
+/// the discretionary skip count, the known-issues count or the
+/// deliberate-divergence count exceeds its ceiling, OR the pass count falls
+/// below its floor. None = all within limits / unset.
 /// `== ceiling` and `== floor` are allowed; only strictly past them violates.
+// Four measured counts paired with their four ceilings; splitting them into a
+// struct would only move the same eight values behind a name the tests then
+// have to construct. Same call as write_scorecard below.
+#[allow(clippy::too_many_arguments)]
 fn ratchet_violation(
     skips: usize,
     known_issues: usize,
+    deliberate: usize,
     pass: usize,
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
+    max_deliberate: Option<usize>,
     min_pass: Option<usize>,
 ) -> Option<String> {
     if let Some(max) = max_skips
@@ -219,6 +280,13 @@ fn ratchet_violation(
     {
         return Some(format!(
             "known-issues ceiling violation: {known_issues} known_issues/flaky skips > ceiling {max}."
+        ));
+    }
+    if let Some(max) = max_deliberate
+        && deliberate > max
+    {
+        return Some(format!(
+            "deliberate-divergence ceiling violation: {deliberate} > ceiling {max}. A test that              fails on purpose needs an explicit ratchet bump, so a real regression cannot be              relabelled as intentional."
         ));
     }
     if let Some(min) = min_pass
@@ -355,9 +423,16 @@ struct Manifest {
     skips: BTreeMap<String, String>,
     /// subset of `skips` tagged category "known_issues" or "flaky".
     known_issues: usize,
+    /// path -> why the divergence is INTENTIONAL, for tests oam fails on
+    /// purpose and will keep failing. Purely a reporting classification: the
+    /// test still runs, still counts as a failure, and stays in the
+    /// denominator, so this cannot be used to flatter the pass rate the way a
+    /// skip could. Ratcheted by `maxDeliberate` all the same.
+    deliberate: BTreeMap<String, String>,
     /// ratchet ceilings; None = not enforced.
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
+    max_deliberate: Option<usize>,
     /// pass-count FLOOR: the suite fails if fewer tests pass than this. The
     /// counterpart to the skip ceiling -- it should only ever be RAISED, so a
     /// node-compat regression that drops the pass count reddens CI. None = off.
@@ -371,8 +446,10 @@ fn load_manifest(path: &Path) -> Manifest {
     let mut m = Manifest {
         skips: BTreeMap::new(),
         known_issues: 0,
+        deliberate: BTreeMap::new(),
         max_skips: None,
         max_known_issues: None,
+        max_deliberate: None,
         min_pass: None,
         min_pass_by_host: BTreeMap::new(),
     };
@@ -389,6 +466,10 @@ fn load_manifest(path: &Path) -> Manifest {
             .map(|x| x as usize);
         m.max_known_issues = r
             .get("maxKnownIssues")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
+        m.max_deliberate = r
+            .get("maxDeliberate")
             .and_then(|x| x.as_u64())
             .map(|x| x as usize);
         m.min_pass = r
@@ -416,6 +497,16 @@ fn load_manifest(path: &Path) -> Manifest {
                     m.known_issues += 1;
                 }
                 m.skips.insert(k.clone(), reason);
+            } else if cfg.get("deliberate").and_then(|d| d.as_bool()) == Some(true) {
+                // Mutually exclusive with `skip` by construction: a deliberate
+                // divergence must still RUN and still FAIL, so marking one as
+                // both would silently drop it from the denominator.
+                let reason = cfg
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("deliberate divergence")
+                    .to_string();
+                m.deliberate.insert(k.clone(), reason);
             }
         }
     }
@@ -510,6 +601,7 @@ fn write_scorecard(
     oam: &Path,
     by_module: &BTreeMap<String, [usize; 4]>,
     failures: &[(String, String)],
+    deliberate: &[(String, String, String)],
     total: usize,
     runnable: usize,
     pass: usize,
@@ -568,6 +660,15 @@ fn write_scorecard(
         "passOverRunnable": format!("{:.1}%", pct(pass, scored)),
         "passOverTotal": format!("{:.1}%", pct(pass, total)),
         "byModule": modules_json,
+        // A SUBSET of `fail`, not a sibling of it: these are counted in `fail`
+        // and in `runnable` above. Published so the machine twin carries the
+        // reason too, rather than leaving it only in the markdown.
+        "deliberateFailures": deliberate
+            .iter()
+            .map(|(name, detail, reason)| json!({
+                "test": name, "firstDivergence": detail, "reason": reason,
+            }))
+            .collect::<Vec<_>>(),
     });
     std::fs::write(
         repo.join("conformance/node-suite-scorecard.json"),
@@ -614,6 +715,18 @@ fn write_scorecard(
             md.push_str(&format!("- `{name}` -- {detail}\n"));
         }
     }
+    if !deliberate.is_empty() {
+        md.push_str("\n## Deliberate divergences (counted as failures above)\n\n");
+        md.push_str(
+            "These fail on purpose and are expected to keep failing. They are NOT skipped: each \
+             one runs, counts as a failure, and stays in the denominator, so the pass rate above \
+             is unaffected by this section existing. Listed separately only so a settled decision \
+             is not mistaken for untriaged work.\n\n",
+        );
+        for (name, detail, reason) in deliberate {
+            md.push_str(&format!("- `{name}` -- {detail}\n  - {reason}\n"));
+        }
+    }
     std::fs::write(repo.join("CONFORMANCE-NODE.md"), md)?;
     Ok(())
 }
@@ -635,32 +748,57 @@ mod tests {
 
     #[test]
     fn ratchet_within_or_at_ceiling_is_ok() {
-        assert!(ratchet_violation(0, 0, 81, Some(0), Some(0), Some(81)).is_none());
-        assert!(ratchet_violation(3, 1, 90, Some(5), Some(2), Some(81)).is_none());
+        assert!(ratchet_violation(0, 0, 0, 81, Some(0), Some(0), Some(0), Some(81)).is_none());
+        assert!(ratchet_violation(3, 1, 1, 90, Some(5), Some(2), Some(2), Some(81)).is_none());
         // == ceiling / == floor is allowed; only strictly past them violates.
-        assert!(ratchet_violation(5, 2, 81, Some(5), Some(2), Some(81)).is_none());
+        assert!(ratchet_violation(5, 2, 2, 81, Some(5), Some(2), Some(2), Some(81)).is_none());
         // Unset ceilings/floor = unenforced, even with extreme counts.
-        assert!(ratchet_violation(99, 99, 0, None, None, None).is_none());
+        assert!(ratchet_violation(99, 99, 99, 0, None, None, None, None).is_none());
     }
 
     #[test]
     fn ratchet_skips_over_ceiling_violates() {
-        let msg = ratchet_violation(1, 0, 81, Some(0), Some(0), None).expect("must violate");
+        let msg =
+            ratchet_violation(1, 0, 0, 81, Some(0), Some(0), Some(0), None).expect("must violate");
         assert!(msg.contains("skip-ratchet violation"));
         assert!(msg.contains("1 manifest skips > ceiling 0"));
     }
 
     #[test]
     fn ratchet_known_issues_over_ceiling_violates() {
-        let msg = ratchet_violation(0, 3, 81, Some(10), Some(2), None).expect("must violate");
+        let msg =
+            ratchet_violation(0, 3, 0, 81, Some(10), Some(2), Some(0), None).expect("must violate");
         assert!(msg.contains("known-issues ceiling violation"));
         assert!(msg.contains("3 known_issues/flaky skips > ceiling 2"));
     }
 
     #[test]
+    fn deliberate_ceiling_is_ratcheted() {
+        // At the ceiling is fine; one past it is not. This is what stops a real
+        // regression being relabelled "intentional" without a reviewable bump.
+        assert!(ratchet_violation(0, 0, 2, 81, Some(0), Some(0), Some(2), Some(81)).is_none());
+        let msg = ratchet_violation(0, 0, 3, 81, Some(0), Some(0), Some(2), Some(81))
+            .expect("must violate");
+        assert!(msg.contains("deliberate-divergence ceiling violation"));
+        assert!(msg.contains("3 > ceiling 2"));
+    }
+
+    #[test]
+    fn deliberate_does_not_shrink_the_denominator() {
+        // The guarantee the classification rests on: a deliberate divergence is
+        // a FAILURE, not a skip. If it ever stopped counting, the pass rate
+        // would silently improve by annotating tests -- exactly what the skip
+        // ceiling exists to prevent. A pass floor must still fire underneath it.
+        let msg = ratchet_violation(0, 0, 2, 80, Some(0), Some(0), Some(2), Some(81))
+            .expect("must violate");
+        assert!(msg.contains("pass-floor violation"));
+    }
+
+    #[test]
     fn ratchet_pass_below_floor_violates() {
         // A node-compat regression that drops the pass count must redden CI.
-        let msg = ratchet_violation(0, 0, 80, Some(0), Some(0), Some(81)).expect("must violate");
+        let msg = ratchet_violation(0, 0, 0, 80, Some(0), Some(0), Some(0), Some(81))
+            .expect("must violate");
         assert!(msg.contains("pass-floor violation"));
         assert!(msg.contains("80 passing < floor 81"));
     }
