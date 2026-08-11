@@ -8460,6 +8460,46 @@
   }
   const toUnixMs = (time, name) => toUnixSeconds(time, name) * 1000;
 
+  // A read/write POSITION argument, normalised for the natives: a non-negative
+  // number is a pread/pwrite, anything else (null, undefined, a negative) means
+  // "from the current cursor". Shared by the fs and fs/promises factories so
+  // the two cannot drift -- FileHandle.read/write silently DROPPED their
+  // position for as long as the natives had nowhere to put it.
+  const fsPositionArg = (p) => (typeof p === "number" && p >= 0 ? p : null);
+
+  // `Object.keys(err)` order, for the ONE fd call where node's differs.
+  //
+  // Every fd error node raises enumerates errno, code, syscall -- except
+  // fs.writeSync, which builds its error in JS from a libuv ctx object
+  // (errno and syscall copied off the ctx, code assigned last) instead of
+  // throwing from C++. That lands as errno, syscall, code. fs.write and
+  // fs.writevSync both use the common order, so this is a property of that one
+  // call site, not of the `write` syscall, and it cannot live in the native
+  // (all three share it). Own-key order is observable to anything that
+  // snapshots or diffs an error.
+  function ctxOrderError(e) {
+    if (!e || e.code === undefined || e.syscall === undefined) return e;
+    const out = new Error(e.message);
+    out.errno = e.errno;
+    out.syscall = e.syscall;
+    out.code = e.code;
+    if (e.path !== undefined) out.path = e.path;
+    try { out.stack = e.stack; } catch { /* frozen stack: keep our own */ }
+    return out;
+  }
+
+  // node's ERR_OUT_OF_RANGE guard on a read into a caller-supplied buffer.
+  // Without it an over-long `length` reaches the native, which then allocates
+  // it -- `fs.read(fd, Buffer.alloc(4), 0, 1e9)` is a gigabyte on our side and
+  // a synchronous throw on node's.
+  function validateReadLength(buffer, offset, length) {
+    if (!buffer || typeof length !== "number") return;
+    const room = buffer.byteLength - (offset || 0);
+    if (length > room) {
+      throw codes.ERR_OUT_OF_RANGE("length", "<= " + room, length);
+    }
+  }
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     return {
@@ -8585,14 +8625,20 @@
             if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
             await natives.fsWriteChunk(h, data);
           },
+          // `position` is a pwrite/pread offset: it writes/reads THERE and
+          // leaves the cursor alone. Both used to accept the argument and throw
+          // it away, because the natives had no position parameter to pass it
+          // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
           write: async function (buffer, offset, length, position) {
             if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
             var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
-            await natives.fsWriteChunk(h, slice);
+            await natives.fsWriteChunk(h, slice, fsPositionArg(position));
             return { bytesWritten: slice.length, buffer: buffer };
           },
           read: async function (buffer, offset, length, position) {
-            var chunk = await natives.fsReadChunk(h, length || 65536);
+            validateReadLength(buffer, offset, length);
+            var want = length != null ? length : (buffer ? buffer.byteLength - (offset || 0) : 65536);
+            var chunk = await natives.fsReadChunk(h, want, fsPositionArg(position));
             if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
             if (buffer) {
               var dest = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
@@ -9057,7 +9103,9 @@
           const o = offset;
           offset = o.offset ?? 0; length = o.length ?? (buffer ? buffer.length - offset : 0); position = o.position ?? null;
         }
-        return natives.fsReadSync(fd, buffer, offset ?? 0, length ?? (buffer ? buffer.length - (offset ?? 0) : 0), position ?? null);
+        const len = length ?? (buffer ? buffer.length - (offset ?? 0) : 0);
+        validateReadLength(buffer, offset ?? 0, len);
+        return natives.fsReadSync(fd, buffer, offset ?? 0, len, position ?? null);
       },
       writeSync: (fd, data, offsetOrPosition, length, position) => {
         // Buffer form: (fd, buffer, offset, length, position).
@@ -9078,7 +9126,13 @@
         // instead of throwing EBADF (pino/sonic-boom sync mode writes here).
         if (fd === 1) { natives.stdoutWrite(buf); return buf.length; }
         if (fd === 2) { natives.stderrWrite(buf); return buf.length; }
-        return natives.fsWriteSync(fd, buf, pos);
+        // ctxOrderError only here: fs.write and fs.writevSync route through the
+        // same native but keep node's common errno/code/syscall order.
+        try {
+          return natives.fsWriteSync(fd, buf, pos);
+        } catch (e) {
+          throw ctxOrderError(e);
+        }
       },
       opendirSync: function (path) {
         var dirPath = String(path);
@@ -9132,8 +9186,9 @@
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
-      // native open handle (a number) IS the integer fd. fsReadChunk reads
-      // sequentially, so `position` is honored only as null/current (no seek).
+      // native open handle (a number) IS the integer fd. fsReadChunk/
+      // fsWriteChunk take a position, so the positional (pread/pwrite) forms
+      // are honoured here as well as in the sync family.
       open: function (path, flags, mode, cb) {
         if (typeof flags === "function") { cb = flags; flags = "r"; }
         else if (typeof mode === "function") { cb = mode; }
@@ -9216,13 +9271,25 @@
           buffer = o.buffer || globalThis.Buffer.alloc(o.length || 16384);
           offset = o.offset || 0;
           length = o.length != null ? o.length : buffer.length - offset;
+          // o.position was the one field this form never read, so the options
+          // overload kept reading from the cursor after the positional overload
+          // below was fixed. readSync's object form has always honoured it.
+          position = o.position ?? null;
         }
         if (typeof offset === "function") { cb = offset; offset = 0; length = buffer ? buffer.length : 16384; }
         if (typeof length === "function") { cb = length; length = buffer ? buffer.length - (offset || 0) : 16384; }
         if (typeof position === "function") { cb = position; }
         if (typeof cb !== "function") throw new TypeError("Callback must be a function");
         var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
-        Promise.resolve(natives.fsReadChunk(fd, want)).then(
+        // Bounded by the destination, exactly as node bounds it -- and thrown
+        // SYNCHRONOUSLY even from this callback form, which is what node does.
+        validateReadLength(buffer, offset, want);
+        // The position was parsed above and then DROPPED -- fsReadChunk had no
+        // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
+        // cursor and handed back the wrong bytes with no error. The native now
+        // takes one; null still means "from the cursor".
+        var readPos = fsPositionArg(position);
+        Promise.resolve(natives.fsReadChunk(fd, want, readPos)).then(
           function (chunk) {
             if (chunk === undefined || chunk === null) {
               queueMicrotask(function () { cb(null, 0, buffer); });
@@ -9369,6 +9436,154 @@
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
     }
+
+    // ---- vectored IO: readv / writev, callback and sync forms.
+    //
+    // Built ON TOP of the read/write paths rather than as new natives: writev
+    // concatenates and issues one write, readv reads once and scatters. For a
+    // regular file that is indistinguishable from a real iovec call, and it
+    // inherits the positional (pread/pwrite) semantics those paths already have
+    // instead of growing a second copy of them.
+    //
+    // node exports these on node:fs ONLY. fs/promises has no top-level
+    // readv/writev -- there they are FileHandle methods.
+    //
+    // Behaviours measured against node v22.22.2, several of which are not what
+    // you would guess:
+    //   - the sync forms return a plain NUMBER, not {bytesRead, buffers}. Only
+    //     the FileHandle methods return objects.
+    //   - the callback is (err, bytes, buffers) and `buffers` is the SAME ARRAY
+    //     IDENTITY that went in, not a copy.
+    //   - an EMPTY ARRAY is asymmetric: writev returns 0, readv throws EINVAL
+    //     -- and the EINVAL is raised BEFORE the fd is looked at, so it wins
+    //     even on a closed descriptor.
+    //   - an array of only ZERO-LENGTH views is NOT the same case: readv
+    //     returns 0 rather than throwing. The rule keys on the array being
+    //     empty, not on the byte total.
+    //   - a partial final buffer keeps the rest of its bytes UNTOUCHED.
+    const asViewArray = (buffers) => {
+      // Index loop, NOT Array.prototype.every: every() skips holes, so a sparse
+      // array would slip through where node throws.
+      let ok = Array.isArray(buffers);
+      if (ok) {
+        for (let i = 0; i < buffers.length; i++) {
+          if (!ArrayBuffer.isView(buffers[i])) { ok = false; break; }
+        }
+      }
+      if (!ok) {
+        throw nodeTypeError(
+          `The "buffers" argument must be an ArrayBufferView[]. Received ${describeArg(buffers)}`,
+        );
+      }
+      let total = 0;
+      for (let i = 0; i < buffers.length; i++) total += buffers[i].byteLength;
+      return total;
+    };
+
+    // node's EINVAL for readv with an empty list. Own props in node's order.
+    const einvalRead = () => {
+      const err = new Error("EINVAL: invalid argument, read");
+      err.errno = natives.platform === "win32" ? -4071 : -22;
+      err.code = "EINVAL";
+      err.syscall = "read";
+      return err;
+    };
+
+    const flattenViews = (buffers, total) => {
+      const combined = globalThis.Buffer.allocUnsafe(total);
+      let off = 0;
+      for (let i = 0; i < buffers.length; i++) {
+        const v = buffers[i];
+        combined.set(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), off);
+        off += v.byteLength;
+      }
+      return combined;
+    };
+
+    // Scatter `n` bytes of `src` across the views, filling each in turn. A view
+    // that only partially fills keeps its remaining bytes as they were, because
+    // TypedArray.set writes exactly as many bytes as the source holds.
+    const scatterViews = (buffers, src, n) => {
+      let off = 0;
+      for (let i = 0; i < buffers.length && off < n; i++) {
+        const v = buffers[i];
+        const take = Math.min(v.byteLength, n - off);
+        if (take > 0) {
+          new Uint8Array(v.buffer, v.byteOffset, v.byteLength).set(src.subarray(off, off + take));
+        }
+        off += take;
+      }
+    };
+
+    // ONLY an empty array skips the descriptor. An array of zero-length views
+    // is a different case: it still issues the syscall, so it still reports
+    // EBADF on a closed or wrong-mode fd. Returning 0 early for both conflated
+    // "no iovecs" with "no bytes" and made readvSync(closedFd, [Buffer.alloc(0)])
+    // succeed where node throws.
+    const emptyList = (buffers) => buffers.length === 0;
+
+    fs.writevSync = (fd, buffers, position) => {
+      const total = asViewArray(buffers);
+      // node returns 0 without touching the descriptor -- measured: writev([])
+      // on a CLOSED fd does not throw.
+      if (emptyList(buffers)) return 0;
+      return natives.fsWriteSync(fd, flattenViews(buffers, total), fsPositionArg(position));
+    };
+
+    fs.readvSync = (fd, buffers, position) => {
+      const total = asViewArray(buffers);
+      // Before the fd check, deliberately: node raises this even for a closed
+      // descriptor.
+      if (emptyList(buffers)) throw einvalRead();
+      const tmp = globalThis.Buffer.allocUnsafe(total);
+      const n = natives.fsReadSync(fd, tmp, 0, total, fsPositionArg(position));
+      scatterViews(buffers, tmp, n);
+      return n;
+    };
+
+    const vectoredCallback = (cb) => {
+      if (typeof cb !== "function") {
+        throw nodeTypeError(
+          `The "cb" argument must be of type function. Received ${describeArg(cb)}`,
+        );
+      }
+      return cb;
+    };
+
+    // The two validation failures land DIFFERENTLY, which is easy to get
+    // backwards: node's validateBufferArray runs at the call site and THROWS
+    // synchronously (node:fs:758), while the empty-list EINVAL is delivered to
+    // the callback. Routing both through the callback meant a try/catch around
+    // fs.readv silently stopped firing.
+    fs.writev = function (fd, buffers, position, cb) {
+      if (typeof position === "function") { cb = position; position = null; }
+      cb = vectoredCallback(cb);
+      const total = asViewArray(buffers);
+      if (emptyList(buffers)) { queueMicrotask(() => cb(null, 0, buffers)); return; }
+      // Reuses fs.write, so the position handling lives in exactly one place.
+      fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
+        err ? cb(err, 0, buffers) : cb(null, written, buffers),
+      );
+    };
+
+    fs.readv = function (fd, buffers, position, cb) {
+      if (typeof position === "function") { cb = position; position = null; }
+      cb = vectoredCallback(cb);
+      const total = asViewArray(buffers);
+      if (emptyList(buffers)) {
+        // This one IS deferred, and beats the fd: node reports EINVAL through
+        // the callback even for a closed descriptor.
+        queueMicrotask(() => cb(einvalRead(), 0, buffers));
+        return;
+      }
+      const tmp = globalThis.Buffer.allocUnsafe(total);
+      fs.read(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
+        if (err) { cb(err, 0, buffers); return; }
+        scatterViews(buffers, tmp, n);
+        // The SAME array instance goes back, which callers compare by identity.
+        cb(null, n, buffers);
+      });
+    };
 
     // ---- openAsBlob
     //

@@ -1,9 +1,10 @@
 {
-  "_doc": "Per-test overrides + denominator ratchet for the node-suite harness. Default = a test is runnable. Add { \"skip\": true, \"reason\": \"...\", \"category\": \"known_issues\"|\"flaky\"|\"\" } ONLY for genuinely-unrunnable tests (native addon, internals flag, platform-N/A). 'ratchet': maxSkips/maxKnownIssues CAP the discretionary skip count (only ever LOWER them); minPass is a pass-count FLOOR (only ever RAISE it) so a node-compat regression that drops the pass count reddens CI. node-suite exits non-zero if skips exceed a ceiling OR passes fall below the floor. Auto-detected unrunnables (// Flags, missing node: builtin) are NOT counted against the skip ceiling. Raising minPass after landing fixes locks the gain in.",
+  "_doc": "Per-test overrides + denominator ratchet for the node-suite harness. Default = a test is runnable. Add { \"skip\": true, \"reason\": \"...\", \"category\": \"known_issues\"|\"flaky\"|\"\" } ONLY for genuinely-unrunnable tests (native addon, internals flag, platform-N/A). Add { \"deliberate\": true, \"reason\": \"...\" } for a test oam fails ON PURPOSE and intends to keep failing -- that one is NOT a skip: it still runs, still counts in `fail`, and stays in the denominator, so it cannot flatter the pass rate; it only moves the test out of the report's triage-backlog section so a settled decision is not mistaken for unfinished work. 'ratchet': maxSkips/maxKnownIssues CAP the discretionary skip count and maxDeliberate CAPs the deliberate count (only ever LOWER them); minPass is a pass-count FLOOR (only ever RAISE it) so a node-compat regression that drops the pass count reddens CI. node-suite exits non-zero if skips or deliberates exceed a ceiling OR passes fall below the floor -- so relabelling a real regression as intentional needs an explicit, reviewable ratchet bump. Auto-detected unrunnables (// Flags, missing node: builtin) are NOT counted against the skip ceiling. Raising minPass after landing fixes locks the gain in.",
   "nodeVersion": "v22.22.2",
   "ratchet": {
     "maxSkips": 1,
     "maxKnownIssues": 0,
+    "maxDeliberate": 2,
     "minPass": 429,
     "minPassByHost": {
       "linux-x86_64": 439,
@@ -16,6 +17,14 @@
       "skip": true,
       "reason": "needs test/addons/not-a-binding, a COMPILED native addon fixture the vendored subset does not ship. The test's real assertion (that the filename is concatenated into the ERR_DLOPEN_FAILED message rather than used as a format string) PASSES on oam; it then dies in fs.accessSync on the missing fixture dir. Real node v22.22.2 fails it identically from this same vendored tree, so it measures the vendoring, not oam.",
       "category": ""
+    },
+    "parallel/test-process-versions.js": {
+      "deliberate": true,
+      "reason": "Asserts a strict deep-equal on the process.versions KEY SET, which requires 'ares', 'uv', 'nghttp2', 'llhttp', 'openssl', 'uvwasi', 'simdjson', 'ada', 'cjs_module_lexer' and friends -- C libraries oam does not link. oam publishes the dependency tree it ACTUALLY builds against, generated from Cargo.lock at build time (v8, tokio, hickory, rustls, ring, oxc, hyper, brotli, flate2, icu, url). Passing would mean deleting the real names and inventing the absent ones, i.e. having process.versions state something false about the binary. The honest surface is worth more than the test."
+    },
+    "parallel/test-process-binding-internalbinding-allowlist.js": {
+      "deliberate": true,
+      "reason": "Asserts all 24 legacy process.binding names are truthy. oam models the ones it can back with the REAL implementation (constants, util, tty_wrap.isTTY) taken by identity off the public surface, and THROWS for the rest -- mostly libuv handle classes (TCP, UDP, Pipe, JSStream, FSEvent) it has nothing behind. Returning {} would claim them, and it is also worse for the caller than throwing: a package that feature-detects process.binding('tcp_wrap'), gets an empty object and proceeds hits a TypeError deep in its own code, where the throw sends it straight to the fallback branch that is correct for oam. See js/node_compat.js (process.binding)."
     }
   }
 }
