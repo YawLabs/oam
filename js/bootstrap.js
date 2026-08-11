@@ -482,6 +482,18 @@
       function cloneInner(v) {
         if (v === null || (typeof v !== "object" && typeof v !== "function")) return v;
         if (memo.has(v)) return memo.get(v);
+        // A file-backed Blob (fs.openAsBlob) is NOT cloneable in node -- it
+        // holds a file reference, not bytes, so a clone would outlive the
+        // guarantee. node throws a plain TypeError, not a DataCloneError:
+        //   TypeError: Invalid state: File-backed Blobs are not cloneable
+        // Marked with a cross-realm registered symbol because the marker is set
+        // in node_compat's fs factory, which cannot see this scope. A symbol
+        // key also keeps it out of Object.keys, so it introduces no structural
+        // difference of its own. Checked HERE rather than at the entry point so
+        // a blob nested inside a cloned object throws too, as node's does.
+        if (v[Symbol.for("oam.blob.fileBacked")] === true) {
+          throw new TypeError("Invalid state: File-backed Blobs are not cloneable");
+        }
         if (v instanceof Date) { const c = new Date(v); memo.set(v, c); return c; }
         if (v instanceof RegExp) { const c = new RegExp(v.source, v.flags); memo.set(v, c); return c; }
         if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) {
@@ -567,9 +579,29 @@
         const bytes = new Uint8Array(size);
         let offset = 0;
         for (const piece of pieces) { bytes.set(piece, offset); offset += piece.length; }
-        this._bytes = bytes;
-        this._type = (options && typeof options.type === "string")
-          ? options.type.toLowerCase() : "";
+        // NON-ENUMERABLE, and that is load-bearing rather than tidiness.
+        // These were plain assignments, so a Blob's internals were own
+        // ENUMERABLE properties: `Object.keys(blob)` returned
+        // ["_bytes","_type"] where node returns [], and -- much worse --
+        // `JSON.stringify(blob)` serialised the ENTIRE payload as a numeric
+        // object ({"0":104,"1":105,...}) where node gives {}. Any log line or
+        // API response carrying an object with a Blob in it dumped the whole
+        // buffer: a memory blowup, and file contents in places they should
+        // never reach. Same reasoning for `writable` -- `slice` below reassigns
+        // `_bytes`, which needs the property to already exist and be writable
+        // or the assignment would create a fresh enumerable one.
+        Object.defineProperty(this, "_bytes", {
+          value: bytes,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+        Object.defineProperty(this, "_type", {
+          value: (options && typeof options.type === "string") ? options.type.toLowerCase() : "",
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
       }
       get size() { return this._bytes.length; }
       get type() { return this._type; }

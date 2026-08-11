@@ -1,5 +1,5 @@
 {
-  "commit": "15f9946",
+  "commit": "9b72dd8",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -310,10 +310,14 @@
         {
           "case": "76-fs-fd-one-descriptor-space.mjs",
           "status": "pass"
+        },
+        {
+          "case": "77-fs-open-as-blob.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 76,
-      "total": 76
+      "pass": 77,
+      "total": 77
     },
     "surface": {
       "exports": {
@@ -544,7 +548,7 @@
             ]
           }
         ],
-        "knownMissing": 421,
+        "knownMissing": 420,
         "newMissing": [],
         "noBaseline": false,
         "nodeTotal": 1874,
