@@ -8437,6 +8437,29 @@
     return data;
   }
 
+  // node's internal time coercion, shared by the fs and fs/promises factories
+  // (fs re-exports it as `_toUnixTimestamp`, which wrappers in the wild call).
+  // Yields SECONDS, as node's does; the natives take milliseconds, so every
+  // caller multiplies. Defined out here rather than duplicated because the two
+  // factories cannot see each other's locals and `fs/promises` is BUILT FIRST
+  // (the fs factory opens by calling registry.get("fs/promises")), so reaching
+  // across at construction time is not an option.
+  function toUnixSeconds(time, name) {
+    if (typeof time === "string" && Number(time) === Number(time)) return Number(time);
+    if (typeof time === "number" && Number.isFinite(time)) {
+      // A negative time means "now" in node, not a pre-epoch date.
+      return time < 0 ? Date.now() / 1000 : time;
+    }
+    if (time instanceof Date) return time.getTime() / 1000;
+    // node's wording verbatim, odd article and all ("or an Time in seconds"),
+    // because assert.throws({ message }) compares it exactly.
+    throw nodeTypeError(
+      `The "${name ?? "time"}" argument must be an instance of Date or an Time in seconds. ` +
+        `Received ${describeArg(time)}`,
+    );
+  }
+  const toUnixMs = (time, name) => toUnixSeconds(time, name) * 1000;
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     return {
@@ -8491,6 +8514,24 @@
       link: (existing, newPath) => natives.fsLink(String(existing), String(newPath)),
       chmod: (path, mode) => natives.fsChmod(String(path), mode),
       truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
+      chown: (path, uid, gid) => natives.fsChown(String(path), uid, gid),
+      lchown: (path, uid, gid) => natives.fsLchown(String(path), uid, gid),
+      utimes: (path, atime, mtime) =>
+        natives.fsUtimes(String(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      lutimes: (path, atime, mtime) =>
+        natives.fsLutimes(String(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      // lchmod diverges between the two modules, which is easy to get wrong.
+      // In `node:fs` the name is bound to UNDEFINED off macOS. Here in
+      // `fs/promises` it is ALWAYS a function, and off macOS it REJECTS.
+      // Measured on win32 node v22.22.2: `typeof fsp.lchmod === "function"`,
+      // and calling it rejects with a plain Error carrying only a `code` own
+      // property -- name "Error", not a subclass.
+      lchmod: (path, mode) => {
+        if (natives.platform === "darwin") return natives.fsLchmod(String(path), mode);
+        const err = new Error("The lchmod() method is not implemented");
+        err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+        return Promise.reject(err);
+      },
       opendir: async function (path) {
         var dirPath = String(path);
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
@@ -9228,20 +9269,9 @@
       },
       // node's internal time coercion, exported (unprefixed by convention but
       // public enough that utimes wrappers in the wild call it).
-      _toUnixTimestamp: function _toUnixTimestamp(time, name) {
-        if (typeof time === "string" && Number(time) === Number(time)) return Number(time);
-        if (typeof time === "number" && Number.isFinite(time)) {
-          // A negative time means "now" in node, not a pre-epoch date.
-          return time < 0 ? Date.now() / 1000 : time;
-        }
-        if (time instanceof Date) return time.getTime() / 1000;
-        // node's wording verbatim, odd article and all ("or an Time in
-        // seconds"), because assert.throws({ message }) compares it exactly.
-        throw nodeTypeError(
-          `The "${name ?? "time"}" argument must be an instance of Date or an Time in seconds. ` +
-            `Received ${describeArg(time)}`,
-        );
-      },
+      // Shared with the fs/promises factory rather than defined twice --
+      // see toUnixSeconds above.
+      _toUnixTimestamp: toUnixSeconds,
     };
     // ---- fd-based ops: fsync / fdatasync / ftruncate / fchmod / fchown /
     // futimes, callback and sync forms.
@@ -9258,7 +9288,7 @@
     // op. Node reports a bad descriptor through the callback, never at the call
     // site, so the throw has to be caught and re-delivered -- the same shape
     // `fstat` uses above.
-    const fdCallbackOp = (run) =>
+    const voidCallbackOp = (run) =>
       function (...args) {
         const cb = args.pop();
         if (typeof cb !== "function") throw new TypeError("Callback must be a function");
@@ -9277,19 +9307,16 @@
         );
       };
 
-    // node's coercion yields SECONDS; both the libc (futimens) and Win32
-    // (SetFileTime) backends behind the native want milliseconds.
-    const utimeMs = (time, name) => fs._toUnixTimestamp(time, name) * 1000;
 
-    fs.fsync = fdCallbackOp((fd) => natives.fsFsync(fd));
-    fs.fdatasync = fdCallbackOp((fd) => natives.fsFdatasync(fd));
+    fs.fsync = voidCallbackOp((fd) => natives.fsFsync(fd));
+    fs.fdatasync = voidCallbackOp((fd) => natives.fsFdatasync(fd));
     // node permits `ftruncate(fd, cb)` with the length omitted, which lands
     // here as undefined once the callback is popped.
-    fs.ftruncate = fdCallbackOp((fd, len) => natives.fsFtruncate(fd, len ?? 0));
-    fs.fchmod = fdCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
-    fs.fchown = fdCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
-    fs.futimes = fdCallbackOp((fd, atime, mtime) =>
-      natives.fsFutimes(fd, utimeMs(atime, "atime"), utimeMs(mtime, "mtime")),
+    fs.ftruncate = voidCallbackOp((fd, len) => natives.fsFtruncate(fd, len ?? 0));
+    fs.fchmod = voidCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
+    fs.fchown = voidCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
+    fs.futimes = voidCallbackOp((fd, atime, mtime) =>
+      natives.fsFutimes(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
     );
 
     fs.fsyncSync = (fd) => { natives.fsFsyncSync(fd); };
@@ -9298,8 +9325,50 @@
     fs.fchmodSync = (fd, mode) => { natives.fsFchmodSync(fd, mode); };
     fs.fchownSync = (fd, uid, gid) => { natives.fsFchownSync(fd, uid, gid); };
     fs.futimesSync = (fd, atime, mtime) => {
-      natives.fsFutimesSync(fd, utimeMs(atime, "atime"), utimeMs(mtime, "mtime"));
+      natives.fsFutimesSync(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
     };
+
+    // ---- path-based ownership / time: chown, lchown, utimes, lutimes, lchmod.
+    //
+    // The `l` forms act on a symlink itself rather than its target, which is
+    // the only reason they exist.
+    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(String(p), uid, gid));
+    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(String(p), uid, gid));
+    fs.utimes = voidCallbackOp((p, atime, mtime) =>
+      natives.fsUtimes(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+    );
+    fs.lutimes = voidCallbackOp((p, atime, mtime) =>
+      natives.fsLutimes(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+    );
+
+    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(String(p), uid, gid); };
+    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(String(p), uid, gid); };
+    fs.utimesSync = (p, atime, mtime) => {
+      natives.fsUtimesSync(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+    };
+    fs.lutimesSync = (p, atime, mtime) => {
+      natives.fsLutimesSync(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+    };
+
+    // lchmod is macOS-only. node gates its own on O_SYMLINK -- which the BSD
+    // family has and Linux does not -- and OFF macOS it publishes the NAME with
+    // the value left undefined. Measured on win32 node v22.22.2: `lchmod` is an
+    // own enumerable key, `typeof fs.lchmod === "undefined"`, and
+    // `import { lchmod } from "node:fs"` links fine and binds undefined.
+    //
+    // So the correct shape off macOS is a present key holding undefined -- NOT
+    // a stub that throws. Assigning undefined creates the own enumerable key,
+    // which is exactly what the ESM named export is derived from, so the import
+    // links; and calling it gives "fs.lchmod is not a function", byte-for-byte
+    // what node gives. A throwing stub would link the same and then diverge on
+    // the message.
+    if (process.platform === "darwin") {
+      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(String(p), mode));
+      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(String(p), mode); };
+    } else {
+      fs.lchmod = undefined;
+      fs.lchmodSync = undefined;
+    }
 
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;

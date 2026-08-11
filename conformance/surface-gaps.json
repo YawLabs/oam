@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.1 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1395,
-        "missing": 389,
+        "present": 1410,
+        "missing": 374,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -177,31 +177,16 @@
           "usingDomains"
         ],
         "fs": [
-          "chown",
-          "chownSync",
           "glob",
           "globSync",
-          "lchmod",
-          "lchmodSync",
-          "lchown",
-          "lchownSync",
-          "lutimes",
-          "lutimesSync",
           "openAsBlob",
           "readv",
           "readvSync",
-          "utimes",
-          "utimesSync",
           "writev",
           "writevSync"
         ],
         "fs/promises": [
-          "chown",
           "glob",
-          "lchmod",
-          "lchown",
-          "lutimes",
-          "utimes",
           "watch"
         ],
         "global:AbortController.prototype": [
@@ -533,8 +518,8 @@
       "generatedAgainst": "v22.23.1 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1395,
-        "missing": 393,
+        "present": 1410,
+        "missing": 378,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -709,31 +694,16 @@
           "usingDomains"
         ],
         "fs": [
-          "chown",
-          "chownSync",
           "glob",
           "globSync",
-          "lchmod",
-          "lchmodSync",
-          "lchown",
-          "lchownSync",
-          "lutimes",
-          "lutimesSync",
           "openAsBlob",
           "readv",
           "readvSync",
-          "utimes",
-          "utimesSync",
           "writev",
           "writevSync"
         ],
         "fs/promises": [
-          "chown",
           "glob",
-          "lchmod",
-          "lchown",
-          "lutimes",
-          "utimes",
           "watch"
         ],
         "global:AbortController.prototype": [
@@ -1065,8 +1035,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1338,
-        "missing": 436,
+        "present": 1353,
+        "missing": 421,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -1284,31 +1254,16 @@
           "usingDomains"
         ],
         "fs": [
-          "chown",
-          "chownSync",
           "glob",
           "globSync",
-          "lchmod",
-          "lchmodSync",
-          "lchown",
-          "lchownSync",
-          "lutimes",
-          "lutimesSync",
           "openAsBlob",
           "readv",
           "readvSync",
-          "utimes",
-          "utimesSync",
           "writev",
           "writevSync"
         ],
         "fs/promises": [
-          "chown",
           "glob",
-          "lchmod",
-          "lchown",
-          "lutimes",
-          "utimes",
           "watch"
         ],
         "global:AbortController.prototype": [
