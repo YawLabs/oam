@@ -771,30 +771,6 @@ comment, **not** something measured. Do not rely on either the claim or its nega
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 
-### A file descriptor does not cross the sync/async boundary
-
-CONFIRMED, and the one on this list most likely to bite a real program.
-
-oam keeps **two** descriptor registries — one for the async fs family and one for the
-sync family — and an fd allocated in one is invisible to the other. Node has a single
-descriptor space, so a descriptor from any `open` works with every other call.
-
-```js
-const fd = await new Promise((res, rej) =>
-  fs.open(p, 'r', (e, d) => (e ? rej(e) : res(d))));
-fs.readSync(fd, buf, 0, 4, 0);   // node: reads.  oam: throws EBADF
-fs.fstatSync(fd);                 // node: stats.  oam: throws EBADF
-fs.closeSync(fd);                 // node: closes. oam: throws EBADF
-```
-
-The reverse direction fails too: `fs.read` on an fd from `fs.openSync` reports an error.
-
-It fails loudly (EBADF) rather than silently, which is why it is documented rather than
-patched — the fix is to unify the two registries into one descriptor space, which is a
-design change, not a local repair. Until then, keep a descriptor on the side of the API
-it came from: an fd from `openSync` for the `*Sync` calls, an fd from `open`/`promises`
-for the callback and promise calls. `fs.promises.open`'s `FileHandle` is unaffected,
-because its methods are bound to the handle rather than to a raw number.
 
 ---
 

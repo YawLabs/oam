@@ -2992,7 +2992,7 @@ fn op_fs_fstat(
     // slow device cannot stall every other fd op.
     let cloned = {
         let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get(&fd) {
+        match guard.files.get(&fd) {
             None => {
                 throw_ebadf(scope, "fstat");
                 return;
@@ -3032,7 +3032,7 @@ fn clone_registered_fd(
     oam_core::adopt_inherited_fd(files, fd);
     let cloned = {
         let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(&fd).map(|file| file.try_clone())
+        guard.files.get(&fd).map(|file| file.try_clone())
     };
     match cloned {
         None => {
@@ -3056,7 +3056,7 @@ where
     oam_core::adopt_inherited_fd(&files, fd);
     let outcome = {
         let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(&fd).map(action)
+        guard.files.get(&fd).map(action)
     };
     match outcome {
         None => throw_ebadf(scope, syscall),
@@ -4032,6 +4032,7 @@ fn op_fs_open_sync(
             core.sync_files()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .files
                 .insert(id, file);
             let val = v8::Number::new(scope, id as f64);
             rv.set(val.into());
@@ -4120,6 +4121,7 @@ fn op_fs_read_sync(
     let read_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
         guard
+            .files
             .get_mut(&fd)
             .map(|file| read_at(file, &mut tmp, pos_seek))
     };
@@ -4178,6 +4180,7 @@ fn op_fs_write_sync(
     let write_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
         guard
+            .files
             .get_mut(&fd)
             .map(|file| write_at(file, &bytes, pos_seek))
     };
@@ -4207,6 +4210,7 @@ fn op_fs_close_sync(
     let removed = files
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .files
         .remove(&fd)
         .is_some();
     if !removed {
@@ -4238,7 +4242,7 @@ fn op_fs_fstat_sync(
     // Held across the whole read: fstat has no path to reopen from, so the
     // extra fields have to come off the descriptor the caller already owns.
     let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-    let payload = guard.get(&fd).map(|file| {
+    let payload = guard.files.get(&fd).map(|file| {
         file.metadata()
             .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(file)))
     });
@@ -4932,6 +4936,7 @@ fn arg_stdio_spec(
             let dup = files
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .files
                 .get(&target)
                 // A dup, so handing it to the child leaves the caller's fd
                 // usable and independently closable.
@@ -5131,6 +5136,7 @@ fn op_spawn_extra(
                 let dup = files
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
+                    .files
                     .get(&target)
                     .and_then(|f| f.try_clone().ok());
                 match dup {
