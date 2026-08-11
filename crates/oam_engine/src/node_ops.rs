@@ -487,23 +487,44 @@ fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
     oam_core::node_errno(code, error)
 }
 
+/// Throw node's system-error shape for a PATH operation.
+///
+/// `path` is reported verbatim, including when it is genuinely empty:
+/// `fs.openSync("")` gives node `ENOENT: no such file or directory, open ''`
+/// with `path: ''` present. For an operation on a descriptor, which has no
+/// path at all, use `throw_fd_error` -- inferring "no path" from `path == ""`
+/// conflated the two and stripped the quotes off every empty-path error.
 fn throw_node_error(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
     path: &str,
     error: &std::io::Error,
 ) {
-    // An EMPTY path means this came from an fd operation, where a denial can
-    // only mean the descriptor is open in the wrong mode -- node reports EBADF,
-    // not EACCES. See oam_core::fd_error_code.
-    let code = if path.is_empty() {
-        oam_core::fd_error_code(error)
-    } else {
-        node_error_code(error)
-    };
+    let code = node_error_code(error);
     let message = node_error_message(code, syscall, path, error);
+    throw_system_error(scope, code, &message, syscall, Some(path), error);
+}
+
+/// Throw node's system-error shape for an operation on an ALREADY-OPEN
+/// descriptor: no `path` property, no path segment in the message, and a
+/// wrong-mode denial reported as EBADF rather than EACCES (see
+/// `oam_core::fd_error_code`).
+fn throw_fd_error(scope: &mut v8::PinScope<'_, '_>, syscall: &str, error: &std::io::Error) {
+    let code = oam_core::fd_error_code(error);
+    let message = oam_core::node_error_message_fd(code, syscall, error);
+    throw_system_error(scope, code, &message, syscall, None, error);
+}
+
+fn throw_system_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    code: &str,
+    message: &str,
+    syscall: &str,
+    path: Option<&str>,
+    error: &std::io::Error,
+) {
     let message_v8 =
-        v8::String::new(scope, &message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
+        v8::String::new(scope, message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
     let exception = v8::Exception::error(scope, message_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
         // ORDER IS PART OF THE SHAPE. `Object.keys(err)` is observable, and
@@ -519,8 +540,15 @@ fn throw_node_error(
             let val = v8::Integer::new(scope, errno);
             obj.set(scope, key.into(), val.into());
         }
-        let props: [(&str, &str); 3] = [("code", code), ("syscall", syscall), ("path", path)];
-        for (name, value) in props {
+        // `path` is present only for a path operation. An fd error has no path
+        // in node at all -- it is not an empty one -- and emitting `path: ''`
+        // put a fourth key on `Object.keys(err)` that node never has.
+        let props = [
+            Some(("code", code)),
+            Some(("syscall", syscall)),
+            path.map(|p| ("path", p)),
+        ];
+        for (name, value) in props.into_iter().flatten() {
             let key = v8::String::new(scope, name).unwrap();
             if let Some(value) = v8::String::new(scope, value) {
                 obj.set(scope, key.into(), value.into());
@@ -528,6 +556,22 @@ fn throw_node_error(
         }
     }
     scope.throw_exception(exception);
+}
+
+/// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
+/// absent / null / negative means "from the current cursor". Shared by the four
+/// read/write natives so the coercion cannot drift between them.
+fn optional_position(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> Option<u64> {
+    let value = args.get(index);
+    if !value.is_number() {
+        return None;
+    }
+    let p = value.number_value(scope).unwrap_or(-1.0);
+    if p >= 0.0 { Some(p as u64) } else { None }
 }
 
 pub(crate) fn arg_string(
@@ -3007,7 +3051,7 @@ fn op_fs_fstat(
             Some(file) => match file.try_clone() {
                 Ok(cloned) => cloned,
                 Err(e) => {
-                    throw_node_error(scope, "fstat", "", &e);
+                    throw_fd_error(scope, "fstat", &e);
                     return;
                 }
             },
@@ -3896,13 +3940,7 @@ fn op_fs_read_chunk(
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     // Optional third arg: a read POSITION. Absent/null means "from the
     // cursor", which is what the stream readers pass.
-    let position = args.get(2);
-    let position = if position.is_number() {
-        let p = position.number_value(scope).unwrap_or(-1.0);
-        if p >= 0.0 { Some(p as u64) } else { None }
-    } else {
-        None
-    };
+    let position = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
@@ -3921,11 +3959,14 @@ fn op_fs_write_chunk(
         throw_type_error(scope, "fsWriteChunk requires data");
         return;
     };
+    // Optional third arg: a write POSITION (pwrite). Absent/null appends at the
+    // cursor, which is what the stream writers pass.
+    let position = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_write_chunk(files, handle, bytes),
+        oam_core::ops::fs_write_chunk(files, handle, bytes, position),
     );
 }
 
@@ -3972,48 +4013,10 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
     scope.throw_exception(exception);
 }
 
-/// fopen-style flag string -> OpenOptions. Mirrors Node's fs flag set; an
-/// unknown flag defaults to read-only (Node would throw, but lenient is
-/// safer for compat). `+`/`w`/`a`/`x` imply write.
-fn open_options_for(flags: &str) -> std::fs::OpenOptions {
-    let mut oo = std::fs::OpenOptions::new();
-    match flags {
-        "r" => {
-            oo.read(true);
-        }
-        "r+" | "rs+" | "sr+" => {
-            oo.read(true).write(true);
-        }
-        "w" => {
-            oo.write(true).create(true).truncate(true);
-        }
-        "wx" | "xw" => {
-            oo.write(true).create_new(true);
-        }
-        "w+" => {
-            oo.read(true).write(true).create(true).truncate(true);
-        }
-        "wx+" | "xw+" => {
-            oo.read(true).write(true).create_new(true);
-        }
-        "a" => {
-            oo.append(true).create(true);
-        }
-        "ax" | "xa" => {
-            oo.append(true).create_new(true);
-        }
-        "a+" => {
-            oo.read(true).append(true).create(true);
-        }
-        "ax+" | "xa+" => {
-            oo.read(true).append(true).create_new(true);
-        }
-        _ => {
-            oo.read(true);
-        }
-    }
-    oo
-}
+/// fopen-style flag string -> OpenOptions. Re-exported from oam_core so the
+/// sync and async opens cannot disagree about what a flag means -- they share
+/// one descriptor space, so they have to share one flag table too.
+use oam_core::open_options_for;
 
 /// fsOpenSync(path, flags) -> fd. Synchronous open backed by std::fs::File in
 /// the sync-file registry; the returned number is the integer fd. The classic
@@ -4099,13 +4102,13 @@ fn read_at(
 /// writes at the end; that is the OS's behaviour, node's too, and restoring the
 /// cursor afterwards does not change it.
 fn write_at(file: &mut std::fs::File, bytes: &[u8], position: Option<u64>) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom};
     let Some(p) = position else {
-        return file.write_all(bytes);
+        return oam_core::write_all_checked(file, bytes);
     };
     let saved = file.stream_position();
     file.seek(SeekFrom::Start(p))?;
-    let result = file.write_all(bytes);
+    let result = oam_core::write_all_checked(file, bytes);
     if let Ok(prev) = saved {
         let _ = file.seek(SeekFrom::Start(prev));
     }
@@ -4143,7 +4146,7 @@ fn op_fs_read_sync(
     };
     match read_result {
         None => throw_ebadf(scope, "read"),
-        Some(Err(e)) => throw_node_error(scope, "read", "", &e),
+        Some(Err(e)) => throw_fd_error(scope, "read", &e),
         Some(Ok(n)) => {
             if n > 0 {
                 let buf_value = args.get(1);
@@ -4202,7 +4205,7 @@ fn op_fs_write_sync(
     };
     match write_result {
         None => throw_ebadf(scope, "write"),
-        Some(Err(e)) => throw_node_error(scope, "write", "", &e),
+        Some(Err(e)) => throw_fd_error(scope, "write", &e),
         Some(Ok(())) => {
             let val = v8::Number::new(scope, bytes.len() as f64);
             rv.set(val.into());
@@ -4264,7 +4267,7 @@ fn op_fs_fstat_sync(
     });
     match payload {
         None => throw_ebadf(scope, "fstat"),
-        Some(Err(e)) => throw_node_error(scope, "fstat", "", &e),
+        Some(Err(e)) => throw_fd_error(scope, "fstat", &e),
         Some(Ok(json)) => return_json(scope, &mut rv, &json),
     }
 }

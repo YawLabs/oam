@@ -121,20 +121,24 @@ impl OpOutcome {
     /// A coded failure carrying node's full system-error shape. Use this
     /// wherever a syscall name and path are known -- it is what makes an
     /// async rejection indistinguishable from its sync twin.
+    ///
+    /// `path` is `None` for an fd-based call, which has no path at all, and
+    /// `Some("")` for a genuinely EMPTY path. Those are different shapes in
+    /// node -- `fs.promises.open("")` rejects with `path: ''` present, while a
+    /// bad-descriptor write has no `path` property -- so the caller states
+    /// which it means instead of it being inferred from emptiness.
     pub fn node_failed_at(
         code: impl Into<String>,
         message: impl Into<String>,
         syscall: &str,
-        path: &str,
+        path: Option<&str>,
         errno: Option<i32>,
     ) -> Self {
         OpOutcome::NodeFailed {
             code: code.into(),
             message: message.into(),
             syscall: Some(syscall.to_string()),
-            // node omits `path` entirely for fd-based calls rather than
-            // reporting an empty string.
-            path: (!path.is_empty()).then(|| path.to_string()),
+            path: path.map(|p| p.to_string()),
             errno,
         }
     }
@@ -988,28 +992,43 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
     }
 }
 
-/// Node-style error message: "ENOENT: no such file or directory, open 'p'".
-pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io::Error) -> String {
-    let reason = match code {
+/// The human-readable half of a node system-error message, keyed by code.
+fn node_error_reason(code: &str, error: &std::io::Error) -> String {
+    match code {
         "ENOENT" => "no such file or directory".to_string(),
         "EACCES" => "permission denied".to_string(),
         "EEXIST" => "file already exists".to_string(),
         "ENOTEMPTY" => "directory not empty".to_string(),
         "ENOTDIR" => "not a directory".to_string(),
         "EISDIR" => "illegal operation on a directory".to_string(),
+        "EINVAL" => "invalid argument".to_string(),
         // Reachable via fd_error_code: without this the OS text ("Access is
         // denied. (os error 5)") would leak into the message.
         "EBADF" => "bad file descriptor".to_string(),
         _ => error.to_string(),
-    };
-    // An fd operation has NO path, and node omits the segment entirely rather
-    // than printing an empty one: "EBADF: bad file descriptor, write", not
-    // "... write ''". oam printed the empty quotes.
-    if path.is_empty() {
-        format!("{code}: {reason}, {syscall}")
-    } else {
-        format!("{code}: {reason}, {syscall} '{path}'")
     }
+}
+
+/// Node-style error message for a PATH operation: "ENOENT: no such file or
+/// directory, open 'p'".
+///
+/// The path segment is always printed, including for a genuinely empty path --
+/// `fs.openSync("")` gives node `ENOENT: no such file or directory, open ''`,
+/// quotes and all. Absence of a path is a DIFFERENT thing from an empty one and
+/// gets its own function (`node_error_message_fd`) rather than being inferred
+/// from `path.is_empty()`; keying on emptiness conflated the two and silently
+/// dropped the quotes from every empty-path error.
+pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io::Error) -> String {
+    let reason = node_error_reason(code, error);
+    format!("{code}: {reason}, {syscall} '{path}'")
+}
+
+/// Node-style error message for an FD operation, which has no path at all:
+/// "EBADF: bad file descriptor, write" -- no trailing segment, not an empty
+/// one. Pairs with `fd_error_code`.
+pub fn node_error_message_fd(code: &str, syscall: &str, error: &std::io::Error) -> String {
+    let reason = node_error_reason(code, error);
+    format!("{code}: {reason}, {syscall}")
 }
 
 /// Error code for an operation on an ALREADY-OPEN descriptor.
@@ -1025,6 +1044,71 @@ pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io
 ///
 /// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
 /// wrong-mode handle where POSIX returns EBADF directly.
+/// fopen-style flag string -> OpenOptions. Mirrors Node's fs flag set; an
+/// unknown flag defaults to read-only (Node would throw, but lenient is
+/// safer for compat). `+`/`w`/`a`/`x` imply write.
+///
+/// Lives here, not in the engine, because BOTH opens need it. The async
+/// `fs_open` used to carry its own three-arm r/w/a table, so a descriptor the
+/// sync family could open was rejected by the async one:
+/// `fs.promises.open(p, "r+")` failed with `fs_open: unknown mode 'r+'` --
+/// not even a node-shaped error -- and every read/write-mode flag was
+/// unreachable from `fs.promises.open` and callback `fs.open`.
+pub fn open_options_for(flags: &str) -> std::fs::OpenOptions {
+    let mut oo = std::fs::OpenOptions::new();
+    match flags {
+        "r" => {
+            oo.read(true);
+        }
+        "r+" | "rs+" | "sr+" => {
+            oo.read(true).write(true);
+        }
+        "w" => {
+            oo.write(true).create(true).truncate(true);
+        }
+        "wx" | "xw" => {
+            oo.write(true).create_new(true);
+        }
+        "w+" => {
+            oo.read(true).write(true).create(true).truncate(true);
+        }
+        "wx+" | "xw+" => {
+            oo.read(true).write(true).create_new(true);
+        }
+        "a" => {
+            oo.append(true).create(true);
+        }
+        "ax" | "xa" => {
+            oo.append(true).create_new(true);
+        }
+        "a+" => {
+            oo.read(true).append(true).create(true);
+        }
+        "ax+" | "xa+" => {
+            oo.read(true).append(true).create_new(true);
+        }
+        _ => {
+            oo.read(true);
+        }
+    }
+    oo
+}
+
+/// `write_all`, except that an EMPTY buffer still issues one write syscall.
+///
+/// `std`'s `write_all` loops `while !buf.is_empty()`, so a zero-byte write
+/// never reaches the OS and never validates the descriptor. Node's does:
+/// `writevSync(fd, [Buffer.alloc(0)])` reports EBADF on a closed or wrong-mode
+/// fd rather than quietly returning 0. Only an EMPTY LIST skips the descriptor
+/// entirely, and that case never gets here.
+pub fn write_all_checked(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return file.write(bytes).map(|_| ());
+    }
+    file.write_all(bytes)
+}
+
 pub fn fd_error_code(error: &std::io::Error) -> &'static str {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         "EBADF"
@@ -1496,8 +1580,27 @@ pub mod ops {
             code,
             super::node_error_message(code, syscall, path, &error),
             syscall,
-            path,
+            Some(path),
             super::node_errno(code, &error),
+        )
+    }
+
+    /// EBADF for a handle that is not (or no longer) in the registry -- node's
+    /// answer for any fd call on a closed descriptor.
+    ///
+    /// This surfaced as `Failed("fs stream: handle N is gone")`, an internal
+    /// diagnostic with no `code`/`syscall`/`errno` at all, so an async read on
+    /// a closed fd rejected with a bare Error where node gives EBADF.
+    fn node_fail_ebadf(syscall: &str) -> OpOutcome {
+        // POSIX EBADF; the windows errno table keys on the code string instead
+        // of the raw value, so this is correct on both.
+        let error = std::io::Error::from_raw_os_error(9);
+        OpOutcome::node_failed_at(
+            "EBADF",
+            super::node_error_message_fd("EBADF", syscall, &error),
+            syscall,
+            None,
+            super::node_errno("EBADF", &error),
         )
     }
 
@@ -1510,9 +1613,9 @@ pub mod ops {
         let code = super::fd_error_code(&error);
         OpOutcome::node_failed_at(
             code,
-            super::node_error_message(code, syscall, "", &error),
+            super::node_error_message_fd(code, syscall, &error),
             syscall,
-            "",
+            None,
             super::node_errno(code, &error),
         )
     }
@@ -2164,7 +2267,7 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
             Err((code, message, errno)) => {
-                OpOutcome::node_failed_at(code, message, "access", &path, errno)
+                OpOutcome::node_failed_at(code, message, "access", Some(path.as_str()), errno)
             }
         })
         .await;
@@ -3071,23 +3174,17 @@ pub mod ops {
         }
     }
 
-    /// Open a file for streaming. Mode: "r" read, "w" truncate-create,
-    /// "a" append-create. Resolves with Json {handle}.
+    /// Open a file for streaming. Takes node's full fopen-style flag set via
+    /// the shared `open_options_for` table -- the same one the sync open uses,
+    /// so a flag that works on `fs.openSync` works here too. Resolves with
+    /// Json {handle}.
     pub async fn fs_open(
         files: super::FileRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         path: String,
         mode: String,
     ) -> OpOutcome {
-        let mut options = std::fs::OpenOptions::new();
-        match mode.as_str() {
-            "r" => options.read(true),
-            "w" => options.write(true).create(true).truncate(true),
-            "a" => options.append(true).create(true),
-            other => {
-                return OpOutcome::Failed(format!("fs_open: unknown mode '{other}'"));
-            }
-        };
+        let options = super::open_options_for(&mode);
         // std OpenOptions on the blocking pool rather than tokio::fs, so the
         // descriptor lands in the ONE registry the sync family also reads.
         // tokio::fs::open is this exact call on this exact pool.
@@ -3149,9 +3246,15 @@ pub mod ops {
             .files
             .remove(&handle);
         let Some(mut file) = file else {
-            return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
+            return node_fail_ebadf("read");
         };
-        let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
+        // Exactly `len`, unclamped -- same as the sync twin's `vec![0u8; length]`.
+        // An 8 MiB ceiling here silently short-read anything bigger (a 10 MiB
+        // readv reported 8388608 where readvSync and node both report
+        // 10485760), and the old min-of-1 turned a zero-length read into a
+        // one-byte one. `len` is bounded by the caller's own destination buffer
+        // on the JS side, which is where node bounds it too (ERR_OUT_OF_RANGE).
+        let mut buf = vec![0u8; len];
         // The File moves onto the blocking pool and comes back with the read's
         // result, because the remove-operate-reinsert dance needs it returned
         // whichever way the read went.
@@ -3188,13 +3291,15 @@ pub mod ops {
                 );
             }
         };
+        // Reinstate the descriptor BEFORE branching on the outcome. A failed
+        // read does not close the file in node, but the error arm used to drop
+        // `file` here: the OS handle closed and the registry entry vanished, so
+        // the fd that had just reported EBADF was then genuinely dead and every
+        // later write/close on it failed too. Only fsClose retires a handle.
+        reinsert_file(&files, handle, file);
         match result {
-            Ok(0) => {
-                reinsert_file(&files, handle, file);
-                OpOutcome::Done
-            }
+            Ok(0) => OpOutcome::Done,
             Ok(n) => {
-                reinsert_file(&files, handle, file);
                 buf.truncate(n);
                 OpOutcome::Bytes(buf)
             }
@@ -3202,21 +3307,28 @@ pub mod ops {
         }
     }
 
-    /// Append one chunk to an open handle (the node:stream write queue
+    /// Write one chunk to an open handle (the node:stream write queue
     /// serializes callers).
+    ///
+    /// `position` = None appends at the cursor; Some(p) is a `pwrite` -- writes
+    /// at p and leaves the cursor alone, which is what a positional
+    /// `FileHandle.write` means. A descriptor opened in APPEND mode ignores the
+    /// position and always writes at the end; that is the OS's behaviour and
+    /// node's, and restoring the cursor afterwards does not change it.
     pub async fn fs_write_chunk(
         files: super::FileRegistry,
         handle: u64,
         bytes: Vec<u8>,
+        position: Option<u64>,
     ) -> OpOutcome {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom};
         let file = files
             .lock()
             .expect("file registry lock")
             .files
             .remove(&handle);
         let Some(mut file) = file else {
-            return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
+            return node_fail_ebadf("write");
         };
         // Node's contract is callback-after-syscall.
         //
@@ -3233,25 +3345,38 @@ pub mod ops {
         // cannot be reintroduced by forgetting a flush, because there is no
         // buffer to forget about.
         let done = tokio::task::spawn_blocking(move || {
-            let r = file.write_all(&bytes);
+            // pwrite when a position is given: save, seek, write, restore --
+            // the same rule `fs_read_chunk` and the sync family follow.
+            let r = match position {
+                None => super::write_all_checked(&mut file, &bytes),
+                Some(p) => {
+                    let saved = file.stream_position();
+                    match file.seek(SeekFrom::Start(p)) {
+                        Ok(_) => {
+                            let r = super::write_all_checked(&mut file, &bytes);
+                            if let Ok(prev) = saved {
+                                let _ = file.seek(SeekFrom::Start(prev));
+                            }
+                            r
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
             (file, r)
         })
         .await;
         let (file, written) = match done {
             Ok(t) => t,
             Err(e) => {
-                return node_fail(
-                    std::io::Error::other(e.to_string()),
-                    "write",
-                    &handle.to_string(),
-                );
+                return node_fail_fd(std::io::Error::other(e.to_string()), "write");
             }
         };
+        // Reinstated before branching: a failed write must not retire the
+        // descriptor. See the matching note in `fs_read_chunk`.
+        reinsert_file(&files, handle, file);
         match written {
-            Ok(()) => {
-                reinsert_file(&files, handle, file);
-                OpOutcome::Done
-            }
+            Ok(()) => OpOutcome::Done,
             Err(e) => node_fail_fd(e, "write"),
         }
     }

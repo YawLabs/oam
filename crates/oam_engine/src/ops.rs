@@ -556,6 +556,21 @@ pub(crate) fn settle_completion(
                 // path. Without syscall/path/errno an async rejection was
                 // distinguishable from its sync twin, and ecosystem code that
                 // reads err.syscall / err.path got undefined.
+                //
+                // errno goes on FIRST, exactly as on the sync path: node
+                // enumerates errno, code, syscall and `Object.keys(err)` is
+                // observable. Setting it last gave async rejections
+                // ["code","syscall","errno"] where the sync twin -- and node --
+                // give ["errno","code","syscall"].
+                // errno is a Number (node's negative libuv code), not a string.
+                if let Some(errno) = errno
+                    && let Some(key) = v8::String::new(tc, "errno")
+                {
+                    let value = v8::Integer::new(tc, errno);
+                    obj.set(tc, key.into(), value.into());
+                }
+                // `path` is absent (not empty) for an fd operation -- see
+                // OpOutcome::node_failed_at.
                 let strings = [
                     ("code", Some(code.as_str())),
                     ("syscall", syscall.as_deref()),
@@ -568,13 +583,6 @@ pub(crate) fn settle_completion(
                     else {
                         continue;
                     };
-                    obj.set(tc, key.into(), value.into());
-                }
-                // errno is a Number (node's negative libuv code), not a string.
-                if let Some(errno) = errno
-                    && let Some(key) = v8::String::new(tc, "errno")
-                {
-                    let value = v8::Integer::new(tc, errno);
                     obj.set(tc, key.into(), value.into());
                 }
             }

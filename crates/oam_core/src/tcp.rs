@@ -93,7 +93,7 @@ fn tcp_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
         code,
         node_error_message(code, syscall, target, &error),
         syscall,
-        "",
+        None,
         node_errno(code, &error),
     )
 }

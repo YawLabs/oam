@@ -1,5 +1,5 @@
 {
-  "commit": "704fb19",
+  "commit": "3f4fa9e",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -318,10 +318,14 @@
         {
           "case": "78-fs-vectored-io.mjs",
           "status": "pass"
+        },
+        {
+          "case": "79-fs-fd-errors-and-positions.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 78,
-      "total": 78
+      "pass": 79,
+      "total": 79
     },
     "surface": {
       "exports": {
