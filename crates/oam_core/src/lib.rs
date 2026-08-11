@@ -2275,22 +2275,25 @@ pub mod ops {
     /// `futimens(2)` / `SetFileTime`. Times arrive as milliseconds since the
     /// unix epoch -- what the JS layer produces from a number, a Date or a
     /// numeric string.
+    /// Milliseconds since the epoch -> `timespec`.
+    ///
+    /// floor + remainder rather than a plain cast: for a negative time (before
+    /// 1970, which node permits) a truncating cast rounds toward zero and lands
+    /// a nanosecond field whose sign disagrees with its seconds.
+    #[cfg(unix)]
+    fn to_timespec(ms: f64) -> libc::timespec {
+        let secs = (ms / 1000.0).floor();
+        let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
+        libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: nanos as _,
+        }
+    }
+
     fn futimes_file(file: &std::fs::File, atime_ms: f64, mtime_ms: f64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            fn to_timespec(ms: f64) -> libc::timespec {
-                // floor + remainder rather than a plain cast: for a negative
-                // time (before 1970, which node permits) a truncating cast
-                // would round toward zero and land a nanosecond field that
-                // disagrees in sign with its seconds.
-                let secs = (ms / 1000.0).floor();
-                let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
-                libc::timespec {
-                    tv_sec: secs as libc::time_t,
-                    tv_nsec: nanos as _,
-                }
-            }
             let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
             let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
             if rc == 0 {
@@ -2400,6 +2403,200 @@ pub mod ops {
         mtime_ms: f64,
     ) -> std::io::Result<()> {
         futimes_file(file, atime_ms, mtime_ms)
+    }
+
+    // ----------------------------------------------- path-based ownership/time
+    //
+    // chown / lchown / utimes / lutimes / lchmod. Unlike the fd family above,
+    // these name a path, so they DO take a permission check at the op layer.
+    //
+    // Behaviours below were measured against node v22.22.2 on win32 rather than
+    // reasoned about, because two of them are counter-intuitive:
+    //   - chownSync on a NONEXISTENT path returns cleanly on Windows. libuv's
+    //     chown is a no-op there and never touches the path, so there is no
+    //     ENOENT to report. Validating the path first would be MORE correct in
+    //     the abstract and would diverge from node.
+    //   - the error `syscall` is the singular `utime` / `lutime`, not the
+    //     plural spelling of the JS function.
+
+    /// `chown(2)` / `lchown(2)`, selected by `follow`.
+    fn chown_path(path: &str, uid: u32, gid: u32, follow: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let c = std::ffi::CString::new(path).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains an interior NUL byte",
+                )
+            })?;
+            // -1 in either field means "leave it alone"; node passes it through
+            // unsigned, so the wrap back to the signed libc type is the round
+            // trip we want, not an accident.
+            let rc = unsafe {
+                if follow {
+                    libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
+                } else {
+                    libc::lchown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
+                }
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // See the note above: node succeeds here even for a path that does
+            // not exist. Deliberately no stat.
+            let _ = (path, uid, gid, follow);
+            Ok(())
+        }
+    }
+
+    /// `utimensat(2)` / `SetFileTime`, selected by `follow`.
+    fn utimes_path(path: &str, atime_ms: f64, mtime_ms: f64, follow: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let c = std::ffi::CString::new(path).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path contains an interior NUL byte",
+                )
+            })?;
+            let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
+            let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES is the minimum right SetFileTime needs --
+            // asking for GENERIC_WRITE would fail on a read-only file that node
+            // can still stamp.
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+            // Without BACKUP_SEMANTICS a DIRECTORY cannot be opened at all, and
+            // node's utimes works on directories (measured).
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            // lutimes: stamp the link itself rather than following it.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+            if !follow {
+                flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+            }
+            let file = std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(flags)
+                .open(path)?;
+            // Same SetFileTime path the fd form uses -- one epoch conversion,
+            // not two spellings of it.
+            futimes_file(&file, atime_ms, mtime_ms)
+        }
+    }
+
+    /// `lchmod`, macOS only -- node gates its own on `O_SYMLINK`, which the BSD
+    /// family has and Linux does not, and exposes the name bound to `undefined`
+    /// elsewhere (measured on win32 v22.22.2). The JS layer mirrors that, so
+    /// this is never reached off macOS.
+    ///
+    /// Spelled `fchmodat(AT_FDCWD, .., AT_SYMLINK_NOFOLLOW)` rather than
+    /// `lchmod`: the libc crate does NOT expose `lchmod` for
+    /// aarch64-apple-darwin, so the obvious spelling is a hard compile error on
+    /// the macOS leg -- caught here by cross-target clippy, which is the only
+    /// way to see it from a Windows box. `fchmodat` is the portable spelling of
+    /// the same call and is what the BSDs document.
+    #[cfg(target_os = "macos")]
+    fn lchmod_path(path: &str, mode: u32) -> std::io::Result<()> {
+        let c = std::ffi::CString::new(path).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            )
+        })?;
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub async fn fs_chown(path: String, uid: u32, gid: u32, follow: bool) -> OpOutcome {
+        let syscall = if follow { "chown" } else { "lchown" };
+        let owned = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || chown_path(&owned, uid, gid, follow)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, syscall, &path),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), syscall, &path),
+        }
+    }
+
+    pub async fn fs_utimes(path: String, atime_ms: f64, mtime_ms: f64, follow: bool) -> OpOutcome {
+        // node reports the SINGULAR syscall name here (measured).
+        let syscall = if follow { "utime" } else { "lutime" };
+        let owned = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || utimes_path(&owned, atime_ms, mtime_ms, follow))
+                .await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, syscall, &path),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), syscall, &path),
+        }
+    }
+
+    pub fn fs_chown_sync(path: &str, uid: u32, gid: u32, follow: bool) -> std::io::Result<()> {
+        chown_path(path, uid, gid, follow)
+    }
+
+    pub fn fs_utimes_sync(
+        path: &str,
+        atime_ms: f64,
+        mtime_ms: f64,
+        follow: bool,
+    ) -> std::io::Result<()> {
+        utimes_path(path, atime_ms, mtime_ms, follow)
+    }
+
+    /// macOS-only; the JS layer never calls this elsewhere (the export is bound
+    /// to `undefined` off macOS, matching node).
+    pub fn fs_lchmod_sync(path: &str, mode: u32) -> std::io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            lchmod_path(path, mode)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, mode);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "lchmod is only available on macOS",
+            ))
+        }
+    }
+
+    pub async fn fs_lchmod(path: String, mode: u32) -> OpOutcome {
+        let owned = path.clone();
+        let result = tokio::task::spawn_blocking(move || fs_lchmod_sync(&owned, mode)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, "lchmod", &path),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "lchmod", &path),
+        }
     }
 
     pub async fn read_text_file(path: String) -> OpOutcome {

@@ -263,6 +263,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsFchmodSync", op_fs_fchmod_sync),
         ("fsFchownSync", op_fs_fchown_sync),
         ("fsFutimesSync", op_fs_futimes_sync),
+        // fs path-based ownership/time (chown/lchown/utimes/lutimes/lchmod)
+        ("fsChown", op_fs_chown),
+        ("fsLchown", op_fs_lchown),
+        ("fsUtimes", op_fs_utimes),
+        ("fsLutimes", op_fs_lutimes),
+        ("fsLchmod", op_fs_lchmod),
+        ("fsChownSync", op_fs_chown_sync),
+        ("fsLchownSync", op_fs_lchown_sync),
+        ("fsUtimesSync", op_fs_utimes_sync),
+        ("fsLutimesSync", op_fs_lutimes_sync),
+        ("fsLchmodSync", op_fs_lchmod_sync),
         // node:zlib (one-shot)
         ("zlibSync", op_zlib_sync),
         ("zlibAsync", op_zlib_async),
@@ -3210,6 +3221,210 @@ fn op_fs_futimes_sync(
     with_registered_fd(scope, fd, "futime", |file| {
         oam_core::ops::fs_futimes_sync(file, atime, mtime)
     });
+}
+
+// ------------------------------------------- path-based ownership / time ops
+//
+// chown / lchown / utimes / lutimes / lchmod. These NAME a path, so unlike the
+// fd family they are not exempt-by-capability -- every one takes a write check.
+// `lchown` and `lutimes` act on the link itself, which is the whole point of
+// their existence, so the check is on the link path as written.
+
+/// uid/gid pair. node passes -1 through unsigned to mean "leave unchanged".
+fn chown_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+) -> (u32, u32) {
+    let uid = args.get(1).uint32_value(scope).unwrap_or(u32::MAX);
+    let gid = args.get(2).uint32_value(scope).unwrap_or(u32::MAX);
+    (uid, gid)
+}
+
+fn op_fs_chown(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "chown requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (uid, gid) = chown_args(scope, &args);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_chown(path, uid, gid, true),
+    );
+}
+
+fn op_fs_lchown(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lchown requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (uid, gid) = chown_args(scope, &args);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_chown(path, uid, gid, false),
+    );
+}
+
+fn op_fs_utimes(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "utimes requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_utimes(path, atime, mtime, true),
+    );
+}
+
+fn op_fs_lutimes(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lutimes requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_utimes(path, atime, mtime, false),
+    );
+}
+
+fn op_fs_lchmod(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lchmod requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_lchmod(path, mode));
+}
+
+fn op_fs_chown_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "chownSync requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (uid, gid) = chown_args(scope, &args);
+    if let Err(e) = oam_core::ops::fs_chown_sync(&path, uid, gid, true) {
+        throw_node_error(scope, "chown", &path, &e);
+    }
+}
+
+fn op_fs_lchown_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lchownSync requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (uid, gid) = chown_args(scope, &args);
+    if let Err(e) = oam_core::ops::fs_chown_sync(&path, uid, gid, false) {
+        throw_node_error(scope, "lchown", &path, &e);
+    }
+}
+
+fn op_fs_utimes_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "utimesSync requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    // node reports the SINGULAR `utime` here, not `utimes`.
+    if let Err(e) = oam_core::ops::fs_utimes_sync(&path, atime, mtime, true) {
+        throw_node_error(scope, "utime", &path, &e);
+    }
+}
+
+fn op_fs_lutimes_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lutimesSync requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    if let Err(e) = oam_core::ops::fs_utimes_sync(&path, atime, mtime, false) {
+        throw_node_error(scope, "lutime", &path, &e);
+    }
+}
+
+fn op_fs_lchmod_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(path) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "lchmodSync requires a path");
+        return;
+    };
+    if !check_write_perm(scope, &path) {
+        return;
+    }
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    if let Err(e) = oam_core::ops::fs_lchmod_sync(&path, mode) {
+        throw_node_error(scope, "lchmod", &path, &e);
+    }
 }
 
 fn op_fs_statfs(
