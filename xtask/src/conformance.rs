@@ -274,7 +274,9 @@ pub fn run(release: bool) -> Result<()> {
         },
     });
     let scorecard_path = repo.join("conformance/scorecard.json");
-    std::fs::write(&scorecard_path, serde_json::to_string_pretty(&scorecard)?)?;
+    // Held, not written yet: the receipts are compared and written as a GROUP
+    // at the end of this function. See write_receipts.
+    let scorecard_json = serde_json::to_string_pretty(&scorecard)?;
 
     // ---------------------------------------------------------- dashboard
     let ctor_pass = wpt["constructor"]["pass"].as_u64().unwrap_or(0);
@@ -355,7 +357,10 @@ pub fn run(release: bool) -> Result<()> {
              known list to shrink.\n",
         );
     }
-    std::fs::write(repo.join("CONFORMANCE.md"), md)?;
+    let rewrote = write_receipts(&[
+        (scorecard_path, scorecard_json),
+        (repo.join("CONFORMANCE.md"), md),
+    ])?;
 
     println!();
     println!(
@@ -385,7 +390,14 @@ pub fn run(release: bool) -> Result<()> {
                 + exports.stale_absent_modules.len(),
         );
     }
-    println!("wrote CONFORMANCE.md + conformance/scorecard.json");
+    println!(
+        "{}",
+        if rewrote {
+            "wrote CONFORMANCE.md + conformance/scorecard.json (results changed)"
+        } else {
+            "CONFORMANCE.md + conformance/scorecard.json unchanged (tree left clean)"
+        }
+    );
 
     // Gate: the hand-curated node-differential cases are the deterministic
     // node-compat guard (byte-identical stdout+exit vs Node). Any divergence
@@ -664,6 +676,54 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
     out
 }
 
+/// Write generated receipt files, but ONLY when something other than the
+/// provenance stamp changed. Returns whether anything was written.
+///
+/// The stamp (commit sha + oam version) moves on EVERY run, so writing
+/// unconditionally meant a pure VERIFICATION run rewrote four committed files
+/// with six lines of metadata and no result change -- leaving a dirty tree for
+/// a human to inspect and discard. `release-local.sh` grew restore_gate_artifacts
+/// for exactly that, but it only covers the release path: an ad-hoc
+/// `xtask conformance` still dirtied the repo, and a dirty file that means
+/// nothing trains you to discard dirty files that mean something.
+///
+/// Now a dirty receipt means the RESULTS moved, which is worth looking at.
+///
+/// Compared and written as a GROUP so a markdown file and its JSON twin can
+/// never disagree about which run produced them -- the JSON carries `host` and
+/// `nodeVersion` as their own fields, so a same-results run on a different host
+/// still rewrites both.
+pub(crate) fn write_receipts(files: &[(PathBuf, String)]) -> Result<bool> {
+    let changed = files
+        .iter()
+        .any(|(path, next)| match std::fs::read_to_string(path) {
+            Ok(prev) => strip_stamp(&prev) != strip_stamp(next),
+            Err(_) => true,
+        });
+    if !changed {
+        return Ok(false);
+    }
+    for (path, contents) in files {
+        std::fs::write(path, contents)?;
+    }
+    Ok(true)
+}
+
+/// Drop the provenance lines -- the markdown header and the JSON twin's
+/// `commit` / `oamVersion`. Everything else, results included, stays
+/// significant.
+fn strip_stamp(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !(t.starts_with("Commit `")
+                || t.starts_with("\"commit\":")
+                || t.starts_with("\"oamVersion\":"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn repo_root() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Ok(manifest
@@ -814,6 +874,82 @@ fn first_difference(a: &str, b: &str) -> Value {
         return json!({ "line": al.min(bl) + 1, "oam": format!("<{al} lines>"), "node": format!("<{bl} lines>") });
     }
     json!(null)
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oam-receipt-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir.join(name)
+    }
+
+    #[test]
+    fn a_stamp_only_change_does_not_rewrite() {
+        // The whole point: a verification run that found no drift must leave
+        // the working tree untouched, so a dirty receipt always means the
+        // RESULTS moved.
+        let md = tmp("CONFORMANCE.md");
+        let json = tmp("scorecard.json");
+        std::fs::write(
+            &md,
+            "Commit `aaaaaaa` | oam 0.9.0 | host x\n\n**79 / 79 cases.**\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &json,
+            "{\n  \"commit\": \"aaaaaaa\",\n  \"oamVersion\": \"oam 0.9.0\",\n  \"pass\": 79\n}",
+        )
+        .unwrap();
+
+        let wrote = write_receipts(&[
+            (md.clone(), "Commit `bbbbbbb` | oam 0.9.1 | host x\n\n**79 / 79 cases.**\n".into()),
+            (json.clone(), "{\n  \"commit\": \"bbbbbbb\",\n  \"oamVersion\": \"oam 0.9.1\",\n  \"pass\": 79\n}".into()),
+        ])
+        .unwrap();
+
+        assert!(!wrote, "stamp-only drift must not rewrite");
+        assert!(std::fs::read_to_string(&md).unwrap().contains("aaaaaaa"));
+    }
+
+    #[test]
+    fn a_result_change_rewrites_both_twins() {
+        // And when a result DOES move, the markdown and its JSON twin are
+        // written together -- they must never disagree about which run
+        // produced them, even though only one of them changed.
+        let md = tmp("CONFORMANCE2.md");
+        let json = tmp("scorecard2.json");
+        std::fs::write(&md, "Commit `aaaaaaa` | oam 0.9.0\n\n**79 / 79 cases.**\n").unwrap();
+        std::fs::write(&json, "{\n  \"commit\": \"aaaaaaa\",\n  \"pass\": 79\n}").unwrap();
+
+        let wrote = write_receipts(&[
+            (
+                md.clone(),
+                "Commit `bbbbbbb` | oam 0.9.0\n\n**78 / 79 cases.**\n".into(),
+            ),
+            (
+                json.clone(),
+                "{\n  \"commit\": \"bbbbbbb\",\n  \"pass\": 78\n}".into(),
+            ),
+        ])
+        .unwrap();
+
+        assert!(wrote, "a result change must rewrite");
+        assert!(std::fs::read_to_string(&md).unwrap().contains("78 / 79"));
+        // The twin had no non-stamp change of its own in the md-only case, but
+        // both are rewritten so the stamps stay in step.
+        assert!(std::fs::read_to_string(&json).unwrap().contains("bbbbbbb"));
+    }
+
+    #[test]
+    fn a_missing_receipt_is_written() {
+        let md = tmp("CONFORMANCE3.md");
+        let _ = std::fs::remove_file(&md);
+        assert!(write_receipts(&[(md.clone(), "Commit `x`\n\nbody\n".into())]).unwrap());
+        assert!(md.exists());
+    }
 }
 
 #[cfg(test)]

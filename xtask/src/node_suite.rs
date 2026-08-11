@@ -164,7 +164,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
         }
     };
 
-    write_scorecard(
+    let rewrote = write_scorecard(
         &repo,
         &oam,
         &by_module,
@@ -186,7 +186,14 @@ pub(crate) fn run(release: bool) -> Result<()> {
         pct(pass, total)
     );
     println!("  {pass} pass  {fail} fail  {skip} skip  {unrunnable} unrunnable-by-harness");
-    println!("wrote CONFORMANCE-NODE.md + conformance/node-suite-scorecard.json");
+    println!(
+        "{}",
+        if rewrote {
+            "wrote CONFORMANCE-NODE.md + conformance/node-suite-scorecard.json (results changed)"
+        } else {
+            "CONFORMANCE-NODE.md + conformance/node-suite-scorecard.json unchanged (tree left clean)"
+        }
+    );
 
     // Skip-ratchet: the discretionary manifest skip count must stay within the
     // committed ceilings. Raising a ceiling is a reviewable diff; exceeding it
@@ -608,7 +615,7 @@ fn write_scorecard(
     fail: usize,
     skip: usize,
     unrunnable: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let oam_version = Command::new(oam)
         .arg("--version")
         .output()
@@ -670,10 +677,8 @@ fn write_scorecard(
             }))
             .collect::<Vec<_>>(),
     });
-    std::fs::write(
-        repo.join("conformance/node-suite-scorecard.json"),
-        serde_json::to_string_pretty(&scorecard)?,
-    )?;
+    // Held for the grouped write at the end -- see conformance::write_receipts.
+    let scorecard_json = serde_json::to_string_pretty(&scorecard)?;
 
     let mut md = String::new();
     md.push_str("# oam Node-suite scorecard\n\n");
@@ -727,8 +732,13 @@ fn write_scorecard(
             md.push_str(&format!("- `{name}` -- {detail}\n  - {reason}\n"));
         }
     }
-    std::fs::write(repo.join("CONFORMANCE-NODE.md"), md)?;
-    Ok(())
+    crate::conformance::write_receipts(&[
+        (
+            repo.join("conformance/node-suite-scorecard.json"),
+            scorecard_json,
+        ),
+        (repo.join("CONFORMANCE-NODE.md"), md),
+    ])
 }
 
 #[cfg(test)]
