@@ -17,3 +17,10 @@ node_modules/
 # broker runs from the repo root, so its screenshots/snapshots land here.
 /.playwright-mcp/
 /oam-example-render.png
+# `oam -e/-p` writes its throwaway script beside the cwd as
+# `.oam-eval-<pid>.<ext>` and unlinks it on exit -- but a run that dies first
+# leaves one behind, and two got committed into the vendored Node corpus that
+# way (d691fda). Not scanned by the node-suite harness, so they sat there
+# invisibly until a later cleanup deleted them and dirtied the release
+# preflight. Ignored at any depth, since the cwd is wherever oam was invoked.
+.oam-eval-*
