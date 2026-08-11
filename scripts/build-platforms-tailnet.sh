@@ -48,12 +48,12 @@ set -euo pipefail
 MODE="release"
 for arg in "$@"; do
   case "$arg" in
-    --mode=release|--mode=measure|--mode=bench) MODE="${arg#--mode=}" ;;
+    --mode=release|--mode=measure|--mode=bench|--mode=surface-gaps) MODE="${arg#--mode=}" ;;
     -h|--help)
       awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/, ""); print}' "$0"
       exit 0
       ;;
-    *) echo "unknown arg: $arg (want --mode=release|measure|bench)" >&2; exit 1 ;;
+    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps)" >&2; exit 1 ;;
   esac
 done
 
@@ -172,6 +172,16 @@ build_mac(){
       pull "$hp" "BENCHMARKS.md"      "$ARTIFACTS_DIR/mac-arm64/" || return 1
       pull "$hp" "bench/results.json" "$ARTIFACTS_DIR/mac-arm64/" || return 1
       ;;
+    surface-gaps)
+      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && bash scripts/build-remote.sh surface-gaps" || return 1
+      # The WHOLE ratchet file comes back, not a darwin fragment. The generator
+      # merges: it rewrites only platforms[darwin] and leaves the win32/linux
+      # sections exactly as they arrived in the sync. So the pulled file is
+      # "what we sent, with darwin re-measured", which is safe to overwrite the
+      # local copy with -- and is why these legs have to run one at a time,
+      # each starting from the previous one's output.
+      pull "$hp" "conformance/surface-gaps.json" "$REPO_DIR/conformance/" || return 1
+      ;;
   esac
 }
 
@@ -192,6 +202,17 @@ case "$MODE" in
     ;;
   measure) [ -f "$ARTIFACTS_DIR/mac-arm64/node-suite-scorecard.json" ] || fail "no scorecard staged" ;;
   bench)   [ -f "$ARTIFACTS_DIR/mac-arm64/results.json" ] || fail "no bench results staged" ;;
+  surface-gaps)
+    # Lands in the repo, not the staging dir -- assert darwin actually moved,
+    # since a silently-unchanged section is the failure this mode exists to
+    # prevent (the gate would then be measuring a host that never ran).
+    node -e '
+      const g = require(process.argv[1]);
+      const d = g.platforms && g.platforms.darwin;
+      if (!d) { console.error("no darwin section in the pulled ratchet"); process.exit(1); }
+      console.error(`darwin: ${d.counts.present}/${d.counts.nodeExportNames} present, generated against ${d.generatedAgainst}`);
+    ' "$REPO_DIR/conformance/surface-gaps.json" || fail "pulled ratchet has no darwin section"
+    ;;
 esac
 ok "all required artifacts staged under $ARTIFACTS_DIR"
 

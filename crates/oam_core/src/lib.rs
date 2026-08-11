@@ -2217,6 +2217,191 @@ pub mod ops {
         }
     }
 
+    // ------------------------------------------------- fd-based fs operations
+    //
+    // Each takes an owned `std::fs::File` the caller cloned out of the sync
+    // registry, the same shape `fs_fstat` uses. The descriptor can only have
+    // come from an `open` that was permission-checked, so these are
+    // exempt-by-capability in `permission_audit`: there is no path here to
+    // re-check, and node draws the line in the same place.
+    //
+    // The error `path` is empty for all of them because an fd genuinely has no
+    // path -- node reports these as `EBADF: bad file descriptor, fsync` with no
+    // path either.
+
+    /// `fchmod(2)`. Windows has no mode bits, only a read-only flag, so the
+    /// owner-write bit decides it -- the same reduction `fs_chmod` already makes
+    /// for the path form.
+    fn fchmod_file(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = file.metadata()?.permissions();
+            perms.set_readonly(mode & 0o200 == 0);
+            file.set_permissions(perms)
+        }
+    }
+
+    /// `fchown(2)`. Windows has no uid/gid and libuv reports success there
+    /// rather than failing, so portable code does not have to branch on
+    /// platform. Mirrored deliberately: a no-op that reports success is node's
+    /// documented behaviour here, not an omission.
+    fn fchown_file(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // -1 means "leave this one alone". node hands it through as an
+            // unsigned value, so the wrap back to the signed libc type is the
+            // intended round trip rather than an accident.
+            let rc =
+                unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, uid, gid);
+            Ok(())
+        }
+    }
+
+    /// `futimens(2)` / `SetFileTime`. Times arrive as milliseconds since the
+    /// unix epoch -- what the JS layer produces from a number, a Date or a
+    /// numeric string.
+    fn futimes_file(file: &std::fs::File, atime_ms: f64, mtime_ms: f64) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            fn to_timespec(ms: f64) -> libc::timespec {
+                // floor + remainder rather than a plain cast: for a negative
+                // time (before 1970, which node permits) a truncating cast
+                // would round toward zero and land a nanosecond field that
+                // disagrees in sign with its seconds.
+                let secs = (ms / 1000.0).floor();
+                let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
+                libc::timespec {
+                    tv_sec: secs as libc::time_t,
+                    tv_nsec: nanos as _,
+                }
+            }
+            let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
+            let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::Storage::FileSystem::SetFileTime;
+            // FILETIME counts 100ns ticks from 1601-01-01; the unix epoch is
+            // 11644473600 seconds later.
+            fn to_filetime(ms: f64) -> FILETIME {
+                let ticks = ((ms + 11_644_473_600_000.0) * 10_000.0).round().max(0.0) as u64;
+                FILETIME {
+                    dwLowDateTime: (ticks & 0xFFFF_FFFF) as u32,
+                    dwHighDateTime: (ticks >> 32) as u32,
+                }
+            }
+            let atime = to_filetime(atime_ms);
+            let mtime = to_filetime(mtime_ms);
+            // Null creation time leaves it untouched, which is what futimes
+            // means -- it sets access and modification only.
+            let ok =
+                unsafe { SetFileTime(file.as_raw_handle() as _, std::ptr::null(), &atime, &mtime) };
+            if ok != 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+
+    /// `fsync(2)` / `fdatasync(2)`. std spells them `sync_all` and `sync_data`
+    /// and handles the platform mapping (`FlushFileBuffers` on Windows, where
+    /// there is no data-only variant and both collapse to the same call).
+    pub async fn fs_fsync(file: std::fs::File, data_only: bool) -> OpOutcome {
+        let syscall = if data_only { "fdatasync" } else { "fsync" };
+        let result = tokio::task::spawn_blocking(move || {
+            if data_only {
+                file.sync_data()
+            } else {
+                file.sync_all()
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, syscall, ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), syscall, ""),
+        }
+    }
+
+    pub async fn fs_ftruncate(file: std::fs::File, len: u64) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || file.set_len(len)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, "ftruncate", ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "ftruncate", ""),
+        }
+    }
+
+    pub async fn fs_fchmod(file: std::fs::File, mode: u32) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || fchmod_file(&file, mode)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, "fchmod", ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchmod", ""),
+        }
+    }
+
+    pub async fn fs_fchown(file: std::fs::File, uid: u32, gid: u32) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || fchown_file(&file, uid, gid)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, "fchown", ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchown", ""),
+        }
+    }
+
+    pub async fn fs_futimes(file: std::fs::File, atime_ms: f64, mtime_ms: f64) -> OpOutcome {
+        let result =
+            tokio::task::spawn_blocking(move || futimes_file(&file, atime_ms, mtime_ms)).await;
+        match result {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail(e, "futime", ""),
+            Err(e) => node_fail(std::io::Error::other(e.to_string()), "futime", ""),
+        }
+    }
+
+    /// Synchronous twins. The sync fs family runs inline in the op callback
+    /// (no `spawn_op`), so these are called directly rather than awaited.
+    pub fn fs_fchmod_sync(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
+        fchmod_file(file, mode)
+    }
+
+    pub fn fs_fchown_sync(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+        fchown_file(file, uid, gid)
+    }
+
+    pub fn fs_futimes_sync(
+        file: &std::fs::File,
+        atime_ms: f64,
+        mtime_ms: f64,
+    ) -> std::io::Result<()> {
+        futimes_file(file, atime_ms, mtime_ms)
+    }
+
     pub async fn read_text_file(path: String) -> OpOutcome {
         match tokio::fs::read_to_string(&path).await {
             Ok(text) => OpOutcome::Text(text),
