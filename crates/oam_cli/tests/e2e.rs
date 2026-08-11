@@ -15672,3 +15672,135 @@ fn child_process_and_workers_cannot_escape_the_sandbox() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ------------------------- --permission at the other CLI entry points
+
+/// `oam --permission test <dir>` must actually sandbox the files it runs.
+///
+/// Regression, and the worst-shaped kind: `test_command` built an all-granted
+/// runtime and THEN called `flags.install()`. Permissions are fixed at
+/// construction -- the ops read an `Arc<Permissions>` out of an isolate slot
+/// written by `new_inner` -- so `install()` could not retrofit them. The flag
+/// was accepted, nothing was printed, and the test file ran with full disk,
+/// network and spawn access.
+///
+/// `oam --permission test` is exactly the command you reach for to run a test
+/// file you do not trust, which is what made silent acceptance worse than
+/// having no flag at all.
+#[test]
+fn permission_is_enforced_by_the_test_runner() {
+    let victim = write_temp("perm-test-runner/victim.txt", "original");
+    let victim_js = victim.to_string_lossy().replace('\\', "\\\\");
+    write_temp(
+        "perm-test-runner/escape.test.ts",
+        &format!(
+            "import {{ test }} from 'oam:test';\n\
+             import fs from 'node:fs';\n\
+             test('attempts a write', () => {{\n\
+               try {{\n\
+                 fs.writeFileSync('{victim_js}', 'ESCAPED');\n\
+                 console.log('WROTE');\n\
+               }} catch (e) {{\n\
+                 console.log('DENIED:' + (e && e.code));\n\
+               }}\n\
+             }});"
+        ),
+    );
+    let dir = write_temp("perm-test-runner/.anchor", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // Denied: the write must not land.
+    let out = oam(&["--permission", "test", dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("DENIED"),
+        "the test runner ignored --permission:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "original",
+        "a test file wrote through the sandbox"
+    );
+
+    // Granted: the same probe must succeed without the flag. Without this the
+    // assertion above would pass just as happily against a test that never ran.
+    let out = oam(&["test", dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("WROTE"),
+        "probe did not write without --permission, so the denial above proves \
+         nothing:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "ESCAPED");
+}
+
+/// `oam --permission` must sandbox the REPL too -- it used to drop straight
+/// into an all-granted prompt, so every line pasted at it ran outside the
+/// sandbox that was asked for.
+///
+/// The probe is `process.env` rather than an `fs` write, and not by preference:
+/// the REPL currently cannot reach a module at all. `require` is undefined
+/// there and dynamic import answers "not wired up on this entry path (REPL,
+/// timer, op callback, or test body)", so `node:fs` is out of reach from the
+/// prompt. `process` is a global and its `env` is filtered at CONSTRUCTION
+/// under the `env` permission, which is exactly the property this regressed on.
+///
+/// If module loading ever lands in the REPL, add an fs-write probe here too --
+/// that is the day this entry point starts being able to touch the disk.
+#[test]
+fn permission_is_enforced_in_the_repl() {
+    use std::io::Write;
+
+    let cache = write_temp("perm-repl-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let feed = |args: &[&str]| -> String {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("PERM_REPL_SECRET", "leaked")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("oam repl spawns");
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(b"console.log('ENV:' + process.env.PERM_REPL_SECRET)\n.exit\n")
+            .expect("feed the repl");
+        let out = child.wait_with_output().expect("repl exits");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let denied = feed(&["--permission"]);
+    assert!(
+        denied.contains("ENV:undefined"),
+        "the REPL ignored --permission -- the environment was readable from the \
+         prompt:\n{denied}"
+    );
+    assert!(
+        !denied.contains("leaked"),
+        "a secret reached a sandboxed REPL:\n{denied}"
+    );
+
+    // Without the flag the same line must print the value. Otherwise the
+    // assertion above would pass against a REPL that simply printed nothing.
+    let granted = feed(&[]);
+    assert!(
+        granted.contains("ENV:leaked"),
+        "probe read nothing in an unrestricted REPL, so the denial above proves \
+         nothing:\n{granted}"
+    );
+}

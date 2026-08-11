@@ -1000,7 +1000,11 @@ fn repl_command() -> ExitCode {
         "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
         env!("CARGO_PKG_VERSION")
     );
-    let mut rt = oam_engine::JsRuntime::new();
+    // Same construction-time rule as `test_command`: `oam --permission` used to
+    // drop into an all-granted REPL, so every line you pasted at the prompt ran
+    // outside the sandbox you asked for.
+    let flags = NODE_FLAGS.get().cloned().unwrap_or_default();
+    let mut rt = oam_engine::JsRuntime::new_with_permissions(flags.permissions());
     // The REPL doesn't call execute_module/execute_cjs (which run
     // reset_run_slots and create a CoreRuntime). Init it here so
     // tick() and repl_eval() have a Tokio runtime to drive ops on.
@@ -1166,7 +1170,15 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         if !json {
             eprintln!("{}", file.display());
         }
-        let mut rt = oam_engine::JsRuntime::new();
+        // Permissions are a CONSTRUCTION-time property -- `flags.install()`
+        // below cannot retrofit them, because the ops read the Arc<Permissions>
+        // out of an isolate slot populated by `new_inner`. This used to call the
+        // all-granted constructor with the install() call after it, so
+        // `oam --permission test suspect.test.js` ran the file completely
+        // unsandboxed while looking sandboxed -- worse than not offering the
+        // flag, because it invites you to run untrusted tests behind it.
+        let flags = NODE_FLAGS.get().cloned().unwrap_or_default();
+        let mut rt = oam_engine::JsRuntime::new_with_permissions(flags.permissions());
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "oam".to_string());
@@ -1178,14 +1190,11 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         // The test runner emits no 'beforeExit' at the module-eval drain --
         // Node --test emits only after the tests have run.
         rt.suppress_before_exit();
-        // Node flags parsed before the subcommand apply to test runtimes too
-        // (`oam --no-warnings test x.test.js`); each file gets a fresh
+        // The rest of the node flags are install-time; each file gets a fresh
         // isolate, so install per runtime.
-        if let Some(flags) = NODE_FLAGS.get() {
-            flags.install(&mut rt);
-            if flags.apply_env_files(&mut rt).is_err() {
-                return ExitCode::from(9);
-            }
+        flags.install(&mut rt);
+        if flags.apply_env_files(&mut rt).is_err() {
+            return ExitCode::from(9);
         }
 
         let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
@@ -2586,6 +2595,23 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
         }
     }
 
+    // ALL-GRANTED, deliberately -- audited as an exemption in
+    // `runtime_construction_audit` below, not an oversight.
+    //
+    // Two reasons a CLI permission flag cannot be honoured here. `main` calls
+    // this at the top, BEFORE the node-flag pre-parse runs, so `NODE_FLAGS` is
+    // never populated on this path. And the loop above deliberately forwards
+    // every unrecognised argument to the embedded script -- that pass-through
+    // is the contract for a self-contained binary, so lifting `--permission`
+    // out of argv would silently steal an argument from an app that defines its
+    // own.
+    //
+    // The gap this leaves is real: an embedded binary always runs unsandboxed
+    // and its user has no flag to change that. The right fix is to bake the
+    // grant set into the binary at build time, where the app author declares it
+    // and the user cannot weaken it -- an `oam build` feature, not an argv
+    // parse. Until that exists, do not describe embedded binaries as
+    // sandboxable.
     let mut rt = oam_engine::JsRuntime::new();
     // Seed embedded bytecode (v2 binaries) now that V8 is initialized, so the
     // CJS loader consumes it without needing a writable cache dir. Keyed by the
@@ -3064,5 +3090,107 @@ mod tests {
             ..Default::default()
         };
         assert!(listed.exec_argv().contains(&"--allow-net=a,b".to_string()));
+    }
+}
+
+/// Every all-granted runtime construction in this binary has to be something
+/// somebody wrote down.
+///
+/// `--permission` is only as strong as its weakest entry point. `oam run` and
+/// `oam -e` took a permission set from the start; `oam repl` and `oam test` did
+/// not, and used the all-granted constructor instead. So
+/// `oam --permission test suspect.test.js` accepted the flag, printed no
+/// warning, and ran the file with full disk, network and spawn access. A flag
+/// that is silently ignored is worse than one that does not exist, because it
+/// is precisely what you reach for when you already suspect the code.
+///
+/// Permissions are fixed at construction -- the ops read an `Arc<Permissions>`
+/// out of an isolate slot written by `new_inner` -- so this cannot be caught by
+/// looking at what happens after the runtime exists. It has to be checked at
+/// the call.
+///
+/// The engine-side sibling is `oam_engine`'s `permission_audit`, which holds
+/// every `op_*` to the same rule. That one cannot see CLI entry points; this
+/// one covers them.
+#[cfg(test)]
+mod runtime_construction_audit {
+    const SRC: &str = include_str!("main.rs");
+
+    /// How many call sites may build an all-granted runtime. Currently one:
+    /// `run_embedded`, which runs before the node-flag pre-parse and forwards
+    /// unrecognised argv straight to the embedded script.
+    ///
+    /// Raising this is a security decision, not a mechanical fix. An entry
+    /// point that can reach `NODE_FLAGS` should construct with
+    /// `flags.permissions()` rather than be added here.
+    const ALLOWED_ALL_GRANTED: usize = 1;
+
+    /// Entry points that must keep constructing WITH a permission set:
+    /// `run`, `eval`, `repl`, `test`.
+    const SANDBOX_CAPABLE_ENTRY_POINTS: usize = 4;
+
+    // Built at runtime from pieces so this module's own source does not match
+    // the scan it performs.
+    fn all_granted_needle() -> String {
+        format!("JsRuntime::{}", "new()")
+    }
+    fn declaration_marker() -> String {
+        format!("ALL-GRANTED, {}", "deliberately")
+    }
+    fn permissioned_needle() -> String {
+        format!("JsRuntime::{}", "new_with_permissions(")
+    }
+
+    #[test]
+    fn every_all_granted_runtime_is_declared() {
+        let needle = all_granted_needle();
+        let marker = declaration_marker();
+        let lines: Vec<&str> = SRC.lines().collect();
+        let mut sites = 0usize;
+        let mut undeclared = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(&needle) {
+                continue;
+            }
+            sites += 1;
+            // The justification has to sit directly above the call, not in some
+            // other file a reader will not open.
+            let from = i.saturating_sub(25);
+            if !lines[from..i].iter().any(|l| l.contains(&marker)) {
+                undeclared.push(i + 1);
+            }
+        }
+
+        assert!(
+            undeclared.is_empty(),
+            "main.rs builds an all-granted runtime at line(s) {undeclared:?} with no \
+             justification above the call.\nThat entry point ignores --permission: it \
+             will accept the flag and run with full disk, network and spawn access.\n\
+             Either construct it with `flags.permissions()` (see `test_command` / \
+             `repl_command`), or, if it genuinely cannot take a permission set, write a \
+             comment above the call containing `{marker}` explaining why and bump \
+             ALLOWED_ALL_GRANTED.",
+        );
+
+        assert_eq!(
+            sites, ALLOWED_ALL_GRANTED,
+            "expected {ALLOWED_ALL_GRANTED} all-granted runtime construction(s) in \
+             main.rs, found {sites}. A new one is a new way for --permission to be \
+             silently ignored -- justify it at the call site and update this constant, \
+             or give the entry point a permission set.",
+        );
+    }
+
+    #[test]
+    fn sandbox_capable_entry_points_still_take_permissions() {
+        let found = SRC.matches(&permissioned_needle()).count();
+        assert_eq!(
+            found, SANDBOX_CAPABLE_ENTRY_POINTS,
+            "expected {SANDBOX_CAPABLE_ENTRY_POINTS} entry points constructing with a \
+             permission set (run, eval, repl, test), found {found}. If one was swapped \
+             back to the all-granted constructor, --permission stops working for that \
+             command with no other symptom.",
+        );
     }
 }
