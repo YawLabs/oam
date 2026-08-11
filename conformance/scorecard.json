@@ -1,5 +1,5 @@
 {
-  "commit": "e8ee2dd",
+  "commit": "615a0be",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -302,10 +302,14 @@
         {
           "case": "74-fs-path-ownership-time.mjs",
           "status": "pass"
+        },
+        {
+          "case": "75-fs-positional-cursor.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 74,
-      "total": 74
+      "pass": 75,
+      "total": 75
     },
     "surface": {
       "exports": {

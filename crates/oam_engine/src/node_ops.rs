@@ -499,19 +499,25 @@ fn throw_node_error(
         v8::String::new(scope, &message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
     let exception = v8::Exception::error(scope, message_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        // ORDER IS PART OF THE SHAPE. `Object.keys(err)` is observable, and
+        // node's fs errors enumerate errno, code, syscall, path -- measured on
+        // a closed-fd readSync: node gives ["errno","code","syscall"] where oam
+        // gave ["code","syscall","errno"]. Anything that snapshots or diffs an
+        // error object (a test, a serialiser, a reporter) sees the difference,
+        // so errno is set FIRST rather than appended after the string props.
+        if let Some(errno) = node_errno(code, error)
+            && let Some(key) = v8::String::new(scope, "errno")
+        {
+            // A Number, not a string: node's negative libuv error number.
+            let val = v8::Integer::new(scope, errno);
+            obj.set(scope, key.into(), val.into());
+        }
         let props: [(&str, &str); 3] = [("code", code), ("syscall", syscall), ("path", path)];
         for (name, value) in props {
             let key = v8::String::new(scope, name).unwrap();
             if let Some(value) = v8::String::new(scope, value) {
                 obj.set(scope, key.into(), value.into());
             }
-        }
-        // errno: Node's negative libuv error number (a Number, not a string).
-        if let Some(errno) = node_errno(code, error)
-            && let Some(key) = v8::String::new(scope, "errno")
-        {
-            let val = v8::Integer::new(scope, errno);
-            obj.set(scope, key.into(), val.into());
         }
     }
     scope.throw_exception(exception);
@@ -3932,17 +3938,19 @@ fn throw_ebadf(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
         v8::String::new(scope, &msg).unwrap_or_else(|| v8::String::new(scope, "EBADF").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        // errno FIRST -- `Object.keys(err)` is observable and node enumerates
+        // errno, code, syscall. See the same note in throw_node_error.
+        // EBADF: libuv-win -4083, -EBADF (-9) on Unix.
+        if let Some(key) = v8::String::new(scope, "errno") {
+            let errno = if cfg!(windows) { -4083 } else { -9 };
+            let val = v8::Integer::new(scope, errno);
+            obj.set(scope, key.into(), val.into());
+        }
         for (name, value) in [("code", "EBADF"), ("syscall", syscall)] {
             let key = v8::String::new(scope, name).unwrap();
             if let Some(v) = v8::String::new(scope, value) {
                 obj.set(scope, key.into(), v.into());
             }
-        }
-        // errno: EBADF -- libuv-win -4083, -EBADF (-9) on Unix.
-        if let Some(key) = v8::String::new(scope, "errno") {
-            let errno = if cfg!(windows) { -4083 } else { -9 };
-            let val = v8::Integer::new(scope, errno);
-            obj.set(scope, key.into(), val.into());
         }
     }
     scope.throw_exception(exception);
@@ -4035,12 +4043,63 @@ fn op_fs_open_sync(
 /// fsReadSync(fd, buffer, offset, length, position) -> bytesRead. Reads into
 /// buffer's backing store at `offset`; `position` (a number) seeks first,
 /// null reads from the current position.
+/// Read at an explicit position WITHOUT moving the descriptor's cursor, which
+/// is what `pread(2)` does and what node's positional `fs.read` family means.
+///
+/// This used to seek and leave the cursor there. The bug is silent and nasty:
+/// node gives `readSync(fd, b, 0, 3, 10)` then `readSync(fd, b, 0, 3, null)`
+/// -> "KLM" then "ABC" (the sequential read still starts at 0), while oam gave
+/// "KLM" then "NOP". A program that positionally probes a file and then reads
+/// sequentially got the wrong bytes with no error anywhere.
+///
+/// Save/seek/act/restore rather than a real pread: std has no positional read
+/// on the stable cross-platform surface (`FileExt` is per-OS and differs in
+/// name between unix `read_at` and windows `seek_read`), and the registry is
+/// already serialised behind its mutex here, so nothing else can observe the
+/// cursor mid-operation.
+fn read_at(
+    file: &mut std::fs::File,
+    buf: &mut [u8],
+    position: Option<u64>,
+) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(p) = position else {
+        return file.read(buf);
+    };
+    let saved = file.stream_position();
+    file.seek(SeekFrom::Start(p))?;
+    let result = file.read(buf);
+    if let Ok(prev) = saved {
+        let _ = file.seek(SeekFrom::Start(prev));
+    }
+    result
+}
+
+/// Write at an explicit position without moving the cursor -- `pwrite(2)`.
+/// Same bug and same reasoning as `read_at`.
+///
+/// A descriptor opened in APPEND mode ignores the position entirely and always
+/// writes at the end; that is the OS's behaviour, node's too, and restoring the
+/// cursor afterwards does not change it.
+fn write_at(file: &mut std::fs::File, bytes: &[u8], position: Option<u64>) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(p) = position else {
+        return file.write_all(bytes);
+    };
+    let saved = file.stream_position();
+    file.seek(SeekFrom::Start(p))?;
+    let result = file.write_all(bytes);
+    if let Ok(prev) = saved {
+        let _ = file.seek(SeekFrom::Start(prev));
+    }
+    result
+}
+
 fn op_fs_read_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    use std::io::{Read, Seek, SeekFrom};
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let offset = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
     let length = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
@@ -4060,15 +4119,9 @@ fn op_fs_read_sync(
     let mut tmp = vec![0u8; length];
     let read_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get_mut(&fd) {
-            Some(file) => {
-                if let Some(p) = pos_seek {
-                    let _ = file.seek(SeekFrom::Start(p));
-                }
-                Some(file.read(&mut tmp))
-            }
-            None => None,
-        }
+        guard
+            .get_mut(&fd)
+            .map(|file| read_at(file, &mut tmp, pos_seek))
     };
     match read_result {
         None => throw_ebadf(scope, "read"),
@@ -4105,7 +4158,6 @@ fn op_fs_write_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    use std::io::{Seek, SeekFrom, Write};
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeSync requires data");
@@ -4125,15 +4177,9 @@ fn op_fs_write_sync(
     oam_core::adopt_inherited_fd(&files, fd);
     let write_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.get_mut(&fd) {
-            Some(file) => {
-                if let Some(p) = pos_seek {
-                    let _ = file.seek(SeekFrom::Start(p));
-                }
-                Some(file.write_all(&bytes))
-            }
-            None => None,
-        }
+        guard
+            .get_mut(&fd)
+            .map(|file| write_at(file, &bytes, pos_seek))
     };
     match write_result {
         None => throw_ebadf(scope, "write"),
