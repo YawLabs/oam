@@ -188,17 +188,27 @@ pub type BodyCancelSignal = std::sync::Arc<tokio::sync::Notify>;
 /// retired mid-flight so the reinsert drops the File instead.
 #[derive(Default)]
 pub struct FileState {
-    pub files: HashMap<u64, tokio::fs::File>,
+    pub files: HashMap<u64, std::fs::File>,
     pub closed: std::collections::HashSet<u64>,
 }
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 
-/// Synchronous open-file registry (std::fs::File, fd-keyed) backing the
-/// classic fs.openSync/readSync/writeSync/closeSync/fstatSync family. Kept
-/// separate from the async (tokio) `files` registry: sync ops run inline in
-/// the op callback (no spawn_op), so they need a blocking File. Dies with the
-/// run, so leaked fds are reclaimed per-run.
-pub type SyncFileRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, std::fs::File>>>;
+/// The SAME registry as `FileRegistry`, kept as a name because the sync fs
+/// family reads better with it at the call sites.
+///
+/// These were once two registries -- a tokio-backed one for the async ops and a
+/// std-backed one for the sync ops -- and a descriptor allocated in one was
+/// INVISIBLE to the other. Node has a single descriptor space, so
+/// `fs.readSync(fdFromAsyncOpen, ...)` works there and threw EBADF here; the
+/// reverse failed too. Both families always drew from the same id counter
+/// (`body_ids`), so the numbers never collided -- it was purely a failed
+/// lookup, which is why it failed loudly rather than reading the wrong file.
+///
+/// Unifying costs nothing: `tokio::fs::File` IS a `std::fs::File` operated on
+/// `spawn_blocking`, so the async ops do that explicitly now and get one
+/// descriptor space for free. It also deletes a real hazard on the write path
+/// -- see `fs_write_chunk`.
+pub type SyncFileRegistry = FileRegistry;
 
 /// First id the runtime hands out for its OWN descriptors.
 ///
@@ -411,13 +421,13 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
         return false;
     }
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.contains_key(&fd) {
+    if guard.files.contains_key(&fd) {
         return true;
     }
     // Held across the dup so two ops racing on the same fd cannot both adopt.
     match dup_inherited(fd) {
         Some(file) => {
-            guard.insert(fd, file);
+            guard.files.insert(fd, file);
             true
         }
         None => false,
@@ -471,7 +481,6 @@ pub struct CoreRuntime {
     cancelled_bodies: CancelledBodies,
     body_cancel_signal: BodyCancelSignal,
     files: FileRegistry,
-    sync_files: SyncFileRegistry,
     zlib_streams: ZlibRegistry,
     http_state: std::sync::Arc<http_server::HttpState>,
     tcp: tcp::TcpRegistry,
@@ -538,7 +547,6 @@ impl CoreRuntime {
             )),
             body_cancel_signal: std::sync::Arc::new(tokio::sync::Notify::new()),
             files: std::sync::Arc::new(std::sync::Mutex::new(FileState::default())),
-            sync_files: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             zlib_streams: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_state: std::sync::Arc::new(http_server::HttpState::default()),
             tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp::TcpState::default())),
@@ -610,8 +618,13 @@ impl CoreRuntime {
 
     /// Synchronous open-file registry for fs.openSync & friends (Arc clone;
     /// dies with the run).
+    /// The open-file registry, as seen by the SYNC fs family.
+    ///
+    /// The same registry `files()` returns -- there is one descriptor space, as
+    /// in node. Kept as a distinct name only because it reads better at the
+    /// sync call sites; see the note on `SyncFileRegistry`.
     pub fn sync_files(&self) -> SyncFileRegistry {
-        self.sync_files.clone()
+        self.files.clone()
     }
 
     /// Incremental zlib stream registry (Arc clone; dies with the run).
@@ -3019,7 +3032,7 @@ pub mod ops {
         path: String,
         mode: String,
     ) -> OpOutcome {
-        let mut options = tokio::fs::OpenOptions::new();
+        let mut options = std::fs::OpenOptions::new();
         match mode.as_str() {
             "r" => options.read(true),
             "w" => options.write(true).create(true).truncate(true),
@@ -3028,7 +3041,16 @@ pub mod ops {
                 return OpOutcome::Failed(format!("fs_open: unknown mode '{other}'"));
             }
         };
-        match options.open(&path).await {
+        // std OpenOptions on the blocking pool rather than tokio::fs, so the
+        // descriptor lands in the ONE registry the sync family also reads.
+        // tokio::fs::open is this exact call on this exact pool.
+        let owned = path.clone();
+        let opened = tokio::task::spawn_blocking(move || options.open(&owned)).await;
+        let opened = match opened {
+            Ok(r) => r,
+            Err(e) => return node_fail(std::io::Error::other(e.to_string()), "open", &path),
+        };
+        match opened {
             Ok(file) => {
                 let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 files
@@ -3045,7 +3067,7 @@ pub mod ops {
     /// Reinsert a File ONLY if it was not closed mid-flight. Returns
     /// whether it was kept (false = the handle was retired by fsClose
     /// during the IO await, so the File is dropped here, closing the fd).
-    fn reinsert_file(files: &super::FileRegistry, handle: u64, file: tokio::fs::File) -> bool {
+    fn reinsert_file(files: &super::FileRegistry, handle: u64, file: std::fs::File) -> bool {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
         if guard.closed.remove(&handle) {
             drop(file); // closed during the await: do not resurrect
@@ -3059,7 +3081,7 @@ pub mod ops {
     /// Read up to `len` bytes. Bytes = data, Done = EOF (handle stays open
     /// until fs_close — the JS side closes explicitly).
     pub async fn fs_read_chunk(files: super::FileRegistry, handle: u64, len: usize) -> OpOutcome {
-        use tokio::io::AsyncReadExt;
+        use std::io::Read;
         let file = files
             .lock()
             .expect("file registry lock")
@@ -3069,7 +3091,25 @@ pub mod ops {
             return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
         };
         let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
-        match file.read(&mut buf).await {
+        // The File moves onto the blocking pool and comes back with the read's
+        // result, because the remove-operate-reinsert dance needs it returned
+        // whichever way the read went.
+        let done = tokio::task::spawn_blocking(move || {
+            let r = file.read(&mut buf);
+            (file, buf, r)
+        })
+        .await;
+        let (file, mut buf, result) = match done {
+            Ok(t) => t,
+            Err(e) => {
+                return node_fail(
+                    std::io::Error::other(e.to_string()),
+                    "read",
+                    &handle.to_string(),
+                );
+            }
+        };
+        match result {
             Ok(0) => {
                 reinsert_file(&files, handle, file);
                 OpOutcome::Done
@@ -3090,7 +3130,7 @@ pub mod ops {
         handle: u64,
         bytes: Vec<u8>,
     ) -> OpOutcome {
-        use tokio::io::AsyncWriteExt;
+        use std::io::Write;
         let file = files
             .lock()
             .expect("file registry lock")
@@ -3099,16 +3139,34 @@ pub mod ops {
         let Some(mut file) = file else {
             return OpOutcome::Failed(format!("fs stream: handle {handle} is gone"));
         };
-        // write_all on tokio::fs::File resolves once the bytes land in
-        // tokio's INTERNAL buffer; the write(2) runs later on the blocking
-        // pool (flushed on drop, unsynchronized). Node's contract is
-        // callback-after-syscall -- without the flush, WriteStream 'finish'
-        // races the kernel write and a finish-handler read sees a short
-        // file (conformance case 21 flaked exactly this way on Linux under
-        // load). flush() waits for the pool write to complete.
-        let written = match file.write_all(&bytes).await {
-            Ok(()) => file.flush().await,
-            Err(e) => Err(e),
+        // Node's contract is callback-after-syscall.
+        //
+        // The tokio version of this needed an explicit flush() to get that:
+        // `write_all` on a tokio::fs::File resolves once the bytes reach
+        // tokio's INTERNAL buffer, with the real write(2) running later on the
+        // blocking pool (flushed on drop, unsynchronized). Without the flush,
+        // WriteStream 'finish' raced the kernel write and a finish-handler read
+        // saw a short file -- conformance case 21 flaked exactly that way on
+        // Linux under load.
+        //
+        // std::fs::File is UNBUFFERED: write_all IS the syscall, and it has
+        // already returned by the time the blocking task completes. The race
+        // cannot be reintroduced by forgetting a flush, because there is no
+        // buffer to forget about.
+        let done = tokio::task::spawn_blocking(move || {
+            let r = file.write_all(&bytes);
+            (file, r)
+        })
+        .await;
+        let (file, written) = match done {
+            Ok(t) => t,
+            Err(e) => {
+                return node_fail(
+                    std::io::Error::other(e.to_string()),
+                    "write",
+                    &handle.to_string(),
+                );
+            }
         };
         match written {
             Ok(()) => {
