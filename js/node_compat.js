@@ -9370,6 +9370,50 @@
       fs.lchmodSync = undefined;
     }
 
+    // ---- openAsBlob
+    //
+    // Shapes measured against node v22.22.2 rather than inferred:
+    //   - `options.type` is coerced with `|| ''` BEFORE the string check, so
+    //     {type: 0 | false | null | NaN | undefined} all yield "" and only a
+    //     truthy non-string (e.g. 123) throws ERR_INVALID_ARG_TYPE. node's own
+    //     source is `const type = options.type || ''; validateString(...)`.
+    //   - an unreadable path does NOT surface the fs error. node throws a
+    //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
+    //     file as blob", and `code` as its ONLY own property -- no errno, no
+    //     syscall, no path.
+    fs.openAsBlob = async (p, options) => {
+      const type = (options && options.type) || "";
+      if (typeof type !== "string") {
+        throw nodeTypeError(
+          `The "options.type" argument must be of type string. Received ${describeArg(type)}`,
+        );
+      }
+      let bytes;
+      try {
+        bytes = await natives.fsReadFile(String(p));
+      } catch {
+        // Deliberately swallowing the underlying error: node reports none of
+        // it, and leaking ENOENT here would be a divergence, not a courtesy.
+        const err = new TypeError("Unable to open file as blob");
+        err.code = "ERR_INVALID_ARG_VALUE";
+        throw err;
+      }
+      const blob = new Blob([bytes], { type });
+      // node returns an instance of an INTERNAL TransferableBlob subclass and
+      // plants an own `constructor` back-pointing at Blob so the subclass does
+      // not leak through `b.constructor.name`. Measured descriptor:
+      // {value: Blob, writable: true, enumerable: true, configurable: true} --
+      // enumerable, so `Object.keys(blob)` is ["constructor"], which a
+      // structural comparison would otherwise see as a difference. A plain
+      // assignment produces exactly that descriptor.
+      blob.constructor = Blob;
+      // Marks it un-structuredClone-able, which node's file-backed blob is.
+      // A registered symbol so bootstrap.js's cloner can see it across scopes,
+      // and a symbol key so it stays out of Object.keys.
+      blob[Symbol.for("oam.blob.fileBacked")] = true;
+      return blob;
+    };
+
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
