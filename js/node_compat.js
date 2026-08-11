@@ -9222,7 +9222,12 @@
         if (typeof position === "function") { cb = position; }
         if (typeof cb !== "function") throw new TypeError("Callback must be a function");
         var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
-        Promise.resolve(natives.fsReadChunk(fd, want)).then(
+        // The position was parsed above and then DROPPED -- fsReadChunk had no
+        // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
+        // cursor and handed back the wrong bytes with no error. The native now
+        // takes one; null still means "from the cursor".
+        var readPos = typeof position === "number" && position >= 0 ? position : null;
+        Promise.resolve(natives.fsReadChunk(fd, want, readPos)).then(
           function (chunk) {
             if (chunk === undefined || chunk === null) {
               queueMicrotask(function () { cb(null, 0, buffer); });
@@ -9369,6 +9374,156 @@
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
     }
+
+    // ---- vectored IO: readv / writev, callback and sync forms.
+    //
+    // Built ON TOP of the read/write paths rather than as new natives: writev
+    // concatenates and issues one write, readv reads once and scatters. For a
+    // regular file that is indistinguishable from a real iovec call, and it
+    // inherits the positional (pread/pwrite) semantics those paths already have
+    // instead of growing a second copy of them.
+    //
+    // node exports these on node:fs ONLY. fs/promises has no top-level
+    // readv/writev -- there they are FileHandle methods.
+    //
+    // Behaviours measured against node v22.22.2, several of which are not what
+    // you would guess:
+    //   - the sync forms return a plain NUMBER, not {bytesRead, buffers}. Only
+    //     the FileHandle methods return objects.
+    //   - the callback is (err, bytes, buffers) and `buffers` is the SAME ARRAY
+    //     IDENTITY that went in, not a copy.
+    //   - an EMPTY ARRAY is asymmetric: writev returns 0, readv throws EINVAL
+    //     -- and the EINVAL is raised BEFORE the fd is looked at, so it wins
+    //     even on a closed descriptor.
+    //   - an array of only ZERO-LENGTH views is NOT the same case: readv
+    //     returns 0 rather than throwing. The rule keys on the array being
+    //     empty, not on the byte total.
+    //   - a partial final buffer keeps the rest of its bytes UNTOUCHED.
+    const asViewArray = (buffers) => {
+      // Index loop, NOT Array.prototype.every: every() skips holes, so a sparse
+      // array would slip through where node throws.
+      let ok = Array.isArray(buffers);
+      if (ok) {
+        for (let i = 0; i < buffers.length; i++) {
+          if (!ArrayBuffer.isView(buffers[i])) { ok = false; break; }
+        }
+      }
+      if (!ok) {
+        throw nodeTypeError(
+          `The "buffers" argument must be an ArrayBufferView[]. Received ${describeArg(buffers)}`,
+        );
+      }
+      let total = 0;
+      for (let i = 0; i < buffers.length; i++) total += buffers[i].byteLength;
+      return total;
+    };
+
+    // node's EINVAL for readv with an empty list. Own props in node's order.
+    const einvalRead = () => {
+      const err = new Error("EINVAL: invalid argument, read");
+      err.errno = natives.platform === "win32" ? -4071 : -22;
+      err.code = "EINVAL";
+      err.syscall = "read";
+      return err;
+    };
+
+    const flattenViews = (buffers, total) => {
+      const combined = globalThis.Buffer.allocUnsafe(total);
+      let off = 0;
+      for (let i = 0; i < buffers.length; i++) {
+        const v = buffers[i];
+        combined.set(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), off);
+        off += v.byteLength;
+      }
+      return combined;
+    };
+
+    // Scatter `n` bytes of `src` across the views, filling each in turn. A view
+    // that only partially fills keeps its remaining bytes as they were, because
+    // TypedArray.set writes exactly as many bytes as the source holds.
+    const scatterViews = (buffers, src, n) => {
+      let off = 0;
+      for (let i = 0; i < buffers.length && off < n; i++) {
+        const v = buffers[i];
+        const take = Math.min(v.byteLength, n - off);
+        if (take > 0) {
+          new Uint8Array(v.buffer, v.byteOffset, v.byteLength).set(src.subarray(off, off + take));
+        }
+        off += take;
+      }
+    };
+
+    const posOrNull = (p) => (typeof p === "number" && p >= 0 ? p : null);
+
+    fs.writevSync = (fd, buffers, position) => {
+      const total = asViewArray(buffers);
+      // node returns 0 without touching the descriptor -- measured: writev([])
+      // on a CLOSED fd does not throw.
+      if (total === 0) return 0;
+      return natives.fsWriteSync(fd, flattenViews(buffers, total), posOrNull(position));
+    };
+
+    fs.readvSync = (fd, buffers, position) => {
+      const total = asViewArray(buffers);
+      // Before the fd check, deliberately: node raises this even for a closed
+      // descriptor.
+      if (buffers.length === 0) throw einvalRead();
+      if (total === 0) return 0;
+      const tmp = globalThis.Buffer.allocUnsafe(total);
+      const n = natives.fsReadSync(fd, tmp, 0, total, posOrNull(position));
+      scatterViews(buffers, tmp, n);
+      return n;
+    };
+
+    const vectoredCallback = (args, name) => {
+      const cb = args[args.length - 1];
+      if (typeof cb !== "function") {
+        throw nodeTypeError(
+          `The "cb" argument must be of type function. Received ${describeArg(cb)}`,
+        );
+      }
+      return cb;
+    };
+
+    fs.writev = function (fd, buffers, position, cb) {
+      if (typeof position === "function") { cb = position; position = null; }
+      cb = vectoredCallback([fd, buffers, position, cb], "writev");
+      let total;
+      try {
+        total = asViewArray(buffers);
+      } catch (e) {
+        queueMicrotask(() => cb(e));
+        return;
+      }
+      if (total === 0) { queueMicrotask(() => cb(null, 0, buffers)); return; }
+      // Reuses fs.write, so the position handling lives in exactly one place.
+      fs.write(fd, flattenViews(buffers, total), 0, total, posOrNull(position), (err, written) =>
+        err ? cb(err, 0, buffers) : cb(null, written, buffers),
+      );
+    };
+
+    fs.readv = function (fd, buffers, position, cb) {
+      if (typeof position === "function") { cb = position; position = null; }
+      cb = vectoredCallback([fd, buffers, position, cb], "readv");
+      let total;
+      try {
+        total = asViewArray(buffers);
+        if (buffers.length === 0) throw einvalRead();
+      } catch (e) {
+        // node reports both the arg-type error and the EINVAL through the
+        // callback here, not at the call site.
+        queueMicrotask(() => cb(e, 0, buffers));
+        return;
+      }
+      if (total === 0) { queueMicrotask(() => cb(null, 0, buffers)); return; }
+      const tmp = globalThis.Buffer.allocUnsafe(total);
+      fs.read(fd, tmp, 0, total, posOrNull(position), (err, n) => {
+        if (err) { cb(err, 0, buffers); return; }
+        scatterViews(buffers, tmp, n);
+        // The SAME array instance goes back, which callers compare by identity.
+        cb(null, n, buffers);
+      });
+    };
 
     // ---- openAsBlob
     //

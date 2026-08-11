@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.1 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1411,
-        "missing": 373,
+        "present": 1415,
+        "missing": 369,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -178,11 +178,7 @@
         ],
         "fs": [
           "glob",
-          "globSync",
-          "readv",
-          "readvSync",
-          "writev",
-          "writevSync"
+          "globSync"
         ],
         "fs/promises": [
           "glob",
@@ -517,8 +513,8 @@
       "generatedAgainst": "v22.23.1 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1411,
-        "missing": 377,
+        "present": 1415,
+        "missing": 373,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -694,11 +690,7 @@
         ],
         "fs": [
           "glob",
-          "globSync",
-          "readv",
-          "readvSync",
-          "writev",
-          "writevSync"
+          "globSync"
         ],
         "fs/promises": [
           "glob",
@@ -1033,8 +1025,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1354,
-        "missing": 420,
+        "present": 1358,
+        "missing": 416,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -1253,11 +1245,7 @@
         ],
         "fs": [
           "glob",
-          "globSync",
-          "readv",
-          "readvSync",
-          "writev",
-          "writevSync"
+          "globSync"
         ],
         "fs/promises": [
           "glob",

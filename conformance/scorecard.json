@@ -1,5 +1,5 @@
 {
-  "commit": "9b72dd8",
+  "commit": "704fb19",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -314,10 +314,14 @@
         {
           "case": "77-fs-open-as-blob.mjs",
           "status": "pass"
+        },
+        {
+          "case": "78-fs-vectored-io.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 77,
-      "total": 77
+      "pass": 78,
+      "total": 78
     },
     "surface": {
       "exports": {
@@ -548,7 +552,7 @@
             ]
           }
         ],
-        "knownMissing": 420,
+        "knownMissing": 416,
         "newMissing": [],
         "noBaseline": false,
         "nodeTotal": 1874,

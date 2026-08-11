@@ -493,7 +493,14 @@ fn throw_node_error(
     path: &str,
     error: &std::io::Error,
 ) {
-    let code = node_error_code(error);
+    // An EMPTY path means this came from an fd operation, where a denial can
+    // only mean the descriptor is open in the wrong mode -- node reports EBADF,
+    // not EACCES. See oam_core::fd_error_code.
+    let code = if path.is_empty() {
+        oam_core::fd_error_code(error)
+    } else {
+        node_error_code(error)
+    };
     let message = node_error_message(code, syscall, path, error);
     let message_v8 =
         v8::String::new(scope, &message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
@@ -3887,11 +3894,20 @@ fn op_fs_read_chunk(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
+    // Optional third arg: a read POSITION. Absent/null means "from the
+    // cursor", which is what the stream readers pass.
+    let position = args.get(2);
+    let position = if position.is_number() {
+        let p = position.number_value(scope).unwrap_or(-1.0);
+        if p >= 0.0 { Some(p as u64) } else { None }
+    } else {
+        None
+    };
     let files = core_runtime!(scope).files();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fs_read_chunk(files, handle, len),
+        oam_core::ops::fs_read_chunk(files, handle, len, position),
     );
 }
 

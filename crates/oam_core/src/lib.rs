@@ -997,9 +997,40 @@ pub fn node_error_message(code: &str, syscall: &str, path: &str, error: &std::io
         "ENOTEMPTY" => "directory not empty".to_string(),
         "ENOTDIR" => "not a directory".to_string(),
         "EISDIR" => "illegal operation on a directory".to_string(),
+        // Reachable via fd_error_code: without this the OS text ("Access is
+        // denied. (os error 5)") would leak into the message.
+        "EBADF" => "bad file descriptor".to_string(),
         _ => error.to_string(),
     };
-    format!("{code}: {reason}, {syscall} '{path}'")
+    // An fd operation has NO path, and node omits the segment entirely rather
+    // than printing an empty one: "EBADF: bad file descriptor, write", not
+    // "... write ''". oam printed the empty quotes.
+    if path.is_empty() {
+        format!("{code}: {reason}, {syscall}")
+    } else {
+        format!("{code}: {reason}, {syscall} '{path}'")
+    }
+}
+
+/// Error code for an operation on an ALREADY-OPEN descriptor.
+///
+/// A descriptor was opened successfully, so there is no path left to be denied:
+/// the only way an fd read/write comes back "access denied" is that the handle
+/// is open in the wrong mode -- writing to an `r` fd, reading from a `w` one.
+/// libuv reports that as EBADF, and so does node:
+///
+///   writeSync(fdOpenedForRead, buf)
+///     node: EBADF: bad file descriptor, write
+///     oam:  EACCES: permission denied, write ''
+///
+/// Windows is what makes this show up: it returns ERROR_ACCESS_DENIED for a
+/// wrong-mode handle where POSIX returns EBADF directly.
+pub fn fd_error_code(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        "EBADF"
+    } else {
+        node_error_code(error)
+    }
 }
 
 /// fs.access semantics: existence always; W_OK (mode & 2) additionally
@@ -1466,6 +1497,22 @@ pub mod ops {
             super::node_error_message(code, syscall, path, &error),
             syscall,
             path,
+            super::node_errno(code, &error),
+        )
+    }
+
+    /// `node_fail` for an operation on an already-open descriptor: no path, and
+    /// a wrong-mode denial reads as EBADF (see `fd_error_code`).
+    ///
+    /// These used to pass the HANDLE NUMBER as the path, so a failed stream
+    /// read reported `... read '64'` where node has no path at all.
+    fn node_fail_fd(error: std::io::Error, syscall: &str) -> OpOutcome {
+        let code = super::fd_error_code(&error);
+        OpOutcome::node_failed_at(
+            code,
+            super::node_error_message(code, syscall, "", &error),
+            syscall,
+            "",
             super::node_errno(code, &error),
         )
     }
@@ -3080,8 +3127,22 @@ pub mod ops {
 
     /// Read up to `len` bytes. Bytes = data, Done = EOF (handle stays open
     /// until fs_close — the JS side closes explicitly).
-    pub async fn fs_read_chunk(files: super::FileRegistry, handle: u64, len: usize) -> OpOutcome {
-        use std::io::Read;
+    /// Read up to `len` bytes. `position` = None reads from (and advances) the
+    /// cursor; Some(p) is a `pread` -- reads at p and leaves the cursor alone.
+    ///
+    /// The position parameter used to not exist, so the JS `fs.read` callback
+    /// form had nowhere to put the one it was given and silently dropped it:
+    /// `fs.read(fd, buf, 0, 3, 10, cb)` read from the CURSOR instead of offset
+    /// 10 and returned the wrong bytes with no error. Worse than the sync twin
+    /// fixed alongside it, which at least read the right bytes and only left
+    /// the cursor misplaced.
+    pub async fn fs_read_chunk(
+        files: super::FileRegistry,
+        handle: u64,
+        len: usize,
+        position: Option<u64>,
+    ) -> OpOutcome {
+        use std::io::{Read, Seek, SeekFrom};
         let file = files
             .lock()
             .expect("file registry lock")
@@ -3095,7 +3156,25 @@ pub mod ops {
         // result, because the remove-operate-reinsert dance needs it returned
         // whichever way the read went.
         let done = tokio::task::spawn_blocking(move || {
-            let r = file.read(&mut buf);
+            // pread when a position is given: save, seek, read, restore. Same
+            // rule the sync family follows -- node's positional read does not
+            // disturb the cursor.
+            let r = match position {
+                None => file.read(&mut buf),
+                Some(p) => {
+                    let saved = file.stream_position();
+                    match file.seek(SeekFrom::Start(p)) {
+                        Ok(_) => {
+                            let r = file.read(&mut buf);
+                            if let Ok(prev) = saved {
+                                let _ = file.seek(SeekFrom::Start(prev));
+                            }
+                            r
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
             (file, buf, r)
         })
         .await;
@@ -3119,7 +3198,7 @@ pub mod ops {
                 buf.truncate(n);
                 OpOutcome::Bytes(buf)
             }
-            Err(e) => node_fail(e, "read", &handle.to_string()),
+            Err(e) => node_fail_fd(e, "read"),
         }
     }
 
@@ -3173,7 +3252,7 @@ pub mod ops {
                 reinsert_file(&files, handle, file);
                 OpOutcome::Done
             }
-            Err(e) => node_fail(e, "write", &handle.to_string()),
+            Err(e) => node_fail_fd(e, "write"),
         }
     }
 
