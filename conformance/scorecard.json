@@ -1,5 +1,5 @@
 {
-  "commit": "25050e5",
+  "commit": "33d4f7a",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.9.0",
@@ -294,10 +294,14 @@
         {
           "case": "72-fs-async-sync-error-parity.mjs",
           "status": "pass"
+        },
+        {
+          "case": "73-fs-fd-ops.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 72,
-      "total": 72
+      "pass": 73,
+      "total": 73
     },
     "surface": {
       "exports": {
@@ -528,7 +532,7 @@
             ]
           }
         ],
-        "knownMissing": 448,
+        "knownMissing": 436,
         "newMissing": [],
         "noBaseline": false,
         "nodeTotal": 1874,

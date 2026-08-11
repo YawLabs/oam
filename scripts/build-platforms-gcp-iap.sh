@@ -57,12 +57,12 @@ set -euo pipefail
 MODE="release"
 for arg in "$@"; do
   case "$arg" in
-    --mode=release|--mode=measure|--mode=bench) MODE="${arg#--mode=}" ;;
+    --mode=release|--mode=measure|--mode=bench|--mode=surface-gaps) MODE="${arg#--mode=}" ;;
     -h|--help)
       awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/, ""); print}' "$0"
       exit 0
       ;;
-    *) echo "unknown arg: $arg (want --mode=release|measure|bench)" >&2; exit 1 ;;
+    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps)" >&2; exit 1 ;;
   esac
 done
 
@@ -377,6 +377,18 @@ case "$MODE" in
     gcp_scp_from "bench/results.json" "$ARTIFACTS_DIR/linux-x64/"
     cp "$STAGE_DIR/logs/io-uring-ab.log" "$ARTIFACTS_DIR/linux-x64/io-uring-ab.log"
     ;;
+  surface-gaps)
+    remote_step surface-gaps
+    step "Pull the ratchet"
+    # The WHOLE file comes back, not a linux fragment. The generator merges --
+    # it rewrites only platforms[linux] and leaves the sections that arrived in
+    # the sync untouched -- so this is "what we sent, with linux re-measured".
+    # That is also why the mac and linux legs must run ONE AT A TIME, each
+    # starting from the previous one's output: run them concurrently and
+    # whichever lands second overwrites the other's section with the stale copy
+    # it was sent.
+    gcp_scp_from "conformance/surface-gaps.json" "$REPO_DIR/conformance/"
+    ;;
 esac
 
 # --- verify -------------------------------------------------------------------
@@ -386,6 +398,17 @@ case "$MODE" in
   release) [ -f "$ARTIFACTS_DIR/oam-x86_64-unknown-linux-gnu" ] || fail "no linux binary staged" ;;
   measure) [ -f "$ARTIFACTS_DIR/linux-x64/node-suite-scorecard.json" ] || fail "no scorecard staged" ;;
   bench)   [ -f "$ARTIFACTS_DIR/linux-x64/results.json" ] || fail "no bench results staged" ;;
+  surface-gaps)
+    # Lands in the repo, not the staging dir. Assert linux actually moved: a
+    # silently-unchanged section is the exact failure this mode exists to
+    # prevent, because the gate would then be reading a host that never ran.
+    node -e '
+      const g = require(process.argv[1]);
+      const l = g.platforms && g.platforms.linux;
+      if (!l) { console.error("no linux section in the pulled ratchet"); process.exit(1); }
+      console.error(`linux: ${l.counts.present}/${l.counts.nodeExportNames} present, generated against ${l.generatedAgainst}`);
+    ' "$REPO_DIR/conformance/surface-gaps.json" || fail "pulled ratchet has no linux section"
+    ;;
 esac
 ok "all required artifacts staged under $ARTIFACTS_DIR"
 

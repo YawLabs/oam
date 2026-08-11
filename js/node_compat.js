@@ -9243,6 +9243,64 @@
         );
       },
     };
+    // ---- fd-based ops: fsync / fdatasync / ftruncate / fchmod / fchown /
+    // futimes, callback and sync forms.
+    //
+    // Assigned after the literal so they can reuse fs._toUnixTimestamp rather
+    // than duplicating node's coercion. These are module-level exports in node
+    // (unlike the FileHandle methods of the same name in fs/promises), and a
+    // builtin's ESM named exports are its module object's own enumerable keys,
+    // so a missing one is a LINK-time SyntaxError for anyone importing it --
+    // which is how a single unused name takes down a whole bundled CLI.
+    //
+    // Deliberately NOT routed through callbackify1: that helper re-throws a
+    // synchronous error, and these natives throw EBADF synchronously out of the
+    // op. Node reports a bad descriptor through the callback, never at the call
+    // site, so the throw has to be caught and re-delivered -- the same shape
+    // `fstat` uses above.
+    const fdCallbackOp = (run) =>
+      function (...args) {
+        const cb = args.pop();
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        const token = fsReqStart();
+        let p;
+        try {
+          p = run(...args);
+        } catch (e) {
+          fsReqEnd(token);
+          queueMicrotask(() => cb(e));
+          return;
+        }
+        p.then(
+          () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
+          (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+        );
+      };
+
+    // node's coercion yields SECONDS; both the libc (futimens) and Win32
+    // (SetFileTime) backends behind the native want milliseconds.
+    const utimeMs = (time, name) => fs._toUnixTimestamp(time, name) * 1000;
+
+    fs.fsync = fdCallbackOp((fd) => natives.fsFsync(fd));
+    fs.fdatasync = fdCallbackOp((fd) => natives.fsFdatasync(fd));
+    // node permits `ftruncate(fd, cb)` with the length omitted, which lands
+    // here as undefined once the callback is popped.
+    fs.ftruncate = fdCallbackOp((fd, len) => natives.fsFtruncate(fd, len ?? 0));
+    fs.fchmod = fdCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
+    fs.fchown = fdCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
+    fs.futimes = fdCallbackOp((fd, atime, mtime) =>
+      natives.fsFutimes(fd, utimeMs(atime, "atime"), utimeMs(mtime, "mtime")),
+    );
+
+    fs.fsyncSync = (fd) => { natives.fsFsyncSync(fd); };
+    fs.fdatasyncSync = (fd) => { natives.fsFdatasyncSync(fd); };
+    fs.ftruncateSync = (fd, len) => { natives.fsFtruncateSync(fd, len ?? 0); };
+    fs.fchmodSync = (fd, mode) => { natives.fsFchmodSync(fd, mode); };
+    fs.fchownSync = (fd, uid, gid) => { natives.fsFchownSync(fd, uid, gid); };
+    fs.futimesSync = (fd, atime, mtime) => {
+      natives.fsFutimesSync(fd, utimeMs(atime, "atime"), utimeMs(mtime, "mtime"));
+    };
+
     fs.realpathSync.native = fs.realpathSync;
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare

@@ -250,6 +250,19 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsWriteSync", op_fs_write_sync),
         ("fsCloseSync", op_fs_close_sync),
         ("fsFstatSync", op_fs_fstat_sync),
+        // fs fd-based ops (fsync/ftruncate/fchmod/fchown/futimes families)
+        ("fsFsync", op_fs_fsync),
+        ("fsFdatasync", op_fs_fdatasync),
+        ("fsFtruncate", op_fs_ftruncate),
+        ("fsFchmod", op_fs_fchmod),
+        ("fsFchown", op_fs_fchown),
+        ("fsFutimes", op_fs_futimes),
+        ("fsFsyncSync", op_fs_fsync_sync),
+        ("fsFdatasyncSync", op_fs_fdatasync_sync),
+        ("fsFtruncateSync", op_fs_ftruncate_sync),
+        ("fsFchmodSync", op_fs_fchmod_sync),
+        ("fsFchownSync", op_fs_fchown_sync),
+        ("fsFutimesSync", op_fs_futimes_sync),
         // node:zlib (one-shot)
         ("zlibSync", op_zlib_sync),
         ("zlibAsync", op_zlib_async),
@@ -2977,6 +2990,226 @@ fn op_fs_fstat(
         }
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(cloned));
+}
+
+// --------------------------------------------------------- fd-based fs ops
+//
+// fsync / fdatasync / ftruncate / fchmod / fchown / futimes, async and sync.
+// All exempt-by-capability in `permission_audit`: the fd can only have come
+// from an `open` that was checked, and there is no path here to re-check.
+
+/// Resolve an fd to an owned `File` for an op that will hand it to a blocking
+/// thread. Throws EBADF and returns None when the fd is not open.
+///
+/// The registry comes in as a parameter rather than from `core_runtime!`: that
+/// macro expands to a bare `return;`, which only compiles inside a function
+/// returning `()`. The op callbacks do; this does not.
+fn clone_registered_fd(
+    scope: &mut v8::PinScope<'_, '_>,
+    files: &oam_core::SyncFileRegistry,
+    fd: u64,
+    syscall: &str,
+) -> Option<std::fs::File> {
+    // Same adoption rule as fstat: a low fd we never allocated came from the
+    // parent at spawn.
+    oam_core::adopt_inherited_fd(files, fd);
+    let cloned = {
+        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&fd).map(|file| file.try_clone())
+    };
+    match cloned {
+        None => {
+            throw_ebadf(scope, syscall);
+            None
+        }
+        Some(Err(e)) => {
+            throw_node_error(scope, syscall, "", &e);
+            None
+        }
+        Some(Ok(file)) => Some(file),
+    }
+}
+
+/// Run a synchronous fd operation against the registry, throwing on failure.
+fn with_registered_fd<F>(scope: &mut v8::PinScope<'_, '_>, fd: u64, syscall: &str, action: F)
+where
+    F: FnOnce(&std::fs::File) -> std::io::Result<()>,
+{
+    let files = core_runtime!(scope).sync_files();
+    oam_core::adopt_inherited_fd(&files, fd);
+    let outcome = {
+        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&fd).map(action)
+    };
+    match outcome {
+        None => throw_ebadf(scope, syscall),
+        Some(Err(e)) => throw_node_error(scope, syscall, "", &e),
+        Some(Ok(())) => {}
+    }
+}
+
+/// atime/mtime as milliseconds since the epoch. The JS layer already turned
+/// numbers, Dates and numeric strings into plain numbers.
+fn utime_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    first: i32,
+) -> (f64, f64) {
+    let atime = args.get(first).number_value(scope).unwrap_or(0.0);
+    let mtime = args.get(first + 1).number_value(scope).unwrap_or(0.0);
+    (atime, mtime)
+}
+
+fn op_fs_fsync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "fsync") else {
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, false));
+}
+
+fn op_fs_fdatasync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "fdatasync") else {
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, true));
+}
+
+fn op_fs_ftruncate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "ftruncate") else {
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_ftruncate(file, len));
+}
+
+fn op_fs_fchmod(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "fchmod") else {
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchmod(file, mode));
+}
+
+fn op_fs_fchown(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let uid = args.get(1).uint32_value(scope).unwrap_or(0);
+    let gid = args.get(2).uint32_value(scope).unwrap_or(0);
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "fchown") else {
+        return;
+    };
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchown(file, uid, gid));
+}
+
+fn op_fs_futimes(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    let files = core_runtime!(scope).sync_files();
+    let Some(file) = clone_registered_fd(scope, &files, fd, "futime") else {
+        return;
+    };
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_futimes(file, atime, mtime),
+    );
+}
+
+fn op_fs_fsync_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    with_registered_fd(scope, fd, "fsync", |file| file.sync_all());
+}
+
+fn op_fs_fdatasync_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    with_registered_fd(scope, fd, "fdatasync", |file| file.sync_data());
+}
+
+fn op_fs_ftruncate_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
+    with_registered_fd(scope, fd, "ftruncate", |file| file.set_len(len));
+}
+
+fn op_fs_fchmod_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
+    with_registered_fd(scope, fd, "fchmod", |file| {
+        oam_core::ops::fs_fchmod_sync(file, mode)
+    });
+}
+
+fn op_fs_fchown_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let uid = args.get(1).uint32_value(scope).unwrap_or(0);
+    let gid = args.get(2).uint32_value(scope).unwrap_or(0);
+    with_registered_fd(scope, fd, "fchown", |file| {
+        oam_core::ops::fs_fchown_sync(file, uid, gid)
+    });
+}
+
+fn op_fs_futimes_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let (atime, mtime) = utime_args(scope, &args, 1);
+    with_registered_fd(scope, fd, "futime", |file| {
+        oam_core::ops::fs_futimes_sync(file, atime, mtime)
+    });
 }
 
 fn op_fs_statfs(
@@ -5815,6 +6048,18 @@ mod permission_audit {
             ("op_fs_close_sync", "fd from a checked open()"),
             ("op_fs_fstat", "fd from a checked open()"),
             ("op_fs_fstat_sync", "fd from a checked open()"),
+            ("op_fs_fsync", "fd from a checked open()"),
+            ("op_fs_fsync_sync", "fd from a checked open()"),
+            ("op_fs_fdatasync", "fd from a checked open()"),
+            ("op_fs_fdatasync_sync", "fd from a checked open()"),
+            ("op_fs_ftruncate", "fd from a checked open()"),
+            ("op_fs_ftruncate_sync", "fd from a checked open()"),
+            ("op_fs_fchmod", "fd from a checked open()"),
+            ("op_fs_fchmod_sync", "fd from a checked open()"),
+            ("op_fs_fchown", "fd from a checked open()"),
+            ("op_fs_fchown_sync", "fd from a checked open()"),
+            ("op_fs_futimes", "fd from a checked open()"),
+            ("op_fs_futimes_sync", "fd from a checked open()"),
             (
                 "op_spawn_kill",
                 "signals a child already permitted at spawn",
