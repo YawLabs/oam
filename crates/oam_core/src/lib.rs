@@ -1109,12 +1109,24 @@ pub fn write_all_checked(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Res
     file.write_all(bytes)
 }
 
+///
+/// POSIX needs its own arm even though it reports EBADF honestly, because
+/// `std::io::ErrorKind` has no BadFileDescriptor variant: raw errno 9 lands in
+/// `Uncategorized`, and `node_error_code` falls through to EIO. The same
+/// `writeSync(fdOpenedForRead, buf)` therefore gave `EBADF` on Windows and
+/// `EIO: Bad file descriptor (os error 9), write` -- leaked OS text and all --
+/// on macOS and Linux. `node_errno` was already deriving -9 from the raw errno
+/// there, so the code and the errno disagreed with each other on top of
+/// disagreeing with node.
 pub fn fd_error_code(error: &std::io::Error) -> &'static str {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
-        "EBADF"
-    } else {
-        node_error_code(error)
+        return "EBADF";
     }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EBADF) {
+        return "EBADF";
+    }
+    node_error_code(error)
 }
 
 /// fs.access semantics: existence always; W_OK (mode & 2) additionally
