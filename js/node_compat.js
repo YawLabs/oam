@@ -10675,7 +10675,7 @@
     const SIGNAL_NAMES = new Set(
       natives.platform === "win32"
         ? ["SIGINT", "SIGBREAK", "SIGHUP", "SIGTERM"]
-        : ["SIGINT", "SIGTERM", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGBREAK", "SIGQUIT"],
+        : ["SIGINT", "SIGTERM", "SIGHUP", "SIGUSR1", "SIGUSR2", "SIGWINCH", "SIGBREAK", "SIGQUIT", "SIGCONT", "SIGTSTP"],
     );
     process.on("newListener", (type) => {
       if (

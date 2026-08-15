@@ -61,11 +61,23 @@ impl Drop for SignalHandle {
 /// Only those need the restore-and-re-raise dance when no listener is
 /// attached; for an ignore-by-default signal (SIGWINCH) simply dropping the
 /// delivery already reproduces the default exactly.
+///
+/// SIGTSTP is in this set: its default action stops the process, and after
+/// SIG_DFL is restored the re-raise reproduces exactly that. SIGCONT is NOT:
+/// its default is "continue", so re-raising after restore would be a no-op
+/// anyway, and treating it as terminating could kill a process whose stop
+/// default had been dropped -- a dormant SIGCONT must stay a no-op.
 #[cfg(unix)]
 fn default_terminates(signum: i32) -> bool {
     matches!(
         signum,
-        libc::SIGHUP | libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGUSR1 | libc::SIGUSR2
+        libc::SIGHUP
+            | libc::SIGINT
+            | libc::SIGTERM
+            | libc::SIGQUIT
+            | libc::SIGUSR1
+            | libc::SIGUSR2
+            | libc::SIGTSTP
     )
 }
 
@@ -84,6 +96,10 @@ fn signal_kind(name: &str) -> Option<tokio::signal::unix::SignalKind> {
         "SIGUSR1" => SignalKind::user_defined1(),
         "SIGUSR2" => SignalKind::user_defined2(),
         "SIGWINCH" => SignalKind::window_change(),
+        // tokio has no named constructors for these two; build from the libc
+        // number (platform-correct on both Linux and macOS).
+        "SIGCONT" => SignalKind::from_raw(libc::SIGCONT),
+        "SIGTSTP" => SignalKind::from_raw(libc::SIGTSTP),
         _ => return None,
     })
 }
