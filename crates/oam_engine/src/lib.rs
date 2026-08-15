@@ -127,6 +127,42 @@ pub(crate) struct ProcessArgv(pub Vec<String>);
 /// almost always the user misreading "MB" as "GiB".
 const DEFAULT_HEAP_MB: usize = 4096;
 
+/// Provenance of the active heap cap, surfaced in the OOM banner. The cap is
+/// captured at `JsRuntime::new()` (one thread per isolate), so the banner
+/// reads the source from a thread-local rather than re-reading the env var --
+/// re-reading at OOM time would lie if the user `export`ed the var between
+/// startup and the OOM, because the cap itself was already baked into V8's
+/// resource constraints.
+#[derive(Copy, Clone)]
+enum HeapCapSource {
+    /// User set `OAM_MAX_HEAP_MB` to a positive number.
+    User,
+    /// Built-in 4 GiB default (env var unset, empty, or "0").
+    Default,
+}
+
+thread_local! {
+    /// Provenance for the current isolate's heap cap. Set in `JsRuntime::new`
+    /// immediately before `add_near_heap_limit_callback` so V8's callback
+    /// (which runs on the same thread as the isolate that registered it)
+    /// picks up the right label. V8 never invokes the callback from another
+    /// thread, so the thread-local is the right scope: a worker thread that
+    /// creates its own isolate writes its own value before any OOM there.
+    /// `Cell` because the OOM callback may run later on the same thread and
+    /// observe a stale label if we replaced `static` with a non-`Copy` type.
+    static HEAP_CAP_SOURCE: std::cell::Cell<HeapCapSource> = const { std::cell::Cell::new(HeapCapSource::Default) };
+}
+
+/// Resolved heap-cap configuration. The `Option<usize>` is the cap in MiB
+/// (`None` -> V8 default, no cap). The [`source`] tag is the provenance, used
+/// by the OOM banner so it attributes the cap to the user-set env var or the
+/// built-in default truthfully -- re-reading the env at OOM time would lie
+/// if the user mutated it after startup.
+struct HeapCap {
+    mb: Option<usize>,
+    source: HeapCapSource,
+}
+
 /// Parse `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
 ///
 /// Node parity: this is oam's `--max-old-space-size` analogue. Resolution:
@@ -137,16 +173,30 @@ const DEFAULT_HEAP_MB: usize = 4096;
 ///   * `n > 0` -> n MB cap. A very small value is honored as-is; it trips
 ///     the OOM callback during startup, printing the clean banner rather
 ///     than aborting raw.
-fn oam_max_heap_mb() -> Option<usize> {
+fn resolve_heap_cap() -> HeapCap {
     let raw = std::env::var("OAM_MAX_HEAP_MB").ok();
     let raw = match raw {
         Some(s) if !s.is_empty() => s,
-        _ => return Some(DEFAULT_HEAP_MB),
+        _ => {
+            return HeapCap {
+                mb: Some(DEFAULT_HEAP_MB),
+                source: HeapCapSource::Default,
+            };
+        }
     };
     match raw.trim().parse::<usize>() {
-        Ok(0) => None,
-        Ok(mb) => Some(mb),
-        Err(_) => None,
+        Ok(0) => HeapCap {
+            mb: None,
+            source: HeapCapSource::Default,
+        },
+        Ok(_mb) => HeapCap {
+            mb: Some(raw.trim().parse().unwrap()),
+            source: HeapCapSource::User,
+        },
+        Err(_) => HeapCap {
+            mb: None,
+            source: HeapCapSource::Default,
+        },
     }
 }
 
@@ -171,16 +221,16 @@ unsafe extern "C" fn near_heap_limit_oom(
 ) -> usize {
     use std::io::Write as _;
     let mb = current_heap_limit / (1024 * 1024);
-    // Only blame OAM_MAX_HEAP_MB when the user actually set it; otherwise
-    // attribute the cap to the built-in default so the message tells the
-    // truth about where the number came from. Empty/unset -> "" -> "default",
-    // any other non-"0" value -> user's value. `0` opts out, so this callback
-    // is never registered (see `if heap_cap_mb.is_some()` below).
-    let source = std::env::var("OAM_MAX_HEAP_MB")
-        .ok()
-        .filter(|s| !s.is_empty() && s.trim() != "0")
-        .map(|_| "set by OAM_MAX_HEAP_MB")
-        .unwrap_or("default 4 GiB");
+    // Provenance comes from a thread-local set by `JsRuntime::new`, NOT from
+    // re-reading OAM_MAX_HEAP_MB. The cap is captured into V8's resource
+    // constraints at isolate creation, so re-reading the env here would lie
+    // if the user mutated it after startup. The callback only fires on the
+    // same thread that registered it (V8 invariant), so the thread-local is
+    // the right scope.
+    let source = HEAP_CAP_SOURCE.with(|s| match s.get() {
+        HeapCapSource::User => "set by OAM_MAX_HEAP_MB",
+        HeapCapSource::Default => "default 4 GiB",
+    });
     let banner = format!(
         "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
     );
@@ -229,9 +279,15 @@ impl JsRuntime {
         // analogue). Applied at isolate creation so EVERY isolate -- top-level,
         // `oam serve` workers, and fork-prewarm threads -- inherits the cap;
         // a runaway MCP sidecar can't grow the heap unbounded. The default
-        // (4 GiB) is set by `oam_max_heap_mb`; only `OAM_MAX_HEAP_MB=0` opts
+        // (4 GiB) is set by `resolve_heap_cap`; only `OAM_MAX_HEAP_MB=0` opts
         // out to the V8 default.
-        let heap_cap_mb = oam_max_heap_mb();
+        let heap_cap = resolve_heap_cap();
+        let heap_cap_mb = heap_cap.mb;
+        // Publish the cap's provenance to the OOM callback before registering
+        // it. V8 invokes the callback on the same thread that owns the
+        // isolate, so the thread-local is the right scope -- a worker thread
+        // building its own isolate writes its own value here.
+        HEAP_CAP_SOURCE.with(|s| s.set(heap_cap.source));
         let mut params =
             v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
         if let Some(mb) = heap_cap_mb {
@@ -667,70 +723,107 @@ mod tests {
 
     // Env-var tests share a process-wide environment. Serialize them so
     // a parallel `cargo test` thread reading OAM_MAX_HEAP_MB doesn't see
-    // a value another test just set. The lock is held only for the duration
-    // of a single env-var mutation + assertion, so unrelated tests run
-    // unaffected.
+    // a value another test just set. The lock is held for the duration of
+    // the EnvGuard scope so the SET -- ASSERT -- DROP sequence is atomic
+    // from any other test's perspective.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard for env-var mutations in tests. Sets `OAM_MAX_HEAP_MB` on
+    /// construction and restores the prior value (or unsets it) on drop --
+    /// including the panic-during-assertion case where a bare `remove_var`
+    /// after the assert would be skipped by the unwinder. The guard holds
+    /// `ENV_LOCK` for its lifetime so parallel tests can't observe a
+    /// half-applied mutation.
+    struct HeapCapEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<String>,
+    }
+
+    impl HeapCapEnvGuard {
+        fn set(value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var("OAM_MAX_HEAP_MB").ok();
+            // SAFETY: serialized by `_lock` above; no other thread reads this
+            // env var until we drop.
+            unsafe { std::env::set_var("OAM_MAX_HEAP_MB", value) };
+            Self { _lock: lock, prior }
+        }
+        fn unset() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = std::env::var("OAM_MAX_HEAP_MB").ok();
+            // SAFETY: serialized by `_lock` above.
+            unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+            Self { _lock: lock, prior }
+        }
+    }
+
+    impl Drop for HeapCapEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `self._lock` (still held here).
+            match self.prior.as_deref() {
+                Some(v) => unsafe { std::env::set_var("OAM_MAX_HEAP_MB", v) },
+                None => unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") },
+            }
+        }
+    }
 
     #[test]
     fn heap_cap_defaults_to_4gib_when_unset() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: no other threads are reading OAM_MAX_HEAP_MB while we hold
-        // ENV_LOCK (the lock is the test-thread serialization point).
-        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+        let _g = HeapCapEnvGuard::unset();
         assert_eq!(
-            oam_max_heap_mb(),
+            resolve_heap_cap().mb,
             Some(4096),
             "unset OAM_MAX_HEAP_MB must default to 4 GiB; the pre-default \
              behavior (no cap) is what caused the 1.4 GiB mark-compact OOMs \
              in the crash log",
         );
+        assert!(
+            matches!(resolve_heap_cap().source, HeapCapSource::Default),
+            "unset -> Default source",
+        );
     }
 
     #[test]
     fn heap_cap_zero_opts_out() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "0") };
+        let _g = HeapCapEnvGuard::set("0");
         assert_eq!(
-            oam_max_heap_mb(),
+            resolve_heap_cap().mb,
             None,
             "OAM_MAX_HEAP_MB=0 must mean no cap (V8 default); this is the \
              explicit opt-out for callers that genuinely want the heap unbounded",
         );
-        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
     }
 
     #[test]
     fn heap_cap_empty_string_falls_back_to_default() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "") };
+        let _g = HeapCapEnvGuard::set("");
         assert_eq!(
-            oam_max_heap_mb(),
+            resolve_heap_cap().mb,
             Some(4096),
             "an empty OAM_MAX_HEAP_MB is treated the same as unset",
         );
-        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
     }
 
     #[test]
     fn heap_cap_honors_explicit_value() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "256") };
-        assert_eq!(oam_max_heap_mb(), Some(256));
-        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+        let _g = HeapCapEnvGuard::set("256");
+        assert_eq!(resolve_heap_cap().mb, Some(256));
+        assert!(
+            matches!(resolve_heap_cap().source, HeapCapSource::User),
+            "explicit positive value -> User source so the OOM banner attributes \
+             the cap to OAM_MAX_HEAP_MB truthfully",
+        );
     }
 
     #[test]
     fn heap_cap_garbage_value_opts_out() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "not-a-number") };
+        let _g = HeapCapEnvGuard::set("not-a-number");
         assert_eq!(
-            oam_max_heap_mb(),
+            resolve_heap_cap().mb,
             None,
             "a non-numeric OAM_MAX_HEAP_MB opts out (typo-safe) rather than \
              silently pinning the heap to a tiny ceiling",
         );
-        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
     }
 
     #[test]

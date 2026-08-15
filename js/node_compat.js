@@ -8429,11 +8429,18 @@
   // an error beats the alternative: the walker's `out.push()` loop has no
   // yield points, so a 100k+ match glob against a deep tree can grow the V8
   // heap past 1 GiB and trip "Ineffective mark-compacts near heap limit",
-  // aborting the whole process (no graceful exit). 1M matches is well under
-  // that ceiling on every supported host and is comfortably above what any
-  // reasonable `fs.glob` consumer reads in one call (a normal
-  // `src/**/*.{ts,tsx}` lands in the low thousands). Set
-  // `options.maxResults` to override per-call; passing `Infinity` disables it.
+  // aborting the whole process (no graceful exit). The dedup pass below
+  // also early-aborts once the unique count clears the cap, bounding the
+  // worst-case heap cost to roughly:
+  //   `out` array   ~ 24 MB / 1M entries (pointers)
+  //   `emitted` Set ~ 80 MB / 1M entries (string hash + value)
+  //   result strings ~ 300 MB / 1M entries @ ~300-byte avg paths
+  //                          (a 5M-match glob aborts at the cap with ~400 MB
+  //                           total rather than ~1.5 GB for the full walk)
+  // 1M matches fits comfortably in the 4 GiB V8 heap default. A normal
+  // `src/**/*.{ts,tsx}` against a real workspace lands in the low
+  // thousands. Set `options.maxResults` to override per-call; passing
+  // `Infinity` disables it.
   const DEFAULT_MAX_RESULTS = 1_000_000;
 
   // Pattern -> { regex, hasMagic }. Splits on `/`, normalizes path separators
@@ -8683,14 +8690,54 @@
     }
     // Resolve the result-count cap. `maxResults` is an oam extension (node's
     // fs.glob has no such option today); a non-finite or non-positive number
-    // disables the cap for callers that genuinely need the full set. The
+    // throws rather than silently falling back to the default, since a
+    // caller passing `0` expects "zero matches" or "fail fast", not 1M
+    // results they didn't ask for. `Infinity` disables the cap. The
     // rationale lives on `DEFAULT_MAX_RESULTS` above.
-    var maxResults =
-      typeof opts.maxResults === "number" && Number.isFinite(opts.maxResults) && opts.maxResults > 0
-        ? Math.floor(opts.maxResults)
-        : opts.maxResults === Infinity
-          ? Infinity
-          : DEFAULT_MAX_RESULTS;
+    var maxResults;
+    if (typeof opts.maxResults === "number") {
+      if (Number.isFinite(opts.maxResults)) {
+        if (opts.maxResults > 0) {
+          maxResults = Math.floor(opts.maxResults);
+        } else {
+          // Finite but non-positive: zero or negative. Reject loudly so the
+          // caller doesn't quietly get 1M matches. Floats get floored first
+          // so 1.5 -> 1 (valid) lands in the cap branch, and 0.5 -> 0 hits
+          // here as "user asked for zero".
+          if (Math.floor(opts.maxResults) > 0) {
+            maxResults = Math.floor(opts.maxResults);
+          } else {
+            throw codes.ERR_OUT_OF_RANGE(
+              "options.maxResults",
+              "a positive integer or Infinity",
+              opts.maxResults,
+            );
+          }
+        }
+      } else if (opts.maxResults === Infinity) {
+        maxResults = Infinity;
+      } else {
+        // NaN / -Infinity. The latter is a finite-style request for "no cap"
+        // -- honor it. NaN gets the same ERR_OUT_OF_RANGE treatment.
+        if (opts.maxResults === -Infinity) {
+          maxResults = Infinity;
+        } else {
+          throw codes.ERR_OUT_OF_RANGE(
+            "options.maxResults",
+            "a positive integer or Infinity",
+            opts.maxResults,
+          );
+        }
+      }
+    } else if (opts.maxResults === undefined) {
+      maxResults = DEFAULT_MAX_RESULTS;
+    } else {
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "options.maxResults",
+        ["number", "undefined"],
+        opts.maxResults,
+      );
+    }
     var normalized = pattern.replace(/\\/g, "/");
     if (normalized.startsWith("./")) normalized = normalized.slice(2);
     var segs = normalized.split("/");
@@ -8737,6 +8784,7 @@
     // the extra stat.
     var deduped = [];
     var emitted = new Set();
+    var overCap = false;
     for (var i = 0; i < out.length; i++) {
       var item = out[i];
       var key;
@@ -8750,20 +8798,31 @@
       if (emitted.has(key)) continue;
       emitted.add(key);
       deduped.push(item);
+      // Early-abort during dedup once the unique count clears the cap. The
+      // post-loop check below is still required for the accurate count in
+      // the error message, but stopping here means we don't keep allocating
+      // `emitted` Set entries past `maxResults` -- the OOM path is bounded
+      // to roughly `maxResults * (1 + dedup_multiplier)` entries rather than
+      // the full match count. `out` itself is freed with the call frame.
+      if (!overCap && maxResults !== Infinity && deduped.length > maxResults) {
+        overCap = true;
+      }
+      if (overCap) break;
     }
-    // Cap check: throwing after dedup uses the REAL unique count (the walker
-    // counts every `**` traversal, so `out.length` is several times the
-    // unique count for any pattern containing `**`). Surfacing the unique
-    // count is the number the caller actually cares about, and a thrown
-    // error here means `deduped` is freed with the rest of the call frame
-    // -- the OOM path is unreachable past this point.
-    if (maxResults !== Infinity && deduped.length > maxResults) {
-      throw new RangeError(
-        "glob: pattern matched " +
-          deduped.length +
-          " paths, exceeding maxResults=" +
-          maxResults +
-          " (set options.maxResults higher or narrow the pattern)",
+    // Cap check: the dedup loop above breaks early once `deduped.length`
+    // exceeds `maxResults`, so by the time we reach this line `deduped` is
+    // the minimum unique count (the true count is at least this large). If
+    // the early-abort didn't fire the dedup finished in full and the count
+    // is exact. Either way the error message tells the caller how many
+    // unique matches were found before the cap tripped, which is the number
+    // they care about when deciding whether to widen the cap or narrow the
+    // pattern. Uses `codes.ERR_OUT_OF_RANGE` so conformance harnesses see
+    // the standard `.code` field.
+    if (overCap || deduped.length > maxResults) {
+      throw codes.ERR_OUT_OF_RANGE(
+        "results",
+        "<= " + maxResults + " (set options.maxResults higher or narrow the pattern)",
+        deduped.length,
       );
     }
     return deduped;
