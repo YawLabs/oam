@@ -5403,8 +5403,11 @@ fn op_cluster_fork(
         throw_type_error(scope, "clusterFork: script path required");
         return;
     };
-    // TEMP-DISABLED for vacuity check
-    let _ = &script_path;
+    // Fork re-execs this runtime with `script_path` as argv, so the child is
+    // gated on the script it will run -- the same escape hatch spawn would be.
+    if !check_child_perm(scope, &script_path) {
+        return;
+    }
     let Some(worker_id) = arg_string(scope, &args, 1) else {
         throw_type_error(scope, "clusterFork: worker id required");
         return;

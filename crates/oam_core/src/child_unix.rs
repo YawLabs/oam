@@ -559,3 +559,19 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
         Err(e) => OpOutcome::Failed(format!("wait join: {e}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::signal_number;
+
+    /// Signal-name mapping covers the known names and rejects unknown/empty
+    /// ones (the `None` arm is the divergence fix: unknown no longer silently
+    /// becomes SIGTERM).
+    #[test]
+    fn signal_number_maps_known_and_unknown() {
+        assert_eq!(signal_number("SIGTERM"), Some(libc::SIGTERM));
+        assert_eq!(signal_number("SIGKILL"), Some(libc::SIGKILL));
+        assert_eq!(signal_number("SIGFOO"), None);
+        assert_eq!(signal_number(""), None);
+    }
+}

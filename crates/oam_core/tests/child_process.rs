@@ -19,9 +19,7 @@ use oam_core::child::{
 #[cfg(unix)]
 use oam_core::child::child_kill;
 #[cfg(unix)]
-use oam_core::child_unix::{
-    RawChildRegistry, StdioFd, raw_kill, raw_wait, signal_number, spawn_extra,
-};
+use oam_core::child_unix::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
 
 /// Spawn a child through `spawn_child` that writes `marker` to stdout and
 /// then exits. cfg-gated on the shell, not the whole test: `cmd /c echo` on
@@ -244,15 +242,4 @@ async fn raw_kill_after_exit_reports_real_exit() {
         serde_json::json!({ "code": 0, "signal": null }),
         "an already-exited raw child must report its real exit, not the kill signal"
     );
-}
-
-/// T5 (unix): signal-name mapping covers the known names and rejects unknown
-/// or empty ones.
-#[cfg(unix)]
-#[test]
-fn signal_number_maps_known_and_unknown() {
-    assert_eq!(signal_number("SIGTERM"), Some(libc::SIGTERM));
-    assert_eq!(signal_number("SIGKILL"), Some(libc::SIGKILL));
-    assert_eq!(signal_number("SIGFOO"), None);
-    assert_eq!(signal_number(""), None);
 }
