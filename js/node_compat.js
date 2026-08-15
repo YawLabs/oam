@@ -19938,6 +19938,12 @@
               }
               r.push(Buffer.from(chunk));
             }
+            // NOT done at push(null) -- see readableFinished. Node fires the
+            // ChildProcess 'close' only AFTER each stdio stream emits 'end';
+            // settling here would let 'close' (gated on allSettled(reads))
+            // race ahead of the buffered-data drain and drop 'end' on a
+            // child that writes, closes, and exits within one peek cycle.
+            await readableFinished(r);
           })());
         }
       }
