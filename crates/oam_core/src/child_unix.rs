@@ -131,19 +131,19 @@ fn relocate(fd: RawFd, base: RawFd) -> Result<RawFd, String> {
 /// Map a Node signal name to this platform's signal number (libc constants are
 /// platform-correct, unlike hardcoded numbers which diverge on macOS). Shared
 /// with the main `child.rs` kill path (`pub(crate)`).
-pub(crate) fn signal_number(name: &str) -> i32 {
+pub(crate) fn signal_number(name: &str) -> Option<i32> {
     match name {
-        "SIGHUP" => libc::SIGHUP,
-        "SIGINT" => libc::SIGINT,
-        "SIGQUIT" => libc::SIGQUIT,
-        "SIGABRT" => libc::SIGABRT,
-        "SIGKILL" => libc::SIGKILL,
-        "SIGUSR1" => libc::SIGUSR1,
-        "SIGUSR2" => libc::SIGUSR2,
-        "SIGTERM" => libc::SIGTERM,
-        "SIGCONT" => libc::SIGCONT,
-        "SIGSTOP" => libc::SIGSTOP,
-        _ => libc::SIGTERM,
+        "SIGHUP" => Some(libc::SIGHUP),
+        "SIGINT" => Some(libc::SIGINT),
+        "SIGQUIT" => Some(libc::SIGQUIT),
+        "SIGABRT" => Some(libc::SIGABRT),
+        "SIGKILL" => Some(libc::SIGKILL),
+        "SIGUSR1" => Some(libc::SIGUSR1),
+        "SIGUSR2" => Some(libc::SIGUSR2),
+        "SIGTERM" => Some(libc::SIGTERM),
+        "SIGCONT" => Some(libc::SIGCONT),
+        "SIGSTOP" => Some(libc::SIGSTOP),
+        _ => None,
     }
 }
 
@@ -356,7 +356,27 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
         return OpOutcome::Done;
     };
     let result = tokio::task::spawn_blocking(move || {
+        // Poll with NO timeout before the read: poll(-1) blocks until the fd
+        // is readable OR the child's write end closes. Child death guarantees
+        // readability (POLLIN|POLLHUP, and the read then returns 0 = EOF), so
+        // this thread cannot park forever on a dead child -- and a
+        // live-but-quiet child simply waits, instead of a poll timeout
+        // masquerading as EOF and silently truncating the stream.
+        let mut pfd = libc::pollfd {
+            fd: rawfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a valid stack pollfd for the live rawfd; touches no
+        // other memory.
+        let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if pr < 0 {
+            return Err(format!("poll: {}", std::io::Error::last_os_error()));
+        }
         let mut buf = vec![0u8; 65536];
+        // SAFETY: the fd is ready (POLLIN, or HUP when the write end closed),
+        // so this read cannot block; on HUP it returns 0 (EOF). buf is a live
+        // 64 KiB buffer for the live rawfd.
         let n = unsafe { libc::read(rawfd, buf.as_mut_ptr() as *mut libc::c_void, 65536) };
         if n < 0 {
             Err(format!("read: {}", std::io::Error::last_os_error()))
@@ -474,12 +494,19 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
         // means the pid may already be reaped -- and the kernel can recycle a
         // reaped pid immediately, so a kill then could hit an unrelated process.
         if child.child.is_some() {
+            // Unknown signal names resolve to SIGTERM -- same as the None case.
             let signum = signal
                 .as_deref()
                 .map(signal_number)
+                .unwrap_or(Some(libc::SIGTERM))
                 .unwrap_or(libc::SIGTERM);
-            child.kill_signal = Some(signal.unwrap_or_else(|| signal_name(signum)));
-            unsafe { libc::kill(child.pid as libc::pid_t, signum) };
+            let name = signal.unwrap_or_else(|| signal_name(signum));
+            // Record the kill only when the signal actually fired. A failed
+            // kill (EPERM) must not masquerade as a signal death in raw_wait.
+            // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
+            if unsafe { libc::kill(child.pid as libc::pid_t, signum) } == 0 {
+                child.kill_signal = Some(name);
+            }
         }
     }
 }

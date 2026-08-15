@@ -18,6 +18,12 @@ pub struct ChildProcess {
     pub stdin: Option<tokio::process::ChildStdin>,
     pub stdout: Option<tokio::process::ChildStdout>,
     pub stderr: Option<tokio::process::ChildStderr>,
+    /// Set while a read holds the stdout pipe out of the registry, so a
+    /// concurrent second read sees the stream as busy rather than at EOF.
+    pub stdout_busy: bool,
+    /// Set while a read holds the stderr pipe out of the registry, so a
+    /// concurrent second read sees the stream as busy rather than at EOF.
+    pub stderr_busy: bool,
     pub pid: u32,
     /// Wakes the parked `child_wait` future, which owns the `Child` and is the
     /// only place that can signal it. Lets kill survive `child` being taken.
@@ -36,6 +42,8 @@ impl ChildProcess {
             stdin,
             stdout,
             stderr,
+            stdout_busy: false,
+            stderr_busy: false,
             pid,
             kill: Arc::new(Notify::new()),
             kill_signal: None,
@@ -503,25 +511,63 @@ pub struct SpawnSyncError {
 }
 
 pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcome {
-    let stdout = {
-        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&handle).and_then(|cp| cp.stdout.take())
+    // Check-and-set atomically under one lock. A concurrent second read sees
+    // busy=true and WAITS for the in-flight read to release the pipe rather
+    // than failing, so the pump's 'close' path cannot stall on a rejected
+    // read promise. A None pipe with busy=false is a real EOF (stream closed
+    // / never piped). The guard is dropped before the yield, so no lock is
+    // held across the await; the loop always terminates because the in-flight
+    // read clears busy on every exit path (bounded by data/EOF/child death).
+    let stdout = loop {
+        let taken = {
+            let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&handle) {
+                Some(cp) if cp.stdout_busy => None,
+                Some(cp) => match cp.stdout.take() {
+                    Some(pipe) => {
+                        cp.stdout_busy = true;
+                        Some(Some(pipe))
+                    }
+                    None => Some(None),
+                },
+                None => Some(None),
+            }
+        };
+        match taken {
+            Some(pipe) => break pipe,
+            None => tokio::task::yield_now().await,
+        }
     };
     match stdout {
         Some(mut stdout) => {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 65536];
             match stdout.read(&mut buf).await {
-                Ok(0) => OpOutcome::Done,
+                Ok(0) => {
+                    // Real EOF: the pipe is dropped, not re-inserted. Clear busy.
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stdout_busy = false;
+                    }
+                    OpOutcome::Done
+                }
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(cp) = guard.get_mut(&handle) {
                         cp.stdout = Some(stdout);
+                        cp.stdout_busy = false;
                     }
                     OpOutcome::Bytes(buf)
                 }
-                Err(e) => OpOutcome::Failed(format!("read stdout: {e}")),
+                Err(e) => {
+                    // Read error: the pipe is dropped, not re-inserted. Clear busy.
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stdout_busy = false;
+                    }
+                    OpOutcome::Failed(format!("read stdout: {e}"))
+                }
             }
         }
         None => OpOutcome::Done,
@@ -529,25 +575,63 @@ pub async fn child_read_stdout(children: ChildRegistry, handle: u64) -> OpOutcom
 }
 
 pub async fn child_read_stderr(children: ChildRegistry, handle: u64) -> OpOutcome {
-    let stderr = {
-        let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&handle).and_then(|cp| cp.stderr.take())
+    // Check-and-set atomically under one lock. A concurrent second read sees
+    // busy=true and WAITS for the in-flight read to release the pipe rather
+    // than failing, so the pump's 'close' path cannot stall on a rejected
+    // read promise. A None pipe with busy=false is a real EOF (stream closed
+    // / never piped). The guard is dropped before the yield, so no lock is
+    // held across the await; the loop always terminates because the in-flight
+    // read clears busy on every exit path (bounded by data/EOF/child death).
+    let stderr = loop {
+        let taken = {
+            let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&handle) {
+                Some(cp) if cp.stderr_busy => None,
+                Some(cp) => match cp.stderr.take() {
+                    Some(pipe) => {
+                        cp.stderr_busy = true;
+                        Some(Some(pipe))
+                    }
+                    None => Some(None),
+                },
+                None => Some(None),
+            }
+        };
+        match taken {
+            Some(pipe) => break pipe,
+            None => tokio::task::yield_now().await,
+        }
     };
     match stderr {
         Some(mut stderr) => {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0u8; 65536];
             match stderr.read(&mut buf).await {
-                Ok(0) => OpOutcome::Done,
+                Ok(0) => {
+                    // Real EOF: the pipe is dropped, not re-inserted. Clear busy.
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stderr_busy = false;
+                    }
+                    OpOutcome::Done
+                }
                 Ok(n) => {
                     buf.truncate(n);
                     let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(cp) = guard.get_mut(&handle) {
                         cp.stderr = Some(stderr);
+                        cp.stderr_busy = false;
                     }
                     OpOutcome::Bytes(buf)
                 }
-                Err(e) => OpOutcome::Failed(format!("read stderr: {e}")),
+                Err(e) => {
+                    // Read error: the pipe is dropped, not re-inserted. Clear busy.
+                    let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(cp) = guard.get_mut(&handle) {
+                        cp.stderr_busy = false;
+                    }
+                    OpOutcome::Failed(format!("read stderr: {e}"))
+                }
             }
         }
         None => OpOutcome::Done,
@@ -655,9 +739,18 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
 /// POSIX signals, so `start_kill()` (TerminateProcess) is the only mechanism;
 /// the requested signal name is surfaced by `exit_report` instead.
 #[cfg(unix)]
-fn deliver_kill(_child: &mut tokio::process::Child, pid: u32, signal: Option<&str>) {
+fn deliver_kill(child: &mut tokio::process::Child, pid: u32, signal: Option<&str>) {
+    // Only signal while the child is still alive. If it already exited and the
+    // SIGCHLD driver reaped it, the kernel can recycle the pid immediately, so
+    // a kill then could hit an unrelated process. On a try_wait error we fall
+    // through and signal anyway (conservative).
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    // Unknown signal names fall back to SIGTERM, pending JS-side validation.
     let signum = signal
         .map(crate::child_unix::signal_number)
+        .unwrap_or(Some(libc::SIGTERM))
         .unwrap_or(libc::SIGTERM);
     // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
     unsafe { libc::kill(pid as libc::pid_t, signum) };

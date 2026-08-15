@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
     GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
@@ -425,8 +425,39 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
     let raw = h.0 as usize;
     let result = tokio::task::spawn_blocking(move || {
         let hh = raw as HANDLE;
+        // Peek before the blocking read so ReadFile only runs once bytes are
+        // confirmed waiting. PeekNamedPipe fails (EOF) the moment the child's
+        // write end closes, so this loop cannot spin forever on a dead child;
+        // a live-but-quiet child re-peeks until data arrives -- no timeout
+        // cap, because a timeout here is a false EOF that silently truncates
+        // the stream.
+        loop {
+            let mut avail: u32 = 0;
+            // SAFETY: hh is a live pipe read handle; null buffer/read/left
+            // args, avail receives the total-bytes-available count.
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    hh,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut avail,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                // Broken pipe (child died / closed its end) == clean EOF.
+                return Ok(None);
+            }
+            if avail > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let mut buf = vec![0u8; 65536];
         let mut n: u32 = 0;
+        // SAFETY: bytes are confirmed waiting, so this read cannot block; buf
+        // is a live 64 KiB buffer for the live hh.
         let ok = unsafe { ReadFile(hh, buf.as_mut_ptr(), 65536, &mut n, std::ptr::null_mut()) };
         if ok == 0 {
             // ERROR_BROKEN_PIPE (109) on a closed write end == clean EOF.
@@ -546,9 +577,22 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
 pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
     let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(child) = guard.get_mut(&id) {
-        child.kill_signal = signal;
+        // raw_wait only COPIES the handle out of the registry (SendHandle is
+        // Copy), so `process.is_some()` does not prove liveness: a child that
+        // exited on its own still has Some(process). Poll the handle; only
+        // record + terminate a process that is actually still running --
+        // reporting a kill for a child that already exited would hide its
+        // real exit code.
         if let Some(SendHandle(h)) = child.process {
-            unsafe { TerminateProcess(h, 1) };
+            // WAIT_TIMEOUT (0x102) == still running.
+            const WAIT_TIMEOUT: u32 = 0x102;
+            // SAFETY: h is a live process handle; zero-timeout poll, no wait.
+            let state = unsafe { WaitForSingleObject(h, 0) };
+            if state == WAIT_TIMEOUT {
+                child.kill_signal = signal;
+                // SAFETY: h is a live process handle we own.
+                unsafe { TerminateProcess(h, 1) };
+            }
         }
     }
 }

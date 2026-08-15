@@ -15673,6 +15673,72 @@ fn child_process_and_workers_cannot_escape_the_sandbox() {
     );
 }
 
+/// `cluster.fork()` must respect the `child` permission gate.
+///
+/// `cluster.fork()` hands `process.argv[1]` verbatim to
+/// `natives.clusterFork(scriptPath, ...)` (node_compat.js:20819/20826), and
+/// `op_cluster_fork` re-execs this runtime with that path as the worker's
+/// argv (`crates/oam_core/src/cluster.rs`). So a script that is NOT covered
+/// by `--allow-child` calling `cluster.fork()` re-execs ITSELF as a worker --
+/// the same escape hatch `spawn("sh")` is. It used to run ungated while
+/// `spawn` was denied. The worker branch writes a marker file; if the marker
+/// exists, the fork ran and the sandbox was bypassed.
+///
+/// `setupPrimary({ exec })` is a no-op here (node_compat.js:20871), so there
+/// is no redirect trick -- the gated path is the primary's own script. The
+/// marker-file write uses only `fs`, no cmd/sh, so this is portable.
+#[test]
+fn cluster_fork_cannot_escape_the_child_sandbox() {
+    let dir = write_temp("cluster_escape_target/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let marker = dir.join("cluster_escaped.txt");
+    let _ = std::fs::remove_file(&marker);
+    let marker_js = marker.to_string_lossy().replace('\\', "/");
+
+    // The worker is this same script re-exec'd with OAM_CLUSTER_WORKER set, so
+    // gate the marker write on the worker branch (cluster.isWorker). The
+    // primary branch forks, then stays alive long enough for a (wrongly)
+    // spawned worker to run -- otherwise the primary could exit before the
+    // marker had a chance to land and read as a vacuous pass.
+    let script = write_temp(
+        "cluster_escape.mjs",
+        &format!(
+            "import cluster from 'node:cluster';\n\
+             import fs from 'node:fs';\n\
+             if (cluster.isWorker) {{\n\
+             \x20 try {{ fs.writeFileSync('{marker_js}', 'x'); }} catch {{}}\n\
+             }} else {{\n\
+             \x20 try {{\n\
+             \x20   const w = cluster.fork();\n\
+             \x20   w.on('error', (e) => console.log('forkErr=' + (e && e.code)));\n\
+             \x20   setTimeout(() => {{ try {{ w.kill(); }} catch {{}}; console.log('primary=DONE'); }}, 3000);\n\
+             \x20 }} catch (e) {{\n\
+             \x20   console.log('fork=' + (e && e.code));\n\
+             \x20 }}\n\
+             }}"
+        ),
+    );
+
+    // --allow-child points at a DIFFERENT (existing) path, so the worker
+    // script being fork'd (the primary itself) is outside the allow list.
+    let other = write_temp("cluster_allowed_child.js", "// not the worker script\n");
+    let out = oam(&[
+        "--permission",
+        "--allow-child",
+        other.to_str().unwrap(),
+        script.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !marker.exists(),
+        "a cluster worker wrote through the sandbox -- cluster.fork() bypassed \
+         the child permission gate:\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ------------------------- --permission at the other CLI entry points
 
 /// `oam --permission test <dir>` must actually sandbox the files it runs.

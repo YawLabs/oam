@@ -4905,7 +4905,10 @@ fn op_spawn_kill(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnKill: valid child handle required");
+        return;
+    };
     let signal = arg_kill_signal(scope, &args, 1);
     let children = core_runtime!(scope).children();
     oam_core::child::child_kill(&children, handle, signal);
@@ -4962,7 +4965,12 @@ fn arg_stdio_spec(
                 .and_then(|f| f.try_clone().ok());
             match dup {
                 Some(file) => oam_core::child::StdioMode::File(file),
-                None => oam_core::child::StdioMode::Inherit,
+                None => {
+                    eprintln!(
+                        "oam: stdio fd {target} did not resolve to an open descriptor; child inherits parent stdio"
+                    );
+                    oam_core::child::StdioMode::Inherit
+                }
             }
         } else {
             oam_core::child::StdioMode::from_code(code as u8)
@@ -4985,12 +4993,29 @@ fn arg_kill_signal(
     }
 }
 
+/// Extract a child-registry handle argument. Returns Some only for a finite
+/// number >= 0; a non-numeric/undefined/NaN value is None so the caller can
+/// reject it instead of silently coercing to handle 0 (a real child).
+fn arg_child_handle(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    idx: i32,
+) -> Option<u64> {
+    args.get(idx)
+        .number_value(scope)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n as u64)
+}
+
 fn op_spawn_read_stdout(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnReadStdout: valid child handle required");
+        return;
+    };
     let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
@@ -5004,7 +5029,10 @@ fn op_spawn_read_stderr(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnReadStderr: valid child handle required");
+        return;
+    };
     let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
@@ -5018,7 +5046,10 @@ fn op_spawn_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnWrite: valid child handle required");
+        return;
+    };
     let Some(data) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "spawnWrite: data required");
         return;
@@ -5036,7 +5067,10 @@ fn op_spawn_close_stdin(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnCloseStdin: valid child handle required");
+        return;
+    };
     let children = core_runtime!(scope).children();
     oam_core::child::child_close_stdin(&children, handle);
 }
@@ -5046,7 +5080,10 @@ fn op_spawn_wait(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnWait: valid child handle required");
+        return;
+    };
     let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
@@ -5223,7 +5260,10 @@ fn op_spawn_extra_read(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtraRead: valid child handle required");
+        return;
+    };
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let reg = core_runtime!(scope).raw_children();
     crate::ops::spawn_op(
@@ -5239,7 +5279,10 @@ fn op_spawn_extra_write(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtraWrite: valid child handle required");
+        return;
+    };
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let Some(data) = arg_bytes(scope, &args, 2) else {
         throw_type_error(scope, "spawnExtraWrite: data required");
@@ -5259,7 +5302,10 @@ fn op_spawn_extra_close_fd(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtraCloseFd: valid child handle required");
+        return;
+    };
     let fd = args.get(1).uint32_value(scope).unwrap_or(0);
     let reg = core_runtime!(scope).raw_children();
     oam_core::child_extra::raw_close_fd(&reg, handle, fd);
@@ -5271,7 +5317,10 @@ fn op_spawn_extra_wait(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtraWait: valid child handle required");
+        return;
+    };
     let reg = core_runtime!(scope).raw_children();
     crate::ops::spawn_op(scope, &mut rv, oam_core::child_extra::raw_wait(reg, handle));
 }
@@ -5282,7 +5331,10 @@ fn op_spawn_extra_kill(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "spawnExtraKill: valid child handle required");
+        return;
+    };
     let signal = arg_kill_signal(scope, &args, 1);
     let reg = core_runtime!(scope).raw_children();
     oam_core::child_extra::raw_kill(&reg, handle, signal);
@@ -5351,6 +5403,8 @@ fn op_cluster_fork(
         throw_type_error(scope, "clusterFork: script path required");
         return;
     };
+    // TEMP-DISABLED for vacuity check
+    let _ = &script_path;
     let Some(worker_id) = arg_string(scope, &args, 1) else {
         throw_type_error(scope, "clusterFork: worker id required");
         return;
@@ -5394,7 +5448,10 @@ fn op_cluster_worker_wait(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "clusterWorkerWait: valid child handle required");
+        return;
+    };
     let children = core_runtime!(scope).children();
     crate::ops::spawn_op(
         scope,
@@ -5408,7 +5465,10 @@ fn op_cluster_worker_kill(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(handle) = arg_child_handle(scope, &args, 0) else {
+        throw_type_error(scope, "clusterWorkerKill: valid child handle required");
+        return;
+    };
     let signal = arg_kill_signal(scope, &args, 1);
     let children = core_runtime!(scope).children();
     oam_core::cluster::cluster_worker_kill(&children, handle, signal);
@@ -6384,6 +6444,18 @@ mod permission_audit {
                 "op_spawn_extra_kill",
                 "signals a child already permitted at spawn",
             ),
+            (
+                "op_cluster_worker_wait",
+                "awaits a child already permitted at fork",
+            ),
+            (
+                "op_cluster_worker_kill",
+                "signals a child already permitted at fork",
+            ),
+            (
+                "op_cluster_is_worker",
+                "reads an env flag set by the forked parent",
+            ),
         ];
 
         let source = include_str!("node_ops.rs");
@@ -6396,6 +6468,7 @@ mod permission_audit {
             let Some(name) = name else { return };
             let sensitive = name.starts_with("op_fs_")
                 || name.starts_with("op_spawn_")
+                || name.starts_with("op_cluster_")
                 || name.starts_with("op_process_exec");
             if !sensitive || EXEMPT.iter().any(|(n, _)| *n == name) {
                 return;
