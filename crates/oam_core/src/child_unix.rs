@@ -493,7 +493,17 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
         // it under this same lock *before* the blocking reap, so `child.is_none()`
         // means the pid may already be reaped -- and the kernel can recycle a
         // reaped pid immediately, so a kill then could hit an unrelated process.
-        if child.child.is_some() {
+        //
+        // Even with `child.is_some()`, the process may already be a zombie
+        // (exited but not yet reaped). kill(2) on a zombie returns 0 -- the pid
+        // is still a valid target until the parent reaps -- so without this
+        // probe we would record a signal death that never happened, masking the
+        // real exit in raw_wait. try_wait is non-blocking and reaps the zombie
+        // itself if it finds one; the later child.wait() in raw_wait still sees
+        // the same ExitStatus (std stores it internally across try_wait/wait).
+        if let Some(inner) = child.child.as_mut()
+            && matches!(inner.try_wait(), Ok(None))
+        {
             // Unknown signal names resolve to SIGTERM -- same as the None case.
             let signum = signal
                 .as_deref()
