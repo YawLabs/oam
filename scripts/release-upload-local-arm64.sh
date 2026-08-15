@@ -61,9 +61,19 @@ fi
 # failure MORE likely: every killed session restarts on --resume, and a process
 # mid-launch is precisely what denies the link step this path. Renaming frees
 # it without touching a single process -- see scripts/lib/build-locks.sh.
+#
+# BOTH paths get parked: cargo's link writes deps/oam.exe FIRST and only promotes
+# it to release/oam.exe on success, so the LNK1104 deny window lands on the
+# deps-stage file. An orphan from an earlier aborted build is the usual holder
+# there; rename frees it the same way it frees the promoted binary.
 oam_reap_parked target/release
+oam_reap_parked target/release/deps
 if ! oam_park_file target/release/oam.exe; then
   echo "error: target/release/oam.exe is locked and a rename could not free it" >&2
+  exit 1
+fi
+if ! oam_park_file target/release/deps/oam.exe; then
+  echo "error: target/release/deps/oam.exe is locked and a rename could not free it" >&2
   exit 1
 fi
 cargo build --release -p oam_cli

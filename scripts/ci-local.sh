@@ -117,8 +117,16 @@ clear_debug_holders
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
 # renaming works where deleting does not, and re-uplifting the binary from
 # deps/ is near-free -- cargo hardlinks it, it does not relink.
+#
+# BOTH paths get parked: cargo's link writes deps/oam.exe FIRST and only
+# promotes it to debug/oam.exe on success, so the LNK1104 deny window lands
+# on the deps-stage file. An orphan test binary (a previous run's `cargo
+# test` left mapped) is the usual holder there -- same deny window, same
+# fix.
 oam_park_file target/debug/oam.exe \
   || ko "target/debug/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
+oam_park_file target/debug/deps/oam.exe \
+  || ko "target/debug/deps/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
 if cargo build --workspace; then
   ok "build ok"
 else

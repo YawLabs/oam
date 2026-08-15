@@ -460,7 +460,16 @@ step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
 # Live processes run this exact file -- typed-cli sessions, the resident
 # type-check daemon. Park it rather than killing them (see free_locked_binary;
 # scripts/release-upload-local-arm64.sh still has the old taskkill).
+#
+# BOTH paths get freed, not just the promoted binary: cargo's link step writes
+# deps/oam.exe FIRST and only promotes it to release/oam.exe on success, so the
+# LNK1104 denial window is on the deps-stage file. The same deny window that
+# holds release/oam.exe (live typed-cli panes) can hold deps/oam.exe (an orphan
+# from a previous aborted build, or the file a parallel cargo invocation wrote
+# moments before the link started). Renaming frees both without touching any
+# process -- see scripts/lib/build-locks.sh.
 free_locked_binary target/release/oam.exe
+free_locked_binary target/release/deps/oam.exe
 cargo build --release -p oam_cli
 cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
@@ -473,6 +482,13 @@ else
   # CARGO_TARGET_DIR isolation keeps the x64 toolchain's host artifacts from
   # churning the native toolchain's fingerprints in target/.
   rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --force-non-host
+  # Same LNK1104 story as the native leg: link writes deps/oam.exe before
+  # promoting it to release/oam.exe, so both paths must be free of a deny-delete
+  # holder. x64-host's trees are isolated from the native ones by CARGO_TARGET_DIR
+  # -- nothing live ever runs out of this tree -- so a holder here is an orphan
+  # of an earlier aborted x64 build, not a typed-cli session.
+  free_locked_binary target/x64-host/x86_64-pc-windows-msvc/release/oam.exe
+  free_locked_binary target/x64-host/x86_64-pc-windows-msvc/release/deps/oam.exe
   CARGO_TARGET_DIR=target/x64-host \
     cargo +stable-x86_64-pc-windows-msvc build --release --target x86_64-pc-windows-msvc -p oam_cli
   cp target/x64-host/x86_64-pc-windows-msvc/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
