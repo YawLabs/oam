@@ -3719,6 +3719,7 @@
           return ret;
         },
 
+        matchesGlob: pathMatchesGlob,
         sep: "\\",
         delimiter: ";",
       };
@@ -4028,6 +4029,7 @@
           return ret;
         },
 
+        matchesGlob: pathMatchesGlob,
         sep: "/",
         delimiter: ":",
       };
@@ -8414,6 +8416,390 @@
     return new Dirent(name, parentPath, kind);
   }
 
+  // -- glob support (Node v22 surface) --
+  //
+  // The runtime never reaches the filesystem directly for glob: it builds a
+  // pattern-to-regex compiler, then walks readdir() results. Both pieces
+  // live here so the three factories (fs.sync, fs/promises, callback) and
+  // path.matchesGlob all share them.
+
+  // Hard cap on deduped glob matches. Anything past this is almost always a
+  // runaway pattern (`**/*` against a tree with millions of files inside
+  // node_modules / target) that the caller did not intend. Surfacing it as
+  // an error beats the alternative: the walker's `out.push()` loop has no
+  // yield points, so a 100k+ match glob against a deep tree can grow the V8
+  // heap past 1 GiB and trip "Ineffective mark-compacts near heap limit",
+  // aborting the whole process (no graceful exit). 1M matches is well under
+  // that ceiling on every supported host and is comfortably above what any
+  // reasonable `fs.glob` consumer reads in one call (a normal
+  // `src/**/*.{ts,tsx}` lands in the low thousands). Set
+  // `options.maxResults` to override per-call; passing `Infinity` disables it.
+  const DEFAULT_MAX_RESULTS = 1_000_000;
+
+  // Pattern -> { regex, hasMagic }. Splits on `/`, normalizes path separators
+  // internally. `*` is any-non-slash, `**` is any (incl. slash), `?` one-
+  // non-slash, `[abc]` / `[!abc]` char classes, `{a,b}` brace expansion (one
+  // level deep; backslash escapes `,` `}` `{`). `**` followed by a literal
+  // segment in the same pattern (e.g. `a/**/b`) lets the `**` match zero or
+  // more directories by absorbing the trailing `/` so the regex doesn't pin
+  // a literal slash at that point.
+  function globToRegex(pattern, opts) {
+    var nocase = !!(opts && opts.nocase);
+    var segs = pattern.split("/");
+    var re = "^";
+    var hasMagic = false;
+    for (var si = 0; si < segs.length; si++) {
+      var seg = segs[si];
+      var segRe = "";
+      var segMagic = false;
+      for (var i = 0; i < seg.length; i++) {
+        var c = seg[i];
+        if (c === "*") {
+          if (seg[i + 1] === "*") {
+            segMagic = true;
+            segRe += ".*";
+            while (i + 1 < seg.length && seg[i + 1] === "*") i++;
+            if (i + 1 < seg.length && seg[i + 1] === "/") i++;
+          } else {
+            segMagic = true;
+            segRe += "[^/]*";
+          }
+        } else if (c === "?") {
+          segMagic = true;
+          segRe += "[^/]";
+        } else if (c === "[") {
+          segMagic = true;
+          var cls = "";
+          i++;
+          if (i < seg.length && (seg[i] === "!" || seg[i] === "^")) { cls += "^"; i++; }
+          if (i < seg.length && seg[i] === "]") { cls += "\\]"; i++; }
+          while (i < seg.length && seg[i] !== "]") {
+            if (seg[i] === "\\" && i + 1 < seg.length) { cls += seg[i] + seg[i + 1]; i += 2; continue; }
+            cls += seg[i];
+            i++;
+          }
+          segRe += "[" + cls + "]";
+        } else if (c === "{") {
+          segMagic = true;
+          var depth = 1;
+          var body = "";
+          i++;
+          while (i < seg.length && depth > 0) {
+            if (seg[i] === "\\" && i + 1 < seg.length) { body += seg[i] + seg[i + 1]; i += 2; continue; }
+            if (seg[i] === "{") depth++;
+            else if (seg[i] === "}") { depth--; if (depth === 0) break; }
+            body += seg[i];
+            i++;
+          }
+          var alts = [];
+          var cur = "";
+          var d2 = 0;
+          for (var j = 0; j < body.length; j++) {
+            var bj = body[j];
+            if (bj === "\\" && j + 1 < body.length) { cur += bj + body[j + 1]; j++; continue; }
+            if (bj === "{") d2++;
+            else if (bj === "}") d2--;
+            if (bj === "," && d2 === 0) { alts.push(cur); cur = ""; }
+            else cur += bj;
+          }
+          alts.push(cur);
+          var inner = "(?:";
+          for (var k = 0; k < alts.length; k++) {
+            if (k > 0) inner += "|";
+            inner += globToRegex(alts[k], opts).source.slice(1, -1);
+          }
+          segRe += inner + ")";
+        } else if (c === "\\") {
+          if (i + 1 < seg.length) { segRe += "\\" + seg[++i]; }
+          else segRe += "\\\\";
+        } else if (/[.+^$()|]/.test(c)) {
+          segRe += "\\" + c;
+        } else {
+          segRe += c;
+        }
+      }
+      hasMagic = hasMagic || segMagic;
+      re += segRe;
+      if (si < segs.length - 1) re += "/";
+    }
+    return { regex: new RegExp(re + "$", nocase ? "i" : ""), source: re + "$", hasMagic: hasMagic };
+  }
+
+  // -- traversal --
+  //
+  // `cwd` is the absolute directory the pattern is resolved against. `segs`
+  // are the slash-split pattern; `pos` is the segment index we're at. Each
+  // step reads the directory, picks entries that match `segs[pos]`, then
+  // either descends (more segments to consume) or records a match (this is
+  // the final segment).
+  //
+  // `**` is the twist: it can match zero or more directories. The walker
+  // therefore treats `**` as "consume the segment AND try to skip it (try the
+  // empty match first); if a directory entry fits, also descend through it."
+  // The cycle check on `follow:true` records every ancestor inode we've
+  // recursed into; revisiting one would loop forever, so we throw ELOOP.
+  function globWalk(opts, natives, cwd, segs, pos, base, visited, out, sep, absolutePattern) {
+    var seg = segs[pos];
+    var entries;
+    try {
+      entries = natives.fsReaddirSync(base);
+    } catch (e) {
+      // Missing directories (ENOENT), non-directory paths (ENOTDIR), and any
+      // other readdir failure are silently treated as zero matches -- matches
+      // node v22 behavior, which never throws from a glob for any of these.
+      // Callers can detect "no cwd" via the empty result.
+      return;
+    }
+    var include = opts.include;
+    var includeRe = null;
+    if (typeof include === "string") {
+      var inc = globToRegex(include, opts);
+      includeRe = inc.regex;
+    }
+    var segCompiled = globToRegex(seg, opts);
+    var segIsMagic = segCompiled.hasMagic;
+    var isGlobStar = seg === "**";
+    var isLast = pos === segs.length - 1;
+    // `include` is a directory pre-filter that ONLY applies to non-`**`
+    // intermediate segments. `**` is a permission to traverse anything, so
+    // gating it on `include` would silently exclude the whole subtree.
+    var includeApplies = includeRe && !isGlobStar && !isLast;
+    for (var k = 0; k < entries.length; k++) {
+      var entry = entries[k];
+      var name = entry.name;
+      // The leaf-name filter: for non-`**`, the entry's name must match the
+      // segment pattern. For `**`, every name passes (the segment is just a
+      // permission to traverse).
+      if (!isGlobStar) {
+        if (!matchSegment(seg, segCompiled, segIsMagic, name, opts)) continue;
+      }
+      if (includeApplies && !includeRe.test(name)) continue;
+      var childPath = base + sep + name;
+      // `**` is a wildcard for any number of path segments, INCLUDING zero.
+      // Three actions:
+      //  1. Skip `**` and try the rest of the pattern at the SAME depth
+      //     (covers `a/**/b.js` matching `a/b.js` with ** absorbing zero dirs).
+      //  2. When `**` is the FINAL pattern segment, record the entry.
+      //  3. Descend with `**` still active -- the next pattern segment(s)
+      //     will eventually match against some descendant.
+      // The order matters: action 2 only fires for terminal `**`, otherwise
+      // emitting the directory itself would shadow the per-segment match in
+      // action 1 (a/ would show up in **/*.js, which isn't what callers want).
+      if (isGlobStar) {
+        if (isLast) {
+          // node v22 emits directories from a terminal `**` regardless of
+          // nodir:true (verified empirically against v22.22.2). The
+          // non-globstar terminal branch honors nodir because literal pattern
+          // segments are explicit user intent.
+          var relGS = childPath.slice(cwd.length + 1);
+          if (!(opts.exclude && matchExclude(opts.exclude, relGS))) {
+            emitMatch(opts, natives, base, relGS, childPath, entry.kind, out, sep, absolutePattern);
+          }
+        } else {
+          // Empty match: skip **, run the next pattern segment at this depth.
+          globWalk(opts, natives, cwd, segs, pos + 1, base, visited, out, sep, absolutePattern);
+        }
+        if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
+          if (opts.follow === true && entry.kind === "symlink") {
+            try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
+            if (visited.has(childPath)) {
+              throw makeSystemError("ELOOP", "glob", childPath);
+            }
+            visited.add(childPath);
+          }
+          globWalk(opts, natives, cwd, segs, pos, childPath, visited, out, sep, absolutePattern);
+          if (opts.follow === true && entry.kind === "symlink") visited.delete(childPath);
+        }
+      } else if (isLast) {
+        if (opts.nodir === true && entry.kind === "dir") continue;
+        var rel = childPath.slice(cwd.length + 1);
+        if (opts.exclude && matchExclude(opts.exclude, rel)) continue;
+        emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
+      } else if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
+        if (opts.follow === true && entry.kind === "symlink") {
+          try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
+          if (visited.has(childPath)) {
+            throw makeSystemError("ELOOP", "glob", childPath);
+          }
+          visited.add(childPath);
+        }
+        globWalk(opts, natives, cwd, segs, pos + 1, childPath, visited, out, sep, absolutePattern);
+        if (opts.follow === true && entry.kind === "symlink") visited.delete(childPath);
+      }
+    }
+  }
+
+  function matchSegment(seg, compiled, isMagic, name, opts) {
+    if (!isMagic) return seg === name;
+    return compiled.regex.test(name);
+  }
+
+  // node accepts `function` or `string[]` for `exclude` (a bare string is
+  // rejected with ERR_INVALID_ARG_TYPE in the validator above). The string[]
+  // form treats each element as a glob matched against the relative path.
+  function matchExclude(exclude, relPath) {
+    if (typeof exclude === "function") return exclude(relPath);
+    if (Array.isArray(exclude)) {
+      for (var i = 0; i < exclude.length; i++) {
+        if (globToRegex(exclude[i], {}).regex.test(relPath)) return true;
+      }
+    }
+    return false;
+  }
+
+  function emitMatch(opts, natives, parentPath, rel, childPath, kind, out, sep, absolutePattern) {
+    if (opts.withFileTypes) {
+      // Dirent's `name` is the leaf, `parentPath` is the containing directory.
+      // The walker threads `parentPath` (the readdir base) through, not the
+      // glob root -- otherwise entries inside a/b/ would all claim the same
+      // parent as the cwd.
+      out.push(new Dirent(rel.split(sep).pop(), parentPath, kind));
+      return;
+    }
+    // `absolute` is a no-op in node v22 unless the pattern itself is absolute:
+    // a relative pattern always yields relative paths even with absolute:true,
+    // an absolute pattern always yields absolute paths even without the flag.
+    out.push(absolutePattern ? childPath : rel);
+  }
+
+  // Public entry used by the three factories. Validates args; everything
+  // else (path normalization, traversal, option plumbing) is `globWalk`'s
+  // job.
+  function globSyncRaw(pattern, options, natives) {
+    if (typeof pattern !== "string") {
+      throw codes.ERR_INVALID_ARG_TYPE("pattern", "string", pattern);
+    }
+    var opts = options || {};
+    if (opts.cwd !== undefined && typeof opts.cwd !== "string") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.cwd", "string", opts.cwd);
+    }
+    if (opts.exclude !== undefined && opts.exclude !== null) {
+      var validExclude =
+        typeof opts.exclude === "function" ||
+        (Array.isArray(opts.exclude) && opts.exclude.every(function (e) { return typeof e === "string"; }));
+      if (!validExclude) {
+        throw codes.ERR_INVALID_ARG_TYPE("options.exclude", ["function", "string[]"], opts.exclude);
+      }
+    }
+    // Resolve the result-count cap. `maxResults` is an oam extension (node's
+    // fs.glob has no such option today); a non-finite or non-positive number
+    // disables the cap for callers that genuinely need the full set. The
+    // rationale lives on `DEFAULT_MAX_RESULTS` above.
+    var maxResults =
+      typeof opts.maxResults === "number" && Number.isFinite(opts.maxResults) && opts.maxResults > 0
+        ? Math.floor(opts.maxResults)
+        : opts.maxResults === Infinity
+          ? Infinity
+          : DEFAULT_MAX_RESULTS;
+    var normalized = pattern.replace(/\\/g, "/");
+    if (normalized.startsWith("./")) normalized = normalized.slice(2);
+    var segs = normalized.split("/");
+    var cwd = opts.cwd ? String(opts.cwd) : ".";
+    var isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized);
+    // For absolute patterns, the walker should start at the directory portion
+    // of the path (everything except the last segment). The pattern's
+    // trailing component is then matched against the listing in that dir.
+    // Relative patterns start at cwd.
+    var root, startSeg;
+    if (isAbsolute) {
+      // pattern[0] is "/" (POSIX) or the drive letter (Windows). Walk starts
+      // at the directory containing the final segment. The segments were
+      // normalized to '/', so rejoin with the platform's native separator --
+      // the original pattern uses '\\' on Windows and node emits '\\' in the
+      // result.
+      startSeg = segs.length - 1;
+      root = segs.slice(0, startSeg).join(pattern.indexOf("\\") !== -1 ? "\\" : "/");
+    } else {
+      startSeg = 0;
+      root = cwd;
+    }
+    // Path separator for joining the root with descendant names during
+    // traversal. For relative cwd, derive from the cwd itself (Windows cwd
+    // uses '\\', POSIX uses '/'). For absolute patterns the root above
+    // already carries the platform separator.
+    var sep = root.indexOf("\\") !== -1 ? "\\" : "/";
+    var out = [];
+    var seen = new Set();
+    // `**` matches the cwd itself (`.` on a relative cwd) in addition to
+    // everything below it -- this is the documented node behavior and the
+    // shape most tooling (lint, prettier ignore globs) relies on. The `.`
+    // is emitted in string form even with nodir:true; for withFileTypes the
+    // walker handles the cwd-self via the normal descent path (the cwd's
+    // own children get emitted, not a synthetic "." Dirent).
+    if (segs.length === 1 && segs[0] === "**" && !opts.withFileTypes) {
+      out.push(isAbsolute ? root : ".");
+    }
+    globWalk(opts, natives, root, segs, startSeg, root, seen, out, sep, isAbsolute);
+    out.sort();
+    // The walker explores each match multiple times when `**` is involved
+    // (zero-segment match + every-depth descent). Real Node deduplicates via
+    // a realpath cache; a path-set is enough for our purposes and avoids
+    // the extra stat.
+    var deduped = [];
+    var emitted = new Set();
+    for (var i = 0; i < out.length; i++) {
+      var item = out[i];
+      var key;
+      if (opts.withFileTypes) {
+        key = item.name + "|" + item.parentPath + "|" + item._kind;
+      } else if (isAbsolute) {
+        key = item;
+      } else {
+        key = item;
+      }
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      deduped.push(item);
+    }
+    // Cap check: throwing after dedup uses the REAL unique count (the walker
+    // counts every `**` traversal, so `out.length` is several times the
+    // unique count for any pattern containing `**`). Surfacing the unique
+    // count is the number the caller actually cares about, and a thrown
+    // error here means `deduped` is freed with the rest of the call frame
+    // -- the OOM path is unreachable past this point.
+    if (maxResults !== Infinity && deduped.length > maxResults) {
+      throw new RangeError(
+        "glob: pattern matched " +
+          deduped.length +
+          " paths, exceeding maxResults=" +
+          maxResults +
+          " (set options.maxResults higher or narrow the pattern)",
+      );
+    }
+    return deduped;
+  }
+
+  // node v22's fs.promises.glob returns an AsyncIterable<string|Dirent>, not a
+  // Promise<string[]>. Build the iterable from the materialized array so
+  // Array.fromAsync works identically on both runtimes. (Native async
+  // streaming would be a wider change -- the walker is sync and the dedup
+  // pass needs the full set anyway.)
+  function globAsyncIterable(items) {
+    return {
+      [Symbol.asyncIterator]() {
+        var i = 0;
+        return {
+          next() {
+            if (i < items.length) return Promise.resolve({ value: items[i++], done: false });
+            return Promise.resolve({ value: undefined, done: true });
+          },
+        };
+      },
+    };
+  }
+
+  // path.matchesGlob shares the regex compiler but treats its input as a
+  // single-name match (no slash splitting). path/posix and path/win32 both
+  // forward to it (the underlying match is separator-agnostic on this side;
+  // the path module picks the separator when splitting).
+  function pathMatchesGlob(p, pattern) {
+    if (typeof p !== "string") throw codes.ERR_INVALID_ARG_TYPE("path", "string", p);
+    if (typeof pattern !== "string") throw codes.ERR_INVALID_ARG_TYPE("pattern", "string", pattern);
+    var compiled = globToRegex(pattern, {});
+    if (!compiled.hasMagic) return p === pattern;
+    return compiled.regex.test(p);
+  }
+
   function readOptions(options) {
     if (typeof options === "string") return { encoding: options };
     return options ?? {};
@@ -8546,6 +8932,13 @@
       unlink: (path) => natives.fsUnlink(String(path)),
       rename: (from, to) => natives.fsRename(String(from), String(to)),
       copyFile: (from, to) => natives.fsCopyFile(String(from), String(to)),
+      // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
+      // Wrap the materialized array so Array.fromAsync() works on both sides.
+      glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
+      // callback fs.glob needs a Promise-returning function (callbackify1
+      // calls .then on the result). Hide this from users -- the public
+      // promises API is the AsyncIterable form above.
+      _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(String(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(String(path)),
       mkdtemp: (prefix) => natives.fsMkdtemp(String(prefix)),
@@ -9051,6 +9444,7 @@
           withFileTypes === true,
         );
       },
+      globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
       mkdirSync: (path, options) => {
         natives.fsMkdirSync(String(path), readOptions(options).recursive === true);
       },
@@ -9164,6 +9558,7 @@
       lstat: callbackify1(promises.lstat),
       statfs: callbackify1(promises.statfs),
       readdir: callbackify1(promises.readdir),
+      glob: callbackify1(promises._globAsPromise),
       mkdir: callbackify1(promises.mkdir),
       rm: callbackify1(promises.rm),
       rmdir: callbackify1(promises.rmdir),

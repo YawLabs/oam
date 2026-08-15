@@ -1,8 +1,8 @@
 {
-  "commit": "101ddc0",
+  "commit": "95b4cc9",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.9.0",
+  "oamVersion": "oam 0.9.1",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -322,10 +322,14 @@
         {
           "case": "79-fs-fd-errors-and-positions.mjs",
           "status": "pass"
+        },
+        {
+          "case": "80-fs-glob.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 79,
-      "total": 79
+      "pass": 80,
+      "total": 80
     },
     "surface": {
       "exports": {
@@ -383,7 +387,8 @@
           {
             "module": "fs/promises",
             "names": [
-              "Dirent"
+              "Dirent",
+              "_globAsPromise"
             ]
           },
           {
@@ -556,7 +561,7 @@
             ]
           }
         ],
-        "knownMissing": 416,
+        "knownMissing": 410,
         "newMissing": [],
         "noBaseline": false,
         "nodeTotal": 1874,

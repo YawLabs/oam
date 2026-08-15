@@ -1025,8 +1025,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1358,
-        "missing": 416,
+        "present": 1364,
+        "missing": 410,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -1243,12 +1243,7 @@
           "init",
           "usingDomains"
         ],
-        "fs": [
-          "glob",
-          "globSync"
-        ],
         "fs/promises": [
-          "glob",
           "watch"
         ],
         "global:AbortController.prototype": [
@@ -1443,16 +1438,13 @@
           "setPriority"
         ],
         "path": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "path/posix": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "path/win32": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "perf_hooks": [
           "Performance",

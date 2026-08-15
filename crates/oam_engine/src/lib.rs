@@ -114,17 +114,40 @@ pub struct JsRuntime {
 /// Lives in an isolate slot because the reading native is zero-capture.
 pub(crate) struct ProcessArgv(pub Vec<String>);
 
+/// Default V8 heap cap when `OAM_MAX_HEAP_MB` is unset. 4 GiB matches Node's
+/// built-in default for `--max-old-space-size` on 64-bit hosts. Without a
+/// cap, a single runaway sync op -- a glob over a large tree, an unbuffered
+/// file read, a parser that pins its inputs -- can grow the heap past 1.4 GiB
+/// and trip V8's "Ineffective mark-compacts near heap limit" path, which has
+/// no graceful exit and aborts the process (see crash.rs::v8_oom_handler).
+/// Capping at startup converts that into the deterministic `near_heap_limit_oom`
+/// exit instead. 4 GiB matches the upper bound of the user-visible
+/// `OAM_MAX_HEAP_MB` knob: raising it past 4 GiB gives back roughly nothing
+/// on a 64-bit host (V8 compresses pointers below that threshold) and is
+/// almost always the user misreading "MB" as "GiB".
+const DEFAULT_HEAP_MB: usize = 4096;
+
 /// Parse `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
 ///
-/// Node parity: this is oam's `--max-old-space-size` analogue. `Some(mb)`
-/// installs a cap; `None` (unset, empty, non-numeric, or `0`) leaves V8 at
-/// its default (no artificial cap). A very small value is honored as-is --
-/// it simply trips the OOM callback during startup, printing the clean
-/// banner rather than aborting raw.
+/// Node parity: this is oam's `--max-old-space-size` analogue. Resolution:
+///   * unset or empty -> [`DEFAULT_HEAP_MB`] (4 GiB on 64-bit).
+///   * `0` -> no cap (V8 default; explicit opt-out).
+///   * non-numeric -> no cap, matching the pre-default behavior so a typo
+///     never silently pins the heap to a tiny ceiling.
+///   * `n > 0` -> n MB cap. A very small value is honored as-is; it trips
+///     the OOM callback during startup, printing the clean banner rather
+///     than aborting raw.
 fn oam_max_heap_mb() -> Option<usize> {
-    let raw = std::env::var("OAM_MAX_HEAP_MB").ok()?;
-    let mb: usize = raw.trim().parse().ok()?;
-    if mb == 0 { None } else { Some(mb) }
+    let raw = std::env::var("OAM_MAX_HEAP_MB").ok();
+    let raw = match raw {
+        Some(s) if !s.is_empty() => s,
+        _ => return Some(DEFAULT_HEAP_MB),
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) => None,
+        Ok(mb) => Some(mb),
+        Err(_) => None,
+    }
 }
 
 /// V8 `NearHeapLimitCallback`: fires when the heap approaches the
@@ -148,8 +171,18 @@ unsafe extern "C" fn near_heap_limit_oom(
 ) -> usize {
     use std::io::Write as _;
     let mb = current_heap_limit / (1024 * 1024);
+    // Only blame OAM_MAX_HEAP_MB when the user actually set it; otherwise
+    // attribute the cap to the built-in default so the message tells the
+    // truth about where the number came from. Empty/unset -> "" -> "default",
+    // any other non-"0" value -> user's value. `0` opts out, so this callback
+    // is never registered (see `if heap_cap_mb.is_some()` below).
+    let source = std::env::var("OAM_MAX_HEAP_MB")
+        .ok()
+        .filter(|s| !s.is_empty() && s.trim() != "0")
+        .map(|_| "set by OAM_MAX_HEAP_MB")
+        .unwrap_or("default 4 GiB");
     let banner = format!(
-        "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap set by OAM_MAX_HEAP_MB\n"
+        "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
     );
     let stderr = std::io::stderr();
     let mut lock = stderr.lock();
@@ -192,11 +225,12 @@ impl JsRuntime {
         with_fork_pool: bool,
     ) -> Self {
         init_platform();
-        // OAM_MAX_HEAP_MB: optional hard cap on the V8 heap (Node's
-        // --max-old-space-size analogue). Applied at isolate creation so
-        // EVERY isolate -- top-level, `oam serve` workers, and fork-prewarm
-        // threads -- inherits the cap; a runaway MCP sidecar can't grow the
-        // heap unbounded. Unset/0/invalid -> V8 default (no artificial cap).
+        // OAM_MAX_HEAP_MB: hard cap on the V8 heap (Node's --max-old-space-size
+        // analogue). Applied at isolate creation so EVERY isolate -- top-level,
+        // `oam serve` workers, and fork-prewarm threads -- inherits the cap;
+        // a runaway MCP sidecar can't grow the heap unbounded. The default
+        // (4 GiB) is set by `oam_max_heap_mb`; only `OAM_MAX_HEAP_MB=0` opts
+        // out to the V8 default.
         let heap_cap_mb = oam_max_heap_mb();
         let mut params =
             v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
@@ -629,6 +663,75 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
 mod tests {
     use super::*;
     use napi::NAPI_ENV_DROP_COUNT;
+    use std::sync::Mutex;
+
+    // Env-var tests share a process-wide environment. Serialize them so
+    // a parallel `cargo test` thread reading OAM_MAX_HEAP_MB doesn't see
+    // a value another test just set. The lock is held only for the duration
+    // of a single env-var mutation + assertion, so unrelated tests run
+    // unaffected.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn heap_cap_defaults_to_4gib_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: no other threads are reading OAM_MAX_HEAP_MB while we hold
+        // ENV_LOCK (the lock is the test-thread serialization point).
+        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+        assert_eq!(
+            oam_max_heap_mb(),
+            Some(4096),
+            "unset OAM_MAX_HEAP_MB must default to 4 GiB; the pre-default \
+             behavior (no cap) is what caused the 1.4 GiB mark-compact OOMs \
+             in the crash log",
+        );
+    }
+
+    #[test]
+    fn heap_cap_zero_opts_out() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "0") };
+        assert_eq!(
+            oam_max_heap_mb(),
+            None,
+            "OAM_MAX_HEAP_MB=0 must mean no cap (V8 default); this is the \
+             explicit opt-out for callers that genuinely want the heap unbounded",
+        );
+        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+    }
+
+    #[test]
+    fn heap_cap_empty_string_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "") };
+        assert_eq!(
+            oam_max_heap_mb(),
+            Some(4096),
+            "an empty OAM_MAX_HEAP_MB is treated the same as unset",
+        );
+        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+    }
+
+    #[test]
+    fn heap_cap_honors_explicit_value() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "256") };
+        assert_eq!(oam_max_heap_mb(), Some(256));
+        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+    }
+
+    #[test]
+    fn heap_cap_garbage_value_opts_out() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OAM_MAX_HEAP_MB", "not-a-number") };
+        assert_eq!(
+            oam_max_heap_mb(),
+            None,
+            "a non-numeric OAM_MAX_HEAP_MB opts out (typo-safe) rather than \
+             silently pinning the heap to a tiny ceiling",
+        );
+        unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") };
+    }
 
     #[test]
     fn executes_script_and_returns_value() {

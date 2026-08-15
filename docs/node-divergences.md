@@ -632,10 +632,12 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 | `constants` | 113 (70 linux / 66 darwin) | The legacy all-in-one table. Platform-conditional values — the `WSA*` block on Windows, `O_DIRECT`/`O_NOCTTY`/`RTLD_*` on POSIX, plus `UV_DIRENT_*` and the `SSL_OP_*`/`ENGINE_METHOD_*` OpenSSL set everywhere. This module is the *entire* reason the ratchet is keyed by platform: a Windows-only baseline reports 16 phantom new gaps on Linux and 12 on darwin, every one of them here. `fs.constants` and `os.constants` are separately correct — see *Platform constant tables* above. |
 | `dns/promises` | 31 | `Resolver`, `getServers`/`setServers`, `lookupService`, `resolveTlsa`, and the `BADNAME`/`NOTFOUND`/… error-code constants. |
 | `module` | 25 | The `Module._*` loader internals (`_load`, `_resolveFilename`, `_cache`, `_extensions`), `register`, `SourceMap`/`findSourceMap`, the compile-cache API. |
-| `fs` | 29 | Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `glob`/`globSync`, `openAsBlob`. Each needs a syscall oam does not yet wrap; they are the top of the backlog. |
+| `fs` | 27 | Ownership and fd metadata (`chown`/`fchown`/`lchown`, `fchmod`/`lchmod`), durability (`fsync`/`fdatasync`), `ftruncate`, the `utimes`/`futimes`/`lutimes` family, `readv`/`writev`, `openAsBlob`. Each needs a syscall oam does not yet wrap; they are the top of the backlog. `glob`/`globSync` are in pure JS now (see `80-fs-glob.mjs`). |
 | `crypto` | 12 | The legacy class constructors (`Hash`, `Hmac`, `Cipher(iv)`, `Decipher(iv)`), `diffieHellman`, `getCipherInfo`, `randomFill`. |
 | `stream/web` | 12 | The controller/reader/writer constructors and the queuing-strategy classes — the same constructors listed in the Web globals row above. |
 | `v8` | 9 | `DefaultSerializer`/`DefaultDeserializer`, `getHeapSnapshot`, `GCProfiler`, `promiseHooks`, `queryObjects`. |
+| `path` | 3 (one per of `path`, `path/posix`, `path/win32`) | `_makeLong` (a Windows long-path helper; not surfaced by `fs.glob`, which is in pure JS). |
+| `fs/promises` | 1 | `watch` (the recursive `fs.watch` family — needs an event channel oam does not yet plumb). |
 
 ---
 
