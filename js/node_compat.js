@@ -19929,8 +19929,10 @@
               try {
                 chunk = await natives.spawnExtraRead(cp._handle, fd);
               } catch {
-                r.push(null);
-                break;
+                // A read failure (stolen/consumed end) is indistinguishable from
+                // EOF to the consumer; fall through to the same push(null) +
+                // readableFinished path so 'end' still precedes 'close'.
+                chunk = null;
               }
               if (chunk === undefined || chunk === null || chunk.length === 0) {
                 r.push(null);
