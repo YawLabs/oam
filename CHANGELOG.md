@@ -91,6 +91,19 @@ tracked by a gate instead of waiting to be discovered by a crash.
   lock when the blocking wait returns: a kill is delivered any time before the reap
   (a zombie discards it harmlessly) and never after (a reaped pid can be recycled by
   the kernel).
+- A failed extra-fd spawn emitted `error` and nothing else, so a caller whose
+  completion path is `close` — a CDP driver probing for a browser binary that is not
+  installed — stalled forever. The extra-fd path now follows `error` with `close`
+  carrying the libuv errno, the same contract the plain path keeps, and both raw
+  native backends now include `errno` in the failure body so that argument can be
+  node's (Windows additionally routes `GetLastError` through the shared mapping, so
+  `ERROR_PATH_NOT_FOUND` reports `ENOENT` instead of `UNKNOWN`).
+- `kill()` with a numeric signal was handed to the native layer as a stringified
+  number no signal table recognizes, so `kill(9)` silently delivered SIGTERM and an
+  invalid number like `kill(987654)` threw nothing. Numbers are now validated against
+  `os.constants.signals` and converted to their canonical name — node's rule: a number
+  is valid iff it appears in the platform's signal mapping, anything else is
+  `ERR_UNKNOWN_SIGNAL`.
 
 ### Changed
 

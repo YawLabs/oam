@@ -19807,9 +19807,31 @@
                    "SIGKILL", "SIGSEGV", "SIGTERM", "SIGBREAK", "SIGWINCH"])
         : new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGKILL",
                    "SIGUSR1", "SIGUSR2", "SIGTERM", "SIGCONT", "SIGSTOP"]);
+    // number -> name, built lazily from os.constants.signals -- the same
+    // source node's getSignalsToNamesMapping reads. Kept as a map (not a
+    // validity Set) because the native kill ops speak NAMES: forwarding the
+    // raw number stringified it into e.g. "9", which signal_number() does not
+    // recognize, so every numeric kill silently fell back to SIGTERM.
+    let killSignalsByNumber = null;
     function validateKillSignal(signal) {
       if (signal === undefined || signal === null) return "SIGTERM";
-      if (typeof signal === "number") return signal; // native side validates numbers
+      if (typeof signal === "number") {
+        if (killSignalsByNumber === null) {
+          killSignalsByNumber = new Map();
+          const sigs = registry.get("os").constants.signals;
+          for (const nm of Object.keys(sigs)) {
+            // First name wins so an alias sharing a number (SIGIOT = SIGABRT
+            // = 6) resolves to the canonical name the native layer knows.
+            if (!killSignalsByNumber.has(sigs[nm])) killSignalsByNumber.set(sigs[nm], nm);
+          }
+        }
+        const name = killSignalsByNumber.get(signal);
+        // node: a number is valid iff it appears in the platform's signal
+        // mapping; anything else is ERR_UNKNOWN_SIGNAL, never a SIGTERM
+        // fallback.
+        if (name === undefined) throw new codes.ERR_UNKNOWN_SIGNAL(String(signal));
+        return name;
+      }
       const name = String(signal).toUpperCase();
       if (!VALID_KILL_SIGNALS.has(name)) throw new codes.ERR_UNKNOWN_SIGNAL(signal);
       return name;
@@ -19973,7 +19995,17 @@
         // An ipc channel bound for this child would otherwise keep listening
         // forever: 'exit' never fires for a child that never started.
         if (cp._ipcTeardown) cp._ipcTeardown();
-        queueMicrotask(() => cp.emit("error", e));
+        queueMicrotask(() => {
+          cp.emit("error", e);
+          // node follows 'error' with 'close' (code = the libuv errno) for a
+          // child that never started -- the same contract handleSpawnFailure
+          // keeps on the plain path. Extra-fd callers complete on 'close' too
+          // (a CDP driver probing for a browser binary that is not installed),
+          // and without it they stall instead of taking their error branch.
+          queueMicrotask(() => {
+            cp.emit("close", typeof e.errno === "number" ? e.errno : null, null);
+          });
+        });
         return;
       }
       cp._handle = info.handle;

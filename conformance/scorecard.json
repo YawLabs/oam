@@ -1,5 +1,5 @@
 {
-  "commit": "1629ab2",
+  "commit": "77d4c04",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.10.1",
@@ -334,10 +334,22 @@
         {
           "case": "80-fs-glob.mjs",
           "status": "pass"
+        },
+        {
+          "case": "81-child-extra-fd-spawn-failure.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "82-child-kill-signal-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "83-child-extra-fd-ipc-kill.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 82,
-      "total": 82
+      "pass": 85,
+      "total": 85
     },
     "surface": {
       "exports": {

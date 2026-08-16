@@ -317,13 +317,16 @@ pub fn spawn_extra(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                "ENOENT"
-            } else {
-                "UNKNOWN"
-            };
+            let code = super::node_error_code(&e);
+            // errno rides along: node emits it as the `code` argument of the
+            // 'close' event for a child that never started, so the JS layer
+            // cannot reproduce node's failure shape without it (same contract
+            // as the non-raw spawn path in child.rs).
+            let errno = super::node_errno(code, &e)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "null".to_string());
             let msg = format!(
-                "{{\"code\":\"{code}\",\"message\":\"spawn failed ({}) for {}\"}}",
+                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"spawn failed ({}) for {}\"}}",
                 e,
                 command.replace('"', "\\\"")
             );

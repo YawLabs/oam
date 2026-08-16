@@ -382,9 +382,17 @@ pub fn spawn_extra(
         if ok == 0 {
             let err = GetLastError();
             cleanup_fail(&child_close, &nul_handles, &parent_fds);
-            let code = if err == 2 { "ENOENT" } else { "UNKNOWN" };
+            // Route through the shared io::Error mapping so ERROR_PATH_NOT_FOUND
+            // (3) and friends land on the same code node reports, and errno
+            // rides along: node emits it as the `code` argument of the 'close'
+            // event for a child that never started (same contract as child.rs).
+            let ioe = std::io::Error::from_raw_os_error(err as i32);
+            let code = super::node_error_code(&ioe);
+            let errno = super::node_errno(code, &ioe)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "null".to_string());
             return Err(format!(
-                "{{\"code\":\"{code}\",\"message\":\"CreateProcessW failed (GetLastError={err}) for {}\"}}",
+                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"CreateProcessW failed (GetLastError={err}) for {}\"}}",
                 command.replace('"', "\\\"")
             ));
         }
