@@ -8567,10 +8567,31 @@
     var segIsMagic = segCompiled.hasMagic;
     var isGlobStar = seg === "**";
     var isLast = pos === segs.length - 1;
+    // For the empty-match case under `**`, the walker needs to test entries
+    // against the NEXT segment at the current depth. Compile it once outside
+    // the per-entry loop so `matchSegment` can reuse it (and so the inline
+    // emit avoids a second readdir that the recursive empty-match descent
+    // would otherwise trigger).
+    var nextSeg = null;
+    var nextCompiled = null;
+    var nextIsMagic = false;
+    if (isGlobStar && !isLast) {
+      nextSeg = segs[pos + 1];
+      nextCompiled = globToRegex(nextSeg, opts);
+      nextIsMagic = nextCompiled.hasMagic;
+    }
     // `include` is a directory pre-filter that ONLY applies to non-`**`
     // intermediate segments. `**` is a permission to traverse anything, so
     // gating it on `include` would silently exclude the whole subtree.
     var includeApplies = includeRe && !isGlobStar && !isLast;
+    // Function exclude in node v22 is called with the ENTRY's leaf name during
+    // the globstar iteration (see lib/internal/fs/glob.js -- the
+    // `this.#exclude(entry.name)` call in the GLOBSTAR branch). That makes
+    // patterns like `exclude: p => p.startsWith('a/')` only block descent when
+    // the directory's full path starts with 'a/' -- not its leaf name. Mirroring
+    // node's behavior here is what makes `**/*.js` with `exclude` keep files
+    // directly inside `a/` while still dropping the contents of `a/b/`.
+    var excludeFn = typeof opts.exclude === "function" ? opts.exclude : null;
     for (var k = 0; k < entries.length; k++) {
       var entry = entries[k];
       var name = entry.name;
@@ -8581,7 +8602,16 @@
         if (!matchSegment(seg, segCompiled, segIsMagic, name, opts)) continue;
       }
       if (includeApplies && !includeRe.test(name)) continue;
+      // node's globstar iteration skips an entry when `exclude(entry.name)`
+      // returns true -- this prevents the empty-match descent AND the
+      // globstar descent for that entry. We apply the same leaf-name probe
+      // here so platforms that use the same separator as the caller's pattern
+      // (macOS/Linux with `/`) behave identically to node. String-array
+      // exclude is handled by the full-path checks below, which are still
+      // correct because array patterns are relative-path globs.
+      if (isGlobStar && excludeFn && excludeFn(name)) continue;
       var childPath = base + sep + name;
+      var rel = childPath.slice(cwd.length + 1);
       // `**` is a wildcard for any number of path segments, INCLUDING zero.
       // Three actions:
       //  1. Skip `**` and try the rest of the pattern at the SAME depth
@@ -8598,15 +8628,34 @@
           // nodir:true (verified empirically against v22.22.2). The
           // non-globstar terminal branch honors nodir because literal pattern
           // segments are explicit user intent.
-          var relGS = childPath.slice(cwd.length + 1);
-          if (!(opts.exclude && matchExclude(opts.exclude, relGS))) {
-            emitMatch(opts, natives, base, relGS, childPath, entry.kind, out, sep, absolutePattern);
-          }
+          // String-array exclude still goes through the full-path matcher
+          // (function exclude was already handled by the leaf-name probe
+          // above), so `exclude: ["foo.*"]` continues to drop `foo.js`.
+          if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
+          emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
         } else {
-          // Empty match: skip **, run the next pattern segment at this depth.
-          globWalk(opts, natives, cwd, segs, pos + 1, base, visited, out, sep, absolutePattern);
+          // Empty match (node: `nextMatches && nextIndex === last && !isLast`):
+          // emit the entry when it matches the NEXT segment. Mirrored inline
+          // here so the function-exclude leaf-name probe is the only exclude
+          // gate -- a separate recursive call to `globWalk` would re-enter
+          // the non-globstar terminal branch and exclude by full relative
+          // path, which would over-exclude `a/b.js` under a globstar.
+          if (
+            entry.kind !== "dir" &&
+            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, opts)
+          ) {
+            if (opts.nodir === true && entry.kind === "dir") continue;
+            if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
+            emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
+          }
         }
         if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
+          // node's `#addSubpattern` calls `this.#exclude(path)` with the
+          // ENTRY's full relative path before queuing a descent. Mirror that
+          // so an `exclude: p => p.startsWith('a/')` blocks descent into
+          // `a/b/` (path 'a/b' starts with 'a/') while leaving `a/` itself
+          // open (path 'a' does not).
+          if (excludeFn && excludeFn(rel)) continue;
           if (opts.follow === true && entry.kind === "symlink") {
             try { natives.fsReaddirSync(childPath); } catch (e) { continue; }
             if (visited.has(childPath)) {
@@ -8619,7 +8668,6 @@
         }
       } else if (isLast) {
         if (opts.nodir === true && entry.kind === "dir") continue;
-        var rel = childPath.slice(cwd.length + 1);
         if (opts.exclude && matchExclude(opts.exclude, rel)) continue;
         emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
       } else if (entry.kind === "dir" || (opts.follow === true && entry.kind === "symlink")) {
