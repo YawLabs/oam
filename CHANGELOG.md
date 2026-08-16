@@ -82,6 +82,15 @@ tracked by a gate instead of waiting to be discovered by a crash.
 - A missing builtin export now explains itself: the error names the module, says the gap
   is oam's, and points at the tracked list, instead of only repeating V8's bare
   "does not provide an export named X".
+- A live `kill()` on an extra-fd child was a silent no-op on Unix. `raw_kill` only
+  signaled while the registry still held the `Child` handle, but `raw_wait` takes that
+  handle at its first poll — and the wait op starts the moment the child spawns — so
+  every real kill arrived after the handle was gone and the child ran on untouched
+  (conformance case 68's sigterm leg timed out on macOS; a CDP browser child could not
+  be terminated). Liveness now comes from a `reaped` flag flipped under the registry
+  lock when the blocking wait returns: a kill is delivered any time before the reap
+  (a zombie discards it harmlessly) and never after (a reaped pid can be recycled by
+  the kernel).
 
 ### Changed
 

@@ -202,10 +202,11 @@ async fn deliver_kill_does_not_signal_exited_child() {
     );
 }
 
-/// T4 (unix): the raw registry's kill path must not report an already-exited
-/// child as killed. Covers the `child.is_some()` liveness guard in
-/// `raw_kill` plus the kill(2) delivery: signaling a reaped pid could hit an
-/// unrelated process, and recording the signal would mask the real exit.
+/// T4 (unix): a kill that lands after the child already exited must not
+/// disturb the real exit report. The child is a zombie here (nobody has
+/// waited yet), and kill(2) accepts a zombie pid while discarding the signal
+/// -- so the invariant under test is raw_wait's reporting: the real
+/// ExitStatus, not the requested kill, is the source of truth.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_kill_after_exit_reports_real_exit() {
@@ -224,11 +225,10 @@ async fn raw_kill_after_exit_reports_real_exit() {
         .unwrap_or_else(|e| e.into_inner())
         .insert(id, raw);
 
-    // raw_wait has NOT taken the Child yet, so `child.is_some()` is true and
-    // raw_kill's guard passes -- the deciding factor is whether the process
-    // is still alive. Give it time to exit (it has not been reaped: nobody
-    // called wait yet, so it is a zombie, and kill(2) on a zombie is a no-op
-    // that must not be recorded as a signal death).
+    // Nobody has waited yet, so the child is unreaped and raw_kill WILL issue
+    // the kill(2). Give it time to exit first: the pid is then a zombie, the
+    // kernel discards the signal, and the report below must still be the real
+    // exit -- not a phantom signal death.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     raw_kill(&reg, id, Some("SIGTERM".to_string()));
 
@@ -241,5 +241,51 @@ async fn raw_kill_after_exit_reports_real_exit() {
         report,
         serde_json::json!({ "code": 0, "signal": null }),
         "an already-exited raw child must report its real exit, not the kill signal"
+    );
+}
+
+/// T5 (unix): a kill issued while `raw_wait` is already in flight must be
+/// delivered. This is the shape every real caller has: the JS side starts the
+/// wait op the moment the child spawns, so raw_wait has take()n the `Child`
+/// handle long before any kill() can arrive. Liveness must therefore come
+/// from the registry's `reaped` flag, not from handle presence -- gating on
+/// the handle made every live extra-fd kill a silent no-op (conformance case
+/// 68's sigterm leg: the child outlived an 8s window untouched).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_kill_during_wait_delivers_signal() {
+    let raw = spawn_extra(
+        "sh",
+        &["-c".to_string(), "sleep 30".to_string()],
+        None,
+        None,
+        false,
+        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+    )
+    .expect("spawn_extra sleeper child");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    // Start the wait FIRST and give it time to take() the Child, putting the
+    // registry in the state every live kill actually sees.
+    let wait = tokio::spawn(raw_wait(reg.clone(), id));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    raw_kill(&reg, id, Some("SIGTERM".to_string()));
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("kill must unblock raw_wait (a no-op kill leaves the sleeper running 30s)")
+        .expect("wait task join");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": null, "signal": "SIGTERM" }),
+        "a kill during an in-flight wait must terminate the child and report the signal"
     );
 }
