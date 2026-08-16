@@ -8606,9 +8606,10 @@
       // returns true -- this prevents the empty-match descent AND the
       // globstar descent for that entry. We apply the same leaf-name probe
       // here so platforms that use the same separator as the caller's pattern
-      // (macOS/Linux with `/`) behave identically to node. String-array
-      // exclude is handled by the full-path checks below, which are still
-      // correct because array patterns are relative-path globs.
+      // (macOS/Linux with `/`) behave identically to node. Array exclude is a
+      // no-op here (excludeFn is null in that case) and is handled by the
+      // full-path checks below; array patterns are relative-path globs, so the
+      // full-path matcher is the only correct shape.
       if (isGlobStar && excludeFn && excludeFn(name)) continue;
       var childPath = base + sep + name;
       var rel = childPath.slice(cwd.length + 1);
@@ -8640,11 +8641,13 @@
           // gate -- a separate recursive call to `globWalk` would re-enter
           // the non-globstar terminal branch and exclude by full relative
           // path, which would over-exclude `a/b.js` under a globstar.
+          // nodir is the cheaper probe and gates every directory entry before
+          // we pay for a regex match; check it first, then match the leaf.
+          if (opts.nodir === true && entry.kind === "dir") continue;
           if (
             entry.kind !== "dir" &&
             matchSegment(nextSeg, nextCompiled, nextIsMagic, name, opts)
           ) {
-            if (opts.nodir === true && entry.kind === "dir") continue;
             if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
             emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
           }
