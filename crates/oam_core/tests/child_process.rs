@@ -24,19 +24,29 @@ use oam_core::child_unix::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_
 #[cfg(windows)]
 use oam_core::child_extra::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
 
-/// Spawn a child through `spawn_child` that writes `marker` to stdout and
-/// then exits. cfg-gated on the shell, not the whole test: `cmd /c echo` on
-/// Windows, `sh -c 'printf ...'` on unix.
+/// Spawn a child through `spawn_child` that BLOCKS draining stdin, and only
+/// after stdin EOF writes `marker` to stdout and exits. Gating the output on
+/// stdin is what makes T2 deterministic: until the test closes stdin, the
+/// first read is parked holding the pipe with no data in flight. A child
+/// that writes at spawn time (the previous shape) races the poller -- on a
+/// fast-spawning host the first read takes, fills, and re-inserts the pipe
+/// within microseconds, so `wait_until_stdout_taken` never observes the
+/// taken state and times out (seen on the Linux builder; Windows only passed
+/// because cmd.exe starts slowly). cfg-gated on the shell, not the whole
+/// test: `cmd /c more` on Windows, `sh -c 'cat; printf'` on unix.
 fn spawn_echoer(marker: &str) -> (tokio::process::Child, u32) {
     #[cfg(windows)]
     let (command, args) = (
         "cmd".to_string(),
-        vec!["/c".to_string(), format!("echo {marker}")],
+        vec!["/c".to_string(), format!("more > nul & echo {marker}")],
     );
     #[cfg(not(windows))]
     let (command, args) = (
         "sh".to_string(),
-        vec!["-c".to_string(), format!("printf '%s' '{marker}'")],
+        vec![
+            "-c".to_string(),
+            format!("cat >/dev/null; printf '%s' '{marker}'"),
+        ],
     );
     spawn_child(command, args, None, None, false, false, stdio_pipe_all()).expect("spawn echoer")
 }
@@ -85,9 +95,10 @@ async fn concurrent_stdout_reads_serialize() {
     let (child, pid) = spawn_echoer(marker);
     let (reg, handle) = register(child, pid);
 
-    // Hold stdout open past the first read: take the child's stdin and park
-    // it on a channel. Dropping it closes the pipe -> EOF -> the second read
-    // resolves. This makes the overlap deterministic instead of racy.
+    // The echoer writes nothing until its stdin reaches EOF, so parking
+    // stdin on a channel holds ALL stdout activity (data and EOF) until the
+    // test decides. Dropping it releases the child: marker, then exit ->
+    // EOF -> the second read resolves.
     let stdin = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
         guard
@@ -111,9 +122,9 @@ async fn concurrent_stdout_reads_serialize() {
     let reg2 = reg.clone();
     let second = tokio::spawn(async move { child_read_stdout(reg2, handle).await });
 
-    // The first read is parked awaiting data (stdout open, nothing written
-    // yet past spawn). Yield so any misbehaving second read gets every chance
-    // to resolve early against the busy loop.
+    // The first read is parked awaiting data (stdout open, and the child
+    // writes nothing until stdin closes). Yield so any misbehaving second
+    // read gets every chance to resolve early against the busy loop.
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     assert!(
@@ -121,13 +132,22 @@ async fn concurrent_stdout_reads_serialize() {
         "second read resolved while the first held the pipe and no data was available"
     );
 
-    // The echoer wrote its marker at spawn time and does not read stdin, so
-    // what releases the reads is EOF: close stdin (via the parked task) so
-    // the shell exits and stdout reaches EOF after the data.
+    // Release the child: closing stdin (via the parked task) unblocks its
+    // stdin drain, so it writes the marker and exits. The first read resolves
+    // with the marker bytes; the second then takes the pipe and sees EOF.
     let _ = stdin_tx.send(());
 
-    let first_out = first.await.expect("first read task panicked");
-    let second_out = second.await.expect("second read task panicked");
+    // Bounded like the sibling kill tests: a child that misbehaves after the
+    // release (never writes, never EOFs) must fail the test, not hang it --
+    // the 5s poller above only bounds the pre-release phase.
+    let first_out = tokio::time::timeout(std::time::Duration::from_secs(10), first)
+        .await
+        .expect("first read must resolve once stdin closes")
+        .expect("first read task panicked");
+    let second_out = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+        .await
+        .expect("second read must resolve once stdin closes")
+        .expect("second read task panicked");
 
     // Collect bytes in arrival order: Bytes before Done.
     let mut collected: Vec<u8> = Vec::new();
@@ -157,8 +177,11 @@ async fn concurrent_stdout_reads_serialize() {
     );
     assert!(saw_done, "neither read observed EOF after the child exited");
 
-    // Reap the child so the test leaves no zombie/orphan behind.
-    let _ = child_wait(reg, handle).await;
+    // Reap the child so the test leaves no zombie/orphan behind (bounded for
+    // the same reason as the reads above).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child_wait(reg, handle))
+        .await
+        .expect("child must be reapable after EOF");
 }
 
 /// T3 (unix): a kill that lands after the child already exited must not

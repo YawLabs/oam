@@ -361,6 +361,30 @@ explicit-`stdio` path filters the `'ipc'` entry out wherever it sits, so
 `child.stdout === null` and routes fd 1 to the channel, oam hands back a live stdout
 stream. Same bug, same fix, still open.
 
+### 21. `fs.glob` honors option extensions that Node silently ignores
+
+Node v22 validates only `cwd` / `exclude` / `withFileTypes`; every other key on the
+options object is silently ignored — including the ones callers habitually carry over
+from the `glob` npm package. oam implements several of them (`nodir`, `include`,
+`follow`, and the oam-only `maxResults`), so **passing one of those options produces
+glob-package-style behavior on oam and no behavior on Node**. Code that passes none of
+them gets identical results from both runtimes.
+
+Case sensitivity is NOT one of these extensions: a user-supplied `nocase` is ignored
+exactly as Node ignores it, and folding is platform-derived (win32/darwin fold for
+magic patterns, literal components are FS-resolved and returned pattern-cased, a
+literal after a globstar compares strictly, and `path.matchesGlob` folds only magic
+patterns). All of that was verified empirically against v22.22.2 and is pinned by
+`80-fs-glob.mjs` from both sides. Honoring `nocase: true` (the pre-fix behavior)
+diverged from Node exactly where it is observable — a case-sensitive filesystem, where
+`FOO.JS` and `foo.js` can coexist.
+
+The remaining honored extensions are a deliberate-for-now convenience with the same
+failure shape this section exists to document: they only diverge when the caller
+passes them. Whether they should be dropped for strict parity is an open decision;
+until then no conformance case may exercise them in a shape where the two runtimes
+disagree.
+
 ---
 
 ## Module loading and the CLI

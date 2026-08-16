@@ -1,14 +1,22 @@
 // fs.glob / fs.globSync / fs/promises.glob + path.matchesGlob.
 //
-// Pure-JS implementation: the runtime compiles the glob to a regex, walks
-// readdir results, and applies the Node v22 option set (cwd, nodir, mark,
-// absolute, withFileTypes, signal, exclude, include, follow, nocase). The
-// case exercises every option the surface-gaps ratchet needs to be clear
-// about, plus the four core patterns (*, **, character classes, brace
-// expansion) and a few error shapes (ENOENT-style, ENOTDIR, type errors).
+// Pure-JS implementation: the runtime compiles the glob to a regex and walks
+// readdir results. Node v22 validates only cwd / exclude / withFileTypes and
+// silently IGNORES everything else callers borrow from the glob npm package
+// (nodir, mark, absolute, include, follow, nocase, an aborted signal) -- the
+// legs below pin the agreed behavior for each, which for most options means
+// "the option does nothing". Case sensitivity is platform-derived (win32 and
+// darwin fold, linux does not), never user-supplied; literal path components
+// are FS-resolved (pattern-cased in the result) except under a globstar,
+// where node compares its trailing literal strictly. The case also covers
+// the four core patterns (*, **, character classes, brace expansion) and a
+// few error shapes.
 //
 // The case runs identically under oam and real Node v22 so the
-// node-differential harness catches any silent divergence.
+// node-differential harness catches any silent divergence. Some legs have
+// platform-dependent output (case folding, whether FOO.JS and foo.js can
+// coexist); that is fine -- the differential compares oam against the local
+// node on the SAME host.
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -48,8 +56,21 @@ show("**/*.js", fs.globSync("**/*.js", { cwd: root }).sort());
 show("a/**/deep.js", fs.globSync("a/**/deep.js", { cwd: root }).sort());
 // --- [Bb]*.js: case-sensitive character class (no nocase)
 show("[Bb]*.js", fs.globSync("[Bb]*.js", { cwd: root }).sort());
-// --- nocase lets FOO.JS through; default would miss it
+// --- nocase is IGNORED (node validates only cwd/exclude/withFileTypes):
+// on linux both FOO.JS and foo.js exist and matching stays case-sensitive,
+// so only foo.js comes back; on win32/darwin the two creates collapsed into
+// one file and platform folding matches it either way.
 show("nocase foo.*", fs.globSync("foo.*", { cwd: root, nocase: true }).sort());
+// --- platform case folding for magic patterns: FOO.* matches foo.js on
+// win32/darwin (node's internal matcher is nocase there), never on linux.
+show("upper magic FOO.*", fs.globSync("FOO.*", { cwd: root }).sort());
+// --- literal components are FS-resolved and come back PATTERN-cased on
+// case-insensitive platforms (A/b.js -> "A/b.js" on win32/darwin, no match
+// on linux).
+show("upper literal dir", fs.globSync("A/b.js", { cwd: root }).sort());
+// --- ...but a literal after a globstar is compared STRICTLY even on
+// case-insensitive platforms: no match anywhere.
+show("globstar upper literal", fs.globSync("**/BAZ.js", { cwd: root }).sort());
 // --- {a,b} brace expansion: matches .js OR .ts in cwd
 show("*.{js,ts}", fs.globSync("*.{js,ts}", { cwd: root }).sort());
 // --- absolute: with an absolute pattern, node and oam agree on the path.
@@ -92,7 +113,9 @@ const cbResults = await new Promise((resolve, reject) =>
 );
 show("callback", cbResults.sort());
 
-// --- AbortSignal honored (rejects with ABORT_ERR)
+// --- an already-aborted signal is IGNORED by node v22's fs.promises.glob
+// (validated empirically: the iteration completes, no ABORT_ERR); pin the
+// no-throw so a well-meaning "honor the signal" change surfaces here.
 try {
   const ac = new AbortController();
   ac.abort();
@@ -102,7 +125,8 @@ try {
   show("aborted", { code: e.code, name: e.name });
 }
 
-// --- ENOTDIR when cwd points at a file
+// --- a cwd pointing at a FILE yields zero matches, not a throw (node v22
+// swallows the readdir ENOTDIR); pinned as NO THROW
 try {
   fs.globSync("*.js", { cwd: path.join(root, "foo.js") });
   show("enotdir", "NO THROW");
@@ -122,6 +146,10 @@ try {
 show("matchesGlob foo.js *.js", path.matchesGlob("foo.js", "*.js"));
 show("matchesGlob exact", path.matchesGlob("foo", "foo"));
 show("matchesGlob FOO.js", path.matchesGlob("FOO.js", "*.js"));
+// --- matchesGlob folds case for MAGIC patterns on win32/darwin only, and
+// never for fully-literal patterns (minimatch nocase + nocaseMagicOnly).
+show("matchesGlob upper magic", path.matchesGlob("foo.js", "FOO.*"));
+show("matchesGlob upper literal", path.matchesGlob("foo.js", "FOO.js"));
 show("matchesGlob a/b.js a/*.js", path.matchesGlob("a/b.js", "a/*.js"));
 show("matchesGlob posix a/b.js", path.posix.matchesGlob("a/b.js", "a/*.js"));
 show("matchesGlob win32 a/b.js", path.win32.matchesGlob("a/b.js", "a/*.js"));

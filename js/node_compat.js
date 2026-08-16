@@ -8450,8 +8450,26 @@
   // segment in the same pattern (e.g. `a/**/b`) lets the `**` match zero or
   // more directories by absorbing the trailing `/` so the regex doesn't pin
   // a literal slash at that point.
+  // Case sensitivity is PLATFORM-derived, never user-supplied: node v22
+  // validates only cwd/exclude/withFileTypes and silently IGNORES a `nocase`
+  // option, while its internal minimatch instances are hard-wired with
+  // `nocase: isWindows || isMacOS`. Verified empirically against v22.22.2:
+  // on win32 `FOO.*` matches foo.js even with `nocase: false` passed, and on
+  // Linux `nocase: true` still returns only the exact-case match. Honoring
+  // the option (the old behavior) diverged from node exactly where it is
+  // observable -- a case-sensitive filesystem. Cached: the platform cannot
+  // change within a process.
+  var GLOB_FOLD_CASE = null;
+  function globFoldCase() {
+    if (GLOB_FOLD_CASE === null) {
+      var plat = globalThis.process && globalThis.process.platform;
+      GLOB_FOLD_CASE = plat === "win32" || plat === "darwin";
+    }
+    return GLOB_FOLD_CASE;
+  }
+
   function globToRegex(pattern, opts) {
-    var nocase = !!(opts && opts.nocase);
+    var nocase = globFoldCase();
     var segs = pattern.split("/");
     var re = "^";
     var hasMagic = false;
@@ -8599,7 +8617,7 @@
       // segment pattern. For `**`, every name passes (the segment is just a
       // permission to traverse).
       if (!isGlobStar) {
-        if (!matchSegment(seg, segCompiled, segIsMagic, name, opts)) continue;
+        if (!matchSegment(seg, segCompiled, segIsMagic, name, true)) continue;
       }
       if (includeApplies && !includeRe.test(name)) continue;
       // node's globstar iteration skips an entry when `exclude(entry.name)`
@@ -8611,7 +8629,13 @@
       // full-path checks below; array patterns are relative-path globs, so the
       // full-path matcher is the only correct shape.
       if (isGlobStar && excludeFn && excludeFn(name)) continue;
-      var childPath = base + sep + name;
+      // Literal (non-globstar) segments are FS-resolved by node, so a match
+      // is emitted -- and descended through -- with the PATTERN's casing,
+      // not the listing's: `SUB/*.js` yields `SUB\inner.js` on win32
+      // (verified against v22.22.2). Magic and globstar segments keep the
+      // listing name. On case-sensitive platforms a literal match implies
+      // seg === name, so this is a no-op there.
+      var childPath = base + sep + (isGlobStar || segIsMagic ? name : seg);
       var rel = childPath.slice(cwd.length + 1);
       // `**` is a wildcard for any number of path segments, INCLUDING zero.
       // Three actions:
@@ -8646,7 +8670,7 @@
           if (opts.nodir === true && entry.kind === "dir") continue;
           if (
             entry.kind !== "dir" &&
-            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, opts)
+            matchSegment(nextSeg, nextCompiled, nextIsMagic, name, false)
           ) {
             if (Array.isArray(opts.exclude) && matchExclude(opts.exclude, rel)) continue;
             emitMatch(opts, natives, base, rel, childPath, entry.kind, out, sep, absolutePattern);
@@ -8687,8 +8711,18 @@
     }
   }
 
-  function matchSegment(seg, compiled, isMagic, name, opts) {
-    if (!isMagic) return seg === name;
+  // Literal segments fold case on case-insensitive platforms EXCEPT under a
+  // globstar: node resolves literal path components through the filesystem
+  // (`SUB/INNER.js` matches sub/inner.js on win32, and `S*/INNER.js` folds
+  // its literal leaf too), but the globstar machinery compares its trailing
+  // literal strictly (`**/INNER.js` matches nothing even on win32) -- both
+  // verified empirically against v22.22.2. Callers pass `foldLiteral`
+  // accordingly. Magic segments fold via the regex's own `i` flag.
+  function matchSegment(seg, compiled, isMagic, name, foldLiteral) {
+    if (!isMagic) {
+      if (seg === name) return true;
+      return !!foldLiteral && globFoldCase() && seg.toLowerCase() === name.toLowerCase();
+    }
     return compiled.regex.test(name);
   }
 
