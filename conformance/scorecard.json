@@ -1,8 +1,8 @@
 {
-  "commit": "1509286",
+  "commit": "1629ab2",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.9.4",
+  "oamVersion": "oam 0.10.1",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -276,11 +276,19 @@
           "status": "pass"
         },
         {
+          "case": "68-child-extra-fd-kill.mjs",
+          "status": "pass"
+        },
+        {
           "case": "68-child-stdio-numbered-fd.mjs",
           "status": "pass"
         },
         {
           "case": "69-child-extra-fd-descriptor.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "69-child-extra-fd-eof.mjs",
           "status": "pass"
         },
         {
@@ -328,8 +336,8 @@
           "status": "pass"
         }
       ],
-      "pass": 80,
-      "total": 80
+      "pass": 82,
+      "total": 82
     },
     "surface": {
       "exports": {

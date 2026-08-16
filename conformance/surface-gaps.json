@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.1 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1415,
-        "missing": 369,
+        "present": 1421,
+        "missing": 363,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -176,12 +176,7 @@
           "init",
           "usingDomains"
         ],
-        "fs": [
-          "glob",
-          "globSync"
-        ],
         "fs/promises": [
-          "glob",
           "watch"
         ],
         "global:AbortController.prototype": [
@@ -376,16 +371,13 @@
           "setPriority"
         ],
         "path": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "path/posix": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "path/win32": [
-          "_makeLong",
-          "matchesGlob"
+          "_makeLong"
         ],
         "perf_hooks": [
           "Performance",

@@ -69,6 +69,11 @@ pub struct RawChild {
     child: Option<Child>,
     pub pid: u32,
     fds: HashMap<u32, FdEnd>,
+    /// True once the pid has been reaped (`raw_wait`'s blocking wait returned).
+    /// A reaped pid can be recycled by the kernel immediately, so `raw_kill`
+    /// must never signal it. This -- not the presence of `child`, which
+    /// `raw_wait` take()s at its first poll -- is the liveness signal.
+    reaped: bool,
 }
 
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
@@ -337,6 +342,7 @@ pub fn spawn_extra(
         child: Some(child),
         pid,
         fds: parent_fds,
+        reaped: false,
     })
 }
 
@@ -487,34 +493,36 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
 pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
     let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(child) = guard.get_mut(&id) {
-        // Only signal while the Child handle is still present. raw_wait take()s
-        // it under this same lock *before* the blocking reap, so `child.is_none()`
-        // means the pid may already be reaped -- and the kernel can recycle a
-        // reaped pid immediately, so a kill then could hit an unrelated process.
+        // Liveness comes from the `reaped` flag, NOT from the presence of the
+        // `Child` handle: raw_wait take()s the handle at its first poll, and
+        // the JS side starts the wait op the moment the child spawns -- so by
+        // the time any kill() arrives the handle is long gone. (Gating on the
+        // handle made every live extra-fd kill a silent no-op; conformance
+        // case 68's sigterm leg timed out on exactly that.)
         //
-        // Even with `child.is_some()`, the process may already be a zombie
-        // (exited but not yet reaped). kill(2) on a zombie returns 0 -- the pid
-        // is still a valid target until the parent reaps -- so without this
-        // probe we would deliver a signal to an already-exited child, whose real
-        // exit raw_wait would then misreport. try_wait is non-blocking and reaps
-        // the zombie itself if it finds one; the later child.wait() in raw_wait
-        // still sees the same ExitStatus (std stores it internally across
-        // try_wait/wait).
-        if let Some(inner) = child.child.as_mut()
-            && matches!(inner.try_wait(), Ok(None))
-        {
-            // Unknown signal names resolve to SIGTERM -- same as the None case.
-            let signum = signal
-                .as_deref()
-                .map(signal_number)
-                .unwrap_or(Some(libc::SIGTERM))
-                .unwrap_or(libc::SIGTERM);
-            // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
-            // raw_wait derives the report from the real ExitStatus, so we do not
-            // record the signal here -- a trapped/survived signal must not be
-            // misreported as a death.
-            unsafe { libc::kill(child.pid as libc::pid_t, signum) };
+        // Until raw_wait's blocking reap returns, the pid is ours to signal in
+        // every state: alive (the signal is delivered and the wait observes
+        // whatever comes of it) or a zombie (kill(2) accepts the pid and
+        // discards the signal -- it cannot alter the recorded exit status).
+        // After the reap the kernel may recycle the pid immediately, so a kill
+        // then could hit an unrelated process; raw_wait flips `reaped` under
+        // this same lock the moment its blocking wait returns, closing that
+        // window (to the same sliver Node/libuv accept: waitpid has returned
+        // but the flag-flip has not yet taken the lock).
+        if child.reaped {
+            return;
         }
+        // Unknown signal names resolve to SIGTERM -- same as the None case.
+        let signum = signal
+            .as_deref()
+            .map(signal_number)
+            .unwrap_or(Some(libc::SIGTERM))
+            .unwrap_or(libc::SIGTERM);
+        // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
+        // raw_wait derives the report from the real ExitStatus, so we do not
+        // record the signal here -- a trapped/survived signal must not be
+        // misreported as a death.
+        unsafe { libc::kill(child.pid as libc::pid_t, signum) };
     }
 }
 
@@ -532,7 +540,23 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
         return OpOutcome::Failed("child already awaited".to_string());
     };
 
-    let status = tokio::task::spawn_blocking(move || child.wait()).await;
+    let status = {
+        let reg = reg.clone();
+        tokio::task::spawn_blocking(move || {
+            let st = child.wait();
+            // From waitpid's return onward the kernel may hand this pid to an
+            // unrelated process, so flip `reaped` (under the registry lock,
+            // atomically w.r.t. any in-flight raw_kill) before the status is
+            // visible anywhere else. Set even on a wait error: an unknown pid
+            // state must fail safe toward "do not signal it again".
+            let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = guard.get_mut(&id) {
+                c.reaped = true;
+            }
+            st
+        })
+        .await
+    };
 
     // Drop the entry, close every fd we still own. The recorded kill_signal is
     // deliberately NOT consulted below: on Unix the real ExitStatus is the
