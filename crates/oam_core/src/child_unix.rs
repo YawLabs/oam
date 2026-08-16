@@ -69,7 +69,6 @@ pub struct RawChild {
     child: Option<Child>,
     pub pid: u32,
     fds: HashMap<u32, FdEnd>,
-    kill_signal: Option<String>,
 }
 
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
@@ -338,7 +337,6 @@ pub fn spawn_extra(
         child: Some(child),
         pid,
         fds: parent_fds,
-        kill_signal: None,
     })
 }
 
@@ -484,8 +482,8 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     }
 }
 
-/// Record the kill signal and deliver it. `raw_wait`'s blocking `Child::wait`
-/// then returns and reports the exit.
+/// Deliver the kill signal. `raw_wait`'s blocking `Child::wait` then returns
+/// and reports the exit (derived from the real `ExitStatus`).
 pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
     let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(child) = guard.get_mut(&id) {
@@ -497,10 +495,11 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
         // Even with `child.is_some()`, the process may already be a zombie
         // (exited but not yet reaped). kill(2) on a zombie returns 0 -- the pid
         // is still a valid target until the parent reaps -- so without this
-        // probe we would record a signal death that never happened, masking the
-        // real exit in raw_wait. try_wait is non-blocking and reaps the zombie
-        // itself if it finds one; the later child.wait() in raw_wait still sees
-        // the same ExitStatus (std stores it internally across try_wait/wait).
+        // probe we would deliver a signal to an already-exited child, whose real
+        // exit raw_wait would then misreport. try_wait is non-blocking and reaps
+        // the zombie itself if it finds one; the later child.wait() in raw_wait
+        // still sees the same ExitStatus (std stores it internally across
+        // try_wait/wait).
         if let Some(inner) = child.child.as_mut()
             && matches!(inner.try_wait(), Ok(None))
         {
@@ -510,13 +509,11 @@ pub fn raw_kill(reg: &RawChildRegistry, id: u64, signal: Option<String>) {
                 .map(signal_number)
                 .unwrap_or(Some(libc::SIGTERM))
                 .unwrap_or(libc::SIGTERM);
-            let name = signal.unwrap_or_else(|| signal_name(signum));
-            // Record the kill only when the signal actually fired. A failed
-            // kill (EPERM) must not masquerade as a signal death in raw_wait.
             // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
-            if unsafe { libc::kill(child.pid as libc::pid_t, signum) } == 0 {
-                child.kill_signal = Some(name);
-            }
+            // raw_wait derives the report from the real ExitStatus, so we do not
+            // record the signal here -- a trapped/survived signal must not be
+            // misreported as a death.
+            unsafe { libc::kill(child.pid as libc::pid_t, signum) };
         }
     }
 }
@@ -537,12 +534,16 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
 
     let status = tokio::task::spawn_blocking(move || child.wait()).await;
 
-    // Drop the entry, capture the kill signal, close every fd we still own.
-    let (kill_signal, fds) = {
+    // Drop the entry, close every fd we still own. The recorded kill_signal is
+    // deliberately NOT consulted below: on Unix the real ExitStatus is the
+    // source of truth (mirrors `exit_report` in child.rs), so a child that
+    // caught our signal and exited 0 reports {code:0, signal:null} like Node,
+    // not a phantom signal death.
+    let fds = {
         let mut guard = reg.lock().unwrap_or_else(|e| e.into_inner());
         match guard.remove(&id) {
-            Some(c) => (c.kill_signal, c.fds),
-            None => (None, HashMap::new()),
+            Some(c) => c.fds,
+            None => HashMap::new(),
         }
     };
     for end in fds.values() {
@@ -553,12 +554,12 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
 
     match status {
         Ok(Ok(st)) => {
-            // A kill we initiated -> code:null + the recorded signal (Node's
-            // convention). A signal we did not initiate -> derive the name.
-            // Otherwise the normal exit code.
-            let json = if let Some(sig) = kill_signal {
-                serde_json::json!({ "code": null, "signal": sig })
-            } else if let Some(signum) = st.signal() {
+            // Derive the report entirely from the child's real ExitStatus. A
+            // signal-terminated child (ours or not) -> code:null + the real
+            // terminating signal; otherwise the normal exit code. WIFSIGNALED
+            // is the source of truth, so a signal the child trapped and
+            // survived is not misreported as a death.
+            let json = if let Some(signum) = st.signal() {
                 serde_json::json!({ "code": null, "signal": signal_name(signum) })
             } else {
                 serde_json::json!({ "code": st.code().unwrap_or(0), "signal": null })

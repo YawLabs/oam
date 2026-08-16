@@ -82,12 +82,6 @@ tracked by a gate instead of waiting to be discovered by a crash.
 - A missing builtin export now explains itself: the error names the module, says the gap
   is oam's, and points at the tracked list, instead of only repeating V8's bare
   "does not provide an export named X".
-- **`.cts` (TypeScript CommonJS) is executable.** `oam run foo.cts`, `import "./lib.cts"`
-  from an ESM parent, and `require("./lib.cts")` from a CJS parent all run through the
-  same oxc TS strip as `.ts` (oxc's `SourceType::from_path` resolves `.cts` as both TS
-  and CJS). The previous OAM-MOD0003 gate ("write ESM TypeScript (.ts) instead") is
-  gone; the OAM-MOD0003 explanation was rewritten to match. `oam test` discovery also
-  covers `.cts`.
 
 ### Changed
 
@@ -401,6 +395,13 @@ releases.
   for trusted packages.
 - **Record/replay (beta)**: `performance.now` is recorded, with an end-to-end
   determinism test.
+- **`.cts` (TypeScript CommonJS) is executable.** `oam run foo.cts`, `import "./lib.cts"`
+  from an ESM parent, and `require("./lib.cts")` from a CJS parent all run through the
+  same oxc TS strip as `.ts` (oxc's `SourceType::from_path` resolves `.cts` as both TS
+  and CJS). The previous OAM-MOD0003 gate ("write ESM TypeScript (.ts) instead") is
+  gone; the OAM-MOD0003 explanation was rewritten to match. `oam test` discovery also
+  covers `.cts`. *(Documented late -- this shipped in 0.6.1 but the entry was written
+  under Unreleased.)*
 - An opt-in `io_uring` filesystem fast path on Linux.
 - macOS `os` and `process` natives via `sysinfo`.
 

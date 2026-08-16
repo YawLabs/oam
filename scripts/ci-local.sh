@@ -115,8 +115,12 @@ fi
 say "3/9 Build (cargo build --workspace)"
 clear_debug_holders
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
-# renaming works where deleting does not, and re-uplifting the binary from
-# deps/ is near-free -- cargo hardlinks it, it does not relink.
+# renaming works where deleting does not. Parking the deps-stage file is NOT
+# free, though: deleting deps/oam.exe dirties cargo's bin-unit fingerprint, so
+# the build below relinks the binary even on an otherwise-fresh tree (measured
+# ~7.6s vs a 0.68s no-op in debug; the release scripts pay more). That cost is
+# accepted -- a locked binary fails the link outright, which is worse than a
+# relink.
 #
 # BOTH paths get parked: cargo's link writes deps/oam.exe FIRST and only
 # promotes it to debug/oam.exe on success, so the LNK1104 deny window lands

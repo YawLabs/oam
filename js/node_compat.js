@@ -19743,6 +19743,27 @@
       return result.stdout;
     }
 
+    // Valid kill-signal names for child.kill(). Mirrors Node's
+    // convertToValidSignal (lib/internal/util.js), which validates against the
+    // platform's libuv signal set: on win32 that set is the reduced list below
+    // (Node throws ERR_UNKNOWN_SIGNAL for SIGCONT/SIGSTOP/etc. there), on POSIX
+    // it is the set oam's native layer can actually deliver. Names are matched
+    // case-insensitively (Node uppercases before lookup). Unknown names must
+    // throw ERR_UNKNOWN_SIGNAL rather than fall back to SIGTERM.
+    const VALID_KILL_SIGNALS =
+      globalThis.__oam.node.platform === "win32"
+        ? new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGABRT", "SIGFPE",
+                   "SIGKILL", "SIGSEGV", "SIGTERM", "SIGBREAK", "SIGWINCH"])
+        : new Set(["SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGKILL",
+                   "SIGUSR1", "SIGUSR2", "SIGTERM", "SIGCONT", "SIGSTOP"]);
+    function validateKillSignal(signal) {
+      if (signal === undefined || signal === null) return "SIGTERM";
+      if (typeof signal === "number") return signal; // native side validates numbers
+      const name = String(signal).toUpperCase();
+      if (!VALID_KILL_SIGNALS.has(name)) throw new codes.ERR_UNKNOWN_SIGNAL(signal);
+      return name;
+    }
+
     class ChildProcess extends EventEmitter {
       constructor() {
         super();
@@ -19761,17 +19782,21 @@
         this._pendingKill = null;
       }
       kill(signal) {
+        // Validate BEFORE any handle/null branching so an unknown signal name
+        // throws ERR_UNKNOWN_SIGNAL regardless of spawn state -- matching Node,
+        // where convertToValidSignal runs first in ChildProcess.prototype.kill.
+        const sig = validateKillSignal(signal);
         if (this._handle == null) {
           // node's spawn is synchronous, so this window does not exist there.
           // It does here for an ipc-bound child, whose channel must bind before
           // exec. Dropping the request left kill() returning true, `killed`
           // false, and the child running -- with nothing the caller could
           // observe. Hold it and deliver the moment the handle lands.
-          this._pendingKill = signal || "SIGTERM";
+          this._pendingKill = sig;
           return true;
         }
-        if (this._extra) natives.spawnExtraKill(this._handle, signal);
-        else natives.spawnKill(this._handle, signal);
+        if (this._extra) natives.spawnExtraKill(this._handle, sig);
+        else natives.spawnKill(this._handle, sig);
         this.killed = true;
         return true;
       }

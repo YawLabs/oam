@@ -336,7 +336,7 @@ fn explain_code(code: &str) -> String {
         ),
         (
             "OAM-MOD0003",
-            "This module type is not executable: a .json file used as the ENTRY (import it from a script — JSON imports work, with or without `with { type: 'json' }`), an unsupported import-attribute type, or an unknown extension. .cts runs through CJS interop with TS strip; .cjs runs through CJS interop; .tsx/.jsx is not supported yet (M2: JSX automatic runtime).",
+            "This module type is not executable: a .json file used as the ENTRY (import it from a script — JSON imports work, with or without `with { type: 'json' }`), an unsupported import-attribute type, or an unknown extension. .cts runs through CJS interop with TS strip; .cjs runs through CJS interop; .tsx/.jsx run through the JSX automatic runtime (v0.8.1+).",
         ),
         (
             "OAM-MOD0004",

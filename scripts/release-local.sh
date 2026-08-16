@@ -458,8 +458,7 @@ fi
 # --- local Windows legs ---------------------------------------------------------
 step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
 # Live processes run this exact file -- typed-cli sessions, the resident
-# type-check daemon. Park it rather than killing them (see free_locked_binary;
-# scripts/release-upload-local-arm64.sh still has the old taskkill).
+# type-check daemon. Park it rather than killing them (see free_locked_binary).
 #
 # BOTH paths get freed, not just the promoted binary: cargo's link step writes
 # deps/oam.exe FIRST and only promotes it to release/oam.exe on success, so the
