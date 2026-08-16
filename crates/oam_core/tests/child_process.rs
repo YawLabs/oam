@@ -20,6 +20,9 @@ use oam_core::child::{
 use oam_core::child::child_kill;
 #[cfg(unix)]
 use oam_core::child_unix::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
+// The Windows raw backend exposes the same surface through the shared alias.
+#[cfg(windows)]
+use oam_core::child_extra::{RawChildRegistry, StdioFd, raw_kill, raw_wait, spawn_extra};
 
 /// Spawn a child through `spawn_child` that writes `marker` to stdout and
 /// then exits. cfg-gated on the shell, not the whole test: `cmd /c echo` on
@@ -287,5 +290,140 @@ async fn raw_kill_during_wait_delivers_signal() {
         report,
         serde_json::json!({ "code": null, "signal": "SIGTERM" }),
         "a kill during an in-flight wait must terminate the child and report the signal"
+    );
+}
+
+/// T6 (windows): T5's shape on the Windows raw backend. child_win avoids the
+/// Unix bug by construction -- raw_wait only COPIES the process handle, so
+/// raw_kill still sees it during an in-flight wait -- but nothing executed
+/// that claim: conformance case 68 prints constants on win32 and T4/T5 are
+/// cfg(unix). This is the browser force-kill path on the primary dev platform.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_kill_during_wait_delivers_signal_win() {
+    // `ping -n 30` is the stdin-independent Windows sleeper: `timeout /t`
+    // dies on redirected stdin and `pause` exits instantly on an EOF stdin.
+    let raw = spawn_extra(
+        "ping",
+        &["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+        None,
+        None,
+        false,
+        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+    )
+    .expect("spawn_extra ping sleeper");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let wait = tokio::spawn(raw_wait(reg.clone(), id));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    raw_kill(&reg, id, Some("SIGTERM".to_string()));
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("kill must unblock raw_wait (a no-op kill leaves ping running 30s)")
+        .expect("wait task join");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": null, "signal": "SIGTERM" }),
+        "a kill during an in-flight wait must terminate the child and report the signal"
+    );
+}
+
+/// T7 (unix): a kill that lands BEFORE raw_wait's first poll -- the Child
+/// handle still present, the child alive. T4 covers handle-present + already
+/// exited and T5 covers handle-taken + alive; this is the remaining state,
+/// where reintroducing any handle-presence probing would regress unseen (the
+/// pre-wait window exists whenever a kill races the wait op's first poll).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_kill_before_wait_delivers_signal() {
+    let raw = spawn_extra(
+        "sh",
+        &["-c".to_string(), "sleep 30".to_string()],
+        None,
+        None,
+        false,
+        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+    )
+    .expect("spawn_extra sleeper child");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    // Kill first -- no wait in flight, so the entry still holds the Child.
+    raw_kill(&reg, id, Some("SIGTERM".to_string()));
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), raw_wait(reg, id))
+        .await
+        .expect("wait must observe the pre-wait kill, not the 30s sleep");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": null, "signal": "SIGTERM" }),
+        "a pre-wait kill must be delivered and reported from the real ExitStatus"
+    );
+}
+
+/// T8 (unix): a child that TRAPS the kill signal and exits 0 reports
+/// {code:0, signal:null} -- WIFSIGNALED is the source of truth, never the
+/// requested kill. Conformance case 68 pins this end-to-end, but only under
+/// the node-oracle harness; this keeps the phantom-signal regression visible
+/// in the plain `cargo test` loop.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_kill_trapped_signal_reports_clean_exit() {
+    // `sleep 30 & wait` (not a foreground sleep): sh runs traps only between
+    // foreground commands, while the `wait` builtin is interrupted by the
+    // signal immediately.
+    let raw = spawn_extra(
+        "sh",
+        &[
+            "-c".to_string(),
+            "trap 'exit 0' USR1; sleep 30 & wait $!".to_string(),
+        ],
+        None,
+        None,
+        false,
+        &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+    )
+    .expect("spawn_extra trapping child");
+    let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = 1u64;
+    reg.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, raw);
+
+    let wait = tokio::spawn(raw_wait(reg.clone(), id));
+    // Give sh time to install the trap; a signal landing before that would
+    // kill it (USR1 default-terminates) and turn the assertion into a real
+    // failure rather than a flake -- 300ms is the margin T3 already uses.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    raw_kill(&reg, id, Some("SIGUSR1".to_string()));
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .expect("trap handler must run and exit the child")
+        .expect("wait task join");
+    let OpOutcome::Json(json) = outcome else {
+        panic!("expected Json exit report, got {outcome:?}");
+    };
+    let report: serde_json::Value = serde_json::from_str(&json).expect("exit report is json");
+    assert_eq!(
+        report,
+        serde_json::json!({ "code": 0, "signal": null }),
+        "a trapped-and-survived kill must not be misreported as a signal death"
     );
 }
