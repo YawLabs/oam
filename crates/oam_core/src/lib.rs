@@ -338,12 +338,49 @@ pub fn close_inherited_fd(fd: u64) {
     }
     #[cfg(not(any(unix, windows)))]
     let _ = fd;
+
+    // The parent's original descriptor is now closed and its fd number is free
+    // for the kernel to reissue. Consume the number so it can never be adopted
+    // again -- see INHERITED_CONSUMED.
+    consume_inherited_fd(fd);
 }
 
 /// The descriptors that were already open when the process started -- i.e. the
 /// ones a PARENT handed us, snapshotted before oam can open anything of its own.
 static INHERITED_AT_START: std::sync::OnceLock<std::collections::HashSet<u64>> =
     std::sync::OnceLock::new();
+
+/// Inherited fd numbers that have since been closed via `close_inherited_fd`.
+/// Once we close the parent's original, the kernel is free to reissue that fd
+/// number to a later `open()` -- so re-adopting it would let a second
+/// `closeSync(n)` close a descriptor the runtime now owns (a stale-snapshot
+/// double-close-with-reuse). Consuming the number on close makes re-adoption
+/// impossible; membership only grows, so it never falsely blocks a live fd.
+static INHERITED_CONSUMED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Mark an inherited fd number as closed, so `adopt_inherited_fd` refuses it.
+fn consume_inherited_fd(fd: u64) {
+    INHERITED_CONSUMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fd);
+}
+
+/// True when `fd` is one we were born holding AND have not since closed. The
+/// snapshot decides "the parent gave me this"; the consumed set removes it again
+/// the moment we close it, which is what keeps a reused fd number from being
+/// re-adopted.
+fn inherited_eligible(fd: u64) -> bool {
+    (3..=MAX_INHERITED_FD).contains(&fd)
+        && INHERITED_AT_START
+            .get()
+            .is_some_and(|set| set.contains(&fd))
+        && !INHERITED_CONSUMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&fd)
+}
 
 /// Record which descriptors we were born holding. Call ONCE, as early in `main`
 /// as possible and before opening any file.
@@ -411,17 +448,14 @@ fn probe_open(fd: u64) -> bool {
 /// hit EBADF on `fs.writeSync(4, ...)` because its descriptors are registry
 /// keys and nothing had ever put the inherited fd in the registry.
 pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
-    if !(3..=MAX_INHERITED_FD).contains(&fd) {
-        return false;
-    }
-    // Only descriptors we were BORN holding. Without this an fd oam opened for
-    // itself after startup is indistinguishable from one the parent passed --
-    // see snapshot_inherited_fds. A missing snapshot means the entry point never
-    // took one, and adopting nothing is the safe answer.
-    if !INHERITED_AT_START
-        .get()
-        .is_some_and(|set| set.contains(&fd))
-    {
+    // Eligible = born holding it AND not since closed. The range, snapshot, and
+    // consumed checks all live in inherited_eligible: without the snapshot an fd
+    // oam opened for itself after startup is indistinguishable from one the
+    // parent passed (see snapshot_inherited_fds); without the consumed gate a
+    // second closeSync(n) after fd-number reuse would adopt -- then close -- a
+    // descriptor the runtime now owns. A missing snapshot adopts nothing, which
+    // is the safe answer.
+    if !inherited_eligible(fd) {
         return false;
     }
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -3501,5 +3535,34 @@ mod tests {
             .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
             .expect("op completes");
         assert!(matches!(completion.outcome, OpOutcome::Failed(_)));
+    }
+
+    // Regression: an inherited fd closed via close_inherited_fd must never be
+    // re-adopted. INHERITED_AT_START is a set-once startup snapshot; before the
+    // fix, a second closeSync(n) issued after the kernel had reused fd n would
+    // re-adopt -- and then close -- a descriptor the runtime had come to own
+    // (a stale-snapshot double-close-with-reuse). Consuming the number on close
+    // is what shuts that window. This test is the only setter of
+    // INHERITED_AT_START in the crate, so it owns the global.
+    #[test]
+    fn closed_inherited_fd_is_not_re_adopted() {
+        let fd = 9u64; // inside the 3..=MAX_INHERITED_FD adoption window
+        INHERITED_AT_START
+            .set(std::collections::HashSet::from([fd]))
+            .expect("only setter of INHERITED_AT_START in this crate");
+
+        // Born holding it, not yet closed -> eligible for adoption.
+        assert!(inherited_eligible(fd));
+
+        // Closing the parent's original consumes the number; a reissued fd n can
+        // no longer be adopted, even though the snapshot still lists it.
+        consume_inherited_fd(fd);
+        assert!(!inherited_eligible(fd));
+
+        // adopt_inherited_fd rides the same gate, so it refuses without ever
+        // probing or duping the (possibly reused) descriptor.
+        let registry: SyncFileRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
+        assert!(!adopt_inherited_fd(&registry, fd));
     }
 }
