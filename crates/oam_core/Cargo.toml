@@ -63,3 +63,7 @@ tokio-uring = "0.5"
 # Raw io_uring -- used only to probe availability (IoUring::new) without the
 # panic tokio_uring::start would raise on an unsupported kernel / seccomp.
 io-uring = "0.6"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"

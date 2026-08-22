@@ -248,15 +248,21 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
     let raw = i32::try_from(fd).ok()?;
     // F_GETFD is the cheapest "is this open" question; dup would also tell us,
     // but only by allocating a descriptor we would have to put back.
+    // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`; no
+    // pointers are involved.
     if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
         return None;
     }
     // FD_CLOEXEC on the dup: an fd the parent handed US is not automatically
     // something our own children should receive.
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` duplicates the integer fd `raw`; no
+    // pointers are involved and the returned fd is checked below.
     let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
     if dup == -1 {
         return None;
     }
+    // SAFETY: `dup` is a fresh, owned fd (checked non-negative just above); the
+    // new File takes sole ownership and closes it on drop.
     Some(unsafe { std::fs::File::from_raw_fd(dup) })
 }
 
@@ -282,6 +288,10 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
     unsafe extern "C" fn ignore_invalid_parameter() {}
 
     let raw = i32::try_from(fd).ok()?;
+    // SAFETY: `_get_osfhandle` reads the CRT fd table for `raw`; the
+    // invalid-parameter handler is swapped to a no-op around the probe so a bad
+    // fd yields -1 instead of aborting under a debug CRT, then restored. No
+    // pointer of ours is dereferenced.
     let handle = unsafe {
         let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
         let h = _get_osfhandle(raw);
@@ -292,6 +302,9 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
         return None;
     }
     let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: `handle` is the live OS handle probed just above; `&mut dup` is a
+    // live out-param the call fills; the other arguments are our own process
+    // handle and constants.
     let ok = unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
@@ -306,6 +319,8 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
     if ok == 0 || dup.is_null() {
         return None;
     }
+    // SAFETY: `dup` is a freshly duplicated, non-null, owned HANDLE (checked
+    // just above); the new File takes sole ownership and closes it on drop.
     Some(unsafe { std::fs::File::from_raw_handle(dup) })
 }
 
@@ -319,6 +334,8 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
 pub fn close_inherited_fd(fd: u64) {
     #[cfg(unix)]
     if let Ok(raw) = i32::try_from(fd) {
+        // SAFETY: closes the integer fd `raw`; no pointers are involved. The
+        // caller guarantees this is an inherited descriptor we still own.
         unsafe { libc::close(raw) };
     }
     #[cfg(windows)]
@@ -330,6 +347,9 @@ pub fn close_inherited_fd(fd: u64) {
             ) -> Option<unsafe extern "C" fn()>;
         }
         unsafe extern "C" fn ignore_invalid_parameter() {}
+        // SAFETY: `_close` closes the CRT fd `raw`; the invalid-parameter handler
+        // is swapped to a no-op around the call so a stale fd returns an error
+        // instead of aborting, then restored. Only an integer fd is passed.
         unsafe {
             let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
             _close(raw);
@@ -415,6 +435,8 @@ fn probe_open(fd: u64) -> bool {
     };
     #[cfg(unix)]
     {
+        // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`
+        // to test whether it is open; no pointers are involved.
         unsafe { libc::fcntl(raw, libc::F_GETFD) != -1 }
     }
     #[cfg(windows)]
@@ -426,6 +448,10 @@ fn probe_open(fd: u64) -> bool {
             ) -> Option<unsafe extern "C" fn()>;
         }
         unsafe extern "C" fn ignore_invalid_parameter() {}
+        // SAFETY: `_get_osfhandle` reads the CRT fd table for `raw` to test
+        // whether the fd is backed; the invalid-parameter handler is swapped to
+        // a no-op around the probe so a bad fd yields -1 instead of aborting,
+        // then restored. No pointer of ours is dereferenced.
         unsafe {
             let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
             let h = _get_osfhandle(raw);
@@ -1391,7 +1417,9 @@ pub mod zlib {
         }
     }
 
-    // Manual Send -- CompressorInner holds encoder types that are all Send.
+    // SAFETY: CompressorInner holds only flate2 encoder types (GzEncoder /
+    // ZlibEncoder / DeflateEncoder over `Vec<u8>`), all of which are `Send`; the
+    // wrapper adds no thread-affine state, so moving it across threads is sound.
     unsafe impl Send for StreamCompressor {}
 
     // ----------------------------------------------------------------
@@ -1495,6 +1523,9 @@ pub mod zlib {
         }
     }
 
+    // SAFETY: DecompressorInner holds only flate2 write-decoders over `Vec<u8>`
+    // (all `Send`) plus the unit `Unzip` variant; the wrapper adds no thread-
+    // affine state, so moving it across threads is sound.
     unsafe impl Send for StreamDecompressor {}
 }
 
@@ -1561,8 +1592,9 @@ impl BrotliCompressor {
     }
 }
 
-// CompressorWriter<Vec<u8>> is Send -- Vec<u8> is Send and the brotli
-// state is self-contained with no thread-local references.
+// SAFETY: `brotli::CompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` (Send) and
+// self-contained brotli state with no thread-local references, so moving it
+// across threads is sound.
 unsafe impl Send for BrotliCompressor {}
 
 /// Incremental brotli decompressor wrapping `brotli::DecompressorWriter`.
@@ -1607,6 +1639,9 @@ impl BrotliDecompressor {
     }
 }
 
+// SAFETY: `brotli::DecompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` (Send)
+// and self-contained brotli state with no thread-local references, so moving it
+// across threads is sound.
 unsafe impl Send for BrotliDecompressor {}
 
 /// Built-in op implementations. Plain futures; the engine decides how their
@@ -1740,6 +1775,8 @@ pub mod ops {
         // behind the unstable `windows_by_handle` feature, and oam builds on
         // stable -- so the call is made explicitly rather than reaching for a
         // nightly accessor.
+        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid initial
+        // value; the GetFileInformationByHandle call below fills it.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `handle` is owned by a live File for the whole call, and
         // `info` is a correctly sized, writable BY_HANDLE_FILE_INFORMATION.
@@ -1747,6 +1784,8 @@ pub mod ops {
             return None;
         }
 
+        // SAFETY: an all-zero FILE_STANDARD_INFO is a valid initial value; the
+        // GetFileInformationByHandleEx call below fills it.
         let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
         // `blocks` counts 512-byte units of ALLOCATED space, which is not
         // ceil(size / 512): a small file resident in the MFT allocates none,
@@ -1766,6 +1805,8 @@ pub mod ops {
             0
         };
 
+        // SAFETY: an all-zero FILE_BASIC_INFO is a valid initial value; the
+        // GetFileInformationByHandleEx call below fills it.
         let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
         // SAFETY: as above.
         let ctime_ms = if unsafe {
@@ -1996,10 +2037,11 @@ pub mod ops {
         // libuv reports 0 there, so this does too rather than invent one.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // SAFETY: `buf` is a live, correctly-sized `statfs` and `c_path`
-            // is a NUL-terminated C string that outlives the call. The value
-            // is only read after a 0 (success) return.
+            // SAFETY: an all-zero `statfs` is a valid uninitialized value.
             let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `c_path` is a NUL-terminated C string that outlives the
+            // call and `&mut buf` is the live struct above; its fields are only
+            // read below after a 0 (success) return.
             if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -2015,8 +2057,11 @@ pub mod ops {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // SAFETY: as above, for the POSIX `statvfs` shape.
+            // SAFETY: an all-zero `statvfs` is a valid uninitialized value.
             let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: as above, for the POSIX `statvfs` shape -- `c_path`
+            // outlives the call and `&mut buf` is the live struct; read only
+            // after a 0 (success) return.
             if unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -2466,6 +2511,8 @@ pub mod ops {
             // -1 means "leave this one alone". node hands it through as an
             // unsigned value, so the wrap back to the signed libc type is the
             // intended round trip rather than an accident.
+            // SAFETY: `file.as_raw_fd()` is a live fd for the duration of the
+            // call and the uid/gid are plain integers; no pointers are involved.
             let rc =
                 unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
             if rc == 0 {
@@ -2504,6 +2551,8 @@ pub mod ops {
         {
             use std::os::unix::io::AsRawFd;
             let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
+            // SAFETY: `file.as_raw_fd()` is a live fd and `times.as_ptr()` points
+            // at the live two-element array above, which outlives the call.
             let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
             if rc == 0 {
                 Ok(())
@@ -2529,6 +2578,9 @@ pub mod ops {
             let mtime = to_filetime(mtime_ms);
             // Null creation time leaves it untouched, which is what futimes
             // means -- it sets access and modification only.
+            // SAFETY: `file` is a live File whose handle is valid for the call;
+            // the null creation-time pointer leaves it untouched, and
+            // `&atime`/`&mtime` are live FILETIME locals the call only reads.
             let ok =
                 unsafe { SetFileTime(file.as_raw_handle() as _, std::ptr::null(), &atime, &mtime) };
             if ok != 0 {
@@ -2641,6 +2693,9 @@ pub mod ops {
             // -1 in either field means "leave it alone"; node passes it through
             // unsigned, so the wrap back to the signed libc type is the round
             // trip we want, not an accident.
+            // SAFETY: `c.as_ptr()` is a NUL-terminated C string that outlives the
+            // call and the uid/gid are plain integers; no other memory is
+            // touched.
             let rc = unsafe {
                 if follow {
                     libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
@@ -2675,6 +2730,9 @@ pub mod ops {
             })?;
             let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
             let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            // SAFETY: `c.as_ptr()` is a NUL-terminated C string and
+            // `times.as_ptr()` points at the live array above; both outlive the
+            // call, and AT_FDCWD/flags are plain integers.
             let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) };
             if rc == 0 {
                 Ok(())
@@ -2727,6 +2785,8 @@ pub mod ops {
                 "path contains an interior NUL byte",
             )
         })?;
+        // SAFETY: `c.as_ptr()` is a NUL-terminated C string that outlives the
+        // call; AT_FDCWD, the mode, and AT_SYMLINK_NOFOLLOW are plain integers.
         let rc = unsafe {
             libc::fchmodat(
                 libc::AT_FDCWD,

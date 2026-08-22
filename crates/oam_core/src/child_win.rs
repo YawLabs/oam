@@ -54,6 +54,10 @@ const FDEV: u8 = 0x40;
 /// raw value across the blocking pool is sound.
 #[derive(Clone, Copy)]
 struct SendHandle(HANDLE);
+// SAFETY: HANDLE is a raw `*mut c_void`, hence not auto-`Send`. Every handle is
+// touched from only one thread at a time -- it is taken out of the registry for
+// the duration of an op -- so moving the raw value across the blocking pool
+// never exposes it to a concurrent accessor.
 unsafe impl Send for SendHandle {}
 
 /// What to do with one child fd index.
@@ -93,6 +97,8 @@ pub struct RawChild {
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
 
 fn crt_flag(h: HANDLE) -> u8 {
+    // SAFETY: `h` is a live handle owned by the caller; GetFileType only reads
+    // the kernel object's type and dereferences none of our memory.
     match unsafe { GetFileType(h) } {
         FILE_TYPE_PIPE => FOPEN | FPIPE,
         FILE_TYPE_CHAR => FOPEN | FDEV,
@@ -167,10 +173,17 @@ fn build_env_block(env: &[(String, String)], clear: bool) -> Vec<u16> {
 }
 
 fn open_nul() -> HANDLE {
+    // SAFETY: SECURITY_ATTRIBUTES is a plain C-data struct for which an all-zero
+    // bit pattern is a valid initial value; its meaningful fields are set on the
+    // two lines below before the struct is used.
     let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
     sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
     sa.bInheritHandle = 1;
     let name = to_wide("NUL");
+    // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call and
+    // `&sa` points to the live SECURITY_ATTRIBUTES above; the remaining arguments
+    // are constants or null. The returned HANDLE (or INVALID_HANDLE_VALUE on
+    // failure) is checked by the caller.
     unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -196,6 +209,14 @@ pub fn spawn_extra(
     clear_env: bool,
     stdio: &[StdioFd],
 ) -> Result<RawChild, String> {
+    // SAFETY: one large block wraps the whole spawn sequence; each Win32 call
+    // inside establishes its preconditions locally. `sa`/`si`/`pi` are
+    // zero-initialized POD then filled; every HANDLE handed to the child is
+    // freshly created or duplicated and owned here; `blob`, `inherit_list`,
+    // `attr_buf`, `cmd_w`, and the env block all outlive the CreateProcessW that
+    // borrows their pointers; and every out-param is a live local. Each early
+    // return first runs `cleanup_fail`, which closes every handle allocated so
+    // far, so no handle leaks on an error path.
     unsafe {
         let mut sa: SECURITY_ATTRIBUTES = std::mem::zeroed();
         sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
@@ -524,6 +545,8 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
         let ok = unsafe { ReadFile(hh, buf.as_mut_ptr(), 65536, &mut n, std::ptr::null_mut()) };
         if ok == 0 {
             // ERROR_BROKEN_PIPE (109) on a closed write end == clean EOF.
+            // SAFETY: GetLastError only reads the calling thread's last-error
+            // slot; it takes no pointers and is always sound.
             let err = unsafe { GetLastError() };
             if err == 109 {
                 Ok(None)
@@ -545,19 +568,27 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.handle = Some(h);
             } else {
+                // SAFETY: the registry entry is gone, so `h` (taken for this op)
+                // has no other owner; close it exactly once.
                 unsafe { CloseHandle(h.0) };
             }
             OpOutcome::Bytes(bytes)
         }
         Ok(Ok(None)) => {
+            // SAFETY: EOF -- `h` is not re-inserted, so this op is its sole
+            // owner; close it exactly once.
             unsafe { CloseHandle(h.0) };
             OpOutcome::Done
         }
         Ok(Err(e)) => {
+            // SAFETY: error path -- `h` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { CloseHandle(h.0) };
             OpOutcome::Failed(e)
         }
         Err(e) => {
+            // SAFETY: join failure -- `h` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { CloseHandle(h.0) };
             OpOutcome::Failed(format!("read join: {e}"))
         }
@@ -583,6 +614,9 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
         let mut off = 0usize;
         while off < data.len() {
             let mut written: u32 = 0;
+            // SAFETY: `hh` is the live write handle taken for this op; the
+            // pointer/length are the head of the still-live `data` slice and
+            // `written` is a live out-param.
             let ok = unsafe {
                 WriteFile(
                     hh,
@@ -593,7 +627,9 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
                 )
             };
             if ok == 0 {
-                return Err(format!("WriteFile: {}", unsafe { GetLastError() }));
+                // SAFETY: GetLastError only reads the thread's last-error slot.
+                let err = unsafe { GetLastError() };
+                return Err(format!("WriteFile: {err}"));
             }
             if written == 0 {
                 return Err("WriteFile wrote 0".to_string());
@@ -610,15 +646,21 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.handle = Some(h);
             } else {
+                // SAFETY: the registry entry is gone, so `h` (taken for this op)
+                // has no other owner; close it exactly once.
                 unsafe { CloseHandle(h.0) };
             }
             OpOutcome::Done
         }
         Ok(Err(e)) => {
+            // SAFETY: error path -- `h` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { CloseHandle(h.0) };
             OpOutcome::Failed(e)
         }
         Err(e) => {
+            // SAFETY: join failure -- `h` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { CloseHandle(h.0) };
             OpOutcome::Failed(format!("write join: {e}"))
         }
@@ -631,6 +673,8 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd))
         && let Some(SendHandle(h)) = end.handle.take()
     {
+        // SAFETY: `h` was just taken out of the registry entry, so this call is
+        // its sole owner; close it exactly once.
         unsafe { CloseHandle(h) };
     }
 }
@@ -674,11 +718,15 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     let raw = proc_h.0 as usize;
     let exit = tokio::task::spawn_blocking(move || {
         let hh = raw as HANDLE;
+        // SAFETY: `hh` is the live process handle copied out of the registry;
+        // WaitForSingleObject only blocks on it and touches no memory of ours.
         let wait = unsafe { WaitForSingleObject(hh, INFINITE) };
         if wait != WAIT_OBJECT_0 {
             return Err(format!("WaitForSingleObject: {wait}"));
         }
         let mut code: u32 = 0;
+        // SAFETY: `hh` is the same live (now-exited) process handle; `code` is a
+        // live out-param the call writes.
         unsafe { GetExitCodeProcess(hh, &mut code) };
         Ok(code)
     })
@@ -694,10 +742,14 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     };
     for end in fds.values() {
         if let Some(SendHandle(h)) = end.handle {
+            // SAFETY: `fds` was removed from the registry above, so this fn is
+            // the sole owner of each remaining pipe end; close each once.
             unsafe { CloseHandle(h) };
         }
     }
     if let Some(SendHandle(h)) = proc_handle {
+        // SAFETY: the process handle was removed from the registry above, so
+        // this fn is its sole owner; close it once.
         unsafe { CloseHandle(h) };
     }
 
@@ -742,6 +794,9 @@ mod tests {
     /// becomes the sole owner and the read end reports ERROR_BROKEN_PIPE at once.
     #[test]
     fn spawn_extra_does_not_leak_unrelated_inheritable_handles() {
+        // SAFETY: the test drives raw Win32 pipe/handle APIs (CreatePipe,
+        // SetHandleInformation, PeekNamedPipe, CloseHandle) on handles it creates
+        // and owns for the test's duration; every argument is a live local.
         unsafe {
             // Canary pipe: the read end stays the parent's (non-inheritable);
             // the write end is INHERITABLE but is deliberately NOT in any child
