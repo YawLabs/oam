@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 mod bench;
 mod conformance;
 mod node_suite;
+mod unsafe_budget;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "oam repo automation")]
@@ -48,6 +49,17 @@ enum Command {
         #[arg(long)]
         release: bool,
     },
+    /// Bidirectional-ratchet gate for the `unsafe` surface (AI-POLICY.md gate
+    /// 5). Counts real unsafe constructs per crate (ceiling, may only drop) and
+    /// `// SAFETY:` comments (floor, may only rise) and diffs both against
+    /// conformance/unsafe-budget.json.
+    ///
+    /// Pass --regen (alias --bless) to rewrite the baseline from the tree.
+    UnsafeBudget {
+        /// Regenerate conformance/unsafe-budget.json from the current tree.
+        #[arg(long, alias = "bless")]
+        regen: bool,
+    },
     /// Open a PR bumping the pinned rusty_v8/V8 version (4-week cadence; never >2 majors behind).
     V8Bump,
     /// Rebuild the startup snapshot blobs.
@@ -62,6 +74,7 @@ fn main() -> Result<()> {
         Command::Bench { release, compare } => bench::run(release, compare),
         Command::Conformance { release } => conformance::run(release),
         Command::NodeSuite { release } => node_suite::run(release),
+        Command::UnsafeBudget { regen } => unsafe_budget::run(regen),
         Command::V8Bump => bail!("not implemented: lands with CI (task: M0/CI)"),
         Command::Snapshot => bail!("not implemented: lands with M1 snapshot pipeline"),
         Command::Package => bail!("not implemented: lands with first public release"),

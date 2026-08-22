@@ -17,7 +17,9 @@
 #                                            fails -- node-compat.yml parity)
 #   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
-#   9. unsafe-mention count per crate       (ADVISORY, never fails)
+#   9. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
+#                                            real unsafe_count ceiling per crate
+#                                            + // SAFETY: documented_count floor)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
 # gates a release on this script PLUS gate+test+conformance on the GCP Linux
@@ -256,14 +258,19 @@ else
   say "6/9 + 7/9 + 8/9 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "9/9 Unsafe budget (advisory)"
-# Advisory for now; becomes a ratchet gate with the SAFETY-comment checker
-# (AI-POLICY.md gate 5). oam_engine is the quarantined FFI boundary.
-for crate in crates/*/; do
-  n=$(grep -rn 'unsafe' "$crate/src" --include='*.rs' 2>/dev/null | wc -l || true)
-  echo "  $crate: $n unsafe mentions"
-done
-ok "unsafe audit reported (advisory only)"
+say "9/9 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+# GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
+# noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
+# unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
+# above its unsafe_count ceiling, or below its documented_count floor -- OR any
+# count strictly BETTER than the committed baseline (which must be re-blessed) --
+# fails here. Baseline: conformance/unsafe-budget.json; regen with
+# `cargo run -p xtask -- unsafe-budget --regen`.
+if cargo run -p xtask -- unsafe-budget; then
+  ok "unsafe budget within ceilings / at-or-above floors"
+else
+  ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
+fi
 
 echo ""
 ok "All local CI gates passed"
