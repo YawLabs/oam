@@ -85,6 +85,25 @@ pub(crate) fn run(regen: bool) -> Result<()> {
     let path = repo.join("conformance/unsafe-budget.json");
 
     if regen {
+        // Show what re-blessing changes BEFORE overwriting, so a reviewer can
+        // see (e.g.) a raised ceiling rather than blessing a new unsafe blind.
+        // A missing or unreadable prior baseline is not fatal here -- regen is
+        // the recovery path for exactly that, so fall back to "no diff".
+        match path.exists().then(|| load_budget(&path)) {
+            Some(Ok(old)) => {
+                let changes = diff_budgets(&old, &measured);
+                if changes.is_empty() {
+                    println!("regen: no change vs the committed baseline.");
+                } else {
+                    println!("regen: changes vs the committed baseline:");
+                    for c in &changes {
+                        println!("  {c}");
+                    }
+                }
+            }
+            Some(Err(e)) => println!("regen: prior baseline unreadable ({e}); overwriting."),
+            None => println!("regen: no prior baseline (first run)."),
+        }
         write_budget(&path, &measured)?;
         print_summary(&measured);
         println!("\nwrote {} (regenerated from the tree)", rel(&repo, &path));
@@ -253,6 +272,58 @@ fn compute_violations(measured: &Budget, baseline: &Budget) -> Vec<String> {
         }
     }
 
+    out
+}
+
+/// Human-readable "what changed" between a prior baseline and the freshly
+/// measured tree, for `--regen` to print before it overwrites. Neutral (not
+/// gate-framed): every crate/count/per-file delta, plus added/removed crates
+/// and files. Empty = the baseline already matches the tree. Pure.
+fn diff_budgets(old: &Budget, new: &Budget) -> Vec<String> {
+    fn doc(d: Option<usize>) -> String {
+        d.map_or_else(|| "none".to_string(), |n| n.to_string())
+    }
+    let mut out = Vec::new();
+    for (name, n) in new {
+        let Some(o) = old.get(name) else {
+            out.push(format!(
+                "+ {name} (new crate): unsafe {}, documented {}",
+                n.unsafe_count,
+                doc(n.documented_count)
+            ));
+            continue;
+        };
+        if o.unsafe_count != n.unsafe_count {
+            out.push(format!(
+                "{name} unsafe_count {} -> {}",
+                o.unsafe_count, n.unsafe_count
+            ));
+        }
+        if o.documented_count != n.documented_count {
+            out.push(format!(
+                "{name} documented_count {} -> {}",
+                doc(o.documented_count),
+                doc(n.documented_count)
+            ));
+        }
+        for (f, nc) in &n.files {
+            match o.files.get(f) {
+                None => out.push(format!("{name}/{f} (new file) documented {nc}")),
+                Some(oc) if oc != nc => out.push(format!("{name}/{f} documented {oc} -> {nc}")),
+                Some(_) => {}
+            }
+        }
+        for f in o.files.keys() {
+            if !n.files.contains_key(f) {
+                out.push(format!("{name}/{f} (file removed)"));
+            }
+        }
+    }
+    for name in old.keys() {
+        if !new.contains_key(name) {
+            out.push(format!("- {name} (crate removed)"));
+        }
+    }
     out
 }
 
@@ -942,6 +1013,46 @@ mod tests {
         let v = compute_violations(&measured, &baseline);
         assert_eq!(v.len(), 1);
         assert!(v[0].contains("97"), "{}", v[0]);
+    }
+
+    // ---- regen diff (what --regen prints before overwriting) ----
+
+    #[test]
+    fn diff_reports_count_file_and_crate_changes() {
+        let old = budget(&[
+            ("oam_engine", 700, Some(690), &[("napi.rs", 600)]),
+            ("oam_gone", 3, None, &[]),
+        ]);
+        let new = budget(&[
+            // unsafe down, documented up, a per-file floor raised.
+            ("oam_engine", 699, Some(692), &[("napi.rs", 602)]),
+            // brand-new crate.
+            ("oam_new", 2, None, &[]),
+            // oam_gone dropped.
+        ]);
+        let d = diff_budgets(&old, &new);
+        assert!(
+            d.iter().any(|m| m == "oam_engine unsafe_count 700 -> 699"),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|m| m == "oam_engine documented_count 690 -> 692"),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|m| m == "oam_engine/napi.rs documented 600 -> 602"),
+            "{d:?}"
+        );
+        assert!(d.iter().any(|m| m.contains("oam_new (new crate)")), "{d:?}");
+        assert!(d.iter().any(|m| m == "- oam_gone (crate removed)"), "{d:?}");
+    }
+
+    #[test]
+    fn diff_is_empty_when_baseline_matches_tree() {
+        let b = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
+        assert!(diff_budgets(&b, &b).is_empty());
     }
 
     // ---- JSON round-trip ----
