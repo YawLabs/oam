@@ -952,6 +952,49 @@ mod tests {
         path.to_string_lossy().replace('\\', "/")
     }
 
+    // ---- soundness: fsReadSync bounds check must not wrap
+    //
+    // Regression for the overflow-bypassable bounds check in op_fs_read_sync.
+    // `offset` comes from an unvalidated JS number; its saturating f64->usize
+    // cast reaches usize::MAX, and the old `byte_offset + n <= len` check did
+    // unchecked adds, so `usize::MAX + 1` wrapped to 0, passed the check, and
+    // did an out-of-bounds copy_nonoverlapping (segfault in release, overflow
+    // panic in debug). Reachable from ordinary user JS via `__oam.node`.
+
+    #[test]
+    fn fs_read_sync_rejects_wrapping_offset() {
+        let path = temp_path("read-oob.bin");
+        std::fs::write(&path, b"ABCDEFGH").unwrap();
+        let js = js_path(&path);
+        let mut rt = JsRuntime::new();
+        // fd-based ops resolve their file registry through the CoreRuntime.
+        rt.ensure_core_runtime();
+        let result = rt
+            .execute_script(
+                "fs_read_oob.js",
+                &format!(
+                    r#"
+                    const fd = __oam.node.fsOpenSync('{js}', 'r');
+                    const buf = new Uint8Array(4);
+                    // 1e30 saturates to usize::MAX in the cast; pre-fix this
+                    // wrapped the bounds check into a wild OOB write.
+                    const wrote = __oam.node.fsReadSync(fd, buf, 1e30, 1, 0);
+                    const untouched = Array.from(buf).every((b) => b === 0);
+                    // A normal read must still copy into the buffer.
+                    const n = __oam.node.fsReadSync(fd, buf, 0, 4, 0);
+                    __oam.node.fsCloseSync(fd);
+                    `${{wrote}}:${{untouched}}:${{n}}:${{buf[0]}}`
+                    "#
+                ),
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        // wrote=1 byte read; untouched=true (OOB copy suppressed); n=4 normal
+        // read; buf[0]=65 ('A'). The zlibHandleWriteSync guard shares the same
+        // checked_add fold and throws a RangeError on the wrapping case.
+        assert_eq!(result, "1:true:4:65", "got: {result}");
+    }
+
     // ---- read denied
     //
     // Use __oam.node.fsReadFileSync directly (the internal op) rather than

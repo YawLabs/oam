@@ -2420,8 +2420,14 @@ fn op_zlib_handle_write_sync(
                 {
                     let store = buf.get_backing_store();
                     if let Some(data) = store.data() {
-                        let byte_offset = view.byte_offset() + out_off;
-                        if byte_offset + produced <= store.byte_length() {
+                        // `out_off` is an unvalidated JS int32 (a negative value
+                        // casts to ~usize::MAX); fold the bounds adds through
+                        // checked_add so a wrap can't slip an OOB write past the
+                        // length check.
+                        if let Some(byte_offset) = view.byte_offset().checked_add(out_off)
+                            && let Some(end) = byte_offset.checked_add(produced)
+                            && end <= store.byte_length()
+                        {
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
@@ -4155,8 +4161,14 @@ fn op_fs_read_sync(
                 {
                     let store = buffer.get_backing_store();
                     if let Some(data) = store.data() {
-                        let byte_offset = view.byte_offset() + offset;
-                        if byte_offset + n <= store.byte_length() {
+                        // `offset` is an unvalidated JS number whose saturating
+                        // f64->usize cast can reach usize::MAX; fold the bounds
+                        // adds through checked_add so a wrap can't slip an OOB
+                        // write past the length check.
+                        if let Some(byte_offset) = view.byte_offset().checked_add(offset)
+                            && let Some(end) = byte_offset.checked_add(n)
+                            && end <= store.byte_length()
+                        {
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(tmp.as_ptr(), dest, n);
