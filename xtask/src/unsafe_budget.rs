@@ -506,7 +506,12 @@ fn char_literal_end(chars: &[char], q: usize) -> Option<usize> {
     }
     if chars[q + 1] == '\\' {
         // Escaped char literal: scan to the closing quote on the same line.
-        let mut j = q + 2;
+        // Start AT the backslash (q+1), not past it, so the `'\\' => j += 2`
+        // arm consumes the whole escape pair uniformly. Starting at q+2 mis-scans
+        // `'\\'`: the escaped backslash at q+2 gets read as a fresh escape, jumps
+        // the real closing quote at q+3, and the scan runs away to a later stray
+        // quote -- blanking (and undercounting) any `unsafe` in between.
+        let mut j = q + 1;
         while j < n {
             match chars[j] {
                 '\\' => j += 2,
@@ -803,6 +808,27 @@ mod tests {
     #[test]
     fn lifetimes_are_not_char_literals() {
         let src = "fn f<'a>(x: &'a str) -> &'static str { unsafe { h() } }";
+        let (u, _) = scan_source(src);
+        assert_eq!(u, 1);
+    }
+
+    #[test]
+    fn backslash_char_literal_does_not_run_away() {
+        // `'\\'` is an escaped backslash. If char_literal_end scans from past the
+        // backslash it jumps the real closing quote and runs to the next stray
+        // quote (in the string), blanking the `unsafe` -- undercounting the
+        // ceiling this gate protects. Both plain and byte forms.
+        for lit in ["'\\\\'", "b'\\\\'"] {
+            let src = format!("let c = {lit}; let x = \"'\"; unsafe {{ f(); }}");
+            let (u, _) = scan_source(&src);
+            assert_eq!(u, 1, "backslash char literal {lit} miscounted");
+        }
+    }
+
+    #[test]
+    fn escaped_quote_char_literal_is_counted() {
+        // `'\''` (escaped single-quote) must not desync the quote scan.
+        let src = "let q = '\\''; unsafe { g(); }";
         let (u, _) = scan_source(src);
         assert_eq!(u, 1);
     }
