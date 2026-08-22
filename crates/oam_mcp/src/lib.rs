@@ -10,6 +10,10 @@
 //! Dispatch is a pure function (message in, response out) so the protocol
 //! logic unit-tests without processes or pipes.
 
+// AI-POLICY gate 5: this crate carries no `unsafe`. `forbid` (not `deny`) so it
+// can never be silently reintroduced under an inner `#[allow(unsafe_code)]`.
+#![forbid(unsafe_code)]
+
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
