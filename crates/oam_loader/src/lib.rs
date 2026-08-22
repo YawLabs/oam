@@ -10,6 +10,9 @@
 //! interop, tsconfig paths, .tsx (needs the module loader for the JSX
 //! automatic runtime), content-addressed transform caches.
 
+// AI-POLICY gate 5: this crate carries no `unsafe`. `forbid` (not `deny`) so it
+// can never be silently reintroduced under an inner `#[allow(unsafe_code)]`.
+#![forbid(unsafe_code)]
 // Diagnostic-as-error is ~200 bytes on cold resolution/parse failure paths;
 // boxing would tax every caller's API for nothing. Crate-wide stance,
 // shared with oam_ts.

@@ -7,6 +7,10 @@
 //!
 //! Spec home (once docs ship): https://oam.sh/odif
 
+// AI-POLICY gate 5: this crate carries no `unsafe`. `forbid` (not `deny`) so it
+// can never be silently reintroduced under an inner `#[allow(unsafe_code)]`.
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 
 pub const ODIF_VERSION: &str = "1";
