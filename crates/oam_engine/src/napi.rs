@@ -2777,11 +2777,16 @@ pub unsafe extern "C" fn napi_resolve_deferred(
     if deferred.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
-    let resolver = v8::Local::new(scope, &entry.resolver);
+    // Validate the resolution BEFORE taking ownership of the deferred. N-API
+    // frees the deferred only on success; if Box::from_raw ran first, this
+    // invalid-arg return would drop (free) the DeferredEntry while the caller
+    // still owns the handle, turning a contract-conforming retry into a
+    // use-after-free / double-free.
     let Some(value) = (unsafe { to_local(resolution) }) else {
         return NAPI_INVALID_ARG;
     };
+    let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
+    let resolver = v8::Local::new(scope, &entry.resolver);
     resolver.resolve(scope, value);
     NAPI_OK
 }
@@ -2798,11 +2803,14 @@ pub unsafe extern "C" fn napi_reject_deferred(
     if deferred.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
-    let resolver = v8::Local::new(scope, &entry.resolver);
+    // Validate the rejection BEFORE taking ownership of the deferred (see
+    // napi_resolve_deferred): freeing the DeferredEntry on this invalid-arg
+    // path would dangle the caller's handle and make a retry a use-after-free.
     let Some(value) = (unsafe { to_local(rejection) }) else {
         return NAPI_INVALID_ARG;
     };
+    let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
+    let resolver = v8::Local::new(scope, &entry.resolver);
     resolver.reject(scope, value);
     NAPI_OK
 }
@@ -3164,6 +3172,19 @@ pub(crate) fn load_addon<'s>(
         };
     let register: RegisterFn = *register;
 
+    // Tie the library's lifetime to the JsRuntime BEFORE running register().
+    // register() can create napi functions -- whose code pointers live in this
+    // DLL -- and attach them to persistent JS objects (globalThis, exports, or
+    // even the error it throws), so once it has run the DLL can never be safely
+    // unloaded. Pushing here rather than only on the success path keeps the
+    // pending-exception return below from dropping `library` and unmapping code
+    // the surviving env still points into.
+    scope
+        .get_slot_mut::<AddonRegistry>()
+        .expect("AddonRegistry slot installed")
+        .libraries
+        .push(library);
+
     // Allocate a fresh NapiEnv.  Push it into the AddonRegistry slot so
     // its lifetime is tied to the JsRuntime.  We hold a raw pointer for
     // use during registration (the Box heap address is stable even as the
@@ -3198,11 +3219,6 @@ pub(crate) fn load_addon<'s>(
         scope.throw_exception(exception);
         return None;
     }
-    scope
-        .get_slot_mut::<AddonRegistry>()
-        .expect("AddonRegistry slot installed")
-        .libraries
-        .push(library);
 
     match unsafe { to_local(result) } {
         Some(returned) => Some(returned),
