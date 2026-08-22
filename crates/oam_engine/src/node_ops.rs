@@ -2403,6 +2403,14 @@ fn op_zlib_handle_write_sync(
     let input = arg_bytes(scope, &args, 2).unwrap_or_default();
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
     let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
+    // `out_len` is an unvalidated int32 (a negative value casts to ~usize::MAX);
+    // `vec![0u8; out_len]` would abort this non-unwindable callback. zlib can
+    // never produce more than the output buffer holds, so clamp to its capacity.
+    let out_len = out_len.min(
+        v8::Local::<v8::ArrayBufferView>::try_from(args.get(3))
+            .map(|v| v.byte_length())
+            .unwrap_or(0),
+    );
 
     let streams = core_runtime!(scope).zlib_streams();
 
@@ -4142,6 +4150,15 @@ fn op_fs_read_sync(
     // counter starts above the inheritable window -- so it is the parent's to
     // adopt. This is what lets oam BE the child of an extra-fd spawn.
     oam_core::adopt_inherited_fd(&files, fd);
+    // `length` is an unvalidated JS number; its saturating f64->usize cast can
+    // reach usize::MAX, and `vec![0u8; length]` would abort this non-unwindable
+    // callback (capacity-overflow panic). A read can never usefully exceed the
+    // destination buffer, so clamp the allocation to its capacity.
+    let length = length.min(
+        v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
+            .map(|v| v.byte_length())
+            .unwrap_or(0),
+    );
     let mut tmp = vec![0u8; length];
     let read_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
