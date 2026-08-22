@@ -960,4 +960,163 @@ mod tests {
         let back = budget_from_json(&budget_to_json(&b)).unwrap();
         assert_eq!(b, back);
     }
+
+    // ---- lexical scanner: boundary / literal edge cases ----
+
+    #[test]
+    fn unsafe_as_a_substring_of_an_identifier_is_not_counted() {
+        // The whole ceiling is per-crate `unsafe` counts; a broken word boundary
+        // would over-count. `wrap_unsafe { .. }` is a struct literal whose name
+        // ENDS in `unsafe` and is followed by `{` -- the case a dropped prev-word
+        // guard would miscount as an unsafe block. Plus leading/interior forms.
+        let src = "let unsafe_x = is_unsafe(); let a = wrap_unsafe { x: 1 }; unsafe { real(); }";
+        let (u, _) = scan_source(src);
+        assert_eq!(u, 1, "only the real `unsafe {{` block counts");
+    }
+
+    #[test]
+    fn byte_and_raw_byte_strings_are_blanked() {
+        // FFI code carries C byte-strings; `unsafe` inside one must not count.
+        let src = r####"
+            let a = b"an unsafe byte string";
+            let c = br"a raw unsafe byte string";
+            unsafe { real(); }
+        "####;
+        let (u, _) = scan_source(src);
+        assert_eq!(u, 1);
+    }
+
+    #[test]
+    fn nested_block_comment_hides_unsafe() {
+        // Rust block comments nest; only correct depth tracking keeps the
+        // `unsafe { hidden }` -- which sits AFTER the inner `*/` but still inside
+        // the outer comment -- blanked. A naive first-`*/` scan would end the
+        // comment at the inner close and count it, giving 2 instead of 1.
+        let src = "/* a /* b */ unsafe { hidden(); } */ unsafe { real(); }";
+        let (u, _) = scan_source(src);
+        assert_eq!(u, 1);
+    }
+
+    #[test]
+    fn safety_inside_a_block_comment_is_not_counted() {
+        // Only a `// SAFETY:` LINE comment justifies an unsafe; a `SAFETY:` that
+        // is itself inside a block comment is inert text, not coverage.
+        let src = "/* // SAFETY: not real */\n// SAFETY: real\nunsafe { g(); }";
+        let (u, d) = scan_source(src);
+        assert_eq!(u, 1);
+        assert_eq!(d, 1, "only the line-comment SAFETY counts");
+    }
+
+    #[test]
+    fn multi_hash_raw_string_interior_quote_hash_does_not_close_early() {
+        // `r##"..."##` may contain `"#` (one hash) without closing; a wrong hash
+        // count would end the string early and misread the trailing code.
+        let src = r####"
+            let a = r##"contains "# and the word unsafe inside"##;
+            unsafe { real(); }
+        "####;
+        let (u, _) = scan_source(src);
+        assert_eq!(u, 1, "interior \"# must not close the raw string");
+    }
+
+    // ---- pure gate: baseline/tree asymmetry and scope transitions ----
+
+    #[test]
+    fn crate_in_baseline_but_absent_from_tree_is_flagged() {
+        // A deleted/renamed crate must force a --regen, not silently drop its
+        // ceiling from the gate.
+        let measured = budget(&[("oam_engine", 700, Some(690), &[])]);
+        let baseline = budget(&[
+            ("oam_engine", 700, Some(690), &[]),
+            ("oam_gone", 3, None, &[]),
+        ]);
+        let v = compute_violations(&measured, &baseline);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("oam_gone") && m.contains("no such crate is in the tree")),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn per_file_floor_in_baseline_but_absent_from_tree_is_flagged() {
+        // A renamed/removed engine file with a per-file floor must force --regen.
+        let measured = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
+        let baseline = budget(&[(
+            "oam_engine",
+            700,
+            Some(690),
+            &[("napi.rs", 600), ("gone.rs", 4)],
+        )]);
+        let v = compute_violations(&measured, &baseline);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("gone.rs") && m.contains("was not found in the tree")),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn documented_scope_transition_bites_both_directions() {
+        // Editing DOCUMENTED_SCOPE desyncs a crate's documented_count from the
+        // baseline; both directions must force a --regen.
+        let engine_tracked = budget(&[("oam_engine", 700, Some(690), &[])]);
+        let engine_untracked = budget(&[("oam_engine", 700, None, &[])]);
+
+        // tree no longer tracks it (None) but baseline still records Some.
+        let dropped = compute_violations(&engine_untracked, &engine_tracked);
+        assert!(
+            dropped.iter().any(|m| m.contains("no longer tracks it")),
+            "{dropped:?}"
+        );
+
+        // tree now tracks it (Some) but baseline has no documented_count.
+        let added = compute_violations(&engine_tracked, &engine_untracked);
+        assert!(
+            added
+                .iter()
+                .any(|m| m.contains("does not record a documented_count")),
+            "{added:?}"
+        );
+    }
+
+    // ---- deserialize: a corrupt committed baseline must fail loudly ----
+
+    #[test]
+    fn baseline_without_crates_object_errors() {
+        let err = budget_from_json(&json!({ "_comment": "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("crates"), "{err}");
+    }
+
+    #[test]
+    fn baseline_crate_without_unsafe_count_errors() {
+        let err = budget_from_json(&json!({ "crates": { "oam_x": {} } }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no numeric unsafe_count"), "{err}");
+    }
+
+    #[test]
+    fn non_numeric_per_file_floor_is_dropped() {
+        // Documents CURRENT behavior: a corrupt (non-numeric) per-file floor is
+        // silently skipped rather than erroring. Lenient by construction -- a
+        // stricter version would `bail!` here; this test pins the status quo so a
+        // future change to it is deliberate.
+        let b = budget_from_json(&json!({
+            "crates": {
+                "oam_engine": {
+                    "unsafe_count": 5,
+                    "documented_count": 3,
+                    "files": { "napi.rs": "not a number" }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(
+            b["oam_engine"].files.is_empty(),
+            "a non-numeric floor is currently dropped, not retained"
+        );
+    }
 }
