@@ -83,6 +83,9 @@ pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
 /// falls back to `pipe` + `fcntl`, exactly as `std`'s own spawn does.
 fn make_pipe() -> Result<(RawFd, RawFd), String> {
     let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a live 2-element array; `pipe2`/`pipe` write the two new
+    // fds into it, and the `fcntl` fallback only sets CLOEXEC on the integer fds
+    // just returned. No other memory is touched.
     let rc = unsafe {
         #[cfg(target_os = "linux")]
         {
@@ -106,6 +109,8 @@ fn make_pipe() -> Result<(RawFd, RawFd), String> {
 
 /// Open `/dev/null` read-write, `CLOEXEC`.
 fn open_dev_null() -> Result<RawFd, String> {
+    // SAFETY: `c"/dev/null"` is a static NUL-terminated C string that outlives
+    // the call; `open` only reads it and returns a new fd (or -1), checked below.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(format!(
@@ -119,12 +124,17 @@ fn open_dev_null() -> Result<RawFd, String> {
 /// Relocate `fd` to the lowest free fd `>= base`, `CLOEXEC`. ALWAYS consumes
 /// `fd` (closes it on both success and failure), so callers never re-close it.
 fn relocate(fd: RawFd, base: RawFd) -> Result<RawFd, String> {
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` duplicates the integer fd `fd` to the
+    // lowest free fd >= `base`; no pointers are involved and the result is
+    // checked below.
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, base) };
     let err = if high < 0 {
         Some(std::io::Error::last_os_error())
     } else {
         None
     };
+    // SAFETY: closes the integer fd `fd`; this fn always consumes it exactly
+    // once (its documented contract), so no double-close is possible.
     unsafe { libc::close(fd) };
     match err {
         Some(e) => Err(format!("fcntl(F_DUPFD_CLOEXEC): {e}")),
@@ -193,10 +203,22 @@ pub fn spawn_extra(
     // Close everything allocated so far, plus any extra transient fds, on error.
     macro_rules! bail {
         ($($extra:expr),* ; $e:expr) => {{
-            $( unsafe { libc::close($extra) }; )*
-            for &(src, _) in &dup_plan { unsafe { libc::close(src) }; }
+            $(
+                // SAFETY: `$extra` is an fd this fn opened and still owns on the
+                // error path; closing it exactly once reclaims it.
+                unsafe { libc::close($extra) };
+            )*
+            for &(src, _) in &dup_plan {
+                // SAFETY: `src` is a relocated child-end fd we own and have not
+                // yet handed to a child; close it once on the error path.
+                unsafe { libc::close(src) };
+            }
             for end in parent_fds.values() {
-                if let Some(fd) = end.fd { unsafe { libc::close(fd) }; }
+                if let Some(fd) = end.fd {
+                    // SAFETY: `fd` is a parent-kept pipe end this fn owns; close
+                    // it once on the error path.
+                    unsafe { libc::close(fd) };
+                }
             }
             return Err($e);
         }};
@@ -262,6 +284,9 @@ pub fn spawn_extra(
             StdioFd::Descriptor(src) => {
                 // Duplicated before relocating, so the caller keeps its own
                 // descriptor: `relocate` consumes what it is handed.
+                // SAFETY: `libc::dup` duplicates the integer fd `*src` (the
+                // caller's descriptor); it takes no pointers and the result is
+                // checked below.
                 let copy = unsafe { libc::dup(*src) };
                 if copy == -1 {
                     bail!(; format!("dup(fd{fd}) failed: {}", std::io::Error::last_os_error()));
@@ -299,6 +324,12 @@ pub fn spawn_extra(
     // Apply the fd plan in the child just before exec. Only dup2 (async-signal-
     // safe); the plan Vec is pre-allocated, so the hook allocates nothing.
     let plan = dup_plan.clone();
+    // SAFETY: `pre_exec` runs the closure in the forked child before exec, where
+    // only async-signal-safe operations are permitted. The closure does exactly
+    // one thing per plan entry -- `dup2(src, dst)` -- allocating nothing (the
+    // `plan` Vec is pre-built), touching no lock or heap; on error it returns a
+    // raw-errno `io::Error` that std reads and _exit()s without unwinding. dup2
+    // is on the POSIX async-signal-safe list, so the hook is sound.
     unsafe {
         cmd.pre_exec(move || {
             for &(src, dst) in &plan {
@@ -338,6 +369,9 @@ pub fn spawn_extra(
     // Parent no longer needs the child-end (relocated) sources; the child holds
     // its dup2'd copies at the target fds.
     for &(src, _) in &dup_plan {
+        // SAFETY: `src` is a relocated child-end fd the parent still owns after a
+        // successful spawn; the child holds its own dup2'd copy, so closing ours
+        // exactly once here is sound.
         unsafe { libc::close(src) };
     }
 
@@ -402,19 +436,27 @@ pub async fn raw_read(reg: RawChildRegistry, id: u64, fd: u32) -> OpOutcome {
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.fd = Some(rawfd);
             } else {
+                // SAFETY: the registry entry is gone, so `rawfd` (taken for this
+                // op) has no other owner; close it exactly once.
                 unsafe { libc::close(rawfd) };
             }
             OpOutcome::Bytes(bytes)
         }
         Ok(Ok(None)) => {
+            // SAFETY: EOF -- `rawfd` is not re-inserted, so this op is its sole
+            // owner; close it exactly once.
             unsafe { libc::close(rawfd) };
             OpOutcome::Done
         }
         Ok(Err(e)) => {
+            // SAFETY: error path -- `rawfd` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { libc::close(rawfd) };
             OpOutcome::Failed(e)
         }
         Err(e) => {
+            // SAFETY: join failure -- `rawfd` is not re-inserted, so this op is
+            // its sole owner; close it exactly once.
             unsafe { libc::close(rawfd) };
             OpOutcome::Failed(format!("read join: {e}"))
         }
@@ -437,6 +479,8 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
     let result = tokio::task::spawn_blocking(move || {
         let mut off = 0usize;
         while off < data.len() {
+            // SAFETY: `rawfd` is the live write fd taken for this op; the
+            // pointer/length are the head of the still-live `data` slice.
             let n = unsafe {
                 libc::write(
                     rawfd,
@@ -466,15 +510,21 @@ pub async fn raw_write(reg: RawChildRegistry, id: u64, fd: u32, data: Vec<u8>) -
             if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd)) {
                 end.fd = Some(rawfd);
             } else {
+                // SAFETY: the registry entry is gone, so `rawfd` (taken for this
+                // op) has no other owner; close it exactly once.
                 unsafe { libc::close(rawfd) };
             }
             OpOutcome::Done
         }
         Ok(Err(e)) => {
+            // SAFETY: error path -- `rawfd` is not re-inserted, so this op is its
+            // sole owner; close it exactly once.
             unsafe { libc::close(rawfd) };
             OpOutcome::Failed(e)
         }
         Err(e) => {
+            // SAFETY: join failure -- `rawfd` is not re-inserted, so this op is
+            // its sole owner; close it exactly once.
             unsafe { libc::close(rawfd) };
             OpOutcome::Failed(format!("write join: {e}"))
         }
@@ -487,6 +537,8 @@ pub fn raw_close_fd(reg: &RawChildRegistry, id: u64, fd: u32) {
     if let Some(end) = guard.get_mut(&id).and_then(|c| c.fds.get_mut(&fd))
         && let Some(rawfd) = end.fd.take()
     {
+        // SAFETY: `rawfd` was just taken out of the registry entry, so this call
+        // is its sole owner; close it exactly once.
         unsafe { libc::close(rawfd) };
     }
 }
@@ -575,6 +627,8 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
     };
     for end in fds.values() {
         if let Some(rawfd) = end.fd {
+            // SAFETY: `fds` was removed from the registry above, so this fn is
+            // the sole owner of each remaining pipe end; close each once.
             unsafe { libc::close(rawfd) };
         }
     }

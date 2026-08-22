@@ -625,7 +625,8 @@ fn dispatch(cli: Cli) -> ExitCode {
             inspect,
             inspect_brk,
         } => {
-            // Safety: single-threaded at this point (before JsRuntime::new).
+            // SAFETY: single-threaded at this point (before JsRuntime::new), so
+            // the process-wide env mutation races no other thread's getenv.
             unsafe {
                 std::env::set_var("PORT", port.to_string());
                 std::env::set_var("HOST", host);

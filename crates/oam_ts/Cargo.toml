@@ -10,3 +10,7 @@ license.workspace = true
 oam_diagnostics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"

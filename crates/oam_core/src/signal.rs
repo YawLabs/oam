@@ -135,6 +135,12 @@ pub fn start_signal(
                 // re-raise so the process dies exactly as it would have,
                 // and the parent observes the right terminating signal.
                 if default_terminates(signum) {
+                    // SAFETY: `libc::signal`/`libc::raise` take only the integer
+                    // signal number and the well-known SIG_DFL constant -- no
+                    // pointers into our memory. This runs only when the signal's
+                    // default action terminates and no JS listener remains, so
+                    // restoring SIG_DFL and re-raising reproduces exactly that
+                    // default action.
                     unsafe {
                         libc::signal(signum, libc::SIG_DFL);
                         libc::raise(signum);
@@ -275,6 +281,9 @@ pub fn start_signal(
     // Install the console ctrl handler exactly once (adding the same routine
     // twice would have it invoked twice per event).
     if !HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        // SAFETY: passes a valid pointer to our zero-capture `extern "system"`
+        // handler plus the add=1 flag; the call registers the handler and
+        // dereferences no memory of ours. The swap guard ensures it runs once.
         unsafe {
             SetConsoleCtrlHandler(Some(ctrl_handler), 1);
         }
