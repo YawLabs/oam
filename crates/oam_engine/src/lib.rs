@@ -214,6 +214,10 @@ fn resolve_heap_cap() -> HeapCap {
 /// (128 + SIGABRT) as a recognizable "heap OOM" signal, delivered uniformly
 /// on every platform as a clean exit (no signal, no core dump). It never
 /// returns, so V8's fatal path is preempted entirely.
+// SAFETY: a raw V8 `NearHeapLimitCallback` -- only V8 invokes it, with the exact
+// C ABI signature; `_data` is the null pointer we registered and the heap-limit
+// args are plain usizes (nothing is dereferenced). It exits the process and
+// never returns to V8.
 unsafe extern "C" fn near_heap_limit_oom(
     _data: *mut std::ffi::c_void,
     current_heap_limit: usize,
@@ -759,9 +763,11 @@ mod tests {
 
     impl Drop for HeapCapEnvGuard {
         fn drop(&mut self) {
-            // SAFETY: serialized by `self._lock` (still held here).
             match self.prior.as_deref() {
+                // SAFETY: serialized by `self._lock` (still held here), so no
+                // other thread reads OAM_MAX_HEAP_MB concurrently.
                 Some(v) => unsafe { std::env::set_var("OAM_MAX_HEAP_MB", v) },
+                // SAFETY: as above -- `self._lock` is still held.
                 None => unsafe { std::env::remove_var("OAM_MAX_HEAP_MB") },
             }
         }

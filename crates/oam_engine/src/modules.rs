@@ -90,6 +90,9 @@ pub(crate) struct UncaughtLedger {
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
+// SAFETY: only V8 invokes this, as the isolate message listener, with the exact
+// C ABI signature; `message`/`exception` are V8 Locals valid for the call and
+// touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn message_listener(
     message: v8::Local<v8::Message>,
     exception: v8::Local<v8::Value>,
@@ -559,6 +562,11 @@ impl JsRuntime {
     /// None by reset_run_slots / tick() / repl_eval() so no later turn can
     /// read a stale pointer. The single `unsafe` for this lives here.
     pub(crate) fn park_active_host(&mut self, host: &dyn ModuleHost) {
+        // SAFETY: a lifetime-only transmute of a fat pointer -- only the erased
+        // lifetime changes, the (data, vtable) halves keep identical layout, so
+        // it is sound. The `'static` is never observed: per this fn's SAFETY
+        // contract above, the slot is cleared to None before any later JS turn,
+        // so no deref of this pointer outlives `host`.
         let host_ptr: *const (dyn ModuleHost + 'static) =
             unsafe { std::mem::transmute(host as *const dyn ModuleHost) };
         self.isolate.set_slot(ActiveHost(Some(host_ptr)));
@@ -1725,6 +1733,9 @@ fn resolve_module_callback<'s>(
     _import_attributes: v8::Local<'s, v8::FixedArray>,
     referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
+    // SAFETY: V8 calls this synchronously during instantiate_module with the
+    // live `context` it is resolving in, so opening a callback scope on that
+    // context is valid for the duration of the call.
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
 
@@ -2347,6 +2358,9 @@ fn path_to_file_url(path: &Path) -> String {
 /// Builtin facades get url = "node:<name>" with no filename/dirname; CJS
 /// facades get their real file path — createRequire(import.meta.url) works
 /// everywhere user code can spell it. Zero capture, raw C ABI.
+// SAFETY: only V8 invokes this, as the import.meta initializer callback, with
+// the exact C ABI signature; `context`/`module`/`meta` are V8 Locals valid for
+// the call and touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn import_meta_callback(
     context: v8::Local<v8::Context>,
     module: v8::Local<v8::Module>,
@@ -2403,6 +2417,9 @@ pub(crate) unsafe extern "C" fn import_meta_callback(
 
 /// V8 promise-reject callback: maintains the RejectionLedger. Zero capture,
 /// raw C ABI (set_promise_reject_callback takes the fn type directly).
+// SAFETY: only V8 invokes this, as the promise-reject callback, with the exact
+// C ABI signature; `message` is a V8-provided struct valid for the call and
+// touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseRejectMessage) {
     v8::callback_scope!(unsafe scope, &message);
     let promise = message.get_promise();

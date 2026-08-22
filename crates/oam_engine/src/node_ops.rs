@@ -843,6 +843,10 @@ static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
 
 #[cfg(windows)]
 fn win_std_handle(fd: i32) -> isize {
+    // SAFETY: the declared signature matches the Win32 GetStdHandle ABI
+    // (kernel32: one DWORD in, a HANDLE-sized isize out). The declaration
+    // dereferences nothing, so the only obligation is the signature itself,
+    // which is fixed by the platform.
     unsafe extern "system" {
         fn GetStdHandle(n_std_handle: u32) -> isize;
     }
@@ -852,6 +856,9 @@ fn win_std_handle(fd: i32) -> isize {
         1 => 0xFFFF_FFF5,
         _ => 0xFFFF_FFF4,
     };
+    // SAFETY: GetStdHandle takes a plain DWORD by value and returns a handle;
+    // `id` is one of the three documented STD_*_HANDLE constants and no
+    // pointers are involved, so the call cannot violate memory safety.
     unsafe { GetStdHandle(id) }
 }
 
@@ -862,6 +869,10 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     const ENABLE_LINE_INPUT: u32 = 0x0002;
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
     const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    // SAFETY: the signatures match the Win32 console ABI (GetConsoleMode:
+    // HANDLE + out DWORD*; SetConsoleMode: HANDLE + by-value DWORD). Pointer
+    // validity for the actual calls is established at the call site below,
+    // not here.
     unsafe extern "system" {
         fn GetConsoleMode(h: isize, mode: *mut u32) -> i32;
         fn SetConsoleMode(h: isize, mode: u32) -> i32;
@@ -870,6 +881,10 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     if h == 0 || h == -1 {
         return false;
     }
+    // SAFETY: `h` is a console handle from win_std_handle, already rejected
+    // above if 0/-1. `mode` is a live stack u32 passed by `&mut`, valid for
+    // GetConsoleMode's out-write, and is only read after the return is checked
+    // non-zero. SetConsoleMode takes the handle plus a by-value DWORD.
     unsafe {
         let mut mode: u32 = 0;
         if GetConsoleMode(h, &mut mode) == 0 {
@@ -927,6 +942,9 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
         window: SmallRect,
         max_window: Coord,
     }
+    // SAFETY: the signature matches the Win32 ABI (HANDLE + out
+    // CONSOLE_SCREEN_BUFFER_INFO*), and the `#[repr(C)]` Csbi/Coord/SmallRect
+    // layout mirrors the OS struct so the out-write lands in the right fields.
     unsafe extern "system" {
         fn GetConsoleScreenBufferInfo(h: isize, info: *mut Csbi) -> i32;
     }
@@ -934,6 +952,10 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
     if h == 0 || h == -1 {
         return None;
     }
+    // SAFETY: Csbi is `#[repr(C)]` plain integer data, so an all-zero bit
+    // pattern is a valid instance. `info` is a live stack struct passed by
+    // `&mut`; its fields are only read after the return is checked non-zero.
+    // `h` is a validated console handle from win_std_handle.
     unsafe {
         let mut info: Csbi = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
@@ -950,6 +972,12 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
 
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+    // SAFETY: `termios` is POSIX plain-old-data, so `zeroed()` is a valid
+    // initial value that tcgetattr overwrites; its return is checked before
+    // `term` is read. `&mut term` / `&raw_term` point at live stack storage
+    // for the duration of each tc*attr call, and cfmakeraw only mutates the
+    // struct in place. `fd` is the caller-supplied descriptor; a bad fd makes
+    // the syscalls fail cleanly (non-zero return), never UB.
     unsafe {
         if enable {
             let mut term: libc::termios = std::mem::zeroed();
@@ -981,6 +1009,10 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
 
 #[cfg(unix)]
 fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
+    // SAFETY: `winsize` is POSIX plain data, valid all-zero; `&mut ws` is live
+    // stack storage the TIOCGWINSZ ioctl fills, and it is only read after the
+    // ioctl return is checked zero. TIOCGWINSZ is the correct request constant
+    // for a `winsize` out-argument.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) != 0 {
@@ -1075,6 +1107,9 @@ fn op_posix_get_id(
     let which = args.get(0).int32_value(scope).unwrap_or(0);
     #[cfg(unix)]
     {
+        // SAFETY: getuid/getgid/geteuid/getegid take no arguments, touch no
+        // memory, and always succeed; they are unsafe only as libc FFI. The
+        // result is a plain uid_t/gid_t.
         let id = unsafe {
             match which {
                 0 => libc::getuid(),
@@ -1113,6 +1148,10 @@ fn op_posix_set_id(
             return;
         }
         let id = raw as u32;
+        // SAFETY: setuid/setgid/seteuid/setegid take a single by-value id and
+        // return an int; no pointers are dereferenced. `id` was range-checked
+        // above to fit u32. Failure is surfaced via errno, read immediately
+        // after the call.
         let ok = unsafe {
             match which {
                 0 => libc::setuid(id),
@@ -1144,12 +1183,19 @@ fn op_posix_get_groups(
 ) {
     #[cfg(unix)]
     {
+        // SAFETY: getgroups(0, NULL) is the documented "just return the count"
+        // form -- a null list pointer is explicitly allowed when the size is 0,
+        // so nothing is dereferenced. The return is checked for error below.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
         if count < 0 {
             rv.set(v8::null(scope).into());
             return;
         }
         let mut buf = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `buf` was allocated with exactly `count` gid_t elements, so
+        // the pointer is valid for `count` writes -- the size passed and the
+        // allocation agree. `count` is non-negative here (the error case
+        // returned above). getgroups writes at most `count` entries.
         let got = unsafe { libc::getgroups(count, buf.as_mut_ptr()) };
         if got < 0 {
             rv.set(v8::null(scope).into());
@@ -1190,6 +1236,10 @@ fn op_posix_set_groups(
             };
             gids.push(v.number_value(scope).unwrap_or(0.0) as libc::gid_t);
         }
+        // SAFETY: `gids.as_ptr()` is valid for exactly `gids.len()` gid_t
+        // reads, and that same length is passed as the count -- the array and
+        // the size agree. setgroups only reads the array. Failure is surfaced
+        // via errno, read immediately after.
         let ok = unsafe { libc::setgroups(gids.len() as _, gids.as_ptr()) } == 0;
         if ok {
             rv.set(v8::null(scope).into());
@@ -1228,6 +1278,9 @@ fn op_posix_init_groups(
         };
         // `as _`, not a fixed cast: initgroups(3) takes c_int on macOS and
         // gid_t (u32) on Linux, so a concrete type breaks one of them.
+        // SAFETY: `cuser` is a live CString (owned in this scope) whose
+        // NUL-terminated pointer initgroups reads but does not retain; `gid`
+        // is passed by value. Result is surfaced via errno, read below.
         let ok = unsafe { libc::initgroups(cuser.as_ptr(), gid as _) } == 0;
         if ok {
             rv.set(v8::null(scope).into());
@@ -1267,6 +1320,10 @@ fn op_posix_lookup_id(
             }
             // getpwuid returns a pointer into static storage: copy the name
             // out immediately, never retain the pointer.
+            // SAFETY: getpwuid returns either NULL (checked) or a pointer into
+            // libc static storage valid until the next getpw* call; the name is
+            // copied out immediately via CStr and the pointer is never retained
+            // past this block. `uid` was range-checked to fit uid_t above.
             let name = unsafe {
                 let pw = libc::getpwuid(uid as libc::uid_t);
                 if pw.is_null() {
@@ -1293,6 +1350,10 @@ fn op_posix_lookup_id(
             return;
         };
         // Same static-storage rule as above.
+        // SAFETY: `cname` is a live CString read (not retained) by getpwnam /
+        // getgrnam. Each returns NULL (checked) or a pointer into libc static
+        // storage; only the id field is read out before the block ends, so the
+        // pointer never outlives the call.
         let id: Option<u32> = unsafe {
             if kind == 0 {
                 let pw = libc::getpwnam(cname.as_ptr());
@@ -1347,9 +1408,15 @@ fn op_set_timezone(
     // crate, which does not export it on darwin.
     #[cfg(unix)]
     {
+        // SAFETY: the declaration matches tzset(3)'s ABI -- no arguments, no
+        // return. It is declared locally because the libc crate does not
+        // export it on darwin.
         unsafe extern "C" {
             fn tzset();
         }
+        // SAFETY: tzset takes no arguments and touches no caller memory; it
+        // only re-reads the TZ environment variable (set just above) into
+        // libc's internal zone state. Unsafe solely as an FFI call.
         unsafe { tzset() };
     }
     // V8 caches its own zone for Date: without this notification the change
@@ -1415,6 +1482,11 @@ fn op_process_execve(
         let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
         envp_ptrs.push(std::ptr::null());
 
+        // SAFETY: `cpath` is a live CString; `argv_ptrs` / `envp_ptrs` are live
+        // NULL-terminated arrays of pointers into the `argv` / `envp` CStrings,
+        // all owned in this scope and valid for the call. execve reads them and
+        // does not retain them. On success it never returns (the image is
+        // replaced); on failure it returns and errno is read immediately below.
         unsafe {
             libc::execve(cpath.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
         }
@@ -2436,6 +2508,16 @@ fn op_zlib_handle_write_sync(
                             && let Some(end) = byte_offset.checked_add(produced)
                             && end <= store.byte_length()
                         {
+                            // SAFETY: the enclosing `if` bounds-checks the
+                            // write via checked_add (PR #52): `byte_offset =
+                            // view.byte_offset() + out_off` and `end =
+                            // byte_offset + produced` are both checked_add (so
+                            // a JS-supplied wrap cannot slip past), and `end <=
+                            // store.byte_length()` is confirmed. `data` is the
+                            // ArrayBuffer's live backing store, so `dest = data
+                            // + byte_offset` is valid for `produced` bytes.
+                            // `output` is a distinct local Vec of `out_len >=
+                            // produced` bytes, so source and dest do not overlap.
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
@@ -4186,6 +4268,16 @@ fn op_fs_read_sync(
                             && let Some(end) = byte_offset.checked_add(n)
                             && end <= store.byte_length()
                         {
+                            // SAFETY: the enclosing `if` bounds-checks the
+                            // write via checked_add (PR #52): `byte_offset =
+                            // view.byte_offset() + offset` and `end =
+                            // byte_offset + n` are both checked_add, with `end
+                            // <= store.byte_length()` confirmed -- a JS-supplied
+                            // wrap cannot slip past. `data` is the ArrayBuffer's
+                            // live backing store, so `dest` is valid for `n`
+                            // bytes. `tmp` is a separate local Vec of `length >=
+                            // n` bytes read from the fd, so source and dest are
+                            // non-overlapping.
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(tmp.as_ptr(), dest, n);
@@ -5627,6 +5719,9 @@ fn os_release() -> String {
         szCSDVersion: [u16; 128],
     }
 
+    // SAFETY: the signature matches the ntdll RtlGetVersion ABI (one
+    // OSVERSIONINFOW* in, NTSTATUS out); the `#[repr(C)]` OSVERSIONINFOW
+    // mirrors the OS layout so the fields it fills line up.
     unsafe extern "system" {
         fn RtlGetVersion(info: *mut OSVERSIONINFOW) -> i32;
     }
@@ -5639,6 +5734,10 @@ fn os_release() -> String {
         dwPlatformId: 0,
         szCSDVersion: [0; 128],
     };
+    // SAFETY: `info` is a live stack OSVERSIONINFOW with `dwOSVersionInfoSize`
+    // set to its own size before the call, as the API requires; `&mut info` is
+    // valid for the out-write. RtlGetVersion succeeds on a correctly-sized
+    // struct, so the (ignored) NTSTATUS is not needed.
     unsafe { RtlGetVersion(&mut info) };
     format!(
         "{}.{}.{}",
@@ -5672,6 +5771,9 @@ struct MEMORYSTATUSEX {
     ullAvailExtendedVirtual: u64,
 }
 
+// SAFETY: the signature matches the kernel32 GlobalMemoryStatusEx ABI (one
+// MEMORYSTATUSEX* in, BOOL out); the `#[repr(C)]` MEMORYSTATUSEX mirrors the
+// OS struct so the filled fields align.
 #[cfg(windows)]
 unsafe extern "system" {
     fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
@@ -5690,6 +5792,10 @@ fn mem_status() -> MEMORYSTATUSEX {
         ullAvailVirtual: 0,
         ullAvailExtendedVirtual: 0,
     };
+    // SAFETY: `status` is a live stack MEMORYSTATUSEX with `dwLength` set to
+    // its own size before the call, as the API requires; `&mut status` is valid
+    // for the out-write. The BOOL result is ignored because a correctly-sized
+    // struct does not fail here.
     unsafe { GlobalMemoryStatusEx(&mut status) };
     status
 }
@@ -5804,6 +5910,10 @@ fn process_rss() -> usize {
         PeakPagefileUsage: usize,
     }
 
+    // SAFETY: the signatures match the kernel32 ABI (K32GetProcessMemoryInfo:
+    // HANDLE + PROCESS_MEMORY_COUNTERS* + DWORD size; GetCurrentProcess: no
+    // args -> pseudo-handle). The `#[repr(C)]` PROCESS_MEMORY_COUNTERS mirrors
+    // the OS layout.
     unsafe extern "system" {
         fn K32GetProcessMemoryInfo(
             hProcess: isize,
@@ -5825,6 +5935,11 @@ fn process_rss() -> usize {
         PagefileUsage: 0,
         PeakPagefileUsage: 0,
     };
+    // SAFETY: GetCurrentProcess returns the current-process pseudo-handle (no
+    // cleanup needed); `counters` is a live stack struct whose `cb` is set to
+    // its own size before the call, and `&mut counters` is valid for an
+    // out-write of exactly `cb` bytes. Result ignored -- WorkingSetSize stays 0
+    // on the rare failure.
     unsafe {
         K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb);
     }
@@ -5868,6 +5983,9 @@ fn cpu_model() -> String {
     const KEY_READ: u32 = 0x20019;
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
+    // SAFETY: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
+    // RegQueryValueExW, RegCloseKey); every pointer argument is validated at
+    // its call site below.
     unsafe extern "system" {
         fn RegOpenKeyExW(
             hKey: isize,
@@ -5895,6 +6013,10 @@ fn cpu_model() -> String {
     let value_name = to_wide("ProcessorNameString");
     let mut hkey: isize = 0;
 
+    // SAFETY: `sub_key` is a live NUL-terminated UTF-16 vec valid for the read;
+    // `&mut hkey` is a live stack out-handle. HKEY_LOCAL_MACHINE and KEY_READ
+    // are the documented predefined-key / access constants. On non-zero (error)
+    // the handle is not used; on success `hkey` is closed below.
     if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
         return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
     }
@@ -5903,6 +6025,11 @@ fn cpu_model() -> String {
     let mut buf_len = buf.len() as u32;
     let mut reg_type: u32 = 0;
 
+    // SAFETY: `hkey` is the open key from the checked RegOpenKeyExW above.
+    // `value_name` is a live NUL-terminated UTF-16 vec; `buf` is a live
+    // 256-byte vec and `buf_len` holds its length, so the API writes at most
+    // `buf_len` bytes into valid storage and updates `buf_len` in place.
+    // `reg_type` is a live out-u32; the reserved arg is NULL as required.
     let result = unsafe {
         RegQueryValueExW(
             hkey,
@@ -5913,6 +6040,9 @@ fn cpu_model() -> String {
             &mut buf_len,
         )
     };
+    // SAFETY: `hkey` was successfully opened by RegOpenKeyExW above and has not
+    // been closed; closing it exactly once here releases the key. The return is
+    // not needed.
     unsafe { RegCloseKey(hkey) };
 
     if result != 0 || buf_len < 2 {
@@ -5934,6 +6064,9 @@ fn cpu_speed_mhz() -> u32 {
     const KEY_READ: u32 = 0x20019;
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
+    // SAFETY: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
+    // RegQueryValueExW, RegCloseKey); every pointer argument is validated at
+    // its call site below.
     unsafe extern "system" {
         fn RegOpenKeyExW(
             hKey: isize,
@@ -5961,6 +6094,10 @@ fn cpu_speed_mhz() -> u32 {
     let value_name = to_wide("~MHz");
     let mut hkey: isize = 0;
 
+    // SAFETY: `sub_key` is a live NUL-terminated UTF-16 vec valid for the read;
+    // `&mut hkey` is a live stack out-handle. HKEY_LOCAL_MACHINE and KEY_READ
+    // are the documented predefined-key / access constants. On non-zero (error)
+    // the handle is not used; on success `hkey` is closed below.
     if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub_key.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
         return 0;
     }
@@ -5969,6 +6106,11 @@ fn cpu_speed_mhz() -> u32 {
     let mut val_len = 4u32;
     let mut reg_type: u32 = 0;
 
+    // SAFETY: `hkey` is the open key from the checked RegOpenKeyExW above.
+    // `value_name` is a live NUL-terminated UTF-16 vec; the data out-pointer is
+    // a live `u32` (`val`) and `val_len` is set to 4 (its byte size), so the
+    // API writes at most 4 bytes into valid storage. `reg_type` is a live
+    // out-u32; the reserved arg is NULL as required.
     let result = unsafe {
         RegQueryValueExW(
             hkey,
@@ -5979,6 +6121,9 @@ fn cpu_speed_mhz() -> u32 {
             &mut val_len,
         )
     };
+    // SAFETY: `hkey` was successfully opened by RegOpenKeyExW above and has not
+    // been closed; closing it exactly once here releases the key. The return is
+    // not needed.
     unsafe { RegCloseKey(hkey) };
 
     if result != 0 { 0 } else { val }
@@ -6098,6 +6243,10 @@ fn parent_pid() -> u32 {
         InheritedFromUniqueProcessId: usize,
     }
 
+    // SAFETY: the signatures match the ntdll / kernel32 ABI
+    // (NtQueryInformationProcess + GetCurrentProcess); the `#[repr(C)]`
+    // PROCESS_BASIC_INFORMATION mirrors the documented layout so
+    // InheritedFromUniqueProcessId reads from the right offset.
     unsafe extern "system" {
         fn NtQueryInformationProcess(
             ProcessHandle: isize,
@@ -6118,6 +6267,12 @@ fn parent_pid() -> u32 {
         InheritedFromUniqueProcessId: 0,
     };
     let mut ret_len: u32 = 0;
+    // SAFETY: class 0 = ProcessBasicInformation, whose out-struct is
+    // PROCESS_BASIC_INFORMATION; `pbi` is a live stack instance of exactly that
+    // type and the length passed is its own size, so the API writes within
+    // bounds. `ret_len` is a live out-u32. GetCurrentProcess yields the
+    // pseudo-handle. NTSTATUS ignored -- pbi stays zero-initialized (parent pid
+    // 0) on failure.
     unsafe {
         NtQueryInformationProcess(
             GetCurrentProcess(),
@@ -6267,6 +6422,9 @@ fn cpu_usage_us() -> (u64, u64) {
         }
     }
 
+    // SAFETY: the signatures match the kernel32 ABI (GetCurrentProcess +
+    // GetProcessTimes with four FILETIME* out-params); the `#[repr(C)]`
+    // FILETIME mirrors the OS 64-bit tick layout.
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
         fn GetProcessTimes(
@@ -6282,6 +6440,10 @@ fn cpu_usage_us() -> (u64, u64) {
     let mut exit = FILETIME { lo: 0, hi: 0 };
     let mut kernel = FILETIME { lo: 0, hi: 0 };
     let mut user = FILETIME { lo: 0, hi: 0 };
+    // SAFETY: all four FILETIME out-arguments are live, distinct stack structs
+    // valid for their writes; GetCurrentProcess yields the pseudo-handle (no
+    // cleanup). The BOOL result is ignored -- the times stay zero on the rare
+    // failure.
     unsafe {
         GetProcessTimes(
             GetCurrentProcess(),
@@ -6307,6 +6469,12 @@ fn cpu_usage_us() -> (u64, u64) {
         ru_stime: timeval,
         _pad: [u8; 112],
     }
+    // SAFETY: the declaration matches getrusage(2)'s ABI (int who + rusage*
+    // out). The locally-defined `#[repr(C)]` `rusage` / `timeval` reproduce the
+    // leading ru_utime/ru_stime fields, and the 112-byte `_pad` must be large
+    // enough that the whole struct is >= the platform's `struct rusage` --
+    // getrusage writes the full struct, so an undersized layout here would be an
+    // OOB write. Verify the pad covers each Unix target's rusage size.
     unsafe extern "C" {
         fn getrusage(who: i32, usage: *mut rusage) -> i32;
     }
@@ -6321,6 +6489,9 @@ fn cpu_usage_us() -> (u64, u64) {
         },
         _pad: [0; 112],
     };
+    // SAFETY: `who = 0` is RUSAGE_SELF; `usage` is a live stack struct passed
+    // by `&mut`, valid for the out-write (see the layout note on the extern
+    // above). Result ignored -- fields stay zero on failure.
     unsafe { getrusage(0, &mut usage) };
     let user = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
     let system = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
@@ -6360,24 +6531,43 @@ fn op_process_kill(
 
 #[cfg(windows)]
 fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+    // SAFETY: the signatures match the kernel32 ABI (OpenProcess,
+    // TerminateProcess, CloseHandle); none take pointer arguments, so each
+    // call's only obligation is handle validity, discharged at the call sites
+    // below.
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
         fn CloseHandle(handle: isize) -> i32;
     }
     if signal == 0 {
+        // SAFETY: OpenProcess takes only by-value integers (access mask 0x1000
+        // = PROCESS_QUERY_LIMITED_INFORMATION, no inherit, target pid); no
+        // memory is touched. The returned handle is null-checked before use and
+        // closed below.
         let handle = unsafe { OpenProcess(0x1000, 0, pid) };
         if handle == 0 {
             return Err(format!("kill: no such process {pid}"));
         }
+        // SAFETY: `handle` was returned non-null by OpenProcess just above and
+        // has not been closed; closing it once here releases it.
         unsafe { CloseHandle(handle) };
         return Ok(());
     }
+    // SAFETY: OpenProcess takes only by-value integers (access 0x0001 =
+    // PROCESS_TERMINATE, no inherit, target pid); the returned handle is
+    // null-checked before use and closed below.
     let handle = unsafe { OpenProcess(0x0001, 0, pid) };
     if handle == 0 {
         return Err(format!("kill: no such process {pid}"));
     }
+    // SAFETY: `handle` is the non-null PROCESS_TERMINATE handle from OpenProcess
+    // above; TerminateProcess takes it plus a by-value exit code and touches no
+    // caller memory.
     let ok = unsafe { TerminateProcess(handle, 1) };
+    // SAFETY: `handle` was returned non-null by OpenProcess above and not yet
+    // closed; closing it once here releases it regardless of the
+    // TerminateProcess result.
     unsafe { CloseHandle(handle) };
     if ok == 0 {
         return Err(format!("kill: could not terminate process {pid}"));
@@ -6387,9 +6577,14 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
+    // SAFETY: the declaration matches kill(2)'s ABI (two by-value ints, int
+    // return). No memory is referenced.
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
+    // SAFETY: kill takes two by-value integers and touches no caller memory; it
+    // is unsafe only as an FFI call. Failure is surfaced via errno, read
+    // immediately below.
     let ret = unsafe { kill(pid as i32, signal) };
     if ret != 0 {
         let errno = std::io::Error::last_os_error();

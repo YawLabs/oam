@@ -146,29 +146,36 @@ impl Drop for NapiEnv {
 type Env = *mut NapiEnv;
 
 /// SAFETY HELPERS — every napi fn funnels through these.
+// SAFETY: the caller must pass the `env` pointer this engine handed the addon; it is dereferenced and its stashed PinScope recovered -- sound only while a native entry (trampoline / load_addon) is on the stack, which is the only time napi fns run.
 unsafe fn env_scope<'a>(env: Env) -> Option<&'a mut v8::PinScope<'static, 'static>> {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null, then the stashed `scope` field is cast back to `&mut PinScope` -- non-null only while a native entry is on the stack.
     unsafe {
         let env = env.as_mut()?;
         (env.scope as *mut v8::PinScope<'static, 'static>).as_mut()
     }
 }
 
+// SAFETY: the caller must pass a `napi_value` produced by this engine; it is reinterpreted as a `v8::Local` (ABI-identical, size-asserted). Null yields None.
 unsafe fn to_local<'s>(value: NapiValue) -> Option<v8::Local<'s, v8::Value>> {
     if value.is_null() {
         None
     } else {
+        // SAFETY: reinterprets the non-null `napi_value` pointer as a `v8::Local<Value>`; the two are ABI-identical (size-asserted at module top).
         Some(unsafe { std::mem::transmute::<NapiValue, v8::Local<'s, v8::Value>>(value) })
     }
 }
 
 fn from_local(local: v8::Local<'_, v8::Value>) -> NapiValue {
+    // SAFETY: ABI pun of a `v8::Local<Value>` to the pointer-sized `napi_value` (size-asserted equal at module top).
     unsafe { std::mem::transmute::<v8::Local<'_, v8::Value>, NapiValue>(local) }
 }
 
+// SAFETY: the caller must pass a valid writable `*mut T` (or null) for `ptr`; out() null-checks before writing `value`.
 unsafe fn out<T>(ptr: *mut T, value: T) -> NapiStatus {
     if ptr.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `ptr` was null-checked at the top of out(); writes `value` into the caller's out-parameter.
     unsafe { ptr.write(value) };
     NAPI_OK
 }
@@ -198,6 +205,7 @@ fn napi_trampoline(
     let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) else {
         return;
     };
+    // SAFETY: the External's payload is the `*mut FnData` stored when this function was built (napi_create_function); it stays live in NapiEnv::fn_data for the env's lifetime.
     let fn_data = unsafe { &*(external.value() as *const FnData) };
     let env = fn_data.env;
 
@@ -212,12 +220,14 @@ fn napi_trampoline(
     };
 
     // Re-entrant scope swap: nested napi_call_function arrives back here.
+    // SAFETY: `env` is the FnData's owning env; swaps in the current PinScope, invokes the addon callback `fn_data.cb` (a C-ABI fn pointer from the addon), and returns the previous scope pointer to restore re-entrantly.
     let (prev_scope, result) = unsafe {
         let prev = (*env).scope;
         (*env).scope = scope as *mut v8::PinScope<'_, '_> as *mut c_void;
         let result = (fn_data.cb)(env, &mut info as *mut CbInfo);
         (prev, result)
     };
+    // SAFETY: `env` is the FnData's owning env; restores the previous scope pointer and, if the callback left a deferred exception, re-throws it into V8.
     unsafe {
         (*env).scope = prev_scope;
         if let Some(pending) = (*env).pending.take() {
@@ -226,6 +236,7 @@ fn napi_trampoline(
             return;
         }
     }
+    // SAFETY: `result` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     if let Some(local) = unsafe { to_local(result) } {
         rv.set(local);
     }
@@ -234,64 +245,82 @@ fn napi_trampoline(
 // =========================================================== value creation
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_undefined` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_undefined(env: Env, result: *mut NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::undefined(scope).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_null` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_null(env: Env, result: *mut NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::null(scope).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_global` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_global(env: Env, result: *mut NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     let context = scope.get_current_context();
     let global = context.global(scope);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(global.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_boolean` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_boolean(
     env: Env,
     value: bool,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::Boolean::new(scope, value).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_int32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_int32(
     env: Env,
     value: i32,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::Integer::new(scope, value).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_uint32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_uint32(
     env: Env,
     value: u32,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe {
         out(
             result,
@@ -301,11 +330,13 @@ pub unsafe extern "C" fn napi_create_uint32(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_int64(
     env: Env,
     value: i64,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -314,6 +345,7 @@ pub unsafe extern "C" fn napi_create_int64(
     // integers are not, so Node's napi_create_int64 returns BigInt at the
     // boundary. Inclusive range against (2^53 - 1) matches.
     const MAX_SAFE: i64 = (1_i64 << 53) - 1;
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe {
         if (-MAX_SAFE..=MAX_SAFE).contains(&value) {
             out(
@@ -330,30 +362,36 @@ pub unsafe extern "C" fn napi_create_int64(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_double` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_double(
     env: Env,
     value: f64,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::Number::new(scope, value).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_string_utf8` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_utf8(
     env: Env,
     string: *const c_char,
     length: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     if string.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `string` is the caller's NUL-terminated C string, null-checked before this read.
     let bytes = unsafe {
         if length == usize::MAX {
             std::ffi::CStr::from_ptr(string).to_bytes()
@@ -365,34 +403,44 @@ pub unsafe extern "C" fn napi_create_string_utf8(
     let Some(created) = v8::String::new(scope, &text) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(created.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_object` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_object(env: Env, result: *mut NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::Object::new(scope).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_array` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_array(env: Env, result: *mut NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(v8::Array::new(scope, 0).into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_array_with_length` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_array_with_length(
     env: Env,
     length: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe {
         out(
             result,
@@ -405,10 +453,13 @@ pub unsafe extern "C" fn napi_create_array_with_length(
 
 /// napi_valuetype numeric values per js_native_api_types.h.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_typeof` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_typeof(env: Env, value: NapiValue, result: *mut i32) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -433,101 +484,123 @@ pub unsafe extern "C" fn napi_typeof(env: Env, value: NapiValue, result: *mut i3
     } else {
         6 // object
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, kind) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_bool` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bool(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     if !local.is_boolean() {
         return NAPI_BOOLEAN_EXPECTED;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_true()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_int32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_int32(
     env: Env,
     value: NapiValue,
     result: *mut i32,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     if !local.is_number() {
         return NAPI_NUMBER_EXPECTED;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.int32_value(scope).unwrap_or(0)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_uint32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_uint32(
     env: Env,
     value: NapiValue,
     result: *mut u32,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     if !local.is_number() {
         return NAPI_NUMBER_EXPECTED;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.uint32_value(scope).unwrap_or(0)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_int64(
     env: Env,
     value: NapiValue,
     result: *mut i64,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     if !local.is_number() {
         return NAPI_NUMBER_EXPECTED;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.number_value(scope).unwrap_or(0.0) as i64) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_double` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_double(
     env: Env,
     value: NapiValue,
     result: *mut f64,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     if !local.is_number() {
         return NAPI_NUMBER_EXPECTED;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.number_value(scope).unwrap_or(0.0)) }
 }
 
 /// Two-phase: null buf -> *result = utf8 byte length; else copy + NUL.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_string_utf8` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_utf8(
     env: Env,
     value: NapiValue,
@@ -535,9 +608,11 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
     bufsize: usize,
     result: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -546,12 +621,15 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
     };
     let text = string.to_rust_string_lossy(scope);
     if buf.is_null() {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, text.len()) };
     }
     if bufsize == 0 {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, 0) };
     }
     let copy_len = text.len().min(bufsize - 1);
+    // SAFETY: `buf` is the caller's out buffer with `bufsize` >= copy_len+1 (enforced above); copies `copy_len` UTF-8 bytes, writes the NUL terminator, and reports the length via the null-checked `result`.
     unsafe {
         std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, copy_len);
         *buf.add(copy_len) = 0;
@@ -563,67 +641,83 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_array` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_array(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_array()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_array_length` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_array_length(
     env: Env,
     value: NapiValue,
     result: *mut u32,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     let Ok(array) = v8::Local::<v8::Array>::try_from(local) else {
         return NAPI_ARRAY_EXPECTED;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, array.length()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_strict_equals` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_strict_equals(
     env: Env,
     lhs: NapiValue,
     rhs: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `lhs` and `rhs` are napi_value handles from this env; to_local reinterprets each as a repr-compatible `v8::Local` (size-asserted) and returns None for a null handle.
     let (Some(a), Some(b)) = (unsafe { (to_local(lhs), to_local(rhs)) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, a.strict_equals(b)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_coerce_to_string` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_string(
     env: Env,
     value: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     match local.to_string(scope) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(string) => unsafe { out(result, from_local(string.into())) },
         None => NAPI_PENDING_EXCEPTION,
     }
@@ -631,27 +725,34 @@ pub unsafe extern "C" fn napi_coerce_to_string(
 
 // ============================================================== properties
 
+// SAFETY: the caller must pass a `napi_value` from this env; it is read as a `v8::Local` and downcast to Object.
 unsafe fn as_object<'s>(value: NapiValue) -> Option<v8::Local<'s, v8::Object>> {
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let local = unsafe { to_local(value) }?;
     v8::Local::<v8::Object>::try_from(local).ok()
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_set_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_named_property(
     env: Env,
     object: NapiValue,
     name: *const c_char,
     value: NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let (Some(value), false) = (unsafe { to_local(value) }, name.is_null()) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let Some(key) = v8::String::new(scope, &name) else {
         return NAPI_GENERIC_FAILURE;
@@ -661,68 +762,82 @@ pub unsafe extern "C" fn napi_set_named_property(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_named_property(
     env: Env,
     object: NapiValue,
     name: *const c_char,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     if name.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let Some(key) = v8::String::new(scope, &name) else {
         return NAPI_GENERIC_FAILURE;
     };
     match target.get(scope, key.into()) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(value) => unsafe { out(result, from_local(value)) },
         None => NAPI_PENDING_EXCEPTION,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_has_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_named_property(
     env: Env,
     object: NapiValue,
     name: *const c_char,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     if name.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
     let Some(key) = v8::String::new(scope, &name) else {
         return NAPI_GENERIC_FAILURE;
     };
     let has = target.has(scope, key.into()).unwrap_or(false);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, has) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_set_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_property(
     env: Env,
     object: NapiValue,
     key: NapiValue,
     value: NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `key` and `value` are napi_value handles from this env; to_local reinterprets each as a repr-compatible `v8::Local` (size-asserted) and returns None for a null handle.
     let (Some(key), Some(value)) = (unsafe { (to_local(key), to_local(value)) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -731,40 +846,49 @@ pub unsafe extern "C" fn napi_set_property(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_property(
     env: Env,
     object: NapiValue,
     key: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(key) = (unsafe { to_local(key) }) else {
         return NAPI_INVALID_ARG;
     };
     match target.get(scope, key) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(value) => unsafe { out(result, from_local(value)) },
         None => NAPI_PENDING_EXCEPTION,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_set_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_element(
     env: Env,
     object: NapiValue,
     index: u32,
     value: NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(value) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -773,19 +897,23 @@ pub unsafe extern "C" fn napi_set_element(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_element(
     env: Env,
     object: NapiValue,
     index: u32,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     match target.get_index(scope, index) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(value) => unsafe { out(result, from_local(value)) },
         None => NAPI_PENDING_EXCEPTION,
     }
@@ -794,6 +922,7 @@ pub unsafe extern "C" fn napi_get_element(
 // =============================================================== functions
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_function(
     env: Env,
     name: *const c_char,
@@ -802,6 +931,7 @@ pub unsafe extern "C" fn napi_create_function(
     data: *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -819,15 +949,18 @@ pub unsafe extern "C" fn napi_create_function(
         return NAPI_GENERIC_FAILURE;
     };
     if !name.is_null() {
+        // SAFETY: `name` is the caller's NUL-terminated C string, null-checked before this read.
         let label = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
         if let Some(label) = v8::String::new(scope, &label) {
             function.set_name(label);
         }
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(function.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_cb_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_cb_info(
     env: Env,
     cbinfo: *mut CbInfo,
@@ -836,12 +969,15 @@ pub unsafe extern "C" fn napi_get_cb_info(
     this_arg: *mut NapiValue,
     data: *mut *mut c_void,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `cbinfo` is the CbInfo pointer the trampoline placed on its stack and passed to this callback; as_ref yields None if the addon passed null.
     let Some(info) = (unsafe { cbinfo.as_ref() }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: writes back through the caller's out-parameters -- each of `argc`, `argv`, `this_arg`, `data` is null-checked before use, and `argv` is filled for at most the `*argc` slots the caller declared.
     unsafe {
         if !argc.is_null() {
             let wanted = *argc;
@@ -868,6 +1004,7 @@ pub unsafe extern "C" fn napi_get_cb_info(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_call_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_call_function(
     env: Env,
     recv: NapiValue,
@@ -876,9 +1013,11 @@ pub unsafe extern "C" fn napi_call_function(
     argv: *const NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `recv` and `func` are napi_value handles from this env; to_local reinterprets each as a repr-compatible `v8::Local` (size-asserted) and returns None for a null handle.
     let (Some(recv), Some(func_value)) = (unsafe { (to_local(recv), to_local(func)) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -886,6 +1025,7 @@ pub unsafe extern "C" fn napi_call_function(
         return NAPI_FUNCTION_EXPECTED;
     };
     let args: Vec<v8::Local<v8::Value>> = (0..argc)
+        // SAFETY: `argv[i]` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         .filter_map(|i| unsafe { to_local(*argv.add(i)) })
         .collect();
     match function.call(scope, recv, &args) {
@@ -893,6 +1033,7 @@ pub unsafe extern "C" fn napi_call_function(
             if result.is_null() {
                 NAPI_OK
             } else {
+                // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
                 unsafe { out(result, from_local(value)) }
             }
         }
@@ -902,6 +1043,7 @@ pub unsafe extern "C" fn napi_call_function(
 
 // ================================================================== errors
 
+// SAFETY: `code` and `msg` are optional caller C strings, each read only after a null check; `scope` is a live PinScope.
 unsafe fn build_error(
     scope: &mut v8::PinScope<'_, '_>,
     code: *const c_char,
@@ -911,6 +1053,7 @@ unsafe fn build_error(
     let message = if msg.is_null() {
         "unknown native error".into()
     } else {
+        // SAFETY: `msg` is the caller's NUL-terminated C string, null-checked before this read.
         unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy()
     };
     let message = v8::String::new(scope, &message)?;
@@ -918,6 +1061,7 @@ unsafe fn build_error(
     if !code.is_null()
         && let Ok(object) = v8::Local::<v8::Object>::try_from(error)
     {
+        // SAFETY: `code` is the caller's NUL-terminated C string, null-checked before this read.
         let code_text = unsafe { std::ffi::CStr::from_ptr(code) }.to_string_lossy();
         let key = v8::String::new(scope, "code")?;
         if let Some(value) = v8::String::new(scope, &code_text) {
@@ -932,6 +1076,7 @@ fn plain_error<'s>(
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::error(scope, message);
+    // SAFETY: relifetimes the freshly built error `v8::Local` to 'static; build_error immediately re-roots it into a `v8::Global` before the scope ends, so the handle stays valid.
     unsafe { std::mem::transmute::<v8::Local<v8::Value>, v8::Local<'static, v8::Value>>(error) }
 }
 
@@ -940,33 +1085,42 @@ fn type_error<'s>(
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::type_error(scope, message);
+    // SAFETY: relifetimes the freshly built error `v8::Local` to 'static; build_error immediately re-roots it into a `v8::Global` before the scope ends, so the handle stays valid.
     unsafe { std::mem::transmute::<v8::Local<v8::Value>, v8::Local<'static, v8::Value>>(error) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_throw` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw(env: Env, error: NapiValue) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `error` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(error) }) else {
         return NAPI_INVALID_ARG;
     };
     let global = v8::Global::new(scope, local);
+    // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
     unsafe { (*env).pending = Some(global) };
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_throw_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_error(
     env: Env,
     code: *const c_char,
     msg: *const c_char,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `code` and `msg` are the caller's optional C strings; build_error reads each only after a null check.
     match unsafe { build_error(scope, code, msg, plain_error) } {
         Some(error) => {
+            // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
             unsafe { (*env).pending = Some(error) };
             NAPI_OK
         }
@@ -975,16 +1129,20 @@ pub unsafe extern "C" fn napi_throw_error(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_throw_type_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_type_error(
     env: Env,
     code: *const c_char,
     msg: *const c_char,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `code` and `msg` are the caller's optional C strings; build_error reads each only after a null check.
     match unsafe { build_error(scope, code, msg, type_error) } {
         Some(error) => {
+            // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
             unsafe { (*env).pending = Some(error) };
             NAPI_OK
         }
@@ -993,34 +1151,43 @@ pub unsafe extern "C" fn napi_throw_type_error(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_exception_pending` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_exception_pending(env: Env, result: *mut bool) -> NapiStatus {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; as_ref/as_mut yields None if the caller passed null.
     let Some(env_ref) = (unsafe { env.as_ref() }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, env_ref.pending.is_some()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_and_clear_last_exception` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_and_clear_last_exception(
     env: Env,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
     let pending = unsafe { (*env).pending.take() };
     let value = match pending {
         Some(global) => from_local(v8::Local::new(scope, &global)),
         None => from_local(v8::undefined(scope).into()),
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, value) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_version` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_version(env: Env, result: *mut u32) -> NapiStatus {
     if env.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, 8) } // N-API version 8 (the stable baseline)
 }
 
@@ -1029,6 +1196,7 @@ pub unsafe extern "C" fn napi_get_version(env: Env, result: *mut u32) -> NapiSta
 /// `v8::External` wrapping a raw pointer.  The optional finalizer is
 /// accepted but ignored for now (no GC finalizer hook yet).
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_external` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external(
     env: Env,
     data: *mut c_void,
@@ -1036,22 +1204,27 @@ pub unsafe extern "C" fn napi_create_external(
     _finalize_hint: *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     let ext = v8::External::new(scope, data);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(ext.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_external` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_external(
     env: Env,
     value: NapiValue,
     result: *mut *mut c_void,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1061,6 +1234,7 @@ pub unsafe extern "C" fn napi_get_value_external(
     if result.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
     unsafe { *result = ext.value() };
     NAPI_OK
 }
@@ -1073,33 +1247,40 @@ pub unsafe extern "C" fn napi_get_value_external(
 type NapiRefHandle = *mut c_void;
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_reference` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_reference(
     env: Env,
     value: NapiValue,
     initial_refcount: u32,
     result: *mut NapiRefHandle,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     let global = v8::Global::new(scope, local);
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &mut *env };
     env_ref.refs.push(Box::new(NapiRefEntry {
         value: global,
         refcount: initial_refcount,
     }));
     let ptr = &mut **env_ref.refs.last_mut().unwrap() as *mut NapiRefEntry as *mut c_void;
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, ptr) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_delete_reference` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) -> NapiStatus {
     if env.is_null() || ref_.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &mut *env };
     let target = ref_ as *const NapiRefEntry;
     env_ref.refs.retain(|r| !std::ptr::eq(r.as_ref(), target));
@@ -1107,23 +1288,28 @@ pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) ->
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_reference_value` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_reference_value(
     env: Env,
     ref_: NapiRefHandle,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     if ref_.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
     let entry = unsafe { &*(ref_ as *const NapiRefEntry) };
     let local = v8::Local::new(scope, &entry.value);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(local)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_reference_ref` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reference_ref(
     env: Env,
     ref_: NapiRefHandle,
@@ -1132,15 +1318,18 @@ pub unsafe extern "C" fn napi_reference_ref(
     if env.is_null() || ref_.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
     let entry = unsafe { &mut *(ref_ as *mut NapiRefEntry) };
     entry.refcount = entry.refcount.saturating_add(1);
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = entry.refcount };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_reference_unref` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reference_unref(
     env: Env,
     ref_: NapiRefHandle,
@@ -1149,9 +1338,11 @@ pub unsafe extern "C" fn napi_reference_unref(
     if env.is_null() || ref_.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
     let entry = unsafe { &mut *(ref_ as *mut NapiRefEntry) };
     entry.refcount = entry.refcount.saturating_sub(1);
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = entry.refcount };
     }
     NAPI_OK
@@ -1202,6 +1393,7 @@ fn napi_attrs_to_v8(attrs: u32) -> v8::PropertyAttribute {
 ///   limitation: V8 accessor setup requires a separate AccessorCallback path
 ///   not yet wired to the napi trampoline).
 #[unsafe(no_mangle)]
+// SAFETY: `napi_define_class` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_define_class(
     env: Env,
     utf8name: *const c_char,
@@ -1212,17 +1404,20 @@ pub unsafe extern "C" fn napi_define_class(
     properties: *const NapiPropertyDescriptor,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     // Create the constructor function via the shared trampoline.
     let mut ctor_out: NapiValue = std::ptr::null_mut();
+    // SAFETY: forwards to napi_create_function with this env and the caller-supplied constructor/method fn pointer and data -- the same C-ABI contract as the entry points.
     let status = unsafe {
         napi_create_function(env, utf8name, usize::MAX, constructor, data, &mut ctor_out)
     };
     if status != NAPI_OK {
         return status;
     }
+    // SAFETY: `ctor_out` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(ctor_local) = (unsafe { to_local(ctor_out) }) else {
         return NAPI_GENERIC_FAILURE;
     };
@@ -1238,6 +1433,7 @@ pub unsafe extern "C" fn napi_define_class(
         .unwrap_or_else(|| v8::Object::new(scope));
 
     let props = if property_count > 0 && !properties.is_null() {
+        // SAFETY: `properties` points to at least `property_count` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
         unsafe { std::slice::from_raw_parts(properties, property_count) }
     } else {
         &[]
@@ -1246,11 +1442,13 @@ pub unsafe extern "C" fn napi_define_class(
     for prop in props {
         // Resolve property name.
         let key: v8::Local<v8::Value> = if !prop.utf8name.is_null() {
+            // SAFETY: `prop.utf8name` is the caller's NUL-terminated C string, null-checked before this read.
             let name = unsafe { std::ffi::CStr::from_ptr(prop.utf8name) }.to_string_lossy();
             match v8::String::new(scope, &name) {
                 Some(s) => s.into(),
                 None => continue,
             }
+        // SAFETY: `prop.name` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         } else if let Some(name_val) = unsafe { to_local(prop.name) } {
             name_val
         } else {
@@ -1274,6 +1472,7 @@ pub unsafe extern "C" fn napi_define_class(
         if let Some(method_cb) = prop.method {
             // Method descriptor: create a function via the trampoline.
             let mut fn_out: NapiValue = std::ptr::null_mut();
+            // SAFETY: forwards to napi_create_function with this env and the caller-supplied constructor/method fn pointer and data -- the same C-ABI contract as the entry points.
             let status = unsafe {
                 napi_create_function(
                     env,
@@ -1287,10 +1486,12 @@ pub unsafe extern "C" fn napi_define_class(
             if status != NAPI_OK {
                 continue;
             }
+            // SAFETY: `fn_out` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
             if let Some(fn_val) = unsafe { to_local(fn_out) } {
                 let attr = napi_attrs_to_v8(prop.attributes);
                 target.define_own_property(scope, name_key, fn_val, attr);
             }
+        // SAFETY: `prop.value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         } else if let Some(prop_val) = unsafe { to_local(prop.value) } {
             // Value descriptor.
             let attr = napi_attrs_to_v8(prop.attributes);
@@ -1299,6 +1500,7 @@ pub unsafe extern "C" fn napi_define_class(
         // getter/setter: deferred -- require AccessorCallback wiring
     }
 
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(ctor_fn.into())) }
 }
 
@@ -1307,6 +1509,7 @@ pub unsafe extern "C" fn napi_define_class(
 /// Any previous wrap on the same object is replaced. The optional finalizer
 /// is stored but not yet called automatically (pending GC hook support).
 #[unsafe(no_mangle)]
+// SAFETY: `napi_wrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_wrap(
     env: Env,
     js_object: NapiValue,
@@ -1315,13 +1518,16 @@ pub unsafe extern "C" fn napi_wrap(
     finalize_hint: *mut c_void,
     result: *mut NapiRefHandle,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `js_object` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(js_object) }) else {
         return NAPI_INVALID_ARG;
     };
     let global = v8::Global::new(scope, local);
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &mut *env };
 
     // Replace any existing wrap for this object.
@@ -1332,6 +1538,7 @@ pub unsafe extern "C" fn napi_wrap(
             existing.finalize = finalize_cb;
             existing.hint = finalize_hint;
             if !result.is_null() {
+                // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
                 unsafe { *result = std::ptr::null_mut() };
             }
             return NAPI_OK;
@@ -1346,6 +1553,7 @@ pub unsafe extern "C" fn napi_wrap(
     }));
 
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = std::ptr::null_mut() };
     }
     NAPI_OK
@@ -1353,22 +1561,27 @@ pub unsafe extern "C" fn napi_wrap(
 
 /// Retrieve the native pointer stored by `napi_wrap`.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_unwrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_unwrap(
     env: Env,
     js_object: NapiValue,
     result: *mut *mut c_void,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `js_object` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(js_object) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &*env };
     for wrap in &env_ref.wraps {
         let wrap_local = v8::Local::new(scope, &wrap.object);
         if local.strict_equals(wrap_local) {
             if !result.is_null() {
+                // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
                 unsafe { *result = wrap.native };
             }
             return NAPI_OK;
@@ -1379,17 +1592,21 @@ pub unsafe extern "C" fn napi_unwrap(
 
 /// Remove the wrap stored by `napi_wrap` and retrieve the native pointer.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_remove_wrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_remove_wrap(
     env: Env,
     js_object: NapiValue,
     result: *mut *mut c_void,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `js_object` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(js_object) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &mut *env };
     let mut found = None;
     env_ref.wraps.retain(|w| {
@@ -1404,6 +1621,7 @@ pub unsafe extern "C" fn napi_remove_wrap(
     match found {
         Some(ptr) => {
             if !result.is_null() {
+                // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
                 unsafe { *result = ptr };
             }
             NAPI_OK
@@ -1414,6 +1632,7 @@ pub unsafe extern "C" fn napi_remove_wrap(
 
 /// Call a constructor function with `new` to produce a new instance.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_new_instance` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_new_instance(
     env: Env,
     constructor: NapiValue,
@@ -1421,9 +1640,11 @@ pub unsafe extern "C" fn napi_new_instance(
     argv: *const NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `constructor` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(ctor_local) = (unsafe { to_local(constructor) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1431,9 +1652,11 @@ pub unsafe extern "C" fn napi_new_instance(
         return NAPI_FUNCTION_EXPECTED;
     };
     let args: Vec<v8::Local<v8::Value>> = (0..argc)
+        // SAFETY: `argv[i]` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         .filter_map(|i| unsafe { to_local(*argv.add(i)) })
         .collect();
     match ctor_fn.new_instance(scope, &args) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(obj) => unsafe { out(result, from_local(obj.into())) },
         None => NAPI_PENDING_EXCEPTION,
     }
@@ -1441,18 +1664,22 @@ pub unsafe extern "C" fn napi_new_instance(
 
 /// Check `value instanceof constructor`.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_instanceof` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_instanceof(
     env: Env,
     object: NapiValue,
     constructor: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(obj_local) = (unsafe { to_local(object) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `constructor` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(ctor_local) = (unsafe { to_local(constructor) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1460,6 +1687,7 @@ pub unsafe extern "C" fn napi_instanceof(
         return NAPI_FUNCTION_EXPECTED;
     };
     match obj_local.instance_of(scope, ctor_obj) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(is) => unsafe { out(result, is) },
         None => NAPI_PENDING_EXCEPTION,
     }
@@ -1468,14 +1696,17 @@ pub unsafe extern "C" fn napi_instanceof(
 // =================================================================== bigint
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_bigint_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_bigint_int64(
     env: Env,
     value: i64,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe {
         out(
             result,
@@ -1485,14 +1716,17 @@ pub unsafe extern "C" fn napi_create_bigint_int64(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_bigint_uint64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_bigint_uint64(
     env: Env,
     value: u64,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe {
         out(
             result,
@@ -1504,15 +1738,18 @@ pub unsafe extern "C" fn napi_create_bigint_uint64(
 /// Returns `(value, lossless)` where `lossless` is false if the BigInt
 /// is too large to represent exactly as i64.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_bigint_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bigint_int64(
     env: Env,
     value: NapiValue,
     result: *mut i64,
     lossless: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1521,24 +1758,29 @@ pub unsafe extern "C" fn napi_get_value_bigint_int64(
     };
     let (val, ok) = bigint.i64_value();
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = val };
     }
     if !lossless.is_null() {
+        // SAFETY: `lossless` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *lossless = ok };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_bigint_uint64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bigint_uint64(
     env: Env,
     value: NapiValue,
     result: *mut u64,
     lossless: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1547,9 +1789,11 @@ pub unsafe extern "C" fn napi_get_value_bigint_uint64(
     };
     let (val, ok) = bigint.u64_value();
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = val };
     }
     if !lossless.is_null() {
+        // SAFETY: `lossless` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *lossless = ok };
     }
     NAPI_OK
@@ -1563,12 +1807,14 @@ pub unsafe extern "C" fn napi_get_value_bigint_uint64(
 /// The returned pointer is valid as long as the V8 heap owns the backing store
 /// (i.e. while the ArrayBuffer returned in `result` is alive).
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_buffer(
     env: Env,
     size: usize,
     data: *mut *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1579,16 +1825,19 @@ pub unsafe extern "C" fn napi_create_buffer(
             .data()
             .map(|p| p.as_ptr())
             .unwrap_or(std::ptr::null_mut());
+        // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *data = ptr };
     }
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(view.into())) }
 }
 
 /// Create a Buffer, copy `size` bytes from `data` into it.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_buffer_copy` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_buffer_copy(
     env: Env,
     size: usize,
@@ -1596,22 +1845,27 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
     result_data: *mut *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     let ab = v8::ArrayBuffer::new(scope, size);
     let store = ab.get_backing_store();
     if let Some(dst) = store.data() {
+        // SAFETY: `data` points to at least `size` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
         let src_bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
+        // SAFETY: `dst.as_ptr` points to at least `size` caller-owned writable elements; from_raw_parts_mut forms the out-slice written below.
         let dst_bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_ptr() as *mut u8, size) };
         dst_bytes.copy_from_slice(src_bytes);
         if !result_data.is_null() {
+            // SAFETY: `result_data` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *result_data = dst.as_ptr() };
         }
     }
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(view.into())) }
 }
 
@@ -1622,6 +1876,7 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
 /// hook support is added. Callers that MUST run cleanup on collection should
 /// use napi_create_buffer_copy instead (which copies into V8-managed memory).
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_external_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external_buffer(
     env: Env,
     size: usize,
@@ -1630,15 +1885,18 @@ pub unsafe extern "C" fn napi_create_external_buffer(
     _finalize_hint: *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `data` points to at least `size` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
     let store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.to_vec().into_boxed_slice());
     let ab = v8::ArrayBuffer::with_backing_store(scope, &store.make_shared());
     let Some(view) = v8::Uint8Array::new(scope, ab, 0, size) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(view.into())) }
 }
 
@@ -1647,32 +1905,39 @@ pub unsafe extern "C" fn napi_create_external_buffer(
 /// byte-array view as a buffer — addons that pass Uint8Array/Buffer both
 /// work correctly, which is the relevant use case.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_buffer(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_uint8_array()) }
 }
 
 /// Get a pointer to the underlying bytes of a TypedArray or ArrayBuffer.
 /// For a TypedArray, accounts for byte_offset so `*data` points to element 0.
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_buffer_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_buffer_info(
     env: Env,
     value: NapiValue,
     data: *mut *mut c_void,
     length: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1690,9 +1955,11 @@ pub unsafe extern "C" fn napi_get_buffer_info(
                 .data()
                 .map(|p| p.as_ptr() as *mut u8)
                 .unwrap_or(std::ptr::null_mut());
+            // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *data = base.add(byte_off) as *mut c_void };
         }
         if !length.is_null() {
+            // SAFETY: `length` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *length = byte_len };
         }
         NAPI_OK
@@ -1703,9 +1970,11 @@ pub unsafe extern "C" fn napi_get_buffer_info(
                 .data()
                 .map(|p| p.as_ptr())
                 .unwrap_or(std::ptr::null_mut());
+            // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *data = ptr };
         }
         if !length.is_null() {
+            // SAFETY: `length` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *length = ab.byte_length() };
         }
         NAPI_OK
@@ -1753,6 +2022,7 @@ pub static mut uv_event_loop: *mut c_void = std::ptr::null_mut();
 // ------------------------------------------------------------------ errors
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_last_error_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_last_error_info(
     _env: Env,
     result: *mut *const NapiExtendedErrorInfo,
@@ -1765,21 +2035,25 @@ pub unsafe extern "C" fn napi_get_last_error_info(
         error_code: 0,
     };
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = &EMPTY as *const NapiExtendedErrorInfo };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_error(
     env: Env,
     _code: NapiValue,
     msg: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `msg` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(msg_local) = (unsafe { to_local(msg) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1787,19 +2061,23 @@ pub unsafe extern "C" fn napi_create_error(
         return NAPI_STRING_EXPECTED;
     };
     let error = v8::Exception::error(scope, msg_str);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(error)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_type_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_type_error(
     env: Env,
     _code: NapiValue,
     msg: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `msg` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(msg_local) = (unsafe { to_local(msg) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1807,19 +2085,23 @@ pub unsafe extern "C" fn napi_create_type_error(
         return NAPI_STRING_EXPECTED;
     };
     let error = v8::Exception::type_error(scope, msg_str);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(error)) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_range_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_range_error(
     env: Env,
     _code: NapiValue,
     msg: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `msg` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(msg_local) = (unsafe { to_local(msg) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1827,6 +2109,7 @@ pub unsafe extern "C" fn napi_create_range_error(
         return NAPI_STRING_EXPECTED;
     };
     let error = v8::Exception::range_error(scope, msg_str);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(error)) }
 }
 
@@ -1835,20 +2118,25 @@ fn range_error<'s>(
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::range_error(scope, message);
+    // SAFETY: relifetimes the freshly built error `v8::Local` to 'static; build_error immediately re-roots it into a `v8::Global` before the scope ends, so the handle stays valid.
     unsafe { std::mem::transmute::<v8::Local<v8::Value>, v8::Local<'static, v8::Value>>(error) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_throw_range_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_range_error(
     env: Env,
     code: *const c_char,
     msg: *const c_char,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `code` and `msg` are the caller's optional C strings; build_error reads each only after a null check.
     match unsafe { build_error(scope, code, msg, range_error) } {
         Some(error) => {
+            // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
             unsafe { (*env).pending = Some(error) };
             NAPI_OK
         }
@@ -1857,14 +2145,17 @@ pub unsafe extern "C" fn napi_throw_range_error(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_error(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1886,10 +2177,12 @@ pub unsafe extern "C" fn napi_is_error(
     } else {
         false
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, is_err) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_fatal_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_fatal_error(
     location: *const c_char,
     _loc_len: usize,
@@ -1899,6 +2192,7 @@ pub unsafe extern "C" fn napi_fatal_error(
     let loc = if location.is_null() {
         "<unknown>".to_string()
     } else {
+        // SAFETY: `location` is the caller's NUL-terminated C string, null-checked before this read.
         unsafe { std::ffi::CStr::from_ptr(location) }
             .to_string_lossy()
             .into_owned()
@@ -1906,6 +2200,7 @@ pub unsafe extern "C" fn napi_fatal_error(
     let msg = if message.is_null() {
         "<no message>".to_string()
     } else {
+        // SAFETY: `message` is the caller's NUL-terminated C string, null-checked before this read.
         unsafe { std::ffi::CStr::from_ptr(message) }
             .to_string_lossy()
             .into_owned()
@@ -1915,6 +2210,7 @@ pub unsafe extern "C" fn napi_fatal_error(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_fatal_exception` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_fatal_exception(env: Env, _err: NapiValue) -> NapiStatus {
     let _ = env;
     NAPI_GENERIC_FAILURE
@@ -1923,18 +2219,21 @@ pub unsafe extern "C" fn napi_fatal_exception(env: Env, _err: NapiValue) -> Napi
 // ------------------------------------------------------------------ strings
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_string_latin1` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_latin1(
     env: Env,
     str_ptr: *const c_char,
     length: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     if str_ptr.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `str_ptr` is the caller's NUL-terminated C string, null-checked before this read.
     let bytes: &[u8] = unsafe {
         if length == usize::MAX {
             std::ffi::CStr::from_ptr(str_ptr).to_bytes()
@@ -1945,22 +2244,26 @@ pub unsafe extern "C" fn napi_create_string_latin1(
     let Some(s) = v8::String::new_from_one_byte(scope, bytes, v8::NewStringType::Normal) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(s.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_string_utf16` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_utf16(
     env: Env,
     str_ptr: *const u16,
     length: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     if str_ptr.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `str_ptr` points to at least `len` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
     let units: &[u16] = unsafe {
         if length == usize::MAX {
             // NUL-terminated UTF-16: find the terminator
@@ -1976,10 +2279,12 @@ pub unsafe extern "C" fn napi_create_string_utf16(
     let Some(s) = v8::String::new_from_two_byte(scope, units, v8::NewStringType::Normal) else {
         return NAPI_GENERIC_FAILURE;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(s.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_string_latin1` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_latin1(
     env: Env,
     value: NapiValue,
@@ -1987,9 +2292,11 @@ pub unsafe extern "C" fn napi_get_value_string_latin1(
     bufsize: usize,
     result: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -1999,23 +2306,29 @@ pub unsafe extern "C" fn napi_get_value_string_latin1(
     // Latin-1 length = number of UTF-16 code units (chars) for BMP strings
     let char_len = string.length();
     if buf.is_null() {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, char_len) };
     }
     if bufsize == 0 {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, 0) };
     }
     // Write latin-1 bytes via write_one_byte_v2.
     let copy_len = char_len.min(bufsize - 1);
+    // SAFETY: `buf` points to at least `copy_len` caller-owned writable elements; from_raw_parts_mut forms the out-slice written below.
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, copy_len) };
     string.write_one_byte_v2(scope, 0, buf_slice, v8::WriteFlags::empty());
+    // SAFETY: writes the trailing NUL into the caller's `buf` at the copy length (within the `bufsize` bound checked above).
     unsafe { *(buf.add(copy_len)) = 0 };
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = copy_len };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_value_string_utf16` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_utf16(
     env: Env,
     value: NapiValue,
@@ -2023,9 +2336,11 @@ pub unsafe extern "C" fn napi_get_value_string_utf16(
     bufsize: usize,
     result: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2034,16 +2349,21 @@ pub unsafe extern "C" fn napi_get_value_string_utf16(
     };
     let char_len = string.length();
     if buf.is_null() {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, char_len) };
     }
     if bufsize == 0 {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         return unsafe { out(result, 0) };
     }
     let copy_len = char_len.min(bufsize - 1);
+    // SAFETY: `buf` points to at least `copy_len` caller-owned writable elements; from_raw_parts_mut forms the out-slice written below.
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, copy_len) };
     string.write_v2(scope, 0, buf_slice, v8::WriteFlags::empty());
+    // SAFETY: writes the trailing NUL into the caller's `buf` at the copy length (within the `bufsize` bound checked above).
     unsafe { *(buf.add(copy_len)) = 0u16 };
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = copy_len };
     }
     NAPI_OK
@@ -2052,52 +2372,62 @@ pub unsafe extern "C" fn napi_get_value_string_utf16(
 // ------------------------------------------------------------------ symbols
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_symbol` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_symbol(
     env: Env,
     description: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     let desc = if description.is_null() {
         None
     } else {
+        // SAFETY: `description` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         unsafe { to_local(description) }.and_then(|v| v8::Local::<v8::String>::try_from(v).ok())
     };
     let sym = v8::Symbol::new(scope, desc);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(sym.into())) }
 }
 
 // ------------------------------------------------------------------ handle scopes (stubs)
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_open_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_handle_scope(_env: Env, result: *mut *mut c_void) -> NapiStatus {
     // We don't implement real handle scopes -- the V8 PinScope on the stack
     // serves the same purpose. Return a sentinel so callers don't null-deref.
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_close_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_handle_scope(_env: Env, _scope: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_open_escapable_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_escapable_handle_scope(
     _env: Env,
     result: *mut *mut c_void,
 ) -> NapiStatus {
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_close_escapable_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_escapable_handle_scope(
     _env: Env,
     _scope: *mut c_void,
@@ -2106,6 +2436,7 @@ pub unsafe extern "C" fn napi_close_escapable_handle_scope(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_escape_handle` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_escape_handle(
     _env: Env,
     _scope: *mut c_void,
@@ -2116,6 +2447,7 @@ pub unsafe extern "C" fn napi_escape_handle(
     if result.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
     unsafe { *result = escapee };
     NAPI_OK
 }
@@ -2123,6 +2455,7 @@ pub unsafe extern "C" fn napi_escape_handle(
 // ------------------------------------------------------------------ callback scope stubs
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_open_callback_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_callback_scope(
     _env: Env,
     _resource_object: NapiValue,
@@ -2130,12 +2463,14 @@ pub unsafe extern "C" fn napi_open_callback_scope(
     result: *mut *mut c_void,
 ) -> NapiStatus {
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = std::ptr::dangling_mut::<c_void>() };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_close_callback_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_callback_scope(_env: Env, _scope: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
@@ -2143,61 +2478,75 @@ pub unsafe extern "C" fn napi_close_callback_scope(_env: Env, _scope: *mut c_voi
 // ------------------------------------------------------------------ properties
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_has_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_property(
     env: Env,
     object: NapiValue,
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(key_local) = (unsafe { to_local(key) }) else {
         return NAPI_INVALID_ARG;
     };
     let has = target.has(scope, key_local).unwrap_or(false);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, has) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_delete_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_property(
     env: Env,
     object: NapiValue,
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(key_local) = (unsafe { to_local(key) }) else {
         return NAPI_INVALID_ARG;
     };
     let deleted = target.delete(scope, key_local).unwrap_or(false);
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = deleted };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_has_own_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_own_property(
     env: Env,
     object: NapiValue,
     key: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
+    // SAFETY: `key` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(key_local) = (unsafe { to_local(key) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2205,70 +2554,85 @@ pub unsafe extern "C" fn napi_has_own_property(
         return NAPI_INVALID_ARG;
     };
     let has = target.has_own_property(scope, key_name).unwrap_or(false);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, has) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_has_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_element(
     env: Env,
     object: NapiValue,
     index: u32,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     let has = target.has_index(scope, index).unwrap_or(false);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, has) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_delete_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_element(
     env: Env,
     object: NapiValue,
     index: u32,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     let deleted = target.delete_index(scope, index).unwrap_or(false);
     if !result.is_null() {
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = deleted };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_define_properties` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_define_properties(
     env: Env,
     object: NapiValue,
     count: usize,
     props: *const NapiPropertyDescriptor,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     if count == 0 || props.is_null() {
         return NAPI_OK;
     }
+    // SAFETY: `props` points to at least `count` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
     let descriptors = unsafe { std::slice::from_raw_parts(props, count) };
     for prop in descriptors {
         let key: v8::Local<v8::Value> = if !prop.utf8name.is_null() {
+            // SAFETY: `prop.utf8name` is the caller's NUL-terminated C string, null-checked before this read.
             let name = unsafe { std::ffi::CStr::from_ptr(prop.utf8name) }.to_string_lossy();
             match v8::String::new(scope, &name) {
                 Some(s) => s.into(),
                 None => continue,
             }
+        // SAFETY: `prop.name` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         } else if let Some(name_val) = unsafe { to_local(prop.name) } {
             name_val
         } else {
@@ -2280,6 +2644,7 @@ pub unsafe extern "C" fn napi_define_properties(
         };
         if let Some(method_cb) = prop.method {
             let mut fn_out: NapiValue = std::ptr::null_mut();
+            // SAFETY: forwards to napi_create_function with this env and the caller-supplied constructor/method fn pointer and data -- the same C-ABI contract as the entry points.
             let st = unsafe {
                 napi_create_function(
                     env,
@@ -2293,10 +2658,12 @@ pub unsafe extern "C" fn napi_define_properties(
             if st != NAPI_OK {
                 continue;
             }
+            // SAFETY: `fn_out` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
             if let Some(fn_val) = unsafe { to_local(fn_out) } {
                 let attr = napi_attrs_to_v8(prop.attributes);
                 target.define_own_property(scope, name_key, fn_val, attr);
             }
+        // SAFETY: `prop.value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
         } else if let Some(prop_val) = unsafe { to_local(prop.value) } {
             let attr = napi_attrs_to_v8(prop.attributes);
             target.define_own_property(scope, name_key, prop_val, attr);
@@ -2306,38 +2673,47 @@ pub unsafe extern "C" fn napi_define_properties(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_property_names` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_property_names(
     env: Env,
     object: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     match target.get_property_names(scope, v8::GetPropertyNamesArgs::default()) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(names) => unsafe { out(result, from_local(names.into())) },
         None => NAPI_PENDING_EXCEPTION,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_prototype` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_prototype(
     env: Env,
     object: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `object` is a napi_value handle from this env; as_object reads it as a `v8::Local` and downcasts to Object (None when null or not an object).
     let Some(target) = (unsafe { as_object(object) }) else {
         return NAPI_OBJECT_EXPECTED;
     };
     let proto = target.get_prototype(scope);
     match proto {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(p) => unsafe { out(result, from_local(p)) },
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         None => unsafe { out(result, from_local(v8::null(scope).into())) },
     }
 }
@@ -2345,6 +2721,7 @@ pub unsafe extern "C" fn napi_get_prototype(
 // ------------------------------------------------------------------ callbacks
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_new_target` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_new_target(
     _env: Env,
     cbinfo: *mut CbInfo,
@@ -2356,6 +2733,7 @@ pub unsafe extern "C" fn napi_get_new_target(
         return NAPI_INVALID_ARG;
     }
     // Signal "not called as constructor" by writing null.
+    // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
     unsafe { *result = std::ptr::null_mut() };
     NAPI_OK
 }
@@ -2363,52 +2741,64 @@ pub unsafe extern "C" fn napi_get_new_target(
 // ------------------------------------------------------------------ coercions
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_coerce_to_bool` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_bool(
     env: Env,
     value: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     let b = local.to_boolean(scope);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(b.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_coerce_to_number` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_number(
     env: Env,
     value: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     match local.to_number(scope) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(n) => unsafe { out(result, from_local(n.into())) },
         None => NAPI_PENDING_EXCEPTION,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_coerce_to_object` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_object(
     env: Env,
     value: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     match local.to_object(scope) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(obj) => unsafe { out(result, from_local(obj.into())) },
         None => NAPI_PENDING_EXCEPTION,
     }
@@ -2417,27 +2807,33 @@ pub unsafe extern "C" fn napi_coerce_to_object(
 // ------------------------------------------------------------------ arraybuffers
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_arraybuffer(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_array_buffer()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_arraybuffer(
     env: Env,
     size: usize,
     data: *mut *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2448,12 +2844,15 @@ pub unsafe extern "C" fn napi_create_arraybuffer(
             .data()
             .map(|p| p.as_ptr())
             .unwrap_or(std::ptr::null_mut());
+        // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *data = ptr };
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(ab.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_external_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external_arraybuffer(
     env: Env,
     external_data: *mut c_void,
@@ -2462,25 +2861,31 @@ pub unsafe extern "C" fn napi_create_external_arraybuffer(
     _finalize_hint: *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `external_data` points to at least `byte_length` caller-owned elements; from_raw_parts reads them for the length the C caller declared.
     let bytes = unsafe { std::slice::from_raw_parts(external_data as *const u8, byte_length) };
     let store = v8::ArrayBuffer::new_backing_store_from_bytes(bytes.to_vec().into_boxed_slice());
     let ab = v8::ArrayBuffer::with_backing_store(scope, &store.make_shared());
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(ab.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_arraybuffer_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_arraybuffer_info(
     env: Env,
     ab_value: NapiValue,
     data: *mut *mut c_void,
     length: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `ab_value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(ab_value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2489,6 +2894,7 @@ pub unsafe extern "C" fn napi_get_arraybuffer_info(
     };
     let store = ab.get_backing_store();
     if !data.is_null() {
+        // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe {
             *data = store
                 .data()
@@ -2497,6 +2903,7 @@ pub unsafe extern "C" fn napi_get_arraybuffer_info(
         };
     }
     if !length.is_null() {
+        // SAFETY: `length` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *length = ab.byte_length() };
     }
     NAPI_OK
@@ -2505,21 +2912,26 @@ pub unsafe extern "C" fn napi_get_arraybuffer_info(
 // ------------------------------------------------------------------ typedarrays
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_typedarray` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_typedarray(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_typed_array()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_typedarray` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_typedarray(
     env: Env,
     type_: u32,
@@ -2528,9 +2940,11 @@ pub unsafe extern "C" fn napi_create_typedarray(
     offset: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `ab_value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(ab_value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2552,12 +2966,14 @@ pub unsafe extern "C" fn napi_create_typedarray(
         _ => return NAPI_INVALID_ARG,
     };
     match view {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(v) => unsafe { out(result, from_local(v)) },
         None => NAPI_GENERIC_FAILURE,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_typedarray_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_typedarray_info(
     env: Env,
     ta_value: NapiValue,
@@ -2567,9 +2983,11 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
     ab_out: *mut NapiValue,
     offset_out: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `ta_value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(ta_value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2630,16 +3048,20 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
     let byte_len = view.byte_length();
     let elem_count = byte_len.checked_div(element_size).unwrap_or(0);
     if !type_out.is_null() {
+        // SAFETY: `type_out` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *type_out = type_id };
     }
     if !count_out.is_null() {
+        // SAFETY: `count_out` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *count_out = elem_count };
     }
     if !offset_out.is_null() {
+        // SAFETY: `offset_out` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *offset_out = byte_off };
     }
     if let Some(ab) = view.buffer(scope) {
         if !ab_out.is_null() {
+            // SAFETY: `ab_out` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *ab_out = from_local(ab.into()) };
         }
         if !data_out.is_null() {
@@ -2648,6 +3070,7 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
                 .data()
                 .map(|p| p.as_ptr() as *mut u8)
                 .unwrap_or(std::ptr::null_mut());
+            // SAFETY: `data_out` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *data_out = base.add(byte_off) as *mut c_void };
         }
     }
@@ -2657,6 +3080,7 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
 // ------------------------------------------------------------------ dataview
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_dataview` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_dataview(
     env: Env,
     size: usize,
@@ -2664,9 +3088,11 @@ pub unsafe extern "C" fn napi_create_dataview(
     offset: usize,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `ab_value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(ab_value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2674,25 +3100,31 @@ pub unsafe extern "C" fn napi_create_dataview(
         return NAPI_INVALID_ARG;
     };
     let dv = v8::DataView::new(scope, ab, offset, size);
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(dv.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_dataview` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_dataview(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_data_view()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_dataview_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_dataview_info(
     env: Env,
     dv_value: NapiValue,
@@ -2701,9 +3133,11 @@ pub unsafe extern "C" fn napi_get_dataview_info(
     ab_out: *mut NapiValue,
     offset: *mut usize,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `dv_value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(dv_value) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2713,13 +3147,16 @@ pub unsafe extern "C" fn napi_get_dataview_info(
     let byte_off = view.byte_offset();
     let byte_len = view.byte_length();
     if !byte_length.is_null() {
+        // SAFETY: `byte_length` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *byte_length = byte_len };
     }
     if !offset.is_null() {
+        // SAFETY: `offset` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *offset = byte_off };
     }
     if let Some(ab) = view.buffer(scope) {
         if !ab_out.is_null() {
+            // SAFETY: `ab_out` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *ab_out = from_local(ab.into()) };
         }
         if !data.is_null() {
@@ -2728,6 +3165,7 @@ pub unsafe extern "C" fn napi_get_dataview_info(
                 .data()
                 .map(|p| p.as_ptr() as *mut u8)
                 .unwrap_or(std::ptr::null_mut());
+            // SAFETY: `data` is a caller-provided out-parameter pointer, null-checked before this write.
             unsafe { *data = base.add(byte_off) as *mut c_void };
         }
     }
@@ -2742,11 +3180,13 @@ struct DeferredEntry {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_promise` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_promise(
     env: Env,
     deferred: *mut *mut c_void,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2760,17 +3200,21 @@ pub unsafe extern "C" fn napi_create_promise(
     });
     let ptr = Box::into_raw(entry) as *mut c_void;
     if !deferred.is_null() {
+        // SAFETY: `deferred` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *deferred = ptr };
     }
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(promise.into())) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_resolve_deferred` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_resolve_deferred(
     env: Env,
     deferred: *mut c_void,
     resolution: NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2782,9 +3226,11 @@ pub unsafe extern "C" fn napi_resolve_deferred(
     // invalid-arg return would drop (free) the DeferredEntry while the caller
     // still owns the handle, turning a contract-conforming retry into a
     // use-after-free / double-free.
+    // SAFETY: `resolution` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(value) = (unsafe { to_local(resolution) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `deferred` is the opaque handle this API handed out via Box::into_raw in napi_create_promise; the C caller passes back the same pointer, so reclaiming the Box is a valid round-trip (non-null and the value validated first).
     let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
     let resolver = v8::Local::new(scope, &entry.resolver);
     resolver.resolve(scope, value);
@@ -2792,11 +3238,13 @@ pub unsafe extern "C" fn napi_resolve_deferred(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_reject_deferred` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reject_deferred(
     env: Env,
     deferred: *mut c_void,
     rejection: NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2806,9 +3254,11 @@ pub unsafe extern "C" fn napi_reject_deferred(
     // Validate the rejection BEFORE taking ownership of the deferred (see
     // napi_resolve_deferred): freeing the DeferredEntry on this invalid-arg
     // path would dangle the caller's handle and make a retry a use-after-free.
+    // SAFETY: `rejection` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(value) = (unsafe { to_local(rejection) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `deferred` is the opaque handle this API handed out via Box::into_raw in napi_create_promise; the C caller passes back the same pointer, so reclaiming the Box is a valid round-trip (non-null and the value validated first).
     let entry = unsafe { Box::from_raw(deferred as *mut DeferredEntry) };
     let resolver = v8::Local::new(scope, &entry.resolver);
     resolver.reject(scope, value);
@@ -2816,31 +3266,38 @@ pub unsafe extern "C" fn napi_reject_deferred(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_promise` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_promise(
     env: Env,
     value: NapiValue,
     result: *mut bool,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_promise()) }
 }
 
 // ------------------------------------------------------------------ script
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_run_script` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_run_script(
     env: Env,
     script: NapiValue,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `script` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(script) }) else {
         return NAPI_INVALID_ARG;
     };
@@ -2856,6 +3313,7 @@ pub unsafe extern "C" fn napi_run_script(
             if result.is_null() {
                 NAPI_OK
             } else {
+                // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
                 unsafe { out(result, from_local(val)) }
             }
         }
@@ -2866,12 +3324,14 @@ pub unsafe extern "C" fn napi_run_script(
 // ------------------------------------------------------------------ memory
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_adjust_external_memory` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_adjust_external_memory(
     _env: Env,
     _change: i64,
     adjusted: *mut i64,
 ) -> NapiStatus {
     if !adjusted.is_null() {
+        // SAFETY: `adjusted` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *adjusted = 0 };
     }
     NAPI_OK
@@ -2880,65 +3340,80 @@ pub unsafe extern "C" fn napi_adjust_external_memory(
 // ------------------------------------------------------------------ dates
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_date` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_date(
     env: Env,
     time: f64,
     result: *mut NapiValue,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
     match v8::Date::new(scope, time) {
+        // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
         Some(date) => unsafe { out(result, from_local(date.into())) },
         None => NAPI_GENERIC_FAILURE,
     }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_is_date` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_date(env: Env, value: NapiValue, result: *mut bool) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, local.is_date()) }
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_date_value` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_date_value(
     env: Env,
     value: NapiValue,
     result: *mut f64,
 ) -> NapiStatus {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
     let Ok(date) = v8::Local::<v8::Date>::try_from(local) else {
         return NAPI_INVALID_ARG;
     };
+    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, date.number_value(scope).unwrap_or(f64::NAN)) }
 }
 
 // ------------------------------------------------------------------ version / event loop
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_node_version` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_node_version(
     _env: Env,
     version: *mut *const NapiNodeVersion,
 ) -> NapiStatus {
     if !version.is_null() {
+        // SAFETY: `version` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *version = &NODE_VERSION as *const NapiNodeVersion };
     }
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_uv_event_loop` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_uv_event_loop(_env: Env, loop_: *mut *mut c_void) -> NapiStatus {
     if !loop_.is_null() {
+        // SAFETY: `loop_` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *loop_ = std::ptr::null_mut() };
     }
     NAPI_GENERIC_FAILURE
@@ -2947,6 +3422,7 @@ pub unsafe extern "C" fn napi_get_uv_event_loop(_env: Env, loop_: *mut *mut c_vo
 // ------------------------------------------------------------------ module registration
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_module_register` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_module_register(_mod: *mut c_void) -> NapiStatus {
     // Old-style napi_module registration -- not used by napi-sys 2.x.
     NAPI_OK
@@ -2955,6 +3431,7 @@ pub unsafe extern "C" fn napi_module_register(_mod: *mut c_void) -> NapiStatus {
 // ------------------------------------------------------------------ cleanup hooks
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_add_env_cleanup_hook` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_add_env_cleanup_hook(
     _env: Env,
     _fun: *mut c_void,
@@ -2964,6 +3441,7 @@ pub unsafe extern "C" fn napi_add_env_cleanup_hook(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_remove_env_cleanup_hook` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_remove_env_cleanup_hook(
     _env: Env,
     _fun: *mut c_void,
@@ -2973,6 +3451,7 @@ pub unsafe extern "C" fn napi_remove_env_cleanup_hook(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_add_finalizer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_add_finalizer(
     _env: Env,
     _js_object: NapiValue,
@@ -2987,6 +3466,7 @@ pub unsafe extern "C" fn napi_add_finalizer(
 // ------------------------------------------------------------------ async (stubs -- not supported)
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_async_init` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_async_init(
     _env: Env,
     _resource: NapiValue,
@@ -2997,11 +3477,13 @@ pub unsafe extern "C" fn napi_async_init(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_async_destroy` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_async_destroy(_env: Env, _context: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_make_callback` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_make_callback(
     _env: Env,
     _context: *mut c_void,
@@ -3015,6 +3497,7 @@ pub unsafe extern "C" fn napi_make_callback(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_async_work(
     _env: Env,
     _resource: NapiValue,
@@ -3028,16 +3511,19 @@ pub unsafe extern "C" fn napi_create_async_work(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_delete_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_queue_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_queue_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_cancel_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_cancel_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
@@ -3056,6 +3542,7 @@ struct TsfnStub {
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_create_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_threadsafe_function(
     _env: Env,
     _func: NapiValue,
@@ -3073,11 +3560,13 @@ pub unsafe extern "C" fn napi_create_threadsafe_function(
         return NAPI_INVALID_ARG;
     }
     let stub = Box::new(TsfnStub { context });
+    // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
     unsafe { *result = Box::into_raw(stub) as *mut c_void };
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_get_threadsafe_function_context` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_threadsafe_function_context(
     func: *mut c_void,
     result: *mut *mut c_void,
@@ -3085,12 +3574,15 @@ pub unsafe extern "C" fn napi_get_threadsafe_function_context(
     if func.is_null() || result.is_null() {
         return NAPI_INVALID_ARG;
     }
+    // SAFETY: `func` is the opaque threadsafe-function handle returned by napi_create_threadsafe_function (a Box::into_raw'd TsfnStub); checked non-null above.
     let stub = unsafe { &*(func as *const TsfnStub) };
+    // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
     unsafe { *result = stub.context };
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_call_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_call_threadsafe_function(
     _func: *mut c_void,
     _data: *mut c_void,
@@ -3101,11 +3593,13 @@ pub unsafe extern "C" fn napi_call_threadsafe_function(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_acquire_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_acquire_threadsafe_function(_func: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_release_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_release_threadsafe_function(
     _func: *mut c_void,
     _mode: u32,
@@ -3116,6 +3610,7 @@ pub unsafe extern "C" fn napi_release_threadsafe_function(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_unref_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_unref_threadsafe_function(
     _env: Env,
     _func: *mut c_void,
@@ -3124,6 +3619,7 @@ pub unsafe extern "C" fn napi_unref_threadsafe_function(
 }
 
 #[unsafe(no_mangle)]
+// SAFETY: `napi_ref_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_ref_threadsafe_function(_env: Env, _func: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
@@ -3146,6 +3642,7 @@ pub(crate) fn load_addon<'s>(
     if trace {
         eprintln!("[napi] dlopen start {}", path.display());
     }
+    // SAFETY: loads the addon shared object at `path`; running an arbitrary `.node`'s initializers is inherently unsafe FFI, bounded by the AddonRegistry that keeps the library mapped for the runtime's life.
     let library = match unsafe { libloading::Library::new(path) } {
         Ok(library) => library,
         Err(e) => {
@@ -3157,6 +3654,7 @@ pub(crate) fn load_addon<'s>(
         eprintln!("[napi] dlopen ok; looking up napi_register_module_v1");
     }
     let register: libloading::Symbol<RegisterFn> =
+        // SAFETY: resolves `napi_register_module_v1` in the just-loaded `library`; the returned Symbol borrows `library`, which stays live until the fn pointer is copied out on the next lines.
         match unsafe { library.get(b"napi_register_module_v1") } {
             Ok(symbol) => symbol,
             Err(e) => {
@@ -3200,26 +3698,31 @@ pub(crate) fn load_addon<'s>(
     let exports = v8::Object::new(scope);
     let exports_value: v8::Local<v8::Value> = exports.into();
 
+    // SAFETY: `env` is this addon's freshly allocated NapiEnv; stashes the live PinScope pointer so nested napi calls during register() can recover it.
     unsafe {
         (*env).scope = scope as *mut v8::PinScope<'_, '_> as *mut c_void;
     }
     if trace {
         eprintln!("[napi] symbol found; calling register()");
     }
+    // SAFETY: calls the addon's `napi_register_module_v1` (a C-ABI fn pointer from the loaded `.node`) with this env and the exports object; the addon then runs arbitrary native code -- the inherent FFI trust boundary.
     let result = unsafe { register(env, from_local(exports_value)) };
     if trace {
         eprintln!("[napi] register() returned");
     }
+    // SAFETY: `env` is this addon's NapiEnv; clears the stashed scope pointer now that register() has returned and the borrow is ending.
     unsafe {
         (*env).scope = std::ptr::null_mut();
     }
 
+    // SAFETY: `env` is a valid `*mut NapiEnv` (established above); reads/writes its `pending` deferred-exception slot.
     if let Some(pending) = unsafe { (*env).pending.take() } {
         let exception = v8::Local::new(scope, &pending);
         scope.throw_exception(exception);
         return None;
     }
 
+    // SAFETY: `result` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     match unsafe { to_local(result) } {
         Some(returned) => Some(returned),
         None => Some(exports_value),
