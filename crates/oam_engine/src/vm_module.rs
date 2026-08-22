@@ -252,6 +252,9 @@ fn resolve_vm_module<'s>(
     _import_attributes: v8::Local<'s, v8::FixedArray>,
     referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
+    // SAFETY: V8 calls this synchronously during instantiate_module with the
+    // live `context` being instantiated, so opening a callback scope on that
+    // context is valid for the duration of the call.
     v8::callback_scope!(unsafe scope, context);
     let specifier = specifier.to_rust_string_lossy(scope);
 

@@ -11,15 +11,15 @@
       "unsafe_count": 0
     },
     "oam_engine": {
-      "documented_count": 10,
+      "documented_count": 575,
       "files": {
-        "crash.rs": 0,
+        "crash.rs": 5,
         "inspector.rs": 2,
-        "lib.rs": 3,
-        "modules.rs": 1,
-        "napi.rs": 3,
-        "node_ops.rs": 1,
-        "vm_module.rs": 0
+        "lib.rs": 5,
+        "modules.rs": 6,
+        "napi.rs": 506,
+        "node_ops.rs": 50,
+        "vm_module.rs": 1
       },
       "unsafe_count": 573
     },
