@@ -2403,6 +2403,14 @@ fn op_zlib_handle_write_sync(
     let input = arg_bytes(scope, &args, 2).unwrap_or_default();
     let out_off = args.get(4).int32_value(scope).unwrap_or(0) as usize;
     let out_len = args.get(5).int32_value(scope).unwrap_or(0) as usize;
+    // `out_len` is an unvalidated int32 (a negative value casts to ~usize::MAX);
+    // `vec![0u8; out_len]` would abort this non-unwindable callback. zlib can
+    // never produce more than the output buffer holds, so clamp to its capacity.
+    let out_len = out_len.min(
+        v8::Local::<v8::ArrayBufferView>::try_from(args.get(3))
+            .map(|v| v.byte_length())
+            .unwrap_or(0),
+    );
 
     let streams = core_runtime!(scope).zlib_streams();
 
@@ -2420,8 +2428,14 @@ fn op_zlib_handle_write_sync(
                 {
                     let store = buf.get_backing_store();
                     if let Some(data) = store.data() {
-                        let byte_offset = view.byte_offset() + out_off;
-                        if byte_offset + produced <= store.byte_length() {
+                        // `out_off` is an unvalidated JS int32 (a negative value
+                        // casts to ~usize::MAX); fold the bounds adds through
+                        // checked_add so a wrap can't slip an OOB write past the
+                        // length check.
+                        if let Some(byte_offset) = view.byte_offset().checked_add(out_off)
+                            && let Some(end) = byte_offset.checked_add(produced)
+                            && end <= store.byte_length()
+                        {
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(output.as_ptr(), dest, produced);
@@ -4136,6 +4150,15 @@ fn op_fs_read_sync(
     // counter starts above the inheritable window -- so it is the parent's to
     // adopt. This is what lets oam BE the child of an extra-fd spawn.
     oam_core::adopt_inherited_fd(&files, fd);
+    // `length` is an unvalidated JS number; its saturating f64->usize cast can
+    // reach usize::MAX, and `vec![0u8; length]` would abort this non-unwindable
+    // callback (capacity-overflow panic). A read can never usefully exceed the
+    // destination buffer, so clamp the allocation to its capacity.
+    let length = length.min(
+        v8::Local::<v8::ArrayBufferView>::try_from(args.get(1))
+            .map(|v| v.byte_length())
+            .unwrap_or(0),
+    );
     let mut tmp = vec![0u8; length];
     let read_result = {
         let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
@@ -4155,8 +4178,14 @@ fn op_fs_read_sync(
                 {
                     let store = buffer.get_backing_store();
                     if let Some(data) = store.data() {
-                        let byte_offset = view.byte_offset() + offset;
-                        if byte_offset + n <= store.byte_length() {
+                        // `offset` is an unvalidated JS number whose saturating
+                        // f64->usize cast can reach usize::MAX; fold the bounds
+                        // adds through checked_add so a wrap can't slip an OOB
+                        // write past the length check.
+                        if let Some(byte_offset) = view.byte_offset().checked_add(offset)
+                            && let Some(end) = byte_offset.checked_add(n)
+                            && end <= store.byte_length()
+                        {
                             unsafe {
                                 let dest = (data.as_ptr() as *mut u8).add(byte_offset);
                                 std::ptr::copy_nonoverlapping(tmp.as_ptr(), dest, n);
