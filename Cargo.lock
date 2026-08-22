@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "oam_cli"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "base64",
  "clap",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "oam_core"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "base64",
  "brotli",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "oam_diagnostics"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "oam_engine"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "ada-url",
  "aes",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "oam_loader"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "base64",
  "flate2",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "oam_mcp"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "oam_diagnostics",
  "oam_ts",
@@ -1988,14 +1988,14 @@ dependencies = [
 
 [[package]]
 name = "oam_napi_test_addon"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "libloading",
 ]
 
 [[package]]
 name = "oam_ts"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "oam_diagnostics",
  "serde",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
