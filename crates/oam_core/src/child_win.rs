@@ -35,9 +35,11 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::OpOutcome;
@@ -316,23 +318,73 @@ pub fn spawn_extra(
             blob.extend_from_slice(&(*h as usize).to_ne_bytes());
         }
 
-        let mut si: STARTUPINFOW = std::mem::zeroed();
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = child_handles
+        // Explicit inheritance via PROC_THREAD_ATTRIBUTE_HANDLE_LIST. Without a
+        // list, CreateProcessW(bInheritHandles=TRUE) hands the child EVERY
+        // inheritable handle in the process at that instant -- so a concurrent
+        // spawn (another spawn_extra, or a tokio/std child) leaks our pipe ends
+        // into an unrelated child (which then never sees EOF -> hang), and our
+        // child conversely inherits handles it should not. Naming exactly our
+        // handles limits the child to them and makes concurrent spawn_extra
+        // calls race-free: each child sees only its own list. (A residual
+        // window remains against a concurrent NON-list spawner like tokio/std,
+        // inherent to the Win32 API -- std has the same limitation.)
+        //
+        // Handles in the list must be unique and valid; child_handles can
+        // repeat (two `inherit` fds share one std handle) and can hold INVALID
+        // sentinels, so dedup/filter first.
+        let mut inherit_list: Vec<HANDLE> = Vec::with_capacity(child_handles.len());
+        for h in &child_handles {
+            if !h.is_null() && *h != INVALID_HANDLE_VALUE && !inherit_list.contains(h) {
+                inherit_list.push(*h);
+            }
+        }
+
+        // Two-call sizing dance, then one HANDLE_LIST entry. The attribute list
+        // stores a POINTER to `inherit_list` (it is not copied), so both
+        // `inherit_list` and `attr_buf` must outlive the CreateProcessW below.
+        let mut attr_size: usize = 0;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+        let mut attr_buf: Vec<u8> = vec![0u8; attr_size];
+        let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
+            let err = GetLastError();
+            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            return Err(format!("InitializeProcThreadAttributeList failed: {err}"));
+        }
+        if UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherit_list.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(inherit_list.as_slice()),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            let err = GetLastError();
+            DeleteProcThreadAttributeList(attr_list);
+            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            return Err(format!("UpdateProcThreadAttribute failed: {err}"));
+        }
+
+        let mut si: STARTUPINFOEXW = std::mem::zeroed();
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = child_handles
             .first()
             .copied()
             .unwrap_or(INVALID_HANDLE_VALUE);
-        si.hStdOutput = child_handles
+        si.StartupInfo.hStdOutput = child_handles
             .get(1)
             .copied()
             .unwrap_or(INVALID_HANDLE_VALUE);
-        si.hStdError = child_handles
+        si.StartupInfo.hStdError = child_handles
             .get(2)
             .copied()
             .unwrap_or(INVALID_HANDLE_VALUE);
-        si.cbReserved2 = blob.len() as u16;
-        si.lpReserved2 = blob.as_mut_ptr();
+        si.StartupInfo.cbReserved2 = blob.len() as u16;
+        si.StartupInfo.lpReserved2 = blob.as_mut_ptr();
+        si.lpAttributeList = attr_list;
 
         // Command line.
         let mut cmdline = String::new();
@@ -372,13 +424,16 @@ pub fn spawn_extra(
             cmd_w.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            1, // bInheritHandles
-            creation_flags,
+            1, // bInheritHandles (scoped by the handle list in si.lpAttributeList)
+            creation_flags | EXTENDED_STARTUPINFO_PRESENT,
             env_ptr,
             cwd_ptr,
-            &si,
+            &si.StartupInfo,
             &mut pi,
         );
+        // The attribute list has done its job for this CreateProcessW; free it
+        // on both the success and failure paths before anything else.
+        DeleteProcThreadAttributeList(attr_list);
         if ok == 0 {
             let err = GetLastError();
             cleanup_fail(&child_close, &nul_handles, &parent_fds);
@@ -659,5 +714,103 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
         }
         Ok(Err(e)) => OpOutcome::Failed(e),
         Err(e) => OpOutcome::Failed(format!("wait join: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RawChildRegistry, StdioFd, raw_kill, spawn_extra};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+        SetHandleInformation,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+
+    /// Regression for the spawn handle-inheritance race: a child must inherit
+    /// ONLY the handles named in its stdio list, never an unrelated inheritable
+    /// handle that merely happens to be open in the parent at spawn time.
+    ///
+    /// Before the PROC_THREAD_ATTRIBUTE_HANDLE_LIST fix,
+    /// CreateProcessW(bInheritHandles=TRUE) handed the child EVERY inheritable
+    /// handle in the process -- so the canary write end below would stay open in
+    /// the child, and the parent (having closed its own copy) would never see
+    /// the pipe break. With the fix, the child never receives it, so the parent
+    /// becomes the sole owner and the read end reports ERROR_BROKEN_PIPE at once.
+    #[test]
+    fn spawn_extra_does_not_leak_unrelated_inheritable_handles() {
+        unsafe {
+            // Canary pipe: the read end stays the parent's (non-inheritable);
+            // the write end is INHERITABLE but is deliberately NOT in any child
+            // stdio list, so a correct spawn must not hand it to the child.
+            let mut sa: SECURITY_ATTRIBUTES = std::mem::zeroed();
+            sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+            sa.bInheritHandle = 1;
+            let mut canary_read: HANDLE = std::ptr::null_mut();
+            let mut canary_write: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                CreatePipe(&mut canary_read, &mut canary_write, &sa, 0),
+                0,
+                "CreatePipe(canary) failed: {}",
+                GetLastError()
+            );
+            SetHandleInformation(canary_read, HANDLE_FLAG_INHERIT, 0);
+
+            // A child that stays alive by blocking on stdin (the parent never
+            // closes the write end), so if it DID inherit the canary it keeps it
+            // open for the whole poll below. Only fds 0/1/2 are listed.
+            let child = spawn_extra(
+                "cmd",
+                &["/c".to_string(), "more > nul".to_string()],
+                None,
+                None,
+                false,
+                &[StdioFd::ChildRead, StdioFd::Ignore, StdioFd::Ignore],
+            )
+            .expect("spawn_extra");
+
+            // Drop the parent's own canary write end. The only write end that can
+            // remain now is a leaked child copy; a correct spawn leaves none.
+            CloseHandle(canary_write);
+
+            let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
+            reg.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(1u64, child);
+
+            // A correct spawn breaks the pipe (no write ends) within ms; a leak
+            // keeps it open for the child's life (blocked on stdin -> forever),
+            // so the deadline fails the test cleanly instead of hanging.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut broke = false;
+            while Instant::now() < deadline {
+                let mut avail: u32 = 0;
+                let ok = PeekNamedPipe(
+                    canary_read,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut avail,
+                    std::ptr::null_mut(),
+                );
+                if ok == 0 && GetLastError() == ERROR_BROKEN_PIPE {
+                    broke = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            raw_kill(&reg, 1, None);
+            CloseHandle(canary_read);
+
+            assert!(
+                broke,
+                "child inherited the unrelated canary handle -- inheritance is \
+                 not being scoped to the handle list"
+            );
+        }
     }
 }
