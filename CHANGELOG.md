@@ -16,7 +16,22 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`oam.exe` no longer needs the VC++ redistributable.** The Windows builds link
+  the static CRT, so a fresh machine can run a downloaded binary without first
+  installing Microsoft's runtime. (#66)
+- The release pipeline reclaims builder disk before a build, and two IAP tunnel
+  warnings that fired on every remote build are fixed. `scripts/` is now covered
+  by its own gate. (#67)
+
+### Changed
+
+- `--allow-worker` is documented as no longer implying `--allow-child-process` —
+  it stopped implying it in 0.9.1, when child isolates began inheriting the
+  parent's grants. (#65)
+- The `unsafe` coverage gate is enforced through clippy, and the
+  `documented_count` floor it replaced is retired. (#63)
 
 ## [0.11.0] - 2026-08-22
 
