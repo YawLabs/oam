@@ -585,11 +585,38 @@
     return name + ' contains unescaped characters';
   });
   // ---- RangeError family ----
+  // node's addNumericalSeparator (lib/internal/errors.js): group a big
+  // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
+  // Works on the STRING form and is sign-aware -- the leading "-" is never
+  // part of a group, so -4294967297 gives -4_294_967_297.
+  function addNumericalSeparator(val) {
+    let res = "";
+    let i = val.length;
+    const start = val[0] === "-" ? 1 : 0;
+    for (; i >= start + 4; i -= 3) {
+      res = "_" + val.slice(i - 3, i) + res;
+    }
+    return val.slice(0, i) + res;
+  }
   codes.ERR_OUT_OF_RANGE = E("ERR_OUT_OF_RANGE", RangeError, function(name, range, received) {
     // -0 has to be spelled out: String(-0) is "0", so a caller that passed
     // negative zero would read a message naming a value it did not pass.
     // Node distinguishes them here too.
-    const shown = Object.is(received, -0) ? "-0" : received;
+    //
+    // Past 2**32 node groups the digits, under exactly this condition
+    // (`NumberIsInteger(input) && MathAbs(input) > 2 ** 32` -- isInteger
+    // already rejects non-numbers, and -0 fails the magnitude test so the
+    // branch above keeps it). Without it a large errno reports a bare run of
+    // digits where node reports a grouped one, which is what the validateErrno
+    // path surfaces.
+    let shown;
+    if (Object.is(received, -0)) {
+      shown = "-0";
+    } else if (Number.isInteger(received) && Math.abs(received) > 2 ** 32) {
+      shown = addNumericalSeparator(String(received));
+    } else {
+      shown = received;
+    }
     return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + shown;
   });
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
@@ -4119,9 +4146,9 @@
     ESRCH: "no such process", ETIMEDOUT: "connection timed out",
     ETXTBSY: "text file is busy", EXDEV: "cross-device link not permitted",
     UNKNOWN: "unknown error",
-    // Windows-only in oam: libuv defines these, but oam's POSIX table has no
-    // verified number for them, so they appear on win32 and are omitted
-    // elsewhere rather than guessed.
+    // libuv codes node publishes no errno constant for. On unix they still get
+    // the host's real number, from the `uvOnly` group of the POSIX table; on
+    // win32 they take the fixed fallback below like every other code does.
     EFTYPE: "inappropriate file type or format", EHOSTDOWN: "host is down",
     ENONET: "machine is not on the network", EREMOTEIO: "remote I/O error",
     ESHUTDOWN: "cannot send after transport endpoint shutdown",
@@ -4182,7 +4209,17 @@
   }
 
   // The host's POSIX errno numbers, from oam_engine (libc, resolved per-target
-  // by the compiler). Parsed once.
+  // by the compiler). Parsed once, and deliberately in TWO groups:
+  //
+  //   .errno   exactly the key set node publishes as os.constants.errno on
+  //            this platform (79 names on POSIX) -- a differential-tested,
+  //            observable set, so it must not gain a name.
+  //   .uvOnly  the extra names ONLY the libuv table below needs a real host
+  //            number for (EHOSTDOWN, ESHUTDOWN, ...). node has no constant
+  //            for these, so publishing the union would put keys on
+  //            os.constants.errno that node does not have -- while dropping
+  //            them would push those codes onto libuv's fallback numbers and
+  //            decode them to the wrong name.
   let posixErrnoCache;
   function posixErrno(natives) {
     if (posixErrnoCache === undefined) posixErrnoCache = JSON.parse(natives.posixErrno);
@@ -4210,7 +4247,8 @@
     const posix = natives.platform === "win32" ? null : posixErrno(natives);
     const out = new Map();
     for (const code of Object.keys(UV_ERROR_MESSAGES)) {
-      const hosted = posix === null ? undefined : posix[code];
+      // Both groups: the uv table is the one consumer that wants the union.
+      const hosted = posix === null ? undefined : (posix.errno[code] ?? posix.uvOnly[code]);
       const number = hosted === undefined ? UV_FALLBACK_ERRNO[code] : -hosted;
       if (number === undefined) continue;
       out.set(number, [code, UV_ERROR_MESSAGES[code]]);
@@ -4293,11 +4331,14 @@
           SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
           SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
         },
-        // The host's POSIX errno, positive (node's shape). A COPY, so code
-        // that mutates os.constants.errno cannot reach the libuv table built
-        // from the same parse -- and each member non-writable and
-        // non-configurable, which is node's descriptor for these.
-        errno: constantBag(posixErrno(natives)),
+        // The host's POSIX errno, positive (node's shape). Only the `.errno`
+        // group: the parse also carries libuv-only names, and node publishes
+        // none of them here (conformance case 87 diffs this exact key set
+        // against the real node on the same host). A COPY, so code that
+        // mutates os.constants.errno cannot reach the libuv table built from
+        // the same parse -- and each member non-writable and non-configurable,
+        // which is node's descriptor for these.
+        errno: constantBag(posixErrno(natives).errno),
         priority: {
           PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
           PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
@@ -10852,8 +10893,19 @@
       enumerable: true,
       configurable: true,
     });
+    // argv0 is a BOOTSTRAP SNAPSHOT in node -- `value: process.argv[0]`,
+    // captured once before node overwrites argv[0] with execPath, and never
+    // writable after. It must therefore be independent of process.argv: a CLI
+    // harness doing `process.argv = ["node", "cli.js"]` retargets argv only,
+    // and on node argv0 still reports the name the process was invoked under.
+    // So this reads the NATIVE argv, not argv() -- the argv setter above
+    // replaces that cache, and sharing it made an assignment rewrite argv0.
+    // Still lazy, and for the same reason argv() is: the embedder declares
+    // argv after this module instantiates, so the snapshot is taken on the
+    // first read rather than at construction time.
+    let argv0Cache;
     Object.defineProperty(process, "argv0", {
-      get: () => argv()[0],
+      get: () => (argv0Cache ??= natives.argv()[0]),
       enumerable: true,
       configurable: true,
     });

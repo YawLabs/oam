@@ -934,11 +934,26 @@ pub fn exit_process(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Node's `err.errno` -- the libuv error NUMBER (negative). On Unix it is just
-/// `-errno` (libuv UV_E* == -E*). On Windows libuv uses its own -4000-range
-/// table (verified against node: ENOENT -4058, EISDIR -4068, EEXIST -4075,
-/// ENOTEMPTY -4051); codes not in the table fall back to `-raw_os_error` so the
-/// property is at least present + negative.
+/// Node's `err.errno` -- the libuv error NUMBER (negative).
+///
+/// On Unix it is just `-errno`: libuv's `UV__E*` macros borrow the platform's
+/// own errno whenever it defines one, so `UV_ENOENT == -ENOENT`. On Windows
+/// every one of those macros is guarded on `!defined(_WIN32)`, so the host
+/// NEVER lends its CRT/Winsock number and libuv falls back to its own fixed
+/// -4000/-3000-range value for EVERY code. The complete fallback table is
+/// transcribed below; the numbers are already negative and are returned
+/// verbatim (no negation is applied on this path).
+///
+/// This is the same table the JS side carries as `UV_FALLBACK_ERRNO` in
+/// js/node_compat.js, which is what `util.getSystemErrorName` /
+/// `getSystemErrorMessage` / `getSystemErrorMap` invert. The two must agree
+/// entry for entry: a code missing here stamps a raw Win32/Winsock number onto
+/// `err.errno` that the JS side cannot decode, and the lookup silently
+/// degrades to "Unknown system error N".
+///
+/// A code outside the table (e.g. the DNS-only `ENOTFOUND`, which is not a
+/// libuv errno at all) still falls back to `-raw_os_error` so the property is
+/// at least present and negative.
 ///
 /// Lives here rather than in oam_engine so the child-spawn failure body can
 /// carry it too: node emits the errno as the `code` argument of the 'close'
@@ -947,29 +962,94 @@ pub fn exit_process(code: i32) -> ! {
 pub fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
     #[cfg(windows)]
     {
+        // libuv's Windows fallback table, verbatim from uv/errno.h -- values
+        // are the negative libuv numbers, so they are returned as-is.
         let uv = match code {
-            "EPERM" => -4048,
-            "ENOENT" => -4058,
+            "E2BIG" => -4093,
             "EACCES" => -4092,
-            "EEXIST" => -4075,
-            "ENOTDIR" => -4052,
-            "EISDIR" => -4068,
-            "EINVAL" => -4071,
-            "EMFILE" => -4066,
-            "ENFILE" => -4061,
-            "ENOSPC" => -4055,
-            "EROFS" => -4043,
-            "EBUSY" => -4082,
-            "ENOTEMPTY" => -4051,
-            "ENAMETOOLONG" => -4064,
-            "ELOOP" => -4067,
-            "EXDEV" => -4037,
-            "EBADF" => -4083,
+            "EADDRINUSE" => -4091,
+            "EADDRNOTAVAIL" => -4090,
+            "EAFNOSUPPORT" => -4089,
             "EAGAIN" => -4088,
-            "EPIPE" => -4047,
+            "EAI_ADDRFAMILY" => -3000,
+            "EAI_AGAIN" => -3001,
+            "EAI_BADFLAGS" => -3002,
+            "EAI_BADHINTS" => -3013,
+            "EAI_CANCELED" => -3003,
+            "EAI_FAIL" => -3004,
+            "EAI_FAMILY" => -3005,
+            "EAI_MEMORY" => -3006,
+            "EAI_NODATA" => -3007,
+            "EAI_NONAME" => -3008,
+            "EAI_OVERFLOW" => -3009,
+            "EAI_PROTOCOL" => -3014,
+            "EAI_SERVICE" => -3010,
+            "EAI_SOCKTYPE" => -3011,
+            "EALREADY" => -4084,
+            "EBADF" => -4083,
+            "EBUSY" => -4082,
+            "ECANCELED" => -4081,
+            "ECHARSET" => -4080,
+            "ECONNABORTED" => -4079,
+            "ECONNREFUSED" => -4078,
+            "ECONNRESET" => -4077,
+            "EDESTADDRREQ" => -4076,
+            "EEXIST" => -4075,
+            "EFAULT" => -4074,
             "EFBIG" => -4036,
-            "ENXIO" => -4033,
+            "EFTYPE" => -4028,
+            "EHOSTDOWN" => -4031,
+            "EHOSTUNREACH" => -4073,
+            "EILSEQ" => -4027,
+            "EINTR" => -4072,
+            "EINVAL" => -4071,
+            "EIO" => -4070,
+            "EISCONN" => -4069,
+            "EISDIR" => -4068,
+            "ELOOP" => -4067,
+            "EMFILE" => -4066,
             "EMLINK" => -4032,
+            "EMSGSIZE" => -4065,
+            "ENAMETOOLONG" => -4064,
+            "ENETDOWN" => -4063,
+            "ENETUNREACH" => -4062,
+            "ENFILE" => -4061,
+            "ENOBUFS" => -4060,
+            "ENODATA" => -4024,
+            "ENODEV" => -4059,
+            "ENOENT" => -4058,
+            "ENOEXEC" => -4022,
+            "ENOMEM" => -4057,
+            "ENONET" => -4056,
+            "ENOPROTOOPT" => -4035,
+            "ENOSPC" => -4055,
+            "ENOSYS" => -4054,
+            "ENOTCONN" => -4053,
+            "ENOTDIR" => -4052,
+            "ENOTEMPTY" => -4051,
+            "ENOTSOCK" => -4050,
+            "ENOTSUP" => -4049,
+            "ENOTTY" => -4029,
+            "ENXIO" => -4033,
+            "EOF" => -4095,
+            "EOVERFLOW" => -4026,
+            "EPERM" => -4048,
+            "EPIPE" => -4047,
+            "EPROTO" => -4046,
+            "EPROTONOSUPPORT" => -4045,
+            "EPROTOTYPE" => -4044,
+            "ERANGE" => -4034,
+            "EREMOTEIO" => -4030,
+            "EROFS" => -4043,
+            "ESHUTDOWN" => -4042,
+            "ESOCKTNOSUPPORT" => -4025,
+            "ESPIPE" => -4041,
+            "ESRCH" => -4040,
+            "ETIMEDOUT" => -4039,
+            "ETXTBSY" => -4038,
+            "EUNATCH" => -4023,
+            "EXDEV" => -4037,
+            "UNKNOWN" => -4094,
             _ => return error.raw_os_error().map(|e| -e),
         };
         Some(uv)

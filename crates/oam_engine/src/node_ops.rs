@@ -6600,7 +6600,8 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// The HOST platform's POSIX errno numbers as JSON (`{"ENOENT":2,...}`).
+/// The HOST platform's POSIX errno numbers as JSON, in two groups:
+/// `{"errno":{"ENOENT":2,...},"uvOnly":{"EHOSTDOWN":112,...}}`.
 ///
 /// Sourced from `libc`, so the COMPILER resolves each constant for the target
 /// being built -- linux, darwin and windows-msvc all disagree (EAGAIN is 11 on
@@ -6610,14 +6611,22 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
 /// than a wrong number at runtime, which is the whole point of building it
 /// this way.
 ///
-/// Two consumers in js/node_compat.js: `os.constants.errno` publishes these
-/// positive values directly, and the libuv error table negates them -- libuv
-/// defines `UV_E<X>` as `-E<X>` wherever the platform has `E<X>`, so the same
-/// source serves both.
+/// Two consumers in js/node_compat.js, and they want DIFFERENT key sets --
+/// which is why this ships two groups rather than one flat table:
 ///
-/// Not included: the ~58 `WSA*` winsock codes node additionally publishes in
-/// `os.constants.errno` on Windows. libc does not carry them as errno
-/// constants, so they stay absent rather than invented.
+/// * `os.constants.errno` publishes `errno` verbatim (positive values). That
+///   key set is OBSERVABLE and node's is exact -- 79 names on POSIX -- so one
+///   extra name is a conformance failure, not a harmless superset.
+/// * The libuv error table negates BOTH groups: libuv defines `UV_E<X>` as
+///   `-E<X>` wherever the platform has `E<X>`, including for codes node never
+///   publishes as a constant (EHOSTDOWN, ESHUTDOWN, ...). Those live in
+///   `uvOnly`; without a real host number they would fall back to libuv's
+///   fixed value and decode to the wrong name.
+///
+/// Not sourced here: the ~58 `WSA*` winsock codes node additionally publishes
+/// in `os.constants.errno` on Windows. libc is a `cfg(unix)` dependency and
+/// does not carry them as errno constants either way, so they live in the
+/// transcribed `#[cfg(windows)]` arm below rather than being invented here.
 #[cfg(unix)]
 fn posix_errno_json() -> String {
     macro_rules! errno_entries {
@@ -6626,7 +6635,11 @@ fn posix_errno_json() -> String {
         };
     }
 
-    let mut entries: Vec<(&'static str, i64)> = errno_entries![
+    // Group 1 -- EXACTLY the set node publishes as os.constants.errno on this
+    // platform. A name only libuv needs belongs in group 2 below, not here:
+    // conformance/cases/87-os-errno-constants-platform.mjs diffs this key set
+    // against the real node on the same host, byte for byte.
+    let mut errno: Vec<(&'static str, i64)> = errno_entries![
         E2BIG,
         EACCES,
         EADDRINUSE,
@@ -6706,31 +6719,27 @@ fn posix_errno_json() -> String {
     ]
     .to_vec();
 
-    // Present on both unix families, absent from the Windows CRT.
-    #[cfg(unix)]
-    entries.extend_from_slice(errno_entries![
-        EDQUOT,
-        EHOSTDOWN,
-        EMULTIHOP,
-        ESHUTDOWN,
-        ESOCKTNOSUPPORT,
-        ESTALE
-    ]);
-    #[cfg(target_os = "linux")]
-    entries.extend_from_slice(errno_entries![ENONET, EREMOTEIO, EUNATCH]);
-    #[cfg(target_os = "macos")]
-    entries.extend_from_slice(errno_entries![EFTYPE]);
+    // Present on both unix families, absent from the Windows CRT -- and node
+    // publishes all three, which is what completes the POSIX 79.
+    errno.extend_from_slice(errno_entries![EDQUOT, EMULTIHOP, ESTALE]);
 
-    entries.sort_unstable();
-    let mut json = String::from("{");
-    for (i, (name, value)) in entries.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(&format!("\"{name}\":{value}"));
-    }
-    json.push('}');
-    json
+    // Group 2 -- names node does NOT publish as a constant, that the libuv
+    // table still needs the host's real number for (js/node_compat.js
+    // uvErrnoTable). Also unix-only: the Windows CRT has none of them.
+    let mut uv_only: Vec<(&'static str, i64)> =
+        errno_entries![EHOSTDOWN, ESHUTDOWN, ESOCKTNOSUPPORT].to_vec();
+    #[cfg(target_os = "linux")]
+    uv_only.extend_from_slice(errno_entries![ENONET, EREMOTEIO, EUNATCH]);
+    #[cfg(target_os = "macos")]
+    uv_only.extend_from_slice(errno_entries![EFTYPE]);
+
+    errno.sort_unstable();
+    uv_only.sort_unstable();
+    format!(
+        "{{\"errno\":{},\"uvOnly\":{}}}",
+        errno_object(&errno),
+        errno_object(&uv_only)
+    )
 }
 
 /// The Windows arm of the table above. `libc` is deliberately a `cfg(unix)`
@@ -6882,8 +6891,18 @@ fn posix_errno_json() -> String {
         ("WSA_E_CANCELLED", 10111),
         ("WSA_E_NO_MORE", 10110),
     ];
+    // Same two-group shape as the unix arm, with an EMPTY `uvOnly`: every one
+    // of libuv's error macros is `_WIN32` here, so it takes the fixed fallback
+    // number for every code and never borrows a CRT errno. The published
+    // `errno` group is unchanged -- exactly the set node has on win32.
+    format!("{{\"errno\":{},\"uvOnly\":{{}}}}", errno_object(ERRNO))
+}
+
+/// `[("ENOENT", 2), ...]` as a JSON object literal. The keys are ASCII errno
+/// identifiers and the values are integers, so nothing here needs escaping.
+fn errno_object(entries: &[(&str, i64)]) -> String {
     let mut json = String::from("{");
-    for (i, (name, value)) in ERRNO.iter().enumerate() {
+    for (i, (name, value)) in entries.iter().enumerate() {
         if i > 0 {
             json.push(',');
         }
