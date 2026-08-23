@@ -33,12 +33,24 @@
 #   ./scripts/gc-target.sh                 # prune, keeping 1 copy per family
 #   ./scripts/gc-target.sh --dry-run       # report only, delete nothing
 #   ./scripts/gc-target.sh --keep 2        # keep the 2 newest per family
+#
+# On --keep: cargo emits a bin and that bin`s test harness under the SAME family
+# name (both `oam-<hash>`, or `oam-<hash>.exe` on Windows), so the default keep=1
+# can evict the current half of the pair and force a rebuild of it. That is a
+# time cost, never a correctness one -- everything under deps/ is regenerable --
+# but it is why the remote `gc` dispatch in build-remote.sh passes --keep 2.
 #   ./scripts/gc-target.sh --keep-incremental   # leave incremental/ alone
 # =============================================================================
 
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
+# Repo root from THIS script location, NOT `git rev-parse`: the remote build
+# hosts receive the tree by tar with --exclude=./.git (the orchestrators
+# TAR_EXCLUDES), so there is no git dir there. rev-parse then fails, and
+# because `cd ""` is a silent no-op the script would carry on against whatever
+# directory the caller happened to be in -- pruning the wrong tree, or nothing,
+# and reporting success either way.
+cd "$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/build-locks.sh
 . scripts/lib/build-locks.sh
 
@@ -63,11 +75,24 @@ done
 case "$KEEP" in ''|*[!0-9]*) echo "--keep needs a number, got '$KEEP'" >&2; exit 1 ;; esac
 [ "$KEEP" -ge 1 ] || { echo "--keep must be >= 1 (0 would delete the current build)" >&2; exit 1; }
 
-# target/x64-host/release is the win-x64 leg: release-local.sh builds it
-# WITHOUT --target (see the comment there), so its output is not under a
-# triple subdirectory. The triple-suffixed path stays listed so a tree left
+# One x64-host tree per emulated platform, not just Windows.
+#
+# target/x64-host/release is the win-x64 leg: release-local.sh builds it WITHOUT
+# --target (see the comment there), so its output is not under a triple
+# subdirectory. The triple-suffixed Windows path stays listed so a tree left
 # behind by a pre-0.11 release still gets collected.
-TREES=(target/debug target/release target/x64-host/release target/x64-host/x86_64-pc-windows-msvc/release)
+TREES=(
+  target/debug
+  target/release
+  target/x64-host/release
+  target/x64-host/x86_64-pc-windows-msvc/release
+  target/x64-host/x86_64-apple-darwin/release
+)
+
+# deps/ pruning needs GNU find (-printf). macOS BSD find yields nothing and the
+# prune silently reports zero candidates -- degrade LOUDLY instead.
+GNU_FIND=1
+find . -maxdepth 0 -printf '' >/dev/null 2>&1 || GNU_FIND=0
 
 before_gb="$(oam_dir_gb target)"
 say "target/ is ${before_gb}GB before pruning (keep=$KEEP, dry-run=$DRY_RUN)"
@@ -93,6 +118,11 @@ for tree in "${TREES[@]}"; do
   fi
 
   [ -d "$tree/deps" ] || continue
+  if [ "$GNU_FIND" = "0" ]; then
+    warn "$tree/deps: per-family prune skipped -- needs GNU find -printf (BSD find here); incremental/ was still reclaimed"
+    oam_reap_parked "$tree"; oam_reap_parked "$tree/deps"
+    continue
+  fi
   # Newest-first globally, so the FIRST time awk sees a family it is that
   # family's current artifact. Anything past --keep in the same family is a
   # superseded copy. NUL-delimited: nothing here has spaces today, but a path
@@ -108,18 +138,36 @@ for tree in "${TREES[@]}"; do
     find "$tree/deps" -maxdepth 1 -type f -printf '%T@\t%k\t%p\0' 2>/dev/null |
       sort -zrn |
       awk -v keep="$KEEP" -v RS='\0' -v ORS='\0' -F'\t' '
+        BEGIN {
+          # Interval expressions ({16}) are NOT portable. mawk is Ubuntu`s
+          # default awk -- and so the GCP builder`s -- and mawk 1.3.4 matches
+          # NOTHING for /-[0-9a-f]{16}/ rather than erroring, so this whole
+          # prune was a silent no-op on Linux: it reported a clean deps/ while
+          # collecting zero of 2535 files (21GB). A dynamic string regex
+          # behaves identically on mawk, gawk and BSD awk.
+          hex = ""
+          for (i = 0; i < 16; i++) hex = hex "[0-9a-f]"
+          bare   = "-" hex "$"
+          dotted = "-" hex "\\."
+        }
         {
           path = $3
           n = split(path, seg, "/")
           base = seg[n]
-          # <name>-<16 hex>.<ext> is cargo`s hash-named output shape. Strip the
-          # hash to get the family; anything that does not match that shape
-          # (build scripts` output, .d files cargo rewrites in place) is left
-          # entirely alone.
-          if (match(base, /-[0-9a-f]{16}\./)) {
-            family = substr(base, 1, RSTART - 1) substr(base, RSTART + 18)
-            if (++seen[family] > keep) print $2 " " path
+          # cargo hash-names outputs in TWO shapes and both must be handled:
+          #   <name>-<16 hex>.<ext>   rlib / rmeta / d, and .exe on Windows
+          #   <name>-<16 hex>         bare test + bin executables on unix
+          # Matching only the dotted shape blinded this prune to exactly the
+          # files that dominate the tree: on the Linux builder 2026-08-22,
+          # 107 extensionless binaries held 16GB of a 21GB deps/.
+          if (match(base, bare)) {
+            family = substr(base, 1, RSTART - 1)
+          } else if (match(base, dotted)) {
+            family = substr(base, 1, RSTART - 1) substr(base, RSTART + RLENGTH)
+          } else {
+            next
           }
+          if (++seen[family] > keep) print $2 " " path
         }
       '
   )

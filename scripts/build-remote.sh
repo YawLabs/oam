@@ -28,6 +28,9 @@
 #                     (node required for the comparison columns; missing bun
 #                     just drops that column -- best-effort install attempted)
 #     io-uring-ab  -- Linux-only same-binary A/B (bench.yml io-uring-ab parity)
+#     gc           -- reclaim accreted cargo output (scripts/gc-target.sh):
+#                     incremental/ wholesale + per-family dedupe of deps/.
+#                     Deliberately NOT `rm -rf target/debug` -- see run_gc.
 #     mac-release  -- one-shot mac release leg (tailnet SSH has no idle-drop,
 #                     so no sub-step splitting needed): prep + gate + test +
 #                     build (arm64 native) + x64 build via the
@@ -55,7 +58,7 @@
 # =============================================================================
 set -euo pipefail
 
-DISPATCH="${1:?dispatch: prep | gate | test | conformance | surface-gaps | node-suite | build | bench | io-uring-ab | mac-release | mac-measure | mac-bench}"
+DISPATCH="${1:?dispatch: prep | gate | test | conformance | surface-gaps | node-suite | build | bench | io-uring-ab | gc | mac-release | mac-measure | mac-bench}"
 
 # Non-interactive ssh does not source ~/.profile, and rustup installs into
 # ~/.cargo -- pull its env in explicitly so every dispatch finds cargo.
@@ -239,6 +242,33 @@ run_io_uring_ab() {
   for _ in 1 2; do OAM_IO_URING=1 ./target/release/oam run bench/io_uring_ab.mjs --no-check; done
 }
 
+# Reclaim what cargo never collects, WITHOUT going cold.
+#
+# `rm -rf target/debug` after each build is the obvious move and the wrong one:
+# the orchestrators deliberately preserve target/ across syncs so the dependency
+# graph and the rusty_v8 static lib survive (a cold build on the GCP builder is
+# ~30 min, an incremental one minutes). Deleting the tree buys disk by spending
+# that 30 min on EVERY subsequent release.
+#
+# gc-target.sh is the surgical version and recovers the same disk: incremental/
+# is pure cache and goes wholesale, while deps/ keeps each family`s current
+# artifacts and drops only superseded copies, so the next run is still warm.
+# Measured on the Linux builder 2026-08-22: 39GB -> 9GB, / from 10GB free to
+# 40GB, build cache intact.
+#
+# --keep 2, not the default 1: cargo emits a bin and its test harness under the
+# same family name (both `oam-<hash>`), so keeping a single copy can evict the
+# current one of the pair and force a needless rebuild.
+run_gc() {
+  if [ ! -f scripts/gc-target.sh ]; then
+    warn "scripts/gc-target.sh missing -- skipping target/ reclaim"
+    return 0
+  fi
+  # Advisory by construction: a host that cannot prune must never fail a run
+  # whose artifacts are already built.
+  bash scripts/gc-target.sh --keep 2 || warn "target/ reclaim failed (non-blocking)"
+}
+
 # --- dispatch ----------------------------------------------------------------
 
 case "$DISPATCH" in
@@ -251,6 +281,7 @@ case "$DISPATCH" in
   build)        build_host_release ;;
   bench)        run_bench ;;
   io-uring-ab)  run_io_uring_ab ;;
+  gc)           run_gc ;;
   mac-release)
     remote_prep
     run_gate

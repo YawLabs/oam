@@ -21,6 +21,11 @@
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
 #                                            clippy's job, enforced in step 2)
+#  10. scripts/test-scripts.sh             (GATING; the release-orchestration
+#                                            shell scripts -- gc-target.sh
+#                                            selection logic, tunnel-log
+#                                            parsing, sshd detection, disk
+#                                            thresholds)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
 # gates a release on this script PLUS gate+test+conformance on the GCP Linux
@@ -28,7 +33,7 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-9)
+#   ./scripts/ci-local.sh              # full gate (steps 1-10)
 #   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (6-8)
 #   ./scripts/ci-local.sh --no-tests   # skip the cargo test run (4)
 #
@@ -105,14 +110,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/9 Format (cargo fmt --check)"
+say "1/10 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
   ok "fmt clean"
 else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/9 Clippy (-D warnings)"
+say "2/10 Clippy (-D warnings)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 if cargo clippy --workspace --all-targets -- -D warnings; then
@@ -121,7 +126,7 @@ else
   ko "clippy warnings above"
 fi
 
-say "3/9 Build (cargo build --workspace)"
+say "3/10 Build (cargo build --workspace)"
 clear_debug_holders
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
 # renaming works where deleting does not. Parking the deps-stage file is NOT
@@ -168,7 +173,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "4/9 Tests (cargo test --workspace)"
+  say "4/10 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -201,10 +206,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
-  say "4/9 Tests SKIPPED (--no-tests)"
+  say "4/10 Tests SKIPPED (--no-tests)"
 fi
 
-say "5/9 Smoke (oam run)"
+say "5/10 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -254,7 +259,7 @@ if [ -f target/debug/oam.exe ]; then
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "6/9 Conformance (node-differential gate)"
+  say "6/10 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -262,14 +267,14 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "7/9 Node-suite (skip-ratchet + pass-floor gate)"
+  say "7/10 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 
-  say "8/9 Attribution (THIRD_PARTY_LICENSES drift)"
+  say "8/10 Attribution (THIRD_PARTY_LICENSES drift)"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -309,10 +314,10 @@ if [ "$FAST" -eq 0 ]; then
     fi
   fi
 else
-  say "6/9 + 7/9 + 8/9 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "6/10 + 7/10 + 8/10 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "9/9 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "9/10 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -326,6 +331,20 @@ if cargo run -p xtask -- unsafe-budget; then
   ok "unsafe budget within ceilings"
 else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
+fi
+
+say "10/10 Scripts (release-orchestration shell tests)"
+# GATING, and cheap: ~2s, no compilation. scripts/ ships the binaries but had no
+# gate of its own until now -- which is how gc-target.sh spent its entire life
+# collecting NOTHING on Linux while reporting success (mawk interval expressions,
+# a dot-requiring family regex, and a `cd ""` no-op, all silent). Runs last
+# because it shares no state with steps 1-9: a failure here invalidates none of
+# the Rust work above, and step 9 already establishes that a fast gate can sit at
+# the end. Add `-v` for per-case output.
+if bash scripts/test-scripts.sh; then
+  ok "script tests passed"
+else
+  ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
 fi
 
 echo ""

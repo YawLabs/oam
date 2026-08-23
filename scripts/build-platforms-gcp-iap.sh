@@ -83,6 +83,8 @@ command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found on this box"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/iap-helpers.sh
+. "$SCRIPT_DIR/lib/iap-helpers.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -123,6 +125,46 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
   [ "$VM_START_OK" = "1" ] || fail "could not start $INSTANCE in $ZONE after 6 attempts -- the zone is out of capacity for this machine type. Wait and re-run, or move the builder to another zone."
   WE_STARTED_VM=1
   ok "VM started"
+  # `instances start` returning RUNNING means the API finished, NOT the guest:
+  # sshd comes up ~15-60s later. gcloud`s start-iap-tunnel does a real backend
+  # round-trip BEFORE it binds anything, and against a still-booting guest that
+  # round-trip EXITS with a 4003 instead of retrying -- so the first tunnel
+  # attempt was near-guaranteed to fail on a cold VM, burning ~30s and printing
+  # a scary warning for an entirely expected condition.
+  #
+  # The serial console reads straight off the compute API -- no tunnel, no ssh --
+  # so it is the one guest-side signal available before the chicken-and-egg
+  # breaks. GCE resets the serial buffer each boot, so a match is from THIS boot.
+  wait_for_guest_sshd() {
+    local waited=0 max=180 serial
+    while [ "$waited" -lt "$max" ]; do
+      # Capture then match, rather than `gcloud | grep -q`: under `set -o
+      # pipefail` grep short-circuits on a match, gcloud dies on SIGPIPE, and
+      # the pipeline reports FAILURE -- turning a successful detection into a
+      # false negative that would burn the whole ${max}s window every cold boot.
+      #
+      # Refetching the WHOLE buffer each poll is deliberate. gcloud offers
+      # --start=<byte offset> to fetch only new output, but the offset would
+      # have to be derived from the length of a command substitution, which
+      # strips trailing newlines -- so the offset drifts and a poll can skip
+      # the very line being matched. The buffer is ~150KB and sshd normally
+      # lands on the first or second poll; trading a correct detection for
+      # those bytes is not worth it.
+      serial="$(gcloud compute instances get-serial-port-output "$INSTANCE" \
+        --zone="$ZONE" --project="$PROJECT" 2>/dev/null || true)"
+      if sshd_banner_seen "$serial"; then
+        ok "guest sshd up (serial console, ${waited}s after start)"
+        return 0
+      fi
+      sleep 10
+      waited=$((waited + 10))
+    done
+    # Never fatal: the tunnel retry loop is still the real backstop.
+    warn "no sshd banner on the serial console after ${max}s -- proceeding (the tunnel loop still retries)"
+    return 0
+  }
+  step "Wait for guest sshd on $INSTANCE"
+  wait_for_guest_sshd
 else
   ok "VM already RUNNING -- will leave it running on exit"
 fi
@@ -149,23 +191,28 @@ IAP_SSH_KEY="${HOME}/.ssh/google_compute_engine"
 # mode, so start_iap_tunnel can retry all of them identically.
 iap_tunnel_serving() {
   local waited=0
+  # 90s, not 15s. gcloud does a real backend round-trip BEFORE it binds anything
+  # (surface/compute/start_iap_tunnel.py -> IapTunnelProxyServerHelper.Run:
+  # _TestConnection(), THEN _OpenLocalTcpSockets(), THEN the log line), and that
+  # self-test takes well over 15s even against a warm, fully booted VM.
+  local budget=90
   while ! grep -q "Listening on port" "$IAP_TUNNEL_LOG" 2>/dev/null; do
     sleep 1
     waited=$((waited + 1))
-    if [ "$waited" -ge 15 ]; then
-      warn "gcloud did not log 'Listening on port' within 15s -- falling back to port-reachability probe"
+    if [ "$waited" -ge "$budget" ]; then
+      warn "gcloud did not log 'Listening on port' within ${budget}s -- falling back to port-reachability probe"
       break
     fi
     kill -0 "$IAP_TUNNEL_PID" 2>/dev/null || return 1
   done
-  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Listening on port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  IAP_TUNNEL_PORT="$(iap_parse_listening_port "$IAP_TUNNEL_LOG" || true)"
   if [ -n "$IAP_TUNNEL_PORT" ]; then
     ok "IAP tunnel up: localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22 (waited ${waited}s)"
     return 0
   fi
   # Some gcloud versions hang in their internal tunnel self-test while the port
   # already serves fine, so a bound-but-unlogged port still counts as up.
-  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Picking local unused port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  IAP_TUNNEL_PORT="$(iap_parse_picked_port "$IAP_TUNNEL_LOG" || true)"
   [ -n "$IAP_TUNNEL_PORT" ] || return 1
   local port_waited=0
   while ! timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$IAP_TUNNEL_PORT" 2>/dev/null; do
@@ -192,7 +239,17 @@ start_iap_tunnel() {
   while :; do
     ok "starting IAP tunnel to $INSTANCE (gcloud start-iap-tunnel, attempt $attempt/$max_attempts)..."
     : >"$IAP_TUNNEL_LOG"
-    gcloud compute start-iap-tunnel "$INSTANCE" 22       --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT"       >"$IAP_TUNNEL_LOG" 2>&1 &
+    # PYTHONUNBUFFERED is load-bearing, not a nicety. gcloud is Python, and of
+    # everything it prints only `Listening on port [N].` goes to STDOUT
+    # (log.out.Print); the rest -- `Picking local unused port`, `Testing if
+    # tunnel connection works` -- is stderr (log.status.Print). Redirecting
+    # stdout into a file makes Python block-buffer it, so the one line this
+    # function waits for sat unflushed in the buffer indefinitely. Verified
+    # 2026-08-22: a fully working tunnel served SSH for 160s+ having never
+    # written that line to the log, so the fallback ran on EVERY invocation.
+    PYTHONUNBUFFERED=1 gcloud compute start-iap-tunnel "$INSTANCE" 22 \
+      --local-host-port=localhost:0 --zone="$ZONE" --project="$PROJECT" \
+      >"$IAP_TUNNEL_LOG" 2>&1 &
     IAP_TUNNEL_PID=$!
     if iap_tunnel_serving; then
       return 0
@@ -313,28 +370,47 @@ for IAP_PROBE_ATTEMPT in 1 2 3 4 5 6 7 8 9 10; do
 done
 if [ "$IAP_PROBE_OK" -eq 1 ]; then
   ok "IAP SSH roundtrip ok (tunnel localhost:$IAP_TUNNEL_PORT)"
-  # Disk headroom. A full builder does not fail fast: cargo runs for ~20
-  # minutes and then dies with `rustc-LLVM ERROR: IO failure on output
-  # stream` / `os error 28`, which reads like a compiler bug. One clean
-  # debug+release build of this tree needs ~7GB, and target/debug accretes
-  # incremental cache across runs (observed: 20GB, filling a 40GB disk).
-  # Check before spending the time, and say exactly what to delete.
-  DISK_FREE_GB="$(gcp_ssh "df -BG --output=avail / | tail -1 | tr -dc '0-9'" 2>/dev/null)"
-  if [ -n "$DISK_FREE_GB" ]; then
-    if [ "$DISK_FREE_GB" -lt 10 ]; then
-      fail "builder has ${DISK_FREE_GB}GB free on / -- a build needs ~7GB and will die mid-compile with a misleading LLVM IO error. Free space first: ssh in and 'rm -rf ~/${REMOTE_DIR}/target/debug' (rebuildable cache), or grow the boot disk."
-    elif [ "$DISK_FREE_GB" -lt 20 ]; then
-      warn "builder has only ${DISK_FREE_GB}GB free on / -- enough for this run, but 'rm -rf ~/${REMOTE_DIR}/target/debug' would give it room"
-    else
-      ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"
-    fi
-  fi
 else
   fail "IAP tunnel is up (port $IAP_TUNNEL_PORT) but ssh 'true' failed after 10 attempts. Check (1) $IAP_SSH_KEY exists, (2) OS Login accepted the key for $LINUX_USER, (3) google_compute_known_hosts is not stale."
 fi
 
 # --- build --------------------------------------------------------------------
 sync_src
+
+# Disk headroom -- deliberately AFTER sync_src, not before. The reclaim below
+# runs `build-remote.sh gc`, which only exists in a tree THIS script has synced:
+# checking first would invoke the PREVIOUS run`s build-remote.sh, hit `unknown
+# dispatch: gc` on any builder that predates that dispatch, and then hard-fail
+# with a message claiming a reclaim that never happened. The sync is seconds and
+# frees the old source tree before extracting, so ordering it first costs
+# nothing and makes both remote scripts current.
+#
+# A full builder does not fail fast: cargo runs ~20 min and then dies with
+# `rustc-LLVM ERROR: IO failure on output stream` / `os error 28`, which reads
+# like a compiler bug. One clean debug+release build of this tree needs ~7GB,
+# and target/ accretes across runs (observed 2026-08-22: 39GB, / at 10GB free).
+step "Check builder disk headroom"
+builder_free_gb(){ gcp_ssh "df -BG --output=avail / | tail -1 | tr -dc '0-9'" 2>/dev/null; }
+DISK_FREE_GB="$(builder_free_gb)"
+if [ -n "$DISK_FREE_GB" ]; then
+  # Tight headroom used to just print advice telling the operator to ssh in and
+  # delete things by hand -- a nag that never fixed anything, so the tree kept
+  # growing until a run hard-failed here. Reclaim it instead; the build cache
+  # survives, so this costs no build time.
+  if disk_needs_reclaim "$DISK_FREE_GB"; then
+    warn "builder has ${DISK_FREE_GB}GB free on / -- reclaiming accreted cargo output before building"
+    gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh gc" >&2 2>&1 \
+      || warn "pre-build reclaim failed -- continuing to the threshold check"
+    DISK_FREE_GB="$(builder_free_gb)"
+  fi
+  # Judge AFTER the reclaim: the cheap fix has already run, so anything still
+  # short needs a real one.
+  if disk_below_floor "$DISK_FREE_GB"; then
+    fail "builder still has only ${DISK_FREE_GB}GB free on / after reclaiming prunable cargo output -- a build needs ~7GB. Grow the boot disk, or ssh in and look for space outside ~/${REMOTE_DIR}/target."
+  fi
+  [ -n "$DISK_FREE_GB" ] && ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"
+fi
+
 remote_step prep
 
 case "$MODE" in
@@ -411,6 +487,14 @@ case "$MODE" in
     ;;
 esac
 ok "all required artifacts staged under $ARTIFACTS_DIR"
+
+# Reclaim AFTER the artifacts are staged, never before: this run`s outputs are
+# already local, so a prune here cannot cost anything it needs. Doing it every
+# run is what stops the tree accreting until the preflight check has to fail a
+# release. Advisory -- the leg has already succeeded, and a failed cleanup must
+# not retract that.
+step "Reclaim builder disk"
+gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh gc" >&2 2>&1   || warn "post-build reclaim failed (non-blocking -- artifacts are already staged)"
 
 # LAST stdout line = the artifact dir, for ART=$(...) capture.
 echo "$ARTIFACTS_DIR"
