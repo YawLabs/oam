@@ -54,6 +54,7 @@ fn dep_versions_json() -> String {
         entries.push((key.to_string(), version));
     }
     entries.extend(icu_versions(&lock));
+    entries.push(ada_version(&lock));
     entries.sort();
     let mut json = String::from("{");
     for (i, (key, version)) in entries.iter().enumerate() {
@@ -118,6 +119,56 @@ fn icu_versions(lock: &str) -> Vec<(String, String)> {
         );
     };
     vec![("icu".to_string(), icu), ("unicode".to_string(), unicode)]
+}
+
+/// `ada` for process.versions. Unlike the rest of Node's dependency names,
+/// this one is NOT a library oam lacks: oam parses every URL with ada -- the
+/// same C++ WHATWG parser node reports under this key, doing the same job
+/// (`ada_url::Url::parse` in oam_engine's node_ops.rs / ops.rs). Withholding
+/// it was as inaccurate as publishing `uv` would be, just in the other
+/// direction.
+///
+/// The value is the version of the VENDORED C++ ada, read from the pinned
+/// `ada-url` crate's own `deps/ada.h` -- not the Rust binding crate's version,
+/// which moves independently and would put a number under a name node already
+/// owns that means something else. Same provenance rule, and same
+/// registry-layout limitation, as `icu_versions` above.
+fn ada_version(lock: &str) -> (String, String) {
+    let crate_version = match lock_package_versions(lock, "ada-url").as_slice() {
+        [one] => one.clone(),
+        other => panic!("expected exactly one ada-url crate in Cargo.lock, found {other:?}"),
+    };
+    let src = crate_src_dir(&format!("ada-url-{crate_version}")).unwrap_or_else(|| {
+        panic!(
+            "ada-url-{crate_version} not found in the cargo registry -- cannot verify the \
+             linked ada version; if the registry layout changed, update crate_src_dir() \
+             (do NOT hardcode a version string)"
+        )
+    });
+    (
+        "ada".to_string(),
+        header_define(&src.join("deps").join("ada.h"), "ADA_VERSION"),
+    )
+}
+
+/// The unpacked source directory of a pinned crate inside the cargo registry,
+/// e.g. `v8-15.0.245.2` or `ada-url-3.4.5`. Shared by the two build-time
+/// version probes that must read a vendored C header rather than the lockfile.
+fn crate_src_dir(dir_name: &str) -> Option<std::path::PathBuf> {
+    let cargo_home = std::env::var("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            #[allow(deprecated)] // build script, host-only; home_dir is fine here
+            std::env::home_dir()
+                .expect("neither CARGO_HOME nor a home directory is set")
+                .join(".cargo")
+        });
+    let registry_src = cargo_home.join("registry").join("src");
+    std::fs::read_dir(&registry_src)
+        .unwrap_or_else(|e| panic!("read {}: {e}", registry_src.display()))
+        .flatten()
+        .map(|entry| entry.path().join(dir_name))
+        .find(|candidate| candidate.is_dir())
 }
 
 /// Value of `#define <name> "<value>"` in a C header, or panic.

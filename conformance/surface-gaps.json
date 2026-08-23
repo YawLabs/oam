@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.23.1 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1421,
-        "missing": 363,
+        "present": 1422,
+        "missing": 362,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -457,7 +457,6 @@
           "_exceptionWithHostPort",
           "_extend",
           "diff",
-          "getSystemErrorMessage",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"
@@ -505,8 +504,8 @@
       "generatedAgainst": "v22.23.1 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1421,
-        "missing": 367,
+        "present": 1422,
+        "missing": 366,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -961,7 +960,6 @@
           "_exceptionWithHostPort",
           "_extend",
           "diff",
-          "getSystemErrorMessage",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"
@@ -1009,8 +1007,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1364,
-        "missing": 410,
+        "present": 1365,
+        "missing": 409,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -1508,7 +1506,6 @@
           "_exceptionWithHostPort",
           "_extend",
           "diff",
-          "getSystemErrorMessage",
           "setTraceSigInt",
           "transferableAbortController",
           "transferableAbortSignal"

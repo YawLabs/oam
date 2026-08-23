@@ -4072,6 +4072,158 @@
     return out;
   }
 
+  // The POSIX errno numbers, NEGATED (the form libuv uses on unix). Single
+  // source for both os.constants.errno (flipped positive by positiveErrno
+  // above) and the libuv error table below, so the two can never disagree
+  // about what ENOENT is.
+  const NEGATIVE_POSIX_ERRNO = {
+    E2BIG: -7, EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99,
+    EAFNOSUPPORT: -97, EAGAIN: -11, EALREADY: -114, EBADF: -9,
+    EBADMSG: -74, EBUSY: -16, ECANCELED: -125, ECHILD: -10,
+    ECONNABORTED: -103, ECONNREFUSED: -111, ECONNRESET: -104,
+    EDEADLK: -35, EDESTADDRREQ: -89, EDOM: -33, EDQUOT: -122,
+    EEXIST: -17, EFAULT: -14, EFBIG: -27, EHOSTUNREACH: -113,
+    EIDRM: -43, EILSEQ: -84, EINPROGRESS: -115, EINTR: -4,
+    EINVAL: -22, EIO: -5, EISCONN: -106, EISDIR: -21,
+    ELOOP: -40, EMFILE: -24, EMLINK: -31, EMSGSIZE: -90,
+    EMULTIHOP: -72, ENAMETOOLONG: -36, ENETDOWN: -100,
+    ENETRESET: -102, ENETUNREACH: -101, ENFILE: -23, ENOBUFS: -105,
+    ENODATA: -61, ENODEV: -19, ENOENT: -2, ENOEXEC: -8,
+    ENOLCK: -37, ENOLINK: -67, ENOMEM: -12, ENOMSG: -42,
+    ENOPROTOOPT: -92, ENOSPC: -28, ENOSR: -63, ENOSTR: -60,
+    ENOSYS: -38, ENOTCONN: -107, ENOTDIR: -20, ENOTEMPTY: -39,
+    ENOTSOCK: -88, ENOTSUP: -95, ENOTTY: -25, ENXIO: -6,
+    EOPNOTSUPP: -95, EOVERFLOW: -75, EPERM: -1, EPIPE: -32,
+    EPROTO: -71, EPROTONOSUPPORT: -93, EPROTOTYPE: -91,
+    ERANGE: -34, EROFS: -30, ESPIPE: -29, ESRCH: -3,
+    ESTALE: -116, ETIME: -62, ETIMEDOUT: -110, ETXTBSY: -26,
+    EWOULDBLOCK: -11, EXDEV: -18,
+  };
+
+  // libuv error strings, keyed by code. Platform-independent in libuv
+  // (uv_strerror returns the same text everywhere), so one table serves
+  // every host.
+  const UV_ERROR_MESSAGES = {
+    E2BIG: "argument list too long", EACCES: "permission denied",
+    EADDRINUSE: "address already in use", EADDRNOTAVAIL: "address not available",
+    EAFNOSUPPORT: "address family not supported",
+    EAGAIN: "resource temporarily unavailable",
+    EAI_ADDRFAMILY: "address family not supported", EAI_AGAIN: "temporary failure",
+    EAI_BADFLAGS: "bad ai_flags value", EAI_BADHINTS: "invalid value for hints",
+    EAI_CANCELED: "request canceled", EAI_FAIL: "permanent failure",
+    EAI_FAMILY: "ai_family not supported", EAI_MEMORY: "out of memory",
+    EAI_NODATA: "no address", EAI_NONAME: "unknown node or service",
+    EAI_OVERFLOW: "argument buffer overflow",
+    EAI_PROTOCOL: "resolved protocol is unknown",
+    EAI_SERVICE: "service not available for socket type",
+    EAI_SOCKTYPE: "socket type not supported",
+    EALREADY: "connection already in progress", EBADF: "bad file descriptor",
+    EBUSY: "resource busy or locked", ECANCELED: "operation canceled",
+    ECHARSET: "invalid Unicode character",
+    ECONNABORTED: "software caused connection abort",
+    ECONNREFUSED: "connection refused", ECONNRESET: "connection reset by peer",
+    EDESTADDRREQ: "destination address required", EEXIST: "file already exists",
+    EFAULT: "bad address in system call argument", EFBIG: "file too large",
+    EHOSTUNREACH: "host is unreachable", EILSEQ: "illegal byte sequence",
+    EINTR: "interrupted system call", EINVAL: "invalid argument",
+    EIO: "i/o error", EISCONN: "socket is already connected",
+    EISDIR: "illegal operation on a directory",
+    ELOOP: "too many symbolic links encountered", EMFILE: "too many open files",
+    EMLINK: "too many links", EMSGSIZE: "message too long",
+    ENAMETOOLONG: "name too long", ENETDOWN: "network is down",
+    ENETUNREACH: "network is unreachable", ENFILE: "file table overflow",
+    ENOBUFS: "no buffer space available", ENODATA: "no data available",
+    ENODEV: "no such device", ENOENT: "no such file or directory",
+    ENOEXEC: "exec format error", ENOMEM: "not enough memory",
+    ENOPROTOOPT: "protocol not available", ENOSPC: "no space left on device",
+    ENOSYS: "function not implemented", ENOTCONN: "socket is not connected",
+    ENOTDIR: "not a directory", ENOTEMPTY: "directory not empty",
+    ENOTSOCK: "socket operation on non-socket",
+    ENOTSUP: "operation not supported on socket",
+    ENOTTY: "inappropriate ioctl for device", ENXIO: "no such device or address",
+    EOF: "end of file", EOVERFLOW: "value too large for defined data type",
+    EPERM: "operation not permitted", EPIPE: "broken pipe",
+    EPROTO: "protocol error", EPROTONOSUPPORT: "protocol not supported",
+    EPROTOTYPE: "protocol wrong type for socket", ERANGE: "result too large",
+    EROFS: "read-only file system", ESPIPE: "invalid seek",
+    ESRCH: "no such process", ETIMEDOUT: "connection timed out",
+    ETXTBSY: "text file is busy", EXDEV: "cross-device link not permitted",
+    UNKNOWN: "unknown error",
+    // Windows-only in oam: libuv defines these, but oam's POSIX table has no
+    // verified number for them, so they appear on win32 and are omitted
+    // elsewhere rather than guessed.
+    EFTYPE: "inappropriate file type or format", EHOSTDOWN: "host is down",
+    ENONET: "machine is not on the network", EREMOTEIO: "remote I/O error",
+    ESHUTDOWN: "cannot send after transport endpoint shutdown",
+    ESOCKTNOSUPPORT: "socket type not supported",
+    EUNATCH: "protocol driver not attached",
+  };
+
+  // Codes libuv assigns a FIXED number on every platform, because there is no
+  // POSIX errno to borrow: the getaddrinfo/resolver codes (-3000 range) and
+  // libuv own EOF / UNKNOWN / ECHARSET (-4095..-4080).
+  const UV_PLATFORM_INDEPENDENT_ERRNO = {
+    EAI_ADDRFAMILY: -3000, EAI_AGAIN: -3001, EAI_BADFLAGS: -3002,
+    EAI_BADHINTS: -3013, EAI_CANCELED: -3003, EAI_FAIL: -3004,
+    EAI_FAMILY: -3005, EAI_MEMORY: -3006, EAI_NODATA: -3007,
+    EAI_NONAME: -3008, EAI_OVERFLOW: -3009, EAI_PROTOCOL: -3014,
+    EAI_SERVICE: -3010, EAI_SOCKTYPE: -3011,
+    EOF: -4095, UNKNOWN: -4094, ECHARSET: -4080,
+  };
+
+  // Windows has no POSIX errno for libuv to negate, so libuv defines its own
+  // -4000-range constants there (uv/errno.h). These are compile-time
+  // constants of libuv itself, identical in every Windows build -- the same
+  // source and the same numbers as the 22-entry table oam_core::node_errno
+  // already uses to stamp `err.errno`, extended to the full set.
+  const UV_WIN32_ERRNO = {
+    E2BIG: -4093, EACCES: -4092, EADDRINUSE: -4091, EADDRNOTAVAIL: -4090,
+    EAFNOSUPPORT: -4089, EAGAIN: -4088, EALREADY: -4084, EBADF: -4083,
+    EBUSY: -4082, ECANCELED: -4081, ECONNABORTED: -4079, ECONNREFUSED: -4078,
+    ECONNRESET: -4077, EDESTADDRREQ: -4076, EEXIST: -4075, EFAULT: -4074,
+    EFBIG: -4036, EHOSTUNREACH: -4073, EILSEQ: -4027, EINTR: -4072,
+    EINVAL: -4071, EIO: -4070, EISCONN: -4069, EISDIR: -4068,
+    ELOOP: -4067, EMFILE: -4066, EMLINK: -4032, EMSGSIZE: -4065,
+    ENAMETOOLONG: -4064, ENETDOWN: -4063, ENETUNREACH: -4062, ENFILE: -4061,
+    ENOBUFS: -4060, ENODATA: -4024, ENODEV: -4059, ENOENT: -4058,
+    ENOEXEC: -4022, ENOMEM: -4057, ENOPROTOOPT: -4035, ENOSPC: -4055,
+    ENOSYS: -4054, ENOTCONN: -4053, ENOTDIR: -4052, ENOTEMPTY: -4051,
+    ENOTSOCK: -4050, ENOTSUP: -4049, ENOTTY: -4029, ENXIO: -4033,
+    EOVERFLOW: -4026, EPERM: -4048, EPIPE: -4047, EPROTO: -4046,
+    EPROTONOSUPPORT: -4045, EPROTOTYPE: -4044, ERANGE: -4034, EROFS: -4043,
+    ESPIPE: -4041, ESRCH: -4040, ETIMEDOUT: -4039, ETXTBSY: -4038,
+    EXDEV: -4037, EFTYPE: -4028, EHOSTDOWN: -4031, ENONET: -4056,
+    EREMOTEIO: -4030, ESHUTDOWN: -4042, ESOCKTNOSUPPORT: -4025,
+    EUNATCH: -4023,
+  };
+
+  // The platform real libuv error table -- the inverse of the numbers oam
+  // stamps onto `err.errno`, and the single source behind
+  // util.getSystemErrorName / getSystemErrorMap.
+  //
+  // On unix libuv defines UV_E<X> as -E<X>, so the table IS the negated POSIX
+  // errno set -- correct by construction rather than transcribed. On Windows
+  // libuv has no errno to borrow and uses its own -4000-range constants.
+  //
+  // Codes oam has no verified number for on a given platform are OMITTED
+  // rather than guessed, the same rule the rest of this file follows: an
+  // absent entry degrades to node own "Unknown system error N" fallback,
+  // while a wrong one would put a real-looking name on the wrong failure.
+  function uvErrnoTable(platform) {
+    const base = platform === "win32" ? UV_WIN32_ERRNO : NEGATIVE_POSIX_ERRNO;
+    const out = new Map();
+    for (const table of [base, UV_PLATFORM_INDEPENDENT_ERRNO]) {
+      for (const code of Object.keys(table)) {
+        const message = UV_ERROR_MESSAGES[code];
+        if (message === undefined) continue;
+        // First writer wins: EWOULDBLOCK/EOPNOTSUPP alias EAGAIN/ENOTSUP on
+        // the same number, and node reports the primary name for it.
+        if (!out.has(table[code])) out.set(table[code], [code, message]);
+      }
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------------- os
   registry.factories.os = (natives) => {
     const isWin = natives.platform === "win32";
@@ -4132,29 +4284,7 @@
           SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
           SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
         },
-        errno: positiveErrno({
-          E2BIG: -7, EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99,
-          EAFNOSUPPORT: -97, EAGAIN: -11, EALREADY: -114, EBADF: -9,
-          EBADMSG: -74, EBUSY: -16, ECANCELED: -125, ECHILD: -10,
-          ECONNABORTED: -103, ECONNREFUSED: -111, ECONNRESET: -104,
-          EDEADLK: -35, EDESTADDRREQ: -89, EDOM: -33, EDQUOT: -122,
-          EEXIST: -17, EFAULT: -14, EFBIG: -27, EHOSTUNREACH: -113,
-          EIDRM: -43, EILSEQ: -84, EINPROGRESS: -115, EINTR: -4,
-          EINVAL: -22, EIO: -5, EISCONN: -106, EISDIR: -21,
-          ELOOP: -40, EMFILE: -24, EMLINK: -31, EMSGSIZE: -90,
-          EMULTIHOP: -72, ENAMETOOLONG: -36, ENETDOWN: -100,
-          ENETRESET: -102, ENETUNREACH: -101, ENFILE: -23, ENOBUFS: -105,
-          ENODATA: -61, ENODEV: -19, ENOENT: -2, ENOEXEC: -8,
-          ENOLCK: -37, ENOLINK: -67, ENOMEM: -12, ENOMSG: -42,
-          ENOPROTOOPT: -92, ENOSPC: -28, ENOSR: -63, ENOSTR: -60,
-          ENOSYS: -38, ENOTCONN: -107, ENOTDIR: -20, ENOTEMPTY: -39,
-          ENOTSOCK: -88, ENOTSUP: -95, ENOTTY: -25, ENXIO: -6,
-          EOPNOTSUPP: -95, EOVERFLOW: -75, EPERM: -1, EPIPE: -32,
-          EPROTO: -71, EPROTONOSUPPORT: -93, EPROTOTYPE: -91,
-          ERANGE: -34, EROFS: -30, ESPIPE: -29, ESRCH: -3,
-          ESTALE: -116, ETIME: -62, ETIMEDOUT: -110, ETXTBSY: -26,
-          EWOULDBLOCK: -11, EXDEV: -18,
-        }),
+        errno: positiveErrno(NEGATIVE_POSIX_ERRNO),
         priority: {
           PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
           PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
@@ -6544,40 +6674,25 @@
       },
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
+      // node keys these off the LIBUV error number -- the same negative
+      // value oam already stamps onto err.errno (oam_core::node_errno) -- so
+      // util.getSystemErrorName(err.errno) must round-trip. It did not: this
+      // pair carried a private, invented -1..-28 sequence that matched no
+      // platform, so on Windows getSystemErrorName(-4058) answered "Unknown
+      // system error -4058" for a plain ENOENT, and on linux every code past
+      // ENOENT was wrong too (EACCES is -13 there, not -3). Both now read the
+      // per-platform libuv table built above, which is the same source the
+      // errno numbers themselves come from.
       getSystemErrorName: function getSystemErrorName(err) {
-        var map = {
-          [-1]: "EOF", [-2]: "ENOENT", [-3]: "EACCES", [-4]: "EEXIST",
-          [-5]: "ENOTDIR", [-6]: "EISDIR", [-7]: "ENOTEMPTY", [-8]: "EPERM",
-          [-9]: "EBADF", [-10]: "EINVAL", [-11]: "ENOMEM", [-12]: "EBUSY",
-          [-13]: "EAGAIN", [-14]: "ENOSYS", [-15]: "EMFILE", [-16]: "ENFILE",
-          [-17]: "EADDRINUSE", [-18]: "EADDRNOTAVAIL", [-19]: "ECONNREFUSED",
-          [-20]: "ECONNRESET", [-21]: "ECONNABORTED", [-22]: "EPIPE",
-          [-23]: "ETIMEDOUT", [-24]: "ENETUNREACH", [-25]: "EHOSTUNREACH",
-          [-26]: "ELOOP", [-27]: "ENAMETOOLONG", [-28]: "ERANGE",
-        };
-        return map[err] || ("Unknown system error " + err);
+        const entry = uvErrnoTable(natives.platform).get(err);
+        return entry === undefined ? "Unknown system error " + err : entry[0];
+      },
+      getSystemErrorMessage: function getSystemErrorMessage(err) {
+        const entry = uvErrnoTable(natives.platform).get(err);
+        return entry === undefined ? "Unknown system error " + err : entry[1];
       },
       getSystemErrorMap: function getSystemErrorMap() {
-        return new Map([
-          [-1, ["EOF", "end of file"]],
-          [-2, ["ENOENT", "no such file or directory"]],
-          [-3, ["EACCES", "permission denied"]],
-          [-4, ["EEXIST", "file already exists"]],
-          [-5, ["ENOTDIR", "not a directory"]],
-          [-6, ["EISDIR", "illegal operation on a directory"]],
-          [-7, ["ENOTEMPTY", "directory not empty"]],
-          [-8, ["EPERM", "operation not permitted"]],
-          [-9, ["EBADF", "bad file descriptor"]],
-          [-10, ["EINVAL", "invalid argument"]],
-          [-11, ["ENOMEM", "not enough memory"]],
-          [-12, ["EBUSY", "resource busy or locked"]],
-          [-13, ["EAGAIN", "resource temporarily unavailable"]],
-          [-17, ["EADDRINUSE", "address already in use"]],
-          [-19, ["ECONNREFUSED", "connection refused"]],
-          [-20, ["ECONNRESET", "connection reset by peer"]],
-          [-22, ["EPIPE", "broken pipe"]],
-          [-23, ["ETIMEDOUT", "connection timed out"]],
-        ]);
+        return uvErrnoTable(natives.platform);
       },
       styleText: function styleText(format, text, options) {
         // Node's inspect.colors table (open/close SGR pairs).
@@ -11041,8 +11156,8 @@
       // Only bindings oam can back with the REAL thing are modeled, and every
       // member is taken BY IDENTITY off the public surface that already
       // implements it, so the binding cannot drift from the module. Members
-      // oam does not have are omitted, and the other 20 names on node's
-      // allowlist keep throwing.
+      // oam does not have are omitted, and the other 21 of node's 24
+      // unconditional allowlist names keep throwing.
       //
       // That last part is deliberate, and it is why
       // test-process-binding-internalbinding-allowlist does not pass: it
@@ -11741,6 +11856,53 @@
         _exitCode = value;
       },
     });
+
+    // Node publishes its identity/build metadata as READ-ONLY data
+    // properties (bootstrap/node.js defines them with writable:false), and
+    // real code relies on that: test-process-versions asserts
+    // `descriptor.writable === false` for every process.versions key, and a
+    // package that accidentally assigns to process.platform silently no-ops
+    // on node instead of corrupting the value for everything loaded after
+    // it. oam built these as plain literal properties, so every one of them
+    // was writable -- a divergence with nothing honest behind it.
+    //
+    // The exact attribute triple is node's, per property (probe-verified
+    // against v22.22.2): `features` and `argv0` are non-configurable, the
+    // rest stay configurable so a test double can still redefine them.
+    // Note this is NOT Object.freeze: node's process.versions is
+    // configurable:true AND extensible (isFrozen/isSealed/isExtensible =
+    // false/false/true), so freezing would trade one divergence for another.
+    for (const name of ["version", "versions", "arch", "platform", "release", "config", "pid"]) {
+      if (Object.getOwnPropertyDescriptor(process, name) === undefined) continue;
+      Object.defineProperty(process, name, {
+        value: process[name],
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    if (Object.getOwnPropertyDescriptor(process, "features") !== undefined) {
+      Object.defineProperty(process, "features", {
+        value: process.features,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+      });
+    }
+    // The version bags themselves: every member read-only, the object left
+    // extensible -- again matching node rather than sealing harder than it.
+    for (const bag of [process.versions, process.release]) {
+      if (bag === null || typeof bag !== "object") continue;
+      for (const key of Object.keys(bag)) {
+        Object.defineProperty(bag, key, {
+          value: bag[key],
+          writable: false,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
+
     return process;
   };
 
