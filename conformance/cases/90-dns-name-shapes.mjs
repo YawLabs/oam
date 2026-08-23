@@ -77,6 +77,21 @@ await new Promise((r) =>
   }),
 );
 
+// 5b) CAA records are keyed BY THEIR TAG: node's shape is
+//     {critical, <tag>: <value>}, not a fixed `issue` key with a separate
+//     `value`. wikipedia.org is the useful fixture because it publishes an
+//     `iodef` record alongside two `issue` records, so a hardcoded key shows up
+//     immediately. `critical` is the wire flags octet (128 when the issuer
+//     critical bit is set), not a 0/1 boolean -- no public fixture here
+//     publishes a critical record, so only the 0 path is covered live.
+await new Promise((r) =>
+  dns.resolveCaa("wikipedia.org", (e, v) => {
+    // Record order is not guaranteed; sort by the serialized form.
+    shape("caa", e, v && v.slice().map((x) => JSON.stringify(x)).sort());
+    r();
+  }),
+);
+
 // 6) getServers is a non-empty array of strings on both runtimes. The VALUES
 //    are the host's own nameservers, so they are deliberately not printed --
 //    only the shape, which is what can regress.
