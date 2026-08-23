@@ -39,14 +39,23 @@ cd "$REPO_DIR"
 SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)"
 trap 'rm -rf "$SUITE_TMP"' EXIT
 
-RED='\033[0;31m'; GRN='\033[0;32m'; CYA='\033[0;36m'; NC='\033[0m'
-PASS=0; FAIL=0; CURRENT=""
+RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; CYA='\033[0;36m'; NC='\033[0m'
+PASS=0; FAIL=0; SKIP=0; CURRENT=""
 group(){ echo -e "\n${CYA}== $* ==${NC}"; }
 it(){ CURRENT="$1"; }
 pass(){ PASS=$((PASS + 1)); [ "$VERBOSE" = "1" ] && echo -e "  ${GRN}ok${NC} $CURRENT"; return 0; }
 fail(){ FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC} $CURRENT"; echo "       $*"; return 0; }
+# A third outcome, because "this host cannot run that check" is neither a pass
+# nor a failure. Counting it as a pass is how a suite reports coverage it does
+# not have; counting it as a failure would block every push on a box that is
+# simply missing an optional tool. It prints unconditionally -- a skip nobody
+# sees is the same as a green one.
+skip(){ SKIP=$((SKIP + 1)); echo -e "  ${YEL}SKIP${NC} $CURRENT"; echo "       $*"; return 0; }
 eq(){ [ "$1" = "$2" ] && pass || fail "expected '$2', got '$1'"; }
-ck(){ if "$@"; then pass; else fail "assertion failed"; fi; }
+# Echo the command on failure. Without it every ck failure read "assertion
+# failed" with no indication of which predicate in the chain gave way, on a
+# suite whose entire purpose is catching silent ones.
+ck(){ if "$@"; then pass; else fail "assertion failed: $*"; fi; }
 
 # ONE repo skeleton. gc-target.sh resolves its root from its own location, so a
 # fixture needs scripts/ beside target/ -- but it does not need a PRIVATE copy,
@@ -73,6 +82,25 @@ gc(){ ( cd "$ROOT" && bash scripts/gc-target.sh "$@" >/dev/null 2>&1 ); }
 have(){ [ -e "$ROOT/target/debug/deps/$1" ]; }
 gone(){ [ ! -e "$ROOT/target/debug/deps/$1" ]; }
 count_in(){ ls "$ROOT/$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+# survivors <name>... -- a bare name must SURVIVE, a !-prefixed one must be GONE.
+#
+# Replaces `ck test -n "$(have X && gone Y && echo y)"`. That idiom collapsed
+# the whole chain to "y" or "" BEFORE the assertion ran, so every failure read
+# `assertion failed: test -n` -- it could not say which file was wrong, or even
+# whether gc-target.sh had run at all. This checks each name and names every one
+# that came out on the wrong side, which is the entire point of a suite written
+# to catch failures that report success.
+survivors(){
+  local bad="" f
+  for f in "$@"; do
+    case "$f" in
+      '!'*) have "${f#!}" && bad="$bad ${f#!}(should be gone)" ;;
+      *)    have "$f"     || bad="$bad $f(missing)" ;;
+    esac
+  done
+  if [ -z "$bad" ]; then pass; else fail "wrong survivors:$bad"; fi
+}
 
 # =============================================================================
 group "gc-target.sh -- artifact selection"
@@ -101,22 +129,23 @@ gc --keep 1
 # The bug that hid for the script`s entire life: no extension, so a family regex
 # requiring a dot after the hash could not see these at all.
 it "collects extensionless unix executables"
-ck test -n "$(have oam-aaaaaaaaaaaaaaa3 && gone oam-aaaaaaaaaaaaaaa1 && gone oam-aaaaaaaaaaaaaaa2 && echo y)"
+survivors oam-aaaaaaaaaaaaaaa3 '!oam-aaaaaaaaaaaaaaa1' '!oam-aaaaaaaaaaaaaaa2'
 
 # Each extension is its own family. If they merged, keep=1 would leave only one
 # of these three rather than all three.
 it "groups dotted artifacts per-extension, separately from the bare executable"
-ck test -n "$(have grp-bbbbbbbbbbbbbbb2 && have grp-bbbbbbbbbbbbbbb2.d && have libgrp-ccccccccccccccc2.rlib && gone grp-bbbbbbbbbbbbbbb1 && gone grp-bbbbbbbbbbbbbbb1.d && echo y)"
+survivors grp-bbbbbbbbbbbbbbb2 grp-bbbbbbbbbbbbbbb2.d libgrp-ccccccccccccccc2.rlib \
+          '!grp-bbbbbbbbbbbbbbb1' '!grp-bbbbbbbbbbbbbbb1.d'
 
 # The safety invariant of a delete tool: a loosened regex would start removing
 # real files and the success message would look identical.
 it "never touches files without a 16-hex hash"
-ck test -n "$(have build_script_build-notahash.txt && have README && have libfoo.rlib && have oam-short123 && echo y)"
+survivors build_script_build-notahash.txt README libfoo.rlib oam-short123
 
 # The whole safety argument rests on newest-first ordering. mt-000...a is newer
 # but sorts FIRST by name, so a name-ordered prune keeps the wrong one.
 it "survivors are the newest by mtime, not by name"
-ck test -n "$(have mt-000000000000000a && gone mt-fffffffffffffff9 && echo y)"
+survivors mt-000000000000000a '!mt-fffffffffffffff9'
 
 # --- keep boundaries, one fixture and one run ---------------------------------
 reset_tree
@@ -127,10 +156,11 @@ plant target/debug/deps 3 xtask-ccccccccccccccc4
 gc --keep 2
 
 it "keeps exactly --keep per family and drops the oldest beyond it"
-ck test -n "$(have xtask-ccccccccccccccc3 && have xtask-ccccccccccccccc4 && gone xtask-ccccccccccccccc1 && gone xtask-ccccccccccccccc2 && echo y)"
+survivors xtask-ccccccccccccccc3 xtask-ccccccccccccccc4 \
+          '!xtask-ccccccccccccccc1' '!xtask-ccccccccccccccc2'
 
 it "a family at exactly --keep loses nothing"
-ck test -n "$(have e2e-ddddddddddddddd1 && have e2e-ddddddddddddddd2 && echo y)"
+survivors e2e-ddddddddddddddd1 e2e-ddddddddddddddd2
 
 # --- every configured tree is collected, not just target/debug ----------------
 # TREES carries the win-x64 leg (built WITHOUT --target, so no triple
@@ -147,7 +177,10 @@ plant target/x64-host/x86_64-apple-darwin/release/deps 1 oam-6666666666666666
 gc --keep 1
 
 it "prunes every configured tree in one run, not just target/debug"
-ck test "$(count_in target/debug/deps)$(count_in target/x64-host/release/deps)$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" = "111"
+# Labelled rather than a bare "111": the counts are compared as one value so a
+# single `it` books a single result, but an unpruned tree has to say WHICH tree.
+eq "debug=$(count_in target/debug/deps) win-x64=$(count_in target/x64-host/release/deps) mac-x64=$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" \
+   "debug=1 win-x64=1 mac-x64=1"
 
 # =============================================================================
 group "gc-target.sh -- portability and safety"
@@ -169,12 +202,20 @@ else pass; fi
 # just runs whatever `awk` already resolves to, N times, and proves nothing.
 it "selection is identical under every awk installed here"
 AWK_TESTED=""
+AWK_BAD=0
 for AWKBIN in mawk gawk original-awk busybox; do
   AWKPATH="$(command -v "$AWKBIN" 2>/dev/null)" || continue
   [ -n "$AWKPATH" ] || continue
   SHIM="$SUITE_TMP/shim-$AWKBIN"
   mkdir -p "$SHIM"
-  printf '#!/bin/sh\nexec %s "$@"\n' "$AWKPATH" > "$SHIM/awk"
+  # busybox is a multi-call dispatcher: it behaves as awk only when invoked AS
+  # awk. `exec busybox "$@"` hands it the gc-target argv with argv[0]=busybox,
+  # so it prints its own usage and the leg fails for a reason that has nothing
+  # to do with awk dialects. Every other candidate is already an awk.
+  case "$AWKBIN" in
+    busybox) printf '#!/bin/sh\nexec %s awk "$@"\n' "$AWKPATH" > "$SHIM/awk" ;;
+    *)       printf '#!/bin/sh\nexec %s "$@"\n'     "$AWKPATH" > "$SHIM/awk" ;;
+  esac
   chmod +x "$SHIM/awk"
   reset_tree
   plant target/debug/deps 0 oam-eeeeeeeeeeeeeee1
@@ -182,9 +223,24 @@ for AWKBIN in mawk gawk original-awk busybox; do
   ( cd "$ROOT" && PATH="$SHIM:$PATH" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
   AWK_TESTED="$AWK_TESTED $AWKBIN"
   have oam-eeeeeeeeeeeeeee2 && gone oam-eeeeeeeeeeeeeee1 \
-    || fail "$AWKBIN selected wrongly: $(ls "$ROOT/target/debug/deps" | tr '\n' ' ')"
+    || { AWK_BAD=1; fail "$AWKBIN selected wrongly: $(ls "$ROOT/target/debug/deps" | tr '\n' ' ')"; }
 done
-[ -n "$AWK_TESTED" ] && pass || fail "no awk implementation found to test with"
+# A wrong selection has already been reported per-awk above; recording a pass
+# on top of it booked one `it` as both a failure and a success.
+if [ "$AWK_BAD" = "1" ]; then :
+elif [ -n "$AWK_TESTED" ]; then pass
+else fail "no awk implementation found to test with"; fi
+
+# mawk is the entire reason the guard above exists -- it is Ubuntu's default
+# and the GCP builder's, and it matches NOTHING for an interval expression
+# rather than erroring. The loop above silently covers whatever happens to be
+# installed, so on a host without mawk it reports a pass having never run the
+# implementation the 16GB bug came from. Name that gap instead of hiding it.
+it "mawk itself was available to test against"
+case " $AWK_TESTED " in
+  *" mawk "*) pass ;;
+  *) skip "mawk is not installed on this host, so the dialect that caused the original bug went untested; the source-level interval check above is the only mawk protection here" ;;
+esac
 
 it "--dry-run deletes nothing"
 reset_tree
@@ -203,7 +259,7 @@ plant target/debug/deps 0 oam-7777777777777771
 plant target/debug/deps 1 oam-7777777777777772
 [ -d "$ROOT/.git" ] && fail "fixture unexpectedly has .git"
 ( cd "$HOME" && bash "$ROOT/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1 )
-ck test -n "$(have oam-7777777777777772 && gone oam-7777777777777771 && echo y)"
+survivors oam-7777777777777772 '!oam-7777777777777771'
 
 # A freshly imaged builder has no target/ at all; cleanup must not fail a run.
 it "an absent target/ is a clean no-op, not an error"
@@ -310,8 +366,18 @@ else fail "empty/non-numeric readings must be inert"; fi
 
 # =============================================================================
 echo
+# A skip is carried into the summary rather than swallowed: "all N passed" on a
+# run that quietly skipped the mawk leg is the same overclaim the suite exists
+# to prevent. Skips do not fail the run -- a missing optional tool is not a
+# regression -- but they are never invisible.
+SKIP_NOTE=""
+[ "$SKIP" -gt 0 ] && SKIP_NOTE=", ${SKIP} skipped"
 if [ "$FAIL" -gt 0 ]; then
-  echo -e "${RED}$FAIL failed${NC}, $PASS passed"
+  echo -e "${RED}$FAIL failed${NC}, $PASS passed${SKIP_NOTE}"
   exit 1
 fi
-echo -e "${GRN}all $PASS passed${NC}"
+if [ "$SKIP" -gt 0 ]; then
+  echo -e "${GRN}$PASS passed${NC}${YEL}${SKIP_NOTE}${NC}"
+else
+  echo -e "${GRN}all $PASS passed${NC}"
+fi
