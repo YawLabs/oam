@@ -167,6 +167,20 @@ smoke() {
   fi
   rm -rf "$d"
   [ "$out" = "ci smoke 42" ] || fail "smoke output unexpected from $bin: '$out'"
+  # Windows assets only: a .exe that imports the dynamic CRT needs the VC++
+  # redistributable, which install.ps1 neither ships nor checks for. It smokes
+  # green on THIS box (Visual Studio installed the redist here) and fails at
+  # startup on a clean machine, so it has to be checked, not run. The mac/linux
+  # assets are smoked on their own hosts by build-remote.sh and never land here.
+  case "$bin" in
+    *.exe)
+      # Self-check before the verdict is trusted: every bug this checker has had
+      # degenerated it toward always-passing, which is indistinguishable from a
+      # clean asset in the release log.
+      assert_static_crt_canary || fail "CRT-linkage self-check failed -- see above"
+      assert_static_crt "$bin" || fail "CRT-linkage gate failed for $bin"
+      ;;
+  esac
   ok "smoke ok ($bin)"
 }
 
@@ -212,6 +226,9 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
 # panes execute, and killing them makes them all restart into that same window.
 # shellcheck source=lib/build-locks.sh
 . "$SCRIPT_DIR/lib/build-locks.sh"
+# Asserted by smoke() below, for the Windows assets only.
+# shellcheck source=lib/crt-linkage.sh
+. "$SCRIPT_DIR/lib/crt-linkage.sh"
 
 # free_locked_binary <path> -- park it, or die with something actionable.
 free_locked_binary() {
@@ -486,11 +503,21 @@ else
   # holder. x64-host's trees are isolated from the native ones by CARGO_TARGET_DIR
   # -- nothing live ever runs out of this tree -- so a holder here is an orphan
   # of an earlier aborted x64 build, not a typed-cli session.
-  free_locked_binary target/x64-host/x86_64-pc-windows-msvc/release/oam.exe
-  free_locked_binary target/x64-host/x86_64-pc-windows-msvc/release/deps/oam.exe
+  free_locked_binary target/x64-host/release/oam.exe
+  free_locked_binary target/x64-host/release/deps/oam.exe
+  # No --target, deliberately: the +stable-x86_64-pc-windows-msvc toolchain
+  # already builds for x86_64-pc-windows-msvc, so naming it was redundant --
+  # but not harmless. Passing --target splits cargo's unit graph into host and
+  # target halves and withholds [target.<triple>].rustflags from the host half,
+  # which is where BUILD SCRIPTS live. oam_engine's build script links V8 to
+  # generate the startup snapshot, so with --target it linked V8's /MT objects
+  # against the dynamic CRT and emitted the LNK4098 that .cargo/config.toml
+  # exists to prevent. Without the flag this leg is a plain native build,
+  # identical in shape to the aarch64 one above, and its output flattens back
+  # to target/x64-host/release (mirrored in scripts/gc-target.sh's TREES).
   CARGO_TARGET_DIR=target/x64-host \
-    cargo +stable-x86_64-pc-windows-msvc build --release --target x86_64-pc-windows-msvc -p oam_cli
-  cp target/x64-host/x86_64-pc-windows-msvc/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
+    cargo +stable-x86_64-pc-windows-msvc build --release -p oam_cli
+  cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"   # runs under the OS's x64 emulation
 fi
 
