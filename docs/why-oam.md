@@ -92,8 +92,10 @@ peak throughput, and it is why the numbers above are the ones that matter.
 
 `oam:mcp` is a built-in module, so a server does not install an SDK to speak the
 protocol. Yaw MCP runs its sidecars on oam by default, and every oam release is
-gated on a matrix that boots each one and calls a real tool
-(`scripts/mcp-sidecar-matrix.mjs`).
+gated on a matrix that boots each one and requires it to serve a non-empty tool
+list (`scripts/mcp-sidecar-matrix.mjs`). Booting is not enough — a sidecar that
+starts and advertises nothing is still broken — but note the gate stops at
+`tools/list` and does not invoke a tool.
 
 ## Honesty notes
 

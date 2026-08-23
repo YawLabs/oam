@@ -38,8 +38,21 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-// The oam-hosted set from bundles.json. `github` is docker-hosted and never
-// rewritten; lemonsqueezy and ctxlint have not been opted in.
+// The oam-hosted set from bundles.json. `github` is the only exclusion left:
+// it is docker-hosted, and the rewrite only ever touches node/npx launches.
+//
+// lemonsqueezy and ctxlint used to be excluded as "not opted in" -- true when
+// `runtime: "oam"` had to be set per server, and stale since Yaw MCP 0.74.1
+// made an UNSET runtime resolve to oam. Neither carries the key, and both are
+// oam-hosted today, so leaving them out meant the release gate under-tested the
+// real set by two.
+//
+// `args` are the launch args that follow the package spec, and ctxlint is the
+// only sidecar that has any (`npx -y @yawlabs/ctxlint@latest serve`). That
+// makes it the only entry exercising the `--` separator the rewrite emits, so
+// it is doing double duty here: without it the harness never sends script args
+// at all, and `oam run <entry> -- <args>` reaching a live stdio MCP server goes
+// untested end to end (the argv plumbing alone is covered by e2e.rs).
 //
 // `env` supplies the configuration a sidecar refuses to START without. These
 // are placeholders pointing at nothing, and that is fine: the matrix asks
@@ -59,6 +72,8 @@ const SIDECARS = [
   },
   { name: "puppeteer", pkg: "@modelcontextprotocol/server-puppeteer" },
   { name: "playwright", pkg: "@playwright/mcp" },
+  { name: "lemonsqueezy", pkg: "@yawlabs/lemonsqueezy-mcp" },
+  { name: "ctxlint", pkg: "@yawlabs/ctxlint", args: ["serve"] },
 ];
 
 const BOOT_TIMEOUT_MS = 90_000;
@@ -324,9 +339,15 @@ function resolveBin(pkg) {
 
 /** Speak MCP over stdio to a sidecar hosted on oam. Resolves with the tool
  *  names it serves, or rejects with why it could not. */
-function probe(entry, extraEnv = {}) {
+function probe(entry, extraEnv = {}, scriptArgs = []) {
+  // `--` is REQUIRED before script args: `oam run` declares script_args with
+  // clap's `last = true`, so `oam run entry.js serve` is "unexpected argument".
+  // This mirrors oam-spawn.ts exactly (`["run", entry, "--", ...rest]` when
+  // rest is non-empty, a bare `["run", entry]` when it is not) -- a harness
+  // that always appended `--` would still pass while production differs.
+  const argv = scriptArgs.length > 0 ? ["run", entry, "--", ...scriptArgs] : ["run", entry];
   return new Promise((resolveP) => {
-    const child = spawn(oamBin, ["run", entry], {
+    const child = spawn(oamBin, argv, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, NO_COLOR: "1", ...extraEnv },
     });
@@ -430,7 +451,7 @@ for (const s of selected) {
     continue;
   }
   process.stderr.write(`  ${s.name.padEnd(12)} probing... `);
-  const r = await probe(entry, s.env ?? {});
+  const r = await probe(entry, s.env ?? {}, s.args ?? []);
   if (r.ok) {
     process.stderr.write(`\r  ${s.name.padEnd(12)} PASS  ${r.tools.length} tools\n`);
     results.push({ ...s, state: "pass", tools: r.tools.length });
