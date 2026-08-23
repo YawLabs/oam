@@ -795,15 +795,30 @@ pub(crate) fn capture_version(exe: &Path, args: &[&str]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The commit these receipts were measured against.
+///
+/// Receipts are regenerated and committed in the SAME commit as the code they
+/// describe, so at generation time HEAD is still the PARENT -- a reader
+/// following `node_compat.js@<commit>:<line>` from an unqualified stamp lands
+/// on the previous tree's line numbers. A dirty tree therefore gets a `+wip`
+/// suffix, which says plainly that the numbers describe the tree ON TOP of
+/// that commit rather than the commit itself.
 pub(crate) fn git_short_commit(repo: &Path) -> String {
-    Command::new("git")
+    let short = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(repo)
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .is_some_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
+    if dirty { format!("{short}+wip") } else { short }
 }
 
 pub(crate) struct Captured {

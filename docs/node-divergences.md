@@ -521,23 +521,29 @@ both behave; only the `end(cb)` shorthand differs.
 
 ## Platform constant tables
 
-`os.constants.errno` and `os.constants.signals` are a single compiled-in POSIX/Linux table
-with no per-platform branch _(source: `js/node_compat.js`)_. Node derives them from the
-host. They agree on Linux; they diverge elsewhere.
+`os.constants.signals` is a single compiled-in POSIX/Linux table with no per-platform
+branch _(source: `js/node_compat.js`)_. Node derives it from the host. It agrees on Linux;
+it diverges elsewhere. (`os.constants.errno` used to have the same problem — see below.)
 
-### 13. `os.constants.errno` magnitudes differ on Windows
+### 13. `os.constants.errno` — FIXED, no longer a divergence
 
-_(Windows-verified.)_ oam exposes 79 entries, Node-on-Windows exposes 134.
+_(Windows-verified; unix by construction.)_ This entry used to record that oam shipped one
+Linux table on every host: 79 entries against Node-on-Windows' 134, with 44 shared names
+carrying Linux numbers (`ECONNREFUSED` 111 vs 107, `EWOULDBLOCK` 11 vs 140), none of Node's
+58 `WSA*` names, and three Unix-only names Node-on-Windows does not have.
 
-- **44 shared names carry different numbers.** `ECONNREFUSED` is 111 in oam (Linux) and
-  107 in Node-on-Windows; `ETIMEDOUT` 110 vs 138; `EWOULDBLOCK` 11 vs 140. The low
-  classics agree — `EPERM` 1, `ENOENT` 2, `EAGAIN` 11.
-- **oam has none of Node's 58 `WSA*` entries** (`WSAECONNREFUSED`, `WSAETIMEDOUT`, ...).
-- oam carries `EDQUOT`, `EMULTIHOP`, `ESTALE`, which Node-on-Windows does not.
+It is now the host's own table. On unix the numbers come from `libc` in
+`crates/oam_engine/src/node_ops.rs`, so the **compiler** resolves each constant for the
+target being built and darwin can no longer inherit linux's values — a name that does not
+exist on a target is a build error rather than a wrong number at runtime. On Windows, where
+`libc` is deliberately not a dependency, it is the fixed MSVC CRT + Winsock set, pinned
+key-for-key against real Node by a conformance case. Measured on Windows: 134/134 entries,
+zero value mismatches.
 
-By inspection the macOS table diverges too, for the same reason. Compare `err.code`
-strings, not `os.constants.errno` numbers — the string codes on thrown errors are correct
-on every platform.
+The same source feeds the libuv error table behind `util.getSystemErrorName` /
+`getSystemErrorMessage` / `getSystemErrorMap`, which is built by libuv's own rule — negate
+the platform's errno where it has one, else take libuv's fixed constant — rather than a
+per-platform transcription.
 
 ### 14. `os.constants.signals` is the POSIX set everywhere
 
@@ -630,7 +636,7 @@ Measured on all three release platforms:
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1365 / 1874 | 409 | 100 | 13 |
+| windows-aarch64 (Node v22.22.2) | 1423 / 1874 | 351 | 100 | 13 |
 | linux-x64 (Node v22.23.1) | 1422 / 1888 | 366 | 100 | 13 |
 | darwin-arm64 (Node v22.23.1) | 1422 / 1884 | 362 | 100 | 13 |
 
@@ -640,11 +646,13 @@ Node versions differ between hosts, which is part of why the totals do — the g
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
 
-Windows is the worst of the three by ~45 names, and all of that difference is
-`node:constants`: Windows Node publishes the 113-name `WSA*` errno block, which has no
-POSIX counterpart. Outside `constants` the three platforms have the *same* gaps, name for
-name — including `node:process`, whose POSIX-only `getuid`/`setgid`/`initgroups` family
-oam implements in full.
+Windows used to be the worst of the three by ~45 names, all of it `node:constants`:
+Windows Node publishes a `WSA*` errno block with no POSIX counterpart, and oam published
+none of it. oam now carries the Winsock names along with the rest of the host's errno
+table (divergence 13 above), which closed 58 of those gaps and puts Windows ahead of the
+other two. Outside `constants` the three platforms have the *same* gaps, name for name —
+including `node:process`, whose POSIX-only `getuid`/`setgid`/`initgroups` family oam
+implements in full.
 
 Every absent name is enumerated in
 [`conformance/surface-gaps.json`](../conformance/surface-gaps.json), which **gates**:
