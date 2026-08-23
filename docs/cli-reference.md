@@ -30,9 +30,10 @@ Notable ones:
 | Flag | Notes |
 |---|---|
 | `--permission` | Denies everything, then grants back with the `--allow-*` flags below. |
-| `--allow-fs-read=<paths>` / `--allow-fs-write=<paths>` | `*` for everything, otherwise a comma-separated allow-list. |
+| `--allow-fs-read=<paths>` / `--allow-fs-write=<paths>` | `*` for everything, otherwise a comma-separated allow-list. Both take the list with `=`; neither has a bare form. |
+| `--allow-net[=<hosts>]` / `--allow-env[=<names>]` | Bare grants everything; the `=` form takes a comma-separated allow-list. |
 | `--allow-child-process` | Spawning **and** `process.execve`, which replaces the image. |
-| `--allow-worker` | Implies child-process: a worker can spawn. |
+| `--allow-worker` | Starting a `worker_threads` Worker or an `oam.fork()` isolate. Does **not** imply `--allow-child-process` — a child isolate inherits the parent's permissions, so it cannot spawn unless the parent could. |
 | `--allow-addons` | Loading native addons. |
 | `--experimental-vm-modules` | Enables `vm.SourceTextModule`. |
 | `--expose-internals` | Resolves `internal/*` from the builtin registry. |
