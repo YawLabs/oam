@@ -7175,6 +7175,90 @@ fn process_versions_honest_keys() {
 }
 
 #[test]
+fn process_versions_ada_is_the_vendored_cpp_version() {
+    // The ada-url CRATE version and the ada C++ version it vendors are
+    // DIFFERENT numbers (3.4.5 vs 3.4.4 at the time of writing), and both are
+    // shaped like a version -- so the regex check in
+    // process_versions_honest_keys passes either way. Publishing the crate
+    // number under a key node owns would be a quiet lie about which parser is
+    // linked, which is exactly what oam_engine/build.rs's ada_version() exists
+    // to prevent. This recomputes the honest answer from the same two sources
+    // build.rs reads (the lockfile pin, then that crate's own deps/ada.h) and
+    // compares -- the duplicated lookup IS the oracle, so a refactor that
+    // reached for the crate version instead would fail here.
+    //
+    // node cannot serve as the oracle: its `ada` is its OWN vendored ada, an
+    // unrelated number. Hence an e2e assertion rather than a conformance case.
+    let lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+    )
+    .expect("read Cargo.lock");
+    let mut crate_version = None;
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "name = \"ada-url\"" {
+            continue;
+        }
+        for follow in lines.by_ref() {
+            if let Some(v) = follow.trim().strip_prefix("version = \"") {
+                crate_version = Some(v.trim_end_matches('"').to_string());
+                break;
+            }
+        }
+        break;
+    }
+    let crate_version = crate_version.expect("ada-url pinned in Cargo.lock");
+
+    let cargo_home = std::env::var("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            #[allow(deprecated)]
+            std::env::home_dir().expect("home dir").join(".cargo")
+        });
+    let registry = cargo_home.join("registry").join("src");
+    let header = match std::fs::read_dir(&registry) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| {
+                e.path()
+                    .join(format!("ada-url-{crate_version}"))
+                    .join("deps")
+                    .join("ada.h")
+            })
+            .find(|p| p.is_file()),
+        // A vendored / offline checkout has no registry to read. build.rs
+        // already fails loudly in that case, so skipping here beats a red test
+        // that says nothing about the runtime.
+        Err(_) => None,
+    };
+    let Some(header) = header else {
+        eprintln!("skipping: ada-url-{crate_version} not unpacked in the cargo registry");
+        return;
+    };
+    let text = std::fs::read_to_string(&header).expect("read deps/ada.h");
+    let vendored = text
+        .lines()
+        .find_map(|l| l.strip_prefix("#define ADA_VERSION \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("ADA_VERSION in deps/ada.h");
+
+    let stdout = run_ok("ada_version.mjs", "console.log(process.versions.ada);");
+    let published = stdout.trim();
+    assert_eq!(
+        published,
+        vendored,
+        "process.versions.ada must be the VENDORED C++ ada version from \
+         {}, not the ada-url crate version ({crate_version})",
+        header.display()
+    );
+    assert_ne!(
+        published, crate_version,
+        "process.versions.ada is the ada-url CRATE version -- it must be the \
+         vendored C++ ADA_VERSION instead"
+    );
+}
+
+#[test]
 fn process_identity_properties_are_read_only() {
     // Node defines its identity/build metadata with writable:false, and
     // test-process-versions asserts exactly that for every process.versions

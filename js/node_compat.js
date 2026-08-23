@@ -586,7 +586,11 @@
   });
   // ---- RangeError family ----
   codes.ERR_OUT_OF_RANGE = E("ERR_OUT_OF_RANGE", RangeError, function(name, range, received) {
-    return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + received;
+    // -0 has to be spelled out: String(-0) is "0", so a caller that passed
+    // negative zero would read a message naming a value it did not pass.
+    // Node distinguishes them here too.
+    const shown = Object.is(received, -0) ? "-0" : received;
+    return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + shown;
   });
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
@@ -4064,45 +4068,11 @@
     return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
   }
 
-  // os.constants.errno is POSITIVE in Node (POSIX errno; ENOENT=2), unlike the
-  // libuv-negative codes used elsewhere. Flip the sign of the negative table.
-  function positiveErrno(table) {
-    const out = {};
-    for (const k of Object.keys(table)) out[k] = -table[k];
-    return out;
-  }
-
-  // The POSIX errno numbers, NEGATED (the form libuv uses on unix). Single
-  // source for both os.constants.errno (flipped positive by positiveErrno
-  // above) and the libuv error table below, so the two can never disagree
-  // about what ENOENT is.
-  const NEGATIVE_POSIX_ERRNO = {
-    E2BIG: -7, EACCES: -13, EADDRINUSE: -98, EADDRNOTAVAIL: -99,
-    EAFNOSUPPORT: -97, EAGAIN: -11, EALREADY: -114, EBADF: -9,
-    EBADMSG: -74, EBUSY: -16, ECANCELED: -125, ECHILD: -10,
-    ECONNABORTED: -103, ECONNREFUSED: -111, ECONNRESET: -104,
-    EDEADLK: -35, EDESTADDRREQ: -89, EDOM: -33, EDQUOT: -122,
-    EEXIST: -17, EFAULT: -14, EFBIG: -27, EHOSTUNREACH: -113,
-    EIDRM: -43, EILSEQ: -84, EINPROGRESS: -115, EINTR: -4,
-    EINVAL: -22, EIO: -5, EISCONN: -106, EISDIR: -21,
-    ELOOP: -40, EMFILE: -24, EMLINK: -31, EMSGSIZE: -90,
-    EMULTIHOP: -72, ENAMETOOLONG: -36, ENETDOWN: -100,
-    ENETRESET: -102, ENETUNREACH: -101, ENFILE: -23, ENOBUFS: -105,
-    ENODATA: -61, ENODEV: -19, ENOENT: -2, ENOEXEC: -8,
-    ENOLCK: -37, ENOLINK: -67, ENOMEM: -12, ENOMSG: -42,
-    ENOPROTOOPT: -92, ENOSPC: -28, ENOSR: -63, ENOSTR: -60,
-    ENOSYS: -38, ENOTCONN: -107, ENOTDIR: -20, ENOTEMPTY: -39,
-    ENOTSOCK: -88, ENOTSUP: -95, ENOTTY: -25, ENXIO: -6,
-    EOPNOTSUPP: -95, EOVERFLOW: -75, EPERM: -1, EPIPE: -32,
-    EPROTO: -71, EPROTONOSUPPORT: -93, EPROTOTYPE: -91,
-    ERANGE: -34, EROFS: -30, ESPIPE: -29, ESRCH: -3,
-    ESTALE: -116, ETIME: -62, ETIMEDOUT: -110, ETXTBSY: -26,
-    EWOULDBLOCK: -11, EXDEV: -18,
-  };
-
-  // libuv error strings, keyed by code. Platform-independent in libuv
-  // (uv_strerror returns the same text everywhere), so one table serves
-  // every host.
+  // libuv error strings, keyed by code. This list is the AUTHORITY on which
+  // codes libuv exposes -- the platform tables below only supply the NUMBER --
+  // so a code absent here is absent from the map on every platform. The text
+  // is platform-independent in libuv (uv_strerror returns the same string
+  // everywhere), so one table serves every host.
   const UV_ERROR_MESSAGES = {
     E2BIG: "argument list too long", EACCES: "permission denied",
     EADDRINUSE: "address already in use", EADDRNOTAVAIL: "address not available",
@@ -4159,69 +4129,108 @@
     EUNATCH: "protocol driver not attached",
   };
 
-  // Codes libuv assigns a FIXED number on every platform, because there is no
-  // POSIX errno to borrow: the getaddrinfo/resolver codes (-3000 range) and
-  // libuv own EOF / UNKNOWN / ECHARSET (-4095..-4080).
-  const UV_PLATFORM_INDEPENDENT_ERRNO = {
-    EAI_ADDRFAMILY: -3000, EAI_AGAIN: -3001, EAI_BADFLAGS: -3002,
-    EAI_BADHINTS: -3013, EAI_CANCELED: -3003, EAI_FAIL: -3004,
-    EAI_FAMILY: -3005, EAI_MEMORY: -3006, EAI_NODATA: -3007,
-    EAI_NONAME: -3008, EAI_OVERFLOW: -3009, EAI_PROTOCOL: -3014,
-    EAI_SERVICE: -3010, EAI_SOCKTYPE: -3011,
-    EOF: -4095, UNKNOWN: -4094, ECHARSET: -4080,
-  };
-
-  // Windows has no POSIX errno for libuv to negate, so libuv defines its own
-  // -4000-range constants there (uv/errno.h). These are compile-time
-  // constants of libuv itself, identical in every Windows build -- the same
-  // source and the same numbers as the 22-entry table oam_core::node_errno
-  // already uses to stamp `err.errno`, extended to the full set.
-  const UV_WIN32_ERRNO = {
+  // libuv's FALLBACK number for each code: the value it uses when the host has
+  // no POSIX errno to borrow. uv/errno.h is one macro per code, all the same
+  // shape --
+  //
+  //   #if defined(EACCES) && !defined(_WIN32)
+  //   # define UV__EACCES (-EACCES)
+  //   #else
+  //   # define UV__EACCES (-4092)
+  //   #endif
+  //
+  // -- so Windows takes the fallback for EVERY code (it is `_WIN32`), and unix
+  // takes it only for codes the platform does not define (EOF, UNKNOWN,
+  // ECHARSET and the EAI_* resolver errors have no POSIX errno anywhere, so
+  // they take it everywhere). One table, applied by that one rule, instead of
+  // a hand-maintained per-platform transcription.
+  const UV_FALLBACK_ERRNO = {
     E2BIG: -4093, EACCES: -4092, EADDRINUSE: -4091, EADDRNOTAVAIL: -4090,
-    EAFNOSUPPORT: -4089, EAGAIN: -4088, EALREADY: -4084, EBADF: -4083,
-    EBUSY: -4082, ECANCELED: -4081, ECONNABORTED: -4079, ECONNREFUSED: -4078,
-    ECONNRESET: -4077, EDESTADDRREQ: -4076, EEXIST: -4075, EFAULT: -4074,
-    EFBIG: -4036, EHOSTUNREACH: -4073, EILSEQ: -4027, EINTR: -4072,
-    EINVAL: -4071, EIO: -4070, EISCONN: -4069, EISDIR: -4068,
-    ELOOP: -4067, EMFILE: -4066, EMLINK: -4032, EMSGSIZE: -4065,
-    ENAMETOOLONG: -4064, ENETDOWN: -4063, ENETUNREACH: -4062, ENFILE: -4061,
-    ENOBUFS: -4060, ENODATA: -4024, ENODEV: -4059, ENOENT: -4058,
-    ENOEXEC: -4022, ENOMEM: -4057, ENOPROTOOPT: -4035, ENOSPC: -4055,
-    ENOSYS: -4054, ENOTCONN: -4053, ENOTDIR: -4052, ENOTEMPTY: -4051,
-    ENOTSOCK: -4050, ENOTSUP: -4049, ENOTTY: -4029, ENXIO: -4033,
-    EOVERFLOW: -4026, EPERM: -4048, EPIPE: -4047, EPROTO: -4046,
-    EPROTONOSUPPORT: -4045, EPROTOTYPE: -4044, ERANGE: -4034, EROFS: -4043,
-    ESPIPE: -4041, ESRCH: -4040, ETIMEDOUT: -4039, ETXTBSY: -4038,
-    EXDEV: -4037, EFTYPE: -4028, EHOSTDOWN: -4031, ENONET: -4056,
-    EREMOTEIO: -4030, ESHUTDOWN: -4042, ESOCKTNOSUPPORT: -4025,
-    EUNATCH: -4023,
+    EAFNOSUPPORT: -4089, EAGAIN: -4088, EAI_ADDRFAMILY: -3000, EAI_AGAIN: -3001,
+    EAI_BADFLAGS: -3002, EAI_BADHINTS: -3013, EAI_CANCELED: -3003, EAI_FAIL: -3004,
+    EAI_FAMILY: -3005, EAI_MEMORY: -3006, EAI_NODATA: -3007, EAI_NONAME: -3008,
+    EAI_OVERFLOW: -3009, EAI_PROTOCOL: -3014, EAI_SERVICE: -3010, EAI_SOCKTYPE: -3011,
+    EALREADY: -4084, EBADF: -4083, EBUSY: -4082, ECANCELED: -4081, ECHARSET: -4080,
+    ECONNABORTED: -4079, ECONNREFUSED: -4078, ECONNRESET: -4077, EDESTADDRREQ: -4076,
+    EEXIST: -4075, EFAULT: -4074, EFBIG: -4036, EFTYPE: -4028, EHOSTDOWN: -4031,
+    EHOSTUNREACH: -4073, EILSEQ: -4027, EINTR: -4072, EINVAL: -4071, EIO: -4070,
+    EISCONN: -4069, EISDIR: -4068, ELOOP: -4067, EMFILE: -4066, EMLINK: -4032,
+    EMSGSIZE: -4065, ENAMETOOLONG: -4064, ENETDOWN: -4063, ENETUNREACH: -4062,
+    ENFILE: -4061, ENOBUFS: -4060, ENODATA: -4024, ENODEV: -4059, ENOENT: -4058,
+    ENOEXEC: -4022, ENOMEM: -4057, ENONET: -4056, ENOPROTOOPT: -4035, ENOSPC: -4055,
+    ENOSYS: -4054, ENOTCONN: -4053, ENOTDIR: -4052, ENOTEMPTY: -4051, ENOTSOCK: -4050,
+    ENOTSUP: -4049, ENOTTY: -4029, ENXIO: -4033, EOF: -4095, EOVERFLOW: -4026,
+    EPERM: -4048, EPIPE: -4047, EPROTO: -4046, EPROTONOSUPPORT: -4045, EPROTOTYPE: -4044,
+    ERANGE: -4034, EREMOTEIO: -4030, EROFS: -4043, ESHUTDOWN: -4042,
+    ESOCKTNOSUPPORT: -4025, ESPIPE: -4041, ESRCH: -4040, ETIMEDOUT: -4039, ETXTBSY: -4038,
+    EUNATCH: -4023, EXDEV: -4037, UNKNOWN: -4094
   };
 
-  // The platform real libuv error table -- the inverse of the numbers oam
-  // stamps onto `err.errno`, and the single source behind
-  // util.getSystemErrorName / getSystemErrorMap.
-  //
-  // On unix libuv defines UV_E<X> as -E<X>, so the table IS the negated POSIX
-  // errno set -- correct by construction rather than transcribed. On Windows
-  // libuv has no errno to borrow and uses its own -4000-range constants.
-  //
-  // Codes oam has no verified number for on a given platform are OMITTED
-  // rather than guessed, the same rule the rest of this file follows: an
-  // absent entry degrades to node own "Unknown system error N" fallback,
-  // while a wrong one would put a real-looking name on the wrong failure.
-  function uvErrnoTable(platform) {
-    const base = platform === "win32" ? UV_WIN32_ERRNO : NEGATIVE_POSIX_ERRNO;
-    const out = new Map();
-    for (const table of [base, UV_PLATFORM_INDEPENDENT_ERRNO]) {
-      for (const code of Object.keys(table)) {
-        const message = UV_ERROR_MESSAGES[code];
-        if (message === undefined) continue;
-        // First writer wins: EWOULDBLOCK/EOPNOTSUPP alias EAGAIN/ENOTSUP on
-        // the same number, and node reports the primary name for it.
-        if (!out.has(table[code])) out.set(table[code], [code, message]);
-      }
+  // node's os.constants members are read-only and non-configurable data
+  // properties, not plain object keys. Same shape here.
+  function constantBag(table) {
+    const out = {};
+    for (const key of Object.keys(table)) {
+      Object.defineProperty(out, key, {
+        value: table[key],
+        writable: false,
+        enumerable: true,
+        configurable: false,
+      });
     }
     return out;
+  }
+
+  // The host's POSIX errno numbers, from oam_engine (libc, resolved per-target
+  // by the compiler). Parsed once.
+  let posixErrnoCache;
+  function posixErrno(natives) {
+    if (posixErrnoCache === undefined) posixErrnoCache = JSON.parse(natives.posixErrno);
+    return posixErrnoCache;
+  }
+
+  // The host's real libuv error table -- the inverse of the numbers oam stamps
+  // onto `err.errno`, and the single source behind util.getSystemErrorName /
+  // getSystemErrorMessage / getSystemErrorMap.
+  //
+  // Built by libuv's own rule (see UV_FALLBACK_ERRNO): negate the platform's
+  // errno where it has one, else take libuv's fixed value. Nothing here is
+  // transcribed per platform, so darwin cannot inherit linux's numbers -- the
+  // failure mode this replaced, where a macOS ECONNREFUSED (-61) decoded as
+  // "ENODATA" because the table held linux's values.
+  //
+  // Memoized: the platform cannot change within a process, and rebuilding an
+  // 85-entry Map on every getSystemErrorName call made error formatting
+  // hundreds of times slower than node's.
+  let uvErrnoCache;
+  function uvErrnoTable(natives) {
+    if (uvErrnoCache !== undefined) return uvErrnoCache;
+    // Windows is `_WIN32` in every one of those macros, so it never borrows a
+    // CRT errno even for codes the CRT defines.
+    const posix = natives.platform === "win32" ? null : posixErrno(natives);
+    const out = new Map();
+    for (const code of Object.keys(UV_ERROR_MESSAGES)) {
+      const hosted = posix === null ? undefined : posix[code];
+      const number = hosted === undefined ? UV_FALLBACK_ERRNO[code] : -hosted;
+      if (number === undefined) continue;
+      out.set(number, [code, UV_ERROR_MESSAGES[code]]);
+    }
+    uvErrnoCache = out;
+    return out;
+  }
+
+  // node validates before it looks up: a non-number is ERR_INVALID_ARG_TYPE and
+  // anything that is not a negative safe integer (0, a positive, -0, NaN,
+  // Infinity, 2.5) is ERR_OUT_OF_RANGE. Returning a plausible
+  // "Unknown system error [object Object]" string instead turns a caller that
+  // passed the ERROR rather than its errno into a corrupted log line.
+  function validateErrno(err, name, codes) {
+    if (typeof err !== "number") {
+      throw new codes.ERR_INVALID_ARG_TYPE(name, "number", err);
+    }
+    if (!(err < 0) || !Number.isSafeInteger(err)) {
+      throw new codes.ERR_OUT_OF_RANGE(name, "a negative integer", err);
+    }
   }
 
   // ------------------------------------------------------------------- os
@@ -4284,7 +4293,11 @@
           SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
           SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
         },
-        errno: positiveErrno(NEGATIVE_POSIX_ERRNO),
+        // The host's POSIX errno, positive (node's shape). A COPY, so code
+        // that mutates os.constants.errno cannot reach the libuv table built
+        // from the same parse -- and each member non-writable and
+        // non-configurable, which is node's descriptor for these.
+        errno: constantBag(posixErrno(natives)),
         priority: {
           PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
           PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
@@ -6684,15 +6697,20 @@
       // per-platform libuv table built above, which is the same source the
       // errno numbers themselves come from.
       getSystemErrorName: function getSystemErrorName(err) {
-        const entry = uvErrnoTable(natives.platform).get(err);
+        validateErrno(err, "err", codes);
+        const entry = uvErrnoTable(natives).get(err);
         return entry === undefined ? "Unknown system error " + err : entry[0];
       },
       getSystemErrorMessage: function getSystemErrorMessage(err) {
-        const entry = uvErrnoTable(natives.platform).get(err);
+        validateErrno(err, "err", codes);
+        const entry = uvErrnoTable(natives).get(err);
         return entry === undefined ? "Unknown system error " + err : entry[1];
       },
       getSystemErrorMap: function getSystemErrorMap() {
-        return uvErrnoTable(natives.platform);
+        // A COPY: node hands back a fresh Map per call, so a caller that
+        // mutates or clears it cannot poison later lookups. Returning the
+        // memoized table directly would make that a process-wide corruption.
+        return new Map(uvErrnoTable(natives));
       },
       styleText: function styleText(format, text, options) {
         // Node's inspect.colors table (open/close SGR pairs).
@@ -10802,9 +10820,24 @@
     // after this module instantiates, so the first script-time access must
     // read the native, not a construction-time copy.
     let argvCache = null;
-    const argv = () => (argvCache ??= natives.argv());
+    let argvAssigned = false;
+    const argv = () => {
+      if (argvAssigned) return argvCache;
+      return (argvCache ??= natives.argv());
+    };
+    // node's process.argv is a writable DATA property, and reassigning it is
+    // how CLI test harnesses drive an entry point (yargs/commander/minimist
+    // suites all do it). oam has to keep the lazy READ -- the embedder
+    // declares argv after this module instantiates -- but a getter with no
+    // setter made that assignment a silent no-op in CJS and a TypeError in
+    // ESM. The setter overwrites the cache, so laziness survives for the
+    // un-assigned case and assignment behaves like node's data property.
     Object.defineProperty(process, "argv", {
       get: () => argv(),
+      set: (value) => {
+        argvCache = value;
+        argvAssigned = true;
+      },
       enumerable: true,
       configurable: true,
     });
@@ -10813,12 +10846,19 @@
       enumerable: true,
       configurable: true,
     });
+    let execPathOverride;
     Object.defineProperty(process, "execPath", {
       // The RESOLVED binary path, not argv[0]: invoked through a symlink,
       // Node reports the symlink's target here and keeps the invoked name
       // in process.argv0. Falling back to argv[0] keeps embedders that
       // never set the native value working.
-      get: () => natives.execPath || argv()[0],
+      //
+      // Writable like node's, for the same reason as argv above: spawn shims
+      // that re-point execPath at a wrapper assign it.
+      get: () => (execPathOverride !== undefined ? execPathOverride : natives.execPath || argv()[0]),
+      set: (value) => {
+        execPathOverride = value;
+      },
       enumerable: true,
       configurable: true,
     });
@@ -11668,16 +11708,20 @@
           node_builtin_shareable_builtins: Object.freeze([]),
         }),
       }),
+      // Key ORDER is node's, not alphabetical: process.features is commonly
+      // JSON.stringify'd into capability reports, and node puts
+      // openssl_is_boringssl after tls. The last three are redefined as
+      // getter-only accessors below, matching node.
       features: {
         inspector: false,
         debug: false,
         uv: true,
         ipv6: true,
-        openssl_is_boringssl: false,
         tls_alpn: true,
         tls_sni: true,
         tls_ocsp: true,
         tls: true,
+        openssl_is_boringssl: false,
         cached_builtins: true,
         require_module: true,
         typescript: "strip",
@@ -11867,8 +11911,13 @@
     // was writable -- a divergence with nothing honest behind it.
     //
     // The exact attribute triple is node's, per property (probe-verified
-    // against v22.22.2): `features` and `argv0` are non-configurable, the
-    // rest stay configurable so a test double can still redefine them.
+    // against v22.22.2): `features` is non-configurable, the rest stay
+    // configurable so a test double can still redefine them. `argv0` is NOT
+    // in this list -- node has it as a non-writable data property, but oam
+    // must read it lazily (the embedder declares argv after this module
+    // instantiates), so it stays a getter-only accessor. That behaves the
+    // same way on assignment (silent no-op sloppy, TypeError strict); only
+    // the descriptor shape differs.
     // Note this is NOT Object.freeze: node's process.versions is
     // configurable:true AND extensible (isFrozen/isSealed/isExtensible =
     // false/false/true), so freezing would trade one divergence for another.
@@ -11889,6 +11938,19 @@
         configurable: false,
       });
     }
+    // node computes these three from internal state and exposes them as
+    // getter-only accessors, so `process.features.typescript = 'x'` is inert
+    // there. oam had them as writable data properties, which let any package
+    // corrupt a capability flag process-wide.
+    for (const name of ["cached_builtins", "require_module", "typescript"]) {
+      const value = process.features[name];
+      Object.defineProperty(process.features, name, {
+        get: () => value,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+
     // The version bags themselves: every member read-only, the object left
     // extensible -- again matching node rather than sealing harder than it.
     for (const bag of [process.versions, process.release]) {
@@ -20748,33 +20810,65 @@
           }, timeout);
         }
       });
-      cp.on("close", (code, signal) => {
-        if (timer) clearTimeout(timer);
+      // BOTH terminal events feed ONE once-guarded finish(), the way node's
+      // exec/execFile route 'close' and 'error' through a single `exithandler`
+      // behind an `exited` flag.
+      //
+      // A child that never starts emits BOTH: 'error' carrying the spawn
+      // failure, then 'close' carrying the libuv errno AS the exit code
+      // (verified against node v22 -- `error ENOENT` then `close -4058 null`;
+      // oam's ChildProcess reproduces that pair exactly, and it is correct).
+      // Wiring the two straight to the callback therefore called it TWICE, and
+      // the second call rebuilt an error out of the close code -- so `err.code`
+      // came back as the NUMBER -4058 and a caller branching on
+      // `err.code === "ENOENT"` took the wrong branch on the very callback that
+      // was meant to tell it the binary is missing. The double EMIT is node's
+      // behaviour and stays; only the CALLBACK is once-only.
+      let exited = false;
+      // The error the 'error' event delivered, if any. Kept whole rather than
+      // re-derived from the close code: it is the only place the real
+      // code/errno/syscall/path/spawnargs of a spawn failure survive.
+      let spawnError = null;
+      const finish = (code, signal) => {
+        if (exited) return;
+        exited = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (!callback) return;
         const stdoutBuf = Buffer.concat(stdout);
         const stderrBuf = Buffer.concat(stderr);
         const enc = opts.encoding || "utf8";
         const out = enc === "buffer" ? stdoutBuf : stdoutBuf.toString(enc);
         const errOut = enc === "buffer" ? stderrBuf : stderrBuf.toString(enc);
-        // A maxBuffer kill wins over the generic "Command failed": the child
-        // died because WE killed it, so the signal-shaped failure below would
-        // describe the symptom rather than the cause.
-        if (maxBufferError && callback) {
-          callback(maxBufferError, out, errOut);
-        } else if ((code !== 0 || timedOut) && callback) {
-          const err = new Error(`Command failed: ${command}\n${errOut}`);
+        // A spawn failure and a maxBuffer kill both win over the generic
+        // "Command failed": the child died because it never started, or because
+        // WE killed it, so the exit-shaped failure below would describe the
+        // symptom rather than the cause.
+        let err = spawnError || maxBufferError;
+        if (!err && (code !== 0 || timedOut)) {
+          err = new Error(`Command failed: ${command}\n${errOut}`);
           err.code = code;
           // node reports a timed-out child as killed, with the signal it sent,
           // so `err.killed` is how callers tell "the command failed" from "we
           // gave up waiting".
           err.killed = timedOut || cp.killed;
           err.signal = timedOut ? opts.killSignal || "SIGTERM" : signal;
-          callback(err, out, errOut);
-        } else if (callback) {
-          callback(null, out, errOut);
         }
-      });
+        // node stamps the command onto EVERY exec/execFile error, including the
+        // spawn failure it did not construct -- `err.cmd` is how one shared
+        // callback tells which of several shell-outs failed.
+        if (err) err.cmd = command;
+        callback(err || null, out, errOut);
+      };
+      cp.on("close", finish);
       cp.on("error", (err) => {
-        if (callback) callback(err, "", "");
+        spawnError = err;
+        // Invoked with no code/signal, exactly as node's errorhandler does: a
+        // child that never ran has neither, and node leaves err.killed and
+        // err.signal undefined on this path rather than inventing them.
+        finish();
       });
       return cp;
     }
@@ -21375,6 +21469,102 @@
 
   // -------------------------------------------------------------------- dns
   registry.factories.dns = (natives) => {
+    // Reshape oam's native DNS failure into node's exact error form. The op
+    // rejects with an Error carrying .code and a raw resolver message and
+    // nothing else; node's dnsException() also sets .syscall, .hostname and --
+    // on the getaddrinfo path ONLY -- .errno, and words the message
+    // "<syscall> <CODE> <hostname>". Without those, `err.syscall === "queryA"`
+    // and util.getSystemErrorName(err.errno) -- the two ways a caller tells a
+    // name-resolution failure from a connection failure -- had nothing to read.
+    //
+    // The .errno asymmetry is node's own, not a gap left here. dns.lookup()
+    // runs through libuv, whose failure IS a negative number, so node keeps it
+    // verbatim. dns.resolve*/dns.reverse run through c-ares, whose failure is a
+    // STRING code with no libuv number behind it, so node leaves .errno
+    // undefined on every one of them (verified against node v22.22: queryA,
+    // queryTxt and getHostByAddr failures all report errno undefined). Stamping
+    // a plausible number there would make getSystemErrorName(err.errno) answer
+    // for an error node says has no number at all.
+
+    // node fabricates the code "ENOTFOUND" for BOTH getaddrinfo failures that
+    // can produce it (EAI_NONAME and EAI_NODATA) while keeping the ORIGINAL
+    // libuv number in .errno -- so it is .errno, not .code, that round-trips
+    // through util.getSystemErrorName (-3008 -> "EAI_NONAME").
+    //
+    // EAI_NONAME is the only number oam claims. Its lookup path collapses every
+    // failure it can hit to ENOTFOUND (resolver error, empty answer, and no
+    // address in the requested family -- see oam_core/src/dns.rs), and node
+    // reports -3008 for all three of those shapes: an unknown name, a name that
+    // holds no address record, and a family the name has no record for.
+    // EAI_NODATA (-3007) is never stamped: oam cannot tell it apart from
+    // EAI_NONAME from here, and an absent errno beats a wrong one.
+    //
+    // No per-platform table, unlike _netErrno in the net factory: every EAI_*
+    // code takes libuv's fixed number on every host, because none of them has a
+    // POSIX errno to negate (see UV_FALLBACK_ERRNO).
+    function _dnsLookupErrno(code) {
+      if (code === "ENOTFOUND") return UV_FALLBACK_ERRNO.EAI_NONAME;
+      return code.startsWith("EAI_") ? UV_FALLBACK_ERRNO[code] : undefined;
+    }
+
+    // node's syscall names for the c-ares queries, from its own resolveMap.
+    // Spelled out rather than derived from the rrtype so an rrtype node does
+    // not support cannot mint a syscall name node never emits -- an unlisted
+    // rrtype leaves the error untouched below instead of guessing.
+    const DNS_QUERY_SYSCALL = {
+      A: "queryA", AAAA: "queryAaaa", ANY: "queryAny", CAA: "queryCaa",
+      CNAME: "queryCname", MX: "queryMx", NAPTR: "queryNaptr", NS: "queryNs",
+      PTR: "queryPtr", SOA: "querySoa", SRV: "querySrv", TXT: "queryTxt",
+    };
+
+    // `lookupPath` picks the getaddrinfo half of the split described above:
+    // true only for dns.lookup(), the one entry point node gives an errno.
+    function _shapeDnsError(err, syscall, hostname, lookupPath) {
+      const code = err && err.code;
+      // No code means this is not a resolver failure at all (an unsupported
+      // rrtype, say) -- and no syscall means oam has no node name for the
+      // query. Either way the original error is more honest than a reshaped one.
+      if (!code || !syscall) return err;
+      const e = new Error(
+        hostname ? `${syscall} ${code} ${hostname}` : `${syscall} ${code}`,
+      );
+      e.code = code;
+      e.syscall = syscall;
+      // node omits .hostname entirely rather than setting it to "" when the
+      // caller looked up an empty name.
+      if (hostname) e.hostname = hostname;
+      if (lookupPath) {
+        const errno = _dnsLookupErrno(code);
+        if (errno !== undefined) e.errno = errno;
+      }
+      return e;
+    }
+
+    // The three native entry points, each wrapped once so the callback API, the
+    // promises API and the Resolver class all inherit the same shaped error --
+    // dns.promises.lookup() used to hand back the bare op error because it
+    // returned the native promise straight to the caller.
+    function _dnsLookup(hostname, family, all) {
+      const host = String(hostname);
+      return natives.dnsLookup(host, family, all).then(undefined, (err) => {
+        throw _shapeDnsError(err, "getaddrinfo", host, true);
+      });
+    }
+
+    function _dnsQuery(hostname, rrtype) {
+      const host = String(hostname);
+      return natives.dnsResolve(host, rrtype).then(undefined, (err) => {
+        throw _shapeDnsError(err, DNS_QUERY_SYSCALL[rrtype], host, false);
+      });
+    }
+
+    function _dnsReverse(ip) {
+      const addr = String(ip);
+      return natives.dnsReverse(addr).then(undefined, (err) => {
+        throw _shapeDnsError(err, "getHostByAddr", addr, false);
+      });
+    }
+
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
@@ -21385,7 +21575,7 @@
       const family = opts.family || 0;
       const all = !!opts.all;
 
-      natives.dnsLookup(String(hostname), family, all).then(
+      _dnsLookup(hostname, family, all).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -21398,7 +21588,7 @@
     }
 
     function _resolveNative(hostname, rrtype, callback) {
-      natives.dnsResolve(String(hostname), rrtype).then(
+      _dnsQuery(hostname, rrtype).then(
         (result) => callback(null, result),
         (err) => callback(err),
       );
@@ -21415,7 +21605,7 @@
 
     function resolve4(hostname, options, callback) {
       if (typeof options === "function") { callback = options; options = {}; }
-      natives.dnsResolve(String(hostname), "A").then(
+      _dnsQuery(hostname, "A").then(
         (results) => {
           if (options && options.ttl) {
             callback(null, results.map((r) => ({ address: r, ttl: 0 })));
@@ -21429,7 +21619,7 @@
 
     function resolve6(hostname, options, callback) {
       if (typeof options === "function") { callback = options; options = {}; }
-      natives.dnsResolve(String(hostname), "AAAA").then(
+      _dnsQuery(hostname, "AAAA").then(
         (results) => {
           if (options && options.ttl) {
             callback(null, results.map((r) => ({ address: r, ttl: 0 })));
@@ -21487,7 +21677,7 @@
     }
 
     function reverse(ip, callback) {
-      natives.dnsReverse(String(ip)).then(
+      _dnsReverse(ip).then(
         (result) => callback(null, result),
         (err) => callback(err),
       );
@@ -21498,40 +21688,40 @@
         const opts = typeof options === "number" ? { family: options } : (options || {});
         const family = opts.family || 0;
         const all = !!opts.all;
-        return natives.dnsLookup(String(hostname), family, all);
+        return _dnsLookup(hostname, family, all);
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
-        return natives.dnsResolve(String(hostname), rrtype);
+        return _dnsQuery(hostname, rrtype);
       },
       resolve4(hostname, options) {
-        return natives.dnsResolve(String(hostname), "A").then((r) => {
+        return _dnsQuery(hostname, "A").then((r) => {
           if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
           return r;
         });
       },
       resolve6(hostname, options) {
-        return natives.dnsResolve(String(hostname), "AAAA").then((r) => {
+        return _dnsQuery(hostname, "AAAA").then((r) => {
           if (options && options.ttl) return r.map((x) => ({ address: x, ttl: 0 }));
           return r;
         });
       },
-      resolveCname(hostname) { return natives.dnsResolve(String(hostname), "CNAME"); },
-      resolveMx(hostname) { return natives.dnsResolve(String(hostname), "MX"); },
-      resolveTxt(hostname) { return natives.dnsResolve(String(hostname), "TXT"); },
-      resolveNs(hostname) { return natives.dnsResolve(String(hostname), "NS"); },
-      resolveSrv(hostname) { return natives.dnsResolve(String(hostname), "SRV"); },
-      resolveSoa(hostname) { return natives.dnsResolve(String(hostname), "SOA"); },
-      resolvePtr(hostname) { return natives.dnsResolve(String(hostname), "PTR"); },
-      resolveCaa(hostname) { return natives.dnsResolve(String(hostname), "CAA"); },
-      resolveNaptr(hostname) { return natives.dnsResolve(String(hostname), "NAPTR"); },
+      resolveCname(hostname) { return _dnsQuery(hostname, "CNAME"); },
+      resolveMx(hostname) { return _dnsQuery(hostname, "MX"); },
+      resolveTxt(hostname) { return _dnsQuery(hostname, "TXT"); },
+      resolveNs(hostname) { return _dnsQuery(hostname, "NS"); },
+      resolveSrv(hostname) { return _dnsQuery(hostname, "SRV"); },
+      resolveSoa(hostname) { return _dnsQuery(hostname, "SOA"); },
+      resolvePtr(hostname) { return _dnsQuery(hostname, "PTR"); },
+      resolveCaa(hostname) { return _dnsQuery(hostname, "CAA"); },
+      resolveNaptr(hostname) { return _dnsQuery(hostname, "NAPTR"); },
       resolveAny() {
         return Promise.reject(Object.assign(
           new Error("dns.resolveAny is not supported by oam (deprecated in Node.js)"),
           { code: "ENOSYS" },
         ));
       },
-      reverse(ip) { return natives.dnsReverse(String(ip)); },
+      reverse(ip) { return _dnsReverse(ip); },
     };
 
     class Resolver {

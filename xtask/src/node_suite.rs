@@ -622,13 +622,7 @@ fn write_scorecard(
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let commit = crate::conformance::git_short_commit(repo);
 
     let scored = pass + fail;
     let pct = |n: usize, d: usize| {

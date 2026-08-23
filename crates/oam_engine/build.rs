@@ -85,39 +85,25 @@ fn icu_versions(lock: &str) -> Vec<(String, String)> {
         [one] => one.clone(),
         other => panic!("expected exactly one v8 crate in Cargo.lock, found {other:?}"),
     };
-    let cargo_home = std::env::var("CARGO_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            #[allow(deprecated)] // build script, host-only; home_dir is fine here
-            std::env::home_dir()
-                .expect("neither CARGO_HOME nor a home directory is set")
-                .join(".cargo")
-        });
-    let registry_src = cargo_home.join("registry").join("src");
-    let icu_unicode = std::fs::read_dir(&registry_src)
-        .unwrap_or_else(|e| panic!("read {}: {e}", registry_src.display()))
-        .flatten()
-        .map(|entry| entry.path().join(format!("v8-{v8_version}")))
-        .find(|candidate| candidate.is_dir())
-        .map(|v8_dir| {
-            let unicode_dir = v8_dir
-                .join("third_party")
-                .join("icu")
-                .join("source")
-                .join("common")
-                .join("unicode");
-            let icu = header_define(&unicode_dir.join("uvernum.h"), "U_ICU_VERSION");
-            let unicode = header_define(&unicode_dir.join("uchar.h"), "U_UNICODE_VERSION");
-            (icu, unicode)
-        });
-    let Some((icu, unicode)) = icu_unicode else {
+    let icu_unicode = crate_src_dir(&format!("v8-{v8_version}")).map(|v8_dir| {
+        let unicode_dir = v8_dir
+            .join("third_party")
+            .join("icu")
+            .join("source")
+            .join("common")
+            .join("unicode");
+        let icu = header_define(&unicode_dir.join("uvernum.h"), "U_ICU_VERSION");
+        let unicode = header_define(&unicode_dir.join("uchar.h"), "U_UNICODE_VERSION");
+        (icu, unicode)
+    });
+    let (icu, unicode) = icu_unicode.unwrap_or_else(|registry_src| {
         panic!(
             "v8-{v8_version} not found under {} -- cannot verify the linked ICU version; \
              if the registry layout changed, update icu_versions() in oam_engine/build.rs \
              (do NOT hardcode a version string)",
             registry_src.display()
-        );
-    };
+        )
+    });
     vec![("icu".to_string(), icu), ("unicode".to_string(), unicode)]
 }
 
@@ -138,11 +124,12 @@ fn ada_version(lock: &str) -> (String, String) {
         [one] => one.clone(),
         other => panic!("expected exactly one ada-url crate in Cargo.lock, found {other:?}"),
     };
-    let src = crate_src_dir(&format!("ada-url-{crate_version}")).unwrap_or_else(|| {
+    let src = crate_src_dir(&format!("ada-url-{crate_version}")).unwrap_or_else(|registry_src| {
         panic!(
-            "ada-url-{crate_version} not found in the cargo registry -- cannot verify the \
+            "ada-url-{crate_version} not found under {} -- cannot verify the \
              linked ada version; if the registry layout changed, update crate_src_dir() \
-             (do NOT hardcode a version string)"
+             (do NOT hardcode a version string)",
+            registry_src.display()
         )
     });
     (
@@ -154,7 +141,11 @@ fn ada_version(lock: &str) -> (String, String) {
 /// The unpacked source directory of a pinned crate inside the cargo registry,
 /// e.g. `v8-15.0.245.2` or `ada-url-3.4.5`. Shared by the two build-time
 /// version probes that must read a vendored C header rather than the lockfile.
-fn crate_src_dir(dir_name: &str) -> Option<std::path::PathBuf> {
+///
+/// On a miss the `Err` carries the `registry/src` root that was searched, so
+/// every caller's panic can name the directory it actually looked in instead
+/// of leaving the reader to guess where to check.
+fn crate_src_dir(dir_name: &str) -> Result<std::path::PathBuf, std::path::PathBuf> {
     let cargo_home = std::env::var("CARGO_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -164,11 +155,12 @@ fn crate_src_dir(dir_name: &str) -> Option<std::path::PathBuf> {
                 .join(".cargo")
         });
     let registry_src = cargo_home.join("registry").join("src");
-    std::fs::read_dir(&registry_src)
+    let found = std::fs::read_dir(&registry_src)
         .unwrap_or_else(|e| panic!("read {}: {e}", registry_src.display()))
         .flatten()
         .map(|entry| entry.path().join(dir_name))
-        .find(|candidate| candidate.is_dir())
+        .find(|candidate| candidate.is_dir());
+    found.ok_or(registry_src)
 }
 
 /// Value of `#define <name> "<value>"` in a C header, or panic.

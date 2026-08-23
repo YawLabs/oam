@@ -61,7 +61,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 8] = [
+    let data: [(&str, v8::Local<v8::Value>); 9] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
         (
@@ -98,6 +98,13 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             v8::String::new(scope, env!("OAM_DEP_VERSIONS"))
                 .unwrap()
                 .into(),
+        ),
+        (
+            // The host's POSIX errno numbers (JSON), resolved per-target by
+            // the compiler -- the single source behind os.constants.errno and
+            // the libuv error table in js/node_compat.js.
+            "posixErrno",
+            v8::String::new(scope, &posix_errno_json()).unwrap().into(),
         ),
         (
             "pid",
@@ -6591,6 +6598,299 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
         return Err(format!("kill({pid}, {signal}): {errno}"));
     }
     Ok(())
+}
+
+/// The HOST platform's POSIX errno numbers as JSON (`{"ENOENT":2,...}`).
+///
+/// Sourced from `libc`, so the COMPILER resolves each constant for the target
+/// being built -- linux, darwin and windows-msvc all disagree (EAGAIN is 11 on
+/// linux, 35 on darwin, 11 on the Windows CRT; EADDRINUSE is 98 / 48 / 100),
+/// and a transcribed table silently ships one platform's numbers to the other
+/// two. A name that does not exist on a target is a COMPILE error here rather
+/// than a wrong number at runtime, which is the whole point of building it
+/// this way.
+///
+/// Two consumers in js/node_compat.js: `os.constants.errno` publishes these
+/// positive values directly, and the libuv error table negates them -- libuv
+/// defines `UV_E<X>` as `-E<X>` wherever the platform has `E<X>`, so the same
+/// source serves both.
+///
+/// Not included: the ~58 `WSA*` winsock codes node additionally publishes in
+/// `os.constants.errno` on Windows. libc does not carry them as errno
+/// constants, so they stay absent rather than invented.
+#[cfg(unix)]
+fn posix_errno_json() -> String {
+    macro_rules! errno_entries {
+        ($($name:ident),* $(,)?) => {
+            &[$((stringify!($name), libc::$name as i64)),*][..]
+        };
+    }
+
+    let mut entries: Vec<(&'static str, i64)> = errno_entries![
+        E2BIG,
+        EACCES,
+        EADDRINUSE,
+        EADDRNOTAVAIL,
+        EAFNOSUPPORT,
+        EAGAIN,
+        EALREADY,
+        EBADF,
+        EBADMSG,
+        EBUSY,
+        ECANCELED,
+        ECHILD,
+        ECONNABORTED,
+        ECONNREFUSED,
+        ECONNRESET,
+        EDEADLK,
+        EDESTADDRREQ,
+        EDOM,
+        EEXIST,
+        EFAULT,
+        EFBIG,
+        EHOSTUNREACH,
+        EIDRM,
+        EILSEQ,
+        EINPROGRESS,
+        EINTR,
+        EINVAL,
+        EIO,
+        EISCONN,
+        EISDIR,
+        ELOOP,
+        EMFILE,
+        EMLINK,
+        EMSGSIZE,
+        ENAMETOOLONG,
+        ENETDOWN,
+        ENETRESET,
+        ENETUNREACH,
+        ENFILE,
+        ENOBUFS,
+        ENODATA,
+        ENODEV,
+        ENOENT,
+        ENOEXEC,
+        ENOLCK,
+        ENOLINK,
+        ENOMEM,
+        ENOMSG,
+        ENOPROTOOPT,
+        ENOSPC,
+        ENOSR,
+        ENOSTR,
+        ENOSYS,
+        ENOTCONN,
+        ENOTDIR,
+        ENOTEMPTY,
+        ENOTSOCK,
+        ENOTSUP,
+        ENOTTY,
+        ENXIO,
+        EOPNOTSUPP,
+        EOVERFLOW,
+        EPERM,
+        EPIPE,
+        EPROTO,
+        EPROTONOSUPPORT,
+        EPROTOTYPE,
+        ERANGE,
+        EROFS,
+        ESPIPE,
+        ESRCH,
+        ETIME,
+        ETIMEDOUT,
+        ETXTBSY,
+        EWOULDBLOCK,
+        EXDEV
+    ]
+    .to_vec();
+
+    // Present on both unix families, absent from the Windows CRT.
+    #[cfg(unix)]
+    entries.extend_from_slice(errno_entries![
+        EDQUOT,
+        EHOSTDOWN,
+        EMULTIHOP,
+        ESHUTDOWN,
+        ESOCKTNOSUPPORT,
+        ESTALE
+    ]);
+    #[cfg(target_os = "linux")]
+    entries.extend_from_slice(errno_entries![ENONET, EREMOTEIO, EUNATCH]);
+    #[cfg(target_os = "macos")]
+    entries.extend_from_slice(errno_entries![EFTYPE]);
+
+    entries.sort_unstable();
+    let mut json = String::from("{");
+    for (i, (name, value)) in entries.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{name}\":{value}"));
+    }
+    json.push('}');
+    json
+}
+
+/// The Windows arm of the table above. `libc` is deliberately a `cfg(unix)`
+/// dependency in this crate (and in oam_core) so the Windows binary never
+/// pulls it, so there is no compiler-resolved source here -- these are the
+/// fixed MSVC CRT `errno.h` values plus the Winsock `WSA*` codes, which is
+/// exactly the set node publishes on win32.
+///
+/// Transcribed, unlike the unix arm -- but checkable: Windows is the one host
+/// where the full table can be diffed against a real node in CI, and
+/// conformance/cases pins every key=value pair against it. The same
+/// justification as UV_FALLBACK_ERRNO in js/node_compat.js, which is likewise
+/// a set of fixed constants libuv itself hardcodes for this platform.
+#[cfg(windows)]
+fn posix_errno_json() -> String {
+    const ERRNO: &[(&str, i64)] = &[
+        ("E2BIG", 7),
+        ("EACCES", 13),
+        ("EADDRINUSE", 100),
+        ("EADDRNOTAVAIL", 101),
+        ("EAFNOSUPPORT", 102),
+        ("EAGAIN", 11),
+        ("EALREADY", 103),
+        ("EBADF", 9),
+        ("EBADMSG", 104),
+        ("EBUSY", 16),
+        ("ECANCELED", 105),
+        ("ECHILD", 10),
+        ("ECONNABORTED", 106),
+        ("ECONNREFUSED", 107),
+        ("ECONNRESET", 108),
+        ("EDEADLK", 36),
+        ("EDESTADDRREQ", 109),
+        ("EDOM", 33),
+        ("EEXIST", 17),
+        ("EFAULT", 14),
+        ("EFBIG", 27),
+        ("EHOSTUNREACH", 110),
+        ("EIDRM", 111),
+        ("EILSEQ", 42),
+        ("EINPROGRESS", 112),
+        ("EINTR", 4),
+        ("EINVAL", 22),
+        ("EIO", 5),
+        ("EISCONN", 113),
+        ("EISDIR", 21),
+        ("ELOOP", 114),
+        ("EMFILE", 24),
+        ("EMLINK", 31),
+        ("EMSGSIZE", 115),
+        ("ENAMETOOLONG", 38),
+        ("ENETDOWN", 116),
+        ("ENETRESET", 117),
+        ("ENETUNREACH", 118),
+        ("ENFILE", 23),
+        ("ENOBUFS", 119),
+        ("ENODATA", 120),
+        ("ENODEV", 19),
+        ("ENOENT", 2),
+        ("ENOEXEC", 8),
+        ("ENOLCK", 39),
+        ("ENOLINK", 121),
+        ("ENOMEM", 12),
+        ("ENOMSG", 122),
+        ("ENOPROTOOPT", 123),
+        ("ENOSPC", 28),
+        ("ENOSR", 124),
+        ("ENOSTR", 125),
+        ("ENOSYS", 40),
+        ("ENOTCONN", 126),
+        ("ENOTDIR", 20),
+        ("ENOTEMPTY", 41),
+        ("ENOTSOCK", 128),
+        ("ENOTSUP", 129),
+        ("ENOTTY", 25),
+        ("ENXIO", 6),
+        ("EOPNOTSUPP", 130),
+        ("EOVERFLOW", 132),
+        ("EPERM", 1),
+        ("EPIPE", 32),
+        ("EPROTO", 134),
+        ("EPROTONOSUPPORT", 135),
+        ("EPROTOTYPE", 136),
+        ("ERANGE", 34),
+        ("EROFS", 30),
+        ("ESPIPE", 29),
+        ("ESRCH", 3),
+        ("ETIME", 137),
+        ("ETIMEDOUT", 138),
+        ("ETXTBSY", 139),
+        ("EWOULDBLOCK", 140),
+        ("EXDEV", 18),
+        ("WSAEACCES", 10013),
+        ("WSAEADDRINUSE", 10048),
+        ("WSAEADDRNOTAVAIL", 10049),
+        ("WSAEAFNOSUPPORT", 10047),
+        ("WSAEALREADY", 10037),
+        ("WSAEBADF", 10009),
+        ("WSAECANCELLED", 10103),
+        ("WSAECONNABORTED", 10053),
+        ("WSAECONNREFUSED", 10061),
+        ("WSAECONNRESET", 10054),
+        ("WSAEDESTADDRREQ", 10039),
+        ("WSAEDISCON", 10101),
+        ("WSAEDQUOT", 10069),
+        ("WSAEFAULT", 10014),
+        ("WSAEHOSTDOWN", 10064),
+        ("WSAEHOSTUNREACH", 10065),
+        ("WSAEINPROGRESS", 10036),
+        ("WSAEINTR", 10004),
+        ("WSAEINVAL", 10022),
+        ("WSAEINVALIDPROCTABLE", 10104),
+        ("WSAEINVALIDPROVIDER", 10105),
+        ("WSAEISCONN", 10056),
+        ("WSAELOOP", 10062),
+        ("WSAEMFILE", 10024),
+        ("WSAEMSGSIZE", 10040),
+        ("WSAENAMETOOLONG", 10063),
+        ("WSAENETDOWN", 10050),
+        ("WSAENETRESET", 10052),
+        ("WSAENETUNREACH", 10051),
+        ("WSAENOBUFS", 10055),
+        ("WSAENOMORE", 10102),
+        ("WSAENOPROTOOPT", 10042),
+        ("WSAENOTCONN", 10057),
+        ("WSAENOTEMPTY", 10066),
+        ("WSAENOTSOCK", 10038),
+        ("WSAEOPNOTSUPP", 10045),
+        ("WSAEPFNOSUPPORT", 10046),
+        ("WSAEPROCLIM", 10067),
+        ("WSAEPROTONOSUPPORT", 10043),
+        ("WSAEPROTOTYPE", 10041),
+        ("WSAEPROVIDERFAILEDINIT", 10106),
+        ("WSAEREFUSED", 10112),
+        ("WSAEREMOTE", 10071),
+        ("WSAESHUTDOWN", 10058),
+        ("WSAESOCKTNOSUPPORT", 10044),
+        ("WSAESTALE", 10070),
+        ("WSAETIMEDOUT", 10060),
+        ("WSAETOOMANYREFS", 10059),
+        ("WSAEUSERS", 10068),
+        ("WSAEWOULDBLOCK", 10035),
+        ("WSANOTINITIALISED", 10093),
+        ("WSASERVICE_NOT_FOUND", 10108),
+        ("WSASYSCALLFAILURE", 10107),
+        ("WSASYSNOTREADY", 10091),
+        ("WSATYPE_NOT_FOUND", 10109),
+        ("WSAVERNOTSUPPORTED", 10092),
+        ("WSA_E_CANCELLED", 10111),
+        ("WSA_E_NO_MORE", 10110),
+    ];
+    let mut json = String::from("{");
+    for (i, (name, value)) in ERRNO.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{name}\":{value}"));
+    }
+    json.push('}');
+    json
 }
 
 #[cfg(test)]
