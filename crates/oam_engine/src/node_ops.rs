@@ -61,7 +61,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         "aarch64" => "arm64",
         other => other,
     };
-    let data: [(&str, v8::Local<v8::Value>); 9] = [
+    let data: [(&str, v8::Local<v8::Value>); 10] = [
         ("platform", v8::String::new(scope, platform).unwrap().into()),
         ("arch", v8::String::new(scope, arch).unwrap().into()),
         (
@@ -101,10 +101,21 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ),
         (
             // The host's POSIX errno numbers (JSON), resolved per-target by
-            // the compiler -- the single source behind os.constants.errno and
-            // the libuv error table in js/node_compat.js.
+            // the compiler -- EXACTLY the set node publishes in
+            // os.constants.errno, in node's own key order.
             "posixErrno",
             v8::String::new(scope, &posix_errno_json()).unwrap().into(),
+        ),
+        (
+            // The extra errno names libuv maps that node does NOT publish in
+            // os.constants.errno (JSON, same shape). js/node_compat.js merges
+            // this over `posixErrno` to build the libuv error table, so the
+            // published constants stay node-exact while the uv table stays
+            // complete.
+            "posixErrnoUv",
+            v8::String::new(scope, &posix_errno_uv_json())
+                .unwrap()
+                .into(),
         ),
         (
             "pid",
@@ -6600,7 +6611,23 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// The HOST platform's POSIX errno numbers as JSON (`{"ENOENT":2,...}`).
+/// Serializes an errno table to JSON (`{"ENOENT":2,...}`) preserving the
+/// order of `entries` -- `JSON.parse` keeps insertion order for non-index
+/// string keys, so this is what fixes `Object.keys(os.constants.errno)`.
+fn errno_table_json(entries: &[(&str, i64)]) -> String {
+    let mut json = String::from("{");
+    for (i, (name, value)) in entries.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{name}\":{value}"));
+    }
+    json.push('}');
+    json
+}
+
+/// The HOST platform's POSIX errno numbers as JSON (`{"ENOENT":2,...}`) --
+/// EXACTLY the names node publishes in `os.constants.errno`, nothing more.
 ///
 /// Sourced from `libc`, so the COMPILER resolves each constant for the target
 /// being built -- linux, darwin and windows-msvc all disagree (EAGAIN is 11 on
@@ -6610,14 +6637,22 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
 /// than a wrong number at runtime, which is the whole point of building it
 /// this way.
 ///
-/// Two consumers in js/node_compat.js: `os.constants.errno` publishes these
-/// positive values directly, and the libuv error table negates them -- libuv
-/// defines `UV_E<X>` as `-E<X>` wherever the platform has `E<X>`, so the same
-/// source serves both.
+/// Split into two groups, because the two consumers in js/node_compat.js want
+/// different SETS of the same numbers:
+///
+/// * `os.constants.errno` must publish node's set and no more -- an extra key
+///   is an observable divergence (count, `Object.keys`, `util.inspect`), and
+///   this table was previously widened to 85 names on linux / 83 on darwin
+///   against node's 79 for the benefit of the other consumer.
+/// * the libuv error table negates them -- libuv defines `UV_E<X>` as `-E<X>`
+///   wherever the platform has `E<X>` -- and libuv names a handful of codes
+///   node's `os.constants.errno` does not. Those live in
+///   [`posix_errno_uv_json`] and are merged OVER this table on the JS side.
 ///
 /// Not included: the ~58 `WSA*` winsock codes node additionally publishes in
 /// `os.constants.errno` on Windows. libc does not carry them as errno
-/// constants, so they stay absent rather than invented.
+/// constants, so they stay absent rather than invented (the windows arm below
+/// carries them instead).
 #[cfg(unix)]
 fn posix_errno_json() -> String {
     macro_rules! errno_entries {
@@ -6706,42 +6741,75 @@ fn posix_errno_json() -> String {
     ]
     .to_vec();
 
+    // Node ifdefs exactly these three on top of the block above: present on
+    // both unix families, absent from the Windows CRT. 76 + 3 = the 79 names
+    // node publishes on linux and on darwin.
+    entries.extend_from_slice(errno_entries![EDQUOT, EMULTIHOP, ESTALE]);
+
+    // Node emits the non-WSA block alphabetically, so sorting reproduces
+    // `Object.keys(os.constants.errno)` and not merely the pairs.
+    entries.sort_unstable();
+    errno_table_json(&entries)
+}
+
+/// The errno names libuv maps that node does NOT publish in
+/// `os.constants.errno` -- same JSON shape, merged over [`posix_errno_json`]
+/// on the JS side to build the libuv error table.
+///
+/// libuv's `UV_E<X>` set is not node's published errno set: it names codes
+/// like `EHOSTDOWN` and (on linux) `EUNATCH` that `os.constants.errno` has
+/// never carried. Folding them into the published table is how oam ended up
+/// with 85 keys on linux against node's 79, so they are compiled here instead
+/// -- still libc-resolved, so a name missing on a target stays a BUILD error
+/// rather than a wrong number at runtime.
+#[cfg(unix)]
+fn posix_errno_uv_json() -> String {
+    macro_rules! errno_entries {
+        ($($name:ident),* $(,)?) => {
+            &[$((stringify!($name), libc::$name as i64)),*][..]
+        };
+    }
+
     // Present on both unix families, absent from the Windows CRT.
-    #[cfg(unix)]
-    entries.extend_from_slice(errno_entries![
-        EDQUOT,
-        EHOSTDOWN,
-        EMULTIHOP,
-        ESHUTDOWN,
-        ESOCKTNOSUPPORT,
-        ESTALE
-    ]);
+    let mut entries: Vec<(&'static str, i64)> =
+        errno_entries![EHOSTDOWN, ESHUTDOWN, ESOCKTNOSUPPORT].to_vec();
     #[cfg(target_os = "linux")]
     entries.extend_from_slice(errno_entries![ENONET, EREMOTEIO, EUNATCH]);
     #[cfg(target_os = "macos")]
     entries.extend_from_slice(errno_entries![EFTYPE]);
 
     entries.sort_unstable();
-    let mut json = String::from("{");
-    for (i, (name, value)) in entries.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(&format!("\"{name}\":{value}"));
-    }
-    json.push('}');
-    json
+    errno_table_json(&entries)
+}
+
+/// The windows arm of [`posix_errno_uv_json`]: empty, deliberately.
+///
+/// The win32 libuv path in js/node_compat.js resolves every code it needs from
+/// the winsock/CRT fallback table, so it never reads this. Kept as a real
+/// (empty) native so the JS side has one shape on every platform.
+#[cfg(windows)]
+fn posix_errno_uv_json() -> String {
+    errno_table_json(&[])
 }
 
 /// The Windows arm of the table above. `libc` is deliberately a `cfg(unix)`
 /// dependency in this crate (and in oam_core) so the Windows binary never
 /// pulls it, so there is no compiler-resolved source here -- these are the
 /// fixed MSVC CRT `errno.h` values plus the Winsock `WSA*` codes, which is
-/// exactly the set node publishes on win32.
+/// exactly the set node publishes on win32 (no `posix_errno_uv_json` split is
+/// needed: the win32 libuv path takes fallbacks for every code it needs).
+///
+/// ORDER IS PART OF THE CONTRACT, not cosmetics: node emits the CRT block
+/// alphabetically and then the `WSA*` block ASCENDING BY VALUE (WSAEINTR
+/// 10004, WSAEBADF 10009, WSAEACCES 10013, ...), and `Object.keys`,
+/// `JSON.stringify` and `util.inspect` all expose that order. Sorting the
+/// `WSA*` block alphabetically -- as this table used to -- is an observable
+/// divergence, so keep new entries in value order.
 ///
 /// Transcribed, unlike the unix arm -- but checkable: Windows is the one host
 /// where the full table can be diffed against a real node in CI, and
-/// conformance/cases pins every key=value pair against it. The same
+/// conformance/cases/87 pins every key=value pair AND the raw key order
+/// against it. The same
 /// justification as UV_FALLBACK_ERRNO in js/node_compat.js, which is likewise
 /// a set of fixed constants libuv itself hardcodes for this platform.
 #[cfg(windows)]
@@ -6823,74 +6891,66 @@ fn posix_errno_json() -> String {
         ("ETXTBSY", 139),
         ("EWOULDBLOCK", 140),
         ("EXDEV", 18),
-        ("WSAEACCES", 10013),
-        ("WSAEADDRINUSE", 10048),
-        ("WSAEADDRNOTAVAIL", 10049),
-        ("WSAEAFNOSUPPORT", 10047),
-        ("WSAEALREADY", 10037),
-        ("WSAEBADF", 10009),
-        ("WSAECANCELLED", 10103),
-        ("WSAECONNABORTED", 10053),
-        ("WSAECONNREFUSED", 10061),
-        ("WSAECONNRESET", 10054),
-        ("WSAEDESTADDRREQ", 10039),
-        ("WSAEDISCON", 10101),
-        ("WSAEDQUOT", 10069),
-        ("WSAEFAULT", 10014),
-        ("WSAEHOSTDOWN", 10064),
-        ("WSAEHOSTUNREACH", 10065),
-        ("WSAEINPROGRESS", 10036),
         ("WSAEINTR", 10004),
+        ("WSAEBADF", 10009),
+        ("WSAEACCES", 10013),
+        ("WSAEFAULT", 10014),
         ("WSAEINVAL", 10022),
-        ("WSAEINVALIDPROCTABLE", 10104),
-        ("WSAEINVALIDPROVIDER", 10105),
-        ("WSAEISCONN", 10056),
-        ("WSAELOOP", 10062),
         ("WSAEMFILE", 10024),
-        ("WSAEMSGSIZE", 10040),
-        ("WSAENAMETOOLONG", 10063),
-        ("WSAENETDOWN", 10050),
-        ("WSAENETRESET", 10052),
-        ("WSAENETUNREACH", 10051),
-        ("WSAENOBUFS", 10055),
-        ("WSAENOMORE", 10102),
-        ("WSAENOPROTOOPT", 10042),
-        ("WSAENOTCONN", 10057),
-        ("WSAENOTEMPTY", 10066),
+        ("WSAEWOULDBLOCK", 10035),
+        ("WSAEINPROGRESS", 10036),
+        ("WSAEALREADY", 10037),
         ("WSAENOTSOCK", 10038),
+        ("WSAEDESTADDRREQ", 10039),
+        ("WSAEMSGSIZE", 10040),
+        ("WSAEPROTOTYPE", 10041),
+        ("WSAENOPROTOOPT", 10042),
+        ("WSAEPROTONOSUPPORT", 10043),
+        ("WSAESOCKTNOSUPPORT", 10044),
         ("WSAEOPNOTSUPP", 10045),
         ("WSAEPFNOSUPPORT", 10046),
-        ("WSAEPROCLIM", 10067),
-        ("WSAEPROTONOSUPPORT", 10043),
-        ("WSAEPROTOTYPE", 10041),
-        ("WSAEPROVIDERFAILEDINIT", 10106),
-        ("WSAEREFUSED", 10112),
-        ("WSAEREMOTE", 10071),
+        ("WSAEAFNOSUPPORT", 10047),
+        ("WSAEADDRINUSE", 10048),
+        ("WSAEADDRNOTAVAIL", 10049),
+        ("WSAENETDOWN", 10050),
+        ("WSAENETUNREACH", 10051),
+        ("WSAENETRESET", 10052),
+        ("WSAECONNABORTED", 10053),
+        ("WSAECONNRESET", 10054),
+        ("WSAENOBUFS", 10055),
+        ("WSAEISCONN", 10056),
+        ("WSAENOTCONN", 10057),
         ("WSAESHUTDOWN", 10058),
-        ("WSAESOCKTNOSUPPORT", 10044),
-        ("WSAESTALE", 10070),
-        ("WSAETIMEDOUT", 10060),
         ("WSAETOOMANYREFS", 10059),
+        ("WSAETIMEDOUT", 10060),
+        ("WSAECONNREFUSED", 10061),
+        ("WSAELOOP", 10062),
+        ("WSAENAMETOOLONG", 10063),
+        ("WSAEHOSTDOWN", 10064),
+        ("WSAEHOSTUNREACH", 10065),
+        ("WSAENOTEMPTY", 10066),
+        ("WSAEPROCLIM", 10067),
         ("WSAEUSERS", 10068),
-        ("WSAEWOULDBLOCK", 10035),
-        ("WSANOTINITIALISED", 10093),
-        ("WSASERVICE_NOT_FOUND", 10108),
-        ("WSASYSCALLFAILURE", 10107),
+        ("WSAEDQUOT", 10069),
+        ("WSAESTALE", 10070),
+        ("WSAEREMOTE", 10071),
         ("WSASYSNOTREADY", 10091),
-        ("WSATYPE_NOT_FOUND", 10109),
         ("WSAVERNOTSUPPORTED", 10092),
-        ("WSA_E_CANCELLED", 10111),
+        ("WSANOTINITIALISED", 10093),
+        ("WSAEDISCON", 10101),
+        ("WSAENOMORE", 10102),
+        ("WSAECANCELLED", 10103),
+        ("WSAEINVALIDPROCTABLE", 10104),
+        ("WSAEINVALIDPROVIDER", 10105),
+        ("WSAEPROVIDERFAILEDINIT", 10106),
+        ("WSASYSCALLFAILURE", 10107),
+        ("WSASERVICE_NOT_FOUND", 10108),
+        ("WSATYPE_NOT_FOUND", 10109),
         ("WSA_E_NO_MORE", 10110),
+        ("WSA_E_CANCELLED", 10111),
+        ("WSAEREFUSED", 10112),
     ];
-    let mut json = String::from("{");
-    for (i, (name, value)) in ERRNO.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push_str(&format!("\"{name}\":{value}"));
-    }
-    json.push('}');
-    json
+    errno_table_json(ERRNO)
 }
 
 #[cfg(test)]

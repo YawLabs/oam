@@ -20914,6 +20914,63 @@
       );
     }
 
+    // node hangs its own promisified implementation off BOTH exec and execFile
+    // under Symbol.for("nodejs.util.promisify.custom"), so util.promisify()
+    // returns THAT rather than the generic (err, value) wrapper. Three things
+    // that callers depend on live only in the custom form:
+    //   * it resolves { stdout, stderr }. The generic wrapper resolves the
+    //     FIRST callback value -- the bare stdout string -- and drops stderr on
+    //     the floor, so `const { stdout } = await execFileAsync(...)` (the
+    //     idiom every README shows) destructured undefined out of a string.
+    //   * the returned promise carries `.child`, the live ChildProcess. On the
+    //     promisified form it is the only handle a caller has for pid/kill().
+    //   * a rejection carries err.stdout / err.stderr. That is where the output
+    //     of a command that FAILED lives, and it is the output people actually
+    //     want -- the generic wrapper rejects with the bare error.
+    //
+    // Shape copied from node's customPromiseExecFunction, down to the
+    // non-enumerable / non-writable / non-configurable descriptor and the
+    // `err !== null` test (collectExec calls back with `err || null`).
+    function customPromiseExecFunction(orig) {
+      // A plain function, not an arrow: node's is one too (it has a
+      // .prototype), and .name matches the wrapped function while .length is 0.
+      const wrapped = function (...args) {
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        // `orig` hands back the ChildProcess synchronously, so `.child` is set
+        // before the callback below can possibly run.
+        promise.child = orig(...args, (err, stdout, stderr) => {
+          if (err !== null) {
+            err.stdout = stdout;
+            err.stderr = stderr;
+            reject(err);
+          } else {
+            resolve({ stdout, stderr });
+          }
+        });
+        return promise;
+      };
+      Object.defineProperty(wrapped, "name", {
+        value: orig.name,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+      });
+      return wrapped;
+    }
+    for (const fn of [exec, execFile]) {
+      Object.defineProperty(fn, Symbol.for("nodejs.util.promisify.custom"), {
+        value: customPromiseExecFunction(fn),
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      });
+    }
+
     function fork(modulePath, args, options) {
       if (typeof args === "object" && !Array.isArray(args)) {
         options = args;
@@ -21492,10 +21549,21 @@
     // runs through libuv, whose failure IS a negative number, so node keeps it
     // verbatim. dns.resolve*/dns.reverse run through c-ares, whose failure is a
     // STRING code with no libuv number behind it, so node leaves .errno
-    // undefined on every one of them (verified against node v22.22: queryA,
-    // queryTxt and getHostByAddr failures all report errno undefined). Stamping
+    // undefined on every one of them (verified against node v22.22.2: queryA,
+    // queryTxt and getHostByAddr QUERY failures -- a name that does not exist,
+    // an answerless or refused lookup -- all report errno undefined). Stamping
     // a plausible number there would make getSystemErrorName(err.errno) answer
     // for an error node says has no number at all.
+    //
+    // That covers the QUERY failures only, which is as far as the check above
+    // went. It is NOT true of every getHostByAddr failure: the argument check
+    // that runs BEFORE any query does carry a real libuv number, because it is
+    // a libuv return value rather than a c-ares status. node's getHostByAddr
+    // binding runs uv_inet_pton over the address first and returns UV_EINVAL
+    // when it will not parse, so dns.reverse("999.999.999.999") throws
+    // SYNCHRONOUSLY with errno -4071 on Windows / -EINVAL elsewhere. See
+    // _reverseInvalidAddress below, which is the one place this module stamps
+    // an errno on a non-lookup path.
 
     // node fabricates the code "ENOTFOUND" for BOTH getaddrinfo failures that
     // can produce it (EAI_NONAME and EAI_NODATA) while keeping the ORIGINAL
@@ -21576,14 +21644,95 @@
       });
     }
 
+    // node's getHostByAddr binding tries uv_inet_pton(AF_INET) on the address
+    // as given, then uv_inet_pton(AF_INET6) on the address TRUNCATED at the
+    // first '%' (libuv strips the zone id itself), and returns UV_EINVAL if
+    // neither parses. So "fe80::1%eth0" is a valid argument and "%eth0" is not.
+    //
+    // net.isIP() is the same predicate for every other shape -- verified
+    // against node v22.22.2 over 26 address forms (leading zeros, embedded
+    // spaces, "1::2::3", nine groups, "::ffff:1.2.3.4", "::"): isIP() and
+    // dns.reverse() agreed on all of them except the zone-id form, which the
+    // slice below covers. The zone half insists on a v6 result because libuv
+    // only strips '%' on its AF_INET6 attempt: "1.2.3.4%foo" is EINVAL in node.
+    function _isReversibleAddress(addr) {
+      const { isIP } = registry.get("net");
+      if (isIP(addr) !== 0) return true;
+      const zone = addr.indexOf("%");
+      return zone !== -1 && isIP(addr.slice(0, zone)) === 6;
+    }
+
+    // -4071 is libuv's FALLBACK EINVAL, which is the right number only on
+    // Windows; every POSIX host negates its own errno instead (-22 on linux and
+    // darwin). Same rule uvErrnoTable() builds the whole table with, so
+    // util.getSystemErrorName(err.errno) round-trips on all three platforms
+    // rather than decoding to "Unknown system error" off-Windows.
+    function _uvEinval() {
+      if (natives.platform === "win32") return UV_FALLBACK_ERRNO.EINVAL;
+      const hosted = posixErrno(natives).EINVAL;
+      return hosted === undefined ? UV_FALLBACK_ERRNO.EINVAL : -hosted;
+    }
+
+    // The pre-query argument failure described in the .errno note above: same
+    // message/syscall/hostname shaping as a real resolver error, plus the errno
+    // that this one -- alone among the getHostByAddr failures -- actually has.
+    function _reverseInvalidAddress(addr) {
+      const e = _shapeDnsError({ code: "EINVAL" }, "getHostByAddr", addr, false);
+      e.errno = _uvEinval();
+      return e;
+    }
+
+    // node accepts family as 0, 4 or 6 and refuses anything else SYNCHRONOUSLY
+    // with ERR_INVALID_ARG_VALUE, before the query is issued. oam passed the
+    // value straight to the native op, where a family it does not recognize
+    // falls into the "no filter" branch (oam_core/src/dns.rs) -- so
+    // dns.lookup(h, { family: 7 }) quietly answered with an IPv6 address for a
+    // family node would have refused to look up at all.
+    const VALID_FAMILIES = [0, 4, 6];
+    function _validateFamily(value, name) {
+      if (!VALID_FAMILIES.includes(value)) {
+        throw new codes.ERR_INVALID_ARG_VALUE(
+          name,
+          value,
+          `must be one of: ${VALID_FAMILIES.join(", ")}`,
+        );
+      }
+      return value;
+    }
+
+    // The two entry points do NOT accept the same input, and that is node's
+    // own asymmetry rather than a shortcut here: the callback API maps the
+    // strings 'IPv4'/'IPv6' onto 4/6 before validating, the promises API runs
+    // validateOneOf directly and so rejects them like any other bad value.
+    // Verified against node v22.22.2 -- dns.lookup(h, {family:'IPv4'}) resolves
+    // a v4 address, dns.promises.lookup(h, {family:'IPv4'}) throws
+    // ERR_INVALID_ARG_VALUE. Both forms THROW rather than reject; the promises
+    // one validates before it builds a promise at all.
+    function _lookupFamilyOption(value) {
+      if (value === undefined || value === null) return 0;
+      if (value === "IPv4") return 4;
+      if (value === "IPv6") return 6;
+      return _validateFamily(value, "options.family");
+    }
+
+    // The numeric shorthand names the ARGUMENT in node's error message
+    // ("The argument 'family' ..."), the object form names the PROPERTY
+    // ("The property 'options.family' ..."), so the two cannot share a call.
+    function _familyFromOptions(options, mapStrings) {
+      if (typeof options === "number") return _validateFamily(options, "family");
+      const value = options ? options.family : undefined;
+      if (mapStrings) return _lookupFamilyOption(value);
+      if (value === undefined || value === null) return 0;
+      return _validateFamily(value, "options.family");
+    }
+
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
         options = {};
       }
-      if (typeof options === "number") options = { family: options };
-      const opts = options || {};
-      const family = opts.family || 0;
+      const family = _familyFromOptions(options, true);
+      const opts = typeof options === "number" ? {} : options || {};
       const all = !!opts.all;
 
       _dnsLookup(hostname, family, all).then(
@@ -21688,7 +21837,22 @@
     }
 
     function reverse(ip, callback) {
-      _dnsReverse(ip).then(
+      // node validates the callback BEFORE the address, so dns.reverse(bad)
+      // with no callback is ERR_INVALID_ARG_TYPE rather than EINVAL. Checking
+      // it here also keeps the address failure below a THROW: without it a
+      // missing callback turned into a "callback is not a function" TypeError
+      // raised inside a promise reaction, where nothing can catch it.
+      if (typeof callback !== "function") {
+        throw new codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+      const addr = String(ip);
+      // Synchronous, like node: an address that cannot parse never becomes a
+      // query, so there is nothing to deliver asynchronously. oam used to hand
+      // it to the native op and surface the resulting EINVAL through the
+      // callback -- errno-less, and invisible to the `try { dns.reverse(bad) }`
+      // that node's own docs and tests are written against.
+      if (!_isReversibleAddress(addr)) throw _reverseInvalidAddress(addr);
+      _dnsReverse(addr).then(
         (result) => callback(null, result),
         (err) => callback(err),
       );
@@ -21696,10 +21860,10 @@
 
     const promises = {
       lookup(hostname, options) {
-        const opts = typeof options === "number" ? { family: options } : (options || {});
-        const family = opts.family || 0;
-        const all = !!opts.all;
-        return _dnsLookup(hostname, family, all);
+        // No 'IPv4'/'IPv6' spelling on this path -- see _lookupFamilyOption.
+        const family = _familyFromOptions(options, false);
+        const opts = typeof options === "number" ? {} : options || {};
+        return _dnsLookup(hostname, family, !!opts.all);
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
@@ -21732,11 +21896,53 @@
           { code: "ENOSYS" },
         ));
       },
-      reverse(ip) { return _dnsReverse(ip); },
+      reverse(ip) {
+        const addr = String(ip);
+        // Same argument check as reverse() above, but node REJECTS here where
+        // the callback form throws -- its promises resolver builds the promise
+        // first and settles it with dnsException(). Verified v22.22.2.
+        if (!_isReversibleAddress(addr)) {
+          return Promise.reject(_reverseInvalidAddress(addr));
+        }
+        return _dnsReverse(addr);
+      },
     };
 
+    // oam's DNS resolver is ONE process-global hickory resolver built from the
+    // system configuration (oam_core/src/dns.rs), and the three native ops it
+    // is reachable through -- dnsLookup / dnsResolve / dnsReverse -- take a
+    // hostname and an rrtype and nothing else. There is no argument, and no
+    // other op, that could point a query at a caller-supplied nameserver.
+    //
+    // So setServers() refuses rather than recording a list it cannot honor.
+    // What it did before was record the list, hand it back from getServers(),
+    // and then have every resolveX() delegate to the module-level function --
+    // which queries the SYSTEM resolver. A caller that pointed a Resolver at
+    // 192.0.2.99 (TEST-NET-1: routable nowhere, answers nothing) got real A
+    // records back, so the answer was indistinguishable from one that came
+    // from the server it named. node reports ETIMEOUT there. An answer from
+    // the wrong nameserver that cannot be told apart from a right one is worse
+    // than a refusal, and this is the whole reason a program calls setServers:
+    // to stop using the system resolver.
+    //
+    // ENOSYS + "not supported by oam" is the shape resolveAny() above already
+    // uses for the other thing this module cannot do. node's own
+    // ERR_METHOD_NOT_IMPLEMENTED was rejected for it: node builds that one as a
+    // TypeError and never throws it here, so borrowing it would put a node
+    // error code on an error node does not produce.
+    function _serversUnsupported(what) {
+      return Object.assign(
+        new Error(
+          `${what} is not supported by oam: its DNS resolver is process-global ` +
+            "and cannot be pointed at a caller-supplied nameserver, so the " +
+            "query would silently go to the system resolver instead",
+        ),
+        { code: "ENOSYS" },
+      );
+    }
+
     class Resolver {
-      constructor() { this._servers = []; }
+      constructor() {}
       resolve(hostname, rrtype, cb) {
         if (typeof rrtype === "function") { cb = rrtype; rrtype = "A"; }
         resolve(hostname, rrtype, cb);
@@ -21754,8 +21960,12 @@
       resolveNaptr(hostname, cb) { resolveNaptr(hostname, cb); }
       reverse(ip, cb) { reverse(ip, cb); }
       cancel() {}
-      getServers() { return this._servers.slice(); }
-      setServers(servers) { this._servers = (servers || []).slice(); }
+      // Empty rather than the host's real nameservers: oam has no op that reads
+      // the system server list, and setServers() can no longer put one here.
+      getServers() { return []; }
+      setServers() {
+        throw _serversUnsupported("dns.Resolver.prototype.setServers");
+      }
     }
 
     const ADDRCONFIG = 0;
@@ -21781,7 +21991,15 @@
       Resolver,
       promises,
       setDefaultResultOrder() {},
-      setServers() {},
+      // The module-level pair is the SAME silent lie as the Resolver method
+      // above -- dns.setServers(["192.0.2.99"]) followed by dns.resolve4()
+      // answered from the system resolver, from a no-op stub -- and refuses for
+      // the same reason. getServers() stays [] because oam has no op that can
+      // read the system list; it is the one shape here that is merely unknown
+      // rather than wrong.
+      setServers() {
+        throw _serversUnsupported("dns.setServers");
+      },
       getServers: () => [],
       ADDRCONFIG,
       V4MAPPED,

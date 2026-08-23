@@ -12,7 +12,19 @@
 import os from "node:os";
 
 const errno = os.constants.errno;
-const keys = Object.keys(errno).sort();
+
+// RAW insertion order, pinned FIRST. Node emits the CRT/POSIX block
+// alphabetically and then, on win32, the whole WSA* block ascending by VALUE
+// (WSAEINTR 10004, WSAEBADF 10009, WSAEACCES 10013, ...) -- and Object.keys,
+// JSON.stringify and util.inspect all expose that order, so a runtime that
+// emits the same pairs in a different order diverges observably. Sorting
+// before comparing -- which this case used to do, and ONLY do -- hides that
+// class of bug completely. The raw order is legitimately platform-specific,
+// which is fine: the differential runs node on the SAME host.
+const rawKeys = Object.keys(errno);
+console.log("key-order", JSON.stringify(rawKeys));
+
+const keys = [...rawKeys].sort();
 console.log("count", keys.length);
 console.log("keys", JSON.stringify(keys));
 for (const key of keys) {
