@@ -420,6 +420,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("dnsLookup", op_dns_lookup),
         ("dnsResolve", op_dns_resolve),
         ("dnsReverse", op_dns_reverse),
+        ("dnsGetServers", op_dns_get_servers),
         // stdin
         ("stdinRead", op_stdin_read),
         // os extended
@@ -5672,6 +5673,25 @@ fn op_dns_reverse(
 ) {
     let ip: String = args.get(0).to_rust_string_lossy(scope);
     crate::ops::spawn_op(scope, &mut rv, oam_core::dns::dns_reverse(ip));
+}
+
+/// `dns.getServers()` -- SYNCHRONOUS in node (it returns an array, not a
+/// promise), so this reads the captured config directly rather than going
+/// through spawn_op.
+fn op_dns_get_servers(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let servers = oam_core::dns::dns_get_servers();
+    let out = v8::Array::new(scope, servers.len() as i32);
+    for (i, server) in servers.iter().enumerate() {
+        let Some(value) = v8::String::new(scope, server) else {
+            continue;
+        };
+        out.set_index(scope, i as u32, value.into());
+    }
+    rv.set(out.into());
 }
 
 // ============================================================== stdin
