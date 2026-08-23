@@ -1,8 +1,8 @@
 {
-  "commit": "77d4c04",
+  "commit": "986a0f8",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.10.1",
+  "oamVersion": "oam 0.11.0",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -581,7 +581,7 @@
             ]
           }
         ],
-        "knownMissing": 410,
+        "knownMissing": 409,
         "newMissing": [],
         "noBaseline": false,
         "nodeTotal": 1874,

@@ -68,8 +68,9 @@ something false.
 
 ```js
 // oam — compat claims, identity, then the REAL dependency tree
-{ node: '22.16.0', oam: '0.8.0', v8: '15.0.245.2-rusty',
-  brotli, flate2, h2, hickory, hyper, oxc, reqwest, ring, rustls, tokio, url }
+{ node: '22.16.0', oam: <oam version>, v8: '15.0.245.2-rusty',
+  ada, brotli, flate2, h2, hickory, hyper, icu, oxc, reqwest, ring, rustls,
+  tokio, unicode, url }
 
 // Node v22.22.2 — 27 keys
 { node, acorn, ada, amaro, ares, brotli, cjs_module_lexer, cldr, icu, llhttp, modules,
@@ -95,6 +96,15 @@ so the published numbers can never drift from what is linked. `brotli` appears i
 lists and means the same thing in both: the brotli implementation genuinely in the
 binary. An e2e test asserts both directions: real keys present and version-shaped,
 Node-only dependency names provably absent.
+
+`ada` IS published, and it is the one Node dependency name that was withheld
+by mistake rather than by principle: oam parses every URL with ada — the same
+C++ WHATWG parser Node reports under this key, doing the same job
+(`ada_url::Url::parse`, `crates/oam_engine/src/node_ops.rs`). The version is the
+vendored C++ ada read from the pinned `ada-url` crate's own `deps/ada.h` at
+build time, NOT the Rust binding crate's version, which moves independently and
+would put a number under a Node-owned name that means something else. oam's ada
+is simply newer than the one Node 22 bundles (3.4.4 vs 2.9.2).
 
 `icu` and `unicode` ARE published, because V8's bundled ICU is real: the values are
 read at build time from the version headers of the exact `v8` crate pinned in

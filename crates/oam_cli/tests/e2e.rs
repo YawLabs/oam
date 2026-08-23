@@ -7132,8 +7132,9 @@ fn process_versions_honest_keys() {
         "process_versions.mjs",
         "const v = process.versions;\n\
          const versionish = /^\\d+\\.\\d+\\.\\d+/;\n\
-         const real = ['node', 'oam', 'v8', 'brotli', 'flate2', 'h2', 'hickory',\n\
-                       'hyper', 'oxc', 'reqwest', 'ring', 'rustls', 'tokio', 'url'];\n\
+         const real = ['node', 'oam', 'v8', 'ada', 'brotli', 'flate2', 'h2',\n\
+                       'hickory', 'hyper', 'oxc', 'reqwest', 'ring', 'rustls',\n\
+                       'tokio', 'url'];\n\
          for (const k of real) {\n\
            console.log('has_' + k + ':', typeof v[k] === 'string' && versionish.test(v[k]));\n\
          }\n\
@@ -7145,12 +7146,96 @@ fn process_versions_honest_keys() {
          // cldr/tz live in ICU DATA files the v8 crate does not vendor, so\n\
          // their versions cannot be verified -- they must stay absent.\n\
          const lying = ['uv', 'openssl', 'llhttp', 'ares', 'nghttp2', 'napi',\n\
-                        'modules', 'undici', 'zlib', 'ada', 'acorn', 'zstd',\n\
+                        'modules', 'undici', 'zlib', 'acorn', 'zstd',\n\
                         'cldr', 'tz'];\n\
          for (const k of lying) {\n\
            console.log('absent_' + k + ':', !(k in v));\n\
          }\n\
          console.log('node_first:', Object.keys(v)[0] === 'node');",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn process_identity_properties_are_read_only() {
+    // Node defines its identity/build metadata with writable:false, and
+    // test-process-versions asserts exactly that for every process.versions
+    // key. oam built them as plain literal properties, so all of them were
+    // writable. This pins the attribute triple per property -- including the
+    // two things that must NOT change: process.versions stays EXTENSIBLE and
+    // its keys stay configurable, because node's are (Object.freeze would
+    // trade one divergence for another, and nothing else would catch it).
+    let stdout = run_ok(
+        "process_ro_props.mjs",
+        "const d = (o, k) => Object.getOwnPropertyDescriptor(o, k);\n\
+         for (const k of ['version', 'versions', 'arch', 'platform', 'release',\n\
+                          'config', 'pid']) {\n\
+           const p = d(process, k);\n\
+           console.log('ro_' + k + ':', p.writable === false && p.enumerable === true\n\
+                                        && p.configurable === true);\n\
+         }\n\
+         console.log('features_non_configurable:', d(process, 'features').configurable === false);\n\
+         console.log('features_ro:', d(process, 'features').writable === false);\n\
+         const keys = Object.keys(process.versions);\n\
+         console.log('versions_members_ro:', keys.length > 0\n\
+           && keys.every((k) => d(process.versions, k).writable === false));\n\
+         console.log('versions_members_configurable:',\n\
+           keys.every((k) => d(process.versions, k).configurable === true));\n\
+         console.log('release_members_ro:',\n\
+           Object.keys(process.release).every((k) => d(process.release, k).writable === false));\n\
+         // node's process.versions is NOT frozen and NOT sealed.\n\
+         console.log('versions_extensible:', Object.isExtensible(process.versions) === true);\n\
+         console.log('versions_not_frozen:', Object.isFrozen(process.versions) === false);\n\
+         // Assigning is inert rather than corrupting the value for later code.\n\
+         const before = process.platform;\n\
+         try { process.platform = 'bogus'; } catch (e) { /* strict-mode TypeError */ }\n\
+         console.log('assign_is_inert:', process.platform === before);",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn system_error_name_round_trips_the_errno_oam_stamps() {
+    // err.errno carries the LIBUV error number (oam_core::node_errno), and
+    // util.getSystemErrorName is the documented way to turn it back into a
+    // code -- so the two must agree. They did not: getSystemErrorName carried
+    // a private invented -1..-28 sequence matching no platform, so on Windows
+    // a plain ENOENT (-4058) answered "Unknown system error -4058", and on
+    // linux everything past ENOENT was wrong too (EACCES is -13, not -3).
+    let stdout = run_ok(
+        "system_errno.mjs",
+        "import fs from 'node:fs';\n\
+         import util from 'node:util';\n\
+         let err;\n\
+         try { fs.statSync('./oam-nonexistent-errno-probe'); } catch (e) { err = e; }\n\
+         console.log('is_enoent:', err.code === 'ENOENT');\n\
+         console.log('errno_negative:', typeof err.errno === 'number' && err.errno < 0);\n\
+         console.log('round_trips:', util.getSystemErrorName(err.errno) === err.code);\n\
+         console.log('message_real:',\n\
+           util.getSystemErrorMessage(err.errno) === 'no such file or directory');\n\
+         const map = util.getSystemErrorMap();\n\
+         console.log('map_realistic_size:', map.size > 50);\n\
+         console.log('map_agrees_with_name:',\n\
+           [...map].every(([n, [name]]) => util.getSystemErrorName(n) === name));\n\
+         console.log('map_has_the_stamped_errno:', map.get(err.errno)[0] === 'ENOENT');\n\
+         // EOF/UNKNOWN have no POSIX errno, so libuv fixes them everywhere.\n\
+         console.log('eof_fixed:', util.getSystemErrorName(-4095) === 'EOF');\n\
+         console.log('unknown_fixed:', util.getSystemErrorName(-4094) === 'UNKNOWN');\n\
+         // The specific invented entry that made the old table wrong on every\n\
+         // platform: -3 is ESRCH on unix and unassigned on Windows, never EACCES.\n\
+         console.log('no_invented_eacces:', util.getSystemErrorName(-3) !== 'EACCES');\n\
+         console.log('unmapped_falls_back:',\n\
+           util.getSystemErrorName(-999999) === 'Unknown system error -999999');",
     );
     for line in stdout.lines() {
         assert!(
@@ -8192,15 +8277,21 @@ try { process.loadEnvFile('nonexistent.env'); }
 catch (e) { threw = e.code === 'ENOENT'; }
 console.log('missing_throws=' + threw);
 
-// util.getSystemErrorName
-console.log('enoent=' + util.getSystemErrorName(-2));
-console.log('eacces=' + util.getSystemErrorName(-3));
-console.log('unknown=' + util.getSystemErrorName(-999).startsWith('Unknown'));
+// util.getSystemErrorName, keyed off the errno oam actually stamps rather
+// than a hardcoded number: the libuv error value is PLATFORM-SPECIFIC
+// (ENOENT is -2 on unix but -4058 on Windows), so the old -2/-3 literals
+// asserted a table that matched no platform -- node on win32 answers
+// 'Unknown system error -2' for -2, and has no -3 at all.
+let enoentErrno = 0;
+try { fs.statSync('nonexistent-for-errno.txt'); } catch (e) { enoentErrno = e.errno; }
+console.log('errno_is_negative=' + (typeof enoentErrno === 'number' && enoentErrno < 0));
+console.log('enoent=' + util.getSystemErrorName(enoentErrno));
+console.log('unknown=' + util.getSystemErrorName(-999999).startsWith('Unknown'));
 
 // util.getSystemErrorMap
 const map = util.getSystemErrorMap();
 console.log('map_is_map=' + (map instanceof Map));
-console.log('map_enoent=' + map.get(-2)[0]);
+console.log('map_enoent=' + map.get(enoentErrno)[0]);
 "#,
     );
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
@@ -8226,8 +8317,8 @@ console.log('map_enoent=' + map.get(-2)[0]);
         "report_getReport=function",
         "report_obj=true",
         "missing_throws=true",
+        "errno_is_negative=true",
         "enoent=ENOENT",
-        "eacces=EACCES",
         "unknown=true",
         "map_is_map=true",
         "map_enoent=ENOENT",
