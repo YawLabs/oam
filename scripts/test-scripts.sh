@@ -102,6 +102,25 @@ survivors(){
   if [ -z "$bad" ]; then pass; else fail "wrong survivors:$bad"; fi
 }
 
+# Same contract as survivors, but paths are relative to the fixture ROOT rather
+# than to target/debug/deps -- needed by anything asserting across trees, or on
+# incremental/ and the parked copies, none of which live under deps/.
+tree_survivors(){
+  local bad="" f
+  for f in "$@"; do
+    case "$f" in
+      '!'*) [ -e "$ROOT/${f#!}" ] && bad="$bad ${f#!}(should be gone)" ;;
+      *)    [ -e "$ROOT/$f" ]     || bad="$bad $f(missing)" ;;
+    esac
+  done
+  if [ -z "$bad" ]; then pass; else fail "wrong survivors:$bad"; fi
+}
+
+# gc() swallows output, which is right for the selection tests and wrong for the
+# ones whose whole claim is that the script SAID something -- a degrade path
+# that prunes nothing is only distinguishable from a silent no-op by its warning.
+gc_out(){ ( cd "$ROOT" && bash scripts/gc-target.sh "$@" 2>&1 ); }
+
 # =============================================================================
 group "gc-target.sh -- artifact selection"
 # =============================================================================
@@ -170,17 +189,25 @@ survivors e2e-ddddddddddddddd1 e2e-ddddddddddddddd2
 reset_tree
 plant target/debug/deps 0 oam-1111111111111111
 plant target/debug/deps 1 oam-2222222222222222
+plant target/release/deps 0 oam-aaaa000000000001
+plant target/release/deps 1 oam-aaaa000000000002
 plant target/x64-host/release/deps 0 oam-3333333333333333
 plant target/x64-host/release/deps 1 oam-4444444444444444
+plant target/x64-host/x86_64-pc-windows-msvc/release/deps 0 oam-bbbb000000000001
+plant target/x64-host/x86_64-pc-windows-msvc/release/deps 1 oam-bbbb000000000002
 plant target/x64-host/x86_64-apple-darwin/release/deps 0 oam-5555555555555555
 plant target/x64-host/x86_64-apple-darwin/release/deps 1 oam-6666666666666666
 gc --keep 1
 
+# All FIVE entries in TREES, not three. target/release and the triple-suffixed
+# msvc path were the two nobody exercised, and the msvc one exists specifically
+# to collect trees left by a pre-0.11 release -- a legacy entry that nothing
+# runs against is exactly how a list entry becomes a silent no-op.
 it "prunes every configured tree in one run, not just target/debug"
-# Labelled rather than a bare "111": the counts are compared as one value so a
-# single `it` books a single result, but an unpruned tree has to say WHICH tree.
-eq "debug=$(count_in target/debug/deps) win-x64=$(count_in target/x64-host/release/deps) mac-x64=$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" \
-   "debug=1 win-x64=1 mac-x64=1"
+# Labelled rather than a bare count string: the counts are compared as one value
+# so a single `it` books a single result, but an unpruned tree has to say WHICH.
+eq "debug=$(count_in target/debug/deps) release=$(count_in target/release/deps) win-x64=$(count_in target/x64-host/release/deps) msvc=$(count_in target/x64-host/x86_64-pc-windows-msvc/release/deps) mac-x64=$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" \
+   "debug=1 release=1 win-x64=1 msvc=1 mac-x64=1"
 
 # =============================================================================
 group "gc-target.sh -- portability and safety"
@@ -274,6 +301,119 @@ gc --keep 1
 eq "$?" "0"
 
 # =============================================================================
+group "gc-target.sh -- incremental, parked copies, and argv"
+# =============================================================================
+
+# incremental/ is the LARGEST reclaim this script makes -- 53.8GB of the 113GB
+# measured on the dev box, against 48.2GB for deps/ -- and nothing exercised it.
+# It is also the only reclaim with an opt-out, so a flag whose sense inverted
+# would either stop reclaiming the bulk of the tree or destroy a cache the
+# caller asked to keep, and every deps/ assertion above would stay green.
+reset_tree
+plant target/debug/deps 0 oam-cccc000000000001
+plant target/debug/deps 1 oam-cccc000000000002
+mkdir -p "$ROOT/target/debug/incremental/oam-abc123/s-xyz"
+echo cache > "$ROOT/target/debug/incremental/oam-abc123/s-xyz/dep-graph.bin"
+gc --keep 1
+
+it "deletes incremental/ wholesale by default"
+tree_survivors '!target/debug/incremental' target/debug/deps/oam-cccc000000000002
+
+reset_tree
+plant target/debug/deps 0 oam-dddd000000000001
+plant target/debug/deps 1 oam-dddd000000000002
+mkdir -p "$ROOT/target/debug/incremental/oam-abc123"
+echo cache > "$ROOT/target/debug/incremental/oam-abc123/dep-graph.bin"
+gc --keep-incremental --keep 1
+
+it "--keep-incremental spares the cache and still prunes deps/"
+tree_survivors target/debug/incremental/oam-abc123/dep-graph.bin \
+               target/debug/deps/oam-dddd000000000002 \
+               '!target/debug/deps/oam-dddd000000000001'
+
+# build-locks.sh parks a file it cannot unlink as <name>.inuse-<pid>. Reaping
+# those is one of the three jobs this script's own header claims, and it was the
+# only one with no coverage -- a parked copy nothing collects is a slow leak of
+# exactly the multi-GB artifacts the script exists to remove. Both fixtures are
+# deliberately hash-free, so only the reap can account for their removal; a
+# 16-hex name would also be a family-prune candidate and blur which ran.
+reset_tree
+plant target/debug/deps 0 oam-eeee000000000001
+echo parked > "$ROOT/target/debug/oam.exe.inuse-4242"
+echo parked > "$ROOT/target/debug/deps/libfoo.rlib.inuse-4242"
+gc --keep 1
+
+it "reaps parked .inuse-<pid> copies from both the tree and its deps/"
+tree_survivors '!target/debug/oam.exe.inuse-4242' \
+               '!target/debug/deps/libfoo.rlib.inuse-4242' \
+               target/debug/deps/oam-eeee000000000001
+
+# --- argv guards --------------------------------------------------------------
+# Asserted on exit status AND on the tree. A validation that drifted below the
+# prune loop would still exit non-zero, having already deleted -- which is the
+# failure the exit code alone cannot see.
+#
+# Each of these re-plants rather than sharing one fixture, and that is worth the
+# extra spawns: every assertion here is "nothing was deleted", so the first one
+# that DOES delete leaves the rest asserting against a tree it already emptied.
+# Removing the keep>=1 guard produced four failures for one bug before this;
+# now the failing guard is the only thing that reports.
+argv_fixture(){
+  reset_tree
+  plant target/debug/deps 0 oam-ffff000000000001
+  plant target/debug/deps 1 oam-ffff000000000002
+}
+argv_intact(){ tree_survivors target/debug/deps/oam-ffff000000000001 target/debug/deps/oam-ffff000000000002; }
+
+it "--keep 0 is refused, and nothing is deleted"
+argv_fixture
+gc --keep 0 && fail "--keep 0 should exit non-zero" || argv_intact
+
+it "a non-numeric --keep is refused, and nothing is deleted"
+argv_fixture
+gc --keep abc && fail "--keep abc should exit non-zero" || argv_intact
+
+# gc is dispatched REMOTELY by build-remote.sh, so a flag that fell through to a
+# prune instead of an error would run against a live builder's tree.
+it "an unknown flag is refused, and nothing is deleted"
+argv_fixture
+gc --bogus && fail "an unknown flag should exit non-zero" || argv_intact
+
+it "-h prints usage, exits 0, and prunes nothing"
+argv_fixture
+HELP_OUT="$(gc_out -h)"
+if [ -n "$HELP_OUT" ] && [ "$(count_in target/debug/deps)" = "2" ]; then pass
+else fail "help printed ${#HELP_OUT} chars and left $(count_in target/debug/deps) of 2 files"; fi
+
+# --- the BSD/macOS leg --------------------------------------------------------
+# `find -printf` is GNU-only. BSD find yields nothing for it, so without the
+# probe the per-family prune would collect zero while reporting a clean run --
+# the precise shape of the mawk bug this suite exists for. The contract is to
+# degrade LOUDLY: skip the deps prune, say why, and still reclaim incremental/.
+it "a find without -printf skips the deps prune loudly, reclaiming the rest"
+NOPRINTF="$SUITE_TMP/shim-noprintf"
+mkdir -p "$NOPRINTF"
+REAL_FIND="$(command -v find)"
+{
+  echo '#!/bin/sh'
+  echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
+  printf 'exec %s "$@"\n' "$REAL_FIND"
+} > "$NOPRINTF/find"
+chmod +x "$NOPRINTF/find"
+reset_tree
+plant target/debug/deps 0 oam-9999000000000001
+plant target/debug/deps 1 oam-9999000000000002
+mkdir -p "$ROOT/target/debug/incremental"
+echo cache > "$ROOT/target/debug/incremental/dep-graph.bin"
+DEGRADE_OUT="$( cd "$ROOT" && PATH="$NOPRINTF:$PATH" bash scripts/gc-target.sh --keep 1 2>&1 )"
+if grep -q 'needs GNU find' <<<"$DEGRADE_OUT" \
+   && have oam-9999000000000001 && have oam-9999000000000002 \
+   && [ ! -e "$ROOT/target/debug/incremental" ]; then pass
+else
+  fail "warned=$(grep -c 'needs GNU find' <<<"$DEGRADE_OUT") deps=$(count_in target/debug/deps)/2 incremental=$([ -e "$ROOT/target/debug/incremental" ] && echo present || echo reclaimed)"
+fi
+
+# =============================================================================
 group "build-remote.sh -- gc dispatch"
 # =============================================================================
 
@@ -325,6 +465,12 @@ eq "$(iap_parse_listening_port "$LOG")" "52528"
 it "a missing log file is a clean miss, not a crash"
 iap_parse_picked_port "$SUITE_TMP/nonexistent.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
 
+# The same guard on the OTHER parser, which is the authoritative one: a bound
+# port is what proves the tunnel is up, so this is the function whose failure
+# means "do not proceed". Only picked_port's missing-file path was covered.
+it "a missing log file is a clean miss for the listening-port parser too"
+iap_parse_listening_port "$SUITE_TMP/nonexistent.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
+
 # =============================================================================
 group "iap-helpers.sh -- guest boot detection"
 # =============================================================================
@@ -341,6 +487,19 @@ sshd_banner_seen "systemd[1]: Starting ssh.service - OpenBSD Secure Shell server
 it "does not fire on unrelated ssh chatter"
 sshd_banner_seen "tailscaled[417]: pm: using backend prefs ssh=true routes=[]" \
   && fail "matched unrelated output containing 'ssh'" || pass
+
+# The regex carries four alternations and only the Debian one was exercised.
+# Portability across distro unit namings is the entire reason the other three
+# are there, and narrowing the pattern turns cold-VM boot detection into a
+# silent 180s stall on every start rather than a visible failure.
+it "matches the RHEL-family sshd.service unit naming"
+sshd_banner_seen "systemd[1]: Started sshd.service - OpenSSH server daemon." \
+  && pass || fail "did not match the RHEL-family unit line"
+
+it "matches the bare OpenBSD and OpenSSH unit descriptions"
+if sshd_banner_seen "systemd[1]: Started OpenBSD Secure Shell server." \
+   && sshd_banner_seen "systemd[1]: Started OpenSSH Daemon."; then pass
+else fail "a distro naming the regex claims to cover did not match"; fi
 
 # =============================================================================
 group "iap-helpers.sh -- disk headroom thresholds"
@@ -363,6 +522,19 @@ it "an unreadable df result triggers neither a prune nor an abort"
 if ! disk_needs_reclaim "" && ! disk_below_floor "" \
    && ! disk_needs_reclaim "N/A" && ! disk_below_floor "N/A"; then pass
 else fail "empty/non-numeric readings must be inert"; fi
+
+# Both thresholds are documented env knobs that decide whether a release
+# prunes, proceeds, or aborts, and every assertion above runs against the
+# hardcoded 20/10 defaults. They are resolved at SOURCE time, so an override
+# only takes effect in a fresh shell -- assigning after the fact would silently
+# test nothing, which is why these go through `bash -c`.
+it "OAM_DISK_RECLAIM_GB moves the reclaim threshold"
+eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
+   "reclaim"
+
+it "OAM_DISK_MIN_GB moves the abort floor"
+eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_below_floor 40 && echo abort || echo proceed')" \
+   "abort"
 
 # =============================================================================
 echo
