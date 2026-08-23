@@ -129,7 +129,7 @@ fn run_at(repo: &Path, regen: bool) -> Result<()> {
             "{} is missing. It is a committed artifact and the unsafe-budget gate cannot \
              run without it; restore it from git, or regenerate with \
              `cargo run -p xtask -- unsafe-budget --regen`.",
-            path.display()
+            rel(repo, &path)
         );
     }
     let baseline = load_budget(&path)?;
