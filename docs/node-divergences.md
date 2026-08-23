@@ -630,9 +630,9 @@ Measured on all three release platforms:
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1364 / 1874 | 410 | 100 | 13 |
-| linux-x64 (Node v22.23.1) | 1421 / 1888 | 367 | 100 | 13 |
-| darwin-arm64 (Node v22.23.1) | 1421 / 1884 | 363 | 100 | 13 |
+| windows-aarch64 (Node v22.22.2) | 1365 / 1874 | 409 | 100 | 13 |
+| linux-x64 (Node v22.23.1) | 1422 / 1888 | 366 | 100 | 13 |
+| darwin-arm64 (Node v22.23.1) | 1422 / 1884 | 362 | 100 | 13 |
 
 "Present" subtracts both columns: the per-name gaps *and* the 100 export names living
 inside the 13 modules oam does not register at all (`sys` alone accounts for 49). The
