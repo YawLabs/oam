@@ -556,6 +556,22 @@ Node-on-Windows.
 On Windows, oam returns `"10.0.26200"` (the same string as `os.release()`); Node returns
 `"Windows 11 Pro"`.
 
+### 16. `dns.setServers()` refuses instead of pretending
+
+Node accepts a nameserver list and honours it. oam throws an `Error` with `code: 'ENOSYS'`
+from both `dns.setServers()` and `dns.Resolver.prototype.setServers()`.
+
+oam resolves through a single process-global `TokioResolver` built from the system
+configuration, and has no plumbing to point one query at a caller-supplied nameserver.
+That leaves three options, and refusing is the least bad: recording the list and querying
+the system servers anyway is the one that actually hurts, because a `Resolver` aimed at a
+blackhole address (`192.0.2.99`, TEST-NET-1) came back with **real A records** — an answer
+from the wrong nameserver is indistinguishable from a correct one. A throw sends the caller
+to its own fallback branch, which is the behavior that is right for oam.
+
+`dns.getServers()` is NOT narrowed: it reports the real configured nameservers, taken from
+the same `ResolverConfig` the resolver was built from, so the two stay coherent.
+
 ---
 
 ## Narrowed and partial surfaces

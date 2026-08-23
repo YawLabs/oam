@@ -7175,6 +7175,47 @@ fn process_versions_honest_keys() {
 }
 
 #[test]
+fn dns_set_servers_refuses_rather_than_lying() {
+    // A DELIBERATE divergence, so it cannot be a differential conformance case:
+    // node accepts setServers and honours it, oam throws ENOSYS.
+    //
+    // oam's resolver is process-global (one OnceLock<TokioResolver> built from
+    // the system config), and there is no per-Resolver plumbing to point a
+    // query at a caller-supplied nameserver. Recording the list and then
+    // querying the system servers anyway is the worst of the three options: a
+    // Resolver aimed at a blackhole address came back with real records, which
+    // is indistinguishable from a correct answer. Throwing sends the caller to
+    // its own fallback instead. getServers still reports the REAL configured
+    // servers, so the pair stays coherent.
+    let stdout = run_ok(
+        "dns_set_servers.mjs",
+        "import dns from 'node:dns';
+         const grab = (fn) => { try { fn(); return null; } catch (e) { return e; } };
+         const modErr = grab(() => dns.setServers(['1.1.1.1']));
+         console.log('module_throws:', modErr !== null);
+         console.log('module_code:', modErr && modErr.code === 'ENOSYS');
+         const r = new dns.Resolver();
+         const resErr = grab(() => r.setServers(['1.1.1.1']));
+         console.log('resolver_throws:', resErr !== null);
+         console.log('resolver_code:', resErr && resErr.code === 'ENOSYS');
+         // The refusal must NOT have left a half-applied state behind.
+         const servers = dns.getServers();
+         console.log('getServers_is_array:', Array.isArray(servers));
+         console.log('getServers_nonempty:', servers.length > 0);
+         console.log('getServers_strings:', servers.every((s) => typeof s === 'string'));
+         console.log('resolver_getServers_matches:',
+           JSON.stringify(r.getServers()) === JSON.stringify(servers));",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}
+full output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn process_versions_ada_is_the_vendored_cpp_version() {
     // The ada-url CRATE version and the ada C++ version it vendors are
     // DIFFERENT numbers (3.4.5 vs 3.4.4 at the time of writing), and both are

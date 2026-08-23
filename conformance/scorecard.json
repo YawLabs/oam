@@ -1,5 +1,5 @@
 {
-  "commit": "9ddec1d+wip",
+  "commit": "3f361b6+wip",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.11.0",
@@ -370,10 +370,14 @@
         {
           "case": "89-execfile-callback-once.mjs",
           "status": "pass"
+        },
+        {
+          "case": "90-dns-name-shapes.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 91,
-      "total": 91
+      "pass": 92,
+      "total": 92
     },
     "surface": {
       "exports": {

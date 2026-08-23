@@ -21805,7 +21805,7 @@
     };
 
     class Resolver {
-      constructor() { this._servers = []; }
+      constructor() {}
       resolve(hostname, rrtype, cb) {
         if (typeof rrtype === "function") { cb = rrtype; rrtype = "A"; }
         resolve(hostname, rrtype, cb);
@@ -21823,8 +21823,23 @@
       resolveNaptr(hostname, cb) { resolveNaptr(hostname, cb); }
       reverse(ip, cb) { reverse(ip, cb); }
       cancel() {}
-      getServers() { return this._servers.slice(); }
-      setServers(servers) { this._servers = (servers || []).slice(); }
+      // The REAL configured nameservers, from the same ResolverConfig the
+      // resolver was built from -- not a list the caller handed us.
+      getServers() { return natives.dnsGetServers(); }
+      // Refused rather than recorded. oam's resolver is process-global and has
+      // no per-Resolver server plumbing, so accepting the list and then
+      // querying the SYSTEM servers anyway is the worst outcome: a Resolver
+      // pointed at a blackhole returned real records. Throwing sends the
+      // caller to its own fallback instead of silently answering from the
+      // wrong nameserver.
+      setServers() {
+        const err = new Error(
+          "dns.Resolver.prototype.setServers is not supported by oam: its DNS resolver is " +
+            "process-global and cannot be pointed at a caller-supplied nameserver",
+        );
+        err.code = "ENOSYS";
+        throw err;
+      }
     }
 
     const ADDRCONFIG = 0;
@@ -21850,8 +21865,15 @@
       Resolver,
       promises,
       setDefaultResultOrder() {},
-      setServers() {},
-      getServers: () => [],
+      setServers() {
+        const err = new Error(
+          "dns.setServers is not supported by oam: its DNS resolver is process-global and " +
+            "cannot be pointed at a caller-supplied nameserver",
+        );
+        err.code = "ENOSYS";
+        throw err;
+      },
+      getServers: () => natives.dnsGetServers(),
       ADDRCONFIG,
       V4MAPPED,
       ALL,
