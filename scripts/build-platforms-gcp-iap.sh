@@ -83,6 +83,8 @@ command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found on this box"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/iap-helpers.sh
+. "$SCRIPT_DIR/lib/iap-helpers.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -150,7 +152,7 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
       # those bytes is not worth it.
       serial="$(gcloud compute instances get-serial-port-output "$INSTANCE" \
         --zone="$ZONE" --project="$PROJECT" 2>/dev/null || true)"
-      if grep -qE 'Started (ssh|sshd)\.service|Started OpenBSD Secure Shell|Started OpenSSH' <<<"$serial"; then
+      if sshd_banner_seen "$serial"; then
         ok "guest sshd up (serial console, ${waited}s after start)"
         return 0
       fi
@@ -203,14 +205,14 @@ iap_tunnel_serving() {
     fi
     kill -0 "$IAP_TUNNEL_PID" 2>/dev/null || return 1
   done
-  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Listening on port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  IAP_TUNNEL_PORT="$(iap_parse_listening_port "$IAP_TUNNEL_LOG" || true)"
   if [ -n "$IAP_TUNNEL_PORT" ]; then
     ok "IAP tunnel up: localhost:$IAP_TUNNEL_PORT -> $INSTANCE:22 (waited ${waited}s)"
     return 0
   fi
   # Some gcloud versions hang in their internal tunnel self-test while the port
   # already serves fine, so a bound-but-unlogged port still counts as up.
-  IAP_TUNNEL_PORT=$(awk -F'[][]' '/Picking local unused port/ {print $2; exit}' "$IAP_TUNNEL_LOG")
+  IAP_TUNNEL_PORT="$(iap_parse_picked_port "$IAP_TUNNEL_LOG" || true)"
   [ -n "$IAP_TUNNEL_PORT" ] || return 1
   local port_waited=0
   while ! timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/$IAP_TUNNEL_PORT" 2>/dev/null; do
@@ -395,7 +397,7 @@ if [ -n "$DISK_FREE_GB" ]; then
   # delete things by hand -- a nag that never fixed anything, so the tree kept
   # growing until a run hard-failed here. Reclaim it instead; the build cache
   # survives, so this costs no build time.
-  if [ "$DISK_FREE_GB" -lt 20 ]; then
+  if disk_needs_reclaim "$DISK_FREE_GB"; then
     warn "builder has ${DISK_FREE_GB}GB free on / -- reclaiming accreted cargo output before building"
     gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh gc" >&2 2>&1 \
       || warn "pre-build reclaim failed -- continuing to the threshold check"
@@ -403,7 +405,7 @@ if [ -n "$DISK_FREE_GB" ]; then
   fi
   # Judge AFTER the reclaim: the cheap fix has already run, so anything still
   # short needs a real one.
-  if [ -n "$DISK_FREE_GB" ] && [ "$DISK_FREE_GB" -lt 10 ]; then
+  if disk_below_floor "$DISK_FREE_GB"; then
     fail "builder still has only ${DISK_FREE_GB}GB free on / after reclaiming prunable cargo output -- a build needs ~7GB. Grow the boot disk, or ssh in and look for space outside ~/${REMOTE_DIR}/target."
   fi
   [ -n "$DISK_FREE_GB" ] && ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"
