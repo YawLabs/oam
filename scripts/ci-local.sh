@@ -17,10 +17,10 @@
 #                                            fails -- node-compat.yml parity)
 #   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
-#   9. unsafe budget ceiling ratchet       (GATING; AI-POLICY.md gate 5 --
-#                                            real unsafe_count ceiling per crate;
-#                                            per-site coverage is clippy's job,
-#                                            enforced in step 2)
+#   9. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
+#                                            real unsafe_count ceiling per
+#                                            crate; per-site coverage is
+#                                            clippy's job, enforced in step 2)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
 # gates a release on this script PLUS gate+test+conformance on the GCP Linux
@@ -266,7 +266,8 @@ say "9/9 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # above its unsafe_count ceiling -- OR any count strictly BELOW the committed
 # baseline (which must be re-blessed) -- fails here. The old documented_count
 # FLOOR is retired: it conflicted with clippy's unnecessary_safety_comment, and
-# per-site justification is now denied-by-lint on every crate (step 2). Baseline: conformance/unsafe-budget.json; regen with
+# per-site justification is now denied-by-lint on every crate (step 2).
+# Baseline: conformance/unsafe-budget.json; regen with
 # `cargo run -p xtask -- unsafe-budget --regen`.
 if cargo run -p xtask -- unsafe-budget; then
   ok "unsafe budget within ceilings"

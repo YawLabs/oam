@@ -84,8 +84,15 @@ struct CrateBudget {
 type Budget = BTreeMap<String, CrateBudget>;
 
 pub(crate) fn run(regen: bool) -> Result<()> {
-    let repo = repo_root()?;
-    let measured = measure_budget(&repo)?;
+    run_at(&repo_root()?, regen)
+}
+
+/// `run` against an explicit repo root. Split out so the fail-closed missing-
+/// baseline path and the corrupt-baseline regen recovery are unit-testable
+/// against a throwaway tree; `repo_root()` is fixed at compile time and cannot
+/// be pointed anywhere else.
+fn run_at(repo: &Path, regen: bool) -> Result<()> {
+    let measured = measure_budget(repo)?;
     let path = repo.join("conformance/unsafe-budget.json");
 
     if regen {
@@ -110,7 +117,7 @@ pub(crate) fn run(regen: bool) -> Result<()> {
         }
         write_budget(&path, &measured)?;
         print_summary(&measured);
-        println!("\nwrote {} (regenerated from the tree)", rel(&repo, &path));
+        println!("\nwrote {} (regenerated from the tree)", rel(repo, &path));
         return Ok(());
     }
 
@@ -161,11 +168,11 @@ fn print_summary(b: &Budget) {
 fn ceiling_check(label: &str, measured: usize, recorded: usize) -> Option<String> {
     if measured > recorded {
         Some(format!(
-            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each at its \
-             SITE -- a `// SAFETY:` comment on an unsafe block or `unsafe impl`, a \
-             `/// # Safety` section on a public unsafe fn, and NEITHER on an `unsafe extern` \
-             foreign module (clippy rejects a safety comment on those last two) -- then, with \
-             review, raise the ceiling."
+            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each at \
+             its SITE: a `// SAFETY:` comment on an unsafe block or `unsafe impl`, a \
+             `/// # Safety` doc section on a public unsafe fn, and nothing at all on an \
+             `unsafe extern` foreign module -- clippy rejects a `// SAFETY:` comment on \
+             those last two. Then, with review, raise the ceiling."
         ))
     } else if measured < recorded {
         Some(format!(
@@ -1191,17 +1198,110 @@ mod tests {
         let t = TempRepo::new("dupkey");
         t.file(
             "crates/xtask/src/lib.rs",
-            "pub fn f() { unsafe { g(); } }
-",
+            "pub fn f() { unsafe { g(); } }\n",
         );
-        t.file(
-            "xtask/src/main.rs",
-            "fn main() { unsafe { g(); } }
-",
-        );
+        t.file("xtask/src/main.rs", "fn main() { unsafe { g(); } }\n");
         let err = measure_budget(t.path()).unwrap_err().to_string();
         assert!(err.contains("`xtask`"), "{err}");
         assert!(err.contains("two workspace members"), "{err}");
+    }
+
+    #[test]
+    fn crlf_source_counts_the_same_as_lf() {
+        // The committed baseline is ONE set of numbers shared by all four CI
+        // legs, and this is a Windows box where autocrlf can hand the scanner
+        // `\r\n`. If `\r` ever perturbed the line-comment scan or `skip_ws` the
+        // gate would fail on exactly one platform, reported as a "stale
+        // ceiling" that points nowhere near the real cause.
+        // `fn c` deliberately puts the brace on the NEXT line: that is the one
+        // place `\r` must be skipped as whitespace for the block to be seen.
+        let lf = "// a line comment x\nunsafe fn a() {}\nfn b() { unsafe { g(); } }\nfn c() {\n    unsafe\n    { g(); }\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(scan_source(lf), 3);
+        assert_eq!(
+            scan_source(&crlf),
+            scan_source(lf),
+            "CRLF must not shift the count"
+        );
+    }
+
+    #[test]
+    fn unsafe_trait_counts_toward_the_ceiling() {
+        // `classify` carries a dedicated branch for this precisely because the
+        // tree has none today -- an untested future-proofing branch is one
+        // refactor away from being a silent hole.
+        let t = tally(&strip_comments_and_strings("unsafe trait Send2 {}\n"));
+        assert_eq!(t.total(), 1, "an unsafe trait is a real unsafe construct");
+    }
+
+    #[test]
+    fn a_raw_identifier_is_not_read_as_a_raw_string() {
+        // `r#type` must not open a raw string: if it did, the scan would blank
+        // the rest of the file to spaces and undercount that crate's ceiling --
+        // the same silent-undercount class as the `'\'` runaway above.
+        let src = "let r#type = 1; let r#match = 2; unsafe { g(); }";
+        assert_eq!(scan_source(src), 1);
+    }
+
+    #[test]
+    fn every_violation_is_reported_not_just_the_first() {
+        // A reviewer acting on a truncated list fixes one problem, re-runs, and
+        // hits the next. All of them must surface in one pass.
+        let measured = budget(&[("oam_engine", 701), ("oam_new", 2)]);
+        let baseline = budget(&[("oam_engine", 700)]);
+        let v = compute_violations(&measured, &baseline);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v.iter().any(|m| m.contains("701 > ceiling 700")), "{v:?}");
+        assert!(v.iter().any(|m| m.contains("oam_new")), "{v:?}");
+    }
+
+    #[test]
+    fn budget_round_trips_through_a_real_file() {
+        // `json_round_trips` covers the in-memory Value only. The on-disk path
+        // adds the _comment, pretty-printing and a trailing newline -- a
+        // formatting change there would make every regen diff noisily.
+        let t = TempRepo::new("io");
+        let path = t.path().join("unsafe-budget.json");
+        let b = budget(&[("oam_core", 90), ("oam_engine", 573)]);
+        write_budget(&path, &b).unwrap();
+        assert_eq!(load_budget(&path).unwrap(), b);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("_comment"), "the baseline explains itself");
+        assert!(text.ends_with("}\n"), "exactly one trailing newline");
+    }
+
+    #[test]
+    fn a_missing_baseline_fails_closed() {
+        // The file is a COMMITTED artifact. Treating its absence as "nothing
+        // recorded yet" would silently switch the whole gate off, which is the
+        // one failure mode a ratchet must never have.
+        let t = TempRepo::new("nobaseline");
+        t.file(
+            "crates/oam_x/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }\n",
+        );
+        let err = run_at(t.path(), false).unwrap_err().to_string();
+        assert!(err.contains("is missing"), "{err}");
+        assert!(
+            err.contains("--regen"),
+            "the message names the recovery: {err}"
+        );
+    }
+
+    #[test]
+    fn regen_recovers_from_a_corrupt_baseline() {
+        // --regen IS the documented recovery path for an unreadable baseline,
+        // so it must not abort on one; if this regressed to a `?` the recovery
+        // would be dead exactly when it is needed.
+        let t = TempRepo::new("corrupt");
+        t.file(
+            "crates/oam_x/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }\n",
+        );
+        t.file("conformance/unsafe-budget.json", "{ not valid json");
+        run_at(t.path(), true).expect("regen must survive a corrupt baseline");
+        let back = load_budget(&t.path().join("conformance/unsafe-budget.json")).unwrap();
+        assert_eq!(back["oam_x"].unsafe_count, 1, "rewritten from the tree");
     }
 
     #[test]
