@@ -3,16 +3,21 @@
 # Tests for the release-orchestration shell scripts.
 # =============================================================================
 # scripts/ ships the binaries but had no automated verification of any kind:
-# ci-local.sh`s nine gates are all Rust, and nothing in the workspace referenced
-# these files. That is how gc-target.sh spent its whole life collecting NOTHING
-# on Linux while reporting success -- three separate silent failures at once
-# (mawk interval expressions, a dot-requiring family regex, and a `cd ""`
-# no-op), none of which any gate could have caught.
+# ci-local.sh`s Rust gates never looked at it, and nothing in the workspace
+# referenced these files. That is how gc-target.sh spent its whole life
+# collecting NOTHING on Linux while reporting success -- three silent failures
+# at once (mawk interval expressions, a dot-requiring family regex, and a
+# `cd ""` no-op), none of which any gate could have caught.
 #
-# Everything here runs the REAL scripts against real temp directories. No mocks:
-# the bugs that actually bit were external behaviour (mawk`s regex dialect,
-# gcloud`s output buffering) differing from what the code assumed, which is
-# precisely what a mock would have encoded wrong.
+# Everything here runs the REAL scripts against real directories. No mocks: the
+# bugs that actually bit were external behaviour (mawk`s regex dialect, gcloud`s
+# output buffering) differing from what the code assumed, which is precisely
+# what a mock would have encoded wrong.
+#
+# Cost matters, because this is a gate on every push and process spawn on the
+# Windows dev box runs ~1s. So: ONE temp root for the whole suite, ONE repo
+# skeleton shared by every fixture, and assertions grouped so a single
+# gc-target.sh run can answer several questions.
 #
 # Usage:
 #   ./scripts/test-scripts.sh            # run all, non-zero exit on any failure
@@ -27,6 +32,13 @@ VERBOSE=0
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
+# One temp root, removed on exit. Every fixture used to call mktemp and nothing
+# ever cleaned up: a single run leaked 14 directories, and once this became a
+# pre-push gate that grew without bound (149 had piled up on the dev box before
+# anyone looked). Same shape as ci-local.sh`s CLEANUP_PATHS + EXIT trap.
+SUITE_TMP="$(mktemp -d -t oamtest-XXXXXX)"
+trap 'rm -rf "$SUITE_TMP"' EXIT
+
 RED='\033[0;31m'; GRN='\033[0;32m'; CYA='\033[0;36m'; NC='\033[0m'
 PASS=0; FAIL=0; CURRENT=""
 group(){ echo -e "\n${CYA}== $* ==${NC}"; }
@@ -34,143 +46,175 @@ it(){ CURRENT="$1"; }
 pass(){ PASS=$((PASS + 1)); [ "$VERBOSE" = "1" ] && echo -e "  ${GRN}ok${NC} $CURRENT"; return 0; }
 fail(){ FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC} $CURRENT"; echo "       $*"; return 0; }
 eq(){ [ "$1" = "$2" ] && pass || fail "expected '$2', got '$1'"; }
+ck(){ if "$@"; then pass; else fail "assertion failed"; fi; }
 
-# A deps/ fixture. Files are given ascending mtimes in argument order, so the
-# LAST one named in a family is that family`s current artifact.
-mk_deps(){
-  local dir="$1"; shift
+# ONE repo skeleton. gc-target.sh resolves its root from its own location, so a
+# fixture needs scripts/ beside target/ -- but it does not need a PRIVATE copy,
+# so every fixture shares this one and just resets target/ in between.
+ROOT="$SUITE_TMP/repo"
+mkdir -p "$ROOT/scripts/lib"
+cp "$REPO_DIR/scripts/gc-target.sh"       "$ROOT/scripts/"
+cp "$REPO_DIR/scripts/lib/build-locks.sh" "$ROOT/scripts/lib/"
+
+reset_tree(){ rm -rf "$ROOT/target"; }
+
+# plant <tree-relative-dir> <generation> <file>...
+# Every file in one call shares a generation timestamp; a higher generation is
+# newer. One touch per generation rather than per file, since touch is a spawn.
+plant(){
+  local dir="$ROOT/$1" gen="$2"; shift 2
   mkdir -p "$dir"
-  local i=0 f
-  for f in "$@"; do
-    echo "artifact" > "$dir/$f"
-    touch -t "2026080112$(printf '%02d' "$i")" "$dir/$f"
-    i=$((i + 1))
-  done
+  local f
+  for f in "$@"; do echo "artifact" > "$dir/$f"; done
+  ( cd "$dir" && touch -t "2026080112$(printf '%02d' "$gen")" "$@" )
 }
 
-# A throwaway repo skeleton that gc-target.sh can run inside: it resolves its
-# root from its own location, so it needs scripts/ and the lib it sources.
-mk_repo(){
-  local root; root="$(mktemp -d -t oamgc-XXXXXX)"
-  mkdir -p "$root/scripts/lib"
-  cp "$REPO_DIR/scripts/gc-target.sh"        "$root/scripts/"
-  cp "$REPO_DIR/scripts/lib/build-locks.sh"  "$root/scripts/lib/"
-  printf '%s' "$root"
-}
+gc(){ ( cd "$ROOT" && bash scripts/gc-target.sh "$@" >/dev/null 2>&1 ); }
+have(){ [ -e "$ROOT/target/debug/deps/$1" ]; }
+gone(){ [ ! -e "$ROOT/target/debug/deps/$1" ]; }
+count_in(){ ls "$ROOT/$1" 2>/dev/null | wc -l | tr -d ' '; }
 
 # =============================================================================
 group "gc-target.sh -- artifact selection"
 # =============================================================================
+# One fixture, one gc run, four independent questions. The families are chosen
+# so none of them can mask another:
+#   oam-<hash>          extensionless unix executables -- the 16GB blind spot
+#   grp-<hash> + .d     same stem with and without an extension, which must NOT
+#                       share a keep budget
+#   libgrp-<hash>.rlib  a third extension
+#   mt-<hash>           newest is alphabetically FIRST, oldest LAST, so name
+#                       order and mtime order disagree
+#   plus four files carrying no 16-hex hash at all
+reset_tree
+plant target/debug/deps 0 \
+  oam-aaaaaaaaaaaaaaa1 grp-bbbbbbbbbbbbbbb1 grp-bbbbbbbbbbbbbbb1.d \
+  libgrp-ccccccccccccccc1.rlib mt-fffffffffffffff9
+plant target/debug/deps 1 \
+  oam-aaaaaaaaaaaaaaa2 grp-bbbbbbbbbbbbbbb2 grp-bbbbbbbbbbbbbbb2.d \
+  libgrp-ccccccccccccccc2.rlib mt-000000000000000a
+plant target/debug/deps 2 oam-aaaaaaaaaaaaaaa3
+plant target/debug/deps 3 \
+  build_script_build-notahash.txt README libfoo.rlib oam-short123
+gc --keep 1
 
-# The 16GB blind spot: unix test/bin executables carry no extension, and a
-# family regex that required a dot after the hash could not see any of them.
+# The bug that hid for the script`s entire life: no extension, so a family regex
+# requiring a dot after the hash could not see these at all.
 it "collects extensionless unix executables"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" \
-  oam-aaaaaaaaaaaaaaa1 oam-aaaaaaaaaaaaaaa2 oam-aaaaaaaaaaaaaaa3
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps")" "oam-aaaaaaaaaaaaaaa3"
+ck test -n "$(have oam-aaaaaaaaaaaaaaa3 && gone oam-aaaaaaaaaaaaaaa1 && gone oam-aaaaaaaaaaaaaaa2 && echo y)"
 
-# Each extension is its own family: an .rlib must never be counted against the
-# bare executable`s keep budget, or one of them gets evicted every run.
+# Each extension is its own family. If they merged, keep=1 would leave only one
+# of these three rather than all three.
 it "groups dotted artifacts per-extension, separately from the bare executable"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" \
-  oam-bbbbbbbbbbbbbbb1 oam-bbbbbbbbbbbbbbb2 \
-  oam-bbbbbbbbbbbbbbb1.d oam-bbbbbbbbbbbbbbb2.d \
-  liboam-bbbbbbbbbbbbbbb1.rlib liboam-bbbbbbbbbbbbbbb2.rlib
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps" | sort | tr '\n' ' ')" \
-   "liboam-bbbbbbbbbbbbbbb2.rlib oam-bbbbbbbbbbbbbbb2 oam-bbbbbbbbbbbbbbb2.d "
+ck test -n "$(have grp-bbbbbbbbbbbbbbb2 && have grp-bbbbbbbbbbbbbbb2.d && have libgrp-ccccccccccccccc2.rlib && gone grp-bbbbbbbbbbbbbbb1 && gone grp-bbbbbbbbbbbbbbb1.d && echo y)"
 
-# The safety invariant of a delete tool. A loosened regex would start removing
+# The safety invariant of a delete tool: a loosened regex would start removing
 # real files and the success message would look identical.
 it "never touches files without a 16-hex hash"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" \
-  build_script_build-notahash.txt README libfoo.rlib oam-short123
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps" | wc -l | tr -d ' ')" "4"
+ck test -n "$(have build_script_build-notahash.txt && have README && have libfoo.rlib && have oam-short123 && echo y)"
+
+# The whole safety argument rests on newest-first ordering. mt-000...a is newer
+# but sorts FIRST by name, so a name-ordered prune keeps the wrong one.
+it "survivors are the newest by mtime, not by name"
+ck test -n "$(have mt-000000000000000a && gone mt-fffffffffffffff9 && echo y)"
+
+# --- keep boundaries, one fixture and one run ---------------------------------
+reset_tree
+plant target/debug/deps 0 xtask-ccccccccccccccc1 e2e-ddddddddddddddd1
+plant target/debug/deps 1 xtask-ccccccccccccccc2 e2e-ddddddddddddddd2
+plant target/debug/deps 2 xtask-ccccccccccccccc3
+plant target/debug/deps 3 xtask-ccccccccccccccc4
+gc --keep 2
 
 it "keeps exactly --keep per family and drops the oldest beyond it"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" \
-  xtask-ccccccccccccccc1 xtask-ccccccccccccccc2 \
-  xtask-ccccccccccccccc3 xtask-ccccccccccccccc4
-bash "$R/scripts/gc-target.sh" --keep 2 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps" | sort | tr '\n' ' ')" \
-   "xtask-ccccccccccccccc3 xtask-ccccccccccccccc4 "
+ck test -n "$(have xtask-ccccccccccccccc3 && have xtask-ccccccccccccccc4 && gone xtask-ccccccccccccccc1 && gone xtask-ccccccccccccccc2 && echo y)"
 
 it "a family at exactly --keep loses nothing"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" e2e-ddddddddddddddd1 e2e-ddddddddddddddd2
-bash "$R/scripts/gc-target.sh" --keep 2 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps" | wc -l | tr -d ' ')" "2"
+ck test -n "$(have e2e-ddddddddddddddd1 && have e2e-ddddddddddddddd2 && echo y)"
 
-# The whole safety argument rests on newest-first ordering: if it inverts, the
-# tool keeps stale artifacts and deletes the ones cargo is about to link.
-it "survivors are the newest by mtime, not by name"
-R="$(mk_repo)"
-mkdir -p "$R/target/debug/deps"
-for f in oam-eeeeeeeeeeeeeee9 oam-eeeeeeeeeeeeeee1; do echo x > "$R/target/debug/deps/$f"; done
-touch -t 202608011200 "$R/target/debug/deps/oam-eeeeeeeeeeeeeee9"  # older
-touch -t 202608011300 "$R/target/debug/deps/oam-eeeeeeeeeeeeeee1"  # newer
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps")" "oam-eeeeeeeeeeeeeee1"
+# --- every configured tree is collected, not just target/debug ----------------
+# TREES carries the win-x64 leg (built WITHOUT --target, so no triple
+# subdirectory), the triple-suffixed Windows path, and the mac x64 path. A tree
+# added to that list but never pruned is a silent no-op, which is the same class
+# of failure as the mawk gap -- so assert more than one tree in a single run.
+reset_tree
+plant target/debug/deps 0 oam-1111111111111111
+plant target/debug/deps 1 oam-2222222222222222
+plant target/x64-host/release/deps 0 oam-3333333333333333
+plant target/x64-host/release/deps 1 oam-4444444444444444
+plant target/x64-host/x86_64-apple-darwin/release/deps 0 oam-5555555555555555
+plant target/x64-host/x86_64-apple-darwin/release/deps 1 oam-6666666666666666
+gc --keep 1
+
+it "prunes every configured tree in one run, not just target/debug"
+ck test "$(count_in target/debug/deps)$(count_in target/x64-host/release/deps)$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" = "111"
 
 # =============================================================================
 group "gc-target.sh -- portability and safety"
 # =============================================================================
 
-# THE regression guard. mawk (Ubuntu`s default awk, and the GCP builder`s)
+# THE regression guard. mawk -- Ubuntu`s default awk, and the GCP builder`s --
 # matches NOTHING for /-[0-9a-f]{16}/ rather than erroring, so reintroducing an
-# interval expression silently returns Linux collection to zero with a fully
-# green run. Assert on the source, because the dev box has no mawk to run under.
+# interval expression silently returns Linux collection to zero with a green
+# run. Asserted on the source because the dev box has no mawk to run under.
+# Comments are stripped first: the prose above the awk block necessarily quotes
+# the very pattern it warns against.
 it "the awk program uses no interval expressions"
-# Strip comments BEFORE looking: the prose above the awk block necessarily
-# quotes the very pattern it warns against. (Filtering `grep -n` output by a
-# leading-# match cannot work -- grep -n prefixes the line number first.)
 INTERVALS="$(sed 's/#.*//' scripts/gc-target.sh | grep -nE '\{[0-9]+\}' || true)"
 if [ -n "$INTERVALS" ]; then
   fail "interval expression in live code -- mawk matches nothing for it: $INTERVALS"
 else pass; fi
 
-it "selection is identical under every awk on this host"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" oam-fffffffffffffff1 oam-fffffffffffffff2
-for AWKBIN in mawk gawk awk; do
-  command -v "$AWKBIN" >/dev/null 2>&1 || continue
-  R2="$(mk_repo)"; mk_deps "$R2/target/debug/deps" oam-fffffffffffffff1 oam-fffffffffffffff2
-  PATH_OUT="$(cd "$R2" && bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1; ls target/debug/deps)"
-  [ "$PATH_OUT" = "oam-fffffffffffffff2" ] || fail "$AWKBIN selected '$PATH_OUT'"
+# Actually FORCE each awk via a PATH shim. Looping over awk names without one
+# just runs whatever `awk` already resolves to, N times, and proves nothing.
+it "selection is identical under every awk installed here"
+AWK_TESTED=""
+for AWKBIN in mawk gawk original-awk busybox; do
+  AWKPATH="$(command -v "$AWKBIN" 2>/dev/null)" || continue
+  [ -n "$AWKPATH" ] || continue
+  SHIM="$SUITE_TMP/shim-$AWKBIN"
+  mkdir -p "$SHIM"
+  printf '#!/bin/sh\nexec %s "$@"\n' "$AWKPATH" > "$SHIM/awk"
+  chmod +x "$SHIM/awk"
+  reset_tree
+  plant target/debug/deps 0 oam-eeeeeeeeeeeeeee1
+  plant target/debug/deps 1 oam-eeeeeeeeeeeeeee2
+  ( cd "$ROOT" && PATH="$SHIM:$PATH" bash scripts/gc-target.sh --keep 1 >/dev/null 2>&1 )
+  AWK_TESTED="$AWK_TESTED $AWKBIN"
+  have oam-eeeeeeeeeeeeeee2 && gone oam-eeeeeeeeeeeeeee1 \
+    || fail "$AWKBIN selected wrongly: $(ls "$ROOT/target/debug/deps" | tr '\n' ' ')"
 done
-pass
+[ -n "$AWK_TESTED" ] && pass || fail "no awk implementation found to test with"
 
 it "--dry-run deletes nothing"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" oam-999999999999999a oam-999999999999999b oam-999999999999999c
-bash "$R/scripts/gc-target.sh" --dry-run --keep 1 >/dev/null 2>&1
-eq "$(ls "$R/target/debug/deps" | wc -l | tr -d ' ')" "3"
+reset_tree
+plant target/debug/deps 0 oam-999999999999999a
+plant target/debug/deps 1 oam-999999999999999b
+plant target/debug/deps 2 oam-999999999999999c
+gc --dry-run --keep 1
+eq "$(count_in target/debug/deps)" "3"
 
-# The builder`s exact condition: tree arrives by tar with --exclude=./.git, and
-# the caller`s cwd is $HOME. `git rev-parse` fails there and `cd ""` no-ops, so
-# the script used to prune whatever directory it happened to be standing in.
+# The builder`s exact condition: the tree arrives by tar with --exclude=./.git
+# and the caller`s cwd is $HOME. `git rev-parse` fails there and `cd ""` is a
+# silent no-op, so the script used to prune whatever directory it stood in.
 it "resolves its own root from a foreign cwd with no .git"
-R="$(mk_repo)"
-mk_deps "$R/target/debug/deps" oam-1111111111111111 oam-2222222222222222
-[ -d "$R/.git" ] && fail "fixture unexpectedly has .git"
-( cd "$HOME" && bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1 )
-eq "$(ls "$R/target/debug/deps")" "oam-2222222222222222"
+reset_tree
+plant target/debug/deps 0 oam-7777777777777771
+plant target/debug/deps 1 oam-7777777777777772
+[ -d "$ROOT/.git" ] && fail "fixture unexpectedly has .git"
+( cd "$HOME" && bash "$ROOT/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1 )
+ck test -n "$(have oam-7777777777777772 && gone oam-7777777777777771 && echo y)"
 
+# A freshly imaged builder has no target/ at all; cleanup must not fail a run.
 it "an absent target/ is a clean no-op, not an error"
-R="$(mk_repo)"
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
+reset_tree
+gc --keep 1
 eq "$?" "0"
 
 it "an absent deps/ is a clean no-op, not an error"
-R="$(mk_repo)"
-mkdir -p "$R/target/debug"
-bash "$R/scripts/gc-target.sh" --keep 1 >/dev/null 2>&1
+reset_tree
+mkdir -p "$ROOT/target/debug"
+gc --keep 1
 eq "$?" "0"
 
 # =============================================================================
@@ -187,9 +231,10 @@ grep -q '| gc |' <<<"$USAGE" && pass || fail "gc missing from the dispatch usage
 
 # Cleanup must never fail a run whose artifacts are already built and pulled.
 it "run_gc warns and succeeds when gc-target.sh is absent"
-R="$(mktemp -d -t oamrg-XXXXXX)"; mkdir -p "$R/scripts"
-cp scripts/build-remote.sh "$R/scripts/"
-OUT="$(cd "$R" && bash scripts/build-remote.sh gc 2>&1)"; RC=$?
+BR="$SUITE_TMP/bare/scripts"
+mkdir -p "$BR"
+cp scripts/build-remote.sh "$BR/"
+OUT="$(cd "$SUITE_TMP/bare" && bash scripts/build-remote.sh gc 2>&1)"; RC=$?
 if [ "$RC" = "0" ] && grep -q 'skipping target/ reclaim' <<<"$OUT"; then pass
 else fail "rc=$RC out=$OUT"; fi
 
@@ -203,7 +248,7 @@ group "iap-helpers.sh -- tunnel log parsing"
 # "Listening on port" never arrived, because it is the only line gcloud writes
 # to stdout and redirecting stdout to a file block-buffers it in Python. The
 # tunnel was fully functional and served SSH for 160s+ regardless.
-LOG="$(mktemp -t oamlog-XXXXXX)"
+LOG="$SUITE_TMP/tunnel.log"
 cat > "$LOG" <<'FIXTURE'
 Picking local unused port [52528].
 WARNING:
@@ -222,7 +267,7 @@ it "listening-port parses once gcloud has bound the socket"
 eq "$(iap_parse_listening_port "$LOG")" "52528"
 
 it "a missing log file is a clean miss, not a crash"
-iap_parse_picked_port "/nonexistent/tunnel.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
+iap_parse_picked_port "$SUITE_TMP/nonexistent.log" >/dev/null 2>&1 && fail "parsed a missing file" || pass
 
 # =============================================================================
 group "iap-helpers.sh -- guest boot detection"
@@ -251,8 +296,8 @@ it "does not reclaim well above it";       disk_needs_reclaim 40 && fail "40GB s
 it "aborts below the floor";               disk_below_floor 9 && pass || fail "9GB should abort"
 it "proceeds at the floor";                disk_below_floor 10 && fail "10GB should proceed" || pass
 
-# The builder`s real reading the day this was written: low enough to prune,
-# high enough to still run. Both predicates must agree on that.
+# The builder`s real reading the day this was written: low enough to prune, high
+# enough to still run. Both predicates must agree on that.
 it "10GB free reclaims but still builds"
 if disk_needs_reclaim 10 && ! disk_below_floor 10; then pass; else fail "10GB should reclaim and proceed"; fi
 
