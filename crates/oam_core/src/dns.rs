@@ -294,19 +294,40 @@ pub async fn dns_resolve(hostname: String, rrtype: String) -> OpOutcome {
         },
         "CAA" => match r.lookup(&hostname, RecordType::CAA).await {
             Ok(lookup) => {
-                let records: Vec<serde_json::Value> = lookup
+                // node's shape is `{critical, <tag>: <value>}` -- the TAG is the
+                // KEY. This used to emit `{critical, issue: <tag>, value: <value>}`,
+                // which put the tag name where the value belongs, hardcoded the
+                // key as `issue` no matter the real tag, and added a `value` key
+                // node does not have. Measured against node v22.22.2:
+                // wikipedia.org returns an `iodef` record and two `issue`
+                // records, each keyed by its own tag.
+                //
+                // Built as text rather than through json!/Map because
+                // serde_json's default Map is a BTreeMap and would sort the keys
+                // -- node always puts `critical` first, and RFC 9495's
+                // `contactemail` / `contactphone` tags sort BEFORE it.
+                let objects: Vec<String> = lookup
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
-                        RData::CAA(caa) => Some(serde_json::json!({
-                            "critical": caa.issuer_critical as u8,
-                            "issue": caa.tag.as_str(),
-                            "value": String::from_utf8_lossy(&caa.value).into_owned(),
-                        })),
+                        RData::CAA(caa) => {
+                            // The wire flags octet, which is what node reports --
+                            // not a 0/1 bool. RFC 6844 puts Issuer Critical in bit
+                            // 0 (0x80), so a critical record reads 128, matching
+                            // node's own documented example. hickory splits the
+                            // octet into the bool plus the remaining bits, so this
+                            // reassembles it rather than inventing a value.
+                            let flags =
+                                if caa.issuer_critical { 0x80u8 } else { 0 } | caa.reserved_flags;
+                            let tag = serde_json::json!(caa.tag.as_str());
+                            let value =
+                                serde_json::json!(String::from_utf8_lossy(&caa.value).into_owned());
+                            Some(format!("{{\"critical\":{flags},{tag}:{value}}}"))
+                        }
                         _ => None,
                     })
                     .collect();
-                OpOutcome::Json(serde_json::json!(records).to_string())
+                OpOutcome::Json(format!("[{}]", objects.join(",")))
             }
             Err(e) => dns_err(&hostname, &e),
         },
