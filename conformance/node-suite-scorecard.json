@@ -67,16 +67,16 @@
       "unrunnable": 4
     }
   },
-  "commit": "986a0f8",
+  "commit": "ba0a58d",
   "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
   "deliberateFailures": [
     {
-      "firstDivergence": "[exit=1] oam:node_compat.js:11213",
+      "firstDivergence": "[exit=1] oam:node_compat.js:11253",
       "reason": "Asserts all 24 legacy process.binding names are truthy. oam models the ones it can back with the REAL implementation (constants, util, tty_wrap.isTTY) taken by identity off the public surface, and THROWS for the rest -- mostly libuv handle classes (TCP, UDP, Pipe, JSStream, FSEvent) it has nothing behind. Returning {} would claim them, and it is also worse for the caller than throwing: a package that feature-detects process.binding('tcp_wrap'), gets an empty object and proceeds hits a TypeError deep in its own code, where the throw sends it straight to the fallback branch that is correct for oam. See js/node_compat.js (process.binding).",
       "test": "test-process-binding-internalbinding-allowlist.js"
     },
     {
-      "firstDivergence": "[exit=1] oam:node_compat.js:7433",
+      "firstDivergence": "[exit=1] oam:node_compat.js:7451",
       "reason": "Asserts a strict deep-equal on the process.versions KEY SET, which requires 'ares', 'uv', 'nghttp2', 'llhttp', 'openssl', 'uvwasi', 'simdjson', 'ada', 'cjs_module_lexer' and friends -- C libraries oam does not link. oam publishes the dependency tree it ACTUALLY builds against, generated from Cargo.lock at build time (v8, tokio, hickory, rustls, ring, oxc, hyper, brotli, flate2, icu, url). Passing would mean deleting the real names and inventing the absent ones, i.e. having process.versions state something false about the binary. The honest surface is worth more than the test.",
       "test": "test-process-versions.js"
     }
