@@ -1,2 +1,73 @@
 [alias]
 xtask = "run --package xtask --"
+
+# -----------------------------------------------------------------------------
+# Windows MSVC: static CRT (/MT), matching the native libraries we link.
+# -----------------------------------------------------------------------------
+# Rust's *-pc-windows-msvc targets default to the DYNAMIC CRT (/MD -> msvcrt.lib
+# + VCRUNTIME140.dll), but both native dependencies in the graph are compiled
+# against the STATIC CRT and say so in their object directives:
+#
+#   rusty_v8.lib  /DEFAULTLIB:libcmt.lib   (Chromium builds V8 with clang-cl /MT)
+#   ada.o         /DEFAULTLIB:"LIBCMT"     (ada-url's build.rs calls
+#                                           cc::Build::static_crt(true)
+#                                           unconditionally on MSVC)
+#
+# Two CRTs in one link is what LNK4098 warns about ("defaultlib 'libcmt.lib'
+# conflicts with use of other libs"), and it is a real hazard, not cosmetic: a
+# process holding two CRT states has two heaps, two errno, two stdio tables.
+# The two spellings above are the same defect reported twice -- the casing only
+# reflects which compiler emitted the directive (clang-cl writes `libcmt.lib`,
+# cl.exe writes `LIBCMT`), so rustc's `linker_messages` lint surfaces them as
+# two separate warnings: one on the oam_engine BUILD SCRIPT (it links V8 to
+# generate the startup snapshot) and one on anything linking ada -- oam.exe and
+# every test binary.
+#
+# Static is the correct side to converge on, not dynamic:
+#   * It is what node.exe itself does. An official node 22 build imports 11
+#     DLLs and not one is a CRT (no VCRUNTIME140, no MSVCP140, no
+#     api-ms-win-crt-*). .node addons are built by node-gyp against that model,
+#     so matching it is the best N-API compatibility story available.
+#   * It is what the prebuilt V8 and ada objects were actually COMPILED against.
+#     Forcing them onto the dynamic CRT with /NODEFAULTLIB:libcmt.lib would
+#     leave their inlined CRT internals resolving against a CRT they were not
+#     built for.
+#   * ada-url hardcodes static_crt(true) with no feature to turn it off, so
+#     dynamic is not reachable without patching the crate.
+#   * It drops the VC++ redistributable dependency. install/install.ps1 hands
+#     the user a bare .exe; before this, that .exe imported VCRUNTIME140.dll and
+#     MSVCP140.dll and would fail to start on a machine without the redist --
+#     undocumented, and not something the installer checks for. A self-contained
+#     single binary is the whole distribution model.
+#
+# Knock-on effects, all desirable and all automatic:
+#   * v8's build.rs takes its `crt_static` branch and links libcpmt (static C++
+#     runtime) instead of msvcprt, which is what ada.o already asks for.
+#   * cc-rs reads CARGO_CFG_TARGET_FEATURE, so ring's C compiles switch to /MT.
+#
+# Explicit triples rather than a cfg() table on purpose: cfg() target tables are
+# never applied to host units, and the oam_engine build script links V8 too --
+# it needs these flags as much as the final binary does.
+#
+# Why `-C link-arg=libcmt.lib` is also needed
+# -------------------------------------------
+# ada-url's build.rs pairs its static_crt(true) with
+#
+#     link_args::windows! { unsafe { no_default_lib("libcmt.lib"); } }
+#
+# meaning to spare its CONSUMERS the LNK4098 above. But `link_args::windows!`
+# emits a .drectve `/NODEFAULTLIB:libcmt.lib` into the object of whatever crate
+# expands it -- and here that is build.rs itself, so the directive lands in
+# ada-url's own build-script executable and never reaches a consumer (which is
+# why oam.exe kept warning). Harmless while the build script links the dynamic
+# CRT; fatal once it links the static one, because /NODEFAULTLIB:libcmt.lib then
+# cancels rustc's `/defaultlib:libcmt` and the build script links against NO CRT
+# at all -- LNK2001 on mainCRTStartup, memset, strlen, __CxxFrameHandler3, ...
+# /NODEFAULTLIB only suppresses DEFAULT libraries, so naming libcmt.lib
+# explicitly restores it. Once ada-url moves that directive to a
+# `cargo:rustc-link-arg` (where it belongs), this flag can go.
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=libcmt.lib"]

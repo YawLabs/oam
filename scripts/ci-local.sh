@@ -79,6 +79,12 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # shellcheck source=lib/build-locks.sh
 . scripts/lib/build-locks.sh
 
+# Windows CRT-linkage gate, asserted alongside the smoke step below: a released
+# oam.exe must carry the CRT statically or it cannot start without the VC++
+# redistributable (rationale + method in the lib's header).
+# shellcheck source=lib/crt-linkage.sh
+. scripts/lib/crt-linkage.sh
+
 # Leftovers under target/debug are, by definition, orphans of an earlier run:
 # nothing a human uses long-term runs out of the debug tree. Clearing them
 # before a step that relinks is what keeps LNK1104 from surfacing at the worst
@@ -134,10 +140,31 @@ oam_park_file target/debug/oam.exe \
   || ko "target/debug/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
 oam_park_file target/debug/deps/oam.exe \
   || ko "target/debug/deps/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
-if cargo build --workspace; then
+# Captured, not streamed straight through. rustc surfaces linker diagnostics --
+# LNK4098 "defaultlib 'libcmt.lib' conflicts", the two-CRT bug that
+# .cargo/config.toml exists to prevent -- through the linker_messages lint,
+# which is a WARNING: cargo still exits 0. Clippy cannot see them either, since
+# checking never links. So nothing here would fail if that regression came back;
+# it would surface as two more lines in a wall of build output and ship.
+#
+# The pattern is deliberately broad (any LNK#### or rustc linker-message line)
+# rather than LNK4098 alone: a full relink of this workspace emits ZERO linker
+# diagnostics today, so anything at all is new signal. If a future toolchain
+# starts emitting something genuinely benign -- LNK4099 "PDB not found" against
+# a prebuilt lib is the usual candidate -- narrow it THEN, with a note saying
+# which warning was judged benign and why.
+BUILD_LOG="$(mktemp)"
+CLEANUP_PATHS+=("$BUILD_LOG")
+if cargo build --workspace 2>&1 | tee "$BUILD_LOG"; then
   ok "build ok"
 else
   ko "build failed"
+fi
+if linker_msgs="$(grep -nE 'LNK[0-9]{4}|linker (stdout|stderr):' "$BUILD_LOG")"; then
+  echo "$linker_msgs" >&2
+  ko "linker diagnostics during the build (above) -- a defaultlib conflict means two CRTs in one binary; see the crt-static block in .cargo/config.toml"
+else
+  ok "no linker diagnostics"
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
@@ -198,6 +225,32 @@ if [ "$out" = "ci smoke 42" ]; then
   ok "smoke ok"
 else
   ko "smoke output unexpected: '$out'"
+fi
+
+# Still step 5: running is necessary but not sufficient. This box has the VC++
+# redistributable (every box with Visual Studio does), so a binary that imports
+# the dynamic CRT smokes green here and dies on a clean end-user machine. Only
+# an import check catches that, and only on the Windows leg -- elsewhere there
+# is no oam.exe to inspect.
+if [ -f target/debug/oam.exe ]; then
+  # Self-check first. Every bug this checker has had degenerated it toward
+  # always-passing, which looks exactly like a clean binary from out here.
+  assert_static_crt_canary || ko "CRT-linkage self-check failed -- see above"
+  if assert_static_crt target/debug/oam.exe; then
+    ok "CRT linkage static (no VC++ redist dependency)"
+  else
+    ko "oam.exe imports the dynamic CRT -- see the diagnostic above"
+  fi
+  # The other half, and the half that regresses invisibly: oam_engine's build
+  # script links V8 to generate the startup snapshot and was the original source
+  # of the libcmt.lib LNK4098. Adding --target back to a Windows cargo
+  # invocation withholds the crt-static rustflags from host units, which leaves
+  # the shipped binary correct and this build script wrong.
+  if assert_static_crt_build_script target/debug oam_engine; then
+    ok "CRT linkage static in the oam_engine build script (links V8)"
+  else
+    ko "the oam_engine build script imports the dynamic CRT -- see above"
+  fi
 fi
 
 if [ "$FAST" -eq 0 ]; then

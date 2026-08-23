@@ -63,7 +63,11 @@ done
 case "$KEEP" in ''|*[!0-9]*) echo "--keep needs a number, got '$KEEP'" >&2; exit 1 ;; esac
 [ "$KEEP" -ge 1 ] || { echo "--keep must be >= 1 (0 would delete the current build)" >&2; exit 1; }
 
-TREES=(target/debug target/release target/x64-host/x86_64-pc-windows-msvc/release)
+# target/x64-host/release is the win-x64 leg: release-local.sh builds it
+# WITHOUT --target (see the comment there), so its output is not under a
+# triple subdirectory. The triple-suffixed path stays listed so a tree left
+# behind by a pre-0.11 release still gets collected.
+TREES=(target/debug target/release target/x64-host/release target/x64-host/x86_64-pc-windows-msvc/release)
 
 before_gb="$(oam_dir_gb target)"
 say "target/ is ${before_gb}GB before pruning (keep=$KEEP, dry-run=$DRY_RUN)"
