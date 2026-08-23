@@ -6707,10 +6707,21 @@
         return entry === undefined ? "Unknown system error " + err : entry[1];
       },
       getSystemErrorMap: function getSystemErrorMap() {
-        // A COPY: node hands back a fresh Map per call, so a caller that
-        // mutates or clears it cannot poison later lookups. Returning the
-        // memoized table directly would make that a process-wide corruption.
-        return new Map(uvErrnoTable(natives));
+        // A DEEP copy: node builds a fresh Map AND fresh [code, message] arrays
+        // per call (node_uv.cc GetErrMap), so nothing a caller does to the
+        // result can reach the runtime. `new Map(cached)` alone is not enough --
+        // it makes the Map fresh, so .set/.delete/.clear are contained, but the
+        // VALUE arrays would still be the memoized table's own, and
+        // `map.get(-4058)[0] = x` would then rewrite what getSystemErrorName
+        // returns for the rest of the process. Measured against node v22.22.2:
+        // mutating an entry leaves node's lookup at ENOENT, so the copy has to
+        // go one level deeper than the Map.
+        return new Map(
+          Array.from(uvErrnoTable(natives), ([number, entry]) => [
+            number,
+            [entry[0], entry[1]],
+          ]),
+        );
       },
       styleText: function styleText(format, text, options) {
         // Node's inspect.colors table (open/close SGR pairs).

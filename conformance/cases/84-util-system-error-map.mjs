@@ -55,3 +55,16 @@ console.log("miss-msg", JSON.stringify(util.getSystemErrorMessage(-999999)));
 const copy = util.getSystemErrorMap();
 copy.clear();
 console.log("fresh-copy", util.getSystemErrorMap().size === entries.length);
+
+// ...and fresh ENTRIES, not just a fresh Map. node builds new [code, message]
+// arrays per call, so writing through one cannot reach the lookup helpers. A
+// runtime that only copies the Map passes the clear() check above and still
+// lets `map.get(k)[0] = x` rewrite getSystemErrorName for the whole process --
+// which is exactly what oam did until the entries were copied too.
+const probeKey = entries[0][0];
+const beforeMutation = util.getSystemErrorName(probeKey);
+util.getSystemErrorMap().get(probeKey)[0] = "MUTATED";
+console.log(
+  "entry-isolated",
+  util.getSystemErrorName(probeKey) === beforeMutation,
+);
