@@ -843,7 +843,7 @@ static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
 
 #[cfg(windows)]
 fn win_std_handle(fd: i32) -> isize {
-    // SAFETY: the declared signature matches the Win32 GetStdHandle ABI
+    // ABI: the declared signature matches the Win32 GetStdHandle ABI
     // (kernel32: one DWORD in, a HANDLE-sized isize out). The declaration
     // dereferences nothing, so the only obligation is the signature itself,
     // which is fixed by the platform.
@@ -869,7 +869,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     const ENABLE_LINE_INPUT: u32 = 0x0002;
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
     const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
-    // SAFETY: the signatures match the Win32 console ABI (GetConsoleMode:
+    // ABI: the signatures match the Win32 console ABI (GetConsoleMode:
     // HANDLE + out DWORD*; SetConsoleMode: HANDLE + by-value DWORD). Pointer
     // validity for the actual calls is established at the call site below,
     // not here.
@@ -942,7 +942,7 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
         window: SmallRect,
         max_window: Coord,
     }
-    // SAFETY: the signature matches the Win32 ABI (HANDLE + out
+    // ABI: the signature matches the Win32 ABI (HANDLE + out
     // CONSOLE_SCREEN_BUFFER_INFO*), and the `#[repr(C)]` Csbi/Coord/SmallRect
     // layout mirrors the OS struct so the out-write lands in the right fields.
     unsafe extern "system" {
@@ -1408,7 +1408,7 @@ fn op_set_timezone(
     // crate, which does not export it on darwin.
     #[cfg(unix)]
     {
-        // SAFETY: the declaration matches tzset(3)'s ABI -- no arguments, no
+        // ABI: the declaration matches tzset(3)'s ABI -- no arguments, no
         // return. It is declared locally because the libc crate does not
         // export it on darwin.
         unsafe extern "C" {
@@ -5719,7 +5719,7 @@ fn os_release() -> String {
         szCSDVersion: [u16; 128],
     }
 
-    // SAFETY: the signature matches the ntdll RtlGetVersion ABI (one
+    // ABI: the signature matches the ntdll RtlGetVersion ABI (one
     // OSVERSIONINFOW* in, NTSTATUS out); the `#[repr(C)]` OSVERSIONINFOW
     // mirrors the OS layout so the fields it fills line up.
     unsafe extern "system" {
@@ -5771,7 +5771,7 @@ struct MEMORYSTATUSEX {
     ullAvailExtendedVirtual: u64,
 }
 
-// SAFETY: the signature matches the kernel32 GlobalMemoryStatusEx ABI (one
+// ABI: the signature matches the kernel32 GlobalMemoryStatusEx ABI (one
 // MEMORYSTATUSEX* in, BOOL out); the `#[repr(C)]` MEMORYSTATUSEX mirrors the
 // OS struct so the filled fields align.
 #[cfg(windows)]
@@ -5910,7 +5910,7 @@ fn process_rss() -> usize {
         PeakPagefileUsage: usize,
     }
 
-    // SAFETY: the signatures match the kernel32 ABI (K32GetProcessMemoryInfo:
+    // ABI: the signatures match the kernel32 ABI (K32GetProcessMemoryInfo:
     // HANDLE + PROCESS_MEMORY_COUNTERS* + DWORD size; GetCurrentProcess: no
     // args -> pseudo-handle). The `#[repr(C)]` PROCESS_MEMORY_COUNTERS mirrors
     // the OS layout.
@@ -5983,7 +5983,7 @@ fn cpu_model() -> String {
     const KEY_READ: u32 = 0x20019;
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
-    // SAFETY: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
+    // ABI: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
     // RegQueryValueExW, RegCloseKey); every pointer argument is validated at
     // its call site below.
     unsafe extern "system" {
@@ -6064,7 +6064,7 @@ fn cpu_speed_mhz() -> u32 {
     const KEY_READ: u32 = 0x20019;
     const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
 
-    // SAFETY: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
+    // ABI: the signatures match the advapi32 registry ABI (RegOpenKeyExW,
     // RegQueryValueExW, RegCloseKey); every pointer argument is validated at
     // its call site below.
     unsafe extern "system" {
@@ -6243,7 +6243,7 @@ fn parent_pid() -> u32 {
         InheritedFromUniqueProcessId: usize,
     }
 
-    // SAFETY: the signatures match the ntdll / kernel32 ABI
+    // ABI: the signatures match the ntdll / kernel32 ABI
     // (NtQueryInformationProcess + GetCurrentProcess); the `#[repr(C)]`
     // PROCESS_BASIC_INFORMATION mirrors the documented layout so
     // InheritedFromUniqueProcessId reads from the right offset.
@@ -6422,7 +6422,7 @@ fn cpu_usage_us() -> (u64, u64) {
         }
     }
 
-    // SAFETY: the signatures match the kernel32 ABI (GetCurrentProcess +
+    // ABI: the signatures match the kernel32 ABI (GetCurrentProcess +
     // GetProcessTimes with four FILETIME* out-params); the `#[repr(C)]`
     // FILETIME mirrors the OS 64-bit tick layout.
     unsafe extern "system" {
@@ -6469,7 +6469,7 @@ fn cpu_usage_us() -> (u64, u64) {
         ru_stime: timeval,
         _pad: [u8; 112],
     }
-    // SAFETY: the declaration matches getrusage(2)'s ABI (int who + rusage*
+    // ABI: the declaration matches getrusage(2)'s ABI (int who + rusage*
     // out). The locally-defined `#[repr(C)]` `rusage` / `timeval` reproduce the
     // leading ru_utime/ru_stime fields, and the 112-byte `_pad` must be large
     // enough that the whole struct is >= the platform's `struct rusage` --
@@ -6531,7 +6531,7 @@ fn op_process_kill(
 
 #[cfg(windows)]
 fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
-    // SAFETY: the signatures match the kernel32 ABI (OpenProcess,
+    // ABI: the signatures match the kernel32 ABI (OpenProcess,
     // TerminateProcess, CloseHandle); none take pointer arguments, so each
     // call's only obligation is handle validity, discharged at the call sites
     // below.
@@ -6577,7 +6577,7 @@ fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn kill_process(pid: u32, signal: i32) -> Result<(), String> {
-    // SAFETY: the declaration matches kill(2)'s ABI (two by-value ints, int
+    // ABI: the declaration matches kill(2)'s ABI (two by-value ints, int
     // return). No memory is referenced.
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;

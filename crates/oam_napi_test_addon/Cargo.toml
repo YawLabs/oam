@@ -11,3 +11,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libloading = { workspace = true }
+
+[lints.clippy]
+# Per-site `unsafe` coverage is compiler-enforced here (AI-POLICY gate 5),
+# not counted: a `// SAFETY:` on every unsafe block/impl, a `/// # Safety`
+# section on every public unsafe fn, and no stray SAFETY marker on a fn
+# definition or foreign module (where clippy rightly rejects one).
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+missing_safety_doc = "deny"

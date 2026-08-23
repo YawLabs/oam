@@ -164,9 +164,6 @@ pub fn install_panic_hook() {
 /// Invoked only by V8 as the isolate OOM callback; `location` and
 /// `details.detail` are V8-owned nul-terminated strings (or null) valid for
 /// the duration of the call.
-// SAFETY: only V8 calls this, as the isolate OOM handler, with the exact
-// `OomErrorCallback` C ABI; the string args are V8-owned (or null) and are read
-// only through the null-tolerant `read_cstr` below.
 pub(crate) unsafe extern "C" fn v8_oom_handler(
     location: *const std::os::raw::c_char,
     details: &v8::OomDetails,
@@ -192,8 +189,6 @@ pub(crate) unsafe extern "C" fn v8_oom_handler(
 /// # Safety
 /// `p` must be null or point to a valid nul-terminated C string for the
 /// duration of the call (upheld by V8, which owns the OOM location strings).
-// SAFETY: `p` is null or a valid nul-terminated C string for the call, per the
-// fn's `# Safety` contract above; the null case returns before any read.
 unsafe fn read_cstr(p: *const std::os::raw::c_char) -> String {
     if p.is_null() {
         return "<none>".to_string();

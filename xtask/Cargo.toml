@@ -14,3 +14,10 @@ serde_json = { workspace = true }
 # tasklist, linux reads /proc; sysinfo backs the remaining unix targets
 # (macOS) where /proc is absent. Same crate the engine os natives use.
 sysinfo = { workspace = true }
+
+[lints.clippy]
+# xtask is the gate's own tooling and carries no unsafe today; these keep it
+# that way honestly rather than by assumption.
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+missing_safety_doc = "deny"

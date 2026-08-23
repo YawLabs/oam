@@ -18,9 +18,15 @@ mode structurally impossible here. Same tools, opposite discipline, receipts pub
 4. **Named human accountability.** Every merge carries a responsible human reviewer. Initially
    that is the founder for everything; two-human review for `unsafe` and public-API changes
    once maintainers exist.
-5. **`unsafe` budget.** Every `unsafe` block carries a `// SAFETY:` justification (CI-checked,
-   100% coverage). The published metric is unsafe-per-crate with `oam_engine` quarantined as
-   the FFI boundary, benchmarked against deno_core (the honest comparable for a V8 embedding).
+5. **`unsafe` budget.** Every `unsafe` block and `unsafe impl` carries a `// SAFETY:`
+   justification and every public `unsafe fn` a `/// # Safety` section, enforced per-site on
+   every crate by clippy (`undocumented_unsafe_blocks`, `unnecessary_safety_comment`,
+   `missing_safety_doc`, all `deny`) under CI's `-D warnings` -- not by a counted metric.
+   Honest residue: clippy structurally does not cover *private* `unsafe fn` definitions or
+   `unsafe extern` blocks, so those rest on review. The published metric is unsafe-per-crate
+   (`conformance/unsafe-budget.json`, a ratcheting CEILING that may only go down, covering
+   every workspace member including `xtask`) with `oam_engine` quarantined as the FFI
+   boundary, benchmarked against deno_core (the honest comparable for a V8 embedding).
    Unjustified regressions fail the build.
 6. **Provenance labels.** Commits are labeled human/agent-authored. The public stat we aim to
    keep true: "X% AI-authored, 100% human-reviewed, 0 unreviewed merges."
