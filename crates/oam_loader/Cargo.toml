@@ -27,3 +27,8 @@ sha2 = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true }
+
+[lints.clippy]
+# The crate is `#![forbid(unsafe_code)]`, so the coverage lints are moot --
+# but a stray `// Safety:` prose comment still trips this one, and did.
+unnecessary_safety_comment = "deny"

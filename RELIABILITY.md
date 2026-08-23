@@ -13,7 +13,7 @@ https://oam.sh/compat once public; until then the same jobs run in CI.
 | Crash rate | crashes per million process-hours, from strictly opt-in, minidump-signature-only telemetry (no user code, no paths; privacy policy published before the first byte is collected) | published trend |
 | Soak | 30-day continuously-running workloads (HTTP serve, agent loop, install churn); RSS flatness | regression fails release |
 | Behavior changes in patch releases | counted by the API-diff bot | target 0, published |
-| `unsafe` count | per-crate, SAFETY-comment coverage 100%, `oam_engine` quarantined; compared against deno_core | regression fails build |
+| `unsafe` count | per-crate ratcheting ceiling (may only go down), `oam_engine` quarantined; compared against deno_core. Per-site justification is compiler-enforced on every crate by clippy rather than counted -- private unsafe fns and `unsafe extern` blocks are not covered by any lint and rest on review | regression fails build |
 | Benchmarks | the `oam-bench` suite vs Bun/Node/Deno on >=2 hardware classes incl. Windows ARM64; manifests + raw data + flamegraphs attached; competitor-best-config rule | marketing may cite only CI-reproduced numbers |
 
 ## Semver policy

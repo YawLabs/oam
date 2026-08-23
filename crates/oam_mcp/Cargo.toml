@@ -10,3 +10,8 @@ license.workspace = true
 oam_diagnostics = { workspace = true }
 oam_ts = { workspace = true }
 serde_json = { workspace = true }
+
+[lints.clippy]
+# The crate is `#![forbid(unsafe_code)]`, so the coverage lints are moot --
+# but a stray `// Safety:` prose comment still trips this one, and did.
+unnecessary_safety_comment = "deny"

@@ -1,11 +1,19 @@
-//! `cargo run -p xtask -- unsafe-budget`: the bidirectional-ratchet gate for
-//! the `unsafe` surface (AI-POLICY.md gate 5 -- the "`unsafe` budget").
+//! `cargo run -p xtask -- unsafe-budget`: the CEILING ratchet for the `unsafe`
+//! surface (AI-POLICY.md gate 5 -- the "`unsafe` budget").
 //!
-//! It scans `crates/*/src/**/*.rs`, counts the REAL unsafe constructs per
-//! crate (`unsafe fn` / `unsafe impl` / `unsafe extern` block / `unsafe extern
-//! "C" fn <name>` FFI definition / `unsafe {` block), and the `// SAFETY:`
-//! justification comments, then diffs both against the committed baseline in
-//! `conformance/unsafe-budget.json`.
+//! It scans EVERY workspace member -- the crates under `crates/` plus `xtask`
+//! itself -- and within each one every `.rs` file under `src/` and `tests/`,
+//! plus a top-level `build.rs`. `tests/` and `build.rs` are compiled Rust that
+//! CI builds and runs, and `xtask` is the gate's own tooling (no `[lints]`
+//! section, no `forbid(unsafe_code)`), so leaving any of the three out of the
+//! walk would make unsafe landing there invisible to every gate in the repo.
+//! `benches/` and `examples/` are NOT walked -- no crate in the tree has
+//! either; adding one means widening this walk again.
+//!
+//! In each file it counts the REAL unsafe constructs per crate (`unsafe fn` /
+//! `unsafe impl` / `unsafe extern` block / `unsafe extern "C" fn <name>` FFI
+//! definition / `unsafe {` block), then diffs the per-crate total against the
+//! committed baseline in `conformance/unsafe-budget.json`.
 //!
 //! The counter is deliberately NOT the old `grep -c unsafe` (scripts/ci-local.sh
 //! step 9, which it replaces): that grep over-counted (885 matched lines vs 704
@@ -15,25 +23,44 @@
 //! with no body). Those are lexed out here so the number tracks actual unsafe
 //! code, not mentions of the word.
 //!
-//! The gate is BIDIRECTIONAL, like `conformance.rs::compare_exports` and
-//! `node_suite.rs::ratchet_violation`:
-//!   * `unsafe_count` is a CEILING (may only go DOWN). ABOVE it = new unsafe
-//!     added -> FAIL. Strictly BELOW it = you removed unsafe but did not
-//!     tighten the ceiling -> FAIL "stale, run --regen".
-//!   * `documented_count` (SAFETY comments) is a FLOOR (may only go UP). BELOW
-//!     it = SAFETY coverage regressed -> FAIL. Strictly ABOVE it = you
-//!     documented more but did not raise the floor -> FAIL "stale, run --regen".
+//! # This gate COUNTS; clippy COVERS
 //!
-//! Either "strictly better than recorded" direction forces a ratchet-tightening
-//! commit, so the baseline can never drift behind the tree.
+//! There used to be a second metric here: a `documented_count` FLOOR over
+//! `// SAFETY:` line comments, a lexical proxy for per-site justification. It
+//! is RETIRED, and must not be restored. The lexical floor and clippy's
+//! `unnecessary_safety_comment` lint were in direct CONFLICT: roughly 155 of
+//! the comments the floor was counting are ones the lint FORBIDS. A
+//! `// SAFETY:` sitting on an unsafe FN DEFINITION is misplaced -- the contract
+//! a caller must uphold belongs in a `/// # Safety` doc section, not in a line
+//! comment above the signature -- and an `unsafe extern` FOREIGN MODULE needs
+//! no justification at all. So raising the floor meant writing comments clippy
+//! rejects, and satisfying clippy meant falling below the floor. Those ~155
+//! misplaced comments have now been fixed across the tree, and the floor is
+//! retired with them.
 //!
-//! Scope: oam_core / oam_cli / oam_ts are EXCLUDED from the documented-count
-//! (SAFETY-coverage) check -- a sibling branch puts them under clippy
-//! `undocumented_unsafe_blocks = deny`, which owns their coverage. Their
-//! `unsafe_count` CEILING is still tracked here. The documented FLOOR is tracked
-//! for oam_engine (with an additional PER-FILE floor on the FFI-boundary files,
-//! the ratchet toward 100%) and oam_napi_test_addon. oam_loader / oam_mcp /
-//! oam_diagnostics carry no unsafe at all (ceiling pinned at 0).
+//! Per-site coverage is henceforth owned by clippy, applied to EVERY crate:
+//! `undocumented_unsafe_blocks = deny` (every unsafe block/impl carries a
+//! justification), `unnecessary_safety_comment = deny` (nothing that must NOT
+//! carry one does), and `missing_safety_doc = deny` (every public unsafe fn
+//! carries a `# Safety` section). Clippy checks each SITE, which counting lines
+//! cannot do; a count can be ratcheted DOWNWARD over time, which clippy cannot
+//! do. This file keeps only the half clippy provably cannot: the per-crate
+//! `unsafe_count` CEILING.
+//!
+//! Known residue, named honestly, because "clippy owns coverage" is not the
+//! same as "everything is covered": `missing_safety_doc` fires only on PUBLIC
+//! items, so a PRIVATE `unsafe fn` is structurally uncovered, and an
+//! `unsafe extern` foreign module is not a site any of the three lints demands
+//! a justification on. Those two shapes rely on REVIEW, not on a lint. They are
+//! still inside this ceiling, though, so one cannot be ADDED without a reviewed
+//! baseline bump -- which is exactly where a human notices them.
+//!
+//! The gate is a one-way ratchet, like `conformance.rs::compare_exports` and
+//! `node_suite.rs::ratchet_violation`: `unsafe_count` is a CEILING (may only go
+//! DOWN). ABOVE it = new unsafe added -> FAIL. Strictly BELOW it = you removed
+//! unsafe but did not tighten the ceiling -> FAIL "stale, run --regen". That
+//! second, "strictly better than recorded" direction is what forces a
+//! ratchet-tightening commit, so the baseline can never drift behind the tree.
 //!
 //! Regenerate with `cargo run -p xtask -- unsafe-budget --regen` (alias
 //! `--bless`): it rewrites the baseline from the current tree.
@@ -45,43 +72,27 @@ use std::path::{Path, PathBuf};
 
 use crate::conformance::repo_root;
 
-/// Crates whose SAFETY-coverage FLOOR is tracked here. The rest (oam_core,
-/// oam_cli, oam_ts) get their coverage from clippy `undocumented_unsafe_blocks`
-/// on a sibling branch, so only their `unsafe_count` ceiling is tracked.
-const DOCUMENTED_SCOPE: &[&str] = &["oam_engine", "oam_napi_test_addon"];
-
-/// oam_engine's FFI-boundary files carrying a PER-FILE documented_count floor
-/// -- the "toward 100%" ratchet, file by file. Matched by file name at the
-/// crate's `src/` root.
-const ENGINE_FILES: &[&str] = &[
-    "napi.rs",
-    "node_ops.rs",
-    "modules.rs",
-    "lib.rs",
-    "crash.rs",
-    "inspector.rs",
-    "vm_module.rs",
-];
-
-/// One crate's slice of the budget. `documented_count` is `Some` only for
-/// crates in `DOCUMENTED_SCOPE`; `files` is non-empty only for oam_engine.
+/// One crate's slice of the budget. Ceiling-only by design: per-site
+/// `// SAFETY` coverage is clippy's job now, not a count's (see module doc).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CrateBudget {
     /// Ceiling: real unsafe constructs. May only go DOWN.
     unsafe_count: usize,
-    /// Floor: `// SAFETY:` justification comments. May only go UP. `None` when
-    /// the crate is out of the documented-coverage scope.
-    documented_count: Option<usize>,
-    /// Per-file `documented_count` floors (oam_engine only). file name -> floor.
-    files: BTreeMap<String, usize>,
 }
 
 /// The whole budget: crate name -> its slice.
 type Budget = BTreeMap<String, CrateBudget>;
 
 pub(crate) fn run(regen: bool) -> Result<()> {
-    let repo = repo_root()?;
-    let measured = measure_budget(&repo)?;
+    run_at(&repo_root()?, regen)
+}
+
+/// `run` against an explicit repo root. Split out so the fail-closed missing-
+/// baseline path and the corrupt-baseline regen recovery are unit-testable
+/// against a throwaway tree; `repo_root()` is fixed at compile time and cannot
+/// be pointed anywhere else.
+fn run_at(repo: &Path, regen: bool) -> Result<()> {
+    let measured = measure_budget(repo)?;
     let path = repo.join("conformance/unsafe-budget.json");
 
     if regen {
@@ -106,7 +117,7 @@ pub(crate) fn run(regen: bool) -> Result<()> {
         }
         write_budget(&path, &measured)?;
         print_summary(&measured);
-        println!("\nwrote {} (regenerated from the tree)", rel(&repo, &path));
+        println!("\nwrote {} (regenerated from the tree)", rel(repo, &path));
         return Ok(());
     }
 
@@ -118,7 +129,7 @@ pub(crate) fn run(regen: bool) -> Result<()> {
             "{} is missing. It is a committed artifact and the unsafe-budget gate cannot \
              run without it; restore it from git, or regenerate with \
              `cargo run -p xtask -- unsafe-budget --regen`.",
-            path.display()
+            rel(repo, &path)
         );
     }
     let baseline = load_budget(&path)?;
@@ -126,10 +137,10 @@ pub(crate) fn run(regen: bool) -> Result<()> {
     let violations = compute_violations(&measured, &baseline);
     if !violations.is_empty() {
         bail!(
-            "unsafe-budget ratchet:\n{}\n\nThe unsafe_count ceiling may only go DOWN and the \
-             documented_count floor may only go UP. A NEW unsafe needs a `// SAFETY:` and a \
-             reviewed baseline bump; any count that is strictly BETTER than recorded must be \
-             blessed with `cargo run -p xtask -- unsafe-budget --regen` so the ratchet tightens.",
+            "unsafe-budget ratchet:\n{}\n\nThe unsafe_count ceiling may only go DOWN. A NEW unsafe \
+             needs a reviewed baseline bump (and must satisfy the clippy safety lints at the site); \
+             any count strictly BELOW the ceiling must be blessed with \
+             `cargo run -p xtask -- unsafe-budget --regen` so the ratchet tightens.",
             violations
                 .iter()
                 .map(|v| format!("  {v}"))
@@ -137,24 +148,16 @@ pub(crate) fn run(regen: bool) -> Result<()> {
                 .join("\n")
         );
     }
-    println!("\nunsafe-budget: within ceilings and at/above floors (ratchet holds).");
+    println!("\nunsafe-budget: within ceilings (ratchet holds).");
     Ok(())
 }
 
 fn print_summary(b: &Budget) {
-    println!("unsafe budget (real constructs, // SAFETY: coverage):");
+    println!("unsafe budget (real constructs per crate):");
     for (name, c) in b {
-        match c.documented_count {
-            Some(d) => println!("  {name}: {} unsafe, {d} documented", c.unsafe_count),
-            None => println!(
-                "  {name}: {} unsafe (coverage via clippy, not tracked here)",
-                c.unsafe_count
-            ),
-        }
-        for (file, floor) in &c.files {
-            println!("      {file}: {floor} documented");
-        }
+        println!("  {name}: {} unsafe", c.unsafe_count);
     }
+    println!("  (per-site safety justification is enforced by clippy, not counted here.)");
 }
 
 // ------------------------------------------------------------- gating (pure)
@@ -165,8 +168,11 @@ fn print_summary(b: &Budget) {
 fn ceiling_check(label: &str, measured: usize, recorded: usize) -> Option<String> {
     if measured > recorded {
         Some(format!(
-            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each with a \
-             `// SAFETY:` and (with review) raise the ceiling."
+            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each at \
+             its SITE: a `// SAFETY:` comment on an unsafe block or `unsafe impl`, a \
+             `/// # Safety` doc section on a public unsafe fn, and nothing at all on an \
+             `unsafe extern` foreign module -- clippy rejects a `// SAFETY:` comment on \
+             those last two. Then, with review, raise the ceiling."
         ))
     } else if measured < recorded {
         Some(format!(
@@ -178,30 +184,11 @@ fn ceiling_check(label: &str, measured: usize, recorded: usize) -> Option<String
     }
 }
 
-/// A floor that may only go UP. Fails BELOW it (coverage regressed) and
-/// STRICTLY ABOVE it (stale -- more was documented than the floor records, so
-/// re-bless to lock the gain in). Pure; unit-tested both ways.
-fn floor_check(label: &str, measured: usize, recorded: usize) -> Option<String> {
-    if measured < recorded {
-        Some(format!(
-            "{label}: {measured} < floor {recorded} -- SAFETY coverage regressed. Restore the \
-             `// SAFETY:` justification(s)."
-        ))
-    } else if measured > recorded {
-        Some(format!(
-            "{label}: {measured} > floor {recorded} -- stale floor (more is documented than the \
-             baseline records). Run --regen to ratchet it up."
-        ))
-    } else {
-        None
-    }
-}
-
 /// Diff the measured tree against the committed baseline. Returns every
 /// violation (empty = ratchet holds). Pure by design -- no IO -- so the gating
 /// decisions are unit-testable the way `ratchet_violation` /
-/// `compare_exports` are. Both budgets are already scope-shaped by
-/// `measure_budget` / `load_budget`, so this is a straight symmetric diff.
+/// `compare_exports` are. One metric per crate, plus the two
+/// baseline/tree-asymmetry diagnostics, so this is a straight symmetric diff.
 fn compute_violations(measured: &Budget, baseline: &Budget) -> Vec<String> {
     let mut out = Vec::new();
 
@@ -220,48 +207,6 @@ fn compute_violations(measured: &Budget, baseline: &Budget) -> Vec<String> {
         ) {
             out.push(msg);
         }
-
-        match (m.documented_count, base.documented_count) {
-            (Some(mc), Some(bc)) => {
-                if let Some(msg) = floor_check(&format!("crate `{name}` documented_count"), mc, bc)
-                {
-                    out.push(msg);
-                }
-            }
-            (None, Some(_)) => out.push(format!(
-                "crate `{name}` is recorded as documented-scoped but the tree no longer tracks \
-                 it -- run --regen."
-            )),
-            (Some(_), None) => out.push(format!(
-                "crate `{name}` is now documented-scoped but the baseline does not record a \
-                 documented_count -- run --regen."
-            )),
-            (None, None) => {}
-        }
-
-        for (file, bc) in &base.files {
-            match m.files.get(file) {
-                Some(mc) => {
-                    if let Some(msg) =
-                        floor_check(&format!("`{name}`/{file} documented_count"), *mc, *bc)
-                    {
-                        out.push(msg);
-                    }
-                }
-                None => out.push(format!(
-                    "`{name}`/{file} has a per-file floor in the baseline but was not found in \
-                     the tree -- run --regen."
-                )),
-            }
-        }
-        for file in m.files.keys() {
-            if !base.files.contains_key(file) {
-                out.push(format!(
-                    "`{name}`/{file} is tracked in the tree but has no per-file floor in the \
-                     baseline -- run --regen."
-                ));
-            }
-        }
     }
 
     for name in measured.keys() {
@@ -277,20 +222,13 @@ fn compute_violations(measured: &Budget, baseline: &Budget) -> Vec<String> {
 
 /// Human-readable "what changed" between a prior baseline and the freshly
 /// measured tree, for `--regen` to print before it overwrites. Neutral (not
-/// gate-framed): every crate/count/per-file delta, plus added/removed crates
-/// and files. Empty = the baseline already matches the tree. Pure.
+/// gate-framed): every per-crate count delta, plus added/removed crates. Empty
+/// = the baseline already matches the tree. Pure.
 fn diff_budgets(old: &Budget, new: &Budget) -> Vec<String> {
-    fn doc(d: Option<usize>) -> String {
-        d.map_or_else(|| "none".to_string(), |n| n.to_string())
-    }
     let mut out = Vec::new();
     for (name, n) in new {
         let Some(o) = old.get(name) else {
-            out.push(format!(
-                "+ {name} (new crate): unsafe {}, documented {}",
-                n.unsafe_count,
-                doc(n.documented_count)
-            ));
+            out.push(format!("+ {name} (new crate): unsafe {}", n.unsafe_count));
             continue;
         };
         if o.unsafe_count != n.unsafe_count {
@@ -298,25 +236,6 @@ fn diff_budgets(old: &Budget, new: &Budget) -> Vec<String> {
                 "{name} unsafe_count {} -> {}",
                 o.unsafe_count, n.unsafe_count
             ));
-        }
-        if o.documented_count != n.documented_count {
-            out.push(format!(
-                "{name} documented_count {} -> {}",
-                doc(o.documented_count),
-                doc(n.documented_count)
-            ));
-        }
-        for (f, nc) in &n.files {
-            match o.files.get(f) {
-                None => out.push(format!("{name}/{f} (new file) documented {nc}")),
-                Some(oc) if oc != nc => out.push(format!("{name}/{f} documented {oc} -> {nc}")),
-                Some(_) => {}
-            }
-        }
-        for f in o.files.keys() {
-            if !n.files.contains_key(f) {
-                out.push(format!("{name}/{f} (file removed)"));
-            }
         }
     }
     for name in old.keys() {
@@ -338,6 +257,13 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
+    // `xtask` is a workspace member that does NOT live under `crates/`, and it
+    // is the gate's own tooling: no `[lints]` section, no `forbid(unsafe_code)`,
+    // so unsafe landing there is caught by nothing else. Its `name` derives from
+    // `file_name()` -> "xtask" and it flows through the same loop; not being
+    // under `crates/` there is no double-count. A missing `xtask/src` is skipped
+    // by the `src.is_dir()` guard below rather than recorded as an empty crate.
+    entries.push(repo.join("xtask"));
     entries.sort();
 
     for crate_dir in entries {
@@ -350,37 +276,47 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
             continue;
         }
         let mut unsafe_count = 0usize;
-        let mut documented_count = 0usize;
-        let mut files = BTreeMap::new();
-        for file in rust_files(&src)? {
+        for file in crate_files(&crate_dir, &src)? {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
-            let (u, d) = scan_source(&text);
-            unsafe_count += u;
-            documented_count += d;
-            // Per-file floor: only oam_engine's named FFI files, and only when
-            // they sit at the crate's src root (not a same-named file nested in
-            // a subdir).
-            if name == "oam_engine"
-                && file.parent() == Some(src.as_path())
-                && let Some(fname) = file.file_name().and_then(|n| n.to_str())
-                && ENGINE_FILES.contains(&fname)
-            {
-                files.insert(fname.to_string(), d);
-            }
+            unsafe_count += scan_source(&text);
         }
-        budget.insert(
-            name.clone(),
-            CrateBudget {
-                unsafe_count,
-                documented_count: DOCUMENTED_SCOPE
-                    .contains(&name.as_str())
-                    .then_some(documented_count),
-                files,
-            },
-        );
+        // Keyed by DIRECTORY NAME, so two members sharing a final path segment
+        // (a `crates/xtask` alongside the real `xtask`) would collide and the
+        // second insert would drop the first's unsafe from the ceiling. Hiding
+        // unsafe is the one thing this gate exists to prevent: collide loudly.
+        if let Some(prev) = budget.insert(name.clone(), CrateBudget { unsafe_count }) {
+            bail!(
+                "two workspace members map to the crate key `{name}` (one counted {} \
+                 unsafe, the other {unsafe_count}). The budget is keyed by directory \
+                 name, so one silently overwrites the other and drops its unsafe from \
+                 the ceiling. Rename one.",
+                prev.unsafe_count
+            );
+        }
     }
     Ok(budget)
+}
+
+/// Every `.rs` file that counts toward one crate's budget, sorted for a stable
+/// walk: all of `src/` (the base -- the caller has already checked it exists),
+/// all of `tests/`, and a top-level `build.rs`. The latter two are included only
+/// when present. Both are compiled Rust -- integration tests CI builds and runs,
+/// and a build script that runs on the build host -- so unsafe there belongs
+/// under the same ceiling as `src/`. `benches/` and `examples/` are deliberately
+/// out (no crate in the tree has either; see the module doc).
+fn crate_files(crate_dir: &Path, src: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = rust_files(src)?;
+    let tests = crate_dir.join("tests");
+    if tests.is_dir() {
+        out.extend(rust_files(&tests)?);
+    }
+    let build_rs = crate_dir.join("build.rs");
+    if build_rs.is_file() {
+        out.push(build_rs);
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Every `.rs` file under `dir`, recursively, sorted for a stable walk.
@@ -406,21 +342,18 @@ fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 // --------------------------------------------------------- lexical scanner
 
-/// Count `(real unsafe constructs, // SAFETY: comments)` in one source file.
-fn scan_source(src: &str) -> (usize, usize) {
-    let (code, safety) = strip_comments_and_strings(src);
-    (count_unsafe(&code), safety)
+/// Count the real unsafe constructs in one source file.
+fn scan_source(src: &str) -> usize {
+    count_unsafe(&strip_comments_and_strings(src))
 }
 
 /// Blank every comment, string, char, byte and raw literal to spaces (newlines
 /// preserved) so keyword scanning never trips on the word `unsafe` inside a
-/// comment or string, or on a `"` / `//` living inside a raw string. Returns
-/// the blanked code plus the count of `// SAFETY:` line comments.
-fn strip_comments_and_strings(src: &str) -> (String, usize) {
+/// comment or string, or on a `"` / `//` living inside a raw string.
+fn strip_comments_and_strings(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(src.len());
-    let mut safety = 0usize;
     let mut i = 0usize;
 
     while i < n {
@@ -431,10 +364,6 @@ fn strip_comments_and_strings(src: &str) -> (String, usize) {
             let mut j = i + 2;
             while j < n && chars[j] != '\n' {
                 j += 1;
-            }
-            let text: String = chars[i + 2..j].iter().collect();
-            if text.trim_start().starts_with("SAFETY:") {
-                safety += 1;
             }
             for _ in i..j {
                 out.push(' ');
@@ -483,7 +412,7 @@ fn strip_comments_and_strings(src: &str) -> (String, usize) {
         i += 1;
     }
 
-    (out, safety)
+    out
 }
 
 fn is_word_char(c: char) -> bool {
@@ -718,28 +647,21 @@ fn is_fn_pointer(b: &[u8], j: usize) -> bool {
 
 // ------------------------------------------------------------ (de)serialize
 
-const COMMENT: &str = "Real `unsafe` constructs per crate (unsafe_count, a CEILING that may only go \
-DOWN) and `// SAFETY:` justification comments (documented_count, a FLOOR that may only go UP), \
-measured by `cargo run -p xtask -- unsafe-budget`. This is the AI-POLICY.md gate-5 ratchet; it \
-GATES: a crate above its unsafe ceiling, or below its documented floor, fails the run -- and so \
-does any count strictly BETTER than recorded (regenerate with --regen so the ratchet tightens). \
-documented_count is tracked only for oam_engine (with per-file floors on the FFI-boundary files) \
-and oam_napi_test_addon; oam_core/oam_cli/oam_ts get coverage from clippy undocumented_unsafe_blocks \
-on a sibling branch, so only their unsafe_count ceiling lives here. Do not edit by hand.";
+const COMMENT: &str = "Real `unsafe` constructs per crate (unsafe_count), a CEILING that may only \
+go DOWN, measured by `cargo run -p xtask -- unsafe-budget`. This is the AI-POLICY.md gate-5 \
+ratchet; it GATES: a crate ABOVE its ceiling fails the run -- and so does a count strictly BELOW \
+it (regenerate with --regen so the ratchet tightens). Per-SITE `// SAFETY:` coverage is NOT \
+counted here: it is enforced on EVERY crate by clippy undocumented_unsafe_blocks = deny, \
+unnecessary_safety_comment = deny and missing_safety_doc = deny. The old documented_count FLOOR \
+was retired because it and unnecessary_safety_comment were in direct conflict -- the floor counted \
+~155 comments that the lint forbids. Scanned per workspace member: every .rs file under src/ and \
+tests/, plus a top-level build.rs. Do not edit by hand.";
 
 fn budget_to_json(b: &Budget) -> Value {
     let mut crates = serde_json::Map::new();
     for (name, c) in b {
         let mut obj = serde_json::Map::new();
         obj.insert("unsafe_count".into(), json!(c.unsafe_count));
-        if let Some(d) = c.documented_count {
-            obj.insert("documented_count".into(), json!(d));
-        }
-        if !c.files.is_empty() {
-            let files: serde_json::Map<String, Value> =
-                c.files.iter().map(|(f, n)| (f.clone(), json!(n))).collect();
-            obj.insert("files".into(), Value::Object(files));
-        }
         crates.insert(name.clone(), Value::Object(obj));
     }
     json!({ "_comment": COMMENT, "crates": Value::Object(crates) })
@@ -757,26 +679,7 @@ fn budget_from_json(v: &Value) -> Result<Budget> {
             .and_then(Value::as_u64)
             .with_context(|| format!("crate `{name}` has no numeric unsafe_count"))?
             as usize;
-        let documented_count = entry
-            .get("documented_count")
-            .and_then(Value::as_u64)
-            .map(|x| x as usize);
-        let mut files = BTreeMap::new();
-        if let Some(map) = entry.get("files").and_then(Value::as_object) {
-            for (f, n) in map {
-                if let Some(n) = n.as_u64() {
-                    files.insert(f.clone(), n as usize);
-                }
-            }
-        }
-        out.insert(
-            name.clone(),
-            CrateBudget {
-                unsafe_count,
-                documented_count,
-                files,
-            },
-        );
+        out.insert(name.clone(), CrateBudget { unsafe_count });
     }
     Ok(out)
 }
@@ -817,8 +720,7 @@ mod tests {
             unsafe extern "C" { fn c(); }
             fn d() { unsafe { g(); } }
         "#;
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 4);
+        assert_eq!(scan_source(src), 4);
     }
 
     #[test]
@@ -829,7 +731,7 @@ mod tests {
             pub unsafe extern "C" fn napi_get_undefined(env: Env) -> i32 { 0 }
             struct S { cb: unsafe extern "C" fn(Env, *mut u8) -> i32 }
         "#;
-        let t = tally(&strip_comments_and_strings(src).0);
+        let t = tally(&strip_comments_and_strings(src));
         assert_eq!(t.unsafe_extern_fn, 1, "one named definition");
         assert_eq!(t.total(), 1, "the fn-pointer type must not count");
     }
@@ -837,8 +739,11 @@ mod tests {
     #[test]
     fn does_not_count_unsafe_attributes() {
         let src = "#[unsafe(no_mangle)]\npub extern \"C\" fn f() {}\n";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 0, "#[unsafe(...)] is an attribute, not a construct");
+        assert_eq!(
+            scan_source(src),
+            0,
+            "#[unsafe(...)] is an attribute, not a construct"
+        );
     }
 
     #[test]
@@ -849,22 +754,7 @@ mod tests {
             let s = "an unsafe string literal";
             let r = r#"a raw "unsafe" string with quotes"#;
         "##;
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 0);
-    }
-
-    #[test]
-    fn counts_safety_comments_and_only_those() {
-        let src = [
-            "// SAFETY: this one counts",
-            "//SAFETY: no space also counts",
-            "//   SAFETY: indented counts",
-            "// not a safety comment",
-            r#"let x = "// SAFETY: inside a string does not";"#,
-        ]
-        .join("\n");
-        let (_, d) = scan_source(&src);
-        assert_eq!(d, 3);
+        assert_eq!(scan_source(src), 0);
     }
 
     #[test]
@@ -872,15 +762,13 @@ mod tests {
         // If `'"'` were mishandled the trailing `unsafe {` would be swallowed
         // into a phantom string and miscounted as 0.
         let src = "let q = '\"'; fn f() { unsafe { g(); } }";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1);
+        assert_eq!(scan_source(src), 1);
     }
 
     #[test]
     fn lifetimes_are_not_char_literals() {
         let src = "fn f<'a>(x: &'a str) -> &'static str { unsafe { h() } }";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1);
+        assert_eq!(scan_source(src), 1);
     }
 
     #[test]
@@ -891,8 +779,11 @@ mod tests {
         // ceiling this gate protects. Both plain and byte forms.
         for lit in ["'\\\\'", "b'\\\\'"] {
             let src = format!("let c = {lit}; let x = \"'\"; unsafe {{ f(); }}");
-            let (u, _) = scan_source(&src);
-            assert_eq!(u, 1, "backslash char literal {lit} miscounted");
+            assert_eq!(
+                scan_source(&src),
+                1,
+                "backslash char literal {lit} miscounted"
+            );
         }
     }
 
@@ -900,176 +791,7 @@ mod tests {
     fn escaped_quote_char_literal_is_counted() {
         // `'\''` (escaped single-quote) must not desync the quote scan.
         let src = "let q = '\\''; unsafe { g(); }";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1);
-    }
-
-    // ---- pure gate: both directions on both metrics ----
-
-    // (name, unsafe_count, documented_count, per-file floors).
-    type Row<'a> = (&'a str, usize, Option<usize>, &'a [(&'a str, usize)]);
-
-    fn budget(entries: &[Row]) -> Budget {
-        entries
-            .iter()
-            .map(|(name, u, d, files)| {
-                (
-                    (*name).to_string(),
-                    CrateBudget {
-                        unsafe_count: *u,
-                        documented_count: *d,
-                        files: files.iter().map(|(f, n)| ((*f).to_string(), *n)).collect(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn exact_match_is_clean() {
-        let b = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        assert!(compute_violations(&b, &b).is_empty());
-    }
-
-    #[test]
-    fn unsafe_above_ceiling_fails() {
-        let measured = budget(&[("oam_engine", 701, Some(690), &[("napi.rs", 600)])]);
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let v = compute_violations(&measured, &baseline);
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("701 > ceiling 700"), "{}", v[0]);
-    }
-
-    #[test]
-    fn unsafe_below_ceiling_is_stale() {
-        let measured = budget(&[("oam_engine", 699, Some(690), &[("napi.rs", 600)])]);
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let v = compute_violations(&measured, &baseline);
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("stale ceiling"), "{}", v[0]);
-        assert!(v[0].contains("699 < recorded 700"), "{}", v[0]);
-    }
-
-    #[test]
-    fn documented_below_floor_fails() {
-        let measured = budget(&[("oam_engine", 700, Some(689), &[("napi.rs", 600)])]);
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let v = compute_violations(&measured, &baseline);
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("689 < floor 690"), "{}", v[0]);
-        assert!(v[0].contains("coverage regressed"), "{}", v[0]);
-    }
-
-    #[test]
-    fn documented_above_floor_is_stale() {
-        let measured = budget(&[("oam_engine", 700, Some(691), &[("napi.rs", 600)])]);
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let v = compute_violations(&measured, &baseline);
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("stale floor"), "{}", v[0]);
-        assert!(v[0].contains("691 > floor 690"), "{}", v[0]);
-    }
-
-    #[test]
-    fn per_file_floor_bites_both_directions() {
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let below = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 599)])]);
-        let above = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 601)])]);
-        let vb = compute_violations(&below, &baseline);
-        assert!(
-            vb.iter()
-                .any(|m| m.contains("napi.rs") && m.contains("< floor 600")),
-            "{vb:?}"
-        );
-        let va = compute_violations(&above, &baseline);
-        assert!(
-            va.iter()
-                .any(|m| m.contains("napi.rs") && m.contains("> floor 600")),
-            "{va:?}"
-        );
-    }
-
-    #[test]
-    fn a_new_crate_must_be_blessed() {
-        let measured = budget(&[
-            ("oam_engine", 700, Some(690), &[]),
-            ("oam_new", 2, None, &[]),
-        ]);
-        let baseline = budget(&[("oam_engine", 700, Some(690), &[])]);
-        let v = compute_violations(&measured, &baseline);
-        assert!(
-            v.iter()
-                .any(|m| m.contains("oam_new") && m.contains("not in the baseline")),
-            "{v:?}"
-        );
-    }
-
-    #[test]
-    fn out_of_scope_crate_tracks_ceiling_only() {
-        // oam_core carries unsafe but documented_count is None (clippy owns
-        // coverage): the floor check is skipped, the ceiling still bites.
-        let measured = budget(&[("oam_core", 98, None, &[])]);
-        let baseline = budget(&[("oam_core", 97, None, &[])]);
-        let v = compute_violations(&measured, &baseline);
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("97"), "{}", v[0]);
-    }
-
-    // ---- regen diff (what --regen prints before overwriting) ----
-
-    #[test]
-    fn diff_reports_count_file_and_crate_changes() {
-        let old = budget(&[
-            ("oam_engine", 700, Some(690), &[("napi.rs", 600)]),
-            ("oam_gone", 3, None, &[]),
-        ]);
-        let new = budget(&[
-            // unsafe down, documented up, a per-file floor raised.
-            ("oam_engine", 699, Some(692), &[("napi.rs", 602)]),
-            // brand-new crate.
-            ("oam_new", 2, None, &[]),
-            // oam_gone dropped.
-        ]);
-        let d = diff_budgets(&old, &new);
-        assert!(
-            d.iter().any(|m| m == "oam_engine unsafe_count 700 -> 699"),
-            "{d:?}"
-        );
-        assert!(
-            d.iter()
-                .any(|m| m == "oam_engine documented_count 690 -> 692"),
-            "{d:?}"
-        );
-        assert!(
-            d.iter()
-                .any(|m| m == "oam_engine/napi.rs documented 600 -> 602"),
-            "{d:?}"
-        );
-        assert!(d.iter().any(|m| m.contains("oam_new (new crate)")), "{d:?}");
-        assert!(d.iter().any(|m| m == "- oam_gone (crate removed)"), "{d:?}");
-    }
-
-    #[test]
-    fn diff_is_empty_when_baseline_matches_tree() {
-        let b = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        assert!(diff_budgets(&b, &b).is_empty());
-    }
-
-    // ---- JSON round-trip ----
-
-    #[test]
-    fn json_round_trips() {
-        let b = budget(&[
-            ("oam_core", 97, None, &[]),
-            (
-                "oam_engine",
-                700,
-                Some(690),
-                &[("napi.rs", 600), ("lib.rs", 5)],
-            ),
-        ]);
-        let back = budget_from_json(&budget_to_json(&b)).unwrap();
-        assert_eq!(b, back);
+        assert_eq!(scan_source(src), 1);
     }
 
     // ---- lexical scanner: boundary / literal edge cases ----
@@ -1081,8 +803,11 @@ mod tests {
         // ENDS in `unsafe` and is followed by `{` -- the case a dropped prev-word
         // guard would miscount as an unsafe block. Plus leading/interior forms.
         let src = "let unsafe_x = is_unsafe(); let a = wrap_unsafe { x: 1 }; unsafe { real(); }";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1, "only the real `unsafe {{` block counts");
+        assert_eq!(
+            scan_source(src),
+            1,
+            "only the real `unsafe {{` block counts"
+        );
     }
 
     #[test]
@@ -1093,8 +818,7 @@ mod tests {
             let c = br"a raw unsafe byte string";
             unsafe { real(); }
         "####;
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1);
+        assert_eq!(scan_source(src), 1);
     }
 
     #[test]
@@ -1104,18 +828,17 @@ mod tests {
         // the outer comment -- blanked. A naive first-`*/` scan would end the
         // comment at the inner close and count it, giving 2 instead of 1.
         let src = "/* a /* b */ unsafe { hidden(); } */ unsafe { real(); }";
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1);
+        assert_eq!(scan_source(src), 1);
     }
 
     #[test]
-    fn safety_inside_a_block_comment_is_not_counted() {
-        // Only a `// SAFETY:` LINE comment justifies an unsafe; a `SAFETY:` that
-        // is itself inside a block comment is inert text, not coverage.
-        let src = "/* // SAFETY: not real */\n// SAFETY: real\nunsafe { g(); }";
-        let (u, d) = scan_source(src);
-        assert_eq!(u, 1);
-        assert_eq!(d, 1, "only the line-comment SAFETY counts");
+    fn line_comment_inside_a_block_comment_does_not_end_it() {
+        // A `//` inside a block comment is inert text: it must neither terminate
+        // the block comment early nor swallow its closing `*/`, or the real
+        // trailing `unsafe` after it would be blanked and lost from the ceiling.
+        let src =
+            "/* // hidden unsafe { g(); } */\n// also hidden: unsafe { g(); }\nunsafe { g(); }";
+        assert_eq!(scan_source(src), 1, "only the bare trailing block counts");
     }
 
     #[test]
@@ -1126,21 +849,69 @@ mod tests {
             let a = r##"contains "# and the word unsafe inside"##;
             unsafe { real(); }
         "####;
-        let (u, _) = scan_source(src);
-        assert_eq!(u, 1, "interior \"# must not close the raw string");
+        assert_eq!(
+            scan_source(src),
+            1,
+            "interior \"# must not close the raw string"
+        );
     }
 
-    // ---- pure gate: baseline/tree asymmetry and scope transitions ----
+    // ---- pure gate: the ceiling, both directions ----
+
+    // (crate name, unsafe_count) -- the entire model, now that the gate is
+    // ceiling-only. Per-site `// SAFETY` coverage lives in clippy, not here.
+    type Row<'a> = (&'a str, usize);
+
+    fn budget(entries: &[Row]) -> Budget {
+        entries
+            .iter()
+            .map(|(name, u)| ((*name).to_string(), CrateBudget { unsafe_count: *u }))
+            .collect()
+    }
+
+    #[test]
+    fn exact_match_is_clean() {
+        let b = budget(&[("oam_engine", 700), ("oam_core", 90)]);
+        assert!(compute_violations(&b, &b).is_empty());
+    }
+
+    #[test]
+    fn unsafe_above_ceiling_fails() {
+        let measured = budget(&[("oam_engine", 701)]);
+        let baseline = budget(&[("oam_engine", 700)]);
+        let v = compute_violations(&measured, &baseline);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("701 > ceiling 700"), "{}", v[0]);
+    }
+
+    #[test]
+    fn unsafe_below_ceiling_is_stale() {
+        let measured = budget(&[("oam_engine", 699)]);
+        let baseline = budget(&[("oam_engine", 700)]);
+        let v = compute_violations(&measured, &baseline);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("stale ceiling"), "{}", v[0]);
+        assert!(v[0].contains("699 < recorded 700"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_new_crate_must_be_blessed() {
+        let measured = budget(&[("oam_engine", 700), ("oam_new", 2)]);
+        let baseline = budget(&[("oam_engine", 700)]);
+        let v = compute_violations(&measured, &baseline);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("oam_new") && m.contains("not in the baseline")),
+            "{v:?}"
+        );
+    }
 
     #[test]
     fn crate_in_baseline_but_absent_from_tree_is_flagged() {
         // A deleted/renamed crate must force a --regen, not silently drop its
         // ceiling from the gate.
-        let measured = budget(&[("oam_engine", 700, Some(690), &[])]);
-        let baseline = budget(&[
-            ("oam_engine", 700, Some(690), &[]),
-            ("oam_gone", 3, None, &[]),
-        ]);
+        let measured = budget(&[("oam_engine", 700)]);
+        let baseline = budget(&[("oam_engine", 700), ("oam_gone", 3)]);
         let v = compute_violations(&measured, &baseline);
         assert!(
             v.iter()
@@ -1149,46 +920,69 @@ mod tests {
         );
     }
 
+    // ---- regen diff (what --regen prints before overwriting) ----
+
     #[test]
-    fn per_file_floor_in_baseline_but_absent_from_tree_is_flagged() {
-        // A renamed/removed engine file with a per-file floor must force --regen.
-        let measured = budget(&[("oam_engine", 700, Some(690), &[("napi.rs", 600)])]);
-        let baseline = budget(&[(
-            "oam_engine",
-            700,
-            Some(690),
-            &[("napi.rs", 600), ("gone.rs", 4)],
-        )]);
-        let v = compute_violations(&measured, &baseline);
+    fn diff_reports_count_and_crate_changes() {
+        let old = budget(&[("oam_engine", 700), ("oam_gone", 3)]);
+        let new = budget(&[
+            // ceiling ratcheted down.
+            ("oam_engine", 699),
+            // brand-new crate.
+            ("oam_new", 2),
+            // oam_gone dropped.
+        ]);
+        let d = diff_budgets(&old, &new);
         assert!(
-            v.iter()
-                .any(|m| m.contains("gone.rs") && m.contains("was not found in the tree")),
-            "{v:?}"
+            d.iter().any(|m| m == "oam_engine unsafe_count 700 -> 699"),
+            "{d:?}"
         );
+        assert!(
+            d.iter().any(|m| m == "+ oam_new (new crate): unsafe 2"),
+            "{d:?}"
+        );
+        assert!(d.iter().any(|m| m == "- oam_gone (crate removed)"), "{d:?}");
+        assert_eq!(d.len(), 3, "and nothing else: {d:?}");
     }
 
     #[test]
-    fn documented_scope_transition_bites_both_directions() {
-        // Editing DOCUMENTED_SCOPE desyncs a crate's documented_count from the
-        // baseline; both directions must force a --regen.
-        let engine_tracked = budget(&[("oam_engine", 700, Some(690), &[])]);
-        let engine_untracked = budget(&[("oam_engine", 700, None, &[])]);
+    fn diff_is_empty_when_baseline_matches_tree() {
+        let b = budget(&[("oam_engine", 700), ("oam_core", 90)]);
+        assert!(diff_budgets(&b, &b).is_empty());
+    }
 
-        // tree no longer tracks it (None) but baseline still records Some.
-        let dropped = compute_violations(&engine_untracked, &engine_tracked);
-        assert!(
-            dropped.iter().any(|m| m.contains("no longer tracks it")),
-            "{dropped:?}"
-        );
+    // ---- JSON round-trip ----
 
-        // tree now tracks it (Some) but baseline has no documented_count.
-        let added = compute_violations(&engine_tracked, &engine_untracked);
-        assert!(
-            added
-                .iter()
-                .any(|m| m.contains("does not record a documented_count")),
-            "{added:?}"
-        );
+    #[test]
+    fn json_round_trips() {
+        let b = budget(&[("oam_core", 97), ("oam_engine", 700), ("oam_loader", 0)]);
+        let back = budget_from_json(&budget_to_json(&b)).unwrap();
+        assert_eq!(b, back);
+    }
+
+    #[test]
+    fn retired_keys_are_neither_written_nor_read() {
+        // documented_count / files are gone from the model. A freshly written
+        // baseline must not carry them, and a STALE baseline that still does
+        // must load fine on its unsafe_count alone rather than erroring -- the
+        // gate has to keep running while the committed artifact catches up.
+        let v = budget_to_json(&budget(&[("oam_engine", 700)]));
+        let entry = &v["crates"]["oam_engine"];
+        assert!(entry.get("unsafe_count").is_some(), "{entry}");
+        assert!(entry.get("documented_count").is_none(), "{entry}");
+        assert!(entry.get("files").is_none(), "{entry}");
+
+        let stale = budget_from_json(&json!({
+            "crates": {
+                "oam_engine": {
+                    "unsafe_count": 700,
+                    "documented_count": 690,
+                    "files": { "napi.rs": 600 }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(stale, budget(&[("oam_engine", 700)]));
     }
 
     // ---- deserialize: a corrupt committed baseline must fail loudly ----
@@ -1210,24 +1004,376 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_per_file_floor_is_dropped() {
-        // Documents CURRENT behavior: a corrupt (non-numeric) per-file floor is
-        // silently skipped rather than erroring. Lenient by construction -- a
-        // stricter version would `bail!` here; this test pins the status quo so a
-        // future change to it is deliberate.
-        let b = budget_from_json(&json!({
-            "crates": {
-                "oam_engine": {
-                    "unsafe_count": 5,
-                    "documented_count": 3,
-                    "files": { "napi.rs": "not a number" }
-                }
-            }
-        }))
-        .unwrap();
+    fn baseline_crate_with_non_numeric_unsafe_count_errors() {
+        // The one metric left is load-bearing: a corrupt value must fail the
+        // run, never silently read as 0 (which would pass every crate).
+        let err = budget_from_json(&json!({ "crates": { "oam_x": { "unsafe_count": "700" } } }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no numeric unsafe_count"), "{err}");
+    }
+
+    // ---- file walk: which surfaces the ceiling can actually see ----
+
+    /// A throwaway repo tree under the OS temp dir, removed on Drop so a failing
+    /// assertion cannot leak it. std-only: xtask has no `tempfile` dependency.
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            // pid + a process-local counter: the test harness runs these in
+            // parallel threads, so a clock-based name could collide.
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "oam-unsafe-budget-{tag}-{}-{seq}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Write `text` at repo-relative `rel` (forward slashes), creating any
+        /// missing parent directories.
+        fn file(&self, rel: &str, text: &str) {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Sum `scan_source` over everything `crate_files` walks for ONE crate --
+    /// the same arithmetic `measure_budget` does, minus the `crates/` layout, so
+    /// the walk's contribution to the ceiling can be asserted on its own.
+    fn scan_crate(crate_dir: &Path) -> usize {
+        crate_files(crate_dir, &crate_dir.join("src"))
+            .unwrap()
+            .iter()
+            .map(|p| scan_source(&std::fs::read_to_string(p).unwrap()))
+            .sum()
+    }
+
+    #[test]
+    fn crate_files_walks_src_tests_and_build_rs_recursively() {
+        // The walk's own contract: `src/` and `tests/` recursively plus a
+        // top-level `build.rs`, .rs only, sorted. `benches/` is the decoy.
+        let t = TempRepo::new("files");
+        t.file("oam_x/src/lib.rs", "");
+        t.file("oam_x/src/sub/deep.rs", "");
+        t.file("oam_x/src/notes.txt", "");
+        t.file("oam_x/tests/it.rs", "");
+        t.file("oam_x/tests/sub/nested.rs", "");
+        t.file("oam_x/build.rs", "");
+        t.file("oam_x/benches/b.rs", "");
+        let dir = t.path().join("oam_x");
+        let found: Vec<String> = crate_files(&dir, &dir.join("src"))
+            .unwrap()
+            .iter()
+            .map(|p| rel(&dir, p))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "build.rs",
+                "src/lib.rs",
+                "src/sub/deep.rs",
+                "tests/it.rs",
+                "tests/sub/nested.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn crate_files_counts_unsafe_in_a_tests_file() {
+        // `tests/` is compiled Rust that CI builds and runs. Before the walk
+        // widened, an `unsafe` block there was structurally invisible to the
+        // ceiling. The `src/` file is deliberately clean, so the whole count
+        // has to come from `tests/`.
+        let t = TempRepo::new("walk-tests");
+        t.file("oam_x/src/lib.rs", "pub fn f() {}\n");
+        t.file("oam_x/tests/it.rs", "#[test]\nfn t() { unsafe { g(); } }\n");
+        t.file("oam_x/tests/sub/nested.rs", "fn n() { unsafe { g(); } }\n");
+        assert_eq!(
+            scan_crate(&t.path().join("oam_x")),
+            2,
+            "tests/ is inside the ceiling, recursively"
+        );
+    }
+
+    #[test]
+    fn crate_files_counts_unsafe_in_a_top_level_build_rs() {
+        // A build script is compiled and RUN on the build host; unsafe there is
+        // real. Only the top-level `build.rs` is picked up -- it is a file, not
+        // a walked directory -- so the clean `src/` leaves the count to it.
+        let t = TempRepo::new("walk-build");
+        t.file("oam_x/src/lib.rs", "pub fn f() {}\n");
+        t.file("oam_x/build.rs", "fn main() { unsafe { g(); } }\n");
+        assert_eq!(
+            scan_crate(&t.path().join("oam_x")),
+            1,
+            "build.rs is inside the ceiling"
+        );
+    }
+
+    #[test]
+    fn crate_files_walks_src_subdirectories_recursively() {
+        // Widening the walk to tests/ + build.rs must not have cost the original
+        // property: `src/` is walked to arbitrary depth, not just its root. Two
+        // levels down, with a non-.rs decoy alongside it.
+        let t = TempRepo::new("walk-deep");
+        t.file("oam_x/src/lib.rs", "pub fn f() { unsafe { g(); } }\n");
+        t.file("oam_x/src/a/b/deep.rs", "fn d() { unsafe { g(); } }\n");
+        t.file("oam_x/src/a/b/notes.txt", "unsafe { not_rust(); }\n");
+        assert_eq!(
+            scan_crate(&t.path().join("oam_x")),
+            2,
+            "src/ is walked to arbitrary depth, .rs only"
+        );
+    }
+
+    #[test]
+    fn tests_dir_and_build_rs_count_toward_the_crate_ceiling() {
+        // The same widening at the `measure_budget` level: all three surfaces
+        // must land in ONE per-crate total, not just in `crate_files`' list.
+        let t = TempRepo::new("walk");
+        t.file(
+            "crates/oam_engine/src/engine.rs",
+            "pub fn a() { unsafe { g(); } }\n",
+        );
+        t.file(
+            "crates/oam_engine/tests/it.rs",
+            "#[test]\nfn t() { unsafe { g(); } }\n",
+        );
+        t.file(
+            "crates/oam_engine/build.rs",
+            "fn main() { unsafe { g(); } }\n",
+        );
+        let b = measure_budget(t.path()).unwrap();
+        assert_eq!(
+            b["oam_engine"].unsafe_count, 3,
+            "src + tests/ + build.rs all counted"
+        );
+    }
+
+    #[test]
+    fn xtask_is_scanned_like_any_other_workspace_member() {
+        // xtask lives outside `crates/` and carries no [lints] section, so
+        // without this it is the one workspace member where unsafe is caught by
+        // nothing at all.
+        let t = TempRepo::new("xtask");
+        t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
+        t.file("xtask/src/main.rs", "fn main() { unsafe { g(); } }\n");
+        t.file("xtask/src/sub/helper.rs", "fn h() { unsafe { g(); } }\n");
+        let b = measure_budget(t.path()).unwrap();
+        assert_eq!(
+            b["xtask"].unsafe_count, 2,
+            "walked recursively, like every other member"
+        );
+        let names: Vec<&str> = b.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["oam_x", "xtask"],
+            "xtask is not under crates/, so it must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn two_members_with_the_same_directory_name_fail_loudly() {
+        // The budget is keyed by directory name. A `crates/xtask` alongside the
+        // real `xtask` would map to one key, and the loser's unsafe would vanish
+        // from the ceiling -- silently hiding unsafe, which is the single thing
+        // this gate exists to prevent. It must ERROR, not overwrite.
+        let t = TempRepo::new("dupkey");
+        t.file(
+            "crates/xtask/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }\n",
+        );
+        t.file("xtask/src/main.rs", "fn main() { unsafe { g(); } }\n");
+        let err = measure_budget(t.path()).unwrap_err().to_string();
+        assert!(err.contains("`xtask`"), "{err}");
+        assert!(err.contains("two workspace members"), "{err}");
+    }
+
+    #[test]
+    fn crlf_source_counts_the_same_as_lf() {
+        // The committed baseline is ONE set of numbers shared by all four CI
+        // legs, and this is a Windows box where autocrlf can hand the scanner
+        // `\r\n`. If `\r` ever perturbed the line-comment scan or `skip_ws` the
+        // gate would fail on exactly one platform, reported as a "stale
+        // ceiling" that points nowhere near the real cause.
+        // `fn c` deliberately puts the brace on the NEXT line: that is the one
+        // place `\r` must be skipped as whitespace for the block to be seen.
+        let lf = "// a line comment x\nunsafe fn a() {}\nfn b() { unsafe { g(); } }\nfn c() {\n    unsafe\n    { g(); }\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(scan_source(lf), 3);
+        assert_eq!(
+            scan_source(&crlf),
+            scan_source(lf),
+            "CRLF must not shift the count"
+        );
+    }
+
+    #[test]
+    fn unsafe_trait_counts_toward_the_ceiling() {
+        // `classify` carries a dedicated branch for this precisely because the
+        // tree has none today -- an untested future-proofing branch is one
+        // refactor away from being a silent hole.
+        let t = tally(&strip_comments_and_strings("unsafe trait Send2 {}\n"));
+        assert_eq!(t.total(), 1, "an unsafe trait is a real unsafe construct");
+    }
+
+    #[test]
+    fn a_raw_identifier_is_not_read_as_a_raw_string() {
+        // `r#type` must not open a raw string: if it did, the scan would blank
+        // the rest of the file to spaces and undercount that crate's ceiling --
+        // the same silent-undercount class as the `'\'` runaway above.
+        let src = "let r#type = 1; let r#match = 2; unsafe { g(); }";
+        assert_eq!(scan_source(src), 1);
+    }
+
+    #[test]
+    fn every_violation_is_reported_not_just_the_first() {
+        // A reviewer acting on a truncated list fixes one problem, re-runs, and
+        // hits the next. All of them must surface in one pass.
+        let measured = budget(&[("oam_engine", 701), ("oam_new", 2)]);
+        let baseline = budget(&[("oam_engine", 700)]);
+        let v = compute_violations(&measured, &baseline);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v.iter().any(|m| m.contains("701 > ceiling 700")), "{v:?}");
+        assert!(v.iter().any(|m| m.contains("oam_new")), "{v:?}");
+    }
+
+    #[test]
+    fn budget_round_trips_through_a_real_file() {
+        // `json_round_trips` covers the in-memory Value only. The on-disk path
+        // adds the _comment, pretty-printing and a trailing newline -- a
+        // formatting change there would make every regen diff noisily.
+        let t = TempRepo::new("io");
+        let path = t.path().join("unsafe-budget.json");
+        let b = budget(&[("oam_core", 90), ("oam_engine", 573)]);
+        write_budget(&path, &b).unwrap();
+        assert_eq!(load_budget(&path).unwrap(), b);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("_comment"), "the baseline explains itself");
+        assert!(text.ends_with("}\n"), "exactly one trailing newline");
+    }
+
+    #[test]
+    fn a_missing_baseline_fails_closed() {
+        // The file is a COMMITTED artifact. Treating its absence as "nothing
+        // recorded yet" would silently switch the whole gate off, which is the
+        // one failure mode a ratchet must never have.
+        let t = TempRepo::new("nobaseline");
+        t.file(
+            "crates/oam_x/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }\n",
+        );
+        let err = run_at(t.path(), false).unwrap_err().to_string();
+        assert!(err.contains("is missing"), "{err}");
         assert!(
-            b["oam_engine"].files.is_empty(),
-            "a non-numeric floor is currently dropped, not retained"
+            err.contains("--regen"),
+            "the message names the recovery: {err}"
+        );
+    }
+
+    #[test]
+    fn regen_recovers_from_a_corrupt_baseline() {
+        // --regen IS the documented recovery path for an unreadable baseline,
+        // so it must not abort on one; if this regressed to a `?` the recovery
+        // would be dead exactly when it is needed.
+        let t = TempRepo::new("corrupt");
+        t.file(
+            "crates/oam_x/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }\n",
+        );
+        t.file("conformance/unsafe-budget.json", "{ not valid json");
+        run_at(t.path(), true).expect("regen must survive a corrupt baseline");
+        let back = load_budget(&t.path().join("conformance/unsafe-budget.json")).unwrap();
+        assert_eq!(back["oam_x"].unsafe_count, 1, "rewritten from the tree");
+    }
+
+    #[test]
+    fn a_member_without_a_src_dir_is_skipped() {
+        // Both directions of the `src.is_dir()` continue: a docs-only directory
+        // under `crates/` is not a crate, and an absent `xtask/` must not be
+        // recorded as an empty crate just because its path is pushed.
+        let t = TempRepo::new("nosrc");
+        t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
+        t.file("crates/oam_docs/README.md", "not a crate\n");
+        let b = measure_budget(t.path()).unwrap();
+        let names: Vec<&str> = b.keys().map(String::as_str).collect();
+        assert_eq!(names, ["oam_x"]);
+    }
+
+    #[test]
+    fn benches_and_examples_are_not_walked() {
+        // Pins the CURRENT scope rather than a wish: no crate in the tree has
+        // either directory today. If one appears, this failing test is the
+        // reminder to widen `crate_files` instead of silently missing it.
+        let t = TempRepo::new("benches");
+        t.file("crates/oam_x/src/lib.rs", "pub fn f() {}\n");
+        t.file("crates/oam_x/benches/b.rs", "fn b() { unsafe { g(); } }\n");
+        t.file(
+            "crates/oam_x/examples/e.rs",
+            "fn main() { unsafe { g(); } }\n",
+        );
+        let b = measure_budget(t.path()).unwrap();
+        assert_eq!(
+            b["oam_x"].unsafe_count, 0,
+            "benches/ and examples/ are out of the walk"
+        );
+    }
+
+    // ---- the retired floor: coverage is clippy's job, not a count's ----
+
+    #[test]
+    fn a_crate_with_no_safety_comments_still_passes_the_gate() {
+        // The deliberate handoff, pinned so a future reader does not "restore"
+        // the floor: per-site justification is enforced by clippy
+        // (undocumented_unsafe_blocks / unnecessary_safety_comment /
+        // missing_safety_doc, denied on every crate), NOT by counting
+        // `// SAFETY` lines here. Stripping every one of them from a crate must
+        // therefore change nothing this gate measures, and must not trip it.
+        //
+        // If this test starts failing, a lexical floor has been re-introduced.
+        // Read the module doc before "fixing" it -- the floor and
+        // `unnecessary_safety_comment` are in DIRECT conflict: ~155 of the
+        // comments the old floor counted are ones the lint forbids.
+        let documented = concat!(
+            "// SAFETY: the pointer is non-null and uniquely owned here.\n",
+            "fn f() { unsafe { g(); } }\n",
+            "/// # Safety\n",
+            "/// The caller must uphold X.\n",
+            "pub unsafe fn h() {}\n",
+        );
+        let bare = concat!("fn f() { unsafe { g(); } }\n", "pub unsafe fn h() {}\n");
+
+        let with = TempRepo::new("documented");
+        with.file("crates/oam_x/src/lib.rs", documented);
+        let without = TempRepo::new("bare");
+        without.file("crates/oam_x/src/lib.rs", bare);
+
+        let a = measure_budget(with.path()).unwrap();
+        let b = measure_budget(without.path()).unwrap();
+        assert_eq!(a, b, "SAFETY comments are invisible to the ceiling");
+        assert_eq!(a["oam_x"].unsafe_count, 2, "one block + one unsafe fn");
+
+        // ...and the stripped tree still passes against the same baseline.
+        assert!(
+            compute_violations(&b, &budget(&[("oam_x", 2)])).is_empty(),
+            "removing every SAFETY comment must not trip the gate"
         );
     }
 }

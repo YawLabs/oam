@@ -19,8 +19,6 @@
 //! oam EXECUTABLE (.def on Windows, --export-dynamic on Linux; macOS
 //! exes export by default), which is how addons resolve the ABI at load.
 
-#![allow(clippy::missing_safety_doc)]
-
 use std::ffi::{c_char, c_void};
 
 // napi_value == Local<Value> (pointer-sized, non-null). Compile-time proof.
@@ -146,7 +144,13 @@ impl Drop for NapiEnv {
 type Env = *mut NapiEnv;
 
 /// SAFETY HELPERS — every napi fn funnels through these.
-// SAFETY: the caller must pass the `env` pointer this engine handed the addon; it is dereferenced and its stashed PinScope recovered -- sound only while a native entry (trampoline / load_addon) is on the stack, which is the only time napi fns run.
+///
+/// # Safety
+///
+/// The caller must pass the `env` pointer this engine handed the addon; it is
+/// dereferenced and its stashed PinScope recovered -- sound only while a
+/// native entry (trampoline / load_addon) is on the stack, which is the only
+/// time napi fns run.
 unsafe fn env_scope<'a>(env: Env) -> Option<&'a mut v8::PinScope<'static, 'static>> {
     // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null, then the stashed `scope` field is cast back to `&mut PinScope` -- non-null only while a native entry is on the stack.
     unsafe {
@@ -155,7 +159,11 @@ unsafe fn env_scope<'a>(env: Env) -> Option<&'a mut v8::PinScope<'static, 'stati
     }
 }
 
-// SAFETY: the caller must pass a `napi_value` produced by this engine; it is reinterpreted as a `v8::Local` (ABI-identical, size-asserted). Null yields None.
+/// # Safety
+///
+/// The caller must pass a `napi_value` produced by this engine; it is
+/// reinterpreted as a `v8::Local` (ABI-identical, size-asserted). Null yields
+/// None.
 unsafe fn to_local<'s>(value: NapiValue) -> Option<v8::Local<'s, v8::Value>> {
     if value.is_null() {
         None
@@ -170,7 +178,10 @@ fn from_local(local: v8::Local<'_, v8::Value>) -> NapiValue {
     unsafe { std::mem::transmute::<v8::Local<'_, v8::Value>, NapiValue>(local) }
 }
 
-// SAFETY: the caller must pass a valid writable `*mut T` (or null) for `ptr`; out() null-checks before writing `value`.
+/// # Safety
+///
+/// The caller must pass a valid writable `*mut T` (or null) for `ptr`; out()
+/// null-checks before writing `value`.
 unsafe fn out<T>(ptr: *mut T, value: T) -> NapiStatus {
     if ptr.is_null() {
         return NAPI_INVALID_ARG;
@@ -244,8 +255,15 @@ fn napi_trampoline(
 
 // =========================================================== value creation
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_undefined` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_undefined(env: Env, result: *mut NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -255,8 +273,15 @@ pub unsafe extern "C" fn napi_get_undefined(env: Env, result: *mut NapiValue) ->
     unsafe { out(result, from_local(v8::undefined(scope).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_null` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_null(env: Env, result: *mut NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -266,8 +291,15 @@ pub unsafe extern "C" fn napi_get_null(env: Env, result: *mut NapiValue) -> Napi
     unsafe { out(result, from_local(v8::null(scope).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_global` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_global(env: Env, result: *mut NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -279,8 +311,15 @@ pub unsafe extern "C" fn napi_get_global(env: Env, result: *mut NapiValue) -> Na
     unsafe { out(result, from_local(global.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_boolean` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_boolean(
     env: Env,
     value: bool,
@@ -294,8 +333,15 @@ pub unsafe extern "C" fn napi_get_boolean(
     unsafe { out(result, from_local(v8::Boolean::new(scope, value).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_int32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_int32(
     env: Env,
     value: i32,
@@ -309,8 +355,15 @@ pub unsafe extern "C" fn napi_create_int32(
     unsafe { out(result, from_local(v8::Integer::new(scope, value).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_uint32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_uint32(
     env: Env,
     value: u32,
@@ -329,8 +382,15 @@ pub unsafe extern "C" fn napi_create_uint32(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_int64(
     env: Env,
     value: i64,
@@ -361,8 +421,15 @@ pub unsafe extern "C" fn napi_create_int64(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_double` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_double(
     env: Env,
     value: f64,
@@ -376,8 +443,15 @@ pub unsafe extern "C" fn napi_create_double(
     unsafe { out(result, from_local(v8::Number::new(scope, value).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_string_utf8` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_utf8(
     env: Env,
     string: *const c_char,
@@ -407,8 +481,15 @@ pub unsafe extern "C" fn napi_create_string_utf8(
     unsafe { out(result, from_local(created.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_object` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_object(env: Env, result: *mut NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -418,8 +499,15 @@ pub unsafe extern "C" fn napi_create_object(env: Env, result: *mut NapiValue) ->
     unsafe { out(result, from_local(v8::Object::new(scope).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_array` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_array(env: Env, result: *mut NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -429,8 +517,15 @@ pub unsafe extern "C" fn napi_create_array(env: Env, result: *mut NapiValue) -> 
     unsafe { out(result, from_local(v8::Array::new(scope, 0).into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_array_with_length` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_array_with_length(
     env: Env,
     length: usize,
@@ -452,8 +547,15 @@ pub unsafe extern "C" fn napi_create_array_with_length(
 // =========================================================== value reading
 
 /// napi_valuetype numeric values per js_native_api_types.h.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_typeof` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_typeof(env: Env, value: NapiValue, result: *mut i32) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
@@ -488,8 +590,15 @@ pub unsafe extern "C" fn napi_typeof(env: Env, value: NapiValue, result: *mut i3
     unsafe { out(result, kind) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_bool` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bool(
     env: Env,
     value: NapiValue,
@@ -510,8 +619,15 @@ pub unsafe extern "C" fn napi_get_value_bool(
     unsafe { out(result, local.is_true()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_int32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_int32(
     env: Env,
     value: NapiValue,
@@ -532,8 +648,15 @@ pub unsafe extern "C" fn napi_get_value_int32(
     unsafe { out(result, local.int32_value(scope).unwrap_or(0)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_uint32` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_uint32(
     env: Env,
     value: NapiValue,
@@ -554,8 +677,15 @@ pub unsafe extern "C" fn napi_get_value_uint32(
     unsafe { out(result, local.uint32_value(scope).unwrap_or(0)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_int64(
     env: Env,
     value: NapiValue,
@@ -576,8 +706,15 @@ pub unsafe extern "C" fn napi_get_value_int64(
     unsafe { out(result, local.number_value(scope).unwrap_or(0.0) as i64) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_double` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_double(
     env: Env,
     value: NapiValue,
@@ -599,8 +736,15 @@ pub unsafe extern "C" fn napi_get_value_double(
 }
 
 /// Two-phase: null buf -> *result = utf8 byte length; else copy + NUL.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_string_utf8` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_utf8(
     env: Env,
     value: NapiValue,
@@ -640,8 +784,15 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_array` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_array(
     env: Env,
     value: NapiValue,
@@ -659,8 +810,15 @@ pub unsafe extern "C" fn napi_is_array(
     unsafe { out(result, local.is_array()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_array_length` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_array_length(
     env: Env,
     value: NapiValue,
@@ -681,8 +839,15 @@ pub unsafe extern "C" fn napi_get_array_length(
     unsafe { out(result, array.length()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_strict_equals` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_strict_equals(
     env: Env,
     lhs: NapiValue,
@@ -701,8 +866,15 @@ pub unsafe extern "C" fn napi_strict_equals(
     unsafe { out(result, a.strict_equals(b)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_coerce_to_string` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_string(
     env: Env,
     value: NapiValue,
@@ -725,15 +897,25 @@ pub unsafe extern "C" fn napi_coerce_to_string(
 
 // ============================================================== properties
 
-// SAFETY: the caller must pass a `napi_value` from this env; it is read as a `v8::Local` and downcast to Object.
+/// # Safety
+///
+/// The caller must pass a `napi_value` from this env; it is read as a
+/// `v8::Local` and downcast to Object.
 unsafe fn as_object<'s>(value: NapiValue) -> Option<v8::Local<'s, v8::Object>> {
     // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let local = unsafe { to_local(value) }?;
     v8::Local::<v8::Object>::try_from(local).ok()
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_set_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_named_property(
     env: Env,
     object: NapiValue,
@@ -761,8 +943,15 @@ pub unsafe extern "C" fn napi_set_named_property(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_named_property(
     env: Env,
     object: NapiValue,
@@ -792,8 +981,15 @@ pub unsafe extern "C" fn napi_get_named_property(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_has_named_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_named_property(
     env: Env,
     object: NapiValue,
@@ -821,8 +1017,15 @@ pub unsafe extern "C" fn napi_has_named_property(
     unsafe { out(result, has) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_set_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_property(
     env: Env,
     object: NapiValue,
@@ -845,8 +1048,15 @@ pub unsafe extern "C" fn napi_set_property(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_property(
     env: Env,
     object: NapiValue,
@@ -872,8 +1082,15 @@ pub unsafe extern "C" fn napi_get_property(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_set_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_set_element(
     env: Env,
     object: NapiValue,
@@ -896,8 +1113,15 @@ pub unsafe extern "C" fn napi_set_element(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_element(
     env: Env,
     object: NapiValue,
@@ -921,8 +1145,15 @@ pub unsafe extern "C" fn napi_get_element(
 
 // =============================================================== functions
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_function(
     env: Env,
     name: *const c_char,
@@ -959,8 +1190,15 @@ pub unsafe extern "C" fn napi_create_function(
     unsafe { out(result, from_local(function.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_cb_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_cb_info(
     env: Env,
     cbinfo: *mut CbInfo,
@@ -1003,8 +1241,15 @@ pub unsafe extern "C" fn napi_get_cb_info(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_call_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_call_function(
     env: Env,
     recv: NapiValue,
@@ -1043,7 +1288,10 @@ pub unsafe extern "C" fn napi_call_function(
 
 // ================================================================== errors
 
-// SAFETY: `code` and `msg` are optional caller C strings, each read only after a null check; `scope` is a live PinScope.
+/// # Safety
+///
+/// `code` and `msg` are optional caller C strings, each read only after a
+/// null check; `scope` is a live PinScope.
 unsafe fn build_error(
     scope: &mut v8::PinScope<'_, '_>,
     code: *const c_char,
@@ -1089,8 +1337,15 @@ fn type_error<'s>(
     unsafe { std::mem::transmute::<v8::Local<v8::Value>, v8::Local<'static, v8::Value>>(error) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_throw` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw(env: Env, error: NapiValue) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
@@ -1106,8 +1361,15 @@ pub unsafe extern "C" fn napi_throw(env: Env, error: NapiValue) -> NapiStatus {
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_throw_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_error(
     env: Env,
     code: *const c_char,
@@ -1128,8 +1390,15 @@ pub unsafe extern "C" fn napi_throw_error(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_throw_type_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_type_error(
     env: Env,
     code: *const c_char,
@@ -1150,8 +1419,15 @@ pub unsafe extern "C" fn napi_throw_type_error(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_exception_pending` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_exception_pending(env: Env, result: *mut bool) -> NapiStatus {
     // SAFETY: `env` is the caller's `*mut NapiEnv`; as_ref/as_mut yields None if the caller passed null.
     let Some(env_ref) = (unsafe { env.as_ref() }) else {
@@ -1161,8 +1437,15 @@ pub unsafe extern "C" fn napi_is_exception_pending(env: Env, result: *mut bool) 
     unsafe { out(result, env_ref.pending.is_some()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_and_clear_last_exception` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_and_clear_last_exception(
     env: Env,
     result: *mut NapiValue,
@@ -1181,8 +1464,15 @@ pub unsafe extern "C" fn napi_get_and_clear_last_exception(
     unsafe { out(result, value) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_version` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_version(env: Env, result: *mut u32) -> NapiStatus {
     if env.is_null() {
         return NAPI_INVALID_ARG;
@@ -1195,8 +1485,15 @@ pub unsafe extern "C" fn napi_get_version(env: Env, result: *mut u32) -> NapiSta
 
 /// `v8::External` wrapping a raw pointer.  The optional finalizer is
 /// accepted but ignored for now (no GC finalizer hook yet).
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_external` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external(
     env: Env,
     data: *mut c_void,
@@ -1213,8 +1510,15 @@ pub unsafe extern "C" fn napi_create_external(
     unsafe { out(result, from_local(ext.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_external` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_external(
     env: Env,
     value: NapiValue,
@@ -1246,8 +1550,15 @@ pub unsafe extern "C" fn napi_get_value_external(
 
 type NapiRefHandle = *mut c_void;
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_reference` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_reference(
     env: Env,
     value: NapiValue,
@@ -1274,8 +1585,15 @@ pub unsafe extern "C" fn napi_create_reference(
     unsafe { out(result, ptr) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_delete_reference` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) -> NapiStatus {
     if env.is_null() || ref_.is_null() {
         return NAPI_INVALID_ARG;
@@ -1287,8 +1605,15 @@ pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) ->
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_reference_value` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_reference_value(
     env: Env,
     ref_: NapiRefHandle,
@@ -1308,8 +1633,15 @@ pub unsafe extern "C" fn napi_get_reference_value(
     unsafe { out(result, from_local(local)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_reference_ref` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reference_ref(
     env: Env,
     ref_: NapiRefHandle,
@@ -1328,8 +1660,15 @@ pub unsafe extern "C" fn napi_reference_ref(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_reference_unref` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reference_unref(
     env: Env,
     ref_: NapiRefHandle,
@@ -1392,8 +1731,15 @@ fn napi_attrs_to_v8(attrs: u32) -> v8::PropertyAttribute {
 /// - `getter`/`setter` descriptors are accepted but silently skipped (beta
 ///   limitation: V8 accessor setup requires a separate AccessorCallback path
 ///   not yet wired to the napi trampoline).
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_define_class` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_define_class(
     env: Env,
     utf8name: *const c_char,
@@ -1508,8 +1854,15 @@ pub unsafe extern "C" fn napi_define_class(
 ///
 /// Any previous wrap on the same object is replaced. The optional finalizer
 /// is stored but not yet called automatically (pending GC hook support).
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_wrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_wrap(
     env: Env,
     js_object: NapiValue,
@@ -1560,8 +1913,15 @@ pub unsafe extern "C" fn napi_wrap(
 }
 
 /// Retrieve the native pointer stored by `napi_wrap`.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_unwrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_unwrap(
     env: Env,
     js_object: NapiValue,
@@ -1591,8 +1951,15 @@ pub unsafe extern "C" fn napi_unwrap(
 }
 
 /// Remove the wrap stored by `napi_wrap` and retrieve the native pointer.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_remove_wrap` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_remove_wrap(
     env: Env,
     js_object: NapiValue,
@@ -1631,8 +1998,15 @@ pub unsafe extern "C" fn napi_remove_wrap(
 }
 
 /// Call a constructor function with `new` to produce a new instance.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_new_instance` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_new_instance(
     env: Env,
     constructor: NapiValue,
@@ -1663,8 +2037,15 @@ pub unsafe extern "C" fn napi_new_instance(
 }
 
 /// Check `value instanceof constructor`.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_instanceof` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_instanceof(
     env: Env,
     object: NapiValue,
@@ -1695,8 +2076,15 @@ pub unsafe extern "C" fn napi_instanceof(
 
 // =================================================================== bigint
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_bigint_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_bigint_int64(
     env: Env,
     value: i64,
@@ -1715,8 +2103,15 @@ pub unsafe extern "C" fn napi_create_bigint_int64(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_bigint_uint64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_bigint_uint64(
     env: Env,
     value: u64,
@@ -1737,8 +2132,15 @@ pub unsafe extern "C" fn napi_create_bigint_uint64(
 
 /// Returns `(value, lossless)` where `lossless` is false if the BigInt
 /// is too large to represent exactly as i64.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_bigint_int64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bigint_int64(
     env: Env,
     value: NapiValue,
@@ -1768,8 +2170,15 @@ pub unsafe extern "C" fn napi_get_value_bigint_int64(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_bigint_uint64` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_bigint_uint64(
     env: Env,
     value: NapiValue,
@@ -1806,8 +2215,15 @@ pub unsafe extern "C" fn napi_get_value_bigint_uint64(
 ///
 /// The returned pointer is valid as long as the V8 heap owns the backing store
 /// (i.e. while the ArrayBuffer returned in `result` is alive).
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_buffer(
     env: Env,
     size: usize,
@@ -1836,8 +2252,15 @@ pub unsafe extern "C" fn napi_create_buffer(
 }
 
 /// Create a Buffer, copy `size` bytes from `data` into it.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_buffer_copy` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_buffer_copy(
     env: Env,
     size: usize,
@@ -1875,8 +2298,15 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
 /// Note: the finalizer is stored for completeness but is not called until GC
 /// hook support is added. Callers that MUST run cleanup on collection should
 /// use napi_create_buffer_copy instead (which copies into V8-managed memory).
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_external_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external_buffer(
     env: Env,
     size: usize,
@@ -1904,8 +2334,15 @@ pub unsafe extern "C" fn napi_create_external_buffer(
 /// Node's napi_is_buffer is Buffer-specific, but for oam we treat any
 /// byte-array view as a buffer — addons that pass Uint8Array/Buffer both
 /// work correctly, which is the relevant use case.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_buffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_buffer(
     env: Env,
     value: NapiValue,
@@ -1925,8 +2362,15 @@ pub unsafe extern "C" fn napi_is_buffer(
 
 /// Get a pointer to the underlying bytes of a TypedArray or ArrayBuffer.
 /// For a TypedArray, accounts for byte_offset so `*data` points to element 0.
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_buffer_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_buffer_info(
     env: Env,
     value: NapiValue,
@@ -2021,8 +2465,15 @@ pub static mut uv_event_loop: *mut c_void = std::ptr::null_mut();
 
 // ------------------------------------------------------------------ errors
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_last_error_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_last_error_info(
     _env: Env,
     result: *mut *const NapiExtendedErrorInfo,
@@ -2041,8 +2492,15 @@ pub unsafe extern "C" fn napi_get_last_error_info(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_error(
     env: Env,
     _code: NapiValue,
@@ -2065,8 +2523,15 @@ pub unsafe extern "C" fn napi_create_error(
     unsafe { out(result, from_local(error)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_type_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_type_error(
     env: Env,
     _code: NapiValue,
@@ -2089,8 +2554,15 @@ pub unsafe extern "C" fn napi_create_type_error(
     unsafe { out(result, from_local(error)) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_range_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_range_error(
     env: Env,
     _code: NapiValue,
@@ -2122,8 +2594,15 @@ fn range_error<'s>(
     unsafe { std::mem::transmute::<v8::Local<v8::Value>, v8::Local<'static, v8::Value>>(error) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_throw_range_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_throw_range_error(
     env: Env,
     code: *const c_char,
@@ -2144,8 +2623,15 @@ pub unsafe extern "C" fn napi_throw_range_error(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_error(
     env: Env,
     value: NapiValue,
@@ -2181,8 +2667,15 @@ pub unsafe extern "C" fn napi_is_error(
     unsafe { out(result, is_err) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_fatal_error` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_fatal_error(
     location: *const c_char,
     _loc_len: usize,
@@ -2209,8 +2702,15 @@ pub unsafe extern "C" fn napi_fatal_error(
     std::process::abort()
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_fatal_exception` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_fatal_exception(env: Env, _err: NapiValue) -> NapiStatus {
     let _ = env;
     NAPI_GENERIC_FAILURE
@@ -2218,8 +2718,15 @@ pub unsafe extern "C" fn napi_fatal_exception(env: Env, _err: NapiValue) -> Napi
 
 // ------------------------------------------------------------------ strings
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_string_latin1` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_latin1(
     env: Env,
     str_ptr: *const c_char,
@@ -2248,8 +2755,15 @@ pub unsafe extern "C" fn napi_create_string_latin1(
     unsafe { out(result, from_local(s.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_string_utf16` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_string_utf16(
     env: Env,
     str_ptr: *const u16,
@@ -2283,8 +2797,15 @@ pub unsafe extern "C" fn napi_create_string_utf16(
     unsafe { out(result, from_local(s.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_string_latin1` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_latin1(
     env: Env,
     value: NapiValue,
@@ -2327,8 +2848,15 @@ pub unsafe extern "C" fn napi_get_value_string_latin1(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_value_string_utf16` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_value_string_utf16(
     env: Env,
     value: NapiValue,
@@ -2371,8 +2899,15 @@ pub unsafe extern "C" fn napi_get_value_string_utf16(
 
 // ------------------------------------------------------------------ symbols
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_symbol` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_symbol(
     env: Env,
     description: NapiValue,
@@ -2395,8 +2930,15 @@ pub unsafe extern "C" fn napi_create_symbol(
 
 // ------------------------------------------------------------------ handle scopes (stubs)
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_open_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_handle_scope(_env: Env, result: *mut *mut c_void) -> NapiStatus {
     // We don't implement real handle scopes -- the V8 PinScope on the stack
     // serves the same purpose. Return a sentinel so callers don't null-deref.
@@ -2407,14 +2949,28 @@ pub unsafe extern "C" fn napi_open_handle_scope(_env: Env, result: *mut *mut c_v
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_close_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_handle_scope(_env: Env, _scope: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_open_escapable_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_escapable_handle_scope(
     _env: Env,
     result: *mut *mut c_void,
@@ -2426,8 +2982,15 @@ pub unsafe extern "C" fn napi_open_escapable_handle_scope(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_close_escapable_handle_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_escapable_handle_scope(
     _env: Env,
     _scope: *mut c_void,
@@ -2435,8 +2998,15 @@ pub unsafe extern "C" fn napi_close_escapable_handle_scope(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_escape_handle` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_escape_handle(
     _env: Env,
     _scope: *mut c_void,
@@ -2454,8 +3024,15 @@ pub unsafe extern "C" fn napi_escape_handle(
 
 // ------------------------------------------------------------------ callback scope stubs
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_open_callback_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_open_callback_scope(
     _env: Env,
     _resource_object: NapiValue,
@@ -2469,16 +3046,30 @@ pub unsafe extern "C" fn napi_open_callback_scope(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_close_callback_scope` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_close_callback_scope(_env: Env, _scope: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
 
 // ------------------------------------------------------------------ properties
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_has_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_property(
     env: Env,
     object: NapiValue,
@@ -2502,8 +3093,15 @@ pub unsafe extern "C" fn napi_has_property(
     unsafe { out(result, has) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_delete_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_property(
     env: Env,
     object: NapiValue,
@@ -2530,8 +3128,15 @@ pub unsafe extern "C" fn napi_delete_property(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_has_own_property` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_own_property(
     env: Env,
     object: NapiValue,
@@ -2558,8 +3163,15 @@ pub unsafe extern "C" fn napi_has_own_property(
     unsafe { out(result, has) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_has_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_has_element(
     env: Env,
     object: NapiValue,
@@ -2579,8 +3191,15 @@ pub unsafe extern "C" fn napi_has_element(
     unsafe { out(result, has) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_delete_element` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_element(
     env: Env,
     object: NapiValue,
@@ -2603,8 +3222,15 @@ pub unsafe extern "C" fn napi_delete_element(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_define_properties` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_define_properties(
     env: Env,
     object: NapiValue,
@@ -2672,8 +3298,15 @@ pub unsafe extern "C" fn napi_define_properties(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_property_names` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_property_names(
     env: Env,
     object: NapiValue,
@@ -2694,8 +3327,15 @@ pub unsafe extern "C" fn napi_get_property_names(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_prototype` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_prototype(
     env: Env,
     object: NapiValue,
@@ -2720,8 +3360,15 @@ pub unsafe extern "C" fn napi_get_prototype(
 
 // ------------------------------------------------------------------ callbacks
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_new_target` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_new_target(
     _env: Env,
     cbinfo: *mut CbInfo,
@@ -2740,8 +3387,15 @@ pub unsafe extern "C" fn napi_get_new_target(
 
 // ------------------------------------------------------------------ coercions
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_coerce_to_bool` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_bool(
     env: Env,
     value: NapiValue,
@@ -2760,8 +3414,15 @@ pub unsafe extern "C" fn napi_coerce_to_bool(
     unsafe { out(result, from_local(b.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_coerce_to_number` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_number(
     env: Env,
     value: NapiValue,
@@ -2782,8 +3443,15 @@ pub unsafe extern "C" fn napi_coerce_to_number(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_coerce_to_object` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_coerce_to_object(
     env: Env,
     value: NapiValue,
@@ -2806,8 +3474,15 @@ pub unsafe extern "C" fn napi_coerce_to_object(
 
 // ------------------------------------------------------------------ arraybuffers
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_arraybuffer(
     env: Env,
     value: NapiValue,
@@ -2825,8 +3500,15 @@ pub unsafe extern "C" fn napi_is_arraybuffer(
     unsafe { out(result, local.is_array_buffer()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_arraybuffer(
     env: Env,
     size: usize,
@@ -2851,8 +3533,15 @@ pub unsafe extern "C" fn napi_create_arraybuffer(
     unsafe { out(result, from_local(ab.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_external_arraybuffer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_external_arraybuffer(
     env: Env,
     external_data: *mut c_void,
@@ -2873,8 +3562,15 @@ pub unsafe extern "C" fn napi_create_external_arraybuffer(
     unsafe { out(result, from_local(ab.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_arraybuffer_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_arraybuffer_info(
     env: Env,
     ab_value: NapiValue,
@@ -2911,8 +3607,15 @@ pub unsafe extern "C" fn napi_get_arraybuffer_info(
 
 // ------------------------------------------------------------------ typedarrays
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_typedarray` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_typedarray(
     env: Env,
     value: NapiValue,
@@ -2930,8 +3633,15 @@ pub unsafe extern "C" fn napi_is_typedarray(
     unsafe { out(result, local.is_typed_array()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_typedarray` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_typedarray(
     env: Env,
     type_: u32,
@@ -2972,8 +3682,15 @@ pub unsafe extern "C" fn napi_create_typedarray(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_typedarray_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_typedarray_info(
     env: Env,
     ta_value: NapiValue,
@@ -3079,8 +3796,15 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
 
 // ------------------------------------------------------------------ dataview
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_dataview` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_dataview(
     env: Env,
     size: usize,
@@ -3104,8 +3828,15 @@ pub unsafe extern "C" fn napi_create_dataview(
     unsafe { out(result, from_local(dv.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_dataview` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_dataview(
     env: Env,
     value: NapiValue,
@@ -3123,8 +3854,15 @@ pub unsafe extern "C" fn napi_is_dataview(
     unsafe { out(result, local.is_data_view()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_dataview_info` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_dataview_info(
     env: Env,
     dv_value: NapiValue,
@@ -3179,8 +3917,15 @@ struct DeferredEntry {
     resolver: v8::Global<v8::PromiseResolver>,
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_promise` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_promise(
     env: Env,
     deferred: *mut *mut c_void,
@@ -3207,8 +3952,15 @@ pub unsafe extern "C" fn napi_create_promise(
     unsafe { out(result, from_local(promise.into())) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_resolve_deferred` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_resolve_deferred(
     env: Env,
     deferred: *mut c_void,
@@ -3237,8 +3989,15 @@ pub unsafe extern "C" fn napi_resolve_deferred(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_reject_deferred` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_reject_deferred(
     env: Env,
     deferred: *mut c_void,
@@ -3265,8 +4024,15 @@ pub unsafe extern "C" fn napi_reject_deferred(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_promise` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_promise(
     env: Env,
     value: NapiValue,
@@ -3286,8 +4052,15 @@ pub unsafe extern "C" fn napi_is_promise(
 
 // ------------------------------------------------------------------ script
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_run_script` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_run_script(
     env: Env,
     script: NapiValue,
@@ -3323,8 +4096,15 @@ pub unsafe extern "C" fn napi_run_script(
 
 // ------------------------------------------------------------------ memory
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_adjust_external_memory` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_adjust_external_memory(
     _env: Env,
     _change: i64,
@@ -3339,8 +4119,15 @@ pub unsafe extern "C" fn napi_adjust_external_memory(
 
 // ------------------------------------------------------------------ dates
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_date` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_date(
     env: Env,
     time: f64,
@@ -3357,8 +4144,15 @@ pub unsafe extern "C" fn napi_create_date(
     }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_is_date` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_is_date(env: Env, value: NapiValue, result: *mut bool) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(_scope) = (unsafe { env_scope(env) }) else {
@@ -3372,8 +4166,15 @@ pub unsafe extern "C" fn napi_is_date(env: Env, value: NapiValue, result: *mut b
     unsafe { out(result, local.is_date()) }
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_date_value` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_date_value(
     env: Env,
     value: NapiValue,
@@ -3396,8 +4197,15 @@ pub unsafe extern "C" fn napi_get_date_value(
 
 // ------------------------------------------------------------------ version / event loop
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_node_version` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_node_version(
     _env: Env,
     version: *mut *const NapiNodeVersion,
@@ -3409,8 +4217,15 @@ pub unsafe extern "C" fn napi_get_node_version(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_uv_event_loop` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_uv_event_loop(_env: Env, loop_: *mut *mut c_void) -> NapiStatus {
     if !loop_.is_null() {
         // SAFETY: `loop_` is a caller-provided out-parameter pointer, null-checked before this write.
@@ -3421,8 +4236,15 @@ pub unsafe extern "C" fn napi_get_uv_event_loop(_env: Env, loop_: *mut *mut c_vo
 
 // ------------------------------------------------------------------ module registration
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_module_register` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_module_register(_mod: *mut c_void) -> NapiStatus {
     // Old-style napi_module registration -- not used by napi-sys 2.x.
     NAPI_OK
@@ -3430,8 +4252,15 @@ pub unsafe extern "C" fn napi_module_register(_mod: *mut c_void) -> NapiStatus {
 
 // ------------------------------------------------------------------ cleanup hooks
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_add_env_cleanup_hook` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_add_env_cleanup_hook(
     _env: Env,
     _fun: *mut c_void,
@@ -3440,8 +4269,15 @@ pub unsafe extern "C" fn napi_add_env_cleanup_hook(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_remove_env_cleanup_hook` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_remove_env_cleanup_hook(
     _env: Env,
     _fun: *mut c_void,
@@ -3450,8 +4286,15 @@ pub unsafe extern "C" fn napi_remove_env_cleanup_hook(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_add_finalizer` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_add_finalizer(
     _env: Env,
     _js_object: NapiValue,
@@ -3465,8 +4308,15 @@ pub unsafe extern "C" fn napi_add_finalizer(
 
 // ------------------------------------------------------------------ async (stubs -- not supported)
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_async_init` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_async_init(
     _env: Env,
     _resource: NapiValue,
@@ -3476,14 +4326,28 @@ pub unsafe extern "C" fn napi_async_init(
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_async_destroy` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_async_destroy(_env: Env, _context: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_make_callback` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_make_callback(
     _env: Env,
     _context: *mut c_void,
@@ -3496,8 +4360,15 @@ pub unsafe extern "C" fn napi_make_callback(
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_async_work(
     _env: Env,
     _resource: NapiValue,
@@ -3510,20 +4381,41 @@ pub unsafe extern "C" fn napi_create_async_work(
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_delete_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_delete_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_queue_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_queue_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_cancel_async_work` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_cancel_async_work(_env: Env, _work: *mut c_void) -> NapiStatus {
     NAPI_GENERIC_FAILURE
 }
@@ -3541,8 +4433,15 @@ struct TsfnStub {
     context: *mut c_void,
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_create_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_create_threadsafe_function(
     _env: Env,
     _func: NapiValue,
@@ -3565,8 +4464,15 @@ pub unsafe extern "C" fn napi_create_threadsafe_function(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_get_threadsafe_function_context` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_get_threadsafe_function_context(
     func: *mut c_void,
     result: *mut *mut c_void,
@@ -3581,8 +4487,15 @@ pub unsafe extern "C" fn napi_get_threadsafe_function_context(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_call_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_call_threadsafe_function(
     _func: *mut c_void,
     _data: *mut c_void,
@@ -3592,14 +4505,28 @@ pub unsafe extern "C" fn napi_call_threadsafe_function(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_acquire_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_acquire_threadsafe_function(_func: *mut c_void) -> NapiStatus {
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_release_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_release_threadsafe_function(
     _func: *mut c_void,
     _mode: u32,
@@ -3609,8 +4536,15 @@ pub unsafe extern "C" fn napi_release_threadsafe_function(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_unref_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_unref_threadsafe_function(
     _env: Env,
     _func: *mut c_void,
@@ -3618,8 +4552,15 @@ pub unsafe extern "C" fn napi_unref_threadsafe_function(
     NAPI_OK
 }
 
+/// # Safety
+///
+/// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
+/// the live `napi_env` this engine handed the addon, with a native entry
+/// (trampoline or `load_addon`) on the stack; every `napi_value` argument
+/// must be a handle valid in that scope; every out-pointer must be null or
+/// valid for writes of its pointee type. Each dereference below is guarded
+/// individually.
 #[unsafe(no_mangle)]
-// SAFETY: `napi_ref_threadsafe_function` is a C-ABI N-API entry point called by loaded `.node` addons; the raw `env` / value handles / out-pointer arguments must uphold the N-API contract (module header). Each dereference below is guarded individually.
 pub unsafe extern "C" fn napi_ref_threadsafe_function(_env: Env, _func: *mut c_void) -> NapiStatus {
     NAPI_OK
 }

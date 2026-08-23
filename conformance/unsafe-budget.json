@@ -1,5 +1,5 @@
 {
-  "_comment": "Real `unsafe` constructs per crate (unsafe_count, a CEILING that may only go DOWN) and `// SAFETY:` justification comments (documented_count, a FLOOR that may only go UP), measured by `cargo run -p xtask -- unsafe-budget`. This is the AI-POLICY.md gate-5 ratchet; it GATES: a crate above its unsafe ceiling, or below its documented floor, fails the run -- and so does any count strictly BETTER than recorded (regenerate with --regen so the ratchet tightens). documented_count is tracked only for oam_engine (with per-file floors on the FFI-boundary files) and oam_napi_test_addon; oam_core/oam_cli/oam_ts get coverage from clippy undocumented_unsafe_blocks on a sibling branch, so only their unsafe_count ceiling lives here. Do not edit by hand.",
+  "_comment": "Real `unsafe` constructs per crate (unsafe_count), a CEILING that may only go DOWN, measured by `cargo run -p xtask -- unsafe-budget`. This is the AI-POLICY.md gate-5 ratchet; it GATES: a crate ABOVE its ceiling fails the run -- and so does a count strictly BELOW it (regenerate with --regen so the ratchet tightens). Per-SITE `// SAFETY:` coverage is NOT counted here: it is enforced on EVERY crate by clippy undocumented_unsafe_blocks = deny, unnecessary_safety_comment = deny and missing_safety_doc = deny. The old documented_count FLOOR was retired because it and unnecessary_safety_comment were in direct conflict -- the floor counted ~155 comments that the lint forbids. Scanned per workspace member: every .rs file under src/ and tests/, plus a top-level build.rs. Do not edit by hand.",
   "crates": {
     "oam_cli": {
       "unsafe_count": 3
@@ -11,16 +11,6 @@
       "unsafe_count": 0
     },
     "oam_engine": {
-      "documented_count": 575,
-      "files": {
-        "crash.rs": 5,
-        "inspector.rs": 2,
-        "lib.rs": 5,
-        "modules.rs": 6,
-        "napi.rs": 506,
-        "node_ops.rs": 50,
-        "vm_module.rs": 1
-      },
       "unsafe_count": 573
     },
     "oam_loader": {
@@ -30,11 +20,13 @@
       "unsafe_count": 0
     },
     "oam_napi_test_addon": {
-      "documented_count": 0,
       "unsafe_count": 36
     },
     "oam_ts": {
       "unsafe_count": 2
+    },
+    "xtask": {
+      "unsafe_count": 0
     }
   }
 }

@@ -90,9 +90,11 @@ pub(crate) struct UncaughtLedger {
 }
 
 /// V8 message listener. Zero capture, raw C ABI.
-// SAFETY: only V8 invokes this, as the isolate message listener, with the exact
-// C ABI signature; `message`/`exception` are V8 Locals valid for the call and
-// touched only under the callback scope opened below.
+///
+/// # Safety
+/// Only V8 invokes this, as the isolate message listener, with the exact
+/// C ABI signature; `message`/`exception` are V8 Locals valid for the call and
+/// touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn message_listener(
     message: v8::Local<v8::Message>,
     exception: v8::Local<v8::Value>,
@@ -2358,9 +2360,11 @@ fn path_to_file_url(path: &Path) -> String {
 /// Builtin facades get url = "node:<name>" with no filename/dirname; CJS
 /// facades get their real file path — createRequire(import.meta.url) works
 /// everywhere user code can spell it. Zero capture, raw C ABI.
-// SAFETY: only V8 invokes this, as the import.meta initializer callback, with
-// the exact C ABI signature; `context`/`module`/`meta` are V8 Locals valid for
-// the call and touched only under the callback scope opened below.
+///
+/// # Safety
+/// Only V8 invokes this, as the import.meta initializer callback, with
+/// the exact C ABI signature; `context`/`module`/`meta` are V8 Locals valid for
+/// the call and touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn import_meta_callback(
     context: v8::Local<v8::Context>,
     module: v8::Local<v8::Module>,
@@ -2417,9 +2421,11 @@ pub(crate) unsafe extern "C" fn import_meta_callback(
 
 /// V8 promise-reject callback: maintains the RejectionLedger. Zero capture,
 /// raw C ABI (set_promise_reject_callback takes the fn type directly).
-// SAFETY: only V8 invokes this, as the promise-reject callback, with the exact
-// C ABI signature; `message` is a V8-provided struct valid for the call and
-// touched only under the callback scope opened below.
+///
+/// # Safety
+/// Only V8 invokes this, as the promise-reject callback, with the exact
+/// C ABI signature; `message` is a V8-provided struct valid for the call and
+/// touched only under the callback scope opened below.
 pub(crate) unsafe extern "C" fn promise_reject_callback(message: v8::PromiseRejectMessage) {
     v8::callback_scope!(unsafe scope, &message);
     let promise = message.get_promise();

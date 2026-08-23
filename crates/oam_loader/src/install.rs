@@ -565,7 +565,7 @@ fn extract_into(data: &[u8], dest: &Path) -> Result<(), String> {
         let target = dest.join(&rel);
         let target_clean = path_clean(&target);
 
-        // Safety: reject paths that escape the destination. The previous
+        // Security: reject paths that escape the destination. The previous
         // `target.starts_with(dest)` check was purely lexical and missed
         // `..` segments inside a relative entry -- e.g. an entry
         // `package/../../escape.txt` produced `dest/../../escape.txt`, which
