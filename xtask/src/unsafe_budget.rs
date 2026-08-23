@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 use crate::conformance::repo_root;
 
 /// One crate's slice of the budget. Ceiling-only by design: per-site
-/// per-site `// SAFETY` coverage is clippy's job now, not a count's (see module doc).
+/// `// SAFETY` coverage is clippy's job now, not a count's (see module doc).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CrateBudget {
     /// Ceiling: real unsafe constructs. May only go DOWN.
@@ -150,7 +150,7 @@ fn print_summary(b: &Budget) {
     for (name, c) in b {
         println!("  {name}: {} unsafe", c.unsafe_count);
     }
-    println!("  (per-site `// SAFETY:` coverage is enforced by clippy, not counted here.)");
+    println!("  (per-site safety justification is enforced by clippy, not counted here.)");
 }
 
 // ------------------------------------------------------------- gating (pure)
@@ -161,8 +161,11 @@ fn print_summary(b: &Budget) {
 fn ceiling_check(label: &str, measured: usize, recorded: usize) -> Option<String> {
     if measured > recorded {
         Some(format!(
-            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each with a \
-             `// SAFETY:` and (with review) raise the ceiling."
+            "{label}: {measured} > ceiling {recorded} -- new unsafe added. Justify each at its \
+             SITE -- a `// SAFETY:` comment on an unsafe block or `unsafe impl`, a \
+             `/// # Safety` section on a public unsafe fn, and NEITHER on an `unsafe extern` \
+             foreign module (clippy rejects a safety comment on those last two) -- then, with \
+             review, raise the ceiling."
         ))
     } else if measured < recorded {
         Some(format!(
@@ -271,7 +274,19 @@ fn measure_budget(repo: &Path) -> Result<Budget> {
                 .with_context(|| format!("reading {}", file.display()))?;
             unsafe_count += scan_source(&text);
         }
-        budget.insert(name, CrateBudget { unsafe_count });
+        // Keyed by DIRECTORY NAME, so two members sharing a final path segment
+        // (a `crates/xtask` alongside the real `xtask`) would collide and the
+        // second insert would drop the first's unsafe from the ceiling. Hiding
+        // unsafe is the one thing this gate exists to prevent: collide loudly.
+        if let Some(prev) = budget.insert(name.clone(), CrateBudget { unsafe_count }) {
+            bail!(
+                "two workspace members map to the crate key `{name}` (one counted {} \
+                 unsafe, the other {unsafe_count}). The budget is keyed by directory \
+                 name, so one silently overwrites the other and drops its unsafe from \
+                 the ceiling. Rename one.",
+                prev.unsafe_count
+            );
+        }
     }
     Ok(budget)
 }
@@ -1165,6 +1180,28 @@ mod tests {
             ["oam_x", "xtask"],
             "xtask is not under crates/, so it must appear exactly once"
         );
+    }
+
+    #[test]
+    fn two_members_with_the_same_directory_name_fail_loudly() {
+        // The budget is keyed by directory name. A `crates/xtask` alongside the
+        // real `xtask` would map to one key, and the loser's unsafe would vanish
+        // from the ceiling -- silently hiding unsafe, which is the single thing
+        // this gate exists to prevent. It must ERROR, not overwrite.
+        let t = TempRepo::new("dupkey");
+        t.file(
+            "crates/xtask/src/lib.rs",
+            "pub fn f() { unsafe { g(); } }
+",
+        );
+        t.file(
+            "xtask/src/main.rs",
+            "fn main() { unsafe { g(); } }
+",
+        );
+        let err = measure_budget(t.path()).unwrap_err().to_string();
+        assert!(err.contains("`xtask`"), "{err}");
+        assert!(err.contains("two workspace members"), "{err}");
     }
 
     #[test]
