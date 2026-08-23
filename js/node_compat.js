@@ -4322,15 +4322,18 @@
         uid: -1,
         gid: -1,
       }),
+      // node freezes every member of signals / errno / priority. constantBag
+      // reached only errno when it landed, so `os.constants.signals.SIGINT = 999`
+      // stuck where node makes it inert.
       constants: {
-        signals: {
+        signals: constantBag({
           SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5,
           SIGABRT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10,
           SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
           SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21,
           SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24, SIGXFSZ: 25, SIGVTALRM: 26,
           SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGINFO: 29, SIGSYS: 31,
-        },
+        }),
         // The host's POSIX errno, positive (node's shape). Only the `.errno`
         // group: the parse also carries libuv-only names, and node publishes
         // none of them here (conformance case 87 diffs this exact key set
@@ -4339,10 +4342,10 @@
         // the same parse -- and each member non-writable and non-configurable,
         // which is node's descriptor for these.
         errno: constantBag(posixErrno(natives).errno),
-        priority: {
+        priority: constantBag({
           PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
           PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20,
-        },
+        }),
       },
     };
   };
@@ -10910,6 +10913,7 @@
       configurable: true,
     });
     let execPathOverride;
+    let execPathAssigned = false;
     Object.defineProperty(process, "execPath", {
       // The RESOLVED binary path, not argv[0]: invoked through a symlink,
       // Node reports the symlink's target here and keeps the invoked name
@@ -10918,9 +10922,15 @@
       //
       // Writable like node's, for the same reason as argv above: spawn shims
       // that re-point execPath at a wrapper assign it.
-      get: () => (execPathOverride !== undefined ? execPathOverride : natives.execPath || argv()[0]),
+      // A separate flag, not `!== undefined`: node lets you assign undefined
+      // and read undefined back, and conflating the two resurrected the real
+      // path for `process.execPath = process.env.X` with X unset -- hiding
+      // the caller's bug instead of surfacing it.
+      get: () =>
+        execPathAssigned ? execPathOverride : natives.execPath || argv()[0],
       set: (value) => {
         execPathOverride = value;
+        execPathAssigned = true;
       },
       enumerable: true,
       configurable: true,
@@ -19909,10 +19919,17 @@
       // injection. Leaves `node --flag script` (leading flag) and already-
       // `run`-shaped invocations untouched.
       if (!opts.shell && argv.length > 0) {
-        const execPath = globalThis.process.execPath;
+        // The runtime's OWN binary, from the native -- NOT process.execPath.
+        // That property is writable (node's is too), so a shim doing
+        // `process.execPath = <real node>` before spawning it made this treat
+        // a NON-oam child as a self-spawn and inject the `run <script>
+        // --no-check --` rewrite into it, breaking the child. String() also
+        // keeps a non-string assignment from throwing on .replace below.
+        const execPath = String(natives.execPath || (natives.argv() || [])[0] || "");
         const sameBin =
-          cmd === execPath ||
-          cmd.replace(/\\/g, "/").split("/").pop() === execPath.replace(/\\/g, "/").split("/").pop();
+          execPath !== "" &&
+          (cmd === execPath ||
+          cmd.replace(/\\/g, "/").split("/").pop() === execPath.replace(/\\/g, "/").split("/").pop());
         const first = argv[0];
         if (sameBin && !first.startsWith("-") && !OAM_SUBCOMMANDS.has(first)) {
           argv = ["run", first, "--no-check", "--", ...argv.slice(1)];

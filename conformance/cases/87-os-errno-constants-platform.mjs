@@ -14,6 +14,9 @@ import os from "node:os";
 const errno = os.constants.errno;
 const keys = Object.keys(errno).sort();
 console.log("count", keys.length);
+// RAW Object.keys order -- node emits the WSA* block ascending by value, not
+// alphabetically, and a sorted-only list can never catch an ordering drift.
+console.log("key-order", JSON.stringify(Object.keys(errno)));
 console.log("keys", JSON.stringify(keys));
 for (const key of keys) {
   console.log(`${key}=${errno[key]}`);
