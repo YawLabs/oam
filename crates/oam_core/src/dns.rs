@@ -140,6 +140,30 @@ pub async fn dns_lookup(hostname: String, family: i32, all: bool) -> OpOutcome {
 /// dns.resolve(hostname, rrtype) -- query specific DNS record types.
 pub async fn dns_resolve(hostname: String, rrtype: String) -> OpOutcome {
     let r = resolver();
+    // Query names with enough dots ABSOLUTELY, so a NODATA answer is final.
+    //
+    // c-ares (and therefore node) treats a name carrying at least `ndots`
+    // dots -- 1 by default -- as already qualified: it asks once and reports
+    // that answer, NODATA included. hickory instead walks the search list on
+    // any "no records" outcome (its own docs, resolver.rs: "Anything else will
+    // always incur the cost of querying the ResolverConfig::domain and
+    // ResolverConfig::search"), so the LAST attempt decides the error.
+    //
+    // That is invisible on a host with no search domains and wrong on one with
+    // them: on a Mac with `search tailddd0f3.ts.net lan`, resolveTxt of a name
+    // that exists but has no TXT returned NOERROR/no-answers, hickory then
+    // tried `<name>.tailddd0f3.ts.net` and `<name>.lan`, and the NXDOMAIN from
+    // those bogus names surfaced as ENOTFOUND where node reports ENODATA.
+    // Appending the root dot makes hickory issue exactly one query.
+    //
+    // A name with FEWER than ndots dots (a bare `myhost`) is left alone, so the
+    // search list still does its job for the case it exists for.
+    let ndots = r.options().ndots;
+    let hostname = if hostname.ends_with('.') || hostname.matches('.').count() < ndots {
+        hostname
+    } else {
+        format!("{hostname}.")
+    };
     match rrtype.as_str() {
         "A" => match r.lookup(&hostname, RecordType::A).await {
             Ok(lookup) => {
