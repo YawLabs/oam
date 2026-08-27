@@ -1550,6 +1550,39 @@ pub unsafe extern "C" fn napi_get_value_external(
 
 type NapiRefHandle = *mut c_void;
 
+/// Resolve a caller-supplied `napi_ref` to its entry, but only while the
+/// handle is still registered in `env.refs`.
+///
+/// `napi_delete_reference` DROPS the entry's `Box`, so a bare deref of a
+/// handle the addon already deleted is a use-after-free. The identity scan
+/// below is what makes the deref sound: it is the same `ptr::eq` comparison
+/// `napi_delete_reference` uses to find the entry it removes, so a handle
+/// that scan cannot find is exactly a handle that was freed (or was never
+/// ours). Every deref of a `NapiRefHandle` must go through here.
+///
+/// # Safety
+///
+/// `env` must be the live `napi_env` this engine handed the addon; `ref_` is
+/// checked, so it may be null or stale.
+unsafe fn ref_entry<'a>(env: Env, ref_: NapiRefHandle) -> Option<&'a mut NapiRefEntry> {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_ref` guards null, and
+    // the shared reborrow only reads the `refs` vec to validate the handle.
+    let env_ref = unsafe { env.as_ref()? };
+    let target = ref_ as *const NapiRefEntry;
+    if !env_ref
+        .refs
+        .iter()
+        .any(|r| std::ptr::eq(r.as_ref(), target))
+    {
+        return None;
+    }
+    // SAFETY: `target` was just found in `env.refs`, so it names a live
+    // `NapiRefEntry` box that is still owned by this env; the box is heap
+    // stable (pushed before the pointer was dispensed at napi_create_reference),
+    // so the address remains valid until napi_delete_reference removes it.
+    Some(unsafe { &mut *(ref_ as *mut NapiRefEntry) })
+}
+
 /// # Safety
 ///
 /// A C-ABI N-API entry point called by loaded `.node` addons. `env` must be
@@ -1623,11 +1656,10 @@ pub unsafe extern "C" fn napi_get_reference_value(
     let Some(scope) = (unsafe { env_scope(env) }) else {
         return NAPI_INVALID_ARG;
     };
-    if ref_.is_null() {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv` (env_scope proved it non-null); ref_entry rejects a null or already-deleted handle instead of dereferencing it.
+    let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
         return NAPI_INVALID_ARG;
-    }
-    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
-    let entry = unsafe { &*(ref_ as *const NapiRefEntry) };
+    };
     let local = v8::Local::new(scope, &entry.value);
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
     unsafe { out(result, from_local(local)) }
@@ -1647,11 +1679,10 @@ pub unsafe extern "C" fn napi_reference_ref(
     ref_: NapiRefHandle,
     result: *mut u32,
 ) -> NapiStatus {
-    if env.is_null() || ref_.is_null() {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
+    let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
         return NAPI_INVALID_ARG;
-    }
-    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
-    let entry = unsafe { &mut *(ref_ as *mut NapiRefEntry) };
+    };
     entry.refcount = entry.refcount.saturating_add(1);
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
@@ -1674,11 +1705,10 @@ pub unsafe extern "C" fn napi_reference_unref(
     ref_: NapiRefHandle,
     result: *mut u32,
 ) -> NapiStatus {
-    if env.is_null() || ref_.is_null() {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
+    let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
         return NAPI_INVALID_ARG;
-    }
-    // SAFETY: `ref_` is a NapiRef handle this API dispensed, pointing at a heap-stable `NapiRefEntry` box owned by NapiEnv::refs; checked non-null above.
-    let entry = unsafe { &mut *(ref_ as *mut NapiRefEntry) };
+    };
     entry.refcount = entry.refcount.saturating_sub(1);
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.

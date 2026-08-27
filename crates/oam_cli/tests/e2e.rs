@@ -1733,6 +1733,41 @@ fn napi_beta_wrap_counter_roundtrip() {
 }
 
 #[test]
+fn napi_reference_read_after_delete_is_rejected() {
+    // Regression: napi_get_reference_value used to deref the caller's handle
+    // behind a null check alone, so reading a reference the addon had already
+    // deleted returned napi_ok and handed back a freed NapiRefEntry. The host
+    // now validates the handle against its own ref table first.
+    //
+    // refAfterDelete() returns the host's STATUS for that stale read, so this
+    // asserts on the fix rather than on the absence of a crash: the unfixed
+    // host answers 0 (napi_ok).
+    let dir = napi_beta_addon("napi_ref_after_delete");
+    write_temp(
+        "napi_ref_after_delete/ref_after_delete.cjs",
+        "const native = require('./native.node');
+         // 1 === napi_invalid_arg: the host refused the deleted handle.
+         console.log(native.refAfterDelete({ probe: 1 }));
+         // Still healthy afterwards -- the refusal is not a poisoned env.
+         console.log(native.refAfterDelete('another'));",
+    );
+    let main = dir.join("ref_after_delete.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "1",
+        "reading a deleted reference must report napi_invalid_arg, not napi_ok"
+    );
+    assert_eq!(lines[1], "1", "and must keep doing so on a later call");
+}
+
+#[test]
 fn napi_beta_bigint_int64_create_and_read() {
     let dir = napi_beta_addon("napi_beta_bigint");
     write_temp(
