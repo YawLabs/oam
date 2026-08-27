@@ -1962,6 +1962,66 @@ fn napi_create_reference_with_null_out_is_rejected() {
 }
 
 #[test]
+fn napi_delete_reference_refuses_an_unknown_handle() {
+    // napi_delete_reference used to answer napi_ok unconditionally, so a
+    // double-delete looked successful and hid the addon's own lifecycle bug --
+    // and it was the one function in the ref family that did NOT validate,
+    // while read/ref/unref all did.
+    let dir = napi_addon_dir("napi_double_delete");
+    write_temp(
+        "napi_double_delete/double_delete.cjs",
+        "const native = require('./native.node');\n\
+         // 1 === napi_invalid_arg on the SECOND delete of the same handle.\n\
+         console.log(native.deleteRefTwice({}));",
+    );
+    let out = oam(&["run", dir.join("double_delete.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1",
+        "a second delete of the same handle must be refused, not reported as ok"
+    );
+}
+
+#[test]
+fn napi_last_error_info_explains_the_failure() {
+    // napi_get_last_error_info used to return a permanently-zeroed struct, so
+    // an addon that failed a call and followed Node's documented diagnostic
+    // path was told error_code 0 (napi_ok) with a null message -- "nothing went
+    // wrong", precisely when it was debugging something that did.
+    let dir = napi_addon_dir("napi_last_error");
+    write_temp(
+        "napi_last_error/last_error.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.lastErrorMessage({}));",
+    );
+    let out = oam(&["run", dir.join("last_error.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.trim();
+    assert!(
+        line.starts_with("code=1 "),
+        "the reported code must be the failing status, not napi_ok; got {line}"
+    );
+    assert!(
+        line.contains("napi_get_reference_value"),
+        "the message must name the call that failed; got {line}"
+    );
+    assert!(
+        line.contains("not a live reference"),
+        "the message must say WHY it failed; got {line}"
+    );
+}
+
+#[test]
 fn napi_beta_bigint_int64_create_and_read() {
     let dir = napi_addon_dir("napi_beta_bigint");
     write_temp(
