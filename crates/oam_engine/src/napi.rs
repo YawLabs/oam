@@ -1560,6 +1560,17 @@ type NapiRefHandle = *mut c_void;
 /// that scan cannot find is exactly a handle that was freed (or was never
 /// ours). Every deref of a `NapiRefHandle` must go through here.
 ///
+/// KNOWN LIMIT -- handle reuse (ABA). The scan compares ADDRESSES, so it cannot
+/// distinguish a stale handle from a new entry the allocator happened to place
+/// at the same address after `napi_delete_reference` freed the old one. Such a
+/// handle passes this check and resolves to a DIFFERENT reference than the
+/// caller meant: not a use-after-free (the memory is live and correctly typed),
+/// but a silent aliasing bug. Closing it needs handles that carry identity
+/// rather than an address -- an index plus a generation counter, so a reused
+/// slot fails the generation compare. That is a deliberate follow-up, not an
+/// oversight; the address scan is what makes the CURRENT deref sound, and the
+/// remaining hole is strictly smaller than the one it replaced.
+///
 /// # Safety
 ///
 /// `env` must be the live `napi_env` this engine handed the addon; `ref_` is
@@ -1606,6 +1617,13 @@ pub unsafe extern "C" fn napi_create_reference(
     let Some(local) = (unsafe { to_local(value) }) else {
         return NAPI_INVALID_ARG;
     };
+    // Reject a null out-parameter BEFORE creating anything. Pushing first and
+    // failing afterwards left the entry in `env.refs` with no handle ever
+    // dispensed for it -- unreachable, and freed only when the env drops. Node
+    // validates its arguments up front and creates no reference at all.
+    if result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
     let global = v8::Global::new(scope, local);
     // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
     let env_ref = unsafe { &mut *env };
@@ -1614,7 +1632,7 @@ pub unsafe extern "C" fn napi_create_reference(
         refcount: initial_refcount,
     }));
     let ptr = &mut **env_ref.refs.last_mut().unwrap() as *mut NapiRefEntry as *mut c_void;
-    // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
+    // SAFETY: `result` is the caller's out-parameter pointer, null-checked above; out() null-checks it again before writing.
     unsafe { out(result, ptr) }
 }
 

@@ -1793,6 +1793,167 @@ fn napi_reference_read_after_delete_is_rejected() {
 }
 
 #[test]
+fn napi_reference_refcount_roundtrip() {
+    // napi_reference_ref / napi_reference_unref had no coverage at all -- the
+    // addon did not even resolve the two symbols. They are how an addon keeps a
+    // value alive across calls, so a regression means premature collection or a
+    // leak.
+    let dir = napi_addon_dir("napi_refcount");
+    write_temp(
+        "napi_refcount/refcount.cjs",
+        "const native = require('./native.node');\n\
+         // created with refcount 1, ref() -> 2\n\
+         console.log(native.refRefCount({}));\n\
+         // created with refcount 2, unref() -> 1\n\
+         console.log(native.refUnrefCount({}));",
+    );
+    let out = oam(&["run", dir.join("refcount.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "2",
+        "napi_reference_ref must report the incremented count"
+    );
+    assert_eq!(
+        lines[1], "1",
+        "napi_reference_unref must report the decremented count"
+    );
+}
+
+#[test]
+fn napi_reference_ref_and_unref_after_delete_are_rejected() {
+    // Companion to napi_reference_read_after_delete_is_rejected: the same
+    // validating lookup guards all THREE handle derefs, but only the read path
+    // was covered, so reverting either of these two would have gone unnoticed.
+    let dir = napi_addon_dir("napi_ref_unref_deleted");
+    write_temp(
+        "napi_ref_unref_deleted/deleted.cjs",
+        "const native = require('./native.node');\n\
+         // 1 === napi_invalid_arg on a handle already deleted.\n\
+         console.log(native.refRefAfterDelete({}));\n\
+         console.log(native.refUnrefAfterDelete({}));",
+    );
+    let out = oam(&["run", dir.join("deleted.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "1",
+        "napi_reference_ref must refuse a deleted handle"
+    );
+    assert_eq!(
+        lines[1], "1",
+        "napi_reference_unref must refuse a deleted handle"
+    );
+}
+
+#[test]
+fn napi_foreign_reference_handle_is_rejected() {
+    // A non-null pointer this env never dispensed (here, a stack address).
+    // Real addons pass garbage after their own lifecycle bugs; this is the
+    // branch that turns that into a clean error instead of a segfault.
+    let dir = napi_addon_dir("napi_foreign_handle");
+    write_temp(
+        "napi_foreign_handle/foreign.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.foreignHandleStatus());",
+    );
+    let out = oam(&["run", dir.join("foreign.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1",
+        "a pointer this env never dispensed must be refused, not dereferenced"
+    );
+}
+
+#[test]
+fn napi_reference_handle_from_another_env_is_rejected() {
+    // Two .node files in one process -- routine for MCP sidecars -- means two
+    // NapiEnvs, each with its own ref table. A handle valid in env A is LIVE
+    // memory, so only the per-env identity check can catch it being used in
+    // env B. The same-env read is the control: it proves the rejection is about
+    // provenance, not about the handle failing to round-trip through JS.
+    let dir = napi_addon_dir("napi_cross_env");
+    let second = dir.join("second.node");
+    std::fs::copy(dir.join("native.node"), &second).expect("second addon copy");
+    write_temp(
+        "napi_cross_env/cross.cjs",
+        "const a = require('./native.node');\n\
+         const b = require('./second.node');\n\
+         // Distinct addon instances, so distinct envs.\n\
+         console.log(a === b);\n\
+         const handle = a.makeRefHandle({ owned: 'by a' });\n\
+         // 0 === napi_ok: a owns it.\n\
+         console.log(a.readRefHandle(handle));\n\
+         // 1 === napi_invalid_arg: b must not resolve another env's handle.\n\
+         console.log(b.readRefHandle(handle));",
+    );
+    let out = oam(&["run", dir.join("cross.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "false",
+        "the two requires must be distinct instances"
+    );
+    assert_eq!(lines[1], "0", "the owning env must resolve its own handle");
+    assert_eq!(
+        lines[2], "1",
+        "a different env must refuse a handle it never dispensed"
+    );
+}
+
+#[test]
+fn napi_create_reference_with_null_out_is_rejected() {
+    // Pins the STATUS contract only, and deliberately claims no more: a null
+    // out-pointer is napi_invalid_arg.
+    //
+    // The companion fix -- napi_create_reference now null-checks BEFORE
+    // pushing, instead of orphaning an entry no handle could ever reach -- is
+    // NOT covered here, and this test still passes with that check reverted
+    // (verified). The orphan is not observable across the JS boundary: nothing
+    // exposes env.refs. Catching it would need a Rust-side hook into NapiEnv,
+    // which is more instrumentation than the leak justifies. Flagged rather
+    // than papered over.
+    let dir = napi_addon_dir("napi_null_out");
+    write_temp(
+        "napi_null_out/null_out.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.createRefNullOut({}));\n\
+         // Repeated calls must stay rejected rather than accumulating state.\n\
+         console.log(native.createRefNullOut({}));",
+    );
+    let out = oam(&["run", dir.join("null_out.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "1", "a null out-pointer must be napi_invalid_arg");
+    assert_eq!(lines[1], "1", "and must stay so on a second call");
+}
+
+#[test]
 fn napi_beta_bigint_int64_create_and_read() {
     let dir = napi_addon_dir("napi_beta_bigint");
     write_temp(
