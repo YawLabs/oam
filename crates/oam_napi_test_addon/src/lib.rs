@@ -77,12 +77,11 @@ struct Host {
         unsafe extern "C" fn(NapiEnv, usize, *mut *mut c_void, *mut NapiValue) -> NapiStatus,
     get_buffer_info:
         unsafe extern "C" fn(NapiEnv, NapiValue, *mut *mut c_void, *mut usize) -> NapiStatus,
-    #[allow(dead_code)]
     create_reference: unsafe extern "C" fn(NapiEnv, NapiValue, u32, *mut *mut c_void) -> NapiStatus,
-    #[allow(dead_code)]
     get_reference_value: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut NapiValue) -> NapiStatus,
-    #[allow(dead_code)]
     delete_reference: unsafe extern "C" fn(NapiEnv, *mut c_void) -> NapiStatus,
+    reference_ref: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut u32) -> NapiStatus,
+    reference_unref: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut u32) -> NapiStatus,
 }
 
 static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
@@ -147,6 +146,8 @@ unsafe fn resolve_host() -> Option<Host> {
             create_reference: sym!(b"napi_create_reference"),
             get_reference_value: sym!(b"napi_get_reference_value"),
             delete_reference: sym!(b"napi_delete_reference"),
+            reference_ref: sym!(b"napi_reference_ref"),
+            reference_unref: sym!(b"napi_reference_unref"),
         })
     }
 }
@@ -766,6 +767,229 @@ unsafe extern "C" fn ref_after_delete(env: NapiEnv, info: NapiCallbackInfo) -> N
     }
 }
 
+// ------------------------------------------------- reference-lifecycle probes
+//
+// These exist to pin the HOST's napi_ref handling, so each returns a raw status
+// or refcount as a number rather than throwing: the JS side asserts the exact
+// value, which makes a host regression visible instead of merely making the
+// test not crash.
+
+/// Read one argument out of the callback frame.
+///
+/// # Safety
+///
+/// Only called from a `napi_callback` with a live `env` and its `info` frame.
+unsafe fn one_arg(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `argc` is seeded with `argv`'s capacity of 1, bounding what
+    // `napi_get_cb_info` writes into the local array.
+    unsafe {
+        let mut argc = 1usize;
+        let mut argv: [NapiValue; 1] = [std::ptr::null_mut(); 1];
+        (host().get_cb_info)(
+            env,
+            info,
+            &mut argc,
+            argv.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        argv[0]
+    }
+}
+
+/// Wrap an i32 as a napi number, for the probes that report a status or count.
+///
+/// # Safety
+///
+/// Only called from a `napi_callback` with a live `env`.
+unsafe fn num(env: NapiEnv, value: i32) -> NapiValue {
+    // SAFETY: `out` is a live local backing the out-pointer.
+    unsafe {
+        let mut out: NapiValue = std::ptr::null_mut();
+        (host().create_int32)(env, value, &mut out);
+        out
+    }
+}
+
+/// refRefCount(value) -> number: refcount reported by napi_reference_ref.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn ref_ref_count(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` and `count` are live locals backing the out-pointers,
+    // and a failed create returns before the handle is used.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        let mut count = 0u32;
+        let status = (host().reference_ref)(env, handle, &mut count);
+        (host().delete_reference)(env, handle);
+        if status != 0 {
+            return num(env, -2);
+        }
+        num(env, count as i32)
+    }
+}
+
+/// refUnrefCount(value) -> number: refcount reported by napi_reference_unref.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn ref_unref_count(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` and `count` are live locals backing the out-pointers,
+    // and a failed create returns before the handle is used.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 2, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        let mut count = 0u32;
+        let status = (host().reference_unref)(env, handle, &mut count);
+        (host().delete_reference)(env, handle);
+        if status != 0 {
+            return num(env, -2);
+        }
+        num(env, count as i32)
+    }
+}
+
+/// refRefAfterDelete(value) -> number: host status for napi_reference_ref on a
+/// handle the addon already deleted.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn ref_ref_after_delete(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` is a live local; it is deliberately passed to
+    // `reference_ref` AFTER `delete_reference` -- that is the behaviour under
+    // test -- and the addon never dereferences it itself.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        (host().delete_reference)(env, handle);
+        let mut count = 0u32;
+        num(env, (host().reference_ref)(env, handle, &mut count))
+    }
+}
+
+/// refUnrefAfterDelete(value) -> number: host status for napi_reference_unref
+/// on a handle the addon already deleted.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn ref_unref_after_delete(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: as in ref_ref_after_delete -- the stale handle is handed to the
+    // host on purpose and never dereferenced by the addon.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        (host().delete_reference)(env, handle);
+        let mut count = 0u32;
+        num(env, (host().reference_unref)(env, handle, &mut count))
+    }
+}
+
+/// foreignHandleStatus() -> number: host status for napi_get_reference_value on
+/// a non-null pointer this env never dispensed.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn foreign_handle_status(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `bogus` is the address of a live stack local -- a valid readable
+    // address that is nonetheless NOT a napi_ref this env handed out. The host
+    // must reject it on identity and never dereference it as an entry.
+    unsafe {
+        let mut bogus = 0u64;
+        let handle = (&raw mut bogus).cast::<c_void>();
+        let mut out_value: NapiValue = std::ptr::null_mut();
+        num(
+            env,
+            (host().get_reference_value)(env, handle, &mut out_value),
+        )
+    }
+}
+
+/// createRefNullOut(value) -> number: host status when the out-pointer is null.
+/// The host must reject the call without leaving a reference behind.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn create_ref_null_out(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: the null out-pointer IS the input under test; the host is
+    // required to null-check it rather than write through it.
+    unsafe {
+        let value = one_arg(env, info);
+        num(
+            env,
+            (host().create_reference)(env, value, 1, std::ptr::null_mut()),
+        )
+    }
+}
+
+/// makeRefHandle(value) -> BigInt: create a reference and hand its raw handle
+/// back to JS as an exact 64-bit integer, so a test can feed one env's handle
+/// to a DIFFERENT env.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn make_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` and `out` are live locals backing the out-pointers. The
+    // reference is deliberately NOT deleted -- the test reads it afterwards.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        let mut out: NapiValue = std::ptr::null_mut();
+        (host().create_bigint_int64)(env, handle as i64, &mut out);
+        out
+    }
+}
+
+/// readRefHandle(bigint) -> number: host status for napi_get_reference_value on
+/// a handle supplied by JS. The owning env answers napi_ok; another env must
+/// refuse, because the handle is live but belongs to a different ref table.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn read_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `bits` and `lossless` are live locals backing the out-pointers.
+    // The reconstructed pointer goes straight to the host, which validates it
+    // against its own ref table; the addon never dereferences it.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut bits = 0i64;
+        let mut lossless = false;
+        if (host().get_value_bigint_int64)(env, value, &mut bits, &mut lossless) != 0 {
+            return num(env, -1);
+        }
+        let handle = bits as *mut c_void;
+        let mut out_value: NapiValue = std::ptr::null_mut();
+        num(
+            env,
+            (host().get_reference_value)(env, handle, &mut out_value),
+        )
+    }
+}
+
 // ======================================================= module registration
 
 /// # Safety
@@ -811,8 +1035,16 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 8] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 16] = [
             (c"refAfterDelete", ref_after_delete),
+            (c"refRefCount", ref_ref_count),
+            (c"refUnrefCount", ref_unref_count),
+            (c"refRefAfterDelete", ref_ref_after_delete),
+            (c"refUnrefAfterDelete", ref_unref_after_delete),
+            (c"foreignHandleStatus", foreign_handle_status),
+            (c"createRefNullOut", create_ref_null_out),
+            (c"makeRefHandle", make_ref_handle),
+            (c"readRefHandle", read_ref_handle),
             (c"wrapCounter", wrap_counter),
             (c"counterGet", counter_get),
             (c"counterInc", counter_inc),

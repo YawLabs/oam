@@ -889,6 +889,77 @@ mod tests {
         );
     }
 
+    /// Resolve the built test-addon cdylib, failing loudly if it is MISSING or
+    /// STALE.
+    ///
+    /// This used to soft-skip on a missing artifact, which meant the lifecycle
+    /// assertion below silently asserted NOTHING in exactly the case that most
+    /// needs it: a scoped `cargo test -p oam_engine`, which does not build a
+    /// sibling cdylib crate. A stale artifact was not detected at all. Both now
+    /// fail with the command that fixes them.
+    ///
+    /// Mirrors `built_test_addon` in crates/oam_cli/tests/e2e.rs -- the two
+    /// cannot share code (separate crates, and this one is behind cfg(test)),
+    /// so they are kept deliberately identical in behaviour.
+    fn built_test_addon() -> std::path::PathBuf {
+        let addon_file = if cfg!(windows) {
+            "oam_napi_test_addon.dll"
+        } else if cfg!(target_os = "macos") {
+            "liboam_napi_test_addon.dylib"
+        } else {
+            "liboam_napi_test_addon.so"
+        };
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let built = crate_root.join("../../target/debug").join(addon_file);
+        assert!(
+            built.is_file(),
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` first",
+            built.display()
+        );
+        let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
+            // No mtime (exotic filesystem): the presence check above still stands.
+            return built;
+        };
+
+        let addon_root = crate_root.join("../oam_napi_test_addon");
+        let mut sources = vec![addon_root.join("Cargo.toml")];
+        let mut dirs = vec![addon_root.join("src")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+
+        let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+        for source in sources {
+            let Ok(at) = std::fs::metadata(&source).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if newest.as_ref().is_none_or(|(_, best)| at > *best) {
+                newest = Some((source, at));
+            }
+        }
+
+        if let Some((path, source_at)) = newest
+            && source_at > built_at
+        {
+            panic!(
+                "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_engine` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
+                built.display(),
+                path.display()
+            );
+        }
+        built
+    }
+
     /// Verify that NapiEnv (and its owned FnData) is dropped exactly once per
     /// JsRuntime drop when the runtime loaded an N-API addon.
     ///
@@ -897,33 +968,13 @@ mod tests {
     /// runtime drop decrements its slot, and the slot drops all envs.
     ///
     /// NOTE: the test addon DLL must already be built (`cargo build
-    /// -p oam_napi_test_addon`) before running this test.  The CI workflow
-    /// builds all workspace members before running tests, so this is
-    /// satisfied automatically.
+    /// -p oam_napi_test_addon`) before running this test.  A `--workspace` run
+    /// builds every member first, so that satisfies it automatically; a scoped
+    /// `cargo test -p oam_engine` does NOT, which is what `built_test_addon`
+    /// below reports on.
     #[test]
     fn napienv_lifecycle_drops_with_runtime() {
-        // Determine the path to the compiled test addon.
-        let addon_file = if cfg!(windows) {
-            "oam_napi_test_addon.dll"
-        } else if cfg!(target_os = "macos") {
-            "liboam_napi_test_addon.dylib"
-        } else {
-            "liboam_napi_test_addon.so"
-        };
-        let addon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
-            .join(addon_file);
-
-        if !addon_path.is_file() {
-            // Soft-skip rather than hard-fail when the addon hasn't been
-            // compiled yet (e.g. a bare `cargo test -p oam_engine` without
-            // first building the workspace).
-            eprintln!(
-                "SKIP napienv_lifecycle_drops_with_runtime: addon not found at {}",
-                addon_path.display()
-            );
-            return;
-        }
+        let addon_path = built_test_addon();
 
         // Reset the drop counter on this thread (tests may run on the same
         // thread as other napi tests).
