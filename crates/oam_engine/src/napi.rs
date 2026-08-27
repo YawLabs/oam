@@ -4837,13 +4837,23 @@ pub(crate) fn load_addon<'s>(
     // its lifetime is tied to the JsRuntime.  We hold a raw pointer for
     // use during registration (the Box heap address is stable even as the
     // registry's Vec reallocates).
-    let mut env_box = NapiEnv::new();
-    let env: Env = &mut *env_box as *mut NapiEnv;
-    scope
-        .get_slot_mut::<AddonRegistry>()
-        .expect("AddonRegistry slot installed")
-        .envs
-        .push(env_box);
+    // Push FIRST, then derive the pointer from the element in place.
+    //
+    // Deriving from the Box and then MOVING it into the registry invalidates
+    // the pointer: moving a Box is a typed move, so the tag `env` carries is
+    // popped and every later use of it is UB. Confirmed mechanically --
+    // `oam_aliasing_model::held_derive_then_move_box_is_ub` models the old
+    // order and miri rejects it ("trying to retag ... for Unique permission,
+    // but that tag does not exist in the borrow stack"). This is the same
+    // push-then-derive idiom napi_create_function and napi_create_reference
+    // already use.
+    let env: Env = {
+        let registry = scope
+            .get_slot_mut::<AddonRegistry>()
+            .expect("AddonRegistry slot installed");
+        registry.envs.push(NapiEnv::new());
+        &raw mut **registry.envs.last_mut().expect("just pushed")
+    };
 
     let exports = v8::Object::new(scope);
     let exports_value: v8::Local<v8::Value> = exports.into();

@@ -17,6 +17,10 @@
 #                                            fails -- node-compat.yml parity)
 #   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
+#  11. miri aliasing models               (GATING when nightly+miri present,
+#                                            SKIPPED with a notice otherwise --
+#                                            machine-checks the raw-pointer
+#                                            disciplines napi.rs relies on)
 #   9. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
@@ -333,7 +337,7 @@ else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
 fi
 
-say "10/10 Scripts (release-orchestration shell tests)"
+say "10/11 Scripts (release-orchestration shell tests)"
 # GATING, and cheap: ~2s, no compilation. scripts/ ships the binaries but had no
 # gate of its own until now -- which is how gc-target.sh spent its entire life
 # collecting NOTHING on Linux while reporting success (mawk interval expressions,
@@ -345,6 +349,50 @@ if bash scripts/test-scripts.sh; then
   ok "script tests passed"
 else
   ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
+fi
+
+say "11/11 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
+# Every aliasing claim in this repo used to be argued, never machine-checked --
+# and one candidate napi wrapper design reviewed in 2026-08-26 would have ADDED
+# UB while passing every other gate here. oam_aliasing_model closes that.
+#
+# It cannot be pointed at oam_engine directly: miri cannot execute foreign
+# functions (V8), and cargo-miri rejects the argfile cargo uses for a large
+# dependency graph on Windows. So the crate has ZERO dependencies and MODELS the
+# disciplines -- see its lib.rs for what that does and does not prove.
+#
+# Two halves, and both matter:
+#   - the default tests model the CURRENT design and must PASS;
+#   - the `held_*` tests model shapes that were REAL BUGS, are #[ignore]d, and
+#     must still be REJECTED. A harness whose failing cases went quiet reads as
+#     coverage while providing none, so the absence of detection is itself a
+#     failure here.
+#
+# SKIPPED rather than fatal when nightly+miri is absent: it is a large toolchain
+# to require of every checkout, and the rest of the gate is unaffected. The skip
+# is loud on purpose.
+if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+  warn "miri models SKIPPED -- no nightly toolchain (install: rustup toolchain install nightly --component miri)"
+elif ! cargo +nightly miri --version >/dev/null 2>&1; then
+  warn "miri models SKIPPED -- nightly present but miri component missing (rustup component add miri --toolchain nightly)"
+else
+  miri_status=0
+  cargo +nightly miri test -p oam_aliasing_model || miri_status=$?
+  if [ "$miri_status" -ne 0 ]; then
+    ko "miri rejected a model of the CURRENT design -- a pointer discipline napi.rs relies on has regressed"
+  fi
+  ok "miri: current-design models pass"
+
+  # The teeth. Each held_* case must FAIL; a pass means this harness has stopped
+  # detecting the class it exists for.
+  for case in held_two_exclusive_scopes_is_ub \
+              held_deref_deleted_handle_is_use_after_free \
+              held_derive_then_move_box_is_ub; do
+    if cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" >/dev/null 2>&1; then
+      ko "miri ACCEPTED $case -- it models known UB, so the harness has lost its teeth"
+    fi
+  done
+  ok "miri: all 3 known-UB models still rejected"
 fi
 
 echo ""
