@@ -1069,6 +1069,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
         let mut answer: NapiValue = std::ptr::null_mut();
         (host().create_int32)(env, 42, &mut answer);
         (host().set_named_property)(env, exports, c"answer".as_ptr(), answer);
+
         exports
     }
 }
