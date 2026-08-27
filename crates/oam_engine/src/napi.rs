@@ -152,9 +152,9 @@ type Env = *mut NapiEnv;
 /// native entry (trampoline / load_addon) is on the stack, which is the only
 /// time napi fns run.
 unsafe fn env_scope<'a>(env: Env) -> Option<&'a v8::PinScope<'static, 'static>> {
-    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null, then the stashed `scope` field is cast back to a SHARED `&PinScope` -- non-null only while a native entry is on the stack.
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_ref` guards null, then the stashed `scope` field is cast back to a SHARED `&PinScope` -- non-null only while a native entry is on the stack.
     unsafe {
-        let env = env.as_mut()?;
+        let env = env.as_ref()?;
         (env.scope as *const v8::PinScope<'static, 'static>).as_ref()
     }
 }
