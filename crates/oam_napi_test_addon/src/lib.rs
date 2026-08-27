@@ -715,6 +715,57 @@ unsafe extern "C" fn test_ref(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue
     }
 }
 
+/// refAfterDelete(value) -> number
+/// Regression probe for the use-after-free on a deleted reference. Creates a
+/// reference to `value`, deletes it, then asks the host to read the now-stale
+/// handle and returns the host's STATUS code as a number.
+///
+/// A host that dereferences the freed entry answers 0 (napi_ok) and hands back
+/// memory it already released; a host that validates the handle against its
+/// own ref table answers 1 (napi_invalid_arg). The JS side asserts the latter,
+/// so this test fails against the unfixed host rather than merely not crashing.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback` with a live `env`
+/// and its `info` frame.
+unsafe extern "C" fn ref_after_delete(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `argc` is seeded with `argv`'s capacity of 1, bounding what
+    // `napi_get_cb_info` writes. `ref_handle`, `stale` and `out` are live
+    // locals backing the out-pointers, and a failed `napi_create_reference`
+    // returns early rather than using an unwritten handle. `ref_handle` is
+    // deliberately passed to `get_reference_value` AFTER `delete_reference`
+    // -- that is the behaviour under test -- and the host is required to
+    // reject it; the addon never dereferences it itself.
+    unsafe {
+        let mut argc = 1usize;
+        let mut argv: [NapiValue; 1] = [std::ptr::null_mut(); 1];
+        (host().get_cb_info)(
+            env,
+            info,
+            &mut argc,
+            argv.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        let mut out: NapiValue = std::ptr::null_mut();
+        let mut ref_handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, argv[0], 1, &mut ref_handle) != 0 {
+            (host().create_int32)(env, -1, &mut out);
+            return out;
+        }
+        (host().delete_reference)(env, ref_handle);
+
+        // `ref_handle` now names a freed entry. Ask the host to read it.
+        let mut stale: NapiValue = std::ptr::null_mut();
+        let status = (host().get_reference_value)(env, ref_handle, &mut stale);
+
+        (host().create_int32)(env, status, &mut out);
+        out
+    }
+}
+
 // ======================================================= module registration
 
 /// # Safety
@@ -760,7 +811,8 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 7] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 8] = [
+            (c"refAfterDelete", ref_after_delete),
             (c"wrapCounter", wrap_counter),
             (c"counterGet", counter_get),
             (c"counterInc", counter_inc),
