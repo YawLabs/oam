@@ -151,11 +151,11 @@ type Env = *mut NapiEnv;
 /// dereferenced and its stashed PinScope recovered -- sound only while a
 /// native entry (trampoline / load_addon) is on the stack, which is the only
 /// time napi fns run.
-unsafe fn env_scope<'a>(env: Env) -> Option<&'a mut v8::PinScope<'static, 'static>> {
-    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null, then the stashed `scope` field is cast back to `&mut PinScope` -- non-null only while a native entry is on the stack.
+unsafe fn env_scope<'a>(env: Env) -> Option<&'a v8::PinScope<'static, 'static>> {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_ref` guards null, then the stashed `scope` field is cast back to a SHARED `&PinScope` -- non-null only while a native entry is on the stack.
     unsafe {
-        let env = env.as_mut()?;
-        (env.scope as *mut v8::PinScope<'static, 'static>).as_mut()
+        let env = env.as_ref()?;
+        (env.scope as *const v8::PinScope<'static, 'static>).as_ref()
     }
 }
 
@@ -1293,10 +1293,10 @@ pub unsafe extern "C" fn napi_call_function(
 /// `code` and `msg` are optional caller C strings, each read only after a
 /// null check; `scope` is a live PinScope.
 unsafe fn build_error(
-    scope: &mut v8::PinScope<'_, '_>,
+    scope: &v8::PinScope<'_, '_>,
     code: *const c_char,
     msg: *const c_char,
-    kind: fn(&mut v8::PinScope<'_, '_>, v8::Local<v8::String>) -> v8::Local<'static, v8::Value>,
+    kind: fn(&v8::PinScope<'_, '_>, v8::Local<v8::String>) -> v8::Local<'static, v8::Value>,
 ) -> Option<v8::Global<v8::Value>> {
     let message = if msg.is_null() {
         "unknown native error".into()
@@ -1320,7 +1320,7 @@ unsafe fn build_error(
 }
 
 fn plain_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
+    scope: &v8::PinScope<'s, '_>,
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::error(scope, message);
@@ -1329,7 +1329,7 @@ fn plain_error<'s>(
 }
 
 fn type_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
+    scope: &v8::PinScope<'s, '_>,
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::type_error(scope, message);
@@ -2586,7 +2586,7 @@ pub unsafe extern "C" fn napi_create_range_error(
 }
 
 fn range_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
+    scope: &v8::PinScope<'s, '_>,
     message: v8::Local<v8::String>,
 ) -> v8::Local<'static, v8::Value> {
     let error = v8::Exception::range_error(scope, message);
