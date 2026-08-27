@@ -1539,24 +1539,7 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
 fn napi_addon_loads_and_calls_native_functions() {
     // The workspace builds the test addon cdylib alongside everything
     // else; rename it to .node like an npm-shipped prebuilt.
-    let artifact = if cfg!(windows) {
-        "oam_napi_test_addon.dll"
-    } else if cfg!(target_os = "macos") {
-        "liboam_napi_test_addon.dylib"
-    } else {
-        "liboam_napi_test_addon.so"
-    };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
-    if !built.is_file() {
-        panic!(
-            "test addon not built at {} — `cargo build -p oam_napi_test_addon` first",
-            built.display()
-        );
-    }
-    let addon = write_temp("napi/native.node", "placeholder");
-    std::fs::copy(&built, &addon).expect("copy addon into place");
+    napi_addon_dir("napi");
 
     write_temp(
         "napi/main.cjs",
@@ -1612,24 +1595,7 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     //   2^53-1   hi= 2097151 lo=-1  -> Number  (= MAX_SAFE_INTEGER)
     //   -(2^53)  hi=-2097152 lo= 0  -> BigInt  (just below -MAX_SAFE)
     //   -(2^53-1)hi=-2097152 lo= 1  -> Number  (= -MAX_SAFE_INTEGER)
-    let artifact = if cfg!(windows) {
-        "oam_napi_test_addon.dll"
-    } else if cfg!(target_os = "macos") {
-        "liboam_napi_test_addon.dylib"
-    } else {
-        "liboam_napi_test_addon.so"
-    };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
-    if !built.is_file() {
-        panic!(
-            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
-            built.display()
-        );
-    }
-    let addon = write_temp("napi_int64/native.node", "placeholder");
-    std::fs::copy(&built, &addon).expect("copy addon into place");
+    napi_addon_dir("napi_int64");
 
     write_temp(
         "napi_int64/main.cjs",
@@ -1673,7 +1639,16 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
 
 // -------------------------------------------------------------- N-API beta
 
-fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
+/// Resolve the built test-addon cdylib, failing loudly if it is MISSING or
+/// STALE.
+///
+/// The staleness half matters because `cargo test -p oam_cli` does NOT rebuild
+/// a sibling cdylib crate -- only a `--workspace` run does. So an addon edited
+/// since the last build leaves the OLD binary sitting in target/debug, and the
+/// failure that produces is `native.<newExport> is not a function`, which reads
+/// like a host bug rather than a build-order one. Comparing mtimes turns that
+/// into a one-line instruction.
+fn built_test_addon() -> std::path::PathBuf {
     let artifact = if cfg!(windows) {
         "oam_napi_test_addon.dll"
     } else if cfg!(target_os = "macos") {
@@ -1681,18 +1656,68 @@ fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
     } else {
         "liboam_napi_test_addon.so"
     };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
+    let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let built = crate_root.join("../../target/debug").join(artifact);
     if !built.is_file() {
         panic!(
-            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` first",
             built.display()
         );
     }
-    // Each test gets its OWN subdir: napi_beta tests run in parallel, and a
-    // shared native.node path races on Windows (one test's `oam run` holds the
-    // .node open while another overwrites it -> sharing violation).
+    let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
+        // No mtime (exotic filesystem): the presence check above still stands.
+        return built;
+    };
+
+    // Newest of the addon crate's own sources: Cargo.toml plus every .rs under
+    // src/. Walked rather than hardcoded so a second module cannot slip the net.
+    let addon_root = crate_root.join("../oam_napi_test_addon");
+    let mut sources = vec![addon_root.join("Cargo.toml")];
+    let mut dirs = vec![addon_root.join("src")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+
+    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for source in sources {
+        let Ok(at) = std::fs::metadata(&source).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| at > *best) {
+            newest = Some((source, at));
+        }
+    }
+
+    if let Some((path, source_at)) = newest
+        && source_at > built_at
+    {
+        panic!(
+            "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_cli` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
+            built.display(),
+            path.display()
+        );
+    }
+    built
+}
+
+/// Copy the built addon into its own temp subdir as `native.node` and return
+/// that dir.
+///
+/// Each test gets its OWN subdir: the napi tests run in parallel, and a shared
+/// native.node path races on Windows (one test's `oam run` holds the .node open
+/// while another overwrites it -> sharing violation).
+fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
+    let built = built_test_addon();
     let addon = write_temp(&format!("{subdir}/native.node"), "placeholder");
     std::fs::copy(&built, &addon).expect("copy addon into place");
     addon.parent().unwrap().to_path_buf()
@@ -1700,7 +1725,7 @@ fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
 
 #[test]
 fn napi_beta_wrap_counter_roundtrip() {
-    let dir = napi_beta_addon("napi_beta_wrap");
+    let dir = napi_addon_dir("napi_beta_wrap");
     write_temp(
         "napi_beta_wrap/wrap_counter.cjs",
         "const native = require('./native.node');\n\
@@ -1742,7 +1767,7 @@ fn napi_reference_read_after_delete_is_rejected() {
     // refAfterDelete() returns the host's STATUS for that stale read, so this
     // asserts on the fix rather than on the absence of a crash: the unfixed
     // host answers 0 (napi_ok).
-    let dir = napi_beta_addon("napi_ref_after_delete");
+    let dir = napi_addon_dir("napi_ref_after_delete");
     write_temp(
         "napi_ref_after_delete/ref_after_delete.cjs",
         "const native = require('./native.node');
@@ -1769,7 +1794,7 @@ fn napi_reference_read_after_delete_is_rejected() {
 
 #[test]
 fn napi_beta_bigint_int64_create_and_read() {
-    let dir = napi_beta_addon("napi_beta_bigint");
+    let dir = napi_addon_dir("napi_beta_bigint");
     write_temp(
         "napi_beta_bigint/bigint64.cjs",
         "const native = require('./native.node');\n\
@@ -1801,7 +1826,7 @@ fn napi_beta_bigint_int64_create_and_read() {
 
 #[test]
 fn napi_beta_buffer_create_and_len() {
-    let dir = napi_beta_addon("napi_beta_buffer");
+    let dir = napi_addon_dir("napi_beta_buffer");
     write_temp(
         "napi_beta_buffer/buffer.cjs",
         "const native = require('./native.node');\n\
