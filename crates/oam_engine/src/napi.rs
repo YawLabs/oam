@@ -76,6 +76,10 @@ pub struct NapiEnv {
     /// Active napi_wrap entries for this env.
     #[allow(clippy::vec_box)]
     wraps: Vec<Box<NapiWrapEntry>>,
+    /// Backing store for `napi_get_last_error_info`. Node keeps this per-env
+    /// too, which is what makes returning a pointer to it sound: the struct
+    /// lives as long as the env the addon is calling through.
+    last_error: NapiExtendedErrorInfo,
 }
 
 impl NapiEnv {
@@ -86,6 +90,12 @@ impl NapiEnv {
             fn_data: Vec::new(),
             refs: Vec::new(),
             wraps: Vec::new(),
+            last_error: NapiExtendedErrorInfo {
+                error_message: std::ptr::null(),
+                engine_reserved: std::ptr::null_mut(),
+                engine_error_code: 0,
+                error_code: NAPI_OK,
+            },
         })
     }
 }
@@ -205,6 +215,41 @@ unsafe fn to_local<'s>(value: NapiValue) -> Option<v8::Local<'s, v8::Value>> {
 fn from_local(local: v8::Local<'_, v8::Value>) -> NapiValue {
     // SAFETY: ABI pun of a `v8::Local<Value>` to the pointer-sized `napi_value` (size-asserted equal at module top).
     unsafe { std::mem::transmute::<v8::Local<'_, v8::Value>, NapiValue>(local) }
+}
+
+/// Record WHY an entry point is failing, then return that status.
+///
+/// `napi_get_last_error_info` is the documented way an addon asks "why did
+/// that fail?", and returning a permanently-empty struct answered "nothing
+/// failed" -- actively misleading, precisely when the caller is debugging.
+/// Anything that records here must clear on success via [`ok`], or the next
+/// reader sees a stale reason.
+///
+/// # Safety
+///
+/// `env` must be the live `napi_env` this engine handed the addon, or null.
+unsafe fn fail(env: Env, status: NapiStatus, message: &'static std::ffi::CStr) -> NapiStatus {
+    // SAFETY: caller guarantees `env` is this engine's env pointer or null;
+    // `as_mut` guards null, and the write only touches the env's own slot.
+    if let Some(env_ref) = unsafe { env.as_mut() } {
+        env_ref.last_error.error_code = status;
+        env_ref.last_error.error_message = message.as_ptr();
+    }
+    status
+}
+
+/// Clear the last-error slot and return NAPI_OK.
+///
+/// # Safety
+///
+/// `env` must be the live `napi_env` this engine handed the addon, or null.
+unsafe fn ok(env: Env) -> NapiStatus {
+    // SAFETY: as in `fail` -- null-guarded, writes only the env's own slot.
+    if let Some(env_ref) = unsafe { env.as_mut() } {
+        env_ref.last_error.error_code = NAPI_OK;
+        env_ref.last_error.error_message = std::ptr::null();
+    }
+    NAPI_OK
 }
 
 /// # Safety
@@ -1640,18 +1685,39 @@ pub unsafe extern "C" fn napi_create_reference(
 ) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_create_reference: no native scope is active on this env",
+            )
+        };
     };
     // SAFETY: `value` is a napi_value handle from this env; to_local reinterprets it as a repr-compatible `v8::Local` (size-asserted at module top) and returns None when null.
     let Some(local) = (unsafe { to_local(value) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: as above.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_create_reference: `value` is null",
+            )
+        };
     };
     // Reject a null out-parameter BEFORE creating anything. Pushing first and
     // failing afterwards left the entry in `env.refs` with no handle ever
     // dispensed for it -- unreachable, and freed only when the env drops. Node
     // validates its arguments up front and creates no reference at all.
     if result.is_null() {
-        return NAPI_INVALID_ARG;
+        // SAFETY: as above.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_create_reference: `result` out-pointer is null",
+            )
+        };
     }
     let global = v8::Global::new(scope, local);
     // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
@@ -1664,7 +1730,12 @@ pub unsafe extern "C" fn napi_create_reference(
     NAPI_REF_PUSH_COUNT.with(|c| c.set(c.get() + 1));
     let ptr = &mut **env_ref.refs.last_mut().unwrap() as *mut NapiRefEntry as *mut c_void;
     // SAFETY: `result` is the caller's out-parameter pointer, null-checked above; out() null-checks it again before writing.
-    unsafe { out(result, ptr) }
+    let status = unsafe { out(result, ptr) };
+    if status == NAPI_OK {
+        // SAFETY: `env` is the caller's env pointer; ok() null-guards.
+        return unsafe { ok(env) };
+    }
+    status
 }
 
 /// # Safety
@@ -1677,14 +1748,31 @@ pub unsafe extern "C" fn napi_create_reference(
 /// individually.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) -> NapiStatus {
-    if env.is_null() || ref_.is_null() {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null.
+    let Some(env_ref) = (unsafe { env.as_mut() }) else {
         return NAPI_INVALID_ARG;
-    }
-    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
-    let env_ref = unsafe { &mut *env };
+    };
     let target = ref_ as *const NapiRefEntry;
+    let before = env_ref.refs.len();
     env_ref.refs.retain(|r| !std::ptr::eq(r.as_ref(), target));
-    NAPI_OK
+    if env_ref.refs.len() == before {
+        // Nothing was removed, so `ref_` is null, already deleted, or was never
+        // ours. This used to answer NAPI_OK regardless, which made a
+        // double-delete look successful and hid the addon's own bug -- and was
+        // inconsistent with the read/ref/unref paths, which do validate. Node
+        // treats an invalid ref as undefined behaviour; refusing is strictly
+        // safer and is a deliberate divergence (docs/node-divergences.md).
+        // SAFETY: `env` is the caller's env pointer; fail() null-guards.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_delete_reference: handle is not a live reference in this env (already deleted, or never created here)",
+            )
+        };
+    }
+    // SAFETY: `env` is the caller's env pointer; ok() null-guards.
+    unsafe { ok(env) }
 }
 
 /// # Safety
@@ -1703,15 +1791,41 @@ pub unsafe extern "C" fn napi_get_reference_value(
 ) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; env_scope dereferences it and returns the live `PinScope` stashed on `env.scope` -- non-null only while a native entry (trampoline / load_addon) is on the stack.
     let Some(scope) = (unsafe { env_scope(env) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_get_reference_value: no native scope is active on this env",
+            )
+        };
     };
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv` (env_scope proved it non-null); ref_entry rejects a null or already-deleted handle instead of dereferencing it.
     let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: as above.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_get_reference_value: handle is not a live reference in this env (already deleted, or never created here)",
+            )
+        };
     };
     let local = v8::Local::new(scope, &entry.value);
     // SAFETY: `result` is the caller's out-parameter pointer; out() null-checks it before writing.
-    unsafe { out(result, from_local(local)) }
+    let status = unsafe { out(result, from_local(local)) };
+    if status == NAPI_OK {
+        // SAFETY: `env` is the caller's env pointer; ok() null-guards.
+        return unsafe { ok(env) };
+    }
+    // SAFETY: as above.
+    unsafe {
+        fail(
+            env,
+            status,
+            c"napi_get_reference_value: `result` out-pointer is null",
+        )
+    }
 }
 
 /// # Safety
@@ -1730,14 +1844,22 @@ pub unsafe extern "C" fn napi_reference_ref(
 ) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
     let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_reference_ref: handle is not a live reference in this env (already deleted, or never created here)",
+            )
+        };
     };
     entry.refcount = entry.refcount.saturating_add(1);
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = entry.refcount };
     }
-    NAPI_OK
+    // SAFETY: `env` is the caller's env pointer; ok() null-guards.
+    unsafe { ok(env) }
 }
 
 /// # Safety
@@ -1756,14 +1878,22 @@ pub unsafe extern "C" fn napi_reference_unref(
 ) -> NapiStatus {
     // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
     let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
-        return NAPI_INVALID_ARG;
+        // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
+        return unsafe {
+            fail(
+                env,
+                NAPI_INVALID_ARG,
+                c"napi_reference_unref: handle is not a live reference in this env (already deleted, or never created here)",
+            )
+        };
     };
     entry.refcount = entry.refcount.saturating_sub(1);
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
         unsafe { *result = entry.refcount };
     }
-    NAPI_OK
+    // SAFETY: `env` is the caller's env pointer; ok() null-guards.
+    unsafe { ok(env) }
 }
 
 // =========================================================== wrap / classes
@@ -2554,19 +2684,19 @@ pub static mut uv_event_loop: *mut c_void = std::ptr::null_mut();
 /// individually.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_get_last_error_info(
-    _env: Env,
+    env: Env,
     result: *mut *const NapiExtendedErrorInfo,
 ) -> NapiStatus {
-    // Return a static zeroed struct -- callers inspect it after a failed call.
-    static EMPTY: NapiExtendedErrorInfo = NapiExtendedErrorInfo {
-        error_message: std::ptr::null(),
-        engine_reserved: std::ptr::null_mut(),
-        engine_error_code: 0,
-        error_code: 0,
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; `as_ref` guards null and
+    // the shared reborrow only reads the env's own last-error slot.
+    let Some(env_ref) = (unsafe { env.as_ref() }) else {
+        return NAPI_INVALID_ARG;
     };
     if !result.is_null() {
-        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
-        unsafe { *result = &EMPTY as *const NapiExtendedErrorInfo };
+        // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked
+        // before this write. The pointer written borrows the env's own slot, which
+        // outlives this call -- the addon is calling THROUGH that env.
+        unsafe { *result = &raw const env_ref.last_error };
     }
     NAPI_OK
 }

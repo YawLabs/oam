@@ -572,6 +572,49 @@ to its own fallback branch, which is the behavior that is right for oam.
 `dns.getServers()` is NOT narrowed: it reports the real configured nameservers, taken from
 the same `ResolverConfig` the resolver was built from, so the two stay coherent.
 
+### 22. An invalid `napi_ref` is refused, where Node's behavior is undefined
+
+_(N-API is alpha and off by default -- see divergence 2.)_ Node's reference API takes the
+addon at its word: `napi_get_reference_value`, `napi_reference_ref`, `napi_reference_unref`
+and `napi_delete_reference` dereference the `napi_ref` you hand them, and passing one that
+was already deleted is undefined behavior. In practice that reads freed memory.
+
+oam validates instead. Every one of those four looks the handle up in the env's own
+reference table first, and answers `napi_invalid_arg` when it is not there -- already
+deleted, never created here, or belonging to a different env. A double-delete therefore
+reports `napi_invalid_arg` on the second call where Node would report success or corrupt
+memory.
+
+This is deliberate and will not change. An addon lifecycle bug is a bug either way; the
+question is only whether the runtime turns it into a diagnosable error or into a
+use-after-free. Addons that check status codes see a real failure they can act on, and
+addons that ignore them are no worse off than under Node.
+
+The one thing the check cannot catch is address reuse (ABA): the lookup compares
+addresses, so a stale handle whose entry has been freed and replaced at the same address
+resolves to a *different* live reference. That is an aliasing bug rather than a
+use-after-free, and closing it needs handles carrying a generation counter.
+
+### 23. `napi_get_last_error_info` reports the real reason, for the calls that record one
+
+Node returns a per-env `napi_extended_error_info` describing the last failure. oam does the
+same, but only the reference family (`napi_create_reference`, `napi_delete_reference`,
+`napi_get_reference_value`, `napi_reference_ref`, `napi_reference_unref`) currently records
+into it -- those set both `error_code` and a message naming the call and the reason, and
+clear the slot on success.
+
+Every other entry point returns its status without touching the slot. So after a failure in
+a non-recording call, `napi_get_last_error_info` reports whatever the last recording call
+left -- `napi_ok` and a null message on a fresh env. Treat a message as authoritative only
+when it names the call you just made.
+
+This is narrower than Node, and it is stated rather than hidden because the previous
+behavior was worse: the struct was permanently zeroed, so *every* query answered
+`error_code: 0` with a null message. An addon following the documented
+"call failed -> ask why" path was told nothing had failed, exactly when it was debugging
+something that had. Widening the coverage to the remaining entry points is mechanical and
+tracked; the shape above is already correct for the calls it covers.
+
 ---
 
 ## Narrowed and partial surfaces

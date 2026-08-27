@@ -82,6 +82,17 @@ struct Host {
     delete_reference: unsafe extern "C" fn(NapiEnv, *mut c_void) -> NapiStatus,
     reference_ref: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut u32) -> NapiStatus,
     reference_unref: unsafe extern "C" fn(NapiEnv, *mut c_void, *mut u32) -> NapiStatus,
+    get_last_error_info:
+        unsafe extern "C" fn(NapiEnv, *mut *const NapiExtendedErrorInfo) -> NapiStatus,
+}
+
+/// Mirrors `napi_extended_error_info` from js_native_api_types.h.
+#[repr(C)]
+struct NapiExtendedErrorInfo {
+    error_message: *const c_char,
+    engine_reserved: *mut c_void,
+    engine_error_code: u32,
+    error_code: NapiStatus,
 }
 
 static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
@@ -148,6 +159,7 @@ unsafe fn resolve_host() -> Option<Host> {
             delete_reference: sym!(b"napi_delete_reference"),
             reference_ref: sym!(b"napi_reference_ref"),
             reference_unref: sym!(b"napi_reference_unref"),
+            get_last_error_info: sym!(b"napi_get_last_error_info"),
         })
     }
 }
@@ -990,6 +1002,85 @@ unsafe extern "C" fn read_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> Na
     }
 }
 
+/// deleteRefTwice(value) -> number: host status for the SECOND
+/// napi_delete_reference on the same handle. A host that does not validate
+/// answers 0 and hides the addon's double-delete.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn delete_ref_twice(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` is a live local backing the out-pointer. The second
+    // delete is the behaviour under test; the addon never dereferences it.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return num(env, -1);
+        }
+        if (host().delete_reference)(env, handle) != 0 {
+            return num(env, -2);
+        }
+        num(env, (host().delete_reference)(env, handle))
+    }
+}
+
+/// lastErrorMessage(value) -> string: provoke a known failure (reading a
+/// deleted reference), then report what napi_get_last_error_info says about it.
+/// Returns "" when the host reports no message at all.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn last_error_message(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `handle` and `info_ptr` are live locals backing the out-pointers.
+    // `info_ptr` is only dereferenced after the host reported success AND it
+    // came back non-null; `error_message` is read only when non-null, and the
+    // host owns that string for at least the life of this env.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut handle) != 0 {
+            return string(env, "create failed");
+        }
+        (host().delete_reference)(env, handle);
+
+        // Known-bad call: the host must refuse it.
+        let mut out_value: NapiValue = std::ptr::null_mut();
+        if (host().get_reference_value)(env, handle, &mut out_value) == 0 {
+            return string(env, "expected the stale read to fail");
+        }
+
+        // The documented way to ask WHY.
+        let mut info_ptr: *const NapiExtendedErrorInfo = std::ptr::null();
+        if (host().get_last_error_info)(env, &mut info_ptr) != 0 || info_ptr.is_null() {
+            return string(env, "no info");
+        }
+        let code = (*info_ptr).error_code;
+        let msg = (*info_ptr).error_message;
+        if msg.is_null() {
+            return string(env, &format!("code={code} message=<null>"));
+        }
+        let text = std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned();
+        string(env, &format!("code={code} message={text}"))
+    }
+}
+
+/// Wrap a Rust string as a napi string.
+///
+/// # Safety
+///
+/// Only called from a `napi_callback` with a live `env`.
+unsafe fn string(env: NapiEnv, value: &str) -> NapiValue {
+    // SAFETY: `out` is a live local backing the out-pointer; the text pointer
+    // and length describe a buffer that outlives the call.
+    unsafe {
+        let mut out: NapiValue = std::ptr::null_mut();
+        (host().create_string_utf8)(env, value.as_ptr().cast::<c_char>(), value.len(), &mut out);
+        out
+    }
+}
+
 // ======================================================= module registration
 
 /// # Safety
@@ -1035,7 +1126,9 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 16] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 18] = [
+            (c"deleteRefTwice", delete_ref_twice),
+            (c"lastErrorMessage", last_error_message),
             (c"refAfterDelete", ref_after_delete),
             (c"refRefCount", ref_ref_count),
             (c"refUnrefCount", ref_unref_count),
