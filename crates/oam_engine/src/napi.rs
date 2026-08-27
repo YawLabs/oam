@@ -141,7 +141,36 @@ impl Drop for NapiEnv {
     }
 }
 
+// Thread-local counter of entries actually PUSHED into `NapiEnv::refs` by
+// napi_create_reference. Used only in tests, to prove a rejected call creates
+// nothing: the orphan a failed create used to leave behind is invisible from
+// JS (nothing exposes `env.refs`), so this is the seam that makes it testable.
+// Not a doc comment -- rustdoc can't document items produced by a macro.
+#[cfg(test)]
+thread_local! {
+    pub static NAPI_REF_PUSH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 type Env = *mut NapiEnv;
+
+/// Build a `NapiEnv` with `scope` installed, hand it plus one valid
+/// `napi_value` to `f`, then tear the scope back down -- the same install /
+/// restore a native entry performs, so the C entry points behave exactly as
+/// they do under a real addon. Test-only.
+#[cfg(test)]
+pub(crate) fn with_test_env<R>(
+    scope: &mut v8::PinScope<'_, '_>,
+    f: impl FnOnce(Env, NapiValue) -> R,
+) -> R {
+    let mut env = Box::new(NapiEnv::new());
+    env.scope = std::ptr::from_ref(&*scope) as *mut c_void;
+    let value = from_local(v8::Object::new(scope).into());
+    let ptr: Env = &raw mut **env;
+    let out = f(ptr, value);
+    // Match load_addon: the scope must not outlive the frame that installed it.
+    env.scope = std::ptr::null_mut();
+    out
+}
 
 /// SAFETY HELPERS — every napi fn funnels through these.
 ///
@@ -1631,6 +1660,8 @@ pub unsafe extern "C" fn napi_create_reference(
         value: global,
         refcount: initial_refcount,
     }));
+    #[cfg(test)]
+    NAPI_REF_PUSH_COUNT.with(|c| c.set(c.get() + 1));
     let ptr = &mut **env_ref.refs.last_mut().unwrap() as *mut NapiRefEntry as *mut c_void;
     // SAFETY: `result` is the caller's out-parameter pointer, null-checked above; out() null-checks it again before writing.
     unsafe { out(result, ptr) }

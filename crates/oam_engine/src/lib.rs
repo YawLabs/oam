@@ -652,6 +652,21 @@ impl JsRuntime {
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         napi::load_addon(scope, path).is_some()
     }
+
+    /// Run `f` with a live `napi_env` and one valid `napi_value`, exactly as a
+    /// native entry would: a real `PinScope` installed on the env for the
+    /// duration, and torn down afterwards. Lets crate tests exercise the C
+    /// entry points directly, without a `.node` (see
+    /// `rejected_create_reference_pushes_nothing` for why an addon cannot be
+    /// used from this crate's test binary).
+    #[cfg(test)]
+    pub(crate) fn with_napi_env<R>(
+        &mut self,
+        f: impl FnOnce(*mut napi::NapiEnv, napi::NapiValue) -> R,
+    ) -> R {
+        v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
+        napi::with_test_env(scope, f)
+    }
 }
 
 impl Drop for JsRuntime {
@@ -724,7 +739,7 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use napi::NAPI_ENV_DROP_COUNT;
+    use napi::{NAPI_ENV_DROP_COUNT, NAPI_REF_PUSH_COUNT};
     use std::sync::Mutex;
 
     // Env-var tests share a process-wide environment. Serialize them so
@@ -958,6 +973,61 @@ mod tests {
             );
         }
         built
+    }
+
+    /// A rejected `napi_create_reference` must create NOTHING.
+    ///
+    /// It used to push the entry and only then discover the null out-pointer,
+    /// orphaning a reference no handle could ever reach. The e2e suite sees the
+    /// returned STATUS but not the orphan -- nothing exposes `env.refs` across
+    /// the JS boundary -- so the push count is asserted here, in-process.
+    ///
+    /// This calls the C entry point directly rather than going through the test
+    /// addon: `crates/oam_cli/build.rs` re-exports the napi_* symbols with
+    /// `rustc-link-arg-bins`, which covers `oam.exe` but NOT this crate's test
+    /// binary, so an addon loaded here never resolves the host table.
+    #[test]
+    fn rejected_create_reference_pushes_nothing() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, value| {
+            NAPI_REF_PUSH_COUNT.with(|c| c.set(0));
+
+            // Null out-parameter: rejected, and must leave nothing behind.
+            // SAFETY: `env` and `value` come from with_napi_env, which installs a
+            // live PinScope for the duration of this closure -- exactly the state
+            // a native entry guarantees. The null out-pointer is the input under
+            // test; the entry point is required to reject it, not write through it.
+            let status =
+                unsafe { napi::napi_create_reference(env, value, 1, std::ptr::null_mut()) };
+            assert_eq!(
+                status,
+                napi::NAPI_INVALID_ARG,
+                "null out-pointer must be refused"
+            );
+            assert_eq!(
+                NAPI_REF_PUSH_COUNT.with(|c| c.get()),
+                0,
+                "a refused create_reference must not push an entry"
+            );
+
+            // Control: the same call with a real out-pointer does push, so the
+            // assertion above is about the rejection, not about the counter
+            // being inert.
+            let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: same live env/scope as above; `handle` is a live local
+            // backing the out-pointer.
+            let status = unsafe { napi::napi_create_reference(env, value, 1, &mut handle) };
+            assert_eq!(
+                status,
+                napi::NAPI_OK,
+                "a valid create_reference must succeed"
+            );
+            assert_eq!(
+                NAPI_REF_PUSH_COUNT.with(|c| c.get()),
+                1,
+                "a valid create_reference must push exactly one entry"
+            );
+        });
     }
 
     /// Verify that NapiEnv (and its owned FnData) is dropped exactly once per

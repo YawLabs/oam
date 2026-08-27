@@ -1774,7 +1774,11 @@ fn napi_reference_read_after_delete_is_rejected() {
          // 1 === napi_invalid_arg: the host refused the deleted handle.
          console.log(native.refAfterDelete({ probe: 1 }));
          // Still healthy afterwards -- the refusal is not a poisoned env.
-         console.log(native.refAfterDelete('another'));",
+         console.log(native.refAfterDelete('another'));
+         // No argument: get_cb_info pads with undefined, which is still a
+         // referenceable value -- so this takes the same delete path, NOT the
+         // addon's create-failed path.
+         console.log(native.refAfterDelete());",
     );
     let main = dir.join("ref_after_delete.cjs");
     let out = oam(&["run", main.to_str().unwrap()]);
@@ -1790,6 +1794,10 @@ fn napi_reference_read_after_delete_is_rejected() {
         "reading a deleted reference must report napi_invalid_arg, not napi_ok"
     );
     assert_eq!(lines[1], "1", "and must keep doing so on a later call");
+    assert_eq!(
+        lines[2], "1",
+        "a missing argument is padded to undefined, which is referenceable, so          this is still the deleted-handle path rather than a create failure"
+    );
 }
 
 #[test]
