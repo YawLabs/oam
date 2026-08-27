@@ -1539,24 +1539,7 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
 fn napi_addon_loads_and_calls_native_functions() {
     // The workspace builds the test addon cdylib alongside everything
     // else; rename it to .node like an npm-shipped prebuilt.
-    let artifact = if cfg!(windows) {
-        "oam_napi_test_addon.dll"
-    } else if cfg!(target_os = "macos") {
-        "liboam_napi_test_addon.dylib"
-    } else {
-        "liboam_napi_test_addon.so"
-    };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
-    if !built.is_file() {
-        panic!(
-            "test addon not built at {} — `cargo build -p oam_napi_test_addon` first",
-            built.display()
-        );
-    }
-    let addon = write_temp("napi/native.node", "placeholder");
-    std::fs::copy(&built, &addon).expect("copy addon into place");
+    napi_addon_dir("napi");
 
     write_temp(
         "napi/main.cjs",
@@ -1612,24 +1595,7 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     //   2^53-1   hi= 2097151 lo=-1  -> Number  (= MAX_SAFE_INTEGER)
     //   -(2^53)  hi=-2097152 lo= 0  -> BigInt  (just below -MAX_SAFE)
     //   -(2^53-1)hi=-2097152 lo= 1  -> Number  (= -MAX_SAFE_INTEGER)
-    let artifact = if cfg!(windows) {
-        "oam_napi_test_addon.dll"
-    } else if cfg!(target_os = "macos") {
-        "liboam_napi_test_addon.dylib"
-    } else {
-        "liboam_napi_test_addon.so"
-    };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
-    if !built.is_file() {
-        panic!(
-            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
-            built.display()
-        );
-    }
-    let addon = write_temp("napi_int64/native.node", "placeholder");
-    std::fs::copy(&built, &addon).expect("copy addon into place");
+    napi_addon_dir("napi_int64");
 
     write_temp(
         "napi_int64/main.cjs",
@@ -1673,7 +1639,16 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
 
 // -------------------------------------------------------------- N-API beta
 
-fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
+/// Resolve the built test-addon cdylib, failing loudly if it is MISSING or
+/// STALE.
+///
+/// The staleness half matters because `cargo test -p oam_cli` does NOT rebuild
+/// a sibling cdylib crate -- only a `--workspace` run does. So an addon edited
+/// since the last build leaves the OLD binary sitting in target/debug, and the
+/// failure that produces is `native.<newExport> is not a function`, which reads
+/// like a host bug rather than a build-order one. Comparing mtimes turns that
+/// into a one-line instruction.
+fn built_test_addon() -> std::path::PathBuf {
     let artifact = if cfg!(windows) {
         "oam_napi_test_addon.dll"
     } else if cfg!(target_os = "macos") {
@@ -1681,18 +1656,68 @@ fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
     } else {
         "liboam_napi_test_addon.so"
     };
-    let built = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug")
-        .join(artifact);
+    let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let built = crate_root.join("../../target/debug").join(artifact);
     if !built.is_file() {
         panic!(
-            "test addon not built at {} -- `cargo build -p oam_napi_test_addon` first",
+            "test addon not built at {} -- run `cargo build -p oam_napi_test_addon` first",
             built.display()
         );
     }
-    // Each test gets its OWN subdir: napi_beta tests run in parallel, and a
-    // shared native.node path races on Windows (one test's `oam run` holds the
-    // .node open while another overwrites it -> sharing violation).
+    let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
+        // No mtime (exotic filesystem): the presence check above still stands.
+        return built;
+    };
+
+    // Newest of the addon crate's own sources: Cargo.toml plus every .rs under
+    // src/. Walked rather than hardcoded so a second module cannot slip the net.
+    let addon_root = crate_root.join("../oam_napi_test_addon");
+    let mut sources = vec![addon_root.join("Cargo.toml")];
+    let mut dirs = vec![addon_root.join("src")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+
+    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for source in sources {
+        let Ok(at) = std::fs::metadata(&source).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| at > *best) {
+            newest = Some((source, at));
+        }
+    }
+
+    if let Some((path, source_at)) = newest
+        && source_at > built_at
+    {
+        panic!(
+            "test addon at {} is STALE -- {} is newer.\n`cargo test -p oam_cli` does not rebuild a sibling cdylib crate; run `cargo build -p oam_napi_test_addon` (or `cargo test --workspace`) first.",
+            built.display(),
+            path.display()
+        );
+    }
+    built
+}
+
+/// Copy the built addon into its own temp subdir as `native.node` and return
+/// that dir.
+///
+/// Each test gets its OWN subdir: the napi tests run in parallel, and a shared
+/// native.node path races on Windows (one test's `oam run` holds the .node open
+/// while another overwrites it -> sharing violation).
+fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
+    let built = built_test_addon();
     let addon = write_temp(&format!("{subdir}/native.node"), "placeholder");
     std::fs::copy(&built, &addon).expect("copy addon into place");
     addon.parent().unwrap().to_path_buf()
@@ -1700,7 +1725,7 @@ fn napi_beta_addon(subdir: &str) -> std::path::PathBuf {
 
 #[test]
 fn napi_beta_wrap_counter_roundtrip() {
-    let dir = napi_beta_addon("napi_beta_wrap");
+    let dir = napi_addon_dir("napi_beta_wrap");
     write_temp(
         "napi_beta_wrap/wrap_counter.cjs",
         "const native = require('./native.node');\n\
@@ -1733,8 +1758,212 @@ fn napi_beta_wrap_counter_roundtrip() {
 }
 
 #[test]
+fn napi_reference_read_after_delete_is_rejected() {
+    // Regression: napi_get_reference_value used to deref the caller's handle
+    // behind a null check alone, so reading a reference the addon had already
+    // deleted returned napi_ok and handed back a freed NapiRefEntry. The host
+    // now validates the handle against its own ref table first.
+    //
+    // refAfterDelete() returns the host's STATUS for that stale read, so this
+    // asserts on the fix rather than on the absence of a crash: the unfixed
+    // host answers 0 (napi_ok).
+    let dir = napi_addon_dir("napi_ref_after_delete");
+    write_temp(
+        "napi_ref_after_delete/ref_after_delete.cjs",
+        "const native = require('./native.node');
+         // 1 === napi_invalid_arg: the host refused the deleted handle.
+         console.log(native.refAfterDelete({ probe: 1 }));
+         // Still healthy afterwards -- the refusal is not a poisoned env.
+         console.log(native.refAfterDelete('another'));
+         // No argument: get_cb_info pads with undefined, which is still a
+         // referenceable value -- so this takes the same delete path, NOT the
+         // addon's create-failed path.
+         console.log(native.refAfterDelete());",
+    );
+    let main = dir.join("ref_after_delete.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "1",
+        "reading a deleted reference must report napi_invalid_arg, not napi_ok"
+    );
+    assert_eq!(lines[1], "1", "and must keep doing so on a later call");
+    assert_eq!(
+        lines[2], "1",
+        "a missing argument is padded to undefined, which is referenceable, so          this is still the deleted-handle path rather than a create failure"
+    );
+}
+
+#[test]
+fn napi_reference_refcount_roundtrip() {
+    // napi_reference_ref / napi_reference_unref had no coverage at all -- the
+    // addon did not even resolve the two symbols. They are how an addon keeps a
+    // value alive across calls, so a regression means premature collection or a
+    // leak.
+    let dir = napi_addon_dir("napi_refcount");
+    write_temp(
+        "napi_refcount/refcount.cjs",
+        "const native = require('./native.node');\n\
+         // created with refcount 1, ref() -> 2\n\
+         console.log(native.refRefCount({}));\n\
+         // created with refcount 2, unref() -> 1\n\
+         console.log(native.refUnrefCount({}));",
+    );
+    let out = oam(&["run", dir.join("refcount.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "2",
+        "napi_reference_ref must report the incremented count"
+    );
+    assert_eq!(
+        lines[1], "1",
+        "napi_reference_unref must report the decremented count"
+    );
+}
+
+#[test]
+fn napi_reference_ref_and_unref_after_delete_are_rejected() {
+    // Companion to napi_reference_read_after_delete_is_rejected: the same
+    // validating lookup guards all THREE handle derefs, but only the read path
+    // was covered, so reverting either of these two would have gone unnoticed.
+    let dir = napi_addon_dir("napi_ref_unref_deleted");
+    write_temp(
+        "napi_ref_unref_deleted/deleted.cjs",
+        "const native = require('./native.node');\n\
+         // 1 === napi_invalid_arg on a handle already deleted.\n\
+         console.log(native.refRefAfterDelete({}));\n\
+         console.log(native.refUnrefAfterDelete({}));",
+    );
+    let out = oam(&["run", dir.join("deleted.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "1",
+        "napi_reference_ref must refuse a deleted handle"
+    );
+    assert_eq!(
+        lines[1], "1",
+        "napi_reference_unref must refuse a deleted handle"
+    );
+}
+
+#[test]
+fn napi_foreign_reference_handle_is_rejected() {
+    // A non-null pointer this env never dispensed (here, a stack address).
+    // Real addons pass garbage after their own lifecycle bugs; this is the
+    // branch that turns that into a clean error instead of a segfault.
+    let dir = napi_addon_dir("napi_foreign_handle");
+    write_temp(
+        "napi_foreign_handle/foreign.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.foreignHandleStatus());",
+    );
+    let out = oam(&["run", dir.join("foreign.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "1",
+        "a pointer this env never dispensed must be refused, not dereferenced"
+    );
+}
+
+#[test]
+fn napi_reference_handle_from_another_env_is_rejected() {
+    // Two .node files in one process -- routine for MCP sidecars -- means two
+    // NapiEnvs, each with its own ref table. A handle valid in env A is LIVE
+    // memory, so only the per-env identity check can catch it being used in
+    // env B. The same-env read is the control: it proves the rejection is about
+    // provenance, not about the handle failing to round-trip through JS.
+    let dir = napi_addon_dir("napi_cross_env");
+    let second = dir.join("second.node");
+    std::fs::copy(dir.join("native.node"), &second).expect("second addon copy");
+    write_temp(
+        "napi_cross_env/cross.cjs",
+        "const a = require('./native.node');\n\
+         const b = require('./second.node');\n\
+         // Distinct addon instances, so distinct envs.\n\
+         console.log(a === b);\n\
+         const handle = a.makeRefHandle({ owned: 'by a' });\n\
+         // 0 === napi_ok: a owns it.\n\
+         console.log(a.readRefHandle(handle));\n\
+         // 1 === napi_invalid_arg: b must not resolve another env's handle.\n\
+         console.log(b.readRefHandle(handle));",
+    );
+    let out = oam(&["run", dir.join("cross.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "false",
+        "the two requires must be distinct instances"
+    );
+    assert_eq!(lines[1], "0", "the owning env must resolve its own handle");
+    assert_eq!(
+        lines[2], "1",
+        "a different env must refuse a handle it never dispensed"
+    );
+}
+
+#[test]
+fn napi_create_reference_with_null_out_is_rejected() {
+    // Pins the STATUS contract only, and deliberately claims no more: a null
+    // out-pointer is napi_invalid_arg.
+    //
+    // The companion fix -- napi_create_reference now null-checks BEFORE
+    // pushing, instead of orphaning an entry no handle could ever reach -- is
+    // NOT covered here, and this test still passes with that check reverted
+    // (verified). The orphan is not observable across the JS boundary: nothing
+    // exposes env.refs. Catching it would need a Rust-side hook into NapiEnv,
+    // which is more instrumentation than the leak justifies. Flagged rather
+    // than papered over.
+    let dir = napi_addon_dir("napi_null_out");
+    write_temp(
+        "napi_null_out/null_out.cjs",
+        "const native = require('./native.node');\n\
+         console.log(native.createRefNullOut({}));\n\
+         // Repeated calls must stay rejected rather than accumulating state.\n\
+         console.log(native.createRefNullOut({}));",
+    );
+    let out = oam(&["run", dir.join("null_out.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "1", "a null out-pointer must be napi_invalid_arg");
+    assert_eq!(lines[1], "1", "and must stay so on a second call");
+}
+
+#[test]
 fn napi_beta_bigint_int64_create_and_read() {
-    let dir = napi_beta_addon("napi_beta_bigint");
+    let dir = napi_addon_dir("napi_beta_bigint");
     write_temp(
         "napi_beta_bigint/bigint64.cjs",
         "const native = require('./native.node');\n\
@@ -1766,7 +1995,7 @@ fn napi_beta_bigint_int64_create_and_read() {
 
 #[test]
 fn napi_beta_buffer_create_and_len() {
-    let dir = napi_beta_addon("napi_beta_buffer");
+    let dir = napi_addon_dir("napi_beta_buffer");
     write_temp(
         "napi_beta_buffer/buffer.cjs",
         "const native = require('./native.node');\n\
