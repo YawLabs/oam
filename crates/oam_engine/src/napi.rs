@@ -40,10 +40,28 @@ pub const NAPI_ARRAY_EXPECTED: NapiStatus = 8;
 pub const NAPI_GENERIC_FAILURE: NapiStatus = 9;
 pub const NAPI_PENDING_EXCEPTION: NapiStatus = 10;
 
-/// A persistent reference to a V8 value. Stored in `NapiEnv::refs`.
+/// A persistent reference to a V8 value. Lives in a [`NapiRefSlot`] of
+/// `NapiEnv::refs`.
 struct NapiRefEntry {
     value: v8::Global<v8::Value>,
     refcount: u32,
+}
+
+/// One slot of an env's reference table.
+///
+/// A slot is never removed once created. `napi_delete_reference` takes the
+/// entry OUT and bumps `generation`; the index then goes on the free list for
+/// the next create. Because a handle carries the generation it was minted
+/// with, a handle for a recycled slot fails the generation compare instead of
+/// silently resolving to whoever owns the slot now. See the encoding notes
+/// above [`encode_ref_handle`].
+struct NapiRefSlot {
+    /// `None` while the slot is free.
+    entry: Option<NapiRefEntry>,
+    /// Bumped on every free. Starts at 1 and never reaches 0 again, which is
+    /// what keeps a minted handle from ever being all-zero -- the ABI's null
+    /// `napi_ref` sentinel.
+    generation: usize,
 }
 
 /// A native-object wrapping: maps a JS object to a raw Rust pointer.
@@ -70,9 +88,17 @@ pub struct NapiEnv {
     /// `Box` required for pointer stability: addons hold raw `*mut FnData`.
     #[allow(clippy::vec_box)]
     fn_data: Vec<Box<FnData>>,
-    /// Persistent references (napi_create_reference).
-    #[allow(clippy::vec_box)]
-    refs: Vec<Box<NapiRefEntry>>,
+    /// Persistent references (napi_create_reference), addressed by an
+    /// index+generation handle rather than by address. No `Box` here, unlike
+    /// the two vecs either side: nothing outside this file ever holds a
+    /// pointer INTO this table, so its elements are free to move on realloc.
+    refs: Vec<NapiRefSlot>,
+    /// Indices of `refs` slots whose entry has been deleted and which the next
+    /// `napi_create_reference` may reuse.
+    ref_free: Vec<usize>,
+    /// Folded into every handle this env mints, so a handle from one env
+    /// decodes to a miss in another. See [`encode_ref_handle`].
+    ref_tag: usize,
     /// Active napi_wrap entries for this env.
     #[allow(clippy::vec_box)]
     wraps: Vec<Box<NapiWrapEntry>>,
@@ -89,6 +115,8 @@ impl NapiEnv {
             pending: None,
             fn_data: Vec::new(),
             refs: Vec::new(),
+            ref_free: Vec::new(),
+            ref_tag: next_env_ref_tag(),
             wraps: Vec::new(),
             last_error: NapiExtendedErrorInfo {
                 error_message: std::ptr::null(),
@@ -1619,53 +1647,216 @@ pub unsafe extern "C" fn napi_get_value_external(
 
 // ================================================================ references
 //
-// NapiRef handle: an opaque *mut c_void that points to a heap-stable
-// NapiRefEntry box owned by NapiEnv::refs.
+// NapiRef handle: an opaque *mut c_void that is NOT a pointer. It packs a slot
+// index, that slot's generation, and a per-env tag; see `encode_ref_handle`.
 
 type NapiRefHandle = *mut c_void;
 
-/// Resolve a caller-supplied `napi_ref` to its entry, but only while the
-/// handle is still registered in `env.refs`.
+// ------------------------------------------------------- handle encoding
+//
+// A `napi_ref` is pointer-sized because the ABI says so, but nothing in the
+// ABI says it must BE a pointer, and making it one is what created the hole
+// this encoding closes. The layout, most significant field first:
+//
+//     [ env tag : REF_TAG_BITS | generation : REF_GEN_BITS | index : REF_INDEX_BITS ]
+//
+// Widths are derived from the pointer width, so a 32-bit target stays correct
+// with every field simply narrower (8 / 12 / 12 instead of 16 / 24 / 24).
+
+/// Width of the per-env tag. Published so the e2e suite can forge handles
+/// against the real layout instead of duplicating these numbers.
+pub const REF_TAG_BITS: u32 = usize::BITS / 4;
+/// Width of the slot index.
+pub const REF_INDEX_BITS: u32 = (usize::BITS - REF_TAG_BITS) / 2;
+/// Width of the per-slot generation counter.
+pub const REF_GEN_BITS: u32 = usize::BITS - REF_TAG_BITS - REF_INDEX_BITS;
+
+const REF_INDEX_MASK: usize = (1usize << REF_INDEX_BITS) - 1;
+const REF_GEN_MASK: usize = (1usize << REF_GEN_BITS) - 1;
+const REF_TAG_MASK: usize = (1usize << REF_TAG_BITS) - 1;
+
+/// Highest generation a slot may reach. On hitting it the slot is RETIRED
+/// rather than reused, which is what stops the counter wrapping around onto a
+/// generation some addon still holds a handle for. Costs one empty slot after
+/// 16.7M create/delete cycles of that single slot on a 64-bit target.
+const REF_MAX_GENERATION: usize = REF_GEN_MASK;
+
+/// Largest reference table one env can have (16.7M slots on a 64-bit target).
+/// Past this `napi_create_reference` refuses rather than minting a handle
+/// whose index would be truncated.
+const REF_MAX_SLOTS: usize = REF_INDEX_MASK + 1;
+
+/// Source of per-env tags.
 ///
-/// `napi_delete_reference` DROPS the entry's `Box`, so a bare deref of a
-/// handle the addon already deleted is a use-after-free. The identity scan
-/// below is what makes the deref sound: it is the same `ptr::eq` comparison
-/// `napi_delete_reference` uses to find the entry it removes, so a handle
-/// that scan cannot find is exactly a handle that was freed (or was never
-/// ours). Every deref of a `NapiRefHandle` must go through here.
+/// The old address-identity scan got cross-env rejection for free, because the
+/// allocator never hands two live objects the same address. An index alone has
+/// no such property -- every env's table starts at index 0 -- so the tag is
+/// what replaces it. It is `REF_TAG_BITS` wide, so it repeats after 65,536
+/// envs on a 64-bit target; two LIVE envs would have to be that far apart in
+/// load order to share one, and an env is created per loaded addon. Stated
+/// rather than hidden: this is a narrower guarantee than address uniqueness,
+/// and it is the one place this design is weaker than what it replaces.
+static NAPI_ENV_TAG_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn next_env_ref_tag() -> usize {
+    NAPI_ENV_TAG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & REF_TAG_MASK
+}
+
+/// Pack a slot index and generation, with this env's tag, into the
+/// pointer-sized value the ABI hands back as a `napi_ref`.
 ///
-/// KNOWN LIMIT -- handle reuse (ABA). The scan compares ADDRESSES, so it cannot
-/// distinguish a stale handle from a new entry the allocator happened to place
-/// at the same address after `napi_delete_reference` freed the old one. Such a
-/// handle passes this check and resolves to a DIFFERENT reference than the
-/// caller meant: not a use-after-free (the memory is live and correctly typed),
-/// but a silent aliasing bug. Closing it needs handles that carry identity
-/// rather than an address -- an index plus a generation counter, so a reused
-/// slot fails the generation compare. That is a deliberate follow-up, not an
-/// oversight; the address scan is what makes the CURRENT deref sound, and the
-/// remaining hole is strictly smaller than the one it replaced.
+/// Never returns null. `generation` is >= 1 for every live slot and sits in a
+/// middle field, so the whole word is non-zero -- which matters because the
+/// ABI uses a null `napi_ref` as "no reference" (`napi_wrap` writes one).
+fn encode_ref_handle(tag: usize, index: usize, generation: usize) -> NapiRefHandle {
+    debug_assert!(index <= REF_INDEX_MASK, "slot index overflows its field");
+    debug_assert!(
+        generation >= 1 && generation <= REF_GEN_MASK,
+        "generation overflows its field, or is the null-sentinel 0"
+    );
+    let bits = ((tag & REF_TAG_MASK) << (REF_GEN_BITS + REF_INDEX_BITS))
+        | ((generation & REF_GEN_MASK) << REF_INDEX_BITS)
+        | (index & REF_INDEX_MASK);
+    bits as NapiRefHandle
+}
+
+/// Inverse of [`encode_ref_handle`], rejecting anything `tag` did not mint.
+///
+/// Pure integer work: no dereference, so a null, stale, foreign or wholly
+/// forged handle costs a few instructions and can never fault. That is the
+/// substantive difference from the address scan this replaced, which had to
+/// prove a handle was live before it dared touch it.
+fn decode_ref_handle(tag: usize, ref_: NapiRefHandle) -> Option<(usize, usize)> {
+    let bits = ref_ as usize;
+    // The ABI's "no reference" sentinel, and never a value we mint.
+    if bits == 0 {
+        return None;
+    }
+    if (bits >> (REF_GEN_BITS + REF_INDEX_BITS)) != (tag & REF_TAG_MASK) {
+        return None;
+    }
+    let generation = (bits >> REF_INDEX_BITS) & REF_GEN_MASK;
+    if generation == 0 {
+        return None;
+    }
+    Some((bits & REF_INDEX_MASK, generation))
+}
+
+impl NapiEnv {
+    /// Install `entry` in a free slot (or a fresh one) and mint its handle.
+    ///
+    /// Returns the entry back in `Err` when the table is full, so the caller
+    /// can drop it OUTSIDE its borrow of the env: dropping a `NapiRefEntry`
+    /// disposes a `v8::Global`, which touches the isolate, and nothing in this
+    /// file may hold a reference into `NapiEnv` across a call into V8.
+    fn alloc_ref(&mut self, entry: NapiRefEntry) -> Result<NapiRefHandle, NapiRefEntry> {
+        let index = match self.ref_free.pop() {
+            Some(index) => index,
+            None => {
+                if self.refs.len() >= REF_MAX_SLOTS {
+                    return Err(entry);
+                }
+                self.refs.push(NapiRefSlot {
+                    entry: None,
+                    generation: 1,
+                });
+                self.refs.len() - 1
+            }
+        };
+        let tag = self.ref_tag;
+        let slot = &mut self.refs[index];
+        slot.entry = Some(entry);
+        Ok(encode_ref_handle(tag, index, slot.generation))
+    }
+
+    /// Resolve `ref_` to its live entry, or `None` when the handle is null,
+    /// foreign to this env, out of range, names a generation the slot has
+    /// already moved past, or names a slot that is currently free.
+    fn ref_slot_entry(&self, ref_: NapiRefHandle) -> Option<&NapiRefEntry> {
+        let (index, generation) = decode_ref_handle(self.ref_tag, ref_)?;
+        let slot = self.refs.get(index)?;
+        if slot.generation != generation {
+            return None;
+        }
+        slot.entry.as_ref()
+    }
+
+    /// Exclusive counterpart to [`NapiEnv::ref_slot_entry`], for the refcount
+    /// mutators. Same acceptance rule.
+    fn ref_slot_entry_mut(&mut self, ref_: NapiRefHandle) -> Option<&mut NapiRefEntry> {
+        let (index, generation) = decode_ref_handle(self.ref_tag, ref_)?;
+        let slot = self.refs.get_mut(index)?;
+        if slot.generation != generation {
+            return None;
+        }
+        slot.entry.as_mut()
+    }
+
+    /// Take the entry `ref_` names out of the table and make its slot reusable.
+    ///
+    /// Hands the entry back rather than dropping it here, for the same reason
+    /// [`NapiEnv::alloc_ref`] does: the caller drops it once the borrow on the
+    /// env is gone.
+    fn free_ref(&mut self, ref_: NapiRefHandle) -> Option<NapiRefEntry> {
+        let (index, generation) = decode_ref_handle(self.ref_tag, ref_)?;
+        let slot = self.refs.get_mut(index)?;
+        if slot.generation != generation {
+            return None;
+        }
+        // A free slot has already had its generation bumped, so a stale handle
+        // normally fails the compare above. This still catches the one case it
+        // cannot: a RETIRED slot, whose generation is pinned at the maximum.
+        let entry = slot.entry.take()?;
+        if slot.generation < REF_MAX_GENERATION {
+            slot.generation += 1;
+            self.ref_free.push(index);
+        }
+        // else: the slot has exhausted its generations. Leaving it off the free
+        // list retires it for good, which is what stops the counter wrapping
+        // back onto a handle some addon may still be holding.
+        Some(entry)
+    }
+}
+
+/// Resolve a caller-supplied `napi_ref` to its entry, for the read paths.
+///
+/// The handle is DECODED, never dereferenced: it is an index plus a generation
+/// plus this env's tag, so resolving it is a bounds check and two integer
+/// compares against the env's own table. The only pointer this touches is
+/// `env` itself, and the reference it returns is derived from that -- so a
+/// null, stale, foreign or wholly forged handle is a miss, and never a fault.
+///
+/// This replaced a `ptr::eq` scan over boxed entries whose ABA hole was
+/// documented in place and then measured: 5,000 create/delete/create cycles
+/// through the vendored addon accepted 40 stale handles and resolved every one
+/// of them to the WRONG live reference. A generation that is bumped on free
+/// makes that case a deterministic miss.
 ///
 /// # Safety
 ///
 /// `env` must be the live `napi_env` this engine handed the addon; `ref_` is
-/// checked, so it may be null or stale.
-unsafe fn ref_entry<'a>(env: Env, ref_: NapiRefHandle) -> Option<&'a mut NapiRefEntry> {
-    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_ref` guards null, and
-    // the shared reborrow only reads the `refs` vec to validate the handle.
-    let env_ref = unsafe { env.as_ref()? };
-    let target = ref_ as *const NapiRefEntry;
-    if !env_ref
-        .refs
-        .iter()
-        .any(|r| std::ptr::eq(r.as_ref(), target))
-    {
-        return None;
-    }
-    // SAFETY: `target` was just found in `env.refs`, so it names a live
-    // `NapiRefEntry` box that is still owned by this env; the box is heap
-    // stable (pushed before the pointer was dispensed at napi_create_reference),
-    // so the address remains valid until napi_delete_reference removes it.
-    Some(unsafe { &mut *(ref_ as *mut NapiRefEntry) })
+/// checked, so it may be null, stale or foreign.
+unsafe fn ref_entry<'a>(env: Env, ref_: NapiRefHandle) -> Option<&'a NapiRefEntry> {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_ref` guards null. The
+    // reborrow is SHARED, which is what lets the caller keep the result live
+    // across `v8::Local::new` without claiming exclusivity over the whole env.
+    unsafe { env.as_ref()?.ref_slot_entry(ref_) }
+}
+
+/// Exclusive counterpart to [`ref_entry`], for the refcount mutators.
+///
+/// Callers must not hold the result across ANY call into V8 -- V8 can re-enter
+/// JS, JS can re-enter this ABI, and a second `&mut *env` while this one is
+/// live is aliasing UB. The two callers below only touch an integer and a
+/// caller-owned out-pointer, neither of which re-enters.
+///
+/// # Safety
+///
+/// As [`ref_entry`].
+unsafe fn ref_entry_mut<'a>(env: Env, ref_: NapiRefHandle) -> Option<&'a mut NapiRefEntry> {
+    // SAFETY: `env` is the caller's `*mut NapiEnv`; `as_mut` guards null, and
+    // the handle is decoded rather than dereferenced.
+    unsafe { env.as_mut()?.ref_slot_entry_mut(ref_) }
 }
 
 /// # Safety
@@ -1719,18 +1910,35 @@ pub unsafe extern "C" fn napi_create_reference(
             )
         };
     }
+    // Built BEFORE the env is borrowed: `v8::Global::new` calls into V8, and
+    // nothing in this file may hold a reference into `NapiEnv` across that.
     let global = v8::Global::new(scope, local);
-    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned fn_data/refs/wraps vecs.
-    let env_ref = unsafe { &mut *env };
-    env_ref.refs.push(Box::new(NapiRefEntry {
+    let entry = NapiRefEntry {
         value: global,
         refcount: initial_refcount,
-    }));
+    };
+    // SAFETY: `env` is the caller's `*mut NapiEnv`, checked non-null above; reborrowed here to reach its owned ref table. The borrow ends with this statement -- `alloc_ref` returns owned values either way.
+    let minted = unsafe { &mut *env }.alloc_ref(entry);
+    let handle = match minted {
+        Ok(handle) => handle,
+        Err(rejected) => {
+            // Drop the rejected entry -- and the `v8::Global` it owns -- now
+            // that no borrow of the env is live.
+            drop(rejected);
+            // SAFETY: `env` is the caller's env pointer; fail() null-guards.
+            return unsafe {
+                fail(
+                    env,
+                    NAPI_GENERIC_FAILURE,
+                    c"napi_create_reference: this env's reference table is full",
+                )
+            };
+        }
+    };
     #[cfg(test)]
     NAPI_REF_PUSH_COUNT.with(|c| c.set(c.get() + 1));
-    let ptr = &mut **env_ref.refs.last_mut().unwrap() as *mut NapiRefEntry as *mut c_void;
     // SAFETY: `result` is the caller's out-parameter pointer, null-checked above; out() null-checks it again before writing.
-    let status = unsafe { out(result, ptr) };
+    let status = unsafe { out(result, handle) };
     if status == NAPI_OK {
         // SAFETY: `env` is the caller's env pointer; ok() null-guards.
         return unsafe { ok(env) };
@@ -1752,10 +1960,12 @@ pub unsafe extern "C" fn napi_delete_reference(env: Env, ref_: NapiRefHandle) ->
     let Some(env_ref) = (unsafe { env.as_mut() }) else {
         return NAPI_INVALID_ARG;
     };
-    let target = ref_ as *const NapiRefEntry;
-    let before = env_ref.refs.len();
-    env_ref.refs.retain(|r| !std::ptr::eq(r.as_ref(), target));
-    if env_ref.refs.len() == before {
+    let removed = env_ref.free_ref(ref_);
+    let found = removed.is_some();
+    // Drop the entry -- and the `v8::Global` it owns -- only now that the
+    // borrow on the env is gone: disposing a persistent handle calls into V8.
+    drop(removed);
+    if !found {
         // Nothing was removed, so `ref_` is null, already deleted, or was never
         // ours. This used to answer NAPI_OK regardless, which made a
         // double-delete look successful and hid the addon's own bug -- and was
@@ -1800,7 +2010,12 @@ pub unsafe extern "C" fn napi_get_reference_value(
             )
         };
     };
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv` (env_scope proved it non-null); ref_entry rejects a null or already-deleted handle instead of dereferencing it.
+    // The borrow below is SHARED and stays live across `v8::Local::new`. That
+    // is deliberate: `Local::new` only copies a persistent into the current
+    // handle scope, so it cannot run JS and cannot re-enter this ABI. A
+    // re-entrant `napi_create_reference` would take `&mut *env`, which is why
+    // the exclusive lookup (`ref_entry_mut`) is kept off this path.
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv` (env_scope proved it non-null); ref_entry decodes the handle rather than dereferencing it, so null, stale and foreign handles are all misses.
     let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
         // SAFETY: as above.
         return unsafe {
@@ -1842,8 +2057,8 @@ pub unsafe extern "C" fn napi_reference_ref(
     ref_: NapiRefHandle,
     result: *mut u32,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
-    let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry_mut guards null on it and decodes the handle rather than dereferencing it, so a deleted or foreign handle is a miss.
+    let Some(entry) = (unsafe { ref_entry_mut(env, ref_) }) else {
         // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
         return unsafe {
             fail(
@@ -1854,9 +2069,12 @@ pub unsafe extern "C" fn napi_reference_ref(
         };
     };
     entry.refcount = entry.refcount.saturating_add(1);
+    // Copy out and END the exclusive borrow here: `ok()` below re-derives its
+    // own `&mut *env`, and the two must not be live at once.
+    let count = entry.refcount;
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
-        unsafe { *result = entry.refcount };
+        unsafe { *result = count };
     }
     // SAFETY: `env` is the caller's env pointer; ok() null-guards.
     unsafe { ok(env) }
@@ -1876,8 +2094,8 @@ pub unsafe extern "C" fn napi_reference_unref(
     ref_: NapiRefHandle,
     result: *mut u32,
 ) -> NapiStatus {
-    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry guards null on both pointers and rejects an already-deleted handle instead of dereferencing it.
-    let Some(entry) = (unsafe { ref_entry(env, ref_) }) else {
+    // SAFETY: `env` is the FFI caller's `*mut NapiEnv`; ref_entry_mut guards null on it and decodes the handle rather than dereferencing it, so a deleted or foreign handle is a miss.
+    let Some(entry) = (unsafe { ref_entry_mut(env, ref_) }) else {
         // SAFETY: `env` is the caller's env pointer or null; fail() null-guards.
         return unsafe {
             fail(
@@ -1888,9 +2106,11 @@ pub unsafe extern "C" fn napi_reference_unref(
         };
     };
     entry.refcount = entry.refcount.saturating_sub(1);
+    // As in napi_reference_ref: end the exclusive borrow before `ok()`.
+    let count = entry.refcount;
     if !result.is_null() {
         // SAFETY: `result` is a caller-provided out-parameter pointer, null-checked before this write.
-        unsafe { *result = entry.refcount };
+        unsafe { *result = count };
     }
     // SAFETY: `env` is the caller's env pointer; ok() null-guards.
     unsafe { ok(env) }

@@ -1909,6 +1909,14 @@ fn napi_reference_handle_from_another_env_is_rejected() {
     // memory, so only the per-env identity check can catch it being used in
     // env B. The same-env read is the control: it proves the rejection is about
     // provenance, not about the handle failing to round-trip through JS.
+    //
+    // b takes a reference of its own FIRST, and that is load-bearing. Handles
+    // are index+generation now, so b's first reference occupies exactly the
+    // slot and generation a's does -- index 0, generation 1. Everything except
+    // the per-env tag folded into the handle collides. Drop the tag from the
+    // encoding and this test resolves a's handle to b's OWN reference and
+    // reports napi_ok; without b's create it would pass on an empty table for
+    // the wrong reason.
     let dir = napi_addon_dir("napi_cross_env");
     let second = dir.join("second.node");
     std::fs::copy(dir.join("native.node"), &second).expect("second addon copy");
@@ -1919,10 +1927,15 @@ fn napi_reference_handle_from_another_env_is_rejected() {
          // Distinct addon instances, so distinct envs.\n\
          console.log(a === b);\n\
          const handle = a.makeRefHandle({ owned: 'by a' });\n\
+         // b's own first reference: same slot index, same generation, other env.\n\
+         const mine = b.makeRefHandle({ owned: 'by b' });\n\
          // 0 === napi_ok: a owns it.\n\
          console.log(a.readRefHandle(handle));\n\
          // 1 === napi_invalid_arg: b must not resolve another env's handle.\n\
-         console.log(b.readRefHandle(handle));",
+         console.log(b.readRefHandle(handle));\n\
+         // 0 === napi_ok: b still resolves its own, so the rejection above is\n\
+         // about provenance rather than b's table being broken.\n\
+         console.log(b.readRefHandle(mine));",
     );
     let out = oam(&["run", dir.join("cross.cjs").to_str().unwrap()]);
     assert!(
@@ -1939,7 +1952,151 @@ fn napi_reference_handle_from_another_env_is_rejected() {
     assert_eq!(lines[1], "0", "the owning env must resolve its own handle");
     assert_eq!(
         lines[2], "1",
-        "a different env must refuse a handle it never dispensed"
+        "a different env must refuse a handle it never dispensed, even when that handle names a slot index and generation it DOES have"
+    );
+    assert_eq!(
+        lines[3], "0",
+        "and must still resolve its own handle, so the rejection is about provenance"
+    );
+}
+
+#[test]
+fn napi_recycled_reference_slot_refuses_the_stale_handle() {
+    // The ABA case, and the reason napi_ref handles carry a generation instead
+    // of being addresses.
+    //
+    // abaStaleReadStatus() creates a reference, deletes it, creates a SECOND
+    // one -- which recycles what the delete released -- and then hands the host
+    // the FIRST, stale handle. It answers 1 (napi_invalid_arg) when the host
+    // refuses, or the observed value when the host accepts: 222 for the second
+    // reference (the wrong entry), 111 for the original.
+    //
+    // Measured against the pointer-identity scan this replaced, on
+    // windows-aarch64: 40 of these 5000 cycles were ACCEPTED, and every one of
+    // them resolved to 222 -- a live, correctly-typed, WRONG reference, with no
+    // crash to notice. 36 cycles saw the allocator hand the recycled entry the
+    // exact address of the freed one, which is the mechanism. So the loop is
+    // what makes this load-bearing: a single cycle passed even before the fix
+    // (recycling is probabilistic), and asserting on one would have proved
+    // nothing.
+    let dir = napi_addon_dir("napi_ref_aba");
+    write_temp(
+        "napi_ref_aba/aba.cjs",
+        "const native = require('./native.node');\n\
+         let accepted = 0;\n\
+         let recycled = 0;\n\
+         for (let i = 0; i < 5000; i++) {\n\
+         \x20 if (native.abaStaleReadStatus() !== 1) accepted++;\n\
+         \x20 if (native.abaHandleRecycled() === 1) recycled++;\n\
+         }\n\
+         console.log(accepted);\n\
+         // Diagnostic: a handle must never repeat, whatever the allocator does.\n\
+         console.log(recycled);",
+    );
+    let out = oam(&["run", dir.join("aba.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "0",
+        "no stale handle may resolve after its slot is recycled"
+    );
+    assert_eq!(
+        lines[1], "0",
+        "a recycled slot must mint a DIFFERENT handle, because its generation moved"
+    );
+}
+
+#[test]
+fn napi_forged_reference_handles_are_rejected() {
+    // Four ways to be wrong about a handle, each derived from a REAL one so
+    // that only the named field differs. The shifts come from the engine's own
+    // layout constants rather than being spelled out here, so a change to the
+    // encoding cannot leave this test quietly probing the wrong bits.
+    //
+    // Every one of these is load-bearing against a plain index+generation
+    // table with no tag, or against a table that skips either check:
+    //   * +1 index      -- passes without the bounds check (there is 1 slot).
+    //   * +1 generation -- passes without the generation compare.
+    //   * +1 tag        -- passes without the per-env tag.
+    //   * arbitrary     -- the pre-existing garbage-bits case, kept.
+    use oam_engine::napi::{REF_GEN_BITS, REF_INDEX_BITS};
+
+    let dir = napi_addon_dir("napi_forged_handle");
+    let gen_shift = REF_INDEX_BITS;
+    let tag_shift = REF_INDEX_BITS + REF_GEN_BITS;
+    write_temp(
+        "napi_forged_handle/forged.cjs",
+        &format!(
+            "const native = require('./native.node');\n\
+             const h = native.makeRefHandle({{ owned: 'real' }});\n\
+             // 0 === napi_ok: the unmodified handle resolves. Control.\n\
+             console.log(native.readRefHandle(h));\n\
+             // Index one past the only slot in the table.\n\
+             console.log(native.readRefHandle(h + 1n));\n\
+             // Right slot, generation the slot has never been at.\n\
+             console.log(native.readRefHandle(h + (1n << {gen_shift}n)));\n\
+             // Right slot and generation, another env's tag.\n\
+             console.log(native.readRefHandle(h + (1n << {tag_shift}n)));\n\
+             // Arbitrary bits that were never a handle.\n\
+             console.log(native.readRefHandle(0x0123456789abcdefn));"
+        ),
+    );
+    let out = oam(&["run", dir.join("forged.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "0", "the real handle must still resolve");
+    assert_eq!(lines[1], "1", "an out-of-range slot index must be refused");
+    assert_eq!(lines[2], "1", "a stale generation must be refused");
+    assert_eq!(lines[3], "1", "another env's tag must be refused");
+    assert_eq!(lines[4], "1", "arbitrary bits must be refused");
+}
+
+#[test]
+fn napi_reference_slots_are_reused_rather_than_grown() {
+    // The bound that makes an index+generation table safe for this ABI: refs
+    // are created and deleted in pairs by the addon, so a paired create/delete
+    // loop must reuse ONE slot rather than growing the table forever. The slot
+    // index lives in the low bits of the handle, so a handle whose index stays
+    // put across 20k cycles is the observable form of that.
+    let dir = napi_addon_dir("napi_ref_reuse");
+    let index_mask = (1u64 << oam_engine::napi::REF_INDEX_BITS) - 1;
+    write_temp(
+        "napi_ref_reuse/reuse.cjs",
+        &format!(
+            "const native = require('./native.node');\n\
+             const mask = {index_mask}n;\n\
+             let first = null;\n\
+             let moved = 0;\n\
+             for (let i = 0; i < 20000; i++) {{\n\
+             \x20 const h = native.makeRefHandle({{}});\n\
+             \x20 const index = h & mask;\n\
+             \x20 if (first === null) first = index;\n\
+             \x20 else if (index !== first) moved++;\n\
+             \x20 native.deleteRefHandle(h);\n\
+             }}\n\
+             console.log(moved);"
+        ),
+    );
+    let out = oam(&["run", dir.join("reuse.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "a create/delete pair must reuse its slot, not append a new one"
     );
 }
 
