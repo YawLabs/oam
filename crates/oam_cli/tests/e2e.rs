@@ -1534,7 +1534,12 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
 }
 
 // ------------------------------------------------------------- N-API alpha
+//
+// Every item in this section is behind the `napi` cargo feature (default ON):
+// with it off there is no N-API layer to exercise and no exported ABI for an
+// addon to resolve against.
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_addon_loads_and_calls_native_functions() {
     // The workspace builds the test addon cdylib alongside everything
@@ -1582,6 +1587,7 @@ fn napi_addon_loads_and_calls_native_functions() {
     assert_eq!(lines[5], "ERR_NATIVE_ARGS");
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_create_int64_boundary_routes_to_number_or_bigint() {
     // Node-parity: napi_create_int64 must return a JS Number for values
@@ -1648,6 +1654,7 @@ fn napi_create_int64_boundary_routes_to_number_or_bigint() {
 /// failure that produces is `native.<newExport> is not a function`, which reads
 /// like a host bug rather than a build-order one. Comparing mtimes turns that
 /// into a one-line instruction.
+#[cfg(feature = "napi")]
 fn built_test_addon() -> std::path::PathBuf {
     let artifact = if cfg!(windows) {
         "oam_napi_test_addon.dll"
@@ -1716,6 +1723,7 @@ fn built_test_addon() -> std::path::PathBuf {
 /// Each test gets its OWN subdir: the napi tests run in parallel, and a shared
 /// native.node path races on Windows (one test's `oam run` holds the .node open
 /// while another overwrites it -> sharing violation).
+#[cfg(feature = "napi")]
 fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
     let built = built_test_addon();
     let addon = write_temp(&format!("{subdir}/native.node"), "placeholder");
@@ -1723,6 +1731,7 @@ fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
     addon.parent().unwrap().to_path_buf()
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_beta_wrap_counter_roundtrip() {
     let dir = napi_addon_dir("napi_beta_wrap");
@@ -1757,6 +1766,7 @@ fn napi_beta_wrap_counter_roundtrip() {
     assert_eq!(lines[3], "3", "first counter unchanged");
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_reference_read_after_delete_is_rejected() {
     // Regression: napi_get_reference_value used to deref the caller's handle
@@ -1800,6 +1810,7 @@ fn napi_reference_read_after_delete_is_rejected() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_reference_refcount_roundtrip() {
     // napi_reference_ref / napi_reference_unref had no coverage at all -- the
@@ -1833,6 +1844,7 @@ fn napi_reference_refcount_roundtrip() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_reference_ref_and_unref_after_delete_are_rejected() {
     // Companion to napi_reference_read_after_delete_is_rejected: the same
@@ -1864,6 +1876,7 @@ fn napi_reference_ref_and_unref_after_delete_are_rejected() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_foreign_reference_handle_is_rejected() {
     // A non-null pointer this env never dispensed (here, a stack address).
@@ -1888,6 +1901,7 @@ fn napi_foreign_reference_handle_is_rejected() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_reference_handle_from_another_env_is_rejected() {
     // Two .node files in one process -- routine for MCP sidecars -- means two
@@ -1929,6 +1943,7 @@ fn napi_reference_handle_from_another_env_is_rejected() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_create_reference_with_null_out_is_rejected() {
     // Pins the STATUS contract only, and deliberately claims no more: a null
@@ -1961,6 +1976,7 @@ fn napi_create_reference_with_null_out_is_rejected() {
     assert_eq!(lines[1], "1", "and must stay so on a second call");
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_delete_reference_refuses_an_unknown_handle() {
     // napi_delete_reference used to answer napi_ok unconditionally, so a
@@ -1987,6 +2003,7 @@ fn napi_delete_reference_refuses_an_unknown_handle() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_last_error_info_explains_the_failure() {
     // napi_get_last_error_info used to return a permanently-zeroed struct, so
@@ -2021,6 +2038,7 @@ fn napi_last_error_info_explains_the_failure() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_beta_bigint_int64_create_and_read() {
     let dir = napi_addon_dir("napi_beta_bigint");
@@ -2053,6 +2071,7 @@ fn napi_beta_bigint_int64_create_and_read() {
     assert_eq!(lines[3], "-1000", "bigint roundtrip -1000");
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_beta_buffer_create_and_len() {
     let dir = napi_addon_dir("napi_beta_buffer");

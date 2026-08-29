@@ -352,8 +352,25 @@ fn main() -> ExitCode {
                 flags.allow_worker = true;
                 i += 1;
             } else if arg == "--allow-addons" {
-                flags.allow_addons = true;
-                i += 1;
+                // Built without the `napi` cargo feature: no `.node` addon can
+                // ever load, so granting the permission would be a silent
+                // no-op that reads as "addons are on". Fail loudly instead --
+                // a wrong-build diagnosis at startup beats a confusing
+                // OAM-NATIVE0002 throw from deep inside require().
+                #[cfg(not(feature = "napi"))]
+                {
+                    eprintln!(
+                        "oam: --allow-addons is not supported by this build: it was compiled \
+                         without the `napi` cargo feature, so native .node addons cannot be \
+                         loaded at all."
+                    );
+                    return ExitCode::from(9);
+                }
+                #[cfg(feature = "napi")]
+                {
+                    flags.allow_addons = true;
+                    i += 1;
+                }
             } else if arg == "--expose-gc" {
                 flags.expose_gc = true;
                 i += 1;

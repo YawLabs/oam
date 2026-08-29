@@ -151,6 +151,22 @@ pattern do its job (`ssh2`/`cpu-features`, `bufferutil`, `bcrypt`, and friends a
 it). Turning the flag on enables oam's own N-API implementation, which is alpha and
 covers the value/property/function/error core.
 
+The env var is the *runtime* switch. There is also a *compile-time* one: the `napi`
+cargo feature, on by default. A binary built with `--no-default-features` does not
+compile the N-API layer at all and exports no `napi_*` ABI, so no addon can resolve
+against it under any setting. Such a build reports a distinct code so the message never
+suggests an env var that would not help:
+
+```
+cannot load native addon <file>: this build of oam has no N-API support -- it was
+compiled without the `napi` cargo feature. Rebuild with the default features (or
+`--features napi`).
+```
+
+It is still a catchable throw, so the `try { require(native) } catch { fallback }`
+pattern behaves identically. `--allow-addons` is rejected at startup in such a build
+rather than silently granting a permission nothing can use.
+
 ### 3. Fatal reports end with `oam vX.Y.Z`
 
 An uncaught exception prints in Node's format — source frame, caret, blank line, stack,

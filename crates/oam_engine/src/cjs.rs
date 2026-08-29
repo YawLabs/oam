@@ -266,38 +266,64 @@ pub(crate) fn load_cjs<'s>(
 
     // N-API addons: dlopen + register, cached like any CJS module.
     if key.extension().and_then(|e| e.to_str()) == Some("node") {
-        // Native .node loading is OFF by default. A Node-built addon (compiled
-        // against node.exe) can DEADLOCK the OS loader when dlopen'd into oam
-        // (its load-time static initializers run under the Windows loader lock
-        // and call back into the host) -- an unkillable hang BEFORE any oam code
-        // runs. That hang defeats the universal `try { require(native) } catch {
-        // pure-JS fallback }` pattern (ssh2/cpu-features, bufferutil, bcrypt,
-        // ...). Throwing a clean, catchable error instead lets every such
-        // fallback work. oam's own N-API alpha (compatible addons) is available
-        // via OAM_ENABLE_NATIVE_ADDONS=1.
-        if std::env::var_os("OAM_ENABLE_NATIVE_ADDONS").is_none() {
+        // Built WITHOUT the `napi` cargo feature: the N-API layer is not
+        // compiled in at all, so there is nothing to enable and no env var
+        // that would help. A DISTINCT code (0002, not 0001) so the message
+        // never reads as "flip OAM_ENABLE_NATIVE_ADDONS and retry" -- that
+        // would be a lie in this build. Still a THROW, not a hard error: the
+        // universal `try { require(native) } catch { pure-JS fallback }`
+        // pattern must keep working exactly as it does with the feature on.
+        #[cfg(not(feature = "napi"))]
+        {
             throw_error_with_code(
                 scope,
-                "OAM-NATIVE0001",
+                "OAM-NATIVE0002",
                 &format!(
-                    "cannot load native addon {file}: native .node addons are disabled by default \
-                     (a Node-built addon can deadlock the loader). Set OAM_ENABLE_NATIVE_ADDONS=1 \
-                     to enable oam's N-API support (alpha)."
+                    "cannot load native addon {file}: this build of oam has no \
+                     N-API support -- it was compiled without the `napi` cargo \
+                     feature. Rebuild with the default features (or \
+                     `--features napi`)."
                 ),
             );
             return None;
         }
-        let exports_value = crate::napi::load_addon(scope, &key)?;
-        let module = v8::Object::new(scope);
-        let exports_key = v8::String::new(scope, "exports")?;
-        module.set(scope, exports_key.into(), exports_value);
-        let global = v8::Global::new(scope, module);
-        scope
-            .get_slot_mut::<CjsCache>()
-            .expect("cjs cache installed")
-            .modules
-            .insert(key, global);
-        return Some(exports_value);
+        #[cfg(feature = "napi")]
+        {
+            // Native .node loading is OFF by default. A Node-built addon
+            // (compiled against node.exe) can DEADLOCK the OS loader when
+            // dlopen'd into oam (its load-time static initializers run under
+            // the Windows loader lock and call back into the host) -- an
+            // unkillable hang BEFORE any oam code runs. That hang defeats the
+            // universal `try { require(native) } catch { pure-JS fallback }`
+            // pattern (ssh2/cpu-features, bufferutil, bcrypt, ...). Throwing a
+            // clean, catchable error instead lets every such fallback work.
+            // oam's own N-API alpha (compatible addons) is available via
+            // OAM_ENABLE_NATIVE_ADDONS=1.
+            if std::env::var_os("OAM_ENABLE_NATIVE_ADDONS").is_none() {
+                throw_error_with_code(
+                    scope,
+                    "OAM-NATIVE0001",
+                    &format!(
+                        "cannot load native addon {file}: native .node addons \
+                         are disabled by default (a Node-built addon can \
+                         deadlock the loader). Set OAM_ENABLE_NATIVE_ADDONS=1 \
+                         to enable oam's N-API support (alpha)."
+                    ),
+                );
+                return None;
+            }
+            let exports_value = crate::napi::load_addon(scope, &key)?;
+            let module = v8::Object::new(scope);
+            let exports_key = v8::String::new(scope, "exports")?;
+            module.set(scope, exports_key.into(), exports_value);
+            let global = v8::Global::new(scope, module);
+            scope
+                .get_slot_mut::<CjsCache>()
+                .expect("cjs cache installed")
+                .modules
+                .insert(key, global);
+            return Some(exports_value);
+        }
     }
 
     // TypeScript reached via require() (.ts/.cts/.mts): read the source, then

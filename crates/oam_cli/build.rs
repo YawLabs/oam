@@ -2,6 +2,10 @@
 //! resolve `napi_*` from their host process (node.exe's model). Windows
 //! needs an explicit .def; Linux needs --export-dynamic; macOS modern ld
 //! strips unreferenced exports unless told otherwise (-export_dynamic).
+//!
+//! Entirely gated on this crate's `napi` cargo feature (default ON): with it
+//! off, oam_engine::napi is not compiled, no `napi_*` symbol exists, and this
+//! script emits nothing.
 
 const NAPI_EXPORTS: &[&str] = &[
     // alpha wave
@@ -147,6 +151,20 @@ const NAPI_EXPORTS: &[&str] = &[
 ];
 
 fn main() {
+    // Cargo re-runs a build script when the package's feature set changes, so
+    // this branch is part of the fingerprint -- flipping `napi` off relinks
+    // without the export machinery rather than reusing a stale link arg.
+    //
+    // A build script only ever sees its OWN package's features (Cargo sets
+    // CARGO_FEATURE_<NAME> for those, never a dependency's), which is why
+    // oam_cli carries a `napi` passthrough of its own rather than reading
+    // oam_engine's. With it off there is no `napi_*` symbol in the crate graph
+    // to export -- oam_engine::napi is not compiled -- and emitting a .def
+    // naming absent symbols would be a hard LNK2001 at link time.
+    if std::env::var_os("CARGO_FEATURE_NAPI").is_none() {
+        return;
+    }
+
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "windows" => {
