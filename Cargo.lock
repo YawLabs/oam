@@ -1946,6 +1946,7 @@ dependencies = [
  "rand_core 0.6.4",
  "ring",
  "rsa",
+ "rustix 1.1.4",
  "scrypt",
  "serde",
  "serde_json",
