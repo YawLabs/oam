@@ -279,26 +279,37 @@ mod crt_fd {
 /// should surface.
 #[cfg(unix)]
 fn dup_inherited(fd: u64) -> Option<std::fs::File> {
-    use std::os::fd::FromRawFd;
     let raw = i32::try_from(fd).ok()?;
-    // F_GETFD is the cheapest "is this open" question; dup would also tell us,
-    // but only by allocating a descriptor we would have to put back.
+    if raw < 0 {
+        return None;
+    }
+    // F_GETFD is the cheapest "is this open" question, and it is deliberately
+    // still the RAW call: it is the probe that establishes openness, so it is
+    // the one place that cannot presuppose it. `fcntl` on an arbitrary integer
+    // is fully defined -- a closed or never-opened descriptor answers EBADF.
+    //
     // SAFETY: `fcntl(F_GETFD)` only reads the flags of the integer fd `raw`; no
-    // pointers are involved.
+    // pointers are involved, and an invalid `raw` is reported as -1/EBADF
+    // rather than being undefined.
     if unsafe { libc::fcntl(raw, libc::F_GETFD) } == -1 {
         return None;
     }
+    // SAFETY: the F_GETFD probe on the line above returned successfully, so
+    // `raw` names an open descriptor in this process, and it is non-negative
+    // (checked above) -- both of `BorrowedFd::borrow_raw`'s requirements. The
+    // borrow is confined to the `fcntl_dupfd_cloexec` call on the next line and
+    // nothing in between can close `raw`: this function owns no descriptor and
+    // the value came from the parent's inherited set, which is fixed at exec.
+    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
     // FD_CLOEXEC on the dup: an fd the parent handed US is not automatically
     // something our own children should receive.
-    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` duplicates the integer fd `raw`; no
-    // pointers are involved and the returned fd is checked below.
-    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
-    if dup == -1 {
-        return None;
-    }
-    // SAFETY: `dup` is a fresh, owned fd (checked non-negative just above); the
-    // new File takes sole ownership and closes it on drop.
-    Some(unsafe { std::fs::File::from_raw_fd(dup) })
+    //
+    // rustix hands back an `OwnedFd`, so the descriptor arrives already owned
+    // and `File::from` is an infallible, safe move of that ownership -- where
+    // `File::from_raw_fd` used to be a bare assertion that the integer was
+    // ours to close.
+    let dup = rustix::io::fcntl_dupfd_cloexec(borrowed, 0).ok()?;
+    Some(std::fs::File::from(dup))
 }
 
 #[cfg(windows)]
@@ -925,6 +936,55 @@ pub fn run_exit_cleanup() {
 pub fn exit_process(code: i32) -> ! {
     run_exit_cleanup();
     std::process::exit(code)
+}
+
+/// The ONE place a `rustix::io::Errno` becomes a `std::io::Error`.
+///
+/// Load-bearing, and the reason it is a named function rather than an inline
+/// `.map_err(Into::into)` at each site: on Linux rustix defaults to its
+/// `linux_raw` backend, which issues raw syscalls and NEVER writes libc's
+/// thread-local `errno`. So after a failed rustix call
+/// `std::io::Error::last_os_error()` holds whatever unrelated value was left
+/// there earlier -- the number the failing call produced is reachable ONLY
+/// through the returned `Errno`.
+///
+/// Everything downstream of an fs op reads the error through
+/// `std::io::Error::raw_os_error()` (directly in `node_errno`, and indirectly
+/// via `ErrorKind` in `node_error_code`), which is exactly what
+/// `from_raw_os_error` populates. Routing every rustix call site through this
+/// one function is what keeps Node's `code` / `errno` / `syscall` / `path`
+/// triple intact across the libc-to-rustix move.
+///
+/// `Errno::raw_os_error()` is POSITIVE on both backends: the `linux_raw`
+/// backend stores the kernel's negated value internally and negates it back
+/// here, and the libc backend (macOS) never negated it in the first place.
+#[cfg(unix)]
+#[inline]
+pub fn io_from_errno(e: rustix::io::Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.raw_os_error())
+}
+
+/// `-1` in a `chown` uid/gid field means "leave this one alone". It reaches us
+/// from JS as an unsigned `u32::MAX`, which is the same bit pattern libc's
+/// `(uid_t)-1` sentinel uses -- so the old raw `libc::chown` got the behaviour
+/// for free by passing the value straight through.
+///
+/// rustix spells the sentinel `None` instead, and `Uid::from_raw` only rejects
+/// `!0` behind a `debug_assert!` -- which is compiled OUT in release. So a
+/// `Uid::from_raw(u32::MAX)` would sail through a release build and be passed
+/// to the kernel as a literal uid of 4294967295 rather than "no change". The
+/// mapping has to be explicit here, and is covered by a test.
+#[cfg(unix)]
+#[inline]
+pub fn chown_uid(uid: u32) -> Option<rustix::fs::Uid> {
+    (uid != u32::MAX).then(|| rustix::fs::Uid::from_raw(uid))
+}
+
+/// `chown_uid`'s twin for the group field; same `-1` sentinel, same reasoning.
+#[cfg(unix)]
+#[inline]
+pub fn chown_gid(gid: u32) -> Option<rustix::fs::Gid> {
+    (gid != u32::MAX).then(|| rustix::fs::Gid::from_raw(gid))
 }
 
 /// Node's `err.errno` -- the libuv error NUMBER (negative).
@@ -2123,14 +2183,11 @@ pub mod ops {
         // libuv reports 0 there, so this does too rather than invent one.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // SAFETY: an all-zero `statfs` is a valid uninitialized value.
-            let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-            // SAFETY: `c_path` is a NUL-terminated C string that outlives the
-            // call and `&mut buf` is the live struct above; its fields are only
-            // read below after a 0 (success) return.
-            if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            // rustix owns the out-parameter: it allocates the `statfs`, makes
+            // the call, and hands back an initialized struct or an `Errno` --
+            // so neither the zeroed-buffer assumption nor the "fields are only
+            // valid after a 0 return" obligation exists on this side any more.
+            let buf = rustix::fs::statfs(c_path.as_c_str()).map_err(super::io_from_errno)?;
             Ok(statfs_fields_json(
                 buf.f_type as u64,
                 buf.f_bsize as u64,
@@ -2143,14 +2200,8 @@ pub mod ops {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // SAFETY: an all-zero `statvfs` is a valid uninitialized value.
-            let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
-            // SAFETY: as above, for the POSIX `statvfs` shape -- `c_path`
-            // outlives the call and `&mut buf` is the live struct; read only
-            // after a 0 (success) return.
-            if unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            // Same out-parameter ownership note as the BSD `statfs` arm above.
+            let buf = rustix::fs::statvfs(c_path.as_c_str()).map_err(super::io_from_errno)?;
             Ok(statfs_fields_json(
                 0,
                 buf.f_bsize as u64,
@@ -2593,19 +2644,11 @@ pub mod ops {
     fn fchown_file(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            // -1 means "leave this one alone". node hands it through as an
-            // unsigned value, so the wrap back to the signed libc type is the
-            // intended round trip rather than an accident.
-            // SAFETY: `file.as_raw_fd()` is a live fd for the duration of the
-            // call and the uid/gid are plain integers; no pointers are involved.
-            let rc =
-                unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            // `&std::fs::File` already IS an `AsFd`, so rustix borrows the live
+            // descriptor directly -- there is no raw-fd round trip to justify.
+            // -1 ("leave this one alone") becomes `None`; see `chown_uid`.
+            rustix::fs::fchown(file, super::chown_uid(uid), super::chown_gid(gid))
+                .map_err(super::io_from_errno)
         }
         #[cfg(not(unix))]
         {
@@ -2622,29 +2665,38 @@ pub mod ops {
     /// floor + remainder rather than a plain cast: for a negative time (before
     /// 1970, which node permits) a truncating cast rounds toward zero and lands
     /// a nanosecond field whose sign disagrees with its seconds.
+    ///
+    /// `rustix::fs::Timespec` rather than `libc::timespec`: on Linux rustix
+    /// runs the raw-syscall backend and carries its own (identically laid out)
+    /// struct, so this has to be the type the call actually takes. `tv_sec` is
+    /// `i64` on every target; `tv_nsec` is `i64` or `c_long` depending on the
+    /// backend, hence the inferred cast.
     #[cfg(unix)]
-    fn to_timespec(ms: f64) -> libc::timespec {
+    fn to_timespec(ms: f64) -> rustix::fs::Timespec {
         let secs = (ms / 1000.0).floor();
         let nanos = ((ms - secs * 1000.0) * 1_000_000.0).round();
-        libc::timespec {
-            tv_sec: secs as libc::time_t,
+        rustix::fs::Timespec {
+            tv_sec: secs as _,
             tv_nsec: nanos as _,
+        }
+    }
+
+    /// The `(atime, mtime)` pair `futimens`/`utimensat` take, in rustix's named
+    /// form -- which replaces the positional two-element array the raw calls
+    /// used and removes the chance of stamping them in the wrong order.
+    #[cfg(unix)]
+    fn timestamps(atime_ms: f64, mtime_ms: f64) -> rustix::fs::Timestamps {
+        rustix::fs::Timestamps {
+            last_access: to_timespec(atime_ms),
+            last_modification: to_timespec(mtime_ms),
         }
     }
 
     fn futimes_file(file: &std::fs::File, atime_ms: f64, mtime_ms: f64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
-            // SAFETY: `file.as_raw_fd()` is a live fd and `times.as_ptr()` points
-            // at the live two-element array above, which outlives the call.
-            let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
-            if rc == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            rustix::fs::futimens(file, &timestamps(atime_ms, mtime_ms))
+                .map_err(super::io_from_errno)
         }
         #[cfg(windows)]
         {
@@ -2776,24 +2828,26 @@ pub mod ops {
                     "path contains an interior NUL byte",
                 )
             })?;
-            // -1 in either field means "leave it alone"; node passes it through
-            // unsigned, so the wrap back to the signed libc type is the round
-            // trip we want, not an accident.
-            // SAFETY: `c.as_ptr()` is a NUL-terminated C string that outlives the
-            // call and the uid/gid are plain integers; no other memory is
-            // touched.
-            let rc = unsafe {
-                if follow {
-                    libc::chown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
-                } else {
-                    libc::lchown(c.as_ptr(), uid as libc::uid_t, gid as libc::gid_t)
-                }
-            };
-            if rc == 0 {
-                Ok(())
+            // -1 in either field means "leave it alone"; see `chown_uid` for why
+            // that sentinel has to be spelled `None` explicitly here.
+            //
+            // `lchown` has no standalone spelling in rustix, so the no-follow
+            // arm is the portable `fchownat(AT_FDCWD, .., AT_SYMLINK_NOFOLLOW)`
+            // -- the same call libc's `lchown` is a wrapper around. `CWD` is a
+            // safe const `BorrowedFd`, so no raw fd is constructed.
+            let (owner, group) = (super::chown_uid(uid), super::chown_gid(gid));
+            let r = if follow {
+                rustix::fs::chown(c.as_c_str(), owner, group)
             } else {
-                Err(std::io::Error::last_os_error())
-            }
+                rustix::fs::chownat(
+                    rustix::fs::CWD,
+                    c.as_c_str(),
+                    owner,
+                    group,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+            };
+            r.map_err(super::io_from_errno)
         }
         #[cfg(not(unix))]
         {
@@ -2814,17 +2868,15 @@ pub mod ops {
                     "path contains an interior NUL byte",
                 )
             })?;
-            let times = [to_timespec(atime_ms), to_timespec(mtime_ms)];
-            let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-            // SAFETY: `c.as_ptr()` is a NUL-terminated C string and
-            // `times.as_ptr()` points at the live array above; both outlive the
-            // call, and AT_FDCWD/flags are plain integers.
-            let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) };
-            if rc == 0 {
-                Ok(())
+            let times = timestamps(atime_ms, mtime_ms);
+            let flags = if follow {
+                rustix::fs::AtFlags::empty()
             } else {
-                Err(std::io::Error::last_os_error())
-            }
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW
+            };
+            // `CWD` is rustix's safe const `BorrowedFd` for `AT_FDCWD`.
+            rustix::fs::utimensat(rustix::fs::CWD, c.as_c_str(), &times, flags)
+                .map_err(super::io_from_errno)
         }
         #[cfg(windows)]
         {
@@ -2871,21 +2923,18 @@ pub mod ops {
                 "path contains an interior NUL byte",
             )
         })?;
-        // SAFETY: `c.as_ptr()` is a NUL-terminated C string that outlives the
-        // call; AT_FDCWD, the mode, and AT_SYMLINK_NOFOLLOW are plain integers.
-        let rc = unsafe {
-            libc::fchmodat(
-                libc::AT_FDCWD,
-                c.as_ptr(),
-                mode as libc::mode_t,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        // `from_bits_retain` rather than `Mode::from` / `from_raw_mode`: those
+        // mask off the S_IFMT bits, where the raw `fchmodat` this replaces
+        // passed the caller's value through untouched. Retaining every bit
+        // keeps the kernel -- not this wrapper -- the thing that decides what a
+        // malformed mode means.
+        rustix::fs::chmodat(
+            rustix::fs::CWD,
+            c.as_c_str(),
+            rustix::fs::Mode::from_bits_retain(mode as _),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(super::io_from_errno)
     }
 
     pub async fn fs_chown(path: String, uid: u32, gid: u32, follow: bool) -> OpOutcome {
@@ -3641,6 +3690,102 @@ pub mod ops {
             Ok(None) => OpOutcome::Done,
             Err(e) => OpOutcome::Failed(format!("fetch: body read failed: {e}")),
         }
+    }
+}
+
+/// Tests for the libc-to-rustix substitution's two silent-regression risks:
+/// the `-1` uid/gid sentinel and the errno round trip. Both are `cfg(unix)`,
+/// so they only run on the Linux and macOS legs.
+#[cfg(all(test, unix))]
+mod rustix_bridge_tests {
+    use super::{chown_gid, chown_uid, io_from_errno};
+
+    /// The whole point of `chown_uid`/`chown_gid`. `Uid::from_raw`'s own guard
+    /// against `!0` is a `debug_assert!`, which is compiled out in release --
+    /// so if these mapped `u32::MAX` to `Some(..)`, a release build would ask
+    /// the kernel to set uid 4294967295 where node means "leave it alone", and
+    /// every `chown(path, -1, gid)` would start failing with EINVAL/EPERM.
+    #[test]
+    fn minus_one_uid_and_gid_are_the_leave_alone_sentinel() {
+        assert!(chown_uid(u32::MAX).is_none());
+        assert!(chown_gid(u32::MAX).is_none());
+    }
+
+    /// ...and nothing else is. 0 (root) in particular must survive, since it
+    /// is both a real id and the most likely value to be special-cased wrong.
+    #[test]
+    fn real_ids_including_root_survive_the_mapping() {
+        for id in [0u32, 1, 1000, 65534, u32::MAX - 1] {
+            assert_eq!(chown_uid(id).map(|u| u.as_raw()), Some(id));
+            assert_eq!(chown_gid(id).map(|g| g.as_raw()), Some(id));
+        }
+    }
+
+    /// The errno trap, half one: the NUMBER. On Linux rustix issues raw
+    /// syscalls and never writes libc's `errno`, so
+    /// `std::io::Error::last_os_error()` is meaningless after a rustix call --
+    /// the value survives only through this helper. `node_errno` is
+    /// `-raw_os_error()` on unix, so a lost number means `err.errno` goes
+    /// `undefined` on every fs rejection.
+    #[test]
+    fn errno_number_round_trips() {
+        let cases = [
+            (rustix::io::Errno::NOENT, libc::ENOENT),
+            (rustix::io::Errno::ACCESS, libc::EACCES),
+            (rustix::io::Errno::PERM, libc::EPERM),
+            (rustix::io::Errno::BADF, libc::EBADF),
+            (rustix::io::Errno::NOTDIR, libc::ENOTDIR),
+            (rustix::io::Errno::ISDIR, libc::EISDIR),
+            (rustix::io::Errno::NOTEMPTY, libc::ENOTEMPTY),
+            (rustix::io::Errno::EXIST, libc::EEXIST),
+            (rustix::io::Errno::INVAL, libc::EINVAL),
+            (rustix::io::Errno::PIPE, libc::EPIPE),
+            (rustix::io::Errno::LOOP, libc::ELOOP),
+        ];
+        for (errno, raw) in cases {
+            let e = io_from_errno(errno);
+            assert_eq!(e.raw_os_error(), Some(raw), "raw_os_error for {raw}");
+            assert_eq!(
+                super::node_errno("", &e),
+                Some(-raw),
+                "node_errno for {raw}"
+            );
+        }
+    }
+
+    /// The errno trap, half two: the CODE STRING. `node_error_code` reads
+    /// `ErrorKind`, which std derives from `raw_os_error()` -- so it only
+    /// survives the move if the number does. Restricted to the errnos std maps
+    /// to a STABLE `ErrorKind`; EPERM deliberately is not among them (std folds
+    /// it into `PermissionDenied` alongside EACCES, so it has always reported
+    /// `EACCES` here) and neither is EBADF (no stable kind; the fd paths pass
+    /// their code in explicitly rather than deriving it).
+    #[test]
+    fn errno_code_string_round_trips() {
+        let cases = [
+            (rustix::io::Errno::NOENT, "ENOENT"),
+            (rustix::io::Errno::ACCESS, "EACCES"),
+            (rustix::io::Errno::EXIST, "EEXIST"),
+            (rustix::io::Errno::NOTDIR, "ENOTDIR"),
+            (rustix::io::Errno::ISDIR, "EISDIR"),
+            (rustix::io::Errno::NOTEMPTY, "ENOTEMPTY"),
+            (rustix::io::Errno::INVAL, "EINVAL"),
+            (rustix::io::Errno::PIPE, "EPIPE"),
+        ];
+        for (errno, code) in cases {
+            assert_eq!(super::node_error_code(&io_from_errno(errno)), code);
+        }
+    }
+
+    /// The positive-vs-negative half of the same trap: rustix's `linux_raw`
+    /// backend stores kernel error values NEGATED internally. If
+    /// `raw_os_error()` ever handed back that negated form, every code above
+    /// would silently degrade to `EIO` (no `ErrorKind` matches a negative OS
+    /// error) while still looking like a working error path.
+    #[test]
+    fn rustix_raw_os_error_is_positive() {
+        assert!(rustix::io::Errno::NOENT.raw_os_error() > 0);
+        assert_eq!(rustix::io::Errno::NOENT.raw_os_error(), libc::ENOENT);
     }
 }
 

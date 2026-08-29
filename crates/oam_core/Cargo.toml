@@ -50,10 +50,30 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
 ] }
 
-# Unix extra-fd stdio (child_unix.rs): raw pipe/dup2/kill/waitpid via libc.
+# Unix extra-fd stdio (child_unix.rs): the signal-number table, the pollfd for
+# the blocking pipe read, and the async-signal-safe `dup2` inside `pre_exec`.
 # cfg-gated so non-Unix builds never pull it.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Safe, ownership-typed wrappers over the POSIX syscalls this crate used to
+# call through raw `libc` FFI (statfs/statvfs, fchown/chown/chownat,
+# futimens/utimensat, chmodat, dup/fcntl/close/read/write, kill). Every one of
+# those was an `unsafe` block whose obligation is now discharged inside a
+# maintained, audited crate instead of here -- see AI-POLICY.md gate 5.
+#
+# NOT new supply chain: rustix 1.1.4 is already in Cargo.lock via tar -> xattr.
+# This is a new dependency EDGE onto a crate that was already being compiled.
+#
+# MUST stay cfg(unix): on Windows rustix ships only its Winsock surface, so
+# none of the fs/process APIs used here exist there.
+#
+# Errors arrive as `rustix::io::Errno`, NOT via `std::io::Error::last_os_error`
+# -- on Linux rustix defaults to the `linux_raw` backend, which issues raw
+# syscalls and never touches libc's thread-local `errno`. Every call site
+# therefore routes through `io_from_errno` (lib.rs), which is the single point
+# where the raw number becomes the `std::io::Error` that `node_error_code` /
+# `node_errno` read to build Node's `errno`/`syscall`/`path` triple.
+rustix = { version = "1.1.4", features = ["fs", "pipe", "process"] }
 
 # io_uring FS fast path: Linux-only async file I/O via io_uring, opt-in and
 # runtime-probed (see docs/design/io_uring.md). cfg-gated so non-Linux builds
