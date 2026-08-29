@@ -1711,7 +1711,7 @@ fn next_env_ref_tag() -> usize {
 fn encode_ref_handle(tag: usize, index: usize, generation: usize) -> NapiRefHandle {
     debug_assert!(index <= REF_INDEX_MASK, "slot index overflows its field");
     debug_assert!(
-        generation >= 1 && generation <= REF_GEN_MASK,
+        (1..=REF_GEN_MASK).contains(&generation),
         "generation overflows its field, or is the null-sentinel 0"
     );
     let bits = ((tag & REF_TAG_MASK) << (REF_GEN_BITS + REF_INDEX_BITS))

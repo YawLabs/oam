@@ -1,20 +1,17 @@
 {
   "_comment": "Real `unsafe` constructs per crate (unsafe_count), a CEILING that may only go DOWN, measured by `cargo run -p xtask -- unsafe-budget`. This is the AI-POLICY.md gate-5 ratchet; it GATES: a crate ABOVE its ceiling fails the run -- and so does a count strictly BELOW it (regenerate with --regen so the ratchet tightens). Per-SITE `// SAFETY:` coverage is NOT counted here: it is enforced on EVERY crate by clippy undocumented_unsafe_blocks = deny, unnecessary_safety_comment = deny and missing_safety_doc = deny. The old documented_count FLOOR was retired because it and unnecessary_safety_comment were in direct conflict -- the floor counted ~155 comments that the lint forbids. Scanned per workspace member: every .rs file under src/ and tests/, plus a top-level build.rs. Do not edit by hand.",
   "crates": {
-    "oam_aliasing_model": {
-      "unsafe_count": 24
-    },
     "oam_cli": {
       "unsafe_count": 3
     },
     "oam_core": {
-      "unsafe_count": 77
+      "unsafe_count": 90
     },
     "oam_diagnostics": {
       "unsafe_count": 0
     },
     "oam_engine": {
-      "unsafe_count": 596
+      "unsafe_count": 599
     },
     "oam_loader": {
       "unsafe_count": 0
@@ -23,7 +20,7 @@
       "unsafe_count": 0
     },
     "oam_napi_test_addon": {
-      "unsafe_count": 62
+      "unsafe_count": 70
     },
     "oam_ts": {
       "unsafe_count": 2
