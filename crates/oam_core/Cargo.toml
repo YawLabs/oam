@@ -73,7 +73,7 @@ libc = "0.2"
 # therefore routes through `io_from_errno` (lib.rs), which is the single point
 # where the raw number becomes the `std::io::Error` that `node_error_code` /
 # `node_errno` read to build Node's `errno`/`syscall`/`path` triple.
-rustix = { version = "1.1.4", features = ["fs", "pipe", "process"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process"] }
 
 # io_uring FS fast path: Linux-only async file I/O via io_uring, opt-in and
 # runtime-probed (see docs/design/io_uring.md). cfg-gated so non-Linux builds

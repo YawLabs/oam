@@ -732,7 +732,7 @@ pub async fn child_wait(children: ChildRegistry, handle: u64) -> OpOutcome {
 }
 
 /// Deliver a kill to `child`. On Unix this sends the caller's REQUESTED POSIX
-/// signal (default SIGTERM) via `libc::kill` on the pid, so a child can trap
+/// signal (default SIGTERM) via `kill(2)` on the pid, so a child can trap
 /// SIGTERM / SIGINT and shut down gracefully -- matching Node. `child.wait()`
 /// still reaps the exit afterward: tokio's SIGCHLD reaper observes the death
 /// regardless of which signal (or sender) caused it. On Windows there are no
@@ -752,8 +752,7 @@ fn deliver_kill(child: &mut tokio::process::Child, pid: u32, signal: Option<&str
         .map(crate::child_unix::signal_number)
         .unwrap_or(Some(libc::SIGTERM))
         .unwrap_or(libc::SIGTERM);
-    // SAFETY: kill(2) with a valid pid + signal number; touches no memory.
-    unsafe { libc::kill(pid as libc::pid_t, signum) };
+    crate::child_unix::deliver_signal(pid, signum);
 }
 
 #[cfg(windows)]
