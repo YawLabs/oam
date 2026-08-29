@@ -173,12 +173,11 @@ fn build_env_block(env: &[(String, String)], clear: bool) -> Vec<u16> {
 }
 
 fn open_nul() -> HANDLE {
-    // SAFETY: SECURITY_ATTRIBUTES is a plain C-data struct for which an all-zero
-    // bit pattern is a valid initial value; its meaningful fields are set on the
-    // two lines below before the struct is used.
-    let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
-    sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
-    sa.bInheritHandle = 1;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        bInheritHandle: 1,
+        ..Default::default()
+    };
     let name = to_wide("NUL");
     // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the call and
     // `&sa` points to the live SECURITY_ATTRIBUTES above; the remaining arguments

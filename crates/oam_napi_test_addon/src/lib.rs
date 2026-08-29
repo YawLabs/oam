@@ -15,7 +15,6 @@
 //!   readBigInt64(big)   -> Number   napi_get_value_bigint_int64
 //!   makeBuffer(n)       -> Uint8Array napi_create_buffer
 //!   bufferLen(buf)      -> Number   napi_get_buffer_info
-//!   testRef(value) -> [v, v] napi_create_reference + napi_get_reference_value + napi_delete_reference
 
 use std::ffi::{c_char, c_void};
 
@@ -669,62 +668,6 @@ unsafe extern "C" fn buffer_len(env: NapiEnv, info: NapiCallbackInfo) -> NapiVal
         let mut result: NapiValue = std::ptr::null_mut();
         (host().create_int64)(env, length as i64, &mut result);
         result
-    }
-}
-
-/// testRef(value) -> [v, v]
-/// Exercises create_reference / get_reference_value / delete_reference.
-/// Creates a reference to `value`, reads it back twice, deletes the reference,
-/// returns [first_read, second_read] -- both should equal the original value.
-///
-/// # Safety
-///
-/// Only ever invoked by the N-API host as a `napi_callback` with a live `env`
-/// and its `info` frame. Not currently listed in the registration tables, so
-/// in practice the host never calls it at all.
-#[allow(dead_code)]
-unsafe extern "C" fn test_ref(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
-    // SAFETY: `argc` is seeded with `argv`'s capacity of 1, bounding what
-    // `napi_get_cb_info` writes. `ref_handle`, `v1` and `v2` are live locals
-    // backing the out-pointers, and a failed `napi_create_reference` returns
-    // early rather than using an unwritten handle. The reference is created
-    // with refcount 1 and both reads happen before `napi_delete_reference`,
-    // so `ref_handle` is live at every use and is never touched again after
-    // the delete. `v1` stays usable afterwards because it is a handle-scope
-    // value owned by the current callback frame, not by the reference.
-    unsafe {
-        let mut argc = 1usize;
-        let mut argv: [NapiValue; 1] = [std::ptr::null_mut(); 1];
-        (host().get_cb_info)(
-            env,
-            info,
-            &mut argc,
-            argv.as_mut_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        let value = argv[0];
-
-        // Create a reference with refcount = 1.
-        let mut ref_handle: *mut c_void = std::ptr::null_mut();
-        if (host().create_reference)(env, value, 1, &mut ref_handle) != 0 {
-            return std::ptr::null_mut();
-        }
-
-        // Read it back twice.
-        let mut v1: NapiValue = std::ptr::null_mut();
-        let mut v2: NapiValue = std::ptr::null_mut();
-        (host().get_reference_value)(env, ref_handle, &mut v1);
-        (host().get_reference_value)(env, ref_handle, &mut v2);
-
-        // Delete the reference.
-        (host().delete_reference)(env, ref_handle);
-
-        // Build [v1, v2] as a 2-element array.
-        // No napi_create_array here -- use a JS literal trick via String instead,
-        // or just return v1 (same pointer). We'll return the first value since
-        // both should be the same object.  The test checks identity (===).
-        v1
     }
 }
 

@@ -233,6 +233,41 @@ pub const OWN_FD_BASE: u64 = 64;
 /// anywhere near the ceiling.
 pub const MAX_INHERITED_FD: u64 = OWN_FD_BASE - 1;
 
+#[cfg(windows)]
+mod crt_fd {
+    // The CRT fd table is not enumerable, so `_get_osfhandle` is the only way to
+    // ask whether a numbered fd is backed by anything. Both it and `_close`
+    // invoke the invalid-parameter handler on a bad fd, which ABORTS under a
+    // debug CRT, so the handler is swapped for a no-op around each call.
+    // ABI: these match the CRT's own signatures; no memory of ours is passed.
+    unsafe extern "C" {
+        pub fn _close(fd: i32) -> i32;
+        fn _get_osfhandle(fd: i32) -> isize;
+        pub fn _set_thread_local_invalid_parameter_handler(
+            handler: Option<unsafe extern "C" fn()>,
+        ) -> Option<unsafe extern "C" fn()>;
+    }
+    pub unsafe extern "C" fn ignore_invalid_parameter() {}
+
+    /// The OS handle behind CRT fd `raw`, or -1 if the fd is not open.
+    ///
+    /// Safe: only an integer is passed, nothing of ours is dereferenced, and
+    /// the no-op invalid-parameter handler turns a bad fd into a -1 return
+    /// instead of an abort. Any `i32` is an acceptable argument.
+    pub fn osfhandle(raw: i32) -> isize {
+        // SAFETY: `_get_osfhandle` reads the CRT fd table for `raw`; the
+        // invalid-parameter handler is swapped to a no-op around the probe so a
+        // bad fd yields -1 instead of aborting, then restored. No pointer of
+        // ours is dereferenced.
+        unsafe {
+            let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
+            let h = _get_osfhandle(raw);
+            _set_thread_local_invalid_parameter_handler(prev);
+            h
+        }
+    }
+}
+
 /// Duplicate a descriptor the PARENT owns into one we own.
 ///
 /// Deliberately a dup rather than `from_raw_fd(fd)`: the inherited descriptor
@@ -274,30 +309,8 @@ fn dup_inherited(fd: u64) -> Option<std::fs::File> {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    unsafe extern "C" {
-        // The CRT fd table is not enumerable, so this is the only way to ask
-        // whether a numbered fd is backed by anything.
-        fn _get_osfhandle(fd: i32) -> isize;
-        // _get_osfhandle invokes the invalid-parameter handler on a bad fd,
-        // which ABORTS under a debug CRT. Swapping in a no-op handler for the
-        // duration turns the probe back into a plain -1 return.
-        fn _set_thread_local_invalid_parameter_handler(
-            handler: Option<unsafe extern "C" fn()>,
-        ) -> Option<unsafe extern "C" fn()>;
-    }
-    unsafe extern "C" fn ignore_invalid_parameter() {}
-
     let raw = i32::try_from(fd).ok()?;
-    // SAFETY: `_get_osfhandle` reads the CRT fd table for `raw`; the
-    // invalid-parameter handler is swapped to a no-op around the probe so a bad
-    // fd yields -1 instead of aborting under a debug CRT, then restored. No
-    // pointer of ours is dereferenced.
-    let handle = unsafe {
-        let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
-        let h = _get_osfhandle(raw);
-        _set_thread_local_invalid_parameter_handler(prev);
-        h
-    };
+    let handle = crt_fd::osfhandle(raw);
     if handle == -1 || handle as HANDLE == INVALID_HANDLE_VALUE {
         return None;
     }
@@ -340,13 +353,9 @@ pub fn close_inherited_fd(fd: u64) {
     }
     #[cfg(windows)]
     if let Ok(raw) = i32::try_from(fd) {
-        unsafe extern "C" {
-            fn _close(fd: i32) -> i32;
-            fn _set_thread_local_invalid_parameter_handler(
-                handler: Option<unsafe extern "C" fn()>,
-            ) -> Option<unsafe extern "C" fn()>;
-        }
-        unsafe extern "C" fn ignore_invalid_parameter() {}
+        use crt_fd::{
+            _close, _set_thread_local_invalid_parameter_handler, ignore_invalid_parameter,
+        };
         // SAFETY: `_close` closes the CRT fd `raw`; the invalid-parameter handler
         // is swapped to a no-op around the call so a stale fd returns an error
         // instead of aborting, then restored. Only an integer fd is passed.
@@ -441,23 +450,7 @@ fn probe_open(fd: u64) -> bool {
     }
     #[cfg(windows)]
     {
-        unsafe extern "C" {
-            fn _get_osfhandle(fd: i32) -> isize;
-            fn _set_thread_local_invalid_parameter_handler(
-                handler: Option<unsafe extern "C" fn()>,
-            ) -> Option<unsafe extern "C" fn()>;
-        }
-        unsafe extern "C" fn ignore_invalid_parameter() {}
-        // SAFETY: `_get_osfhandle` reads the CRT fd table for `raw` to test
-        // whether the fd is backed; the invalid-parameter handler is swapped to
-        // a no-op around the probe so a bad fd yields -1 instead of aborting,
-        // then restored. No pointer of ours is dereferenced.
-        unsafe {
-            let prev = _set_thread_local_invalid_parameter_handler(Some(ignore_invalid_parameter));
-            let h = _get_osfhandle(raw);
-            _set_thread_local_invalid_parameter_handler(prev);
-            h != -1
-        }
+        crt_fd::osfhandle(raw) != -1
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1497,10 +1490,12 @@ pub mod zlib {
         }
     }
 
-    // SAFETY: CompressorInner holds only flate2 encoder types (GzEncoder /
-    // ZlibEncoder / DeflateEncoder over `Vec<u8>`), all of which are `Send`; the
-    // wrapper adds no thread-affine state, so moving it across threads is sound.
-    unsafe impl Send for StreamCompressor {}
+    // `StreamCompressor` is `Send` by auto-derivation: `CompressorInner` holds
+    // only flate2 encoders over `Vec<u8>`, every one of which is `Send`, and the
+    // wrapper adds no thread-affine state. Deliberately NOT a manual
+    // `unsafe impl Send` -- that would suppress the compiler's own auto-trait
+    // check and silently keep asserting `Send` if the inner types ever stopped
+    // being it.
 
     // ----------------------------------------------------------------
     // Truly incremental decompressor -- slice A.
@@ -1603,10 +1598,19 @@ pub mod zlib {
         }
     }
 
-    // SAFETY: DecompressorInner holds only flate2 write-decoders over `Vec<u8>`
-    // (all `Send`) plus the unit `Unzip` variant; the wrapper adds no thread-
-    // affine state, so moving it across threads is sound.
-    unsafe impl Send for StreamDecompressor {}
+    // `StreamDecompressor` is `Send` by auto-derivation: `DecompressorInner`
+    // holds only flate2 write-decoders over `Vec<u8>` (all `Send`) plus the unit
+    // `Unzip` variant. No manual `unsafe impl` -- see the note on
+    // `StreamCompressor` above.
+
+    // Compile-time proof of both notes. A manual `unsafe impl Send` asserts
+    // `Send` forever; this instead FAILS THE BUILD the day an inner type stops
+    // being `Send`, which is the behaviour we actually want.
+    const _: () = {
+        const fn assert_send<T: Send>() {}
+        assert_send::<StreamCompressor>();
+        assert_send::<StreamDecompressor>();
+    };
 }
 
 // ----------------------------------------------------------------
@@ -1672,10 +1676,10 @@ impl BrotliCompressor {
     }
 }
 
-// SAFETY: `brotli::CompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` (Send) and
-// self-contained brotli state with no thread-local references, so moving it
-// across threads is sound.
-unsafe impl Send for BrotliCompressor {}
+// `BrotliCompressor` is `Send` by auto-derivation: its
+// `brotli::CompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` and self-contained
+// brotli state, with no thread-local references. No manual `unsafe impl` --
+// see the note on `StreamCompressor`.
 
 /// Incremental brotli decompressor wrapping `brotli::DecompressorWriter`.
 pub struct BrotliDecompressor {
@@ -1719,10 +1723,18 @@ impl BrotliDecompressor {
     }
 }
 
-// SAFETY: `brotli::DecompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` (Send)
-// and self-contained brotli state with no thread-local references, so moving it
-// across threads is sound.
-unsafe impl Send for BrotliDecompressor {}
+// `BrotliDecompressor` is `Send` by auto-derivation: its
+// `brotli::DecompressorWriter<Vec<u8>>` wraps only a `Vec<u8>` and
+// self-contained brotli state, with no thread-local references. No manual
+// `unsafe impl` -- see the note on `StreamCompressor`.
+
+// Compile-time proof of both brotli notes; see the zlib assertion above for why
+// this is preferable to an `unsafe impl`.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<BrotliCompressor>();
+    assert_send::<BrotliDecompressor>();
+};
 
 /// Built-in op implementations. Plain futures; the engine decides how their
 /// outcomes surface in JS.
@@ -1855,18 +1867,14 @@ pub mod ops {
         // behind the unstable `windows_by_handle` feature, and oam builds on
         // stable -- so the call is made explicitly rather than reaching for a
         // nightly accessor.
-        // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid initial
-        // value; the GetFileInformationByHandle call below fills it.
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: `handle` is owned by a live File for the whole call, and
         // `info` is a correctly sized, writable BY_HANDLE_FILE_INFORMATION.
         if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
             return None;
         }
 
-        // SAFETY: an all-zero FILE_STANDARD_INFO is a valid initial value; the
-        // GetFileInformationByHandleEx call below fills it.
-        let mut standard: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+        let mut standard = FILE_STANDARD_INFO::default();
         // `blocks` counts 512-byte units of ALLOCATED space, which is not
         // ceil(size / 512): a small file resident in the MFT allocates none,
         // and node duly reports 0 blocks for it.
@@ -1885,9 +1893,7 @@ pub mod ops {
             0
         };
 
-        // SAFETY: an all-zero FILE_BASIC_INFO is a valid initial value; the
-        // GetFileInformationByHandleEx call below fills it.
-        let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        let mut basic = FILE_BASIC_INFO::default();
         // SAFETY: as above.
         let ctime_ms = if unsafe {
             GetFileInformationByHandleEx(
