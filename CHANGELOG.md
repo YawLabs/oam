@@ -18,12 +18,29 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Added
 
+- **`fsPromises.open()` returns a complete `FileHandle`.** `appendFile`,
+  `chmod`, `chown`, `truncate`, `sync`, `datasync`, `readv`, `writev`,
+  `utimes`, `createReadStream`, `createWriteStream` and `readLines` were all
+  absent, so calling any of them was a `TypeError`. Every method now also
+  rejects on a closed handle with Node's shape (`EBADF` plus the per-method
+  `syscall`) instead of reaching the descriptor. (#99)
 - A miri-checked model of the N-API pointer disciplines runs as its own gate
   step, so the aliasing claims behind the addon layer are machine-checked
   rather than argued. It found the `load_addon` defect below. (#88)
 
 ### Fixed
 
+- **A `FileHandle` described whatever file currently sat at its path, not its
+  own descriptor.** `fh.stat()` called the path-based `stat` rather than
+  `fstat`, so after the file was renamed or unlinked it reported a different
+  file's metadata, or failed outright -- open-then-unlink being an ordinary
+  temp-file pattern. It now stats the descriptor. (#99)
+- **`fs.createReadStream`'s `start` option never seeked.** It fed the byte
+  budget while every read still came from the cursor, so `{start: 6, end: 10}`
+  returned the file's first five bytes instead of the requested window. The
+  same code also closed the descriptor at EOF under `autoClose: false`, taking
+  ownership the caller had explicitly withheld. Both are reachable from the
+  plain path API, not just from a `FileHandle`. (#99, #100)
 - **A deleted `napi_ref` could silently resolve to a different live reference.**
   Handles were validated by comparing addresses, so once the allocator reused a
   freed entry's memory a stale handle passed the check and returned whichever
@@ -44,6 +61,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **`--allow-addons` is now enforced, not merely reported.** It maps to the
+  `ffi` permission, which nothing consumed: the grant was visible to
+  `process.permission.has('ffi')` and then ignored, so under `--permission`
+  *without* `--allow-addons` an addon still loaded whenever
+  `OAM_ENABLE_NATIVE_ADDONS` was set. **This is a behaviour change**: such a
+  run is now refused with `ERR_ACCESS_DENIED` (`permission: 'Addon'`). The
+  environment variable and the grant are independent and both must pass --
+  an env var cannot widen a permission the caller withheld. (#96)
 - **The N-API layer can be compiled out.** `oam_engine`'s `napi` feature is on
   by default, so an ordinary build is byte-for-byte unchanged; building without
   it leaves the 132-symbol Node-API surface out of the binary entirely, and
