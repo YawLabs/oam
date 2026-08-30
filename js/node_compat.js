@@ -9218,6 +9218,300 @@
     }
   }
 
+  // ---- vectored-IO primitives, shared by node:fs's readv/writev and by
+  // FileHandle.readv/writev.
+  //
+  // node splits these across the two modules -- node:fs exports the free
+  // functions (sync form returns a NUMBER, callback form is (err, bytes,
+  // buffers)), fs/promises exports only the FileHandle METHODS (which return
+  // {bytesRead, buffers} / {bytesWritten, buffers}). The return shapes differ;
+  // the validation and the gather/scatter do not, so they live out here rather
+  // than being written twice and drifting. Every rule below is measured
+  // against node v22.22.2 and holds for both surfaces:
+  //   - an EMPTY ARRAY is asymmetric: writev reports 0 without touching the
+  //     descriptor, readv raises EINVAL -- and the EINVAL wins even on a
+  //     CLOSED fd, so it is raised before the descriptor is looked at.
+  //   - an array of only ZERO-LENGTH views is NOT that case: it still issues
+  //     the syscall, so it still reports EBADF on a bad descriptor.
+  //   - a partial final buffer keeps the rest of its bytes UNTOUCHED.
+  //   - the SAME array identity comes back out, never a copy.
+  const asViewArray = (buffers) => {
+    // Index loop, NOT Array.prototype.every: every() skips holes, so a sparse
+    // array would slip through where node throws.
+    let ok = Array.isArray(buffers);
+    if (ok) {
+      for (let i = 0; i < buffers.length; i++) {
+        if (!ArrayBuffer.isView(buffers[i])) { ok = false; break; }
+      }
+    }
+    if (!ok) {
+      throw nodeTypeError(
+        `The "buffers" argument must be an ArrayBufferView[]. Received ${describeArg(buffers)}`,
+      );
+    }
+    let total = 0;
+    for (let i = 0; i < buffers.length; i++) total += buffers[i].byteLength;
+    return total;
+  };
+
+  // node's EINVAL for readv with an empty list. Own props in node's order.
+  const einvalRead = (platform) => {
+    const err = new Error("EINVAL: invalid argument, read");
+    err.errno = platform === "win32" ? -4071 : -22;
+    err.code = "EINVAL";
+    err.syscall = "read";
+    return err;
+  };
+
+  const flattenViews = (buffers, total) => {
+    const combined = globalThis.Buffer.allocUnsafe(total);
+    let off = 0;
+    for (let i = 0; i < buffers.length; i++) {
+      const v = buffers[i];
+      combined.set(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), off);
+      off += v.byteLength;
+    }
+    return combined;
+  };
+
+  // Scatter `n` bytes of `src` across the views, filling each in turn. A view
+  // that only partially fills keeps its remaining bytes as they were, because
+  // TypedArray.set writes exactly as many bytes as the source holds.
+  const scatterViews = (buffers, src, n) => {
+    let off = 0;
+    for (let i = 0; i < buffers.length && off < n; i++) {
+      const v = buffers[i];
+      const take = Math.min(v.byteLength, n - off);
+      if (take > 0) {
+        new Uint8Array(v.buffer, v.byteOffset, v.byteLength).set(src.subarray(off, off + take));
+      }
+      off += take;
+    }
+  };
+
+  // ONLY an empty array skips the descriptor. An array of zero-length views is
+  // a different case -- see the header above.
+  const emptyList = (buffers) => buffers.length === 0;
+
+  // ReadStream / WriteStream as real Readable / Writable subclasses, built
+  // lazily on first use (avoids a stream<->fs require cycle at fs-factory
+  // time). Node exposes these as CONSTRUCTORS with a real `.prototype`;
+  // graceful-fs does `Object.create(fs.ReadStream.prototype)`, which the
+  // previous arrow-function alias (no `.prototype`) broke.
+  //
+  // At MODULE scope, not inside the fs factory, because FileHandle's
+  // createReadStream/createWriteStream have to reach the same two classes.
+  // They must NOT come from the `fs.ReadStream` property: that is a
+  // deliberately redefinable getter (graceful-fs replaces it with its own
+  // wrapper), while node's FileHandle uses the internal class regardless of
+  // what userland last assigned.
+  let _rwStreams;
+  function rwStreams(natives) {
+    if (_rwStreams) return _rwStreams;
+    const { Readable, Writable, finished } = registry.get("stream");
+
+    // A caller-supplied, already-open descriptor. node accepts BOTH forms on
+    // the same `fd` option:
+    //   - a raw number, from `fs.createReadStream(path, { fd })`;
+    //   - a FileHandle, which is how FileHandle.createReadStream is
+    //     implemented upstream (`new ReadStream(undefined, {...opts, fd: this})`).
+    // Taking the FileHandle's OWN close() rather than closing its handle
+    // number behind its back is the whole double-close story: that close is
+    // idempotent and flips the handle's `closed` flag, so the descriptor is
+    // released exactly once and every FileHandle method starts reporting
+    // EBADF at the same instant the stream finishes. Closing the number
+    // directly would leave the FileHandle believing it was still open, and it
+    // would then close the fd a SECOND time -- by which point the number can
+    // already have been handed to an unrelated open().
+    const suppliedFd = (opts) => {
+      const fd = opts.fd;
+      if (fd == null) return null;
+      if (typeof fd === "number") return { handle: fd, close: () => natives.fsClose(fd) };
+      if (typeof fd === "object" && typeof fd.fd === "number" && typeof fd.close === "function") {
+        return { handle: fd.fd, close: () => fd.close() };
+      }
+      return null;
+    };
+
+    class ReadStream extends Readable {
+      // Node v22 ReadStream.prototype.close (lib/internal/fs/streams.js --
+      // outside the vendored internal/streams tree, so supplied here).
+      close(cb) {
+        if (typeof cb === "function") finished(this, cb);
+        this.destroy();
+      }
+      constructor(path, options) {
+        const opts = readOptions(options);
+        const highWaterMark = opts.highWaterMark ?? 65536;
+        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
+        const startByte = typeof opts.start === "number" ? opts.start : 0;
+        const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
+        const supplied = suppliedFd(opts);
+        // node's `autoClose` is about the DESCRIPTOR, not the stream object:
+        // false means the application owns the fd and the stream must leave it
+        // open even at EOF and even on error. It also maps onto the stream
+        // machine's autoDestroy, which is the stream-object half of the same
+        // option.
+        const autoClose = opts.autoClose !== false;
+        // `start` is a real seek, not just an arithmetic input to maxBytes.
+        // Reading from the cursor while only COUNTING from `start` returned
+        // the first (end-start+1) bytes of the file instead of the requested
+        // window.
+        let pos = typeof opts.start === "number" ? opts.start : null;
+        let handle = supplied ? supplied.handle : null;
+        let eof = false;
+        let totalRead = 0;
+        const closeFd = async () => {
+          if (handle === null) return;
+          const h = handle;
+          handle = null;
+          try {
+            await (supplied ? supplied.close() : natives.fsClose(h));
+          } catch { /* a close error is not a read error */ }
+        };
+        super({
+          // Node's fs.ReadStream flow: EOF -> push(null) -> 'end' ->
+          // autoDestroy -> destroy() -> _destroy -> 'close'. The stream
+          // machine owns 'close' (single emission); the read path only
+          // closes the fd early so EOF never holds it open.
+          // autoClose:false (Node option) = keep the stream alive past
+          // EOF/error, mapped straight onto the machine's autoDestroy.
+          autoDestroy: autoClose,
+          highWaterMark,
+          encoding: opts.encoding ?? null,
+          // Eager open (Node's _construct phase): a bad path surfaces as
+          // 'error' + 'close' BEFORE any read -- finished()/pipeline() on
+          // an unopenable stream reject with the ENOENT instead of
+          // hanging on a lazily-failing first read.
+          //
+          // Skipped entirely when the descriptor was supplied: node's
+          // _construct returns immediately for a numeric fd and emits
+          // NEITHER 'open' NOR 'ready' (measured on v22.22.2), because
+          // there was no open to report.
+          construct(callback) {
+            if (supplied) { callback(); return; }
+            Promise.resolve(natives.fsOpen(String(path), "r")).then(
+              (r) => {
+                handle = r.handle;
+                this.emit("open", handle);
+                this.emit("ready");
+                callback();
+              },
+              (e) => callback(e),
+            );
+          },
+          async read(size) {
+            try {
+              if (eof || handle === null) {
+                // construct() always ran first (vendored Readable contract),
+                // so a null handle means the EOF path already closed it:
+                // never re-open a finished file.
+                return;
+              }
+              const remaining = maxBytes - totalRead;
+              if (remaining <= 0) {
+                eof = true;
+                if (autoClose) await closeFd();
+                this.push(null);
+                return;
+              }
+              const want = Math.min(size || highWaterMark, remaining);
+              const chunk = await natives.fsReadChunk(handle, want, pos);
+              if (chunk === undefined) {
+                eof = true;
+                if (autoClose) await closeFd();
+                this.push(null);
+              } else {
+                const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
+                if (pos !== null) pos += buf.length;
+                totalRead += buf.length;
+                this.bytesRead = totalRead;
+                this.push(buf);
+              }
+            } catch (e) {
+              this.destroy(e);
+            }
+          },
+          destroy(err, cb) {
+            if (autoClose) closeFd();
+            cb(err);
+          },
+        });
+        this.path = path;
+        this.bytesRead = 0;
+      }
+    }
+    class WriteStream extends Writable {
+      // Node v22 WriteStream.prototype.close === end-then-wait-for-close.
+      close(cb) {
+        if (typeof cb === "function") {
+          if (this.closed) process.nextTick(cb);
+          else this.on("close", cb);
+        }
+        this.end();
+      }
+      constructor(path, options) {
+        const opts = readOptions(options);
+        const flags = opts.flags === "a" ? "a" : "w";
+        const supplied = suppliedFd(opts);
+        const autoClose = opts.autoClose !== false;
+        let handle = supplied ? supplied.handle : null;
+        let totalWritten = 0;
+        const closeFd = async () => {
+          if (handle === null) return;
+          const h = handle;
+          handle = null;
+          try {
+            await (supplied ? supplied.close() : natives.fsClose(h));
+          } catch { /* a close error is not a write error */ }
+        };
+        super({
+          // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
+          // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
+          autoDestroy: autoClose,
+          highWaterMark: opts.highWaterMark ?? 65536,
+          async write(chunk, _encoding, cb) {
+            try {
+              if (handle === null) {
+                handle = (await natives.fsOpen(String(path), flags)).handle;
+                this.emit("open", handle);
+                this.emit("ready");
+              }
+              await natives.fsWriteChunk(handle, chunk);
+              totalWritten += chunk.length;
+              this.bytesWritten = totalWritten;
+              cb();
+            } catch (e) {
+              cb(e);
+            }
+          },
+          async final(cb) {
+            try {
+              // Zero-write stream: the file must still exist afterwards.
+              // Unreachable when the descriptor was supplied -- it is already
+              // open, and `path` is undefined there.
+              if (handle === null) {
+                handle = (await natives.fsOpen(String(path), flags)).handle;
+              }
+              if (autoClose) await closeFd();
+              cb();
+            } catch (e) {
+              cb(e);
+            }
+          },
+          destroy(err, cb) {
+            if (autoClose) closeFd();
+            cb(err);
+          },
+        });
+        this.path = path;
+        this.bytesWritten = 0;
+      }
+    }
+    _rwStreams = { ReadStream, WriteStream };
+    return _rwStreams;
+  }
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     return {
@@ -9324,9 +9618,40 @@
         var info = await natives.fsOpen(String(path), String(flags));
         var h = info.handle;
         var closed = false;
+
+        // node's fsCall guard (lib/internal/fs/promises.js): EVERY FileHandle
+        // method re-checks the descriptor first and rejects on a closed one
+        // rather than reaching a native with a stale handle. The error is a
+        // PLAIN Error -- not a subclass, not one of the ERR_* codes -- with
+        // message "file closed" and exactly two own properties, code then
+        // syscall, in that order. The syscall is per-method and names the
+        // syscall the call WOULD have made (fstat, fchmod, futimes, ...), not
+        // the method; appendFile reports "writeFile" because node implements
+        // it as an alias of writeFile. Measured on v22.22.2 -- all fourteen
+        // methods below were checked individually.
+        var ebadf = function (syscall) {
+          var err = new Error("file closed");
+          err.code = "EBADF";
+          err.syscall = syscall;
+          return err;
+        };
+        // Throwing from inside an async function is a REJECTION, which is what
+        // node does for every one of these -- none of them throws synchronously.
+        var guard = function (syscall) {
+          if (closed) throw ebadf(syscall);
+        };
+        // createReadStream/createWriteStream/readLines are the exception: they
+        // are not fsCall-wrapped, so a closed handle reaches node's stream
+        // constructor as fd -1 and fails its integer-range validation, THROWN
+        // synchronously as a RangeError rather than delivered as a rejection.
+        var guardStreamFd = function () {
+          if (closed) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", -1);
+        };
+
         var fh = {
           fd: h,
           readFile: async function (options) {
+            guard("readFile");
             var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : null);
             var chunks = [];
             while (true) {
@@ -9346,21 +9671,34 @@
             return enc ? buf.toString(enc) : buf;
           },
           writeFile: async function (data, options) {
+            guard("writeFile");
             var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : "utf8");
             if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
             await natives.fsWriteChunk(h, data);
+          },
+          // NOT an append. node documents FileHandle.appendFile as an ALIAS of
+          // writeFile ("the mode cannot be changed from what it was set to
+          // with open()"), and measurement agrees: it writes at the handle's
+          // CURRENT position, so on a handle opened "r+" and rewound it
+          // OVERWRITES from byte 0. Only the "a" flag at open() time appends.
+          // Implemented as a real delegation so the two cannot drift.
+          appendFile: async function (data, options) {
+            guard("writeFile");
+            return fh.writeFile(data, options);
           },
           // `position` is a pwrite/pread offset: it writes/reads THERE and
           // leaves the cursor alone. Both used to accept the argument and throw
           // it away, because the natives had no position parameter to pass it
           // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
           write: async function (buffer, offset, length, position) {
+            guard("write");
             if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
             var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
             await natives.fsWriteChunk(h, slice, fsPositionArg(position));
             return { bytesWritten: slice.length, buffer: buffer };
           },
           read: async function (buffer, offset, length, position) {
+            guard("read");
             validateReadLength(buffer, offset, length);
             var want = length != null ? length : (buffer ? buffer.byteLength - (offset || 0) : 65536);
             var chunk = await natives.fsReadChunk(h, want, fsPositionArg(position));
@@ -9371,12 +9709,109 @@
             }
             return { bytesRead: chunk.length, buffer: buffer || globalThis.Buffer.from(chunk) };
           },
+          // FSTAT, not stat. This used to re-stat the PATH the handle was
+          // opened from, which is a different object the moment anything moves
+          // the name: after a rename it described the wrong file, and after an
+          // unlink it raised ENOENT where node happily reports the still-open
+          // inode. "open a temp file then unlink it and keep the handle" is a
+          // standard pattern, so the divergence was reachable from ordinary
+          // code, and silent in the rename case.
           stat: async function () {
-            return wrapStat(await natives.fsStat(String(path), false));
+            guard("fstat");
+            return wrapStat(await natives.fsFstat(h));
+          },
+          chmod: async function (mode) {
+            guard("fchmod");
+            await natives.fsFchmod(h, mode);
+          },
+          // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
+          // a successful no-op, and node inherits that -- the call RESOLVES
+          // there, it just does not change an owner Windows does not model
+          // this way. Left unguarded so the resolve/reject shape matches.
+          chown: async function (uid, gid) {
+            guard("fchown");
+            await natives.fsFchown(h, uid, gid);
+          },
+          truncate: async function (len) {
+            guard("ftruncate");
+            await natives.fsFtruncate(h, len ?? 0);
+          },
+          sync: async function () {
+            guard("fsync");
+            await natives.fsFsync(h);
+          },
+          datasync: async function () {
+            guard("fdatasync");
+            await natives.fsFdatasync(h);
+          },
+          utimes: async function (atime, mtime) {
+            guard("futimes");
+            await natives.fsFutimes(h, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+          },
+          // The object-returning half of the vectored pair. node:fs's readv
+          // hands back a bare number and node:fs/promises has no free
+          // function at all -- only these. Same validation and same
+          // gather/scatter as fs.readv/fs.writev (module-scope helpers), so a
+          // fix to one lands on both.
+          readv: async function (buffers, position) {
+            guard("readv");
+            var total = asViewArray(buffers);
+            // Before the descriptor, deliberately: node raises this even on a
+            // closed handle -- but the fsCall guard above runs first there
+            // too, and EBADF wins. Measured: readv([]) on a CLOSED handle
+            // reports EBADF, on an open one EINVAL.
+            if (emptyList(buffers)) throw einvalRead(natives.platform);
+            var tmp = globalThis.Buffer.allocUnsafe(total);
+            var chunk = await natives.fsReadChunk(h, total, fsPositionArg(position));
+            var n = chunk === undefined ? 0 : chunk.length;
+            if (n > 0) tmp.set(chunk);
+            scatterViews(buffers, tmp, n);
+            // The SAME array instance goes back out; callers compare identity.
+            return { bytesRead: n, buffers: buffers };
+          },
+          writev: async function (buffers, position) {
+            guard("writev");
+            var total = asViewArray(buffers);
+            // node reports 0 without touching the descriptor.
+            if (emptyList(buffers)) return { bytesWritten: 0, buffers: buffers };
+            await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
+            return { bytesWritten: total, buffers: buffers };
+          },
+          // Both stream factories hand the WHOLE FileHandle to the shared
+          // ReadStream/WriteStream (exactly as node does -- `new ReadStream(
+          // undefined, { ...options, fd: this })`), which is what makes the
+          // ownership right: the stream closes the fd through THIS object's
+          // close(), which is idempotent and flips `closed`, so the handle
+          // cannot be closed twice and every method above starts reporting
+          // EBADF the moment the stream is done. autoClose:false opts out and
+          // leaves the descriptor to the caller.
+          createReadStream: function (options) {
+            guardStreamFd();
+            return new (rwStreams(natives).ReadStream)(undefined, { ...readOptions(options), fd: fh });
+          },
+          createWriteStream: function (options) {
+            guardStreamFd();
+            return new (rwStreams(natives).WriteStream)(undefined, { ...readOptions(options), fd: fh });
+          },
+          // node: createInterface({ input: this.createReadStream(options),
+          // crlfDelay: Infinity }). The returned readline Interface IS the
+          // async iterable -- there is no separate iterator type -- and it
+          // closes when its input stream ends, which (autoClose) closes this
+          // handle. Splitting on /\r?\n/ and dropping the empty tail after a
+          // final newline is the Interface's job, already matching node.
+          readLines: function (options) {
+            guardStreamFd();
+            return registry.get("readline").createInterface({
+              input: fh.createReadStream(options),
+              crlfDelay: Infinity,
+            });
           },
           close: async function () {
             if (!closed) {
               closed = true;
+              // node reports -1 from `fh.fd` once closed; leaving the real
+              // handle number visible invites a caller to keep using it.
+              fh.fd = -1;
               await Promise.resolve(natives.fsClose(h)).catch(function () {});
             }
           },
@@ -9571,161 +10006,6 @@
       if (acc === 1) return append ? "a" : "w";
       if (acc === 2) return append ? "a+" : "r+";
       return "r";
-    }
-
-    // ReadStream / WriteStream as real Readable / Writable subclasses, built
-    // lazily on first use (avoids a stream<->fs require cycle at fs-factory
-    // time). Node exposes these as CONSTRUCTORS with a real `.prototype`;
-    // graceful-fs does `Object.create(fs.ReadStream.prototype)`, which the
-    // previous arrow-function alias (no `.prototype`) broke.
-    let _rwStreams;
-    function rwStreams() {
-      if (_rwStreams) return _rwStreams;
-      const { Readable, Writable, finished } = registry.get("stream");
-      class ReadStream extends Readable {
-        // Node v22 ReadStream.prototype.close (lib/internal/fs/streams.js --
-        // outside the vendored internal/streams tree, so supplied here).
-        close(cb) {
-          if (typeof cb === "function") finished(this, cb);
-          this.destroy();
-        }
-        constructor(path, options) {
-          const opts = readOptions(options);
-          const highWaterMark = opts.highWaterMark ?? 65536;
-          const endByte = typeof opts.end === "number" ? opts.end : Infinity;
-          const startByte = typeof opts.start === "number" ? opts.start : 0;
-          const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
-          let handle = null;
-          let totalRead = 0;
-          super({
-            // Node's fs.ReadStream flow: EOF -> push(null) -> 'end' ->
-            // autoDestroy -> destroy() -> _destroy -> 'close'. The stream
-            // machine owns 'close' (single emission); the read path only
-            // closes the fd early so EOF never holds it open.
-            // autoClose:false (Node option) = keep the stream alive past
-            // EOF/error, mapped straight onto the machine's autoDestroy.
-            autoDestroy: opts.autoClose !== false,
-            highWaterMark,
-            encoding: opts.encoding ?? null,
-            // Eager open (Node's _construct phase): a bad path surfaces as
-            // 'error' + 'close' BEFORE any read -- finished()/pipeline() on
-            // an unopenable stream reject with the ENOENT instead of
-            // hanging on a lazily-failing first read.
-            construct(callback) {
-              Promise.resolve(natives.fsOpen(String(path), "r")).then(
-                (r) => {
-                  handle = r.handle;
-                  this.emit("open", handle);
-                  this.emit("ready");
-                  callback();
-                },
-                (e) => callback(e),
-              );
-            },
-            async read(size) {
-              try {
-                if (handle === null) {
-                  // construct() always ran first (vendored Readable contract),
-                  // so a null handle means the EOF path already closed it:
-                  // never re-open a finished file.
-                  return;
-                }
-                const remaining = maxBytes - totalRead;
-                if (remaining <= 0) {
-                  await Promise.resolve(natives.fsClose(handle)).catch(() => {});
-                  handle = null;
-                  this.push(null);
-                  return;
-                }
-                const want = Math.min(size || highWaterMark, remaining);
-                const chunk = await natives.fsReadChunk(handle, want);
-                if (chunk === undefined) {
-                  await Promise.resolve(natives.fsClose(handle)).catch(() => {});
-                  handle = null;
-                  this.push(null);
-                } else {
-                  const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length);
-                  totalRead += buf.length;
-                  this.bytesRead = totalRead;
-                  this.push(buf);
-                }
-              } catch (e) {
-                this.destroy(e);
-              }
-            },
-            destroy(err, cb) {
-              if (handle !== null) {
-                Promise.resolve(natives.fsClose(handle)).catch(() => {});
-                handle = null;
-              }
-              cb(err);
-            },
-          });
-          this.path = path;
-          this.bytesRead = 0;
-        }
-      }
-      class WriteStream extends Writable {
-        // Node v22 WriteStream.prototype.close === end-then-wait-for-close.
-        close(cb) {
-          if (typeof cb === "function") {
-            if (this.closed) process.nextTick(cb);
-            else this.on("close", cb);
-          }
-          this.end();
-        }
-        constructor(path, options) {
-          const opts = readOptions(options);
-          const flags = opts.flags === "a" ? "a" : "w";
-          let handle = null;
-          let totalWritten = 0;
-          super({
-            // Node's fs.WriteStream flow: end() -> final() -> 'finish' ->
-            // autoDestroy -> destroy() -> 'close'. The machine owns 'close'.
-            autoDestroy: opts.autoClose !== false,
-            highWaterMark: opts.highWaterMark ?? 65536,
-            async write(chunk, _encoding, cb) {
-              try {
-                if (handle === null) {
-                  handle = (await natives.fsOpen(String(path), flags)).handle;
-                  this.emit("open", handle);
-                  this.emit("ready");
-                }
-                await natives.fsWriteChunk(handle, chunk);
-                totalWritten += chunk.length;
-                this.bytesWritten = totalWritten;
-                cb();
-              } catch (e) {
-                cb(e);
-              }
-            },
-            async final(cb) {
-              try {
-                // Zero-write stream: the file must still exist afterwards.
-                if (handle === null) {
-                  handle = (await natives.fsOpen(String(path), flags)).handle;
-                }
-                natives.fsClose(handle);
-                handle = null;
-                cb();
-              } catch (e) {
-                cb(e);
-              }
-            },
-            destroy(err, cb) {
-              if (handle !== null) {
-                natives.fsClose(handle);
-                handle = null;
-              }
-              cb(err);
-            },
-          });
-          this.path = path;
-          this.bytesWritten = 0;
-        }
-      }
-      _rwStreams = { ReadStream, WriteStream };
-      return _rwStreams;
     }
 
     const fs = {
@@ -10032,8 +10312,8 @@
         );
       },
 
-      createReadStream: (path, options) => new (rwStreams().ReadStream)(path, options),
-      createWriteStream: (path, options) => new (rwStreams().WriteStream)(path, options),
+      createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
+      createWriteStream: (path, options) => new (rwStreams(natives).WriteStream)(path, options),
       watch: fsWatch,
       watchFile: fsWatchFile,
       unwatchFile: fsUnwatchFile,
@@ -10173,81 +10453,14 @@
     // instead of growing a second copy of them.
     //
     // node exports these on node:fs ONLY. fs/promises has no top-level
-    // readv/writev -- there they are FileHandle methods.
+    // readv/writev -- there they are FileHandle methods, and they return
+    // OBJECTS where these return a plain number (sync) or (err, bytes,
+    // buffers) (callback). The validation and the gather/scatter are shared:
+    // asViewArray / einvalRead / flattenViews / scatterViews / emptyList live
+    // at module scope so the two surfaces cannot drift.
     //
-    // Behaviours measured against node v22.22.2, several of which are not what
-    // you would guess:
-    //   - the sync forms return a plain NUMBER, not {bytesRead, buffers}. Only
-    //     the FileHandle methods return objects.
-    //   - the callback is (err, bytes, buffers) and `buffers` is the SAME ARRAY
-    //     IDENTITY that went in, not a copy.
-    //   - an EMPTY ARRAY is asymmetric: writev returns 0, readv throws EINVAL
-    //     -- and the EINVAL is raised BEFORE the fd is looked at, so it wins
-    //     even on a closed descriptor.
-    //   - an array of only ZERO-LENGTH views is NOT the same case: readv
-    //     returns 0 rather than throwing. The rule keys on the array being
-    //     empty, not on the byte total.
-    //   - a partial final buffer keeps the rest of its bytes UNTOUCHED.
-    const asViewArray = (buffers) => {
-      // Index loop, NOT Array.prototype.every: every() skips holes, so a sparse
-      // array would slip through where node throws.
-      let ok = Array.isArray(buffers);
-      if (ok) {
-        for (let i = 0; i < buffers.length; i++) {
-          if (!ArrayBuffer.isView(buffers[i])) { ok = false; break; }
-        }
-      }
-      if (!ok) {
-        throw nodeTypeError(
-          `The "buffers" argument must be an ArrayBufferView[]. Received ${describeArg(buffers)}`,
-        );
-      }
-      let total = 0;
-      for (let i = 0; i < buffers.length; i++) total += buffers[i].byteLength;
-      return total;
-    };
-
-    // node's EINVAL for readv with an empty list. Own props in node's order.
-    const einvalRead = () => {
-      const err = new Error("EINVAL: invalid argument, read");
-      err.errno = natives.platform === "win32" ? -4071 : -22;
-      err.code = "EINVAL";
-      err.syscall = "read";
-      return err;
-    };
-
-    const flattenViews = (buffers, total) => {
-      const combined = globalThis.Buffer.allocUnsafe(total);
-      let off = 0;
-      for (let i = 0; i < buffers.length; i++) {
-        const v = buffers[i];
-        combined.set(new Uint8Array(v.buffer, v.byteOffset, v.byteLength), off);
-        off += v.byteLength;
-      }
-      return combined;
-    };
-
-    // Scatter `n` bytes of `src` across the views, filling each in turn. A view
-    // that only partially fills keeps its remaining bytes as they were, because
-    // TypedArray.set writes exactly as many bytes as the source holds.
-    const scatterViews = (buffers, src, n) => {
-      let off = 0;
-      for (let i = 0; i < buffers.length && off < n; i++) {
-        const v = buffers[i];
-        const take = Math.min(v.byteLength, n - off);
-        if (take > 0) {
-          new Uint8Array(v.buffer, v.byteOffset, v.byteLength).set(src.subarray(off, off + take));
-        }
-        off += take;
-      }
-    };
-
-    // ONLY an empty array skips the descriptor. An array of zero-length views
-    // is a different case: it still issues the syscall, so it still reports
-    // EBADF on a closed or wrong-mode fd. Returning 0 early for both conflated
-    // "no iovecs" with "no bytes" and made readvSync(closedFd, [Buffer.alloc(0)])
-    // succeed where node throws.
-    const emptyList = (buffers) => buffers.length === 0;
+    // The one behaviour that is local to this surface: the callback's third
+    // argument is the SAME ARRAY IDENTITY that went in, not a copy.
 
     fs.writevSync = (fd, buffers, position) => {
       const total = asViewArray(buffers);
@@ -10261,7 +10474,7 @@
       const total = asViewArray(buffers);
       // Before the fd check, deliberately: node raises this even for a closed
       // descriptor.
-      if (emptyList(buffers)) throw einvalRead();
+      if (emptyList(buffers)) throw einvalRead(natives.platform);
       const tmp = globalThis.Buffer.allocUnsafe(total);
       const n = natives.fsReadSync(fd, tmp, 0, total, fsPositionArg(position));
       scatterViews(buffers, tmp, n);
@@ -10300,7 +10513,7 @@
       if (emptyList(buffers)) {
         // This one IS deferred, and beats the fd: node reports EINVAL through
         // the callback even for a closed descriptor.
-        queueMicrotask(() => cb(einvalRead(), 0, buffers));
+        queueMicrotask(() => cb(einvalRead(natives.platform), 0, buffers));
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
@@ -10371,7 +10584,7 @@
       ["FileWriteStream", "WriteStream"],
     ]) {
       Object.defineProperty(fs, name, {
-        get: () => rwStreams()[kind],
+        get: () => rwStreams(natives)[kind],
         configurable: true,
         enumerable: true,
       });

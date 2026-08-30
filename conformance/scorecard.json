@@ -1,5 +1,5 @@
 {
-  "commit": "6ff3f16+wip",
+  "commit": "e4cb651+wip",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
   "oamVersion": "oam 0.12.1",
@@ -382,10 +382,14 @@
         {
           "case": "92-child-extra-fd-parent-close-eof.mjs",
           "status": "pass"
+        },
+        {
+          "case": "93-fs-filehandle-surface.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 94,
-      "total": 94
+      "pass": 95,
+      "total": 95
     },
     "surface": {
       "exports": {
