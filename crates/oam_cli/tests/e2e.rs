@@ -1960,6 +1960,7 @@ fn napi_reference_handle_from_another_env_is_rejected() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_recycled_reference_slot_refuses_the_stale_handle() {
     // The ABA case, and the reason napi_ref handles carry a generation instead
@@ -2011,6 +2012,7 @@ fn napi_recycled_reference_slot_refuses_the_stale_handle() {
     );
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_forged_reference_handles_are_rejected() {
     // Four ways to be wrong about a handle, each derived from a REAL one so
@@ -2061,6 +2063,7 @@ fn napi_forged_reference_handles_are_rejected() {
     assert_eq!(lines[4], "1", "arbitrary bits must be refused");
 }
 
+#[cfg(feature = "napi")]
 #[test]
 fn napi_reference_slots_are_reused_rather_than_grown() {
     // The bound that makes an index+generation table safe for this ABI: refs
