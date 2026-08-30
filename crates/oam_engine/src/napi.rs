@@ -2646,8 +2646,6 @@ pub struct NapiExtendedErrorInfo {
     pub engine_error_code: u32,
     pub error_code: NapiStatus,
 }
-// SAFETY: only ever read from C side; never mutated after initialisation.
-unsafe impl Sync for NapiExtendedErrorInfo {}
 
 /// Node.js version info returned by napi_get_node_version.
 #[repr(C)]
