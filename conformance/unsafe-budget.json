@@ -14,7 +14,7 @@
       "unsafe_count": 0
     },
     "oam_engine": {
-      "unsafe_count": 596
+      "unsafe_count": 598
     },
     "oam_loader": {
       "unsafe_count": 0
@@ -23,7 +23,7 @@
       "unsafe_count": 0
     },
     "oam_napi_test_addon": {
-      "unsafe_count": 62
+      "unsafe_count": 68
     },
     "oam_ts": {
       "unsafe_count": 2

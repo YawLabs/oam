@@ -945,6 +945,29 @@ unsafe extern "C" fn read_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> Na
     }
 }
 
+/// deleteRefHandle(bigint) -> number: host status for napi_delete_reference on
+/// a handle supplied by JS. The companion to `makeRefHandle`, so a test can
+/// drive create/delete pairs from JS and watch what the host does with the
+/// slots in between.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn delete_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `bits` and `lossless` are live locals backing the out-pointers.
+    // The reconstructed handle goes straight to the host, which validates it
+    // against its own ref table; the addon never dereferences it.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut bits = 0i64;
+        let mut lossless = false;
+        if (host().get_value_bigint_int64)(env, value, &mut bits, &mut lossless) != 0 {
+            return num(env, -1);
+        }
+        num(env, (host().delete_reference)(env, bits as *mut c_void))
+    }
+}
+
 /// deleteRefTwice(value) -> number: host status for the SECOND
 /// napi_delete_reference on the same handle. A host that does not validate
 /// answers 0 and hides the addon's double-delete.
@@ -965,6 +988,93 @@ unsafe extern "C" fn delete_ref_twice(env: NapiEnv, info: NapiCallbackInfo) -> N
             return num(env, -2);
         }
         num(env, (host().delete_reference)(env, handle))
+    }
+}
+
+/// abaStaleReadStatus() -> number: the ABA probe.
+///
+/// Creates a reference to the number 111, DELETES it, then creates a second
+/// reference to the number 222. That second create is what recycles whatever
+/// storage the delete released. It then hands the host the FIRST (stale)
+/// handle and reports what happened:
+///
+/// * `1`   -- the host refused it (`napi_invalid_arg`). Correct.
+/// * `222` -- the host accepted it and resolved it to the SECOND reference.
+///   That is the ABA bug: a live, correctly-typed entry, but not the one the
+///   handle named.
+/// * `111` -- the host accepted it and answered with the original value, i.e.
+///   it read through storage it had already released.
+/// * negative -- a setup step failed; see the arm that produced it.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn aba_stale_read_status(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: every out-pointer below backs a live local. `first` is handed to
+    // `get_reference_value` AFTER its `delete_reference` on purpose -- that is
+    // the behaviour under test -- and the addon never dereferences it itself.
+    unsafe {
+        let mut v1: NapiValue = std::ptr::null_mut();
+        let mut v2: NapiValue = std::ptr::null_mut();
+        (host().create_int32)(env, 111, &mut v1);
+        (host().create_int32)(env, 222, &mut v2);
+
+        let mut first: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, v1, 1, &mut first) != 0 {
+            return num(env, -1);
+        }
+        if (host().delete_reference)(env, first) != 0 {
+            return num(env, -2);
+        }
+        // Recycles the slot -- and, under a pointer-identity scheme, very
+        // likely the exact heap block -- that the delete above released.
+        let mut second: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, v2, 1, &mut second) != 0 {
+            return num(env, -3);
+        }
+
+        let mut stale: NapiValue = std::ptr::null_mut();
+        if (host().get_reference_value)(env, first, &mut stale) != 0 {
+            return num(env, 1);
+        }
+        let mut observed = 0i32;
+        if (host().get_value_int32)(env, stale, &mut observed) != 0 {
+            return num(env, -4);
+        }
+        num(env, observed)
+    }
+}
+
+/// abaHandleRecycled() -> number: 1 when the handle a create hands back right
+/// after a delete is bit-identical to the deleted one, 0 otherwise.
+///
+/// Diagnostic, and the reason `abaStaleReadStatus` is load-bearing rather than
+/// merely green: under a pointer-identity scheme a recycled ADDRESS is exactly
+/// what lets a stale handle resolve to the wrong entry, so this reports whether
+/// the allocator really did recycle on this run.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn aba_handle_recycled(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: every out-pointer below backs a live local; the two handles are
+    // only ever COMPARED here, never dereferenced by the addon.
+    unsafe {
+        let mut value: NapiValue = std::ptr::null_mut();
+        (host().create_int32)(env, 7, &mut value);
+
+        let mut first: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut first) != 0 {
+            return num(env, -1);
+        }
+        if (host().delete_reference)(env, first) != 0 {
+            return num(env, -2);
+        }
+        let mut second: *mut c_void = std::ptr::null_mut();
+        if (host().create_reference)(env, value, 1, &mut second) != 0 {
+            return num(env, -3);
+        }
+        num(env, i32::from(first == second))
     }
 }
 
@@ -1069,7 +1179,10 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 18] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 21] = [
+            (c"abaStaleReadStatus", aba_stale_read_status),
+            (c"abaHandleRecycled", aba_handle_recycled),
+            (c"deleteRefHandle", delete_ref_handle),
             (c"deleteRefTwice", delete_ref_twice),
             (c"lastErrorMessage", last_error_message),
             (c"refAfterDelete", ref_after_delete),
