@@ -409,13 +409,19 @@ else
 fi
 
 say "11/12 Scripts (release-orchestration shell tests)"
-# GATING, and cheap: ~2s, no compilation. scripts/ ships the binaries but had no
-# gate of its own until now -- which is how gc-target.sh spent its entire life
-# collecting NOTHING on Linux while reporting success (mawk interval expressions,
-# a dot-requiring family regex, and a `cd ""` no-op, all silent). Runs last
-# because it shares no state with steps 1-9: a failure here invalidates none of
-# the Rust work above, and step 9 already establishes that a fast gate can sit at
-# the end. Add `-v` for per-case output.
+# GATING, and compiles nothing -- but NOT the ~2s this comment used to claim.
+# Measured 2026-08-30 on win-arm64: ~7m30s for 59 assertions. The suite is
+# spawn-bound (each case forks a shell), so its cost tracks process-creation
+# speed, which on Windows is roughly an order of magnitude worse than on the
+# Linux/mac legs. Keep new cases cheap and prefer pure-function assertions over
+# fixtures that shell out; a case that shells out in a loop dominates the step.
+# scripts/ ships the binaries but had no gate of its own until now -- which is
+# how gc-target.sh spent its entire life collecting NOTHING on Linux while
+# reporting success (mawk interval expressions, a dot-requiring family regex,
+# and a `cd ""` no-op, all silent). Runs last because it shares no state with
+# steps 1-9: a failure here invalidates none of the Rust work above, and step 9
+# already establishes that a compile-free gate can sit at the end. Add `-v` for
+# per-case output.
 if bash scripts/test-scripts.sh; then
   ok "script tests passed"
 else
