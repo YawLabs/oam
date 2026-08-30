@@ -16,8 +16,25 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- A miri-checked model of the N-API pointer disciplines runs as its own gate
+  step, so the aliasing claims behind the addon layer are machine-checked
+  rather than argued. It found the `load_addon` defect below. (#88)
+
 ### Fixed
 
+- **A deleted `napi_ref` could silently resolve to a different live reference.**
+  Handles were validated by comparing addresses, so once the allocator reused a
+  freed entry's memory a stale handle passed the check and returned whichever
+  reference now sat there — 40 times in 5,000 create/delete cycles when
+  measured. A handle is now an index plus a generation counter, and a stale,
+  forged, or cross-environment handle is refused instead of resolved. (#91)
+- **Loading a native addon used a pointer that a move had invalidated.**
+  `load_addon` derived the `napi_env` pointer from a `Box` and then moved that
+  box into the registry, which invalidates pointers derived from it; the
+  pointer is now derived after the move, matching what `napi_create_function`
+  already did. (#88)
 - **`oam.exe` no longer needs the VC++ redistributable.** The Windows builds link
   the static CRT, so a fresh machine can run a downloaded binary without first
   installing Microsoft's runtime. (#66)
@@ -27,6 +44,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **The N-API layer can be compiled out.** `oam_engine`'s `napi` feature is on
+  by default, so an ordinary build is byte-for-byte unchanged; building without
+  it leaves the 132-symbol Node-API surface out of the binary entirely, and
+  `require()` of a `.node` file then reports the new `OAM-NATIVE0002` rather
+  than advising an environment variable that build cannot honour. (#90)
+- The POSIX filesystem and child-process paths use `rustix` and owned file
+  descriptors in place of hand-written `libc` calls, and 16 further `unsafe`
+  constructs that asserted nothing the compiler was not already proving are
+  gone. Behaviour is unchanged; `oam_core`'s audited `unsafe` surface halves.
+  (#92, #89)
 - `--allow-worker` is documented as no longer implying `--allow-child-process` —
   it stopped implying it in 0.9.1, when child isolates began inheriting the
   parent's grants. (#65)
