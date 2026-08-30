@@ -9343,9 +9343,6 @@
       constructor(path, options) {
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
-        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
-        const startByte = typeof opts.start === "number" ? opts.start : 0;
-        const maxBytes = endByte === Infinity ? Infinity : endByte - startByte + 1;
         const supplied = suppliedFd(opts);
         // node's `autoClose` is about the DESCRIPTOR, not the stream object:
         // false means the application owns the fd and the stream must leave it
@@ -9353,11 +9350,14 @@
         // machine's autoDestroy, which is the stream-object half of the same
         // option.
         const autoClose = opts.autoClose !== false;
-        // `start` is a real seek, not just an arithmetic input to maxBytes.
-        // Reading from the cursor while only COUNTING from `start` returned
-        // the first (end-start+1) bytes of the file instead of the requested
-        // window.
+        // `start` is a real SEEK, and the read cursor from here on -- null
+        // meaning "wherever the descriptor already is". It used to feed only
+        // the maxBytes arithmetic while every read came from the cursor, so a
+        // windowed read returned the first (end-start+1) bytes of the file
+        // instead of the requested range.
         let pos = typeof opts.start === "number" ? opts.start : null;
+        const endByte = typeof opts.end === "number" ? opts.end : Infinity;
+        const maxBytes = endByte === Infinity ? Infinity : endByte - (pos ?? 0) + 1;
         let handle = supplied ? supplied.handle : null;
         let eof = false;
         let totalRead = 0;
