@@ -7,26 +7,29 @@
 # hosted runners never covered anyway):
 #   1. cargo fmt --all --check
 #   2. cargo clippy --workspace --all-targets -- -D warnings
-#   3. cargo build --workspace
-#   4. cargo test --workspace          (15-min ceiling where `timeout` exists)
-#   5. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
-#   6. cargo run -p xtask -- conformance    (node-differential gate + builtin
+#   3. --no-default-features build + clippy + test  (GATING; the napi-off
+#                                            configuration, which nothing else
+#                                            here compiles -- see below)
+#   4. cargo build --workspace
+#   5. cargo test --workspace          (15-min ceiling where `timeout` exists)
+#   6. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
+#   7. cargo run -p xtask -- conformance    (node-differential gate + builtin
 #                                            export-parity ratchet; GATING)
-#   7. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
+#   8. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
 #                                            advisory, only a ratchet violation
 #                                            fails -- node-compat.yml parity)
-#   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
+#   9. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
-#   9. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
+#  10. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
 #                                            clippy's job, enforced in step 2)
-#  10. scripts/test-scripts.sh             (GATING; the release-orchestration
-#                                            shell scripts -- gc-target.sh
-#                                            selection logic, tunnel-log
-#                                            parsing, sshd detection, disk
-#                                            thresholds)
-#  11. miri aliasing models               (GATING when nightly+miri present,
+#  11. scripts/test-scripts.sh             (GATING; the shell scripts under
+#                                            scripts/ -- gc-target.sh selection
+#                                            logic, tunnel-log parsing, sshd
+#                                            detection, disk thresholds, and
+#                                            THIS script's miri-gate verdicts)
+#  12. miri aliasing models               (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
 #                                            disciplines napi.rs relies on)
@@ -37,15 +40,15 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-11)
-#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (6-8)
-#   ./scripts/ci-local.sh --no-tests   # skip the cargo test run (4)
+#   ./scripts/ci-local.sh              # full gate (steps 1-12)
+#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (7-9)
+#   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 3's, and 5)
 #
-# Neither flag skips steps 9-11; step 11 skips itself when nightly+miri is
+# Neither flag skips steps 10-12; step 12 skips itself when nightly+miri is
 # absent.
 #
 # Env:
-#   OAM_SKIP_ATTRIBUTION=1   downgrade step 8 to a warning. Step 8 fails CLOSED,
+#   OAM_SKIP_ATTRIBUTION=1   downgrade step 9 to a warning. Step 9 fails CLOSED,
 #                            so an offline box (cargo-about resolves some license
 #                            texts over the network) cannot push without this.
 #
@@ -97,6 +100,12 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # shellcheck source=lib/crt-linkage.sh
 . scripts/lib/crt-linkage.sh
 
+# Step 12's pass/fail decision, extracted so scripts/test-scripts.sh can drive
+# it with captured miri output on boxes that have no nightly toolchain (which
+# is most of them). Rationale for every verdict is in the lib's header.
+# shellcheck source=lib/miri-gate.sh
+. scripts/lib/miri-gate.sh
+
 # Leftovers under target/debug are, by definition, orphans of an earlier run:
 # nothing a human uses long-term runs out of the debug tree. Clearing them
 # before a step that relinks is what keeps LNK1104 from surfacing at the worst
@@ -108,37 +117,10 @@ clear_debug_holders() {
   oam_reap_parked target/debug/deps
 }
 
-# ONE EXIT trap for the whole script: a second `trap ... EXIT` silently REPLACES
-# the first, so every temp path registers here instead of installing its own.
-CLEANUP_PATHS=()
-cleanup() {
-  if [ ${#CLEANUP_PATHS[@]} -gt 0 ]; then rm -rf "${CLEANUP_PATHS[@]}"; fi
-  return 0
-}
-trap cleanup EXIT
-
-say "1/11 Format (cargo fmt --check)"
-if cargo fmt --all --check; then
-  ok "fmt clean"
-else
-  ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
-fi
-
-say "2/11 Clippy (-D warnings)"
-# -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
-# fingerprint-poison the cargo cache against the plain build/test steps.
-if cargo clippy --workspace --all-targets -- -D warnings; then
-  ok "clippy clean"
-else
-  ko "clippy warnings above"
-fi
-
-say "3/11 Build (cargo build --workspace)"
-clear_debug_holders
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
 # renaming works where deleting does not. Parking the deps-stage file is NOT
 # free, though: deleting deps/oam.exe dirties cargo's bin-unit fingerprint, so
-# the build below relinks the binary even on an otherwise-fresh tree (measured
+# the next build relinks the binary even on an otherwise-fresh tree (measured
 # ~7.6s vs a 0.68s no-op in debug; the release scripts pay more). That cost is
 # accepted -- a locked binary fails the link outright, which is worse than a
 # relink.
@@ -148,10 +130,111 @@ clear_debug_holders
 # on the deps-stage file. An orphan test binary (a previous run's `cargo
 # test` left mapped) is the usual holder there -- same deny window, same
 # fix.
-oam_park_file target/debug/oam.exe \
-  || ko "target/debug/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
-oam_park_file target/debug/deps/oam.exe \
-  || ko "target/debug/deps/oam.exe is locked and could not be parked -- find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
+#
+# Called by every step that LINKS the oam binary, which is more than the plain
+# build: `cargo test -p oam_cli` builds the package's bin targets too, so the
+# feature-off step hits the same deny window.
+park_link_targets() {
+  local hint="find the holder with: Get-CimInstance Win32_Process | Where-Object { \$_.ExecutablePath -like '*target*' } | Select-Object ProcessId,ExecutablePath"
+  oam_park_file target/debug/oam.exe \
+    || ko "target/debug/oam.exe is locked and could not be parked -- $hint"
+  oam_park_file target/debug/deps/oam.exe \
+    || ko "target/debug/deps/oam.exe is locked and could not be parked -- $hint"
+}
+
+# ci.yml bounded a hung test at 15 min (the deadlocked/lingering test class).
+# Git Bash ships coreutils timeout; macOS needs brew coreutils (gtimeout) --
+# unbounded as the last resort.
+#
+# -k 30 matters as much as the ceiling: plain `timeout` TERMs CARGO only. The
+# test binaries cargo already launched, and the detached daemons THOSE spawned,
+# sit in other process groups and survive -- which is how one hung run poisons
+# the NEXT run's link step. KILL after 30s, then reap by image path at the call
+# site, whatever the outcome was.
+bounded_cargo_test() {
+  local st=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 30 900 cargo test "$@" || st=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k 30 900 cargo test "$@" || st=$?
+  else
+    cargo test "$@" || st=$?
+  fi
+  return "$st"
+}
+
+# ONE EXIT trap for the whole script: a second `trap ... EXIT` silently REPLACES
+# the first, so every temp path registers here instead of installing its own.
+CLEANUP_PATHS=()
+cleanup() {
+  if [ ${#CLEANUP_PATHS[@]} -gt 0 ]; then rm -rf "${CLEANUP_PATHS[@]}"; fi
+  return 0
+}
+trap cleanup EXIT
+
+say "1/12 Format (cargo fmt --check)"
+if cargo fmt --all --check; then
+  ok "fmt clean"
+else
+  ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
+fi
+
+say "2/12 Clippy (-D warnings)"
+# -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
+# fingerprint-poison the cargo cache against the plain build/test steps.
+if cargo clippy --workspace --all-targets -- -D warnings; then
+  ok "clippy clean"
+else
+  ko "clippy warnings above"
+fi
+
+say "3/12 Feature-off configuration (--no-default-features)"
+# GATING. `napi` is a DEFAULT feature of both oam_engine and oam_cli, so every
+# other step in this file compiles exactly one of the two configurations the
+# repo ships. The other one -- napi off, which drops the whole of src/napi.rs
+# and the 132-symbol exported ABI, and makes a `.node` require() throw
+# OAM-NATIVE0002 instead of reaching a gated dlopen path -- was verified BY HAND
+# once when it landed (#90) and then had no coverage of any kind: the string
+# `no-default-features` appeared nowhere in scripts/, crates/*/tests/, or CI.
+# A `#[cfg(feature = "napi")]` boundary that stops compiling is invisible until
+# someone builds that way on purpose, which is to say: at a release.
+#
+# Runs HERE, before the default build, on purpose. `cargo test -p oam_cli`
+# builds the package's bin targets, so this step leaves target/debug/oam.exe
+# holding a napi-LESS binary; step 4's `cargo build --workspace` relinks it with
+# default features immediately after. Ordering it later would hand the smoke,
+# conformance and node-suite steps the wrong binary, or leave one behind for
+# the developer after a green run.
+#
+# Scoped to the two crates that HAVE the feature. `--no-default-features` across
+# the whole workspace would also strip unrelated third-party defaults, which
+# tests a configuration nobody ships.
+clear_debug_holders
+park_link_targets
+if cargo build -p oam_cli -p oam_engine --no-default-features; then
+  ok "napi-off build links"
+else
+  ko "the --no-default-features build failed -- a #[cfg(feature = \"napi\")] boundary has rotted"
+fi
+if cargo clippy -p oam_cli -p oam_engine --no-default-features --all-targets -- -D warnings; then
+  ok "napi-off clippy clean"
+else
+  ko "clippy warnings in the --no-default-features configuration (above)"
+fi
+if [ "$SKIP_TESTS" -eq 0 ]; then
+  nodefault_status=0
+  bounded_cargo_test -p oam_cli -p oam_engine --no-default-features || nodefault_status=$?
+  clear_debug_holders
+  [ "$nodefault_status" -eq 0 ] \
+    || ko "napi-off tests failed (status $nodefault_status -- 124 means it hit the 15-min hang ceiling)"
+  ok "napi-off tests passed"
+else
+  warn "napi-off tests SKIPPED (--no-tests) -- build + clippy still ran"
+fi
+
+say "4/12 Build (cargo build --workspace)"
+clear_debug_holders
+park_link_targets
 # Captured, not streamed straight through. rustc surfaces linker diagnostics --
 # LNK4098 "defaultlib 'libcmt.lib' conflicts", the two-CRT bug that
 # .cargo/config.toml exists to prevent -- through the linker_messages lint,
@@ -180,7 +263,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "4/11 Tests (cargo test --workspace)"
+  say "5/12 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -188,23 +271,8 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
   # The harnesses cargo is about to relink are exactly the images a previous
   # run's orphans are still executing.
   clear_debug_holders
-  # ci.yml bounded a hung test at 15 min (the deadlocked/lingering test
-  # class). Git Bash ships coreutils timeout; macOS needs brew coreutils
-  # (gtimeout) -- unbounded as the last resort.
-  #
-  # -k 30 matters as much as the ceiling: plain `timeout` TERMs CARGO only.
-  # The test binaries cargo already launched, and the detached daemons THOSE
-  # spawned, sit in other process groups and survive -- which is how one hung
-  # run poisons the NEXT run's link step. KILL after 30s, then reap by image
-  # path below whatever the outcome was.
   test_status=0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout -k 30 900 cargo test --workspace || test_status=$?
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout -k 30 900 cargo test --workspace || test_status=$?
-  else
-    cargo test --workspace || test_status=$?
-  fi
+  bounded_cargo_test --workspace || test_status=$?
   # Unconditional, and BEFORE the failure exit: a failed or timed-out run leaks
   # more orphans than a clean one, and the smoke step below executes
   # target/debug/oam.
@@ -213,10 +281,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
-  say "4/11 Tests SKIPPED (--no-tests)"
+  say "5/12 Tests SKIPPED (--no-tests)"
 fi
 
-say "5/11 Smoke (oam run)"
+say "6/12 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -239,7 +307,7 @@ else
   ko "smoke output unexpected: '$out'"
 fi
 
-# Still step 5: running is necessary but not sufficient. This box has the VC++
+# Still step 6: running is necessary but not sufficient. This box has the VC++
 # redistributable (every box with Visual Studio does), so a binary that imports
 # the dynamic CRT smokes green here and dies on a clean end-user machine. Only
 # an import check catches that, and only on the Windows leg -- elsewhere there
@@ -266,7 +334,7 @@ if [ -f target/debug/oam.exe ]; then
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "6/11 Conformance (node-differential gate)"
+  say "7/12 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -274,14 +342,14 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "7/11 Node-suite (skip-ratchet + pass-floor gate)"
+  say "8/12 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 
-  say "8/11 Attribution (THIRD_PARTY_LICENSES drift)"
+  say "9/12 Attribution (THIRD_PARTY_LICENSES drift)"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -321,10 +389,10 @@ if [ "$FAST" -eq 0 ]; then
     fi
   fi
 else
-  say "6/11 + 7/11 + 8/11 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "7/12 + 8/12 + 9/12 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "9/11 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "10/12 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -340,7 +408,7 @@ else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
 fi
 
-say "10/11 Scripts (release-orchestration shell tests)"
+say "11/12 Scripts (release-orchestration shell tests)"
 # GATING, and cheap: ~2s, no compilation. scripts/ ships the binaries but had no
 # gate of its own until now -- which is how gc-target.sh spent its entire life
 # collecting NOTHING on Linux while reporting success (mawk interval expressions,
@@ -354,7 +422,7 @@ else
   ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
 fi
 
-say "11/11 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
+say "12/12 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
 # Every aliasing claim in this repo used to be argued, never machine-checked --
 # and one candidate napi wrapper design reviewed in 2026-08-26 would have ADDED
 # UB while passing every other gate here. oam_aliasing_model closes that.
@@ -365,11 +433,18 @@ say "11/11 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disc
 # disciplines -- see its lib.rs for what that does and does not prove.
 #
 # Two halves, and both matter:
-#   - the default tests model the CURRENT design and must PASS;
+#   - the default tests model the CURRENT design and must PASS, and must have
+#     actually RUN -- libtest exits 0 on a run that executed nothing, so an
+#     emptied or wholly-#[ignore]d crate would report a clean gate;
 #   - the `held_*` tests model shapes that were REAL BUGS, are #[ignore]d, and
 #     must still be REJECTED. A harness whose failing cases went quiet reads as
 #     coverage while providing none, so the absence of detection is itself a
 #     failure here.
+#
+# Neither half decides anything inline: both hand (status, output) to a verdict
+# function in scripts/lib/miri-gate.sh, which test-scripts.sh drives with
+# captured miri output on every box -- including the ones with no nightly
+# toolchain, where this step never runs at all.
 #
 # SKIPPED rather than fatal when nightly+miri is absent: it is a large toolchain
 # to require of every checkout, and the rest of the gate is unaffected. The skip
@@ -379,35 +454,45 @@ if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
 elif ! cargo +nightly miri --version >/dev/null 2>&1; then
   warn "miri models SKIPPED -- nightly present but miri component missing (rustup component add miri --toolchain nightly)"
 else
+  # tee'd rather than captured: a miri run is minutes long, and swallowing its
+  # progress to parse the summary afterwards would trade live feedback for a
+  # count. Same shape as the build log above -- tee reads to EOF, so there is
+  # no SIGPIPE for pipefail to trip over.
+  MIRI_LOG="$(mktemp)"
+  CLEANUP_PATHS+=("$MIRI_LOG")
   miri_status=0
-  cargo +nightly miri test -p oam_aliasing_model || miri_status=$?
-  if [ "$miri_status" -ne 0 ]; then
-    ko "miri rejected a model of the CURRENT design -- a pointer discipline napi.rs relies on has regressed"
-  fi
-  ok "miri: current-design models pass"
+  cargo +nightly miri test -p oam_aliasing_model 2>&1 | tee "$MIRI_LOG" || miri_status=$?
+  case "$(miri_current_verdict "$miri_status" "$(cat "$MIRI_LOG")")" in
+    pass) ok "miri: $OAM_MIRI_CURRENT_MIN+ current-design models ran and passed" ;;
+    rejected)
+      ko "miri rejected a model of the CURRENT design -- a pointer discipline napi.rs relies on has regressed (output above)" ;;
+    not-exercised)
+      ko "miri ran fewer than $OAM_MIRI_CURRENT_MIN current-design models (output above) -- models were deleted or #[ignore]d, so this half proved nothing. Restore them, or re-bless OAM_MIRI_CURRENT_MIN in scripts/lib/miri-gate.sh" ;;
+    *)
+      ko "miri exited 0 without a libtest summary -- it never got as far as running the models (output above)" ;;
+  esac
 
   # The teeth. Each held_* case must fail, and must fail because miri DETECTED
   # UNDEFINED BEHAVIOUR -- not merely exit non-zero. Keying on the exit status
   # alone would let a case that fails for any other reason (a plain assert, an
   # ICE, an OOM) read as "still rejected", which is the quiet-harness failure
-  # this step exists to prevent.
-  for case in held_two_exclusive_scopes_is_ub \
-              held_deref_deleted_handle_is_use_after_free \
-              held_derive_then_move_box_is_ub; do
-    if case_out=$(cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" 2>&1); then
-      ko "miri ACCEPTED $case -- it models known UB, so the harness has lost its teeth"
-    fi
-    # Pure-bash match, NOT `printf | grep -q`: this script runs under
-    # `set -o pipefail`, and grep -q exits on its FIRST match, so a large
-    # miri report SIGPIPEs the printf and the pipeline returns 141 -- which
-    # would fire the ko below while the very output it prints contains the
-    # diagnosis. No subprocess here, so there is no pipe to break.
-    if [[ "$case_out" != *"Undefined Behavior"* ]]; then
-      printf '%s\n' "$case_out" >&2
-      ko "miri failed $case WITHOUT reporting undefined behaviour -- the case no longer models the class it names (output above)"
-    fi
+  # this step exists to prevent. The list lives in the lib so a test can assert
+  # every name still exists and is still #[ignore]d.
+  for case in "${OAM_MIRI_HELD_CASES[@]}"; do
+    case_status=0
+    case_out=$(cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" 2>&1) || case_status=$?
+    case "$(miri_held_verdict "$case_status" "$case_out")" in
+      rejected-ub) : ;;
+      accepted)
+        ko "miri ACCEPTED $case -- it models known UB, so the harness has lost its teeth" ;;
+      missing)
+        ko "'--ignored $case' matched no test -- the case was renamed, deleted, or is no longer #[ignore]d, so this loop silently stopped covering it" ;;
+      *)
+        printf '%s\n' "$case_out" >&2
+        ko "miri failed $case WITHOUT reporting undefined behaviour -- the case no longer models the class it names (output above)" ;;
+    esac
   done
-  ok "miri: all 3 known-UB models still rejected, each on a reported UB diagnosis"
+  ok "miri: all ${#OAM_MIRI_HELD_CASES[@]} known-UB models still rejected, each on a reported UB diagnosis"
 fi
 
 echo ""

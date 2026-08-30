@@ -1679,12 +1679,27 @@ const REF_TAG_MASK: usize = (1usize << REF_TAG_BITS) - 1;
 /// rather than reused, which is what stops the counter wrapping around onto a
 /// generation some addon still holds a handle for. Costs one empty slot after
 /// 16.7M create/delete cycles of that single slot on a 64-bit target.
+#[cfg(not(test))]
 const REF_MAX_GENERATION: usize = REF_GEN_MASK;
+/// Test-only limit. 16.7M create/delete cycles on one slot is not a runnable
+/// test, so under `cfg(test)` the LIMIT shrinks and the LAYOUT does not:
+/// `REF_GEN_BITS` / `REF_GEN_MASK` and every encode/decode mask keep their
+/// shipped values, and 3 is an ordinary generation in that layout, so a handle
+/// minted against this limit round-trips through the real encoding unchanged.
+#[cfg(test)]
+const REF_MAX_GENERATION: usize = 3;
 
 /// Largest reference table one env can have (16.7M slots on a 64-bit target).
 /// Past this `napi_create_reference` refuses rather than minting a handle
 /// whose index would be truncated.
+#[cfg(not(test))]
 const REF_MAX_SLOTS: usize = REF_INDEX_MASK + 1;
+/// Test-only limit, for the same reason as [`REF_MAX_GENERATION`]: filling
+/// 16.7M slots is not a runnable test. Only the refusal threshold moves --
+/// `REF_INDEX_BITS` / `REF_INDEX_MASK` are untouched, so indices 0..4 encode
+/// and decode exactly as they do in a shipped build.
+#[cfg(test)]
+const REF_MAX_SLOTS: usize = 4;
 
 /// Source of per-env tags.
 ///
@@ -5112,4 +5127,189 @@ fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {
         .unwrap_or_else(|| v8::String::new(scope, "napi load error").unwrap());
     let exception = v8::Exception::error(scope, message);
     scope.throw_exception(exception);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::JsRuntime;
+
+    // Both branches under test are pure table bookkeeping, but reaching them
+    // through the real C entry points is what makes the STATUS and the
+    // last-error reason part of the assertion. `env` and `value` always come
+    // from `JsRuntime::with_napi_env`, which installs a live `PinScope` on the
+    // env for the closure's duration -- exactly the state a native entry
+    // guarantees -- so the ABI contract is identical at every call site and is
+    // discharged once, in the helpers below, rather than N times inline.
+
+    /// `napi_create_reference` with refcount 1: its status, and the handle it
+    /// wrote (null when it refused, since it writes nothing on failure).
+    fn create_ref(env: Env, value: NapiValue) -> (NapiStatus, NapiRefHandle) {
+        let mut handle: NapiRefHandle = std::ptr::null_mut();
+        // SAFETY: `env` and `value` are the live env and napi_value handed to
+        // the `with_napi_env` closure, which keeps a native scope installed for
+        // its whole body; `handle` is a live local backing the out-pointer.
+        let status = unsafe { napi_create_reference(env, value, 1, &mut handle) };
+        (status, handle)
+    }
+
+    fn delete_ref(env: Env, handle: NapiRefHandle) -> NapiStatus {
+        // SAFETY: env as in `create_ref`. `handle` is decoded rather than
+        // dereferenced by the callee, so a stale or retired one is a miss.
+        unsafe { napi_delete_reference(env, handle) }
+    }
+
+    fn ref_value(env: Env, handle: NapiRefHandle) -> NapiStatus {
+        let mut value: NapiValue = std::ptr::null_mut();
+        // SAFETY: env/handle as above; `value` is a live local out-pointer.
+        unsafe { napi_get_reference_value(env, handle, &mut value) }
+    }
+
+    /// What `napi_get_last_error_info` reports for this env right now.
+    fn last_error(env: Env) -> (NapiStatus, String) {
+        let mut info: *const NapiExtendedErrorInfo = std::ptr::null();
+        // SAFETY: env as above; `info` is a live local out-pointer. What comes
+        // back borrows the env's own `last_error` slot, which outlives this
+        // call, and its `error_message` is one of this module's `&'static
+        // CStr` literals -- so both reads are in-bounds and NUL-terminated.
+        unsafe {
+            assert_eq!(napi_get_last_error_info(env, &mut info), NAPI_OK);
+            let info = info.as_ref().expect("last error info must be written");
+            let message = std::ffi::CStr::from_ptr(info.error_message)
+                .to_string_lossy()
+                .into_owned();
+            (info.error_code, message)
+        }
+    }
+
+    /// `(slots, free-list length, env tag)` -- the table bookkeeping nothing on
+    /// the ABI exposes, which is exactly why both branches below were unproven.
+    fn env_state(env: Env) -> (usize, usize, usize) {
+        // SAFETY: `env` is the live `*mut NapiEnv` from `with_napi_env`; the
+        // reborrow is SHARED, read-only, and ends with this statement.
+        let env = unsafe { &*env };
+        (env.refs.len(), env.ref_free.len(), env.ref_tag)
+    }
+
+    /// A full reference table must REFUSE, not mint a handle whose index is
+    /// truncated into someone else's slot.
+    ///
+    /// Unreachable at the shipped limit -- it wants 16.7M live references on
+    /// one env -- so `REF_MAX_SLOTS` shrinks under `cfg(test)`; only the
+    /// threshold moves, not the encoding. The whole contract is asserted:
+    /// `napi_generic_failure`, nothing pushed, no handle written, a reason
+    /// recorded for `napi_get_last_error_info`, and every already-live handle
+    /// still resolvable afterwards.
+    #[test]
+    fn create_reference_refuses_a_full_table() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, value| {
+            NAPI_REF_PUSH_COUNT.with(|c| c.set(0));
+
+            let live: Vec<NapiRefHandle> = (0..REF_MAX_SLOTS)
+                .map(|i| {
+                    let (status, handle) = create_ref(env, value);
+                    assert_eq!(status, NAPI_OK, "slot {i} is inside the table");
+                    handle
+                })
+                .collect();
+            assert_eq!(env_state(env).0, REF_MAX_SLOTS, "the table must be full");
+
+            let (status, handle) = create_ref(env, value);
+            assert_eq!(
+                status, NAPI_GENERIC_FAILURE,
+                "a create past REF_MAX_SLOTS must be refused"
+            );
+            assert!(handle.is_null(), "a refused create must write no handle");
+            assert_eq!(
+                NAPI_REF_PUSH_COUNT.with(|c| c.get()),
+                REF_MAX_SLOTS,
+                "a refused create must not push an entry"
+            );
+            assert_eq!(
+                env_state(env).0,
+                REF_MAX_SLOTS,
+                "a refused create must not grow the table"
+            );
+
+            // Checked BEFORE the liveness sweep below: a successful entry point
+            // clears the slot, so any OK call would erase the reason.
+            let (code, message) = last_error(env);
+            assert_eq!(code, NAPI_GENERIC_FAILURE, "the reason must be recorded");
+            assert!(
+                message.contains("reference table is full"),
+                "last_error must say WHY, got: {message}"
+            );
+
+            for (i, handle) in live.iter().enumerate() {
+                assert_eq!(
+                    ref_value(env, *handle),
+                    NAPI_OK,
+                    "reference {i} must survive a refused create"
+                );
+            }
+        });
+    }
+
+    /// A slot that exhausts its generations is RETIRED, not recycled.
+    ///
+    /// Also unreachable as shipped -- 16.7M create/delete cycles on one slot --
+    /// so `REF_MAX_GENERATION` shrinks under `cfg(test)`. The observable
+    /// invariant is the bookkeeping, not the arithmetic: the spent slot never
+    /// returns to the free list, so the next create takes a FRESH slot rather
+    /// than wrapping the counter back onto a generation an addon still holds.
+    #[test]
+    fn generation_exhaustion_retires_the_slot() {
+        let mut rt = JsRuntime::new();
+        rt.with_napi_env(|env, value| {
+            let tag = env_state(env).2;
+
+            // Cycle ONE slot until its generations are spent. The free list
+            // hands slot 0 back every time, one generation further on.
+            let mut spent: NapiRefHandle = std::ptr::null_mut();
+            for generation in 1..=REF_MAX_GENERATION {
+                let (status, handle) = create_ref(env, value);
+                assert_eq!(status, NAPI_OK, "generation {generation} is spendable");
+                assert_eq!(
+                    decode_ref_handle(tag, handle),
+                    Some((0, generation)),
+                    "a recycled slot keeps its index and advances its generation"
+                );
+                assert_eq!(delete_ref(env, handle), NAPI_OK);
+                spent = handle;
+            }
+
+            let (slots, free, _) = env_state(env);
+            assert_eq!(
+                (slots, free),
+                (1, 0),
+                "a slot at REF_MAX_GENERATION must be retired, not freed for reuse"
+            );
+
+            let (status, fresh) = create_ref(env, value);
+            assert_eq!(status, NAPI_OK);
+            assert_eq!(
+                decode_ref_handle(tag, fresh),
+                Some((1, 1)),
+                "the next create must take a fresh slot, never the retired one"
+            );
+            assert_eq!(env_state(env).0, 2, "the table grew instead of recycling");
+
+            // And the retired slot keeps refusing its own last handle. This is
+            // the `entry.take()?` in `free_ref` doing it, NOT the generation
+            // compare: a retired slot keeps the generation `spent` carries, so
+            // that compare PASSES and the emptied entry is the only rejection
+            // left -- which is the claim the comment there makes.
+            assert_eq!(
+                ref_value(env, spent),
+                NAPI_INVALID_ARG,
+                "a retired slot must not resolve"
+            );
+            assert_eq!(
+                delete_ref(env, spent),
+                NAPI_INVALID_ARG,
+                "a retired slot must refuse a second delete"
+            );
+        });
+    }
 }
