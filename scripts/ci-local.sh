@@ -17,10 +17,6 @@
 #                                            fails -- node-compat.yml parity)
 #   8. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
-#  11. miri aliasing models               (GATING when nightly+miri present,
-#                                            SKIPPED with a notice otherwise --
-#                                            machine-checks the raw-pointer
-#                                            disciplines napi.rs relies on)
 #   9. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
@@ -30,6 +26,10 @@
 #                                            selection logic, tunnel-log
 #                                            parsing, sshd detection, disk
 #                                            thresholds)
+#  11. miri aliasing models               (GATING when nightly+miri present,
+#                                            SKIPPED with a notice otherwise --
+#                                            machine-checks the raw-pointer
+#                                            disciplines napi.rs relies on)
 #
 # Cross-platform coverage moved to the remote legs: scripts/release-local.sh
 # gates a release on this script PLUS gate+test+conformance on the GCP Linux
@@ -37,9 +37,12 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-10)
+#   ./scripts/ci-local.sh              # full gate (steps 1-11)
 #   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (6-8)
 #   ./scripts/ci-local.sh --no-tests   # skip the cargo test run (4)
+#
+# Neither flag skips steps 9-11; step 11 skips itself when nightly+miri is
+# absent.
 #
 # Env:
 #   OAM_SKIP_ATTRIBUTION=1   downgrade step 8 to a warning. Step 8 fails CLOSED,
@@ -114,14 +117,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/10 Format (cargo fmt --check)"
+say "1/11 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
   ok "fmt clean"
 else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/10 Clippy (-D warnings)"
+say "2/11 Clippy (-D warnings)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 if cargo clippy --workspace --all-targets -- -D warnings; then
@@ -130,7 +133,7 @@ else
   ko "clippy warnings above"
 fi
 
-say "3/10 Build (cargo build --workspace)"
+say "3/11 Build (cargo build --workspace)"
 clear_debug_holders
 # Fallback for a holder the kill could not reach (elevated process, AV handle):
 # renaming works where deleting does not. Parking the deps-stage file is NOT
@@ -177,7 +180,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "4/10 Tests (cargo test --workspace)"
+  say "4/11 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -210,10 +213,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
-  say "4/10 Tests SKIPPED (--no-tests)"
+  say "4/11 Tests SKIPPED (--no-tests)"
 fi
 
-say "5/10 Smoke (oam run)"
+say "5/11 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -263,7 +266,7 @@ if [ -f target/debug/oam.exe ]; then
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "6/10 Conformance (node-differential gate)"
+  say "6/11 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -271,14 +274,14 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "7/10 Node-suite (skip-ratchet + pass-floor gate)"
+  say "7/11 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 
-  say "8/10 Attribution (THIRD_PARTY_LICENSES drift)"
+  say "8/11 Attribution (THIRD_PARTY_LICENSES drift)"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -318,10 +321,10 @@ if [ "$FAST" -eq 0 ]; then
     fi
   fi
 else
-  say "6/10 + 7/10 + 8/10 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "6/11 + 7/11 + 8/11 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "9/10 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "9/11 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -383,16 +386,23 @@ else
   fi
   ok "miri: current-design models pass"
 
-  # The teeth. Each held_* case must FAIL; a pass means this harness has stopped
-  # detecting the class it exists for.
+  # The teeth. Each held_* case must fail, and must fail because miri DETECTED
+  # UNDEFINED BEHAVIOUR -- not merely exit non-zero. Keying on the exit status
+  # alone would let a case that fails for any other reason (a plain assert, an
+  # ICE, an OOM) read as "still rejected", which is the quiet-harness failure
+  # this step exists to prevent.
   for case in held_two_exclusive_scopes_is_ub \
               held_deref_deleted_handle_is_use_after_free \
               held_derive_then_move_box_is_ub; do
-    if cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" >/dev/null 2>&1; then
+    if case_out=$(cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" 2>&1); then
       ko "miri ACCEPTED $case -- it models known UB, so the harness has lost its teeth"
     fi
+    if ! printf '%s' "$case_out" | grep -q "Undefined Behavior"; then
+      printf '%s\n' "$case_out" >&2
+      ko "miri failed $case WITHOUT reporting undefined behaviour -- the case no longer models the class it names (output above)"
+    fi
   done
-  ok "miri: all 3 known-UB models still rejected"
+  ok "miri: all 3 known-UB models still rejected, each on a reported UB diagnosis"
 fi
 
 echo ""
