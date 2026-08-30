@@ -945,6 +945,47 @@ unsafe extern "C" fn read_ref_handle(env: NapiEnv, info: NapiCallbackInfo) -> Na
     }
 }
 
+/// readRefInt(bigint) -> number: resolve a JS-supplied handle and report the
+/// int32 the referenced value holds, rather than just the host's status.
+///
+/// The status-only `readRefHandle` cannot tell one live reference from
+/// another: a host that hands two `napi_create_reference` calls the SAME slot
+/// still answers napi_ok for both. Reading the VALUE back is what makes a
+/// clobbered slot observable.
+///
+/// * `>= 0`  -- the referenced int32.
+/// * `-1`    -- the argument was not a readable BigInt.
+/// * `-2`    -- the host refused the handle (any non-ok status).
+/// * `-3`    -- the handle resolved, but the value was not an int32.
+///
+/// # Safety
+///
+/// Only ever invoked by the N-API host as a `napi_callback`.
+unsafe extern "C" fn read_ref_int(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    // SAFETY: `bits`, `lossless`, `out_value` and `answer` are live locals
+    // backing the out-pointers. The reconstructed handle goes straight to the
+    // host, which validates it against its own ref table; the addon never
+    // dereferences it, and `out_value` is only read once the host reported
+    // napi_ok, i.e. once it wrote through that pointer.
+    unsafe {
+        let value = one_arg(env, info);
+        let mut bits = 0i64;
+        let mut lossless = false;
+        if (host().get_value_bigint_int64)(env, value, &mut bits, &mut lossless) != 0 {
+            return num(env, -1);
+        }
+        let mut out_value: NapiValue = std::ptr::null_mut();
+        if (host().get_reference_value)(env, bits as *mut c_void, &mut out_value) != 0 {
+            return num(env, -2);
+        }
+        let mut answer = 0i32;
+        if (host().get_value_int32)(env, out_value, &mut answer) != 0 {
+            return num(env, -3);
+        }
+        num(env, answer)
+    }
+}
+
 /// deleteRefHandle(bigint) -> number: host status for napi_delete_reference on
 /// a handle supplied by JS. The companion to `makeRefHandle`, so a test can
 /// drive create/delete pairs from JS and watch what the host does with the
@@ -1179,7 +1220,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (host().set_named_property)(env, exports, name.as_ptr(), function);
         }
 
-        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 21] = [
+        let beta_bindings: [(&std::ffi::CStr, NapiCallback); 22] = [
             (c"abaStaleReadStatus", aba_stale_read_status),
             (c"abaHandleRecycled", aba_handle_recycled),
             (c"deleteRefHandle", delete_ref_handle),
@@ -1194,6 +1235,7 @@ pub unsafe extern "C" fn napi_register_module_v1(env: NapiEnv, exports: NapiValu
             (c"createRefNullOut", create_ref_null_out),
             (c"makeRefHandle", make_ref_handle),
             (c"readRefHandle", read_ref_handle),
+            (c"readRefInt", read_ref_int),
             (c"wrapCounter", wrap_counter),
             (c"counterGet", counter_get),
             (c"counterInc", counter_inc),

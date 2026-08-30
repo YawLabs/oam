@@ -1790,6 +1790,198 @@ fn addon_load_is_refused_when_the_ffi_permission_is_withheld() {
     );
 }
 
+/// Run the binary with the N-API alpha opt-in deliberately ABSENT.
+///
+/// The shared `oam()` helper sets `OAM_ENABLE_NATIVE_ADDONS=1` on every
+/// invocation, which is exactly the variable the two tests below have to see
+/// missing. It is `env_remove`d rather than merely left unset so a developer
+/// who exports it in their own shell cannot quietly make them vacuous.
+#[cfg(feature = "napi")]
+fn oam_without_addon_optin(args: &[&str]) -> Output {
+    let cache = write_temp("oam-no-optin-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(args)
+        .env_remove("OAM_ENABLE_NATIVE_ADDONS")
+        .env("OAM_CACHE_DIR", cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .output()
+        .expect("oam binary runs")
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn addon_load_still_needs_the_env_opt_in_when_the_ffi_permission_is_granted() {
+    // The two addon gates are INDEPENDENT, and this pins the half that is easy
+    // to argue away: once `--allow-addons` grants ffi, the sandbox has said
+    // yes, so the OAM_ENABLE_NATIVE_ADDONS check can look redundant. It is not.
+    // The env var is the alpha opt-in for a subsystem that can DEADLOCK the OS
+    // loader on a Node-built addon; the permission only says the caller is
+    // allowed to ask. Deleting the env-var block because "the permission check
+    // supersedes it" would turn every `--allow-addons` run into an opted-in
+    // one.
+    let dir = napi_addon_dir("addon_optin_with_ffi");
+    write_temp(
+        "addon_optin_with_ffi/load.cjs",
+        "try {
+           require('./native.node');
+           console.log('LOADED');
+         } catch (e) {
+           console.log('CAUGHT', e.code);
+         }",
+    );
+    let main = dir.join("load.cjs");
+    let main = main.to_str().unwrap();
+
+    // Control: the SAME argv loads once the opt-in is present, so the refusal
+    // below is about the missing variable and not about the flags or fixture.
+    let ok = oam(&["--permission", "--allow-addons", main]);
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("LOADED"),
+        "control: --permission --allow-addons must load with the opt-in set. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // ffi granted, opt-in absent: still refused, and with the native-addon
+    // code -- the caller was stopped by the subsystem, not by the sandbox.
+    let refused = oam_without_addon_optin(&["--permission", "--allow-addons", main]);
+    let out = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        !out.contains("LOADED"),
+        "the ffi grant must not stand in for OAM_ENABLE_NATIVE_ADDONS. stdout: {out}"
+    );
+    assert!(
+        out.contains("OAM-NATIVE0001"),
+        "want the native-addon opt-in error, got: {out} / stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn addon_sandbox_verdict_is_reported_ahead_of_the_env_opt_in() {
+    // ORDER, not just outcome. With ffi withheld AND the opt-in absent both
+    // gates would refuse, so the pair only pins which one answers -- and the
+    // sandbox has to, because an env var must never be the reason a caller
+    // learns it was denied. Swap the two blocks and the run reports
+    // OAM-NATIVE0001 ("set OAM_ENABLE_NATIVE_ADDONS=1 and retry"), which is
+    // actively misleading advice: doing that still gets ERR_ACCESS_DENIED.
+    let dir = napi_addon_dir("addon_sandbox_before_optin");
+    write_temp(
+        "addon_sandbox_before_optin/load.cjs",
+        "try {
+           require('./native.node');
+           console.log('LOADED');
+         } catch (e) {
+           console.log('CAUGHT', e.code, e.permission);
+         }",
+    );
+    let main = dir.join("load.cjs");
+    let main = main.to_str().unwrap();
+
+    let denied = oam_without_addon_optin(&["--permission", main]);
+    let out = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        !out.contains("LOADED"),
+        "an addon must not load with ffi withheld and the opt-in absent. stdout: {out}"
+    );
+    assert!(
+        out.contains("ERR_ACCESS_DENIED") && out.contains("Addon"),
+        "want the sandbox verdict first: ERR_ACCESS_DENIED + permission Addon, got: {out} / stderr: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        !out.contains("OAM-NATIVE0001"),
+        "the env-var opt-in must not answer ahead of the sandbox -- its message tells the caller to set a variable that would not help: {out}"
+    );
+}
+
+// The two feature-off contracts. `napi_addon_dir` needs a BUILT addon, so
+// these use a placeholder `.node`: both paths refuse before anything is
+// dlopen'd, which is the whole point.
+#[cfg(not(feature = "napi"))]
+#[test]
+fn addon_require_throws_a_catchable_error_when_napi_is_not_compiled_in() {
+    // The universal `try { require(native) } catch { pure-JS fallback }`
+    // pattern (ssh2/cpu-features, bufferutil, bcrypt, ...) is the entire
+    // reason this is a THROW rather than a fatal. Turning it into a hard
+    // error -- or into a silently-undefined export -- breaks every package
+    // that ships that fallback, so the test asserts the script keeps running
+    // afterwards, not merely that something went wrong.
+    let addon = write_temp("napi_off_require/native.node", "placeholder, never loaded");
+    write_temp(
+        "napi_off_require/load.cjs",
+        "try {
+           require('./native.node');
+           console.log('LOADED');
+         } catch (e) {
+           console.log('CAUGHT', e.code);
+         }
+         console.log('FALLBACK RAN');",
+    );
+    let main = addon.parent().unwrap().join("load.cjs");
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "the throw must be catchable, so the process still exits 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("LOADED"),
+        "a build without the napi feature cannot load an addon: {stdout}"
+    );
+    assert!(
+        stdout.contains("CAUGHT OAM-NATIVE0002"),
+        "want the distinct feature-off code -- 0001 would tell the caller to set an env var this build does not read: {stdout}"
+    );
+    assert!(
+        stdout.contains("FALLBACK RAN"),
+        "the catch must resume the script, or every try/catch fallback breaks: {stdout}"
+    );
+}
+
+#[cfg(not(feature = "napi"))]
+#[test]
+fn allow_addons_is_refused_at_startup_when_napi_is_not_compiled_in() {
+    // Accepting the flag would be a silent no-op that READS as "addons are
+    // on", and the caller would only find out from an OAM-NATIVE0002 throw
+    // deep inside require(). Fail at argv parse instead, naming the cargo
+    // feature so the diagnosis is "wrong build", not "wrong code".
+    let script = write_temp("napi_off_flag/main.cjs", "console.log('SCRIPT RAN');");
+    let path = script.to_string_lossy().to_string();
+
+    // Control: the same script runs fine without the flag, so the exit below
+    // is the flag's doing.
+    let ok = oam(&["run", &path]);
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("SCRIPT RAN"),
+        "control: the script must run when --allow-addons is absent. stderr: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let out = oam(&["--allow-addons", &path]);
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "--allow-addons must exit 9 on a build without the napi feature. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("SCRIPT RAN"),
+        "the refusal must happen before the script runs"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-addons") && stderr.contains("napi"),
+        "the message must name the flag and the missing cargo feature: {stderr}"
+    );
+}
+
 #[cfg(feature = "napi")]
 #[test]
 fn napi_beta_wrap_counter_roundtrip() {
@@ -2159,6 +2351,189 @@ fn napi_reference_slots_are_reused_rather_than_grown() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "0",
         "a create/delete pair must reuse its slot, not append a new one"
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_distinct_references_get_distinct_slots() {
+    // Every other ref test holds ONE handle it reads at a time. (The ABA probes
+    // do grow the table -- they leak their second reference, so 5000 cycles
+    // leave ~10k slots behind -- but they never read two handles.) So nothing
+    // covered the ordinary case an addon actually lives in: several live
+    // references, each of which must keep resolving to ITS OWN value.
+    //
+    // `readRefInt` rather than `readRefHandle` is what makes this load-bearing.
+    // A host that hands the second create the FIRST slot still answers napi_ok
+    // for both handles, so a status-only assertion passes on the broken host --
+    // the clobber is only visible in the value that comes back.
+    let dir = napi_addon_dir("napi_two_refs");
+
+    // Shape 1: two live references, then delete one and re-read the other.
+    // Catches `self.refs.len() - 1` -> `0` in the fresh-slot arm of alloc_ref,
+    // which files every new reference into slot 0 on top of the last.
+    write_temp(
+        "napi_two_refs/two.cjs",
+        "const native = require('./native.node');\n\
+         const a = native.makeRefHandle(111);\n\
+         const b = native.makeRefHandle(222);\n\
+         // Two creates, two slots: the handles cannot be equal.\n\
+         console.log(a === b);\n\
+         console.log(native.readRefInt(a));\n\
+         console.log(native.readRefInt(b));\n\
+         // 0 === napi_ok: delete the FIRST, keeping the second live.\n\
+         console.log(native.deleteRefHandle(a));\n\
+         // b is untouched by its neighbour's delete...\n\
+         console.log(native.readRefInt(b));\n\
+         // ...and a is now refused (-2), not silently resolved to b.\n\
+         console.log(native.readRefInt(a));",
+    );
+    let out = oam(&["run", dir.join("two.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "false",
+        "two live references must not share one handle"
+    );
+    assert_eq!(
+        lines[1], "111",
+        "the first reference must resolve to its own value"
+    );
+    assert_eq!(
+        lines[2], "222",
+        "the second reference must resolve to its own value, not the first's"
+    );
+    assert_eq!(
+        lines[3], "0",
+        "deleting the first handle must report napi_ok"
+    );
+    assert_eq!(
+        lines[4], "222",
+        "deleting one reference must not disturb the other"
+    );
+    assert_eq!(
+        lines[5], "-2",
+        "the deleted handle must be refused, not resolved to the surviving reference"
+    );
+
+    // Shape 2: three references, free the MIDDLE one, then create a fourth.
+    // The fourth must land in the freed slot (index 1), which is NOT the last
+    // slot in the table -- so this is what catches `&mut self.refs[index]` ->
+    // `self.refs.last_mut()`, a swap the two-reference shape above cannot see
+    // (there, index 1 IS the last slot).
+    write_temp(
+        "napi_two_refs/three.cjs",
+        "const native = require('./native.node');\n\
+         const a = native.makeRefHandle(11);\n\
+         const b = native.makeRefHandle(22);\n\
+         const c = native.makeRefHandle(33);\n\
+         // 0 === napi_ok: frees the MIDDLE slot onto the free list.\n\
+         console.log(native.deleteRefHandle(b));\n\
+         // Must be filed in b's freed slot rather than appended past c.\n\
+         const d = native.makeRefHandle(44);\n\
+         console.log(native.readRefInt(a));\n\
+         // c is the LAST slot -- the one a last_mut() misfile would clobber.\n\
+         console.log(native.readRefInt(c));\n\
+         console.log(native.readRefInt(d));\n\
+         // -2: b's handle names a generation its slot has moved past.\n\
+         console.log(native.readRefInt(b));\n\
+         console.log(a === d, c === d);",
+    );
+    let out = oam(&["run", dir.join("three.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines[0], "0",
+        "deleting the middle handle must report napi_ok"
+    );
+    assert_eq!(lines[1], "11", "the first reference must survive untouched");
+    assert_eq!(
+        lines[2], "33",
+        "recycling the middle slot must not overwrite the LAST one"
+    );
+    assert_eq!(
+        lines[3], "44",
+        "the recycled slot must mint a handle that resolves to the new value"
+    );
+    assert_eq!(lines[4], "-2", "the freed handle must stay refused");
+    assert_eq!(
+        lines[5], "false false",
+        "the recycled handle must collide with no live handle"
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
+fn napi_delete_of_a_free_slot_does_not_re_list_it() {
+    // A forged handle naming a slot that is currently FREE, at that slot's
+    // CURRENT generation -- so it clears the generation compare and is refused
+    // only by the entry being absent. The refusal STATUS is the same whether
+    // or not the slot is re-listed, so asserting on it alone proves nothing;
+    // the observable consequence is that the free list must not name the same
+    // index twice, because the second create then hands out a handle already
+    // live.
+    //
+    // Catches hoisting `self.ref_free.push(index)` above
+    // `let entry = slot.entry.take()?;` in free_ref: the refused call still
+    // bumps the generation and pushes the index, so the next two creates both
+    // pop it and mint identical handles for different values.
+    use oam_engine::napi::REF_INDEX_BITS;
+
+    let dir = napi_addon_dir("napi_free_slot_forged_delete");
+    let gen_shift = REF_INDEX_BITS;
+    write_temp(
+        "napi_free_slot_forged_delete/forged_delete.cjs",
+        &format!(
+            "const native = require('./native.node');\n\
+             const a = native.makeRefHandle(1);\n\
+             // 0 === napi_ok: the real delete frees the slot.\n\
+             console.log(native.deleteRefHandle(a));\n\
+             // Same slot, its CURRENT generation -- so only the missing entry\n\
+             // can refuse this. 1 === napi_invalid_arg.\n\
+             console.log(native.deleteRefHandle(a + (1n << {gen_shift}n)));\n\
+             const b = native.makeRefHandle(7);\n\
+             const c = native.makeRefHandle(9);\n\
+             // The refused delete must not have queued the index a second\n\
+             // time, or these two creates share a slot AND a handle.\n\
+             console.log(b === c);\n\
+             console.log(native.readRefInt(b));\n\
+             console.log(native.readRefInt(c));"
+        ),
+    );
+    let out = oam(&["run", dir.join("forged_delete.cjs").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "0", "the real delete must report napi_ok");
+    assert_eq!(
+        lines[1], "1",
+        "a handle naming a free slot must be refused, even at that slot's live generation"
+    );
+    assert_eq!(
+        lines[2], "false",
+        "a refused delete must not re-list the slot -- two creates handed the same handle"
+    );
+    assert_eq!(
+        lines[3], "7",
+        "the first new reference must keep its own value"
+    );
+    assert_eq!(
+        lines[4], "9",
+        "the second must not have been filed on top of the first"
     );
 }
 
