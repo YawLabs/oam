@@ -397,7 +397,12 @@ else
     if case_out=$(cargo +nightly miri test -p oam_aliasing_model -- --ignored "$case" 2>&1); then
       ko "miri ACCEPTED $case -- it models known UB, so the harness has lost its teeth"
     fi
-    if ! printf '%s' "$case_out" | grep -q "Undefined Behavior"; then
+    # Pure-bash match, NOT `printf | grep -q`: this script runs under
+    # `set -o pipefail`, and grep -q exits on its FIRST match, so a large
+    # miri report SIGPIPEs the printf and the pipeline returns 141 -- which
+    # would fire the ko below while the very output it prints contains the
+    # diagnosis. No subprocess here, so there is no pipe to break.
+    if [[ "$case_out" != *"Undefined Behavior"* ]]; then
       printf '%s\n' "$case_out" >&2
       ko "miri failed $case WITHOUT reporting undefined behaviour -- the case no longer models the class it names (output above)"
     fi
