@@ -299,6 +299,22 @@ pub(crate) fn load_cjs<'s>(
             // clean, catchable error instead lets every such fallback work.
             // oam's own N-API alpha (compatible addons) is available via
             // OAM_ENABLE_NATIVE_ADDONS=1.
+            // SANDBOX FIRST. `--allow-addons` maps to the `ffi` permission,
+            // and until now nothing consumed it: the grant was reported by
+            // `process.permission.has('ffi')` and then ignored, so a run
+            // under `--permission` WITHOUT `--allow-addons` still loaded an
+            // addon as long as OAM_ENABLE_NATIVE_ADDONS was set in the
+            // environment. An env var must never widen a permission the
+            // caller withheld, so the verdict is taken here, ahead of the
+            // alpha opt-in below, and reported as Node's ERR_ACCESS_DENIED
+            // rather than a native-addon error -- the caller was refused by
+            // the sandbox, not by the subsystem.
+            if let Err(denial) =
+                crate::node_ops::permissions_of(scope).check_ffi(&key.to_string_lossy())
+            {
+                crate::node_ops::throw_permission_denied(scope, &denial);
+                return None;
+            }
             if std::env::var_os("OAM_ENABLE_NATIVE_ADDONS").is_none() {
                 throw_error_with_code(
                     scope,

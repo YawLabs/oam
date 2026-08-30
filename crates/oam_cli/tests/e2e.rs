@@ -1733,6 +1733,65 @@ fn napi_addon_dir(subdir: &str) -> std::path::PathBuf {
 
 #[cfg(feature = "napi")]
 #[test]
+fn addon_load_is_refused_when_the_ffi_permission_is_withheld() {
+    // `--allow-addons` maps to the `ffi` permission, but nothing consumed it:
+    // the grant was reported by `process.permission.has('ffi')` and then
+    // ignored, so under `--permission` WITHOUT `--allow-addons` an addon still
+    // loaded as long as OAM_ENABLE_NATIVE_ADDONS was set. The e2e helper sets
+    // that variable for every invocation here, which is exactly the hole: the
+    // sandbox verdict has to win over an environment variable.
+    let dir = napi_addon_dir("ffi_perm_denied");
+    write_temp(
+        "ffi_perm_denied/load.cjs",
+        "try {
+          require('./native.node');
+          console.log('LOADED');
+        } catch (e) {
+          console.log(e.code, e.permission);
+        }",
+    );
+    let main = dir.join("load.cjs");
+    let main = main.to_str().unwrap();
+
+    // Control: the addon genuinely loads when nothing withholds it. Without
+    // this the denial below could pass for an unrelated reason (a missing
+    // fixture, a bad path) and the test would be vacuous.
+    let ok = oam(&[main]);
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("LOADED"),
+        "control: addon should load with no permission restriction. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // Denied: --permission with no --allow-addons. Node's shape, so the error
+    // is ERR_ACCESS_DENIED carrying permission "Addon" -- NOT a native-addon
+    // error, because the caller was refused by the sandbox, not the subsystem.
+    let denied = oam(&["--permission", main]);
+    let out = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        !out.contains("LOADED"),
+        "addon loaded despite the ffi permission being withheld. stdout: {out}"
+    );
+    assert!(
+        out.contains("ERR_ACCESS_DENIED") && out.contains("Addon"),
+        "want ERR_ACCESS_DENIED + permission Addon, got: {out} / stderr: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+
+    // Granted: --permission --allow-addons loads again, so the check gates on
+    // the grant rather than just refusing everything under --permission.
+    let granted = oam(&["--permission", "--allow-addons", main]);
+    assert!(
+        String::from_utf8_lossy(&granted.stdout).contains("LOADED"),
+        "addon should load when --allow-addons grants ffi. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&granted.stdout),
+        String::from_utf8_lossy(&granted.stderr)
+    );
+}
+
+#[cfg(feature = "napi")]
+#[test]
 fn napi_beta_wrap_counter_roundtrip() {
     let dir = napi_addon_dir("napi_beta_wrap");
     write_temp(

@@ -161,6 +161,28 @@ impl Permissions {
         }
     }
 
+    /// Returns `Err(denial)` when loading a native addon is denied.
+    ///
+    /// `Addon` is Node's own name for this permission (`--allow-addons`);
+    /// oam stores it under the Deno-shaped `ffi` field, so the field name
+    /// and the reported name deliberately differ.
+    ///
+    /// This is the SANDBOX verdict and it is independent of
+    /// `OAM_ENABLE_NATIVE_ADDONS`. That variable is the alpha opt-in for a
+    /// subsystem that can deadlock the loader; it is not a grant, and an
+    /// environment variable must never be able to widen a permission the
+    /// caller withheld.
+    pub fn check_ffi(&self, resource: &str) -> Result<(), PermissionDenial> {
+        if self.ffi.allows(resource) {
+            Ok(())
+        } else {
+            Err(PermissionDenial {
+                permission: "Addon",
+                resource: resource.to_string(),
+            })
+        }
+    }
+
     /// Returns `Err(denial)` when `env` is denied.
     pub fn check_env(&self, key: &str) -> Result<(), PermissionDenial> {
         if self.env.allows(key) {
