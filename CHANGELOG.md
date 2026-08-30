@@ -24,6 +24,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   absent, so calling any of them was a `TypeError`. Every method now also
   rejects on a closed handle with Node's shape (`EBADF` plus the per-method
   `syscall`) instead of reaching the descriptor. (#99)
+- **`FileHandle.readableWebStream()`**, the twentieth and last member of Node
+  v22's `FileHandle`. It does not take ownership: `autoClose` defaults to
+  `false`, so a fully drained stream leaves the descriptor open -- the opposite
+  of `createReadStream`. The handle is locked to the stream for life on the
+  first call. A BYOB reader is not supported (oam's web-streams layer has no
+  byte controller, so a default reader is returned); see
+  `docs/node-divergences.md`. (#102)
 - A miri-checked model of the N-API pointer disciplines runs as its own gate
   step, so the aliasing claims behind the addon layer are machine-checked
   rather than argued. It found the `load_addon` defect below. (#88)
