@@ -10,8 +10,19 @@ license.workspace = true
 name = "oam"
 path = "src/main.rs"
 
+[features]
+default = ["napi"]
+# Passthrough for oam_engine's `napi` feature. It is a SEPARATE feature here
+# because build.rs keys the exported ABI surface off CARGO_FEATURE_NAPI: a
+# build.rs only ever sees its OWN package's features, never a dependency's.
+# With it off, no `.def` / `--export-dynamic` link arg is emitted and the
+# binary exports no `napi_*` symbol at all.
+napi = ["oam_engine/napi"]
+
 [dependencies]
-oam_engine = { workspace = true }
+# default-features = false so `--no-default-features` on THIS crate actually
+# reaches oam_engine; the `napi` feature above turns it back on.
+oam_engine = { workspace = true, default-features = false }
 oam_diagnostics = { workspace = true }
 oam_loader = { workspace = true }
 oam_ts = { workspace = true }

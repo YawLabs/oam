@@ -23,6 +23,11 @@ mod crypto_ops;
 pub mod fork;
 mod inspector;
 mod modules;
+/// The N-API C-ABI layer. Feature-gated (default ON): a build that can never
+/// load a `.node` addon should ship neither this module's `unsafe` FFI surface
+/// nor the 132-symbol ABI `oam_cli/build.rs` exports from the executable for
+/// addons to resolve against. See crates/oam_engine/Cargo.toml `[features]`.
+#[cfg(feature = "napi")]
 pub mod napi;
 mod node_ops;
 mod ops;
@@ -342,6 +347,7 @@ impl JsRuntime {
         // via ensure_core_runtime() before its first tick/eval.
         isolate.set_slot(ops::PendingOps::default());
         isolate.set_slot(crypto_ops::CryptoState::default());
+        #[cfg(feature = "napi")]
         isolate.set_slot(napi::AddonRegistry::new());
         isolate.set_slot(replay::ReplayState::default());
         // Fork pool: up to 2 pre-warmed isolates for oam.fork() cold-start
@@ -643,7 +649,9 @@ impl Default for JsRuntime {
     }
 }
 
-#[cfg(test)]
+// Every helper in this block is N-API-only, so the whole block follows the
+// feature.
+#[cfg(all(test, feature = "napi"))]
 impl JsRuntime {
     /// Load a `.node` addon directly — used by the lifecycle drop-counter
     /// test only.  Returns `true` if the addon registered without a pending
@@ -739,6 +747,7 @@ fn install_runtime_globals(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "napi")]
     use napi::{NAPI_ENV_DROP_COUNT, NAPI_REF_PUSH_COUNT};
     use std::sync::Mutex;
 
@@ -916,6 +925,7 @@ mod tests {
     /// Mirrors `built_test_addon` in crates/oam_cli/tests/e2e.rs -- the two
     /// cannot share code (separate crates, and this one is behind cfg(test)),
     /// so they are kept deliberately identical in behaviour.
+    #[cfg(feature = "napi")]
     fn built_test_addon() -> std::path::PathBuf {
         let addon_file = if cfg!(windows) {
             "oam_napi_test_addon.dll"
@@ -986,6 +996,7 @@ mod tests {
     /// addon: `crates/oam_cli/build.rs` re-exports the napi_* symbols with
     /// `rustc-link-arg-bins`, which covers `oam.exe` but NOT this crate's test
     /// binary, so an addon loaded here never resolves the host table.
+    #[cfg(feature = "napi")]
     #[test]
     fn rejected_create_reference_pushes_nothing() {
         let mut rt = JsRuntime::new();
@@ -1042,6 +1053,7 @@ mod tests {
     /// builds every member first, so that satisfies it automatically; a scoped
     /// `cargo test -p oam_engine` does NOT, which is what `built_test_addon`
     /// below reports on.
+    #[cfg(feature = "napi")]
     #[test]
     fn napienv_lifecycle_drops_with_runtime() {
         let addon_path = built_test_addon();

@@ -133,7 +133,12 @@ oxc_codegen = "0.135"
 oxc_diagnostics = "0.135"
 
 # Internal crates
-oam_engine = { path = "crates/oam_engine" }
+# default-features = false so a member CAN opt out of oam_engine's `napi`
+# feature: Cargo rejects `default-features = false` on an inheriting member
+# unless the workspace entry already says so. oam_cli (the only dependent)
+# turns it back on through its own `napi` passthrough, which is `default`,
+# so an ordinary `cargo build` is unchanged.
+oam_engine = { path = "crates/oam_engine", default-features = false }
 oam_core = { path = "crates/oam_core" }
 oam_diagnostics = { path = "crates/oam_diagnostics" }
 oam_loader = { path = "crates/oam_loader" }

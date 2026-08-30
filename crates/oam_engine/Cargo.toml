@@ -6,6 +6,26 @@ publish.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["napi"]
+# N-API (Node-API): the C-ABI surface compiled `.node` addons call, plus the
+# dlopen/register machinery in src/napi.rs. ON by default so every current
+# build is byte-for-byte unchanged.
+#
+# Turning it OFF drops the whole of src/napi.rs -- the bulk of this crate's
+# `unsafe` FFI surface -- and the 132-symbol exported ABI (131 `napi_*` entry
+# points plus the `uv_event_loop` data symbol, listed in oam_cli/build.rs).
+# Worth doing for any build that can never load a native addon: `.node`
+# require() then throws OAM-NATIVE0002 instead of reaching a dlopen path that
+# is present-but-gated.
+#
+# NOTE for the unsafe-budget ratchet (conformance/unsafe-budget.json): this
+# feature does NOT and MUST NOT move the counter. That checker lexes source
+# TEXT across every cfg branch, so napi.rs is still measured whether or not
+# it compiles. Removing shipped attack surface is the point; moving the
+# number would mean the ratchet had stopped seeing code that still exists.
+napi = ["dep:libloading"]
+
 [dependencies]
 v8 = { workspace = true }
 anyhow = { workspace = true }
@@ -48,8 +68,8 @@ p384 = { workspace = true }
 num-bigint-dig = { workspace = true }
 # node:crypto wave 7: X.509 certificate inspection.
 x509-parser = { workspace = true }
-# N-API addon loading.
-libloading = { workspace = true }
+# N-API addon loading (feature `napi` only).
+libloading = { workspace = true, optional = true }
 # os/process native values on macOS + other non-linux unix (mem/cpu/rss/ppid).
 sysinfo = { workspace = true }
 # WebSocket ops: Message type for wsSend framing.

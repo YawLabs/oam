@@ -34,7 +34,7 @@ Notable ones:
 | `--allow-net[=<hosts>]` / `--allow-env[=<names>]` | Bare grants everything; the `=` form takes a comma-separated allow-list. |
 | `--allow-child-process` | Spawning **and** `process.execve`, which replaces the image. |
 | `--allow-worker` | Starting a `worker_threads` Worker or an `oam.fork()` isolate. Does **not** imply `--allow-child-process` — a child isolate inherits the parent's permissions, so it cannot spawn unless the parent could. |
-| `--allow-addons` | Loading native addons. |
+| `--allow-addons` | Loading native addons. Requires a binary built with the `napi` cargo feature (the default); a build without it rejects the flag at startup rather than granting a permission it cannot honour. |
 | `--experimental-vm-modules` | Enables `vm.SourceTextModule`. |
 | `--expose-internals` | Resolves `internal/*` from the builtin registry. |
 | `--expose-gc`, `--no-warnings`, `--no-deprecation`, `--pending-deprecation` | As in Node. |
@@ -47,7 +47,7 @@ Notable ones:
 
 | Variable | Effect |
 |---|---|
-| `OAM_ENABLE_NATIVE_ADDONS=1` | Enable N-API addon loading. **Off by default and alpha**: an addon compiled against `node.exe` can deadlock the OS loader inside oam, before any oam code runs, so the default is a clean throw that lets a package's JS fallback take over. |
+| `OAM_ENABLE_NATIVE_ADDONS=1` | Enable N-API addon loading. **Off by default and alpha**: an addon compiled against `node.exe` can deadlock the OS loader inside oam, before any oam code runs, so the default is a clean throw that lets a package's JS fallback take over. This is the *runtime* switch; there is also a *compile-time* one — the `napi` cargo feature (on by default). A binary built `--no-default-features` has no N-API layer and no exported `napi_*` ABI at all, so `require()` of a `.node` throws `OAM-NATIVE0002` and this variable does nothing. |
 | `OAM_MAX_HEAP_MB` | Cap the V8 heap. Set this to match a container memory limit. |
 | `OAM_MAX_BODY_BYTES` | Aggregate cap on queued HTTP request-body bytes across all in-flight requests (default 512MB). Past it, excess uploads are shed rather than buffered. Per-request backpressure is the first line of defence; this bounds the total once concurrency is high. |
 | `OAM_CODE_CACHE` | Control V8 code-cache reuse across runs. |
