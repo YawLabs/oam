@@ -30,7 +30,11 @@ VERBOSE=0
 [ "${1:-}" = "-v" ] && VERBOSE=1
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_DIR"
+# Guarded, and not decoration: every path below is repo-relative, so a failed cd
+# would run the whole suite against whatever directory the caller stood in --
+# which is a variant of the `cd ""` no-op that let gc-target.sh prune the wrong
+# tree for its entire life.
+cd "$REPO_DIR" || { echo "cannot cd to $REPO_DIR" >&2; exit 1; }
 
 # One temp root, removed on exit. Every fixture used to call mktemp and nothing
 # ever cleaned up: a single run leaked 14 directories, and once this became a
@@ -535,6 +539,227 @@ eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_r
 it "OAM_DISK_MIN_GB moves the abort floor"
 eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_below_floor 40 && echo abort || echo proceed')" \
    "abort"
+
+# =============================================================================
+group "ci-local.sh -- miri gate verdicts"
+# =============================================================================
+# The gate's own decision logic, which until now was the one part of ci-local.sh
+# nothing exercised -- this suite's header said as much. Step 12 decides from
+# (exit status, output text), and every way that decision can rot makes the gate
+# QUIETER: libtest exits 0 on a run that executed nothing, and a held_* case
+# that dies for an unrelated reason still exits non-zero.
+#
+# Driven with CAPTURED miri output rather than a real run, on purpose. Requiring
+# nightly+miri would mean the logic is checked only on the boxes where step 12
+# already runs -- which is the opposite of what is wanted: the classifier is
+# exactly what a box WITHOUT miri cannot otherwise verify.
+# shellcheck source=lib/miri-gate.sh
+. scripts/lib/miri-gate.sh
+
+# Shape captured from `cargo miri test -p oam_aliasing_model`: two summary lines,
+# because cargo emits one per test binary plus one for doctests. The count is
+# their SUM, so a fixture with only one line would not exercise that.
+MIRI_PASS_OUT="$(cat <<'FIXTURE'
+   Compiling oam_aliasing_model v0.12.1
+running 9 tests
+test tests::two_shared_scopes_coexist ... ok
+test tests::ref_entry_rejects_a_deleted_handle ... ok
+
+test result: ok. 6 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 41.20s
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+FIXTURE
+)"
+
+# What a filter matching NOTHING looks like. Verified against real libtest:
+# `cargo test -p oam_aliasing_model -- --ignored no_such_name` prints this and
+# exits ZERO. This is the fixture the whole "not merely a non-zero exit"
+# argument rests on.
+MIRI_EMPTY_OUT="$(cat <<'FIXTURE'
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s
+FIXTURE
+)"
+
+MIRI_TWO_RAN_OUT="$(cat <<'FIXTURE'
+running 2 tests
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 3.10s
+FIXTURE
+)"
+
+MIRI_UB_OUT="$(cat <<'FIXTURE'
+running 1 test
+error: Undefined Behavior: attempting a read access using <2841> at alloc1[0x0],
+ but that tag does not exist in the borrow stack for this location
+   = help: this indicates a potential bug in the program
+test tests::held_two_exclusive_scopes_is_ub ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 1.90s
+FIXTURE
+)"
+
+# The verdict the exit status alone cannot tell apart from the one above: still
+# a failure, but for a reason that has nothing to do with the class it models.
+MIRI_PANIC_OUT="$(cat <<'FIXTURE'
+running 1 test
+thread 'tests::held_two_exclusive_scopes_is_ub' panicked at crates/oam_aliasing_model/src/lib.rs:388:9:
+assertion `left == right` failed
+test tests::held_two_exclusive_scopes_is_ub ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.40s
+FIXTURE
+)"
+
+MIRI_NOSUMMARY_OUT="$(cat <<'FIXTURE'
+error: the compiler unexpectedly panicked. this is a bug.
+error: could not compile `oam_aliasing_model` (lib test)
+FIXTURE
+)"
+
+it "the executed-model count sums every libtest summary in a run"
+eq "$(miri_executed_count "$MIRI_PASS_OUT")" "6"
+
+it "a run with no libtest summary at all reports no count"
+miri_executed_count "$MIRI_NOSUMMARY_OUT" >/dev/null 2>&1 \
+  && fail "counted models in output that has no summary line" || pass
+
+it "the full model run passing is the only 'pass' verdict"
+eq "$(miri_current_verdict 0 "$MIRI_PASS_OUT")" "pass"
+
+it "a non-zero exit means miri rejected a current-design model"
+eq "$(miri_current_verdict 1 "$MIRI_UB_OUT")" "rejected"
+
+# THE vacuous pass. Nothing about the exit status distinguishes an empty run
+# from a clean one, so a crate whose models were deleted or wholly #[ignore]d
+# would have reported a green gate forever.
+it "an exit-0 run that executed NOTHING is not-exercised, not a pass"
+eq "$(miri_current_verdict 0 "$MIRI_EMPTY_OUT")" "not-exercised"
+
+it "an exit-0 run below the model floor is not-exercised too"
+eq "$(miri_current_verdict 0 "$MIRI_TWO_RAN_OUT")" "not-exercised"
+
+it "an exit-0 run that never reached the tests is unparsable, not a pass"
+eq "$(miri_current_verdict 0 "$MIRI_NOSUMMARY_OUT")" "unparsable"
+
+it "a held case failing ON a UB diagnosis is the passing verdict"
+eq "$(miri_held_verdict 1 "$MIRI_UB_OUT")" "rejected-ub"
+
+it "a held case miri ACCEPTS is a lost tooth, not a pass"
+eq "$(miri_held_verdict 0 "$MIRI_PASS_OUT")" "accepted"
+
+# Renaming a held_* case, deleting it, or dropping its #[ignore] all land here:
+# `--ignored <name>` matches nothing and libtest exits 0. Reported apart from
+# `accepted` because "miri changed its mind" and "the case is gone" need
+# different fixes.
+it "a held case whose filter matched nothing is missing, not accepted"
+eq "$(miri_held_verdict 0 "$MIRI_EMPTY_OUT")" "missing"
+
+it "a held case failing WITHOUT a UB diagnosis is not a rejection"
+eq "$(miri_held_verdict 1 "$MIRI_PANIC_OUT")" "failed-without-ub"
+
+# #95: `printf "$big" | grep -q` returns 141 under pipefail, because grep -q
+# exits at its first match and SIGPIPEs the writer -- so the BIGGER the UB
+# report, the more likely the gate was to read it as "no UB reported". The
+# classifier matches with bash builtins for this reason; this proves it holds at
+# a size that would have tripped the old shape.
+#
+# Padded by DOUBLING rather than appending in a loop: bash string append is
+# quadratic, and 4000 rounds of it cost 6s on the dev box -- real money on a
+# suite that gates every push. Twelve doublings cost nothing and produce a
+# bigger report.
+it "a very large UB report is still classified as a rejection (no SIGPIPE)"
+UB_PAD="   = note: inside oam_aliasing_model::tests::held_two_exclusive_scopes_is_ub
+"
+while [ "${#UB_PAD}" -lt 200000 ]; do UB_PAD="$UB_PAD$UB_PAD"; done
+BIG_UB="$MIRI_UB_OUT
+$UB_PAD"
+eq "$(miri_held_verdict 1 "$BIG_UB")" "rejected-ub"
+
+# =============================================================================
+group "ci-local.sh -- gate wiring"
+# =============================================================================
+# Source-level assertions, in the same spirit as the interval-expression guard
+# on gc-target.sh: these catch a gate step that stopped covering what its own
+# comments claim, on hosts that cannot run the step at all.
+
+MODEL_SRC="crates/oam_aliasing_model/src/lib.rs"
+
+# "<fn name> ignored" / "<fn name> active" for every #[test] in the model crate.
+# No interval expressions -- mawk matches nothing for those (see above).
+MODEL_INDEX="$(awk '
+  /^[[:space:]]*#\[test\]/          { intest = 1; ign = 0; next }
+  intest && /^[[:space:]]*#\[ignore/ { ign = 1; next }
+  intest && /^[[:space:]]*fn [A-Za-z0-9_]+/ {
+    name = $0
+    sub(/^[[:space:]]*fn /, "", name)
+    sub(/\(.*$/, "", name)
+    if (ign) { print name " ignored" } else { print name " active" }
+    intest = 0
+  }
+' "$MODEL_SRC")"
+
+# The loop in step 12 iterates OAM_MIRI_HELD_CASES. A case renamed in the crate
+# and not here does not fail loudly where miri runs -- `--ignored <old name>`
+# matches nothing, which the classifier now calls `missing` -- and on every box
+# without miri it would not be noticed at all. This is the check that runs
+# everywhere.
+it "every held_* case the gate names exists and is still #[ignore]d"
+HELD_BAD=""
+for hc in "${OAM_MIRI_HELD_CASES[@]}"; do
+  if [[ $'\n'"$MODEL_INDEX"$'\n' == *$'\n'"$hc ignored"$'\n'* ]]; then continue; fi
+  if [[ $'\n'"$MODEL_INDEX"$'\n' == *$'\n'"$hc active"$'\n'* ]]; then
+    HELD_BAD="$HELD_BAD $hc(no longer #[ignore]d, so --ignored skips it)"
+  else
+    HELD_BAD="$HELD_BAD $hc(no such #[test] fn in $MODEL_SRC)"
+  fi
+done
+if [ -z "$HELD_BAD" ]; then pass; else fail "held cases out of sync:$HELD_BAD"; fi
+
+# Bidirectional, like the unsafe budget: fewer models than the floor means the
+# gate's first half went vacuous, more means models were added and the floor is
+# stale-low, and both need a human to look.
+it "the model floor matches the number of current-design models in the crate"
+ACTIVE_MODELS=0
+while IFS= read -r mline; do
+  case "$mline" in *" active") ACTIVE_MODELS=$((ACTIVE_MODELS + 1)) ;; esac
+done <<< "$MODEL_INDEX"
+if [ "$ACTIVE_MODELS" = "$OAM_MIRI_CURRENT_MIN" ]; then pass
+else fail "$MODEL_SRC has $ACTIVE_MODELS non-ignored models, OAM_MIRI_CURRENT_MIN is $OAM_MIRI_CURRENT_MIN -- re-bless it in scripts/lib/miri-gate.sh"; fi
+
+# Guards the extraction itself: an inline re-implementation of either verdict
+# would be untested again, and this suite would keep reporting the same green.
+it "the miri step decides through the verdict functions, not inline"
+WIRE_BAD=""
+for want in miri_current_verdict miri_held_verdict 'OAM_MIRI_HELD_CASES\[@\]'; do
+  grep -q -- "$want" scripts/ci-local.sh || WIRE_BAD="$WIRE_BAD $want"
+done
+if [ -z "$WIRE_BAD" ]; then pass; else fail "ci-local.sh no longer references:$WIRE_BAD"; fi
+
+# #90 shipped a whole second build configuration -- oam_engine without `napi`,
+# oam_cli without its passthrough -- that was verified by hand once and then had
+# no coverage anywhere: `no-default-features` appeared in no script, no test and
+# no workflow. A #[cfg(feature = "napi")] boundary rots silently, so all three
+# verbs have to stay in the gate.
+it "the gate builds, lints and tests the --no-default-features configuration"
+NDF_MISSING=""
+grep -qE 'cargo build .*--no-default-features'  scripts/ci-local.sh || NDF_MISSING="$NDF_MISSING build"
+grep -qE 'cargo clippy .*--no-default-features' scripts/ci-local.sh || NDF_MISSING="$NDF_MISSING clippy"
+grep -qE 'cargo_test .*--no-default-features'   scripts/ci-local.sh || NDF_MISSING="$NDF_MISSING test"
+if [ -z "$NDF_MISSING" ]; then pass; else fail "the napi-off gate no longer covers:$NDF_MISSING"; fi
+
+# ci-local.sh is a pre-push hook: a syntax error in it fails every push with a
+# bash parse error rather than a gate verdict, and nothing else here parses it.
+it "ci-local.sh and the libs it sources parse"
+PARSE_BAD=""
+for s in scripts/ci-local.sh scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
+         scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh; do
+  bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
+done
+if [ -z "$PARSE_BAD" ]; then pass; else fail "syntax errors in:$PARSE_BAD"; fi
 
 # =============================================================================
 echo
