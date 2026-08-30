@@ -668,6 +668,7 @@ entries below were executed on both runtimes unless marked.
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl`, `node:readline` | Minimal: enough to import, construct, and iterate lines. | Full. |
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
+| `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` builds an ordinary stream — there is no byte controller and no `byobRequest` — and `getReader({ mode: 'byob' })` ignores the mode, returning a default reader rather than a `ReadableStreamBYOBReader`. The one place in the runtime that node builds a byte stream, `fsPromises.FileHandle.readableWebStream()`, is affected: it delivers node's exact chunks (plain `Uint8Array`, node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor) so default-reader and `for await` consumption match byte for byte, and only a BYOB reader diverges. | Real byte streams, `byobRequest`, and BYOB readers. |
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

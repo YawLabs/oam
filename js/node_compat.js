@@ -629,6 +629,14 @@
     return '"' + name + '" option should be >= ' + (allowZero ? '0' : '1') + ' and < 65536. Received ' + port;
   });
   // ---- Error family ----
+  // Node declares this one with three bases (Error, TypeError, RangeError) and
+  // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
+  // properties; every call site oam has raises the plain-Error default, which
+  // is what `new ERR_INVALID_STATE(msg)` builds. The "Invalid state: " prefix
+  // is part of the format string, not the caller's message.
+  codes.ERR_INVALID_STATE = E("ERR_INVALID_STATE", Error, function(msg) {
+    return 'Invalid state: ' + msg;
+  });
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
@@ -9618,6 +9626,9 @@
         var info = await natives.fsOpen(String(path), String(flags));
         var h = info.handle;
         var closed = false;
+        // readableWebStream() locks the handle to its stream FOR LIFE -- see
+        // the method below; the flag never goes back down.
+        var webStreamLocked = false;
 
         // node's fsCall guard (lib/internal/fs/promises.js): EVERY FileHandle
         // method re-checks the descriptor first and rejects on a closed one
@@ -9776,6 +9787,108 @@
             if (emptyList(buffers)) return { bytesWritten: 0, buffers: buffers };
             await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
             return { bytesWritten: total, buffers: buffers };
+          },
+          // The WEB stream, and not createReadStream in web clothing: node
+          // builds it directly over THIS handle's read() (lib/internal/fs/
+          // promises.js), 16 KiB a pull, from the CURRENT cursor rather than
+          // byte 0, and -- unlike createReadStream -- it does NOT take the
+          // descriptor: autoClose defaults to FALSE, so draining the stream
+          // leaves the handle open and usable.
+          //
+          // The handle is LOCKED to the stream on the first call and stays
+          // locked for life: a second call is ERR_INVALID_STATE even after the
+          // first stream was cancelled or fully drained. The lock is taken
+          // BEFORE the options are validated, so a call that dies on a bad
+          // `options` still burns it -- checked, not assumed.
+          //
+          // `options.type` is NOT value-validated. v22 accepts anything:
+          // 'bytes' and undefined are silent, every other value ('foo', 123,
+          // null) emits an ExperimentalWarning and still builds the same
+          // stream. There is no ERR_INVALID_ARG_VALUE on this path, and the
+          // warning text carries node's own typo ("steam"), reproduced here so
+          // a caller matching on it sees the same bytes.
+          //
+          // DIVERGENCE, deliberate, and the only one: node's stream is a BYTE
+          // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
+          // `getReader({ mode: 'byob' })` there returns a real
+          // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
+          // is default-reader-only -- no byte controller, no byobRequest -- so
+          // this returns a DEFAULT ReadableStream carrying the same 16 KiB
+          // plain-Uint8Array chunks, at the same boundaries, off the same read
+          // path. Everything reachable through a default reader or async
+          // iteration matches node; a BYOB reader does not. The fix belongs in
+          // js/streams.js's controller, not in a second reader here.
+          readableWebStream: function (options) {
+            if (closed) throw codes.ERR_INVALID_STATE("The FileHandle is closed");
+            // node's middle check, "The FileHandle is closing", is unreachable
+            // here: it parks a kClosePromise while the fd is still live, and
+            // oam's close() flips `closed` synchronously, so the branch above
+            // already covers that window.
+            if (webStreamLocked) throw codes.ERR_INVALID_STATE("The FileHandle is locked");
+            webStreamLocked = true;
+
+            if (options === undefined) options = {};
+            // node's validateObject: null, arrays and non-objects (a function
+            // included -- typeof 'function' is not 'object') are rejected.
+            if (options === null || Array.isArray(options) || typeof options !== "object") {
+              throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+            }
+            var type = options.type === undefined ? "bytes" : options.type;
+            var autoClose = options.autoClose === undefined ? false : options.autoClose;
+            if (typeof autoClose !== "boolean") {
+              throw codes.ERR_INVALID_ARG_TYPE("options.autoClose", "boolean", autoClose);
+            }
+            if (type !== "bytes") {
+              process.emitWarning(
+                'A non-"bytes" options.type has no effect. A byte-oriented steam is always created.',
+                "ExperimentalWarning",
+              );
+            }
+
+            // node's ondone: unref the handle, then close it only under
+            // autoClose. close() is idempotent, so the cancel path and the
+            // EOF path can both run it.
+            var ondone = async function () {
+              if (autoClose) await fh.close();
+            };
+            // node's autoAllocateChunkSize. The boundaries are OBSERVABLE --
+            // a 200000-byte file arrives as 12 x 16384 plus a 3392 tail on
+            // both runtimes -- so this is not a free tuning knob.
+            var CHUNK = 16384;
+            return new globalThis.ReadableStream({
+              pull: async function (controller) {
+                // node wires `this.once('close', () => readableStreamCancel(
+                // readable))`, so closing the handle mid-stream ENDS the
+                // stream: a subsequent read() reports done, it does not
+                // reject with EBADF. oam's FileHandle is not an EventEmitter,
+                // so the same outcome is produced from the pull side, and on
+                // BOTH sides of the read -- closed before the pull was
+                // issued, or closed while it was in flight (in which case the
+                // chunk is dropped, exactly as a cancel drops it).
+                if (closed) {
+                  controller.close();
+                  await ondone();
+                  return;
+                }
+                var view = new Uint8Array(CHUNK);
+                // The existing read path, deliberately: same cursor, same
+                // guard, same natives. A second reader here would be a second
+                // place for the chunking to be wrong.
+                var r = await fh.read(view, 0, CHUNK);
+                if (closed || r.bytesRead === 0) {
+                  controller.close();
+                  await ondone();
+                  return;
+                }
+                // A plain Uint8Array, not a Buffer: node's byte stream hands
+                // back the auto-allocated view, whose constructor is
+                // Uint8Array, and callers do print it.
+                controller.enqueue(view.subarray(0, r.bytesRead));
+              },
+              cancel: async function () {
+                await ondone();
+              },
+            });
           },
           // Both stream factories hand the WHOLE FileHandle to the shared
           // ReadStream/WriteStream (exactly as node does -- `new ReadStream(

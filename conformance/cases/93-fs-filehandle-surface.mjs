@@ -25,6 +25,16 @@
 //     fsCall-wrapped, so a closed handle reaches the stream constructor as
 //     fd -1 and fails its integer-range check as a synchronous RangeError.
 //
+//  3. readableWebStream() is the WEB stream, and it is not createReadStream
+//     in web clothing. It reads from the handle's CURRENT cursor, hands back
+//     plain Uint8Array chunks on node's 16384-byte autoAllocateChunkSize
+//     boundaries, and does NOT take the descriptor (autoClose defaults to
+//     false). It LOCKS the handle for life on the first call -- a second
+//     call is ERR_INVALID_STATE even after the first stream was cancelled or
+//     fully drained, and even after a call that died on a bad `options`.
+//     `options.type` is NOT value-validated: anything other than 'bytes'
+//     warns and builds exactly the same stream.
+//
 // createReadStream/createWriteStream additionally take OWNERSHIP of the
 // descriptor: when they finish, the handle is closed, a later fh.close()
 // still resolves (no double close), and everything else starts reporting
@@ -322,6 +332,229 @@ const show = async (label, thunk) => {
   await rejects("closed createRead", async () => fh.createReadStream());
   await rejects("closed createWrit", async () => fh.createWriteStream());
   await rejects("closed readLines ", async () => fh.readLines());
+  // A THIRD shape: readableWebStream is neither fsCall-wrapped nor routed
+  // through a stream constructor. It checks the descriptor itself and throws
+  // ERR_INVALID_STATE synchronously -- a plain Error, no syscall.
+  await rejects("closed readableWeb", async () => fh.readableWebStream());
+}
+
+// --- 9. readableWebStream ------------------------------------------------
+{
+  // Every non-'bytes' options.type emits an ExperimentalWarning rather than
+  // throwing. Collected here and printed at a deterministic point below --
+  // emitWarning is deferred a tick on both runtimes, so it cannot be asserted
+  // inline at the call site.
+  const warnings = [];
+  process.on("warning", (w) => warnings.push(w.name + ": " + w.message));
+
+  const f = path.join(dir, "web.txt");
+  fs.writeFileSync(f, "hello world");
+
+  // A normal read to completion. The chunks are plain Uint8Arrays -- node's
+  // byte stream hands back its auto-allocated view, so this is NOT a Buffer
+  // -- and the handle survives: autoClose defaults to FALSE, the opposite of
+  // createReadStream's ownership above.
+  {
+    const fh = await fsp.open(f);
+    const s = fh.readableWebStream();
+    console.log(
+      "rws ctor                ->",
+      s.constructor.name,
+      "isGlobal",
+      s instanceof globalThis.ReadableStream,
+      "locked",
+      s.locked,
+    );
+    const chunks = [];
+    for await (const c of s) chunks.push(c);
+    console.log("rws chunk ctors         ->", JSON.stringify(chunks.map((c) => c.constructor.name)));
+    console.log("rws bytes               ->", JSON.stringify(Buffer.concat(chunks).toString()));
+    // Drained, and STILL OPEN.
+    await show("rws stat after drain   ", async () => (await fh.stat()).size);
+    await show("rws close after drain  ", () => fh.close());
+  }
+
+  // An empty file is zero chunks, not one empty chunk.
+  {
+    const g = path.join(dir, "web-empty.txt");
+    fs.writeFileSync(g, "");
+    const fh = await fsp.open(g);
+    const chunks = [];
+    for await (const c of fh.readableWebStream()) chunks.push(c);
+    console.log("rws empty file          ->", chunks.length, "chunks");
+    await fh.close();
+  }
+
+  // It starts at the handle's CURRENT cursor, not at byte 0. Six bytes are
+  // consumed by a plain read() first, so the stream must only see "world".
+  {
+    const fh = await fsp.open(f);
+    const pre = Buffer.alloc(6);
+    await fh.read(pre, 0, 6, null);
+    const chunks = [];
+    for await (const c of fh.readableWebStream()) chunks.push(c);
+    console.log(
+      "rws from cursor         ->",
+      JSON.stringify(String(pre)),
+      "then",
+      JSON.stringify(Buffer.concat(chunks).toString()),
+    );
+    await fh.close();
+  }
+
+  // The chunk BOUNDARIES are observable: node's autoAllocateChunkSize is
+  // 16384, so 200000 bytes arrive as 12 full chunks and a 3392-byte tail.
+  // A different chunk size would still round-trip the bytes and still be
+  // wrong, so the shape is asserted, not just the total.
+  {
+    const big = path.join(dir, "web-big.bin");
+    const src = Buffer.alloc(200000);
+    for (let i = 0; i < src.length; i++) src[i] = i % 251;
+    fs.writeFileSync(big, src);
+    const fh = await fsp.open(big);
+    const lens = [];
+    let sum = 0;
+    let intact = true;
+    let at = 0;
+    for await (const c of fh.readableWebStream()) {
+      lens.push(c.length);
+      for (let i = 0; i < c.length; i++) {
+        if (c[i] !== src[at + i]) intact = false;
+        sum += c[i];
+      }
+      at += c.length;
+    }
+    console.log(
+      "rws big chunk lens      ->",
+      JSON.stringify({ n: lens.length, first: lens[0], last: lens[lens.length - 1] }),
+      "total",
+      at,
+      "sum",
+      sum,
+      "intact",
+      intact,
+    );
+    await fh.close();
+  }
+
+  // autoClose:true is the opt-IN to createReadStream-style ownership.
+  {
+    const fh = await fsp.open(f);
+    for await (const _c of fh.readableWebStream({ autoClose: true }));
+    console.log("rws autoClose fd        ->", fh.fd);
+    await show("rws autoClose stat     ", async () => (await fh.stat()).size);
+    await show("rws autoClose close    ", () => fh.close());
+  }
+
+  // Cancelling mid-stream leaves the descriptor alone (autoClose is false):
+  // the handle still stats, and the later close is a first close, not a
+  // double one.
+  {
+    const fh = await fsp.open(f);
+    const reader = fh.readableWebStream().getReader();
+    const first = await reader.read();
+    console.log("rws cancel first chunk  ->", first.done, first.value.length);
+    await reader.cancel();
+    await show("rws stat after cancel  ", async () => (await fh.stat()).size);
+    await show("rws close after cancel ", () => fh.close());
+    await show("rws close twice        ", () => fh.close());
+  }
+
+  // Closing the handle mid-stream ENDS the stream rather than erroring it:
+  // the next read reports done, it does not reject with EBADF.
+  {
+    const big = path.join(dir, "web-big.bin");
+    const fh = await fsp.open(big);
+    const reader = fh.readableWebStream().getReader();
+    await reader.read();
+    await fh.close();
+    await show("rws read after close   ", async () => {
+      const r = await reader.read();
+      return { done: r.done, value: r.value === undefined ? "undefined" : r.value.length };
+    });
+  }
+
+  // The handle is LOCKED for life -- not merely "while a stream is live".
+  {
+    const fh = await fsp.open(f);
+    const s = fh.readableWebStream();
+    await show("rws second call        ", async () => fh.readableWebStream());
+    await s.cancel();
+    await show("rws after cancel       ", async () => fh.readableWebStream());
+    await fh.close();
+
+    const fh2 = await fsp.open(f);
+    for await (const _c of fh2.readableWebStream());
+    await show("rws after drain        ", async () => fh2.readableWebStream());
+    await fh2.close();
+  }
+
+  // The lock is taken BEFORE the options are validated, so a call that dies
+  // on a bad `options` still burns it.
+  {
+    const fh = await fsp.open(f);
+    await show("rws bad opts           ", async () => fh.readableWebStream(null));
+    await show("rws after bad opts     ", async () => fh.readableWebStream());
+    await fh.close();
+  }
+
+  // node's validateObject: null, arrays and non-objects are rejected. A
+  // function is a non-object here (typeof is 'function'), and an empty object
+  // is fine.
+  for (const [label, opts] of [
+    ["null      ", null],
+    ["string    ", "bytes"],
+    ["number    ", 5],
+    ["array     ", []],
+    ["function  ", function named() {}],
+  ]) {
+    const fh = await fsp.open(f);
+    await show("rws opts " + label + "    ", async () => {
+      fh.readableWebStream(opts);
+      return "ok";
+    });
+    await fh.close();
+  }
+
+  // autoClose IS value-validated, with validateBoolean's property message.
+  for (const [label, ac] of [
+    ["string", "yes"],
+    ["number", 1],
+    ["null  ", null],
+  ]) {
+    const fh = await fsp.open(f);
+    await show("rws autoClose " + label + "  ", async () => {
+      fh.readableWebStream({ autoClose: ac });
+      return "ok";
+    });
+    await fh.close();
+  }
+
+  // options.type is the surprise: it is NOT value-validated. 'bytes' and
+  // undefined are silent; EVERY other value warns and builds exactly the same
+  // stream. There is no ERR_INVALID_ARG_VALUE on this path.
+  for (const [label, t] of [
+    ["bytes    ", "bytes"],
+    ["undefined", undefined],
+    ["gzip     ", "gzip"],
+    ["number   ", 7],
+    ["null     ", null],
+  ]) {
+    const fh = await fsp.open(f);
+    const chunks = [];
+    await show("rws type " + label + "     ", async () => {
+      for await (const c of fh.readableWebStream({ type: t })) chunks.push(c);
+      return Buffer.concat(chunks).toString();
+    });
+    await fh.close();
+  }
+
+  // Drain the deferred warnings. Filtered to this method's own text so an
+  // unrelated warning from elsewhere in the case cannot make the count drift.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const mine = warnings.filter((w) => w.includes("options.type"));
+  console.log("rws warnings            ->", mine.length);
+  console.log("rws warning text        ->", JSON.stringify(mine[0]));
 }
 
 fs.rmSync(dir, { recursive: true, force: true });
