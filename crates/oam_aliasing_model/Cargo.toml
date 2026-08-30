@@ -1,0 +1,19 @@
+[package]
+name = "oam_aliasing_model"
+description = "Miri-checkable models of napi.rs's raw-pointer disciplines. Zero dependencies on purpose -- see src/lib.rs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# NO dependencies, and none may be added. Two reasons, both load-bearing:
+#   1. cargo-miri does not support the argfile cargo switches to on long
+#      command lines, so a crate with a real dependency graph cannot be built
+#      under miri on Windows at all.
+#   2. Miri cannot execute foreign functions, so anything reaching V8 is out.
+[dependencies]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+missing_safety_doc = "deny"

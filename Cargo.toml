@@ -9,6 +9,7 @@ members = [
     "crates/oam_mcp",
     "crates/oam_cli",
     "crates/oam_napi_test_addon",
+    "crates/oam_aliasing_model",
     "xtask",
 ]
 
