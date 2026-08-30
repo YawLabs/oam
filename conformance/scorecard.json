@@ -1,8 +1,8 @@
 {
-  "commit": "3f361b6+wip",
+  "commit": "6ff3f16+wip",
   "host": "windows-aarch64",
   "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.11.0",
+  "oamVersion": "oam 0.12.1",
   "schema": "oam-conformance/1",
   "suites": {
     "nodeDifferential": {
@@ -374,10 +374,18 @@
         {
           "case": "90-dns-name-shapes.mjs",
           "status": "pass"
+        },
+        {
+          "case": "91-fs-utimes-fields-symlink.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "92-child-extra-fd-parent-close-eof.mjs",
+          "status": "pass"
         }
       ],
-      "pass": 92,
-      "total": 92
+      "pass": 94,
+      "total": 94
     },
     "surface": {
       "exports": {
