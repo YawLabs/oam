@@ -1115,16 +1115,16 @@ fn op_posix_get_id(
     let which = args.get(0).int32_value(scope).unwrap_or(0);
     #[cfg(unix)]
     {
-        // SAFETY: getuid/getgid/geteuid/getegid take no arguments, touch no
-        // memory, and always succeed; they are unsafe only as libc FFI. The
-        // result is a plain uid_t/gid_t.
-        let id = unsafe {
-            match which {
-                0 => libc::getuid(),
-                1 => libc::getgid(),
-                2 => libc::geteuid(),
-                _ => libc::getegid(),
-            }
+        // These four take no arguments, touch no memory and cannot fail, so
+        // there is nothing for a SAFETY comment to argue -- which is exactly
+        // why they should not be an `unsafe` block at all. rustix exposes them
+        // as plain safe functions returning a typed `Uid`/`Gid`; `as_raw` is
+        // the same u32 the libc call produced.
+        let id = match which {
+            0 => rustix::process::getuid().as_raw(),
+            1 => rustix::process::getgid().as_raw(),
+            2 => rustix::process::geteuid().as_raw(),
+            _ => rustix::process::getegid().as_raw(),
         };
         rv.set_double(f64::from(id));
     }

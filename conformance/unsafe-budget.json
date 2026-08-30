@@ -8,13 +8,13 @@
       "unsafe_count": 3
     },
     "oam_core": {
-      "unsafe_count": 77
+      "unsafe_count": 45
     },
     "oam_diagnostics": {
       "unsafe_count": 0
     },
     "oam_engine": {
-      "unsafe_count": 598
+      "unsafe_count": 597
     },
     "oam_loader": {
       "unsafe_count": 0
