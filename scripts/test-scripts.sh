@@ -281,9 +281,10 @@ plant target/debug/deps 2 oam-999999999999999c
 gc --dry-run --keep 1
 eq "$(count_in target/debug/deps)" "3"
 
-# The builder`s exact condition: the tree arrives by tar with --exclude=./.git
-# and the caller`s cwd is $HOME. `git rev-parse` fails there and `cd ""` is a
-# silent no-op, so the script used to prune whatever directory it stood in.
+# The builder`s exact condition: the tree arrives as a tarball of the files git
+# tracks, which never carries .git itself, and the caller`s cwd is $HOME. `git
+# rev-parse` fails there and `cd ""` is a silent no-op, so the script used to
+# prune whatever directory it stood in.
 it "resolves its own root from a foreign cwd with no .git"
 reset_tree
 plant target/debug/deps 0 oam-7777777777777771
@@ -539,6 +540,67 @@ eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_r
 it "OAM_DISK_MIN_GB moves the abort floor"
 eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_below_floor 40 && echo abort || echo proceed')" \
    "abort"
+
+# =============================================================================
+group "src-sync.sh -- source tarball ceiling"
+# =============================================================================
+# shellcheck source=lib/src-sync.sh
+. scripts/lib/src-sync.sh
+
+# The ceiling exists because on 2026-08-31 a release packed 11.6 GB and pushed
+# it over an IAP tunnel for 35 minutes before dying. 200MB default, real tree
+# ~1.6MB.
+it "passes a realistically-sized tarball"; src_tarball_over_ceiling 2000000 && fail "2MB should pass" || pass
+it "passes right at the ceiling";         src_tarball_over_ceiling 209715200 && fail "200MB should pass" || pass
+it "trips one byte over the ceiling";     src_tarball_over_ceiling 209715201 && pass || fail "200MB+1 should trip"
+it "trips on the incident's 11.6GB";      src_tarball_over_ceiling 11642897270 && pass || fail "11.6GB must trip"
+
+# Same inertness rule as the disk predicates: a failed `wc -c` must not abort a
+# release on a number nobody measured.
+it "an unreadable size triggers neither an abort nor a false pass"
+if ! src_tarball_over_ceiling "" && ! src_tarball_over_ceiling "N/A"; then pass
+else fail "empty/non-numeric readings must be inert"; fi
+
+# Resolved at SOURCE time, so an override only takes effect in a fresh shell.
+it "OAM_SRC_TARBALL_MAX_MB moves the ceiling"
+eq "$(OAM_SRC_TARBALL_MAX_MB=1 bash -c '. scripts/lib/src-sync.sh; src_tarball_over_ceiling 2000000 && echo over || echo under')" \
+   "over"
+
+# =============================================================================
+group "src-sync.sh -- what the sync actually ships"
+# =============================================================================
+# Runs against the REAL repo, because the property under test is a fact about
+# THIS working tree, and a synthetic fixture would just re-encode the assumption
+# that broke. Cheap: one `git ls-files`, no tarball.
+SRC_LIST="$SUITE_TMP/src-list.txt"
+src_file_names(){ ( cd "$REPO_DIR" && git ls-files -z --cached --others --exclude-standard | tr '\0' '\n' ); }
+src_file_names > "$SRC_LIST" 2>/dev/null
+
+it "the file list is non-empty (git answered at all)"
+if [ -s "$SRC_LIST" ]; then pass; else fail "git ls-files produced nothing -- every assertion below would vacuously pass"; fi
+
+# THE regression guard. Claude Code's agent worktrees are full checkouts of this
+# repo, each carrying its own target/; eight of them is what the anchored
+# `--exclude=./target` missed.
+it "ships no .claude/ agent worktree, and no build output of any kind"
+OFFENDERS="$(grep -nE '(^|/)(target|node_modules|dist)/|^\.claude/|^\.git/' "$SRC_LIST" \
+  | grep -v 'conformance/vendor/node/test/fixtures/.*/node_modules/' | head -5)"
+if [ -z "$OFFENDERS" ]; then pass; else fail "build output or agent scratch in the sync list: $OFFENDERS"; fi
+
+# The other half of that guard, and the reason the naive fix (dropping the `./`
+# anchors) is wrong: an unanchored --exclude=node_modules also deletes these
+# four TRACKED fixture files, which the node-suite's warning_node_modules case
+# asserts on. Verified on GNU tar 1.35, 2026-08-31.
+it "still ships the tracked vendored node_modules conformance fixtures"
+eq "$(grep -c 'conformance/vendor/node/test/fixtures/warning_node_modules/node_modules/' "$SRC_LIST")" "4"
+
+# A tree missing any of these does not build on the far side at all.
+it "ships the inputs a remote build cannot start without"
+MISSING=""
+for p in Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml scripts/build-remote.sh; do
+  grep -qxF "$p" "$SRC_LIST" || MISSING="$MISSING $p"
+done
+if [ -z "$MISSING" ]; then pass; else fail "absent from the sync list:$MISSING"; fi
 
 # =============================================================================
 group "ci-local.sh -- miri gate verdicts"

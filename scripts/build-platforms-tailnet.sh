@@ -71,6 +71,8 @@ step(){ echo -e "\n${CYA}=== $* ===${NC}" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib/src-sync.sh
+. "$SCRIPT_DIR/lib/src-sync.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-tailnet-build-$RUNID-XXXXXX)"
@@ -85,21 +87,39 @@ mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 SSH_OPTS=(-i "$MAC_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
 
 # Working tree via tar + scp (rsync isn't on every macOS; tar/scp ship with
-# OpenSSH). Remote target/ is PRESERVED across syncs -- xtask resolves the oam
-# binary repo-relative, and the warm cargo cache is the difference between a
-# ~30-min cold build and a minutes-long incremental one.
-TAR_EXCLUDES=(--exclude=./.git --exclude=./target --exclude=./node_modules --exclude=./dist --exclude='*.log')
+# OpenSSH). What goes in the tarball is decided by lib/src-sync.sh, shared with
+# the linux leg -- this file used to carry its own byte-identical copy of a
+# hand-written exclude array, which is how ONE bug (top-level-only anchoring,
+# 11.6 GB shipped on 2026-08-31) lived in two places at once. Remote target/ is
+# PRESERVED across syncs -- xtask resolves the oam binary repo-relative, and the
+# warm cargo cache is the difference between a ~30-min cold build and a
+# minutes-long incremental one.
 
 sync_src(){  # sync_src <user@host>
   ok "sync source -> $1:$REMOTE_DIR (remote target/ preserved)"
   # Explicit `|| return 1` per step: this runs inside build_mac, which is
   # invoked as `build_mac || handler` -- bash suppresses errexit in that whole
   # call tree, so without the returns a failed scp would still run the remote
-  # extract against a stale/absent tarball.
+  # extract against a stale/absent tarball. Note this leg must NOT call fail():
+  # that exits the script outright and would jump straight past the handler.
+  # Hence `warn` then `return 1` -- loud, but still the caller's decision.
   local t; t="$(mktemp "$STAGE_DIR/src-XXXXXX.tar.gz")" || return 1
-  ( cd "$REPO_DIR" && tar czf "$t" "${TAR_EXCLUDES[@]}" . ) || return 1
-  scp "${SSH_OPTS[@]}" -q "$t" "$1:oam-src.tar.gz" || return 1
-  ssh "${SSH_OPTS[@]}" "$1" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz" || return 1
+  write_src_tarball "$REPO_DIR" "$t" \
+    || { warn "could not pack the source tree from $REPO_DIR -- is git healthy here? ('git ls-files' must work)"; return 1; }
+
+  # Weigh it BEFORE pushing it -- see the linux leg for the incident.
+  local bytes; bytes="$(wc -c <"$t" 2>/dev/null | tr -dc '0-9')"
+  if src_tarball_over_ceiling "$bytes"; then
+    warn "biggest paths the sync would ship:"
+    src_largest_paths "$REPO_DIR" 10 >&2 || true
+    warn "source tarball is $((bytes / 1048576))MB, over the ${OAM_SRC_TARBALL_MAX_MB}MB ceiling -- something is shipping build output. Check the paths above, then either clean them up or raise OAM_SRC_TARBALL_MAX_MB if the growth is legitimate."
+    return 1
+  fi
+  ok "source tarball: $((bytes / 1024))KB (ceiling ${OAM_SRC_TARBALL_MAX_MB}MB)"
+
+  scp "${SSH_OPTS[@]}" -q "$t" "$1:oam-src.tar.gz" || { warn "scp of the source tarball to $1 failed"; return 1; }
+  ssh "${SSH_OPTS[@]}" "$1" "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz" \
+    || { warn "remote extract of the source tarball into $REMOTE_DIR on $1 failed"; return 1; }
   rm -f "$t"
 }
 

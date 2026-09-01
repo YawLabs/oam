@@ -45,8 +45,9 @@
 set -euo pipefail
 
 # Repo root from THIS script location, NOT `git rev-parse`: the remote build
-# hosts receive the tree by tar with --exclude=./.git (the orchestrators
-# TAR_EXCLUDES), so there is no git dir there. rev-parse then fails, and
+# hosts receive the tree as a tarball of the files git tracks (the orchestrators
+# via scripts/lib/src-sync.sh), which never includes .git itself, so there is no
+# git dir there. rev-parse then fails, and
 # because `cd ""` is a silent no-op the script would carry on against whatever
 # directory the caller happened to be in -- pruning the wrong tree, or nothing,
 # and reporting success either way.

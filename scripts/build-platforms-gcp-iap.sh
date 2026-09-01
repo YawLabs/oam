@@ -85,6 +85,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib/iap-helpers.sh
 . "$SCRIPT_DIR/lib/iap-helpers.sh"
+# shellcheck source=lib/src-sync.sh
+. "$SCRIPT_DIR/lib/src-sync.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -310,19 +312,41 @@ gcp_scp_from(){  # gcp_scp_from <remote-glob-under-REMOTE_DIR> <local-dir>
     | tar xzf - -C "$local_dir"
 }
 
-# Ship the WORKING TREE via tar (uncommitted release fixes should build),
-# excluding the bulky/host-local dirs. On the remote side, everything EXCEPT
-# target/ is replaced: xtask resolves the oam binary repo-relative
-# (target/<profile>/oam), and preserving target/ keeps the dep + rusty_v8
-# build cache warm -- a full cold build on the VM costs ~30 min, an
+# Ship the WORKING TREE (uncommitted release fixes should build), asking git
+# what the tree IS rather than hand-maintaining a list of what it is not -- see
+# lib/src-sync.sh for why, and for the 11.6 GB release this cost. On the remote
+# side, everything EXCEPT target/ is replaced: xtask resolves the oam binary
+# repo-relative (target/<profile>/oam), and preserving target/ keeps the dep +
+# rusty_v8 build cache warm -- a full cold build on the VM costs ~30 min, an
 # incremental one minutes.
-TAR_EXCLUDES=(--exclude=./.git --exclude=./target --exclude=./node_modules --exclude=./dist --exclude='*.log')
+#
+# Every step carries an explicit `|| fail`. Without them a tar or scp that died
+# inside the subshell ended the run through errexit, which prints NOTHING: the
+# 2026-08-31 operator saw only the EXIT trap's "stopping VM" line and had no
+# indication of which step had failed, or that a step had failed at all.
 sync_src(){
   ok "sync source -> $INSTANCE:$REMOTE_DIR (via IAP; remote target/ preserved)"
-  local t; t="$(mktemp "$STAGE_DIR/src-XXXXXX.tar.gz")"
-  ( cd "$REPO_DIR" && tar czf "$t" "${TAR_EXCLUDES[@]}" . )
-  gcp_scp_to "$t" "oam-src.tar.gz"
-  gcp_ssh "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz"
+  local t; t="$(mktemp "$STAGE_DIR/src-XXXXXX.tar.gz")" \
+    || fail "could not create a staging tarball under $STAGE_DIR"
+  write_src_tarball "$REPO_DIR" "$t" \
+    || fail "could not pack the source tree from $REPO_DIR -- is git healthy here? ('git ls-files' must work)"
+
+  # Weigh it BEFORE pushing it. This is the cheap check that turns a 35-minute
+  # upload of build junk into an immediate, self-diagnosing abort.
+  local bytes; bytes="$(wc -c <"$t" 2>/dev/null | tr -dc '0-9')"
+  if src_tarball_over_ceiling "$bytes"; then
+    warn "biggest paths the sync would ship:"
+    src_largest_paths "$REPO_DIR" 10 >&2 || true
+    fail "source tarball is $((bytes / 1048576))MB, over the ${OAM_SRC_TARBALL_MAX_MB}MB ceiling -- something is shipping build output. The tree git reports should be a few MB; check the paths above, then either clean them up or raise OAM_SRC_TARBALL_MAX_MB if the growth is legitimate."
+  fi
+  # KB, not MB: the healthy tree is ~1.7MB, and an MB readout would round most
+  # of that to a "0MB" that reads like a broken measurement.
+  ok "source tarball: $((bytes / 1024))KB (ceiling ${OAM_SRC_TARBALL_MAX_MB}MB)"
+
+  gcp_scp_to "$t" "oam-src.tar.gz" \
+    || fail "scp of the source tarball to $INSTANCE failed (tunnel localhost:$IAP_TUNNEL_PORT)"
+  gcp_ssh "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz" \
+    || fail "remote extract of the source tarball into $REMOTE_DIR failed"
   rm -f "$t"
 }
 
