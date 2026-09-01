@@ -15,6 +15,7 @@ overview, plus the environment variables, which `--help` does not list.
 | `oam mcp` | Serve oam's introspection to coding agents over MCP (stdio). E.g. `claude mcp add oam -- oam mcp`. |
 | `oam serve <file>` | `oam run` with `PORT`/`HOST` set from `--port`/`--host`. |
 | `oam install` | Install from the lockfile (the `npm ci` equivalent). |
+| `oam install --precompile` | `oam install`, plus transpile the TypeScript shipped inside installed packages into `node_modules/.oam/precompile/` so the first run pays no transpile cost. Walks every package in the lockfile — a warm (already-installed) tree is populated or refreshed too, and entries invalidate automatically when a package's source, oam's transpiler, or the effective JSX settings change. |
 | `oam trust` | Manage the trust list for package lifecycle scripts. |
 | `oam compile <file>` | Embed a **pre-bundled** JS file into a standalone executable. Bundle it yourself first (esbuild/rollup); this does not bundle. |
 | `oam self-update` | Re-run the canonical installer from oamjs.org, verifying against the published `SHA256SUMS`. |

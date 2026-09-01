@@ -268,17 +268,6 @@ pub fn install(
                 {
                     pending_scripts.push(ps);
                 }
-                if precompile
-                    && let Err(e) =
-                        crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
-                {
-                    errors.push(Diagnostic::new(
-                        "OAM-PKG0008",
-                        Severity::Warning,
-                        Origin::Install,
-                        format!("precompile {pkg_name}: {e}"),
-                    ));
-                }
             }
             Err(e) => {
                 errors.push(diag("OAM-PKG0004", format!("failed to install {key}: {e}")));
@@ -295,6 +284,35 @@ pub fn install(
     // A4: now that the tree and .bin shims are in place, run the lifecycle
     // scripts collected from trusted packages.
     run_lifecycle_scripts(&pending_scripts, &node_modules, &mut errors);
+
+    // --precompile walks EVERY package in the lockfile, not just the ones
+    // extracted by THIS call: a warm tree (a prior `oam install` without the
+    // flag, or an npm-installed node_modules) is populated and refreshed too.
+    // It runs after the lifecycle-script pass so the tree is final, and the
+    // per-file freshness header (transpile fingerprint + source hash) keeps
+    // the warm cost to one read + one hash + one open per source file.
+    if precompile {
+        for (key, entry) in &to_install {
+            if entry.resolved.is_none() {
+                // Link/file deps, as in the install loop above.
+                continue;
+            }
+            let dest = project_dir.join(key);
+            if !dest.join("package.json").is_file() {
+                // Failed to install this run -- already diagnosed above.
+                continue;
+            }
+            // Cache key = the lockfile key relative to the project's
+            // node_modules ("react/node_modules/scheduler" for a nested
+            // package), so nested packages get distinct cache slots and the
+            // run-time reader -- anchored on the OUTERMOST node_modules
+            // ancestor -- derives the same path.
+            let cache_key = key.strip_prefix("node_modules/").unwrap_or(key);
+            let (_, precompile_errors) =
+                crate::precompile::precompile_package(&dest, cache_key, &cache_root);
+            push_precompile_warning(cache_key, &precompile_errors, &mut errors);
+        }
+    }
 
     let elapsed = started.elapsed();
 
@@ -313,6 +331,40 @@ pub fn install(
             errors,
         })
     }
+}
+
+/// Fold a package's per-file precompile failures into ONE `OAM-PKG0008`
+/// warning naming the count and the first few failing files. Precompile is
+/// an optimization -- an uncompiled file falls back to runtime transpile --
+/// so failures never fail the install, and one bad file does not hide how
+/// many others failed with it.
+fn push_precompile_warning(
+    pkg_key: &str,
+    failures: &[crate::precompile::PrecompileError],
+    errors: &mut Vec<Diagnostic>,
+) {
+    if failures.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 3;
+    let mut detail = failures
+        .iter()
+        .take(SHOWN)
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > SHOWN {
+        detail.push_str(&format!(" (+{} more)", failures.len() - SHOWN));
+    }
+    errors.push(Diagnostic::new(
+        "OAM-PKG0008",
+        Severity::Warning,
+        Origin::Install,
+        format!(
+            "precompile {pkg_key}: {} file(s) failed: {detail}",
+            failures.len()
+        ),
+    ));
 }
 
 /// Acquire the cross-process install lock (A5). Returns the held lock file
