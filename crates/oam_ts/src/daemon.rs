@@ -213,13 +213,29 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// absolute path when the dir does not exist.
 pub(crate) fn project_key(tsconfig: &Path) -> String {
     let absolute = std::path::absolute(tsconfig).unwrap_or_else(|_| tsconfig.to_path_buf());
-    let canonical = match (absolute.parent(), absolute.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .map(|dir| dir.join(name))
-            .unwrap_or(absolute),
-        _ => absolute,
+    let canonical = match absolute.file_name() {
+        Some(name) => canonical_root(&absolute).join(name),
+        None => absolute,
     };
     format!("{:016x}", fnv1a64(canonical.to_string_lossy().as_bytes()))
+}
+
+/// The project root (the tsconfig's parent dir) canonicalized the same way
+/// [`project_key`] canonicalizes — symlinks resolved, Windows case/drive
+/// spellings folded. `tsgo_lookup` must be computed from THIS root on both
+/// sides (`serve_inner` records it, `try_existing` compares it): with the
+/// raw spelling, two clients addressing one project via different
+/// spellings (Windows case/drive-letter variants, Unix symlinked dirs)
+/// recorded different lookup strings, and every alternation of `oam check`
+/// retired and cold-respawned the daemon `project_key` deliberately
+/// shares. Falls back to the un-canonicalized parent when it cannot be
+/// resolved (then both sides fall back identically).
+fn canonical_root(tsconfig: &Path) -> PathBuf {
+    let absolute = std::path::absolute(tsconfig).unwrap_or_else(|_| tsconfig.to_path_buf());
+    match absolute.parent() {
+        Some(parent) => std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+        None => absolute,
+    }
 }
 
 fn state_path(tsconfig: &Path) -> PathBuf {
@@ -665,8 +681,12 @@ pub fn check_via_daemon(target: &Path) -> Result<Vec<Diagnostic>, String> {
 /// but could not check (caller falls back without spawning).
 fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     let state = read_state(tsconfig)?;
-    let root = tsconfig.parent().unwrap_or(tsconfig);
-    if state.version != env!("CARGO_PKG_VERSION") || state.tsgo_lookup != crate::tsgo_lookup(root) {
+    // Canonicalized so the compared lookup string agrees with the one
+    // serve_inner recorded regardless of the path spelling THIS client
+    // used — see canonical_root.
+    let root = canonical_root(tsconfig);
+    if state.version != env!("CARGO_PKG_VERSION") || state.tsgo_lookup != crate::tsgo_lookup(&root)
+    {
         // Version skew (oam upgraded, or the tsgo this project resolves to
         // changed): retire the old daemon, caller respawns.
         retire(&state, tsconfig);
@@ -1039,7 +1059,9 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
         token: token.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         tsconfig: tsconfig.to_string_lossy().into_owned(),
-        tsgo_lookup: crate::tsgo_lookup(&root),
+        // Recorded from the canonicalized root (NOT this daemon's spawn-arg
+        // spelling) so every client spelling of the project compares equal.
+        tsgo_lookup: crate::tsgo_lookup(&canonical_root(tsconfig)),
         tsgo_path: tsgo_path.to_string_lossy().into_owned(),
         tsgo_version: tsgo_version.clone(),
     };
@@ -1424,6 +1446,49 @@ mod tests {
         let other = scratch("key-other");
         std::fs::write(other.join("tsconfig.json"), "{}").unwrap();
         assert_ne!(canonical, project_key(&other.join("tsconfig.json")));
+    }
+
+    #[test]
+    fn canonical_root_collapses_spellings_so_tsgo_lookup_agrees() {
+        // Regression: try_existing compared a tsgo_lookup built from the
+        // client's raw spelling against one serve_inner built from the
+        // daemon's spawn-arg spelling, so two spellings of one project
+        // retired each other's daemon on every alternation.
+        let dir = scratch("Lookup-Case");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let base = canonical_root(&tsconfig);
+        #[cfg(windows)]
+        {
+            let upper =
+                PathBuf::from(dir.to_string_lossy().to_ascii_uppercase()).join("tsconfig.json");
+            let lower =
+                PathBuf::from(dir.to_string_lossy().to_ascii_lowercase()).join("tsconfig.json");
+            assert_eq!(base, canonical_root(&upper), "{upper:?}");
+            assert_eq!(base, canonical_root(&lower), "{lower:?}");
+            assert_eq!(
+                crate::tsgo_lookup(&canonical_root(&upper)),
+                crate::tsgo_lookup(&canonical_root(&lower)),
+                "case variants of one project must not retire each other's daemon"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.with_file_name(format!(
+                "{}-link",
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            let linked = canonical_root(&link.join("tsconfig.json"));
+            assert_eq!(base, linked);
+            assert_eq!(
+                crate::tsgo_lookup(&base),
+                crate::tsgo_lookup(&linked),
+                "a symlinked spelling must not retire the daemon"
+            );
+        }
+        // A dotted spelling of the same dir too.
+        assert_eq!(base, canonical_root(&dir.join(".").join("tsconfig.json")));
     }
 
     #[test]
