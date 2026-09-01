@@ -208,6 +208,93 @@ fn typescript_parse_errors_emit_odif_jsonl() {
 }
 
 #[test]
+fn transpile_cache_persists_across_runs_and_rejects_corruption() {
+    // A project .ts (never precompiled -- that cache is node_modules-only)
+    // stores its oxc output content-addressed under <cache>/transpile/, a
+    // second run serves it without re-transpiling, and a corrupted entry
+    // fails the artifact's self-hash: re-transpile, never execute garbage.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "oam-transpile-cache-e2e-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("util.ts"),
+        "export const add = (a: number, b: number): number => a + b;\n",
+    )
+    .expect("write util");
+    std::fs::write(
+        dir.join("app.ts"),
+        "import { add } from './util.ts';\nconsole.log('sum', add(40, 2));\n",
+    )
+    .expect("write app");
+    let cache = dir.join("cache");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", dir.join("app.ts").to_str().unwrap(), "--no-check"])
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    let cold = run();
+    assert!(
+        cold.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cold.stdout).trim(), "sum 42");
+
+    fn artifacts(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    artifacts(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut cached = Vec::new();
+    artifacts(&cache.join("transpile"), &mut cached);
+    assert!(
+        cached.len() >= 2,
+        "expected one artifact per transpiled module, found {cached:?}"
+    );
+
+    let warm = run();
+    assert!(
+        warm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&warm.stdout).trim(), "sum 42");
+
+    // Corrupt every artifact in place: a stale self-hash must be a miss.
+    for artifact in &cached {
+        std::fs::write(
+            artifact,
+            "// oam-transpile v1 deadbeef\nthrow new Error('corrupt artifact executed');\n",
+        )
+        .expect("corrupt");
+    }
+    let after = run();
+    assert!(
+        after.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "sum 42");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn runtime_exceptions_emit_odif_jsonl() {
     let file = write_temp("boom.js", "throw new Error('kaboom');");
     let out = oam(&["run", file.to_str().unwrap(), "--json"]);
@@ -1531,6 +1618,71 @@ fn repl_evaluates_typed_lines_with_live_event_loop() {
     // The bad line errored on stderr without killing the session.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("nope is not defined"), "stderr: {stderr}");
+}
+
+#[test]
+fn repl_top_level_await_declarations_persist() {
+    // `const x = await ...` runs inside an async IIFE; the binding must be
+    // hoisted onto globalThis so the next line still sees it (Node's
+    // processTopLevelAwait behavior). And a line merely CONTAINING the
+    // substring 'await' (`let awaiting = 1`) must NOT be wrapped -- the old
+    // substring heuristic wrapped it and lost the binding.
+    use std::io::Write;
+    let cache = write_temp("replcache-tla/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .env("OAM_CACHE_DIR", cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("repl spawns");
+    let script = "let awaiting = 1\n\
+                  awaiting\n\
+                  const x = await Promise.resolve(41)\n\
+                  x + 1\n\
+                  const { a, b } = await Promise.resolve({ a: 2, b: 40 })\n\
+                  a + b\n\
+                  .exit\n";
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("repl exits");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let cleaned: Vec<String> = stdout
+        .lines()
+        .skip(1) // banner
+        .map(|l| {
+            l.trim_start_matches("> ")
+                .trim_start_matches("... ")
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        cleaned,
+        vec![
+            "undefined", // let awaiting = 1 -- NOT wrapped despite the substring
+            "1",         // awaiting persists at script scope
+            "undefined", // const under top-level await evaluates via the block IIFE
+            "42",        // x was hoisted onto globalThis
+            "undefined", // destructuring declaration under top-level await
+            "42",        // a + b, both hoisted
+        ],
+        "stdout was: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("ReferenceError"),
+        "hoisted bindings must resolve, stderr: {stderr}"
+    );
 }
 
 // ------------------------------------------------------------- N-API alpha
@@ -4744,11 +4896,96 @@ fn runs_typescript_commonjs_module() {
 }
 
 #[test]
+fn require_of_broken_cts_is_a_cjs_syntax_error_with_location() {
+    // A transpile failure on the require() path must throw a SyntaxError
+    // carrying the loader's ODIF code AND the failing file's location --
+    // not a bare Error holding only the oxc message text.
+    let module = write_temp("broken_loc.cts", "const x: = 1;\n");
+    let entry = write_temp(
+        "main_broken_cts.cjs",
+        "try { require('./broken_loc.cts'); console.log('unreachable'); } \
+         catch (e) { console.log(e instanceof SyntaxError, e.code); console.log(e.message); }\n",
+    );
+    let out = oam(&["run", entry.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("true OAM-PARSE0001"), "stdout: {stdout}");
+    let message = lines.next().unwrap_or_default();
+    assert!(
+        message.contains("broken_loc.cts:1:"),
+        "message must carry file:line:col, got: {message}"
+    );
+    let _ = module;
+}
+
+#[test]
+fn require_of_commonjs_jsx_transpiles_via_interop() {
+    // .jsx routed CommonJS by "type":"commonjs" must transpile on the
+    // require() path: the old gate only covered ts/cts/mts, so raw JSX
+    // reached V8 as a SyntaxError. Transpiled as CommonJS, oxc injects the
+    // automatic jsx-runtime require()-shaped, resolved from node_modules.
+    // A DEDICATED dir: write_temp's shared RUN_DIR must never gain a
+    // node_modules/react or a package.json "type" (see the jsx e2e above).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("oam-cjs-jsx-e2e-{}-{nanos}", std::process::id()));
+    let rt = dir.join("node_modules").join("react");
+    std::fs::create_dir_all(&rt).expect("mkdir");
+    std::fs::write(
+        rt.join("package.json"),
+        r#"{"name":"react","version":"19.0.0","exports":{"./jsx-runtime":"./jsx-runtime.js"}}"#,
+    )
+    .expect("write pkg");
+    std::fs::write(
+        rt.join("jsx-runtime.js"),
+        "exports.jsx = (t, p) => ({ tag: t, props: p });\nexports.jsxs = exports.jsx;\n",
+    )
+    .expect("write runtime");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"cjs-jsx-fixture","type":"commonjs"}"#,
+    )
+    .expect("write project pkg");
+    std::fs::write(
+        dir.join("Button.jsx"),
+        "const Button = (props) => <button>{props.label}</button>;\nmodule.exports = { Button };\n",
+    )
+    .expect("write jsx");
+    std::fs::write(
+        dir.join("main.cjs"),
+        "const { Button } = require('./Button.jsx');\nconsole.log(JSON.stringify(Button({ label: 'hi' })));\n",
+    )
+    .expect("write entry");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", dir.join("main.cjs").to_str().unwrap()])
+        .env("OAM_CACHE_DIR", dir.join("cache"))
+        .output()
+        .expect("oam binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("\"tag\":\"button\""), "stdout: {stdout}");
+    assert!(stdout.contains("hi"), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn require_of_typescript_commonjs_strips_types() {
     // .cts reached via require() from a .cjs sibling: the CJS loader must
     // strip TS types before CompileFunction sees the source. Bad input
-    // surfaces as OAM-MOD0003 (matching the loader's error code), not a
-    // raw V8 SyntaxError.
+    // surfaces as a SyntaxError carrying the loader's ODIF code + location
+    // (see require_of_broken_cts_is_a_cjs_syntax_error_with_location).
     let module = write_temp(
         "lib.cts",
         "interface Shape { n: number }\n\
