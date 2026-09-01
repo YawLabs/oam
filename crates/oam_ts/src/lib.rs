@@ -30,7 +30,7 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod daemon;
 
@@ -70,7 +70,10 @@ pub fn tsgo_timeout() -> Duration {
 enum HandleState {
     #[default]
     Idle,
-    Running(u32),
+    /// The in-flight child, held UN-REAPED: a zombie on Unix / an open
+    /// process handle on Windows keeps the pid reserved, so killing by
+    /// this pid can never shoot an unrelated (recycled) process.
+    Running(std::process::Child),
     Cancelled,
 }
 
@@ -89,41 +92,64 @@ impl TsgoHandle {
 
     /// Kill the in-flight tsgo, if any, and refuse future spawns. Returns
     /// whether a child was actually killed.
+    ///
+    /// Pid-recycle safe: the tree kill runs while the held [`Child`]
+    /// (see [`HandleState::Running`]) is still un-reaped — the pid is
+    /// reserved, so it cannot name an unrelated process — and the direct
+    /// kill goes through the `Child` itself (std refuses it once the child
+    /// has been reaped). A cancel that finds the state Idle (the run
+    /// already completed and released the pid via `take_running`) kills
+    /// nothing.
+    ///
+    /// [`Child`]: std::process::Child
     pub fn cancel(&self) -> bool {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let killed = if let HandleState::Running(pid) = *state {
-            kill_tree(pid);
+        let killed = if let HandleState::Running(child) = &mut *state {
+            // Descendants first (they are still findable by parent pid),
+            // through the reserved pid; then the parent via its handle.
+            kill_tree(child.id());
+            let _ = child.kill();
             true
         } else {
             false
         };
-        *state = HandleState::Cancelled;
+        let prior = std::mem::replace(&mut *state, HandleState::Cancelled);
+        drop(state);
+        if let HandleState::Running(mut child) = prior {
+            // Reap outside the lock: the child was just killed, so this
+            // returns promptly — and the pid is released only after the
+            // state stopped referencing it.
+            let _ = child.wait();
+        }
         killed
     }
 
-    /// Record a spawned child. false = already cancelled; the caller must
-    /// kill what it just spawned.
-    fn register(&self, pid: u32) -> bool {
+    /// Record a spawned child; the handle now owns it. Err = already
+    /// cancelled: the child is handed back and the caller must kill and
+    /// reap what it just spawned.
+    fn register(&self, child: std::process::Child) -> Result<(), std::process::Child> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(*state, HandleState::Cancelled) {
-            return false;
+            return Err(child);
         }
-        *state = HandleState::Running(pid);
-        true
+        *state = HandleState::Running(child);
+        Ok(())
     }
 
-    fn clear(&self) {
+    /// Take the running child back out — the ONLY way its pid gets
+    /// released: the caller reaps it AFTER the state no longer references
+    /// it, so a concurrent [`TsgoHandle::cancel`] either finds the child
+    /// here (a still-reserved pid, safe to kill) or finds nothing (and
+    /// kills nothing). None = a cancel got there first (Cancelled is
+    /// sticky) or nothing was running.
+    fn take_running(&self) -> Option<std::process::Child> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(*state, HandleState::Running(_)) {
-            *state = HandleState::Idle;
+        if matches!(*state, HandleState::Running(_))
+            && let HandleState::Running(child) = std::mem::replace(&mut *state, HandleState::Idle)
+        {
+            return Some(child);
         }
-    }
-
-    fn is_cancelled(&self) -> bool {
-        matches!(
-            *self.0.lock().unwrap_or_else(|p| p.into_inner()),
-            HandleState::Cancelled
-        )
+        None
     }
 }
 
@@ -171,52 +197,104 @@ enum RunFailure {
 }
 
 /// Spawn `command` with piped output and collect it, killing the whole
-/// process tree at `timeout`. The child is registered on `handle` so another
-/// thread can cancel it mid-run. A dedicated waiter thread owns the `Child`
-/// (std's `wait_with_output` drains both pipes without deadlocking); on
-/// timeout/cancel that thread is simply abandoned — it returns as soon as
-/// the killed tree closes its pipe ends.
+/// process tree at `timeout`. The spawned `Child` is stored IN `handle`,
+/// un-reaped, so its pid stays reserved and another thread's cancel() can
+/// never race a recycled pid; two drainer threads own the pipes (reading
+/// both concurrently cannot deadlock), and the child is reaped only AFTER
+/// it is taken back out of the handle. On timeout the tree is killed here;
+/// a straggler that inherited the pipe ends just leaves the drainer
+/// threads to expire on their own once it exits.
 fn run_with_timeout(
     mut command: Command,
     timeout: Duration,
     handle: &TsgoHandle,
 ) -> Result<Output, RunFailure> {
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+    fn kill_and_reap(mut child: std::process::Child) {
+        kill_tree(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command.spawn().map_err(RunFailure::Spawn)?;
-    let pid = child.id();
-    if !handle.register(pid) {
-        kill_tree(pid);
-        std::thread::spawn(move || {
-            let _ = child.wait_with_output();
-        });
+    let deadline = Instant::now() + timeout;
+    let mut child = command.spawn().map_err(RunFailure::Spawn)?;
+    let out_pipe = drain(child.stdout.take());
+    let err_pipe = drain(child.stderr.take());
+    if let Err(child) = handle.register(child) {
+        // Cancelled before we could register: kill what we just spawned.
+        kill_and_reap(child);
         return Err(RunFailure::Cancelled);
     }
+    // Pipe EOF signals the tree is done writing; a channel carries it so
+    // this thread can bound the wait.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        let stdout = out_pipe.join().unwrap_or_default();
+        let stderr = err_pipe.join().unwrap_or_default();
+        let _ = tx.send((stdout, stderr));
     });
-    let result = match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => {
-            if handle.is_cancelled() {
-                Err(RunFailure::Cancelled)
-            } else {
-                Ok(output)
+    match rx.recv_timeout(timeout) {
+        Ok((stdout, stderr)) => {
+            let Some(mut child) = handle.take_running() else {
+                // A cancel consumed (and killed) the child mid-run.
+                return Err(RunFailure::Cancelled);
+            };
+            // The pid is released HERE, after take_running. The reap stays
+            // bounded by the original deadline: a child that closed its
+            // pipes early but lives on must surface as a timeout, not an
+            // unbounded wait.
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        return Ok(Output {
+                            status,
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    Ok(None) if Instant::now() >= deadline => {
+                        kill_and_reap(child);
+                        return Err(RunFailure::TimedOut);
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(e) => {
+                        kill_and_reap(child);
+                        return Err(RunFailure::Spawn(e));
+                    }
+                }
             }
         }
-        Ok(Err(e)) => Err(RunFailure::Spawn(e)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            kill_tree(pid);
-            Err(RunFailure::TimedOut)
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match handle.take_running() {
+            Some(child) => {
+                kill_and_reap(child);
+                Err(RunFailure::TimedOut)
+            }
+            // The cancel beat the timeout to the child.
+            None => Err(RunFailure::Cancelled),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Some(child) = handle.take_running() {
+                kill_and_reap(child);
+            }
+            Err(RunFailure::Spawn(std::io::Error::other(
+                "tsgo pipe drain thread exited without a result",
+            )))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(RunFailure::Spawn(
-            std::io::Error::other("tsgo waiter thread exited without a result"),
-        )),
-    };
-    handle.clear();
-    result
+    }
 }
 
 // --------------------------------------------------------------- discovery --
@@ -911,6 +989,47 @@ mod tests {
             Err(RunFailure::Spawn(e)) => panic!("spawn failed: {e}"),
             Err(RunFailure::TimedOut) => panic!("timed out"),
             Ok(_) => panic!("a cancelled handle must not run anything"),
+        }
+    }
+
+    #[test]
+    fn completed_run_releases_the_handle_so_cancel_kills_nothing() {
+        // The pid-recycle contract: once a run completes, the handle no
+        // longer references the (now released) pid, so a late cancel()
+        // must report nothing killed instead of shooting a stale pid.
+        let handle = TsgoHandle::new();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.arg("--list"); // the libtest harness lists and exits 0
+        match run_with_timeout(command, Duration::from_secs(30), &handle) {
+            Ok(output) => assert!(output.status.success()),
+            Err(RunFailure::Spawn(e)) => panic!("spawn failed: {e}"),
+            Err(RunFailure::TimedOut) => panic!("timed out"),
+            Err(RunFailure::Cancelled) => panic!("not cancelled"),
+        }
+        assert!(!handle.cancel(), "nothing may be killed after completion");
+        // And Cancelled stays sticky for the next spawn.
+        let mut again = Command::new(std::env::current_exe().unwrap());
+        again.arg("--list");
+        assert!(matches!(
+            run_with_timeout(again, Duration::from_secs(30), &handle),
+            Err(RunFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn handle_is_reusable_across_completed_runs() {
+        // The daemon reuses ONE handle for every fill: completion must
+        // return the state to Idle, not wedge it.
+        let handle = TsgoHandle::new();
+        for _ in 0..2 {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.arg("--list");
+            match run_with_timeout(command, Duration::from_secs(30), &handle) {
+                Ok(output) => assert!(output.status.success()),
+                Err(RunFailure::Spawn(e)) => panic!("spawn failed: {e}"),
+                Err(RunFailure::TimedOut) => panic!("timed out"),
+                Err(RunFailure::Cancelled) => panic!("cancelled"),
+            }
         }
     }
 
