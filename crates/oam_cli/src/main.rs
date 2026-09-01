@@ -1165,18 +1165,22 @@ fn repl_command() -> ExitCode {
                 let source = std::mem::take(&mut buffer);
                 // Typed input: strip annotations first; oxc handles plain
                 // JS identically, and its parse errors are the user's.
-                let prepared = match oam_loader::transpile_typescript(Path::new("repl.ts"), &source)
-                {
-                    Ok(stripped) => stripped,
-                    Err(e) => {
-                        for d in &e.diagnostics {
-                            eprintln!("{}", d.message);
+                let prepared =
+                    match oam_loader::transpile_typescript_rich(Path::new("repl.ts"), &source) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            for d in &e.diagnostics {
+                                eprintln!("{}", d.message);
+                            }
+                            prompt(false);
+                            continue;
                         }
-                        prompt(false);
-                        continue;
-                    }
-                };
-                match rt.repl_eval(&prepared) {
+                    };
+                match rt.repl_eval(
+                    &prepared.code,
+                    prepared.top_level_await,
+                    &prepared.top_level_bindings,
+                ) {
                     Ok(rendered) => println!("{rendered}"),
                     Err(message) => eprintln!("{message}"),
                 }
@@ -1718,9 +1722,12 @@ impl oam_engine::ModuleHost for CliHost {
         // .json would parse as JS and die on 'Unexpected token'. CJS files
         // never reach this host — the engine routes them through interop
         // before load — so a .cjs/.cts here is an engine routing bug.
+        // The accepted set is DERIVED from the loader's own classifier —
+        // `is_transpiled_source` (.ts/.mts/.cts/.tsx/.jsx, minus the
+        // CJS-routed .cts caught first) plus the plain-JS ESM extensions —
+        // so this host cannot drift from what the loader transpiles.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "js" | "mjs" | "ts" | "mts" | "tsx" | "jsx" => {}
             "cjs" | "cts" => {
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
@@ -1746,13 +1753,14 @@ impl oam_engine::ModuleHost for CliHost {
                     ),
                 )]);
             }
+            _ if matches!(ext, "js" | "mjs") || oam_loader::is_transpiled_source(path) => {}
             other => {
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
                     Severity::Error,
                     Origin::Resolve,
                     format!(
-                        "unsupported module type '.{other}' (expected .js/.mjs/.ts/.mts): {}",
+                        "unsupported module type '.{other}' (expected .js/.mjs/.ts/.mts/.tsx/.jsx): {}",
                         path.display()
                     ),
                 )]);
@@ -1774,13 +1782,20 @@ impl oam_engine::ModuleHost for CliHost {
             // (`import { jsx as _jsx } from "react/jsx-runtime"`), which
             // resolves through normal npm resolution + CJS interop.
             SourceKind::TypeScript | SourceKind::Jsx => {
-                // Install-time pre-compilation cache (oam install --precompile),
-                // keyed by source hash; a hit skips the oxc transpile. Misses
-                // (project sources, stale entries) fall through to transpile.
+                // Cache order: install-time precompile cache (node_modules
+                // only, `oam install --precompile`, keyed by source hash) ->
+                // content-addressed transpile cache (ALL transpiled sources,
+                // project files included) -> oxc, storing the fresh output
+                // so the next run skips the pipeline entirely.
                 if let Some(cached) = oam_loader::precompile::try_precompile_cache(path, &source) {
                     Ok(cached)
+                } else if let Some(cached) = oam_loader::transpile_cache::try_get(path, &source) {
+                    Ok(cached)
                 } else {
-                    oam_loader::transpile_typescript(path, &source).map_err(|e| e.diagnostics)
+                    let js = oam_loader::transpile_typescript(path, &source)
+                        .map_err(|e| e.diagnostics)?;
+                    oam_loader::transpile_cache::store(path, &source, &js);
+                    Ok(js)
                 }
             }
             _ => Ok(source),

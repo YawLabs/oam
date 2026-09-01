@@ -75,6 +75,22 @@ fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: 
     scope.throw_exception(exception);
 }
 
+/// `throw_error_with_code`, but a SyntaxError: a source that cannot parse
+/// is SyntaxError territory in Node, and tooling switches on the
+/// constructor as well as `.code`.
+fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let message =
+        v8::String::new(scope, message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
+    let exception = v8::Exception::syntax_error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let key = v8::String::new(scope, "code").unwrap();
+        if let Some(value) = v8::String::new(scope, code) {
+            obj.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
 /// CJS wrapper parameters, in order. Shared between the require() loader and
 /// the `oam compile` bytecode producer so their compiled functions -- and thus
 /// their V8 code-cache blobs -- are interchangeable.
@@ -243,8 +259,8 @@ fn require_callback(
             scope,
             "ERR_REQUIRE_ESM",
             &format!(
-                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported yet — \
-                 import it instead (synchronous require(esm) is on the M2 roadmap)",
+                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported — \
+                 use import instead, or a .cjs/.cts module where require() is needed",
                 path.display(),
                 referrer.display()
             ),
@@ -360,12 +376,18 @@ pub(crate) fn load_cjs<'s>(
         }
     }
 
-    // TypeScript reached via require() (.ts/.cts/.mts): read the source, then
-    // consult the install-time pre-compilation cache (written by
-    // `oam install --precompile`, keyed by source hash). A cache hit skips the
-    // oxc transpile; a miss strips types inline below, mirroring the ESM host.
-    let ext = key.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_ts = matches!(ext, "ts" | "cts" | "mts");
+    // Sources the loader transpiles, reached via require(): .cts always;
+    // .tsx/.jsx when the package.json walk routes them CommonJS
+    // ("type":"commonjs", or typeless inside node_modules). .ts/.mts cannot
+    // actually get here today -- module_kind() pins them ESM, so
+    // require_callback throws ERR_REQUIRE_ESM first (a documented
+    // divergence: docs/node-divergences.md sec. 24, "TypeScript module
+    // kind") -- but deriving the gate from is_transpiled_source keeps it
+    // correct if that policy ever changes. Cache order for a transpiled
+    // source: install-time precompile cache (node_modules only, written by
+    // `oam install --precompile`) -> content-addressed transpile cache ->
+    // oxc inline, storing the fresh output for the next run.
+    let needs_transpile = oam_loader::is_transpiled_source(&key);
 
     let raw = match std::fs::read_to_string(&key) {
         Ok(source) => source,
@@ -375,30 +397,50 @@ pub(crate) fn load_cjs<'s>(
         }
     };
 
-    let source = if is_ts {
+    let source = if needs_transpile {
         if let Some(cached) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
             // Already plain JS from `oam install --precompile`; do NOT re-transpile.
             cached
+        } else if let Some(cached) = oam_loader::transpile_cache::try_get(&key, &raw) {
+            // Persistent oxc output from a previous run (either host); the
+            // artifact's self-hash was verified, so a corrupt entry
+            // re-transpiles instead of executing.
+            cached
         } else {
-            // oxc strips the TS types, then the CJS wrapper below compiles+runs
-            // the resulting JS. A transpile failure carries the loader's ODIF
-            // code/message rather than a raw oxc panic; any ESM syntax that
+            // oxc strips TS types / lowers JSX (CommonJS-shaped, so the
+            // injected jsx-runtime import is a require()), then the CJS
+            // wrapper below compiles+runs the resulting JS. A transpile
+            // failure throws a SyntaxError carrying the loader's ODIF code
+            // and the first diagnostic's file:line:col; ESM syntax that
             // survives stripping (e.g. a bare `export`) fails later at
             // compile_function and surfaces as the V8 SyntaxError.
             match oam_loader::transpile_typescript(&key, &raw) {
-                Ok(js) => js,
+                Ok(js) => {
+                    oam_loader::transpile_cache::store(&key, &raw, &js);
+                    js
+                }
                 Err(e) => {
-                    let (code, message) = e
-                        .diagnostics
-                        .first()
-                        .map(|d| (d.code.clone(), d.message.clone()))
-                        .unwrap_or_else(|| {
-                            (
-                                "OAM-PARSE0002".to_string(),
-                                format!("{file}: transpile failed"),
-                            )
-                        });
-                    throw_error_with_code(scope, &code, &message);
+                    let extra = e.diagnostics.len().saturating_sub(1);
+                    let (code, message) = match e.diagnostics.first() {
+                        Some(d) => {
+                            let mut message = match d.spans.first() {
+                                Some(span) => format!(
+                                    "{}:{}:{}: {}",
+                                    span.file, span.start.line, span.start.col, d.message
+                                ),
+                                None => format!("{file}: {}", d.message),
+                            };
+                            if extra > 0 {
+                                message.push_str(&format!(" (+{extra} more)"));
+                            }
+                            (d.code.clone(), message)
+                        }
+                        None => (
+                            "OAM-PARSE0002".to_string(),
+                            format!("{file}: transpile failed"),
+                        ),
+                    };
+                    throw_syntax_error_with_code(scope, &code, &message);
                     return None;
                 }
             }

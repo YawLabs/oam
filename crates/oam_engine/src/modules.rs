@@ -852,17 +852,42 @@ impl JsRuntime {
     /// One REPL evaluation: TypeScript-stripped, await-aware, result
     /// rendered via util.inspect, `_` bound to the last value. Err is the
     /// pretty error text.
-    pub fn repl_eval(&mut self, source: &str) -> Result<String, String> {
+    ///
+    /// `top_level_await` comes from the transpiler's parse (real top-level
+    /// await usage -- never the identifier, never an await inside a nested
+    /// function), and `hoisted_bindings` are the names the line declares at
+    /// the top level. An awaiting line runs inside an async IIFE, which
+    /// would swallow let/const/function bindings; the block wrapper
+    /// re-publishes each one onto globalThis (Node's processTopLevelAwait
+    /// hoists the same way), so the next line still sees them.
+    pub fn repl_eval(
+        &mut self,
+        source: &str,
+        top_level_await: bool,
+        hoisted_bindings: &[String],
+    ) -> Result<String, String> {
         // No host on the REPL path: clear any parked pointer (defensive; the
         // REPL never calls execute_module, but keep the invariant uniform).
         self.clear_active_host();
-        let has_await = source.contains("await");
-        let prepared = if has_await {
-            // Top-level await: evaluate as an async IIFE and pump until
-            // settled. Expression form first (trailing semicolons from the
-            // TS strip would break it); statement fallback below.
-            let expression = source.trim_end().trim_end_matches(';');
-            format!("(async () => ({expression}\n))()")
+        let block_wrap = |source: &str| {
+            let hoist: String = hoisted_bindings
+                .iter()
+                .map(|name| format!("\nglobalThis.{name} = {name};"))
+                .collect();
+            format!("(async () => {{ {source}\n{hoist} }})()")
+        };
+        let prepared = if top_level_await {
+            if hoisted_bindings.is_empty() {
+                // Top-level await: evaluate as an async IIFE and pump until
+                // settled. Expression form first (trailing semicolons from
+                // the TS strip would break it); statement fallback below.
+                let expression = source.trim_end().trim_end_matches(';');
+                format!("(async () => ({expression}\n))()")
+            } else {
+                // Declarations are never expressions: go straight to the
+                // block form that re-publishes the bindings.
+                block_wrap(source)
+            }
         } else {
             source.to_string()
         };
@@ -963,10 +988,10 @@ impl JsRuntime {
 
         match run(self, &prepared) {
             Ok(text) => Ok(text),
-            Err((syntax, _message)) if has_await && syntax => {
-                // Statement-shaped await input: re-wrap as a block.
-                let block = format!("(async () => {{ {source}\n }})()");
-                run(self, &block).map_err(|(_, m)| m)
+            Err((syntax, _message)) if top_level_await && hoisted_bindings.is_empty() && syntax => {
+                // Statement-shaped await input: re-wrap as a block. (With
+                // hoisted bindings, `prepared` already was the block form.)
+                run(self, &block_wrap(source)).map_err(|(_, m)| m)
             }
             Err((_, message)) => Err(message),
         }
