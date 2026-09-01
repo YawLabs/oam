@@ -17,6 +17,15 @@ node_modules/
 # broker runs from the repo root, so its screenshots/snapshots land here.
 /.playwright-mcp/
 /oam-example-render.png
+# Claude Code's agent scratch space. worktrees/ holds FULL checkouts of this
+# repo, each with its own target/ -- eight of them (one 4.9 GB) are what turned
+# a release's source sync into an 11.6 GB tarball on 2026-08-31. The remote
+# build sync now asks git what the working tree is (scripts/lib/src-sync.sh),
+# so this entry is what keeps that junk out of it. It was previously ignored
+# only via .git/info/exclude, which is machine-local and does NOT travel with
+# the repo -- so a fresh clone had no protection at all.
+/.claude/worktrees/
+/.claude/settings.local.json
 # `oam -e/-p` writes its throwaway script beside the cwd as
 # `.oam-eval-<pid>.<ext>` and unlinks it on exit -- but a run that dies first
 # leaves one behind, and two got committed into the vendored Node corpus that
