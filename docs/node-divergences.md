@@ -504,6 +504,21 @@ the runtime now works the way a TypeScript toolchain expects, by both routes:
 With no pragma and no tsconfig value, the automatic runtime targets `react/jsx-runtime`,
 matching tsc's default.
 
+**`compilerOptions.jsx` is honored, with one runtime-shaped exception.** The mode picks
+the runtime the way tsc does:
+
+| `jsx`           | oam compiles to                                                         |
+|-----------------|-------------------------------------------------------------------------|
+| `react-jsx`     | `jsx()` / `jsxs()` from `<jsxImportSource>/jsx-runtime` (the default)   |
+| `react-jsxdev`  | `jsxDEV()` from `<jsxImportSource>/jsx-dev-runtime`, with `__source` / `__self` |
+| `react`         | classic `jsxFactory(...)` calls -- `React.createElement` / `React.Fragment` unless `jsxFactory` / `jsxFragmentFactory` say otherwise; no runtime import |
+| `preserve`, `react-native` | **not honored**: treated as `react-jsx`. Both modes leave JSX in the output for a later build tool, and there is no later tool when the file is about to execute. `oam check` still type-checks under the declared mode. |
+
+`extends` chains (string or the TypeScript 5.0 array form) merge these per option like
+every other compilerOption the loader reads. A dependency's own `tsconfig.json` under
+`node_modules` is never consulted -- neither for JSX settings nor for `paths` -- because
+neither Node nor tsc applies it to the package's published files.
+
 ---
 
 ### 16. GET/HEAD body writes are dropped, not sent unframed

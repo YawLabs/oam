@@ -107,6 +107,11 @@ pub fn available() -> Result<String, Diagnostic> {
 }
 
 /// Walk up from `start` looking for tsconfig.json.
+///
+/// Twin: `oam_loader::find_tsconfig` (crates/oam_loader/src/tsconfig.rs) is
+/// the same walk for the runtime resolver, cached per Resolver. This crate
+/// must not depend on oam_loader (it would pull oxc and reqwest into the
+/// checker), so the two are kept in sync by hand -- change one, change both.
 pub fn find_tsconfig(start: &Path) -> Option<PathBuf> {
     let mut dir = if start.is_dir() {
         start.to_path_buf()
