@@ -763,8 +763,8 @@ pub fn status(target: &Path) -> DaemonStatus {
 
 /// Stop the project's daemon if one is running. Returns whether one was.
 /// A daemon that does not answer Shutdown within 2s is killed by its
-/// recorded pid (after checking that pid still names an oam process, so a
-/// recycled pid is never shot); the state file goes either way.
+/// recorded pid (after checking that pid still names an oam process —
+/// best-effort, see [`kill_daemon`]); the state file goes either way.
 pub fn stop(target: &Path) -> bool {
     let Ok(target) = std::path::absolute(target) else {
         return false;
@@ -789,35 +789,17 @@ pub fn stop(target: &Path) -> bool {
 }
 
 /// Kill a wedged daemon by pid with OS tools (no libc/oam_core dependency
-/// here). Refuses when the pid no longer names an oam process.
+/// here). Refuses when the pid no longer names an oam process. Best-effort
+/// only: the verify-then-kill sequence is a TOCTOU window shell tools
+/// cannot close — the pid could in principle be recycled between the
+/// tasklist/ps probe and the taskkill/kill — so this guards against the
+/// common stale-state-file case, not against a determined race.
 fn kill_daemon(pid: u32) -> bool {
-    use std::process::{Command, Stdio};
-    let pid_str = pid.to_string();
-    let quiet = |command: &mut Command| {
-        command
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .stdout(Stdio::piped());
-    };
-    let image = if cfg!(windows) {
-        let mut command = Command::new("tasklist");
-        command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
-        quiet(&mut command);
-        command.output()
-    } else {
-        let mut command = Command::new("ps");
-        command.args(["-p", &pid_str, "-o", "comm="]);
-        quiet(&mut command);
-        command.output()
-    };
-    let is_oam = image.is_ok_and(|out| {
-        String::from_utf8_lossy(&out.stdout)
-            .to_ascii_lowercase()
-            .contains("oam")
-    });
-    if !is_oam {
+    use std::process::Command;
+    if !daemon_process_alive(pid) {
         return false;
     }
+    let pid_str = pid.to_string();
     let status = if cfg!(windows) {
         let mut command = Command::new("taskkill");
         command.args(["/T", "/F", "/PID", &pid_str]);
@@ -830,6 +812,60 @@ fn kill_daemon(pid: u32) -> bool {
         command.status()
     };
     status.is_ok_and(|s| s.success())
+}
+
+fn quiet(command: &mut std::process::Command) {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+}
+
+/// Does `pid` currently name an oam process? Probed with `tasklist` (CSV)
+/// on Windows and `ps -o comm=` elsewhere; the image name must EQUAL
+/// `oam`/`oam.exe` (case-insensitive), never a substring match — ANY
+/// process whose listing merely contained "oam" somewhere (e.g.
+/// `roaming-helper.exe`) used to pass and get its whole tree killed.
+fn daemon_process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    let image = if cfg!(windows) {
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+        quiet(&mut command);
+        command.output()
+    } else {
+        let mut command = Command::new("ps");
+        command.args(["-p", &pid.to_string(), "-o", "comm="]);
+        quiet(&mut command);
+        command.output()
+    };
+    image.is_ok_and(|out| {
+        process_image_name(&String::from_utf8_lossy(&out.stdout), cfg!(windows))
+            .is_some_and(|name| image_is_oam(&name))
+    })
+}
+
+/// The process image name out of `tasklist /FO CSV /NH` output (`csv`
+/// true: the first quoted field) or `ps -o comm=` output (Linux prints the
+/// bare name, macOS the full executable path — take the file name). None =
+/// no parseable process line (e.g. tasklist's "INFO: No tasks..." notice).
+fn process_image_name(raw: &str, csv: bool) -> Option<String> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    if csv {
+        line.strip_prefix('"')?
+            .split("\",\"")
+            .next()
+            .map(str::to_string)
+    } else {
+        Path::new(line)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+}
+
+fn image_is_oam(name: &str) -> bool {
+    name.eq_ignore_ascii_case("oam") || name.eq_ignore_ascii_case("oam.exe")
 }
 
 /// Windows: a spawned child inherits EVERY inheritable handle in our table,
@@ -1451,6 +1487,50 @@ mod tests {
             sidecar(state, "spawn-failed"),
             PathBuf::from("/c/ts-daemons/abc.json.spawn-failed")
         );
+    }
+
+    #[test]
+    fn process_image_name_parses_tasklist_csv_and_ps_comm() {
+        // tasklist /FO CSV /NH: the image is the first quoted field.
+        assert_eq!(
+            process_image_name(
+                "\"oam.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n",
+                true
+            )
+            .as_deref(),
+            Some("oam.exe")
+        );
+        // tasklist's no-match notice has no CSV shape: must parse as None,
+        // never as a process name.
+        assert_eq!(
+            process_image_name(
+                "INFO: No tasks are running which match the specified criteria.\r\n",
+                true
+            ),
+            None
+        );
+        // ps -o comm=: bare name on Linux, full executable path on macOS.
+        assert_eq!(process_image_name("oam\n", false).as_deref(), Some("oam"));
+        assert_eq!(
+            process_image_name("/usr/local/bin/oam\n", false).as_deref(),
+            Some("oam")
+        );
+        assert_eq!(process_image_name("", false), None);
+        assert_eq!(process_image_name("   \n\n", true), None);
+    }
+
+    #[test]
+    fn kill_daemon_identity_requires_exact_oam_image_name() {
+        assert!(image_is_oam("oam"));
+        assert!(image_is_oam("oam.exe"));
+        assert!(image_is_oam("OAM.EXE"), "NTFS spellings vary in case");
+        // Substring matches that used to pass and must not: unrelated
+        // processes whose listing merely contains "oam".
+        assert!(!image_is_oam("roaming-helper.exe"));
+        assert!(!image_is_oam("yoam"));
+        assert!(!image_is_oam("oamd"));
+        assert!(!image_is_oam("oam-helper.exe"));
+        assert!(!image_is_oam(""));
     }
 
     #[test]
