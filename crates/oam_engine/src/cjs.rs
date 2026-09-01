@@ -523,10 +523,14 @@ pub(crate) fn load_cjs<'s>(
     // exists (skips the parse+compile) else compile fresh. The blob is keyed by
     // source + V8 version + oam format so a foreign blob can't be served here;
     // V8 also flags a bad blob via `rejected()` below. The key is computed once
-    // and reused by the store after the body runs. `cached` is held for the
-    // whole compile because `CachedData` borrows it (BufferNotOwned).
-    let cache_key = crate::code_cache::key_for(&source, crate::code_cache::Kind::Function);
-    let cached = crate::code_cache::load(&cache_key);
+    // and reused by the store after the body runs -- and not at all when the
+    // cache is off (OAM_CODE_CACHE=0): a disabled cache must not pay a SHA-256
+    // over the full source per require, least of all in the cold-compile
+    // benchmarks the off switch exists for. `cached` is held for the whole
+    // compile because `CachedData` borrows it (BufferNotOwned).
+    let cache_key = crate::code_cache::enabled()
+        .then(|| crate::code_cache::key_for(&source, crate::code_cache::Kind::Function));
+    let cached = cache_key.as_ref().and_then(crate::code_cache::load);
     let consuming = cached.is_some();
     let seeded = cached.as_ref().is_some_and(|c| c.seeded);
     let mut compiler_source = match cached {
@@ -568,10 +572,15 @@ pub(crate) fn load_cjs<'s>(
             .map(|cd| cd.rejected())
             .unwrap_or(true);
     // A rejected SEED (embedded bytecode from a different V8 build or flag
-    // set) is dropped so a later load in this process is not handed the same
-    // rejected bytes ahead of the disk blob the store below refreshes.
-    if rejected && seeded {
-        crate::code_cache::forget_seed(&cache_key);
+    // set) is dropped -- and the rejection recorded on disk -- so neither a
+    // later load in this process nor a later RUN of the same binary is handed
+    // the rejected bytes ahead of the disk blob the store below refreshes.
+    // (`seeded` implies a consumed blob, hence a Some key.)
+    if rejected
+        && seeded
+        && let Some(cache_key) = &cache_key
+    {
+        crate::code_cache::record_seed_rejection(cache_key);
     }
     let refresh_cache = !consuming || rejected;
 
@@ -602,13 +611,13 @@ pub(crate) fn load_cjs<'s>(
 
     // Persist the bytecode now that the body has executed, so the cached blob
     // includes the body and not just the outer wrapper. Best-effort: a failed
-    // produce or write just means the next run pays the compile again. The
-    // enabled() guard skips the serialize work entirely when the cache is off.
+    // produce or write just means the next run pays the compile again. A None
+    // key means the cache is off, which skips the serialize work entirely.
     if refresh_cache
-        && crate::code_cache::enabled()
+        && let Some(cache_key) = &cache_key
         && let Some(cd) = wrapper.create_code_cache()
     {
-        crate::code_cache::store(&cache_key, &cd);
+        crate::code_cache::store(cache_key, &cd);
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;

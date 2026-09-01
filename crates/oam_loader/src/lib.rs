@@ -568,7 +568,10 @@ pub fn is_declaration_file(p: &Path) -> bool {
 /// (`.js` -> `.ts` then `.tsx`, `.jsx` -> `.tsx`, `.mjs` -> `.mts`,
 /// `.cjs` -> `.cts`); for an extensionless specifier the APPENDED
 /// extensions `.ts .tsx .mts .js .jsx .mjs`, then the directory index
-/// `index.ts index.tsx index.js`. Appending (not with_extension) keeps
+/// `index.ts index.tsx index.js index.jsx` (tsc's directory lookup probes
+/// exactly those four runtime candidates; it never probes index.mts /
+/// index.mjs -- those extensions are only SUBSTITUTED from explicit `.mjs`
+/// specifiers, so they are deliberately absent). Appending (not with_extension) keeps
 /// dotted basenames intact: './my.module' probes 'my.module.ts', never
 /// clobbers the '.module' segment. Returns (found-absolute, every
 /// candidate tried). `oam check` (tsgo) resolves every one of these shapes,
@@ -597,7 +600,7 @@ pub(crate) fn probe_candidates(resolver: &Resolver, raw: &Path) -> (Option<PathB
             for ext in ["ts", "tsx", "mts", "js", "jsx", "mjs"] {
                 candidates.push(append_ext(raw, ext));
             }
-            for index in ["index.ts", "index.tsx", "index.js"] {
+            for index in ["index.ts", "index.tsx", "index.js", "index.jsx"] {
                 candidates.push(raw.join(index));
             }
         }
@@ -795,6 +798,7 @@ mod tests {
                 "index.ts",
                 "index.tsx",
                 "index.js",
+                "index.jsx",
             ]
         );
     }
@@ -809,6 +813,8 @@ mod tests {
         std::fs::write(dir.join("Button.tsx"), "export const Button = 1;\n").unwrap();
         std::fs::create_dir_all(dir.join("widgets")).unwrap();
         std::fs::write(dir.join("widgets/index.tsx"), "export const W = 1;\n").unwrap();
+        std::fs::create_dir_all(dir.join("icons")).unwrap();
+        std::fs::write(dir.join("icons/index.jsx"), "export const I = 1;\n").unwrap();
         let entry = dir.join("entry.tsx");
         let resolver = Resolver::new();
         for spec in ["./Button", "./Button.js", "./Button.jsx"] {
@@ -819,6 +825,10 @@ mod tests {
         }
         let resolved = resolver.resolve_import("./widgets", &entry).unwrap();
         assert!(resolved.ends_with("index.tsx"), "got {resolved:?}");
+        // A directory whose ONLY index is index.jsx (allowJs projects): tsgo
+        // resolves it, so `oam run` must too or the two disagree.
+        let resolved = resolver.resolve_import("./icons", &entry).unwrap();
+        assert!(resolved.ends_with("index.jsx"), "got {resolved:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
