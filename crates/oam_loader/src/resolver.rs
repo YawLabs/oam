@@ -37,8 +37,24 @@ pub struct Resolver {
     /// Directory -> the nearest `tsconfig.json` at or above it (None =
     /// walked to the root and found nothing). Consulted before any stat, so
     /// a project with no tsconfig pays the ancestor walk once per
-    /// directory, not once per resolve.
-    tsconfig_dirs: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+    /// directory, not once per resolve. Carries a generation stamp so
+    /// `clear_caches` cannot be silently undone by an in-flight walk's
+    /// back-fill (see `nearest_tsconfig_from_dir`).
+    tsconfig_dirs: Mutex<TsconfigDirCache>,
+}
+
+/// The tsconfig discovery cache plus the generation stamp guarding its
+/// back-fill.
+#[derive(Default)]
+struct TsconfigDirCache {
+    /// Bumped by every `clear_caches`. A discovery walk snapshots it before
+    /// touching the filesystem and re-checks it under the lock before
+    /// back-filling: without the check, a walk racing a `clear_caches` could
+    /// re-insert its pre-clear answers AFTER the clear, leaving a
+    /// `tsconfig.json` written just before the clear invisible to every
+    /// subsequent resolve.
+    generation: u64,
+    map: HashMap<PathBuf, Option<PathBuf>>,
 }
 
 impl Resolver {
@@ -57,10 +73,9 @@ impl Resolver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.tsconfig_dirs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let mut dirs = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        dirs.map.clear();
+        dirs.generation = dirs.generation.wrapping_add(1);
     }
 
     pub(crate) fn tsconfigs(&self) -> &Mutex<HashMap<PathBuf, TsconfigEntry>> {
@@ -79,12 +94,20 @@ impl Resolver {
     /// visited on the way to an answer is recorded with that answer, so the
     /// next lookup from anywhere in the same subtree is a single map hit.
     pub(crate) fn nearest_tsconfig_from_dir(&self, start: PathBuf) -> Option<PathBuf> {
+        // Snapshot the generation BEFORE any filesystem probe: every answer
+        // this walk produces is only as fresh as the cache state right now,
+        // and the back-fill below must not outlive a concurrent clear.
+        let generation = self
+            .tsconfig_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation;
         let mut visited: Vec<PathBuf> = Vec::new();
         let mut dir = start;
         let found = loop {
             {
                 let cache = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(hit) = cache.get(&dir) {
+                if let Some(hit) = cache.map.get(&dir) {
                     break hit.clone();
                 }
             }
@@ -97,11 +120,27 @@ impl Resolver {
                 break None;
             }
         };
-        let mut cache = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
-        for visited_dir in visited {
-            cache.insert(visited_dir, found.clone());
-        }
+        self.backfill_tsconfig_dirs(generation, visited, &found);
         found
+    }
+
+    /// Record a completed walk's answers, unless a `clear_caches` intervened
+    /// since `generation` was snapshotted -- those answers predate the clear,
+    /// and inserting them would resurrect exactly the staleness the clear
+    /// existed to drop.
+    fn backfill_tsconfig_dirs(
+        &self,
+        generation: u64,
+        visited: Vec<PathBuf>,
+        found: &Option<PathBuf>,
+    ) {
+        let mut cache = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.generation != generation {
+            return;
+        }
+        for visited_dir in visited {
+            cache.map.insert(visited_dir, found.clone());
+        }
     }
 
     /// Resolve a `require()` specifier from the CJS module at `referrer`,
@@ -146,7 +185,7 @@ impl Resolver {
     /// then x.tsx, './x.jsx' -> x.tsx, './x.mjs' -> x.mts, './x.cjs' -> x.cts;
     /// the tsc rewrite convention), then extensionless probing (.ts, .tsx,
     /// .mts, .js, .jsx, .mjs) and directory index (index.ts, index.tsx,
-    /// index.js) -- see `probe_candidates`.
+    /// index.js, index.jsx) -- see `probe_candidates`.
     ///
     /// Bare specifiers resolve via tsconfig paths (if a tsconfig.json is found
     /// in the referrer's ancestor tree) then the Node ESM node_modules walk.
@@ -345,4 +384,70 @@ pub fn default_resolver() -> &'static Resolver {
 /// a fresh `oam run` is a new process) this scope is sufficient.
 pub fn default_clear_caches() {
     default_resolver().clear_caches();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_caches_is_not_undone_by_a_stale_backfill() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "oam-resolver-genguard-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let resolver = Resolver::new();
+
+        // A walk snapshots the generation, then a clear intervenes before its
+        // back-fill lands (the race, driven by hand so it is deterministic).
+        let stale_generation = resolver
+            .tsconfig_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation;
+        resolver.clear_caches();
+        resolver.backfill_tsconfig_dirs(stale_generation, vec![dir.clone()], &None);
+        assert!(
+            resolver
+                .tsconfig_dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map
+                .is_empty(),
+            "a back-fill from before the clear must be dropped"
+        );
+
+        // The reason it matters: a tsconfig.json written just before the
+        // clear is FOUND by the next lookup. Had the stale None landed, this
+        // directory would answer None forever.
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            resolver.nearest_tsconfig_from_dir(dir.clone()),
+            Some(dir.join("tsconfig.json"))
+        );
+
+        // A current-generation back-fill still lands (the cache still caches).
+        let current = resolver
+            .tsconfig_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation;
+        let sub = dir.join("sub");
+        resolver.backfill_tsconfig_dirs(current, vec![sub.clone()], &None);
+        assert!(
+            resolver
+                .tsconfig_dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map
+                .contains_key(&sub)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
