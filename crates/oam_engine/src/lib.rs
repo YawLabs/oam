@@ -747,7 +747,19 @@ pub(crate) fn exception_to_error(
         return anyhow!("{name}: unknown exception");
     };
     let text = message.get(tc).to_rust_string_lossy(tc);
-    let line = message.get_line_number(tc).unwrap_or(0);
+    let mut line = message.get_line_number(tc).unwrap_or(0);
+    // Transpiled files: V8's position is codegen output; remap to the line
+    // the user wrote. The registry only holds entries for transpiled
+    // modules, so plain JS never remaps.
+    if line > 0
+        && let Some(resource) = message.get_script_resource_name(tc)
+    {
+        let file = resource.to_rust_string_lossy(tc);
+        let column = message.get_start_column() as u32;
+        if let Some((src_line, _)) = oam_loader::sourcemap::lookup(&file, line as u32, column) {
+            line = src_line as usize;
+        }
+    }
     anyhow!("{name}:{line}: {text}")
 }
 

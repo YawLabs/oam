@@ -1314,3 +1314,55 @@
     configurable: true,
   });
 })();
+
+// Source-position remap for transpiled files, Node --enable-source-maps
+// style but on by default: oam's codegen REFLOWS .ts/.tsx/.cts (Node's
+// strip-only pipeline preserves positions), so without this every
+// err.stack cites codegen line numbers. V8 materializes err.stack through
+// this hook on first access; the default V8 format is reproduced
+// byte-for-byte (header = ToString(err), one "\n    at <frame>" line per
+// CallSite via the CallSite's own toString) with exactly one change: when
+// the runtime source-map registry has a mapping for a frame's
+// file:line:column (__oam.mapPosition, populated only for transpiled
+// sources), the generated position is rewritten to the source position.
+// Plain .js frames never have a registry entry and pass through verbatim.
+// Userland assigning its own Error.prepareStackTrace overrides this, same
+// as Node. SNAPSHOT CONSTRAINT: __oam is looked up at CALL time.
+(() => {
+  Error.prepareStackTrace = function (err, frames) {
+    let head;
+    try {
+      head = `${err}`;
+    } catch {
+      head = "<error>";
+    }
+    let out = head;
+    for (const frame of frames) {
+      let text = `${frame}`;
+      try {
+        const internal = globalThis.__oam;
+        const map = internal && internal.mapPosition;
+        const file = typeof frame.getFileName === "function" ? frame.getFileName() : null;
+        const line = typeof frame.getLineNumber === "function" ? frame.getLineNumber() : null;
+        const col = typeof frame.getColumnNumber === "function" ? frame.getColumnNumber() : null;
+        if (typeof map === "function" && file && line && col) {
+          const mapped = map(file, line, col);
+          if (mapped) {
+            const generated = `:${line}:${col}`;
+            const at = text.lastIndexOf(generated);
+            if (at !== -1) {
+              text =
+                text.slice(0, at) +
+                `:${mapped[0]}:${mapped[1]}` +
+                text.slice(at + generated.length);
+            }
+          }
+        }
+      } catch {
+        // remap must never break stack formatting
+      }
+      out += `\n    at ${text}`;
+    }
+    return out;
+  };
+})();

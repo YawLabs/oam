@@ -299,6 +299,167 @@ fn transpile_cache_persists_across_runs_and_rejects_corruption() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── source-map stack-trace fidelity ──────────────────────────────────────
+// oam's codegen REFLOWS transpiled sources (Node's strip-only pipeline
+// preserves positions), so without runtime source maps every .ts stack
+// frame cited the codegen line. These pin the source-position contract at
+// each surface: the uncaught report (cold AND warm-from-cache), JS-visible
+// err.stack via Error.prepareStackTrace, require() of a .cts, and -- the
+// control -- plain .js positions passing through untouched.
+
+/// Source whose `throw` sits on line 7, after an erased `import type` and
+/// a multi-line interface. Codegen collapses it to line 2, so a passing
+/// `:7` proves the remap, not luck.
+const STACK_FIDELITY_TS: &str = "import type { Missing } from './type-only.js';\n\
+interface Wide {\n  a: number;\n  b: string;\n}\n\
+const n: number = 6;\n\
+throw new Error('boom' + n);\n";
+
+#[test]
+fn transpiled_ts_uncaught_stack_cites_source_line_cold_and_warm() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("oam-stack-fidelity-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("boom.ts"), STACK_FIDELITY_TS).expect("write boom.ts");
+    let cache = dir.join("cache");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", dir.join("boom.ts").to_str().unwrap(), "--no-check"])
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+    for phase in ["cold", "warm (served from the transpile cache)"] {
+        let out = run();
+        assert!(!out.status.success(), "{phase}: throw must fail the run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("boom.ts:7"),
+            "{phase}: uncaught report must cite SOURCE line 7; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("boom.ts:7:"),
+            "{phase}: the stack frame must cite line 7 too; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("throw new Error('boom' + n)"),
+            "{phase}: code frame must show the SOURCE text (single quotes -- \
+             codegen normalizes to double); stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("boom.ts:2"),
+            "{phase}: the codegen line must not leak; stderr: {stderr}"
+        );
+        // The warm phase only proves cache fidelity if an artifact was
+        // actually stored; a silent store failure would make it a second
+        // cold run.
+        assert!(
+            cache.join("transpile").is_dir(),
+            "{phase}: transpile cache dir must exist after a run"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn transpiled_ts_err_stack_read_inside_js_cites_source_line() {
+    // err.stack materialized INSIDE JS -- the Error.prepareStackTrace
+    // surface, not the Rust fatal path. Throw sits on source line 7.
+    let file = write_temp(
+        "stack7/stack7.ts",
+        "import type { Missing } from './type-only.js';\n\
+         interface Wide {\n  a: number;\n  b: string;\n}\n\
+         function detonate(): never {\n\
+           throw new Error('boom');\n\
+         }\n\
+         try {\n  detonate();\n} catch (e) {\n  console.log((e as Error).stack);\n}\n",
+    );
+    let out = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "caught throw exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("at detonate"),
+        "frame keeps its function name; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("stack7.ts:7:"),
+        "err.stack must cite SOURCE line 7; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("stack7.ts:2:"),
+        "codegen line must not leak into err.stack; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn required_cts_error_stack_cites_source_line() {
+    // require() of a .cts -- the CJS interop transpile path. Throw sits on
+    // source line 7 of lib.cts.
+    let lib = write_temp(
+        "ctsstack/lib.cts",
+        "interface Wide {\n  a: number;\n  b: string;\n}\n\
+         const reason: string = 'boom';\n\
+         function blow(): never {\n\
+           throw new Error(reason);\n\
+         }\n\
+         blow();\n",
+    );
+    assert!(lib.exists());
+    let main = write_temp(
+        "ctsstack/main.cjs",
+        "try {\n  require('./lib.cts');\n} catch (e) {\n  console.log(e.stack);\n}\n",
+    );
+    let out = oam(&["run", main.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "caught require throw exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("at blow"),
+        "frame keeps its function name; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("lib.cts:7:"),
+        ".cts err.stack must cite SOURCE line 7; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("lib.cts:2:") && !stdout.contains("lib.cts:3:"),
+        "codegen lines must not leak; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn plain_js_stack_positions_are_untouched_by_sourcemap_remap() {
+    // The control: a plain .js has no registered map, so both the uncaught
+    // report and the frame keep V8's own positions -- and the frame format
+    // survives the custom prepareStackTrace byte-for-byte.
+    let file = write_temp(
+        "plainstack/plainstack.js",
+        "const pad = 1;\nconst pad2 = 2;\nthrow new Error('js boom');\n",
+    );
+    let out = oam(&["run", file.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("plainstack.js:3"),
+        "plain JS keeps its real line; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("plainstack.js:3:7"),
+        "plain JS frame keeps V8's exact line:column; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn runtime_exceptions_emit_odif_jsonl() {
     let file = write_temp("boom.js", "throw new Error('kaboom');");
@@ -16377,10 +16538,14 @@ fn install_precompile_cts_cache_used_on_run() {
     {
         let src_path = pkg_dir.join("index.cts");
         let src = std::fs::read_to_string(&src_path).unwrap();
-        let header = oam_loader::precompile::artifact_header(&src_path, &src);
         std::fs::write(
             cache_dir.join("index.cts.js"),
-            format!("{header}\nexports.value = 42;\n"),
+            oam_loader::precompile::artifact_payload(
+                &src_path,
+                &src,
+                "exports.value = 42;\n",
+                None,
+            ),
         )
         .unwrap();
     }
@@ -16458,10 +16623,14 @@ fn install_precompile_esm_ts_cache_used_on_run() {
     {
         let src_path = pkg_dir.join("index.ts");
         let src = std::fs::read_to_string(&src_path).unwrap();
-        let header = oam_loader::precompile::artifact_header(&src_path, &src);
         std::fs::write(
             cache_dir.join("index.ts.js"),
-            format!("{header}\nexport const value = 42;\n"),
+            oam_loader::precompile::artifact_payload(
+                &src_path,
+                &src,
+                "export const value = 42;\n",
+                None,
+            ),
         )
         .unwrap();
     }

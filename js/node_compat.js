@@ -7638,6 +7638,22 @@
           break;
         }
         if (!file || !lineNo || !colNo) return null;
+        // Transpiled files: the frame's position is codegen output, but the
+        // on-disk text sliced below is the SOURCE. Remap through the
+        // runtime source-map registry so the extracted expression comes
+        // from the line the user wrote.
+        try {
+          const map = globalThis.__oam && globalThis.__oam.mapPosition;
+          if (typeof map === "function") {
+            const mapped = map(file, lineNo, colNo);
+            if (mapped) {
+              lineNo = mapped[0];
+              colNo = mapped[1];
+            }
+          }
+        } catch {
+          // an unmapped position is still usable
+        }
         let lines = assertSourceCache.get(file);
         if (lines === undefined) {
           try {
