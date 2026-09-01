@@ -14188,6 +14188,18 @@ fn compile_produces_standalone_binary_that_runs() {
         String::from_utf8_lossy(&compile_out.stdout),
         String::from_utf8_lossy(&compile_out.stderr)
     );
+    // The redistribution notice prints single-spaced. A regression here
+    // (literal indentation captured inside the string) printed two runs of
+    // ten spaces mid-sentence on every successful compile.
+    let compile_msg = String::from_utf8_lossy(&compile_out.stderr);
+    let notice = compile_msg
+        .lines()
+        .find(|l| l.contains("ship the notices"))
+        .unwrap_or_else(|| panic!("expected the attribution notice; got: {compile_msg}"));
+    assert!(
+        !notice.contains("  "),
+        "the notice must not contain runs of spaces: {notice:?}"
+    );
     // Run the compiled binary -- it should execute the embedded JS
     // without any arguments.
     let run_out = std::process::Command::new(&output)
@@ -14328,6 +14340,177 @@ fn compile_embeds_bytecode_consumed_without_disk_cache() {
     );
 
     let _ = std::fs::remove_dir_all(&run_cache);
+}
+
+// A .ts entry is refused up front: oam compile embeds the file as-is (no
+// transpile, no bundling), so accepting it would exit 0 and hand the user a
+// binary that dies with a SyntaxError on its first run -- possibly on a
+// machine the author never runs it on (--carrier).
+#[test]
+fn compile_refuses_typescript_entry() {
+    let entry = write_temp(
+        "compile_refuse.ts",
+        "const x: number = 1;\nconsole.log(x);\n",
+    );
+    let output = std::env::temp_dir().join(format!("oam-compile-refuse-ts-{}", std::process::id()));
+    let out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "a .ts entry must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not plain JavaScript"),
+        "the refusal must name the problem: {stderr}"
+    );
+    assert!(
+        stderr.contains("bundle to CJS first"),
+        "the refusal must say how to fix it: {stderr}"
+    );
+    assert!(!output.exists(), "no output may be left behind on refusal");
+}
+
+// An entry that does not compile as CommonJS exits non-zero with V8's own
+// message instead of exiting 0 and emitting a v1 binary that dies with the
+// same SyntaxError on its first run. Two shapes: plain invalid JS, and the
+// common real-world miss -- an ESM bundle (rollup's default output format).
+#[test]
+fn compile_refuses_entry_that_does_not_compile_as_cjs() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output =
+        std::env::temp_dir().join(format!("oam-compile-bad-{}-{nanos}", std::process::id()));
+
+    let bad = write_temp("compile_bad_syntax.js", "function broken( {\n");
+    let out = oam(&[
+        "compile",
+        bad.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "invalid JS must fail the compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("SyntaxError"),
+        "V8's message must reach the user: {stderr}"
+    );
+    assert!(!output.exists(), "no output may be left behind");
+
+    let esm = write_temp("compile_esm_entry.js", "export const x = 1;\n");
+    let out = oam(&[
+        "compile",
+        esm.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "an ESM entry must fail the compile");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("SyntaxError"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("bundle to CJS first"),
+        "the failure must say how to fix it: {stderr}"
+    );
+    assert!(!output.exists(), "no output may be left behind");
+}
+
+// --carrier at anything that is not the running binary embeds JS only (v1):
+// V8 bytecode is bound to the binary that produced it, so an embedded blob
+// would be rejected -- and recompiled, and re-written to the cache -- on
+// EVERY run of the output. A byte-identical copy of the running oam is the
+// sharpest probe: foreign by identity alone, and the v1 output still runs.
+#[test]
+fn compile_foreign_carrier_embeds_js_only() {
+    let entry = write_temp("compile_carrier.js", "console.log('carrier-ok');\n");
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let carrier = std::env::temp_dir().join(format!(
+        "oam-compile-carrier-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    std::fs::copy(env!("CARGO_BIN_EXE_oam"), &carrier).expect("stage a carrier copy");
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-carrier-out-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--carrier",
+        carrier.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "compile with a carrier copy failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("no bytecode embedded"),
+        "a foreign carrier must produce a v1 payload: {stderr}"
+    );
+    assert!(
+        stderr.contains("not the running binary"),
+        "the JS-only notice must explain why: {stderr}"
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&carrier);
+    let _ = std::fs::remove_file(&output);
+    assert!(
+        String::from_utf8_lossy(&run_out.stdout).contains("carrier-ok"),
+        "the v1 output must still run; stderr: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+}
+
+// In a compiled binary, process.argv[1] IS __filename: both are built from
+// module_key (canonical form -- 8.3 short names and symlinks resolved).
+// The two diverged on any host whose temp_dir() spelling is not canonical:
+// macOS's /var -> /private/var symlink, a short-name Windows TEMP.
+#[test]
+fn compile_binary_argv1_is_filename() {
+    let entry = write_temp(
+        "compile_argv1.js",
+        "console.log('argv1-is-filename=' + (process.argv[1] === __filename));\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-argv1-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        stdout.contains("argv1-is-filename=true"),
+        "argv[1] must equal __filename in a compiled binary; got: {stdout}"
+    );
 }
 
 // ── record-replay ──
@@ -16047,6 +16230,238 @@ fn code_cache_corrupt_blob_falls_back_and_refreshes() {
             p.display()
         );
     }
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// The ESM blob is produced AFTER the graph evaluates (so it carries the inner
+// functions evaluation compiled) and the second run CONSUMES that
+// post-evaluate blob. Observable from outside on three axes:
+//   1. run 1 prints blobs-at-eval=0 -- a fresh cache dir holds nothing at
+//      evaluation time (the old design stored the entry's blob at compile
+//      time, BEFORE evaluate, so this line read >= 1);
+//   2. run 2 prints the full count -- the blobs landed after run 1 evaluated;
+//   3. run 2 rewrites nothing: every blob mtime, pinned to a known past value
+//      between the runs, stays put -- only possible if V8 accepted every
+//      consumed blob (a rejection triggers a refresh store).
+#[test]
+fn esm_code_cache_produced_after_evaluation_and_consumed() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-posteval-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+
+    std::fs::write(
+        project_dir.join("lib.mjs"),
+        "export function inner(n) { return n * 2; }\nexport const answer = inner(21);\n",
+    )
+    .unwrap();
+    let entry = project_dir.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "import fs from 'node:fs';\n\
+         import { answer } from './lib.mjs';\n\
+         function countBlobs(dir) {\n\
+           let n = 0;\n\
+           let shards = [];\n\
+           try { shards = fs.readdirSync(dir); } catch { return 0; }\n\
+           for (const s of shards) {\n\
+             let files = [];\n\
+             try { files = fs.readdirSync(dir + '/' + s); } catch { continue; }\n\
+             for (const f of files) if (f.endsWith('.v8c')) n++;\n\
+           }\n\
+           return n;\n\
+         }\n\
+         const blobs = countBlobs(process.env.OAM_CACHE_DIR + '/bytecode');\n\
+         console.log('blobs-at-eval=' + blobs + ' a=' + answer);\n",
+    )
+    .unwrap();
+
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", entry.to_str().unwrap()])
+            .current_dir(&project_dir)
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    let out1 = run();
+    assert!(
+        out1.status.success(),
+        "first run should succeed; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out1.stdout).contains("blobs-at-eval=0 a=42"),
+        "no blob may exist at evaluation time of a cold run (produce is \
+         post-evaluate); stdout: {}",
+        String::from_utf8_lossy(&out1.stdout)
+    );
+    let bytecode_dir = cache.join("bytecode");
+    let mut blobs = Vec::new();
+    collect_v8c(&bytecode_dir, &mut blobs);
+    assert!(
+        blobs.len() >= 2,
+        "entry + lib blobs expected after the run; found {}",
+        blobs.len()
+    );
+
+    // Pin mtimes one hour back: young enough that the daily sweep ignores
+    // them, old enough that a rewrite by run 2 is unambiguous.
+    let pinned = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for p in &blobs {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(pinned)
+            .unwrap();
+    }
+
+    let out2 = run();
+    assert!(out2.status.success(), "second run should succeed");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout).into_owned();
+    assert!(
+        stdout2.contains(&format!("blobs-at-eval={} a=42", blobs.len())),
+        "run 2 must see every blob at evaluation time and stay correct: {stdout2}"
+    );
+    for p in &blobs {
+        let modified = std::fs::metadata(p).unwrap().modified().unwrap();
+        assert!(
+            modified < pinned + std::time::Duration::from_secs(60),
+            "blob rewritten -- V8 rejected a post-evaluate blob: {}",
+            p.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// The post-evaluate produce runs on the FAILURE arm too: a graph whose
+// evaluation throws still gets its bytecode cached (the unbound module
+// scripts exist regardless of the throw), so the next run -- after the user
+// fixes whatever made it throw at runtime -- skips the compile.
+#[test]
+fn esm_code_cache_produced_when_evaluation_throws() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-bytecode-evalthrow-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+    let entry = project_dir.join("main.mjs");
+    std::fs::write(
+        &entry,
+        "function boom() { throw new Error('eval-throws'); }\nboom();\nexport const x = 1;\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", &cache)
+        .output()
+        .expect("oam binary runs");
+    assert!(!out.status.success(), "a throwing module must fail the run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("eval-throws"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        count_v8c(&cache.join("bytecode")) >= 1,
+        "the throwing module's bytecode must still be cached"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+// ── oam cache ──
+
+// `oam cache info` reports the directory, blob count and byte total (and a
+// --json object for machines); `oam cache clean` deletes the directory and
+// succeeds again when it is already gone -- the cache is a pure optimization,
+// so clean is safe at any time.
+#[test]
+fn cache_subcommand_info_and_clean() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir =
+        std::env::temp_dir().join(format!("oam-e2e-cache-cmd-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let cache = project_dir.join("oam-cache");
+    let entry = project_dir.join("main.cjs");
+    std::fs::write(&entry, "console.log('cache-warm=' + 21 * 2);\n").unwrap();
+
+    let run_out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", entry.to_str().unwrap()])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", &cache)
+        .output()
+        .expect("oam binary runs");
+    assert!(
+        run_out.status.success(),
+        "warm-up run failed: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let bytecode_dir = cache.join("bytecode");
+    assert!(
+        count_v8c(&bytecode_dir) >= 1,
+        "warm-up run must store a blob"
+    );
+
+    let cache_cmd = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .output()
+            .expect("oam binary runs")
+    };
+
+    let info = cache_cmd(&["cache", "info"]);
+    assert!(info.status.success(), "cache info must succeed");
+    let stdout = String::from_utf8_lossy(&info.stdout).into_owned();
+    assert!(
+        stdout.contains(&bytecode_dir.display().to_string()),
+        "info must print the directory: {stdout}"
+    );
+    let entries: usize = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("entries:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no entries line in: {stdout}"));
+    assert!(entries >= 1, "info must count the blob(s): {stdout}");
+
+    let json_info = cache_cmd(&["--json", "cache", "info"]);
+    assert!(
+        String::from_utf8_lossy(&json_info.stdout).contains("\"entries\":"),
+        "--json info must emit a machine-readable object: {}",
+        String::from_utf8_lossy(&json_info.stdout)
+    );
+
+    let clean = cache_cmd(&["cache", "clean"]);
+    assert!(
+        clean.status.success(),
+        "cache clean failed: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert!(!bytecode_dir.exists(), "clean must remove the bytecode dir");
+
+    let again = cache_cmd(&["cache", "clean"]);
+    assert!(again.status.success(), "clean of a missing dir is success");
 
     let _ = std::fs::remove_dir_all(&project_dir);
 }
