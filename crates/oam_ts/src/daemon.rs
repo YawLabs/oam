@@ -328,10 +328,13 @@ fn stamp(meta: std::io::Result<std::fs::Metadata>) -> Stamp {
 /// has since vanished hashes as "missing"), plus a walk of the tsconfig
 /// dir over every tsc-loadable extension (catches NEW files the last
 /// listing predates; skips node_modules/.git/.oam anywhere and `target`
-/// only directly under the root), plus the tsconfig `extends`/`references`
-/// chain, plus package.json and the lockfiles on every ancestor (dependency
-/// upgrades). None = too big to fingerprint (then we simply never serve
-/// from cache — correctness first).
+/// only directly under the root), plus the parent DIRECTORIES of listed
+/// files outside the root (a dir's mtime changes on create/delete on
+/// NTFS/ext4/APFS, so a file ADDED under an out-of-root include/references
+/// dir — which no walk covers — still misses the cache), plus the tsconfig
+/// `extends`/`references` chain, plus package.json and the lockfiles on
+/// every ancestor (dependency upgrades). None = too big to fingerprint
+/// (then we simply never serve from cache — correctness first).
 ///
 /// Staleness envelope (probed): a same-size rewrite within the mtime
 /// granularity window would produce the same fingerprint. Tier-1
@@ -376,6 +379,18 @@ fn fingerprint(root: &Path, tsconfig: &Path, listed: &[PathBuf]) -> Option<u64> 
 
     for path in listed {
         entries.insert(path.clone(), stamp(std::fs::metadata(path)));
+        // A listed file OUTSIDE the walked root (out-of-root include /
+        // references / extends targets, @types and lib dirs): stamp its
+        // parent DIRECTORY too — the dir mtime changes when a sibling is
+        // created or deleted, so `../shared/new.ts` invalidates the cache
+        // even though no listing names it yet and no walk reaches it.
+        if !path.starts_with(root)
+            && let Some(parent) = path.parent()
+        {
+            entries
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| stamp(std::fs::metadata(parent)));
+        }
     }
     for path in tsconfig_chain(tsconfig) {
         entries.insert(path.clone(), stamp(std::fs::metadata(&path)));
@@ -1270,6 +1285,33 @@ mod tests {
         std::fs::remove_file(&outside).unwrap();
         let removed = fingerprint(&root, &tsconfig, &listed).unwrap();
         assert_ne!(edited, removed, "a vanished program file");
+    }
+
+    #[test]
+    fn fingerprint_catches_files_added_under_out_of_root_dirs() {
+        // Regression: tsconfig `"include": ["src", "../shared"]`, then
+        // create ../shared/new.ts — the walk never leaves the root and no
+        // listing names the new file, so only the parent-dir stamp of the
+        // listed ../shared files can invalidate the cached result.
+        let dir = scratch("fp-outside-add");
+        let root = dir.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tsconfig = root.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let existing = shared.join("a.ts");
+        std::fs::write(&existing, "export const a: number = 1;").unwrap();
+        let listed = vec![existing.clone()];
+        let before = fingerprint(&root, &tsconfig, &listed).unwrap();
+
+        std::fs::write(shared.join("new.ts"), "export const b: string = 1;").unwrap();
+        let added = fingerprint(&root, &tsconfig, &listed).unwrap();
+        assert_ne!(before, added, "../shared/new.ts must invalidate");
+
+        std::fs::remove_file(shared.join("new.ts")).unwrap();
+        let removed = fingerprint(&root, &tsconfig, &listed).unwrap();
+        assert_ne!(added, removed, "deleting it must invalidate again");
     }
 
     #[test]
