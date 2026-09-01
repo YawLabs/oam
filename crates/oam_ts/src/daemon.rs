@@ -21,10 +21,13 @@
 //! so an edit to anything that can change the diagnostics misses the cache.
 //!
 //! Threads: the main thread only accepts, reads one request, answers
-//! Ping/Shutdown and cache hits, and hands cache misses to ONE check worker
-//! (so a Ping is answered while a minutes-long check runs, and a client
+//! Ping/Shutdown in O(1), and hands EVERY Check to ONE check worker — the
+//! worker probes the cache itself, so the accept thread never runs the
+//! fingerprint walk (up to 50k stats on a large tree, which would starve a
+//! Ping past the client's 2s budget and make it spawn a duplicate daemon).
+//! A Ping is answered even while a minutes-long check runs, and a client
 //! that queues behind a fill of the same tree gets that fill's result
-//! instead of a second tsgo run). A watchdog thread implements the idle
+//! instead of a second tsgo run. A watchdog thread implements the idle
 //! shutdown by sending Shutdown to our own listener.
 //!
 //! Protocol: one JSONL request line in, one response line out, connection
@@ -54,6 +57,9 @@ const SPAWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long retire() waits for an old daemon that ACKED Shutdown to
+/// actually exit before falling back to kill_daemon.
+const RETIRE_EXIT_WAIT: Duration = Duration::from_secs(2);
 /// Server-side bound on reading one request line / writing one response.
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// After a spawn that never came up, don't try again for this long.
@@ -210,13 +216,29 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// absolute path when the dir does not exist.
 pub(crate) fn project_key(tsconfig: &Path) -> String {
     let absolute = std::path::absolute(tsconfig).unwrap_or_else(|_| tsconfig.to_path_buf());
-    let canonical = match (absolute.parent(), absolute.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .map(|dir| dir.join(name))
-            .unwrap_or(absolute),
-        _ => absolute,
+    let canonical = match absolute.file_name() {
+        Some(name) => canonical_root(&absolute).join(name),
+        None => absolute,
     };
     format!("{:016x}", fnv1a64(canonical.to_string_lossy().as_bytes()))
+}
+
+/// The project root (the tsconfig's parent dir) canonicalized the same way
+/// [`project_key`] canonicalizes — symlinks resolved, Windows case/drive
+/// spellings folded. `tsgo_lookup` must be computed from THIS root on both
+/// sides (`serve_inner` records it, `try_existing` compares it): with the
+/// raw spelling, two clients addressing one project via different
+/// spellings (Windows case/drive-letter variants, Unix symlinked dirs)
+/// recorded different lookup strings, and every alternation of `oam check`
+/// retired and cold-respawned the daemon `project_key` deliberately
+/// shares. Falls back to the un-canonicalized parent when it cannot be
+/// resolved (then both sides fall back identically).
+fn canonical_root(tsconfig: &Path) -> PathBuf {
+    let absolute = std::path::absolute(tsconfig).unwrap_or_else(|_| tsconfig.to_path_buf());
+    match absolute.parent() {
+        Some(parent) => std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+        None => absolute,
+    }
 }
 
 fn state_path(tsconfig: &Path) -> PathBuf {
@@ -325,10 +347,13 @@ fn stamp(meta: std::io::Result<std::fs::Metadata>) -> Stamp {
 /// has since vanished hashes as "missing"), plus a walk of the tsconfig
 /// dir over every tsc-loadable extension (catches NEW files the last
 /// listing predates; skips node_modules/.git/.oam anywhere and `target`
-/// only directly under the root), plus the tsconfig `extends`/`references`
-/// chain, plus package.json and the lockfiles on every ancestor (dependency
-/// upgrades). None = too big to fingerprint (then we simply never serve
-/// from cache — correctness first).
+/// only directly under the root), plus the parent DIRECTORIES of listed
+/// files outside the root (a dir's mtime changes on create/delete on
+/// NTFS/ext4/APFS, so a file ADDED under an out-of-root include/references
+/// dir — which no walk covers — still misses the cache), plus the tsconfig
+/// `extends`/`references` chain, plus package.json and the lockfiles on
+/// every ancestor (dependency upgrades). None = too big to fingerprint
+/// (then we simply never serve from cache — correctness first).
 ///
 /// Staleness envelope (probed): a same-size rewrite within the mtime
 /// granularity window would produce the same fingerprint. Tier-1
@@ -373,6 +398,18 @@ fn fingerprint(root: &Path, tsconfig: &Path, listed: &[PathBuf]) -> Option<u64> 
 
     for path in listed {
         entries.insert(path.clone(), stamp(std::fs::metadata(path)));
+        // A listed file OUTSIDE the walked root (out-of-root include /
+        // references / extends targets, @types and lib dirs): stamp its
+        // parent DIRECTORY too — the dir mtime changes when a sibling is
+        // created or deleted, so `../shared/new.ts` invalidates the cache
+        // even though no listing names it yet and no walk reaches it.
+        if !path.starts_with(root)
+            && let Some(parent) = path.parent()
+        {
+            entries
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| stamp(std::fs::metadata(parent)));
+        }
     }
     for path in tsconfig_chain(tsconfig) {
         entries.insert(path.clone(), stamp(std::fs::metadata(&path)));
@@ -647,8 +684,12 @@ pub fn check_via_daemon(target: &Path) -> Result<Vec<Diagnostic>, String> {
 /// but could not check (caller falls back without spawning).
 fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     let state = read_state(tsconfig)?;
-    let root = tsconfig.parent().unwrap_or(tsconfig);
-    if state.version != env!("CARGO_PKG_VERSION") || state.tsgo_lookup != crate::tsgo_lookup(root) {
+    // Canonicalized so the compared lookup string agrees with the one
+    // serve_inner recorded regardless of the path spelling THIS client
+    // used — see canonical_root.
+    let root = canonical_root(tsconfig);
+    if state.version != env!("CARGO_PKG_VERSION") || state.tsgo_lookup != crate::tsgo_lookup(&root)
+    {
         // Version skew (oam upgraded, or the tsgo this project resolves to
         // changed): retire the old daemon, caller respawns.
         retire(&state, tsconfig);
@@ -685,15 +726,46 @@ fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     }
 }
 
+/// Retire an outdated daemon (version skew, tsgo lookup change): ask it to
+/// shut down and WAIT (bounded) until its process is actually gone, falling
+/// back to [`kill_daemon`] like `stop()` does. Returning while the old
+/// process still runs would let a busy old daemon process the queued
+/// Shutdown minutes later and delete the NEW daemon's freshly written
+/// state file, orphaning it (the next check would then spawn a third).
 fn retire(state: &StateFile, tsconfig: &Path) {
-    let _ = request(
+    let answered = request(
         state,
         &Request::Shutdown {
             token: state.token.clone(),
         },
         SHUTDOWN_TIMEOUT,
-    );
+    )
+    .is_some_and(|r| r.ok);
+    if answered {
+        // Acked: exit is imminent (the accept loop returns right after
+        // responding); poll briefly and only then stop being polite.
+        wait_for_daemon_exit(state.pid, RETIRE_EXIT_WAIT);
+    } else {
+        // Wedged, or an old single-threaded daemon deep in a check that
+        // would only process our queued Shutdown afterwards: kill it now
+        // so its delayed cleanup can never fire.
+        kill_daemon(state.pid);
+    }
     let _ = std::fs::remove_file(state_path(tsconfig));
+}
+
+/// Poll until `pid` no longer names a live oam process, killing it at the
+/// deadline. Bounds an old daemon's delayed cleanup to BEFORE the caller
+/// proceeds to respawn.
+fn wait_for_daemon_exit(pid: u32, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    while daemon_process_alive(pid) {
+        if Instant::now() >= deadline {
+            kill_daemon(pid);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn status(target: &Path) -> DaemonStatus {
@@ -745,8 +817,8 @@ pub fn status(target: &Path) -> DaemonStatus {
 
 /// Stop the project's daemon if one is running. Returns whether one was.
 /// A daemon that does not answer Shutdown within 2s is killed by its
-/// recorded pid (after checking that pid still names an oam process, so a
-/// recycled pid is never shot); the state file goes either way.
+/// recorded pid (after checking that pid still names an oam process —
+/// best-effort, see [`kill_daemon`]); the state file goes either way.
 pub fn stop(target: &Path) -> bool {
     let Ok(target) = std::path::absolute(target) else {
         return false;
@@ -771,35 +843,17 @@ pub fn stop(target: &Path) -> bool {
 }
 
 /// Kill a wedged daemon by pid with OS tools (no libc/oam_core dependency
-/// here). Refuses when the pid no longer names an oam process.
+/// here). Refuses when the pid no longer names an oam process. Best-effort
+/// only: the verify-then-kill sequence is a TOCTOU window shell tools
+/// cannot close — the pid could in principle be recycled between the
+/// tasklist/ps probe and the taskkill/kill — so this guards against the
+/// common stale-state-file case, not against a determined race.
 fn kill_daemon(pid: u32) -> bool {
-    use std::process::{Command, Stdio};
-    let pid_str = pid.to_string();
-    let quiet = |command: &mut Command| {
-        command
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .stdout(Stdio::piped());
-    };
-    let image = if cfg!(windows) {
-        let mut command = Command::new("tasklist");
-        command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
-        quiet(&mut command);
-        command.output()
-    } else {
-        let mut command = Command::new("ps");
-        command.args(["-p", &pid_str, "-o", "comm="]);
-        quiet(&mut command);
-        command.output()
-    };
-    let is_oam = image.is_ok_and(|out| {
-        String::from_utf8_lossy(&out.stdout)
-            .to_ascii_lowercase()
-            .contains("oam")
-    });
-    if !is_oam {
+    use std::process::Command;
+    if !daemon_process_alive(pid) {
         return false;
     }
+    let pid_str = pid.to_string();
     let status = if cfg!(windows) {
         let mut command = Command::new("taskkill");
         command.args(["/T", "/F", "/PID", &pid_str]);
@@ -812,6 +866,60 @@ fn kill_daemon(pid: u32) -> bool {
         command.status()
     };
     status.is_ok_and(|s| s.success())
+}
+
+fn quiet(command: &mut std::process::Command) {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+}
+
+/// Does `pid` currently name an oam process? Probed with `tasklist` (CSV)
+/// on Windows and `ps -o comm=` elsewhere; the image name must EQUAL
+/// `oam`/`oam.exe` (case-insensitive), never a substring match — ANY
+/// process whose listing merely contained "oam" somewhere (e.g.
+/// `roaming-helper.exe`) used to pass and get its whole tree killed.
+fn daemon_process_alive(pid: u32) -> bool {
+    use std::process::Command;
+    let image = if cfg!(windows) {
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+        quiet(&mut command);
+        command.output()
+    } else {
+        let mut command = Command::new("ps");
+        command.args(["-p", &pid.to_string(), "-o", "comm="]);
+        quiet(&mut command);
+        command.output()
+    };
+    image.is_ok_and(|out| {
+        process_image_name(&String::from_utf8_lossy(&out.stdout), cfg!(windows))
+            .is_some_and(|name| image_is_oam(&name))
+    })
+}
+
+/// The process image name out of `tasklist /FO CSV /NH` output (`csv`
+/// true: the first quoted field) or `ps -o comm=` output (Linux prints the
+/// bare name, macOS the full executable path — take the file name). None =
+/// no parseable process line (e.g. tasklist's "INFO: No tasks..." notice).
+fn process_image_name(raw: &str, csv: bool) -> Option<String> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    if csv {
+        line.strip_prefix('"')?
+            .split("\",\"")
+            .next()
+            .map(str::to_string)
+    } else {
+        Path::new(line)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+}
+
+fn image_is_oam(name: &str) -> bool {
+    name.eq_ignore_ascii_case("oam") || name.eq_ignore_ascii_case("oam.exe")
 }
 
 /// Windows: a spawned child inherits EVERY inheritable handle in our table,
@@ -985,7 +1093,9 @@ fn serve_inner(tsconfig: &Path, state_file: &Path) -> std::io::Result<()> {
         token: token.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         tsconfig: tsconfig.to_string_lossy().into_owned(),
-        tsgo_lookup: crate::tsgo_lookup(&root),
+        // Recorded from the canonicalized root (NOT this daemon's spawn-arg
+        // spelling) so every client spelling of the project compares equal.
+        tsgo_lookup: crate::tsgo_lookup(&canonical_root(tsconfig)),
         tsgo_path: tsgo_path.to_string_lossy().into_owned(),
         tsgo_version: tsgo_version.clone(),
     };
@@ -1090,8 +1200,10 @@ fn respond(stream: &TcpStream, response: &Response) {
     }
 }
 
-/// Cache misses, one at a time, off the accept thread. A client that was
-/// queued behind a fill of the same tree is served from that fill.
+/// Every Check, one at a time, off the accept thread — the cache probe runs
+/// here too (a fingerprint walk on the accept thread would starve Ping). A
+/// client that was queued behind a fill of the same tree is served from
+/// that fill.
 fn check_worker(rx: Receiver<TcpStream>, shared: Arc<Shared>) {
     for stream in rx {
         shared.busy.store(true, Ordering::SeqCst);
@@ -1159,11 +1271,12 @@ fn handle_connection(stream: TcpStream, shared: &Shared, worker: &Sender<TcpStre
         }
         Request::Check { .. } => {
             shared.checks_served.fetch_add(1, Ordering::Relaxed);
-            if let Some(diagnostics) = shared.cached_if_fresh() {
-                shared.cache_hits.fetch_add(1, Ordering::Relaxed);
-                respond(&stream, &Response::checked(true, diagnostics));
-                return true;
-            }
+            // Always queued, never probed here: cached_if_fresh runs the
+            // full fingerprint walk, and on a large tree that would hold
+            // the accept thread (and the cache mutex) past the next Ping's
+            // 2s budget — the client would conclude the daemon is dead and
+            // spawn a duplicate. The worker re-probes the cache first, so a
+            // hit still skips tsgo; accept-thread latency stays O(1).
             if let Err(std::sync::mpsc::SendError(stream)) = worker.send(stream) {
                 respond(&stream, &Response::failure("daemon check worker is gone"));
             }
@@ -1267,6 +1380,33 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_catches_files_added_under_out_of_root_dirs() {
+        // Regression: tsconfig `"include": ["src", "../shared"]`, then
+        // create ../shared/new.ts — the walk never leaves the root and no
+        // listing names the new file, so only the parent-dir stamp of the
+        // listed ../shared files can invalidate the cached result.
+        let dir = scratch("fp-outside-add");
+        let root = dir.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let tsconfig = root.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let existing = shared.join("a.ts");
+        std::fs::write(&existing, "export const a: number = 1;").unwrap();
+        let listed = vec![existing.clone()];
+        let before = fingerprint(&root, &tsconfig, &listed).unwrap();
+
+        std::fs::write(shared.join("new.ts"), "export const b: string = 1;").unwrap();
+        let added = fingerprint(&root, &tsconfig, &listed).unwrap();
+        assert_ne!(before, added, "../shared/new.ts must invalidate");
+
+        std::fs::remove_file(shared.join("new.ts")).unwrap();
+        let removed = fingerprint(&root, &tsconfig, &listed).unwrap();
+        assert_ne!(added, removed, "deleting it must invalidate again");
+    }
+
+    #[test]
     fn fingerprint_tracks_extends_targets_and_lockfiles() {
         let dir = scratch("fp-chain");
         let root = dir.join("pkg");
@@ -1343,6 +1483,49 @@ mod tests {
     }
 
     #[test]
+    fn canonical_root_collapses_spellings_so_tsgo_lookup_agrees() {
+        // Regression: try_existing compared a tsgo_lookup built from the
+        // client's raw spelling against one serve_inner built from the
+        // daemon's spawn-arg spelling, so two spellings of one project
+        // retired each other's daemon on every alternation.
+        let dir = scratch("Lookup-Case");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let base = canonical_root(&tsconfig);
+        #[cfg(windows)]
+        {
+            let upper =
+                PathBuf::from(dir.to_string_lossy().to_ascii_uppercase()).join("tsconfig.json");
+            let lower =
+                PathBuf::from(dir.to_string_lossy().to_ascii_lowercase()).join("tsconfig.json");
+            assert_eq!(base, canonical_root(&upper), "{upper:?}");
+            assert_eq!(base, canonical_root(&lower), "{lower:?}");
+            assert_eq!(
+                crate::tsgo_lookup(&canonical_root(&upper)),
+                crate::tsgo_lookup(&canonical_root(&lower)),
+                "case variants of one project must not retire each other's daemon"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.with_file_name(format!(
+                "{}-link",
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            let linked = canonical_root(&link.join("tsconfig.json"));
+            assert_eq!(base, linked);
+            assert_eq!(
+                crate::tsgo_lookup(&base),
+                crate::tsgo_lookup(&linked),
+                "a symlinked spelling must not retire the daemon"
+            );
+        }
+        // A dotted spelling of the same dir too.
+        assert_eq!(base, canonical_root(&dir.join(".").join("tsconfig.json")));
+    }
+
+    #[test]
     fn cache_root_never_falls_back_to_the_cwd() {
         let temp = PathBuf::from("/tmpdir");
         let bare = CacheEnv {
@@ -1402,6 +1585,63 @@ mod tests {
         assert_eq!(
             sidecar(state, "spawn-failed"),
             PathBuf::from("/c/ts-daemons/abc.json.spawn-failed")
+        );
+    }
+
+    #[test]
+    fn process_image_name_parses_tasklist_csv_and_ps_comm() {
+        // tasklist /FO CSV /NH: the image is the first quoted field.
+        assert_eq!(
+            process_image_name(
+                "\"oam.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n",
+                true
+            )
+            .as_deref(),
+            Some("oam.exe")
+        );
+        // tasklist's no-match notice has no CSV shape: must parse as None,
+        // never as a process name.
+        assert_eq!(
+            process_image_name(
+                "INFO: No tasks are running which match the specified criteria.\r\n",
+                true
+            ),
+            None
+        );
+        // ps -o comm=: bare name on Linux, full executable path on macOS.
+        assert_eq!(process_image_name("oam\n", false).as_deref(), Some("oam"));
+        assert_eq!(
+            process_image_name("/usr/local/bin/oam\n", false).as_deref(),
+            Some("oam")
+        );
+        assert_eq!(process_image_name("", false), None);
+        assert_eq!(process_image_name("   \n\n", true), None);
+    }
+
+    #[test]
+    fn kill_daemon_identity_requires_exact_oam_image_name() {
+        assert!(image_is_oam("oam"));
+        assert!(image_is_oam("oam.exe"));
+        assert!(image_is_oam("OAM.EXE"), "NTFS spellings vary in case");
+        // Substring matches that used to pass and must not: unrelated
+        // processes whose listing merely contains "oam".
+        assert!(!image_is_oam("roaming-helper.exe"));
+        assert!(!image_is_oam("yoam"));
+        assert!(!image_is_oam("oamd"));
+        assert!(!image_is_oam("oam-helper.exe"));
+        assert!(!image_is_oam(""));
+    }
+
+    #[test]
+    fn wait_for_daemon_exit_never_kills_a_non_oam_process() {
+        // Our own pid is live but names the test binary (oam_ts-<hash>),
+        // not oam: the poll must treat it as not-ours and return at once —
+        // never spin to the deadline, and never kill it.
+        let started = Instant::now();
+        wait_for_daemon_exit(std::process::id(), Duration::from_secs(10));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a foreign pid must not be polled to the deadline"
         );
     }
 
