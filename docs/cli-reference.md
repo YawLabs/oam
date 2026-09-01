@@ -18,6 +18,7 @@ overview, plus the environment variables, which `--help` does not list.
 | `oam trust` | Manage the trust list for package lifecycle scripts. |
 | `oam compile <file>` | Embed a **pre-bundled** JS file into a standalone executable. Bundle it yourself first (esbuild/rollup); this does not bundle. |
 | `oam self-update` | Re-run the canonical installer from oamjs.org, verifying against the published `SHA256SUMS`. |
+| `oam cache info` / `oam cache clean` | Inspect or delete the V8 bytecode cache (see `OAM_CODE_CACHE` below). |
 
 Global: `--json` emits machine-readable ODIF JSONL on stderr instead of
 pretty-printed errors — the form agents should consume.
@@ -50,8 +51,8 @@ Notable ones:
 | `OAM_ENABLE_NATIVE_ADDONS=1` | Enable N-API addon loading. **Off by default and alpha**: an addon compiled against `node.exe` can deadlock the OS loader inside oam, before any oam code runs, so the default is a clean throw that lets a package's JS fallback take over. This is the *runtime* switch; there is also a *compile-time* one — the `napi` cargo feature (on by default). A binary built `--no-default-features` has no N-API layer and no exported `napi_*` ABI at all, so `require()` of a `.node` throws `OAM-NATIVE0002` and this variable does nothing. |
 | `OAM_MAX_HEAP_MB` | Cap the V8 heap. Set this to match a container memory limit. |
 | `OAM_MAX_BODY_BYTES` | Aggregate cap on queued HTTP request-body bytes across all in-flight requests (default 512MB). Past it, excess uploads are shed rather than buffered. Per-request backpressure is the first line of defence; this bounds the total once concurrency is high. |
-| `OAM_CODE_CACHE` | Control V8 code-cache reuse across runs. |
-| `OAM_CACHE_DIR` | Where oam keeps its caches. |
+| `OAM_CODE_CACHE` | V8 bytecode cache across runs. On by default; `0`, `off`, `false` or `no` turns it off entirely -- no consume, no produce, no write. Blobs live under `<cache dir>/bytecode`, content-addressed by source text + V8 build, so a stale blob is a miss, never a wrong hit. Housekeeping is automatic: at most once a day a run sweeps the directory on a background thread, deleting orphaned `.tmp` files older than 10 minutes and blobs not written in 30 days. `oam cache info` prints the directory, entry count and total size; `oam cache clean` deletes it (safe at any time -- the next run recompiles and repopulates). |
+| `OAM_CACHE_DIR` | Where oam keeps its caches (bytecode, type-check daemon state). Default: `%LOCALAPPDATA%\oam` on Windows, `$XDG_CACHE_HOME/oam` or `~/.cache/oam` elsewhere; when none of those resolve (a scrubbed environment), the system temp dir -- never the working directory. |
 | `OAM_IO_URING` | Opt into the Linux io_uring FS path. Off by default — it benchmarked as not a win. |
 | `OAM_EXPERIMENTAL_VM_MODULES` / `OAM_EXPOSE_INTERNALS` | Env equivalents of the flags above; set by the CLI, readable by the loader. |
 
