@@ -15591,6 +15591,123 @@ fn install_precompile_creates_cache() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
+// C1: --precompile on a WARM tree. A prior `oam install` without the flag
+// (or an npm-installed tree) leaves no precompile cache; re-running install
+// WITH the flag must populate it, because the precompile pass walks every
+// package in the lockfile, not just the ones extracted by that call.
+#[test]
+fn install_precompile_populates_warm_tree() {
+    use sha2::{Digest, Sha512};
+
+    let ts_source = "const warm: number = 7;\nconsole.log(warm);\n";
+    let tarball = make_fake_tarball(&[("index.ts", ts_source)]);
+
+    let hash = Sha512::digest(&tarball);
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash.as_slice());
+    let integrity = format!("sha512-{b64}");
+
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    let tarball = Arc::new(tarball);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tarball_clone = tarball.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let data = tarball_clone.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let resolved_url = format!("http://{addr}/fake-pkg-1.0.0.tgz");
+    let lockfile = format!(
+        r#"{{
+            "name": "test-precompile-warm",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{"name":"test-precompile-warm","version":"1.0.0"}},
+                "node_modules/fake-pkg": {{
+                    "version": "1.0.0",
+                    "resolved": "{resolved_url}",
+                    "integrity": "{integrity}"
+                }}
+            }}
+        }}"#
+    );
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let project_dir = std::env::temp_dir().join(format!(
+        "oam-e2e-precompile-warm-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("package-lock.json"), &lockfile).unwrap();
+
+    // First run WITHOUT --precompile: installs the tree, writes no cache.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install"])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+    assert!(
+        out.status.success(),
+        "plain install should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cache_file = project_dir
+        .join("node_modules")
+        .join(".oam")
+        .join("precompile")
+        .join("fake-pkg")
+        .join("index.ts.js");
+    assert!(
+        !cache_file.exists(),
+        "no precompile cache expected without the flag"
+    );
+
+    // Second run WITH --precompile on the now-warm tree: nothing to
+    // extract, but the cache must be populated anyway.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["install", "--precompile"])
+        .current_dir(&project_dir)
+        .env("OAM_CACHE_DIR", project_dir.join("oam-cache"))
+        .output()
+        .expect("oam binary runs");
+    assert!(
+        out.status.success(),
+        "warm install --precompile should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        cache_file.exists(),
+        "warm-tree install --precompile should populate the cache at {}",
+        cache_file.display()
+    );
+    let js = std::fs::read_to_string(&cache_file).unwrap();
+    assert!(
+        !js.contains(": number"),
+        "type annotation should be stripped from cache; got: {js}"
+    );
+
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
 #[test]
 fn install_precompile_cts_cache_used_on_run() {
     let nanos = std::time::SystemTime::now()
