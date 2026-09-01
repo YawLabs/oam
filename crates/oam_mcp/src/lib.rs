@@ -339,6 +339,14 @@ fn explain_code(code: &str) -> String {
             "The package's exports map does not export this subpath (Node's ERR_PACKAGE_PATH_NOT_EXPORTED). Check the package's documented entry points.",
         ),
         (
+            "OAM-MOD0008",
+            "Warning: tsconfig.json `extends` names a package (e.g. @tsconfig/node20), which oam does not resolve yet. The declaring file's own compilerOptions still apply; only what it would have inherited (paths, jsx settings) is unavailable. Inline those options or extend a relative path.",
+        ),
+        (
+            "OAM-MOD0009",
+            "Warning: a tsconfig.json could not be used -- it is not valid JSONC, cannot be read, or its extends chain is deeper than 8 levels (a cycle). Its compilerOptions (paths, jsx settings) are ignored until it parses; `oam check` reports the exact syntax error.",
+        ),
+        (
             "OAM-MOD0003",
             "This module type is not executable: a .json file used as the ENTRY (import it from a script — JSON imports work, with or without `with { type: 'json' }`), an unsupported import-attribute type, or an unknown extension. .cts runs through CJS interop with TS strip; .cjs runs through CJS interop; .tsx/.jsx run through the JSX automatic runtime (v0.8.1+).",
         ),

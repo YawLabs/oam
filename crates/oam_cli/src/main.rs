@@ -872,7 +872,9 @@ fn run_command(
         rx
     });
 
-    let exit = match run_file(file, script_args, inspect, replay_mode) {
+    let outcome = run_file(file, script_args, inspect, replay_mode);
+    report_loader_warnings(json);
+    let exit = match outcome {
         Ok(code) => ExitCode::from(code),
         Err((diagnostics, code)) => {
             for d in &diagnostics {
@@ -947,6 +949,7 @@ fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
     } else {
         run_check(path)
     };
+    report_loader_warnings(json);
     match result {
         Err(failure) => {
             render(&failure, json);
@@ -1352,12 +1355,28 @@ fn render(d: &Diagnostic, json: bool) {
         // would bury the stack and break the `^Error:` line tools grep for.
         eprint!("{}", d.message);
     } else {
+        let label = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        };
         let loc = d
             .spans
             .first()
             .map(|s| format!(" ({}:{}:{})", s.file, s.start.line, s.start.col))
             .unwrap_or_default();
-        eprintln!("error[{}]: {}{}", d.code, d.message, loc);
+        eprintln!("{label}[{}]: {}{}", d.code, d.message, loc);
+    }
+}
+
+/// Drain the loader's deferred warnings (a tsconfig that does not parse, a
+/// package `extends` it cannot resolve yet) through `render`, so they reach
+/// stderr as ODIF like every other diagnostic -- never as prose that breaks
+/// the --json JSONL contract. Called once per command, after the work that
+/// could have queued them.
+fn report_loader_warnings(json: bool) {
+    for d in oam_loader::take_warnings() {
+        render(&d, json);
     }
 }
 
