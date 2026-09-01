@@ -42,6 +42,7 @@ mod npm;
 mod pathutil;
 pub mod precompile;
 mod resolver;
+pub mod transpile_cache;
 pub mod trust;
 mod tsconfig;
 mod warnings;
@@ -122,8 +123,11 @@ pub fn find_tsconfig(referrer: &Path) -> Option<PathBuf> {
 /// source-type policy in `transpile_config`, a different codegen setting, a
 /// new tsconfig option feeding the JSX transform. It is part of every
 /// `transpile_fingerprint`, so a cache keyed on the fingerprint invalidates
-/// on the bump. History: 1 = module-kind policy + jsx mode/factory/source.
-pub const TRANSPILE_FORMAT_VERSION: u32 = 1;
+/// on the bump. History: 1 = module-kind policy + jsx mode/factory/source;
+/// 2 = CJS-routed sources pinned to the CommonJS source type (a Cjs-routed
+/// .jsx was Unambiguous before, so its injected JSX runtime import could
+/// come out ESM-shaped).
+pub const TRANSPILE_FORMAT_VERSION: u32 = 2;
 
 /// The oxc crate versions that shape transpile output, read from Cargo.lock
 /// at build time (build.rs) so they can never drift from what is linked.
@@ -151,10 +155,17 @@ fn transpile_config(resolver: &Resolver, path: &Path) -> TranspileConfig {
     // CommonJS) into an ES module at parse time, and the parser grants
     // top-level `return` / `new.target` and `await` as an identifier only to
     // CommonJS. So the policy follows the engine's own routing
-    // (`module_kind`): a file that will execute through CJS interop keeps
-    // oxc's CommonJS source type; everything else is Module.
+    // (`module_kind`): a file that will execute through CJS interop is
+    // PINNED to oxc's CommonJS source type; everything else is Module.
+    // Pinning (rather than keeping `from_path`'s kind) matters for the
+    // extensions from_path leaves Unambiguous: a .jsx routed CommonJS by
+    // package "type" would otherwise parse module-or-script on content, and
+    // the JSX transform could inject an ESM `import` of the jsx-runtime
+    // into what executes inside a require() wrapper. CommonJS keeps the
+    // injected runtime require()-shaped and grants Node's CJS grammar
+    // (top-level return, await-as-identifier).
     let source_type = if npm::module_kind(path) == ModuleKind::Cjs {
-        source_type
+        source_type.with_commonjs(true)
     } else {
         source_type.with_module(true)
     };
@@ -245,6 +256,43 @@ pub fn transpile_typescript_with(
     path: &Path,
     source: &str,
 ) -> Result<String, TranspileError> {
+    transpile_impl(resolver, path, source, false).map(|out| out.code)
+}
+
+/// `transpile_typescript` plus what the REPL needs from the same parse.
+#[derive(Debug)]
+pub struct TranspileOutput {
+    /// The transpiled JavaScript.
+    pub code: String,
+    /// True only for REAL top-level await usage -- an `await` expression, a
+    /// `for await`, or an `await using` outside every function body. Never
+    /// set for `await` as an identifier (`let awaiting = 1`) or for awaits
+    /// inside nested function/arrow bodies.
+    pub top_level_await: bool,
+    /// Names bound by the source's DIRECT top-level declarations (var/let/
+    /// const including destructuring, function, class, enum), in source
+    /// order. The REPL hoists these onto globalThis when it must wrap an
+    /// awaiting line in an async IIFE, so the bindings survive the wrapper.
+    pub top_level_bindings: Vec<String>,
+}
+
+/// `transpile_typescript` with REPL metadata (real top-level-await
+/// detection + top-level binding names) from the same parse. Costs one
+/// extra AST walk over `transpile_typescript`, so the plain fn stays the
+/// right call for module loading.
+pub fn transpile_typescript_rich(
+    path: &Path,
+    source: &str,
+) -> Result<TranspileOutput, TranspileError> {
+    transpile_impl(default_resolver(), path, source, true)
+}
+
+fn transpile_impl(
+    resolver: &Resolver,
+    path: &Path,
+    source: &str,
+    collect_repl_meta: bool,
+) -> Result<TranspileOutput, TranspileError> {
     let file = path.to_string_lossy().into_owned();
     let allocator = Allocator::default();
     let TranspileConfig { source_type, jsx } = transpile_config(resolver, path);
@@ -256,6 +304,11 @@ pub fn transpile_typescript_with(
             file,
         });
     }
+    let (top_level_await, top_level_bindings) = if collect_repl_meta {
+        repl_meta(&parsed.program)
+    } else {
+        (false, Vec::new())
+    };
     let mut program = parsed.program;
 
     // with_enum_eval: the enum transform needs pre-computed member values in
@@ -279,7 +332,114 @@ pub fn transpile_typescript_with(
         });
     }
 
-    Ok(Codegen::new().build(&program).code)
+    Ok(TranspileOutput {
+        code: Codegen::new().build(&program).code,
+        top_level_await,
+        top_level_bindings,
+    })
+}
+
+/// REPL metadata from the PARSED (pre-transform) AST. See
+/// `TranspileOutput`: `top_level_await` is real usage only (the visitor
+/// tracks function depth, so awaits inside function/arrow bodies never
+/// count), and the binding names come from the program's DIRECT top-level
+/// statements (a `let` inside a top-level block is block-scoped and dies
+/// with its block either way).
+fn repl_meta(program: &oxc_ast::ast::Program<'_>) -> (bool, Vec<String>) {
+    use oxc_ast::ast::{
+        ArrowFunctionExpression, AwaitExpression, BindingPattern, ForOfStatement, Function,
+        Statement, VariableDeclaration, VariableDeclarationKind,
+    };
+    use oxc_ast_visit::Visit;
+
+    struct TlaFinder {
+        found: bool,
+        function_depth: u32,
+    }
+    impl<'a> Visit<'a> for TlaFinder {
+        fn visit_function(&mut self, it: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+            self.function_depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.function_depth -= 1;
+        }
+        fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+            self.function_depth += 1;
+            oxc_ast_visit::walk::walk_arrow_function_expression(self, it);
+            self.function_depth -= 1;
+        }
+        fn visit_await_expression(&mut self, it: &AwaitExpression<'a>) {
+            if self.function_depth == 0 {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_await_expression(self, it);
+        }
+        fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+            if it.r#await && self.function_depth == 0 {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_for_of_statement(self, it);
+        }
+        fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+            if it.kind == VariableDeclarationKind::AwaitUsing && self.function_depth == 0 {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_variable_declaration(self, it);
+        }
+    }
+    let mut finder = TlaFinder {
+        found: false,
+        function_depth: 0,
+    };
+    finder.visit_program(program);
+
+    fn binding_names(pattern: &BindingPattern<'_>, out: &mut Vec<String>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => out.push(id.name.to_string()),
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    binding_names(&property.value, out);
+                }
+                if let Some(rest) = &object.rest {
+                    binding_names(&rest.argument, out);
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for element in array.elements.iter().flatten() {
+                    binding_names(element, out);
+                }
+                if let Some(rest) = &array.rest {
+                    binding_names(&rest.argument, out);
+                }
+            }
+            BindingPattern::AssignmentPattern(assignment) => binding_names(&assignment.left, out),
+        }
+    }
+
+    let mut names = Vec::new();
+    for statement in &program.body {
+        match statement {
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    binding_names(&declarator.id, &mut names);
+                }
+            }
+            Statement::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    names.push(id.name.to_string());
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    names.push(id.name.to_string());
+                }
+            }
+            Statement::TSEnumDeclaration(declaration) => {
+                names.push(declaration.id.name.to_string());
+            }
+            _ => {}
+        }
+    }
+    (finder.found, names)
 }
 
 fn to_odif(
@@ -753,6 +913,56 @@ mod tests {
         assert_eq!(transpile_fingerprint(&a.join("util.ts")), ts_a);
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// `transpile_typescript_rich` reports REAL top-level await usage (the
+    /// substring heuristic it replaces wrapped `let awaiting = 1` too) and
+    /// the names the line binds at the top level.
+    #[test]
+    fn rich_transpile_reports_real_top_level_await_and_bindings() {
+        let path = PathBuf::from("repl.ts");
+        let rich = |src: &str| transpile_typescript_rich(&path, src).unwrap();
+
+        let out = rich("const x = await Promise.resolve(1)");
+        assert!(out.top_level_await);
+        assert_eq!(out.top_level_bindings, ["x"]);
+
+        let out = rich("let awaiting = 1");
+        assert!(!out.top_level_await, "identifier is not usage");
+        assert_eq!(out.top_level_bindings, ["awaiting"]);
+
+        let out = rich("async function f() { await g(); }");
+        assert!(!out.top_level_await, "await inside a function body");
+        assert_eq!(out.top_level_bindings, ["f"]);
+
+        let out = rich("const run = async () => { await g(); };");
+        assert!(!out.top_level_await, "await inside an arrow body");
+        assert_eq!(out.top_level_bindings, ["run"]);
+
+        let out = rich("if (await ready()) { console.log(1) }");
+        assert!(out.top_level_await, "statement-shaped usage");
+        assert!(out.top_level_bindings.is_empty());
+
+        let out = rich("for await (const item of gen()) { console.log(item) }");
+        assert!(out.top_level_await, "for await is usage");
+        assert!(
+            out.top_level_bindings.is_empty(),
+            "the loop binding is block-scoped, not hoistable"
+        );
+
+        let out = rich("const { a, b: [c] } = await load()");
+        assert!(out.top_level_await);
+        assert_eq!(out.top_level_bindings, ["a", "c"]);
+
+        let out = rich("class Foo {}\nenum Mode { Fast }");
+        assert!(!out.top_level_await);
+        assert_eq!(out.top_level_bindings, ["Foo", "Mode"]);
+
+        // The thin wrapper agrees with the rich form on the code.
+        assert_eq!(
+            transpile_typescript(&path, "const n: number = 1;").unwrap(),
+            rich("const n: number = 1;").code
+        );
     }
 
     #[test]
