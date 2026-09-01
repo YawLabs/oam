@@ -467,6 +467,22 @@ require('./thing.mjs')   // oam: ERR_REQUIRE_ESM.  Node 22: works.
 Node 22 added synchronous `require()` of an ESM graph. oam has not implemented it yet;
 use `await import()`. This is a gap, not a policy — it is on the roadmap.
 
+### 24. TypeScript module kind: `.ts`/`.mts` are always ES modules
+
+oam decides a TypeScript file's module system from its extension alone: `.ts` and `.mts`
+are ESM, `.cts` is CommonJS. The package.json `"type"` field is not consulted for them —
+including `"type": "commonjs"`.
+
+```js
+// package.json: { "type": "commonjs" }
+require('./util.ts')   // oam: ERR_REQUIRE_ESM.  Node 22 type stripping: works (CommonJS).
+```
+
+Node 22's type stripping honors the package `"type"` walk for `.ts`, so the same file is
+CommonJS there and `require()` of it works. In oam, use `.cts` for TypeScript that must be
+require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
+`.js`, and transpile on whichever path they land.)
+
 ### 10. `oam run file.js` needs `--` before script flags
 
 ```
