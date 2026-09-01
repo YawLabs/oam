@@ -21,6 +21,8 @@ enum Command {
     ///
     /// Pass --release to benchmark the release binary instead of debug.
     /// Pass --compare to also run the same scripts under other runtimes.
+    /// Pass --case <name> (repeatable) to re-measure only those cases and
+    /// merge them into the committed BENCHMARKS.md + bench/results.json.
     Bench {
         /// Build and benchmark the release binary (cargo build --release).
         #[arg(long)]
@@ -28,6 +30,10 @@ enum Command {
         /// Also run benchmarks under node, bun, deno (if found on PATH).
         #[arg(long)]
         compare: bool,
+        /// Run only this case (repeatable); the result merges into the
+        /// committed files instead of replacing them.
+        #[arg(long = "case", value_name = "NAME")]
+        cases: Vec<String>,
     },
     /// Run the conformance suites (WPT URL, Node differential, builtin
     /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
@@ -71,7 +77,11 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench { release, compare } => bench::run(release, compare),
+        Command::Bench {
+            release,
+            compare,
+            cases,
+        } => bench::run(release, compare, &cases),
         Command::Conformance { release } => conformance::run(release),
         Command::NodeSuite { release } => node_suite::run(release),
         Command::UnsafeBudget { regen } => unsafe_budget::run(regen),
