@@ -34,6 +34,11 @@ pub struct Resolver {
     /// `tsconfig.json` path -> parsed paths config. None = file existed but
     /// had no paths (so we don't re-stat it).
     tsconfigs: Mutex<HashMap<PathBuf, TsconfigEntry>>,
+    /// Directory -> the nearest `tsconfig.json` at or above it (None =
+    /// walked to the root and found nothing). Consulted before any stat, so
+    /// a project with no tsconfig pays the ancestor walk once per
+    /// directory, not once per resolve.
+    tsconfig_dirs: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
 }
 
 impl Resolver {
@@ -52,10 +57,58 @@ impl Resolver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.tsconfig_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub(crate) fn tsconfigs(&self) -> &Mutex<HashMap<PathBuf, TsconfigEntry>> {
         &self.tsconfigs
+    }
+
+    /// Nearest `tsconfig.json` at or above `referrer` (a file or a
+    /// directory), through this resolver's discovery cache. Pure discovery:
+    /// no parsing, no node_modules boundary (that applies when the OPTIONS
+    /// are consumed). None when no ancestor has one.
+    pub fn find_tsconfig(&self, referrer: &Path) -> Option<PathBuf> {
+        crate::tsconfig::find_tsconfig_with(self, referrer)
+    }
+
+    /// The cached ancestor walk behind `find_tsconfig`: every directory
+    /// visited on the way to an answer is recorded with that answer, so the
+    /// next lookup from anywhere in the same subtree is a single map hit.
+    pub(crate) fn nearest_tsconfig_from_dir(&self, start: PathBuf) -> Option<PathBuf> {
+        let mut visited: Vec<PathBuf> = Vec::new();
+        let mut dir = start;
+        let found = loop {
+            {
+                let cache = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(hit) = cache.get(&dir) {
+                    break hit.clone();
+                }
+            }
+            let candidate = dir.join("tsconfig.json");
+            visited.push(dir.clone());
+            if candidate.is_file() {
+                break Some(candidate);
+            }
+            if !dir.pop() {
+                break None;
+            }
+        };
+        let mut cache = self.tsconfig_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        for visited_dir in visited {
+            cache.insert(visited_dir, found.clone());
+        }
+        found
+    }
+
+    /// Resolve a `require()` specifier from the CJS module at `referrer`,
+    /// through this resolver's caches. See the free `resolve_require` for
+    /// the algorithm.
+    pub fn resolve_require(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+        crate::npm::resolve_require_with(self, specifier, referrer)
     }
 
     /// Check whether `path` resolves to a file, consulting the negative
@@ -89,9 +142,11 @@ impl Resolver {
     /// Resolve an import specifier as written in the module at `referrer`.
     ///
     /// Relative + absolute paths: candidate order for './x' is exact (if it has
-    /// an extension), TS-source fallback for JS extensions ('./x.js' -> x.ts,
-    /// the tsgo rewrite convention), then extensionless probing (.ts, .mts, .js,
-    /// .mjs) and directory index (index.ts, index.js).
+    /// an extension), TS-source fallback for JS extensions ('./x.js' -> x.ts
+    /// then x.tsx, './x.jsx' -> x.tsx, './x.mjs' -> x.mts, './x.cjs' -> x.cts;
+    /// the tsc rewrite convention), then extensionless probing (.ts, .tsx,
+    /// .mts, .js, .jsx, .mjs) and directory index (index.ts, index.tsx,
+    /// index.js) -- see `probe_candidates`.
     ///
     /// Bare specifiers resolve via tsconfig paths (if a tsconfig.json is found
     /// in the referrer's ancestor tree) then the Node ESM node_modules walk.
@@ -173,12 +228,9 @@ impl Resolver {
             // (and bare builtin names) never hit userland resolution, and
             // require() in the same project would disagree otherwise — two
             // identities for 'fs' in one run. oam: runtime modules get the
-            // same guarantee.
-            if specifier.starts_with("node:")
-                || specifier.starts_with("oam:")
-                || crate::npm::is_node_builtin(specifier)
-                || crate::is_exposed_internal(specifier)
-            {
+            // same guarantee. (`resolve_require_inner` hoists the identical
+            // guard above its paths block.)
+            if crate::is_builtin_specifier(specifier) {
                 return crate::npm::resolve_bare(
                     specifier,
                     referrer,
