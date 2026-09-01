@@ -42,6 +42,7 @@ mod npm;
 mod pathutil;
 pub mod precompile;
 mod resolver;
+pub mod sourcemap;
 pub mod transpile_cache;
 pub mod trust;
 mod tsconfig;
@@ -69,7 +70,7 @@ pub fn is_exposed_internal(specifier: &str) -> bool {
     specifier.starts_with("internal/")
         && std::env::var("OAM_EXPOSE_INTERNALS").as_deref() == Ok("1")
 }
-use oxc_codegen::Codegen;
+use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
@@ -126,8 +127,10 @@ pub fn find_tsconfig(referrer: &Path) -> Option<PathBuf> {
 /// on the bump. History: 1 = module-kind policy + jsx mode/factory/source;
 /// 2 = CJS-routed sources pinned to the CommonJS source type (a Cjs-routed
 /// .jsx was Unambiguous before, so its injected JSX runtime import could
-/// come out ESM-shaped).
-pub const TRANSPILE_FORMAT_VERSION: u32 = 2;
+/// come out ESM-shaped); 3 = source maps generated for module loading and
+/// embedded in the cache artifacts (v2 layouts), plus path-addressed
+/// `react-jsxdev` fingerprints.
+pub const TRANSPILE_FORMAT_VERSION: u32 = 3;
 
 /// The oxc crate versions that shape transpile output, read from Cargo.lock
 /// at build time (build.rs) so they can never drift from what is linked.
@@ -228,6 +231,17 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
     } else {
         "unambiguous"
     };
+    // Under the automatic-DEV runtime the emitted `_jsxFileName` embeds the
+    // SOURCE PATH, so two identical sources at different paths transpile to
+    // different output. Fold the path into the fingerprint for exactly that
+    // mode -- dev-mode cache entries become path-addressed while the common
+    // modes stay content-addressed.
+    let path_facet = match &jsx {
+        Some(settings) if settings.mode == tsconfig::JsxMode::AutomaticDev => {
+            format!(";path={}", path.to_string_lossy())
+        }
+        _ => String::new(),
+    };
     let jsx = match jsx {
         Some(settings) => settings.fingerprint(),
         None => "none".to_string(),
@@ -235,7 +249,7 @@ pub fn transpile_fingerprint_with(resolver: &Resolver, path: &Path) -> String {
     format!(
         "oxc_transformer={OXC_TRANSFORMER_VERSION};oxc_codegen={OXC_CODEGEN_VERSION};\
          format={TRANSPILE_FORMAT_VERSION};language={language};module={module};\
-         jsx_syntax={};jsx={jsx}",
+         jsx_syntax={};jsx={jsx}{path_facet}",
         source_type.is_jsx()
     )
 }
@@ -256,7 +270,27 @@ pub fn transpile_typescript_with(
     path: &Path,
     source: &str,
 ) -> Result<String, TranspileError> {
-    transpile_impl(resolver, path, source, false).map(|out| out.code)
+    transpile_impl(resolver, path, source, false, false).map(|out| out.code)
+}
+
+/// `transpile_typescript` plus a source map for runtime position remap.
+/// This is what the module-loading paths call: the map is what lets stack
+/// traces and uncaught-error reports cite the .ts line the user wrote
+/// instead of the codegen line (codegen reflows -- see `sourcemap`).
+pub fn transpile_typescript_mapped(
+    path: &Path,
+    source: &str,
+) -> Result<TranspileOutput, TranspileError> {
+    transpile_typescript_mapped_with(default_resolver(), path, source)
+}
+
+/// `transpile_typescript_mapped` against an explicit `Resolver`.
+pub fn transpile_typescript_mapped_with(
+    resolver: &Resolver,
+    path: &Path,
+    source: &str,
+) -> Result<TranspileOutput, TranspileError> {
+    transpile_impl(resolver, path, source, false, true)
 }
 
 /// `transpile_typescript` plus what the REPL needs from the same parse.
@@ -264,6 +298,10 @@ pub fn transpile_typescript_with(
 pub struct TranspileOutput {
     /// The transpiled JavaScript.
     pub code: String,
+    /// Source map JSON (generated -> source), present only on the `mapped`
+    /// entry points. `sourcesContent` is stripped: runtime position lookup
+    /// never needs it, and embedding it would double every cache artifact.
+    pub source_map: Option<String>,
     /// True only for REAL top-level await usage -- an `await` expression, a
     /// `for await`, or an `await using` outside every function body. Never
     /// set for `await` as an identifier (`let awaiting = 1`) or for awaits
@@ -284,7 +322,7 @@ pub fn transpile_typescript_rich(
     path: &Path,
     source: &str,
 ) -> Result<TranspileOutput, TranspileError> {
-    transpile_impl(default_resolver(), path, source, true)
+    transpile_impl(default_resolver(), path, source, true, false)
 }
 
 fn transpile_impl(
@@ -292,6 +330,7 @@ fn transpile_impl(
     path: &Path,
     source: &str,
     collect_repl_meta: bool,
+    emit_map: bool,
 ) -> Result<TranspileOutput, TranspileError> {
     let file = path.to_string_lossy().into_owned();
     let allocator = Allocator::default();
@@ -332,8 +371,29 @@ fn transpile_impl(
         });
     }
 
+    let generated = if emit_map {
+        Codegen::new()
+            .with_options(CodegenOptions {
+                // The path names the map's single `sources` entry; the
+                // runtime registry keys on the module path it records
+                // under, so this is informational.
+                source_map_path: Some(path.to_path_buf()),
+                ..CodegenOptions::default()
+            })
+            .build(&program)
+    } else {
+        Codegen::new().build(&program)
+    };
+    let source_map = generated.map.map(|mut map| {
+        // Position lookup never reads sourcesContent, and embedding it
+        // would carry a full copy of the source into every cache artifact.
+        map.as_source_map_mut().set_source_contents(vec![None]);
+        map.to_json_string()
+    });
+
     Ok(TranspileOutput {
-        code: Codegen::new().build(&program).code,
+        code: generated.code,
+        source_map,
         top_level_await,
         top_level_bindings,
     })
