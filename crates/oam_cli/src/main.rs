@@ -786,10 +786,39 @@ fn self_update_command(version: Option<&str>, dry_run: bool) -> ExitCode {
 // result_large_err: cold path, deliberate — same stance as oam_loader/oam_ts.
 #[allow(clippy::result_large_err)]
 fn run_check(path: &Path) -> Result<Vec<Diagnostic>, Diagnostic> {
+    run_check_with(path, &oam_ts::TsgoHandle::new())
+}
+
+/// [`run_check`] whose one-shot tsgo (the fallback path) is registered on
+/// `handle`, so a caller that stops waiting can kill it instead of leaving
+/// a type-check running after `oam run` has exited. The daemon path needs
+/// no handle: its tsgo belongs to the detached daemon, which finishes the
+/// check and caches it for the next run.
+#[allow(clippy::result_large_err)]
+fn run_check_with(path: &Path, handle: &oam_ts::TsgoHandle) -> Result<Vec<Diagnostic>, Diagnostic> {
     match oam_ts::daemon::check_via_daemon(path) {
         Ok(diagnostics) => Ok(diagnostics),
-        Err(_) => oam_ts::check(path),
+        Err(reason) => {
+            // The daemon's failure is swallowed by contract; OAM_DEBUG
+            // surfaces it (a daemon that cannot start otherwise costs every
+            // check its spawn wait with no observable reason).
+            if std::env::var_os("OAM_DEBUG").is_some_and(|v| !v.is_empty() && v != "0") {
+                eprintln!("oam check: daemon unavailable ({reason}); running one-shot");
+            }
+            oam_ts::check_cancellable(path, handle)
+        }
     }
+}
+
+/// How long warn-mode `oam run` waits for the checker after the program
+/// exits: `OAM_CHECK_WAIT_MS`, default 10s (CI on a loaded box can lengthen
+/// it instead of skipping tests).
+fn check_wait() -> std::time::Duration {
+    std::env::var("OAM_CHECK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(10))
 }
 
 fn error_count(diagnostics: &[Diagnostic]) -> usize {
@@ -863,13 +892,17 @@ fn run_command(
 
     // Warn mode: the check races execution on a thread; we collect it after
     // the program finishes. Execution NEVER waits for the checker to start.
+    // The handle lets the deadline path below kill a one-shot tsgo the
+    // checker thread still owns, so no orphan outlives this process.
     let pending = (mode == CheckMode::Warn && checkable).then(|| {
         let path = file.to_path_buf();
+        let handle = oam_ts::TsgoHandle::new();
         let (tx, rx) = std::sync::mpsc::channel();
+        let checker_handle = handle.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_check(&path));
+            let _ = tx.send(run_check_with(&path, &checker_handle));
         });
-        rx
+        (rx, handle)
     });
 
     let exit = match run_file(file, script_args, inspect, replay_mode) {
@@ -885,8 +918,8 @@ fn run_command(
         }
     };
 
-    if let Some(rx) = pending {
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    if let Some((rx, handle)) = pending {
+        match rx.recv_timeout(check_wait()) {
             Ok(Ok(diagnostics)) => {
                 let errors = error_count(&diagnostics);
                 for d in &diagnostics {
@@ -912,28 +945,54 @@ fn run_command(
                 }
             }
             Err(_) => {
-                // Checker still running when the wait deadline hit (cold
-                // tsgo / daemon warming under load). Same contract as the
-                // unavailable case above: the json stream must say the check
-                // did not happen -- a silently empty stream reads as
-                // "typecheck ran clean" (this exact silence flaked the e2e
-                // suite under full-parallel load).
+                // Checker still running when the wait deadline hit. Same
+                // contract as the unavailable case above: the json stream
+                // must say the check did not happen -- a silently empty
+                // stream reads as "typecheck ran clean" (this exact silence
+                // flaked the e2e suite under full-parallel load).
+                //
+                // Three honest shapes. A one-shot tsgo the checker thread
+                // still owns (no tsconfig, or the daemon fell back) is
+                // killed here, so it is CANCELLED, not "still running", and
+                // nothing warms for the next run. Only a project with a
+                // tsconfig has a daemon that finishes the work and caches
+                // it. (The e2e skip commit 8d7b515 attributed its flake to
+                // "daemon warmth" for a tsconfig-less fixture, which takes
+                // the one-shot path -- there was never a daemon to warm.)
+                let killed = handle.cancel();
+                let has_tsconfig = oam_ts::find_tsconfig(file).is_some();
+                let message = if killed {
+                    format!(
+                        "type check cancelled: it did not finish within {}ms of the program exiting \
+                         (no daemon served this run); re-run `oam check {}` for results \
+                         (OAM_CHECK_WAIT_MS lengthens the wait)",
+                        check_wait().as_millis(),
+                        file.display()
+                    )
+                } else if has_tsconfig {
+                    "type check did not finish before the program exited (daemon warming); \
+                     results are instant on the next run"
+                        .to_string()
+                } else {
+                    format!(
+                        "type check did not finish before the program exited; single-file checks \
+                         have no daemon, so re-run `oam check {}` for results \
+                         (OAM_CHECK_WAIT_MS lengthens the wait)",
+                        file.display()
+                    )
+                };
                 if json {
                     render(
                         &Diagnostic::new(
                             "OAM-TS0005",
                             Severity::Warning,
                             Origin::Typecheck,
-                            "type check did not finish before the program exited (checker \
-                             warming); results are instant on the next run"
-                                .to_string(),
+                            message,
                         ),
                         json,
                     );
                 } else {
-                    eprintln!(
-                        "oam run: type check still running (daemon warming); results are instant on the next run"
-                    );
+                    eprintln!("oam run: {message}");
                 }
             }
         }
