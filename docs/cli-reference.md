@@ -59,8 +59,11 @@ Notable ones:
 
 | Variable | Effect |
 |---|---|
-| `OAM_TSGO` | Path to the tsgo binary, when it is not the bundled one. |
+| `OAM_TSGO` | Path to the tsgo binary. Without it, oam prefers the project's `node_modules/.bin/tsgo` (nearest, walking up), then PATH. |
+| `OAM_TSGO_TIMEOUT_MS` | Wall-clock bound on one tsgo run (default 300000). A run past it is killed — whole process tree — and reported as `OAM-TS0006`. |
+| `OAM_CHECK_WAIT_MS` | How long warn-mode `oam run` waits for the concurrent checker after the program exits (default 10000). |
 | `OAM_DAEMON_IDLE_MS` | How long the type-check daemon stays warm before exiting. |
+| `OAM_DEBUG` | `1` prints why a check fell back from the daemon to one-shot (normally swallowed by the never-worse-than-one-shot contract). |
 
 ### Install and update
 
