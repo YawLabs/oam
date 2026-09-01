@@ -21,10 +21,13 @@
 //! so an edit to anything that can change the diagnostics misses the cache.
 //!
 //! Threads: the main thread only accepts, reads one request, answers
-//! Ping/Shutdown and cache hits, and hands cache misses to ONE check worker
-//! (so a Ping is answered while a minutes-long check runs, and a client
+//! Ping/Shutdown in O(1), and hands EVERY Check to ONE check worker — the
+//! worker probes the cache itself, so the accept thread never runs the
+//! fingerprint walk (up to 50k stats on a large tree, which would starve a
+//! Ping past the client's 2s budget and make it spawn a duplicate daemon).
+//! A Ping is answered even while a minutes-long check runs, and a client
 //! that queues behind a fill of the same tree gets that fill's result
-//! instead of a second tsgo run). A watchdog thread implements the idle
+//! instead of a second tsgo run. A watchdog thread implements the idle
 //! shutdown by sending Shutdown to our own listener.
 //!
 //! Protocol: one JSONL request line in, one response line out, connection
@@ -1090,8 +1093,10 @@ fn respond(stream: &TcpStream, response: &Response) {
     }
 }
 
-/// Cache misses, one at a time, off the accept thread. A client that was
-/// queued behind a fill of the same tree is served from that fill.
+/// Every Check, one at a time, off the accept thread — the cache probe runs
+/// here too (a fingerprint walk on the accept thread would starve Ping). A
+/// client that was queued behind a fill of the same tree is served from
+/// that fill.
 fn check_worker(rx: Receiver<TcpStream>, shared: Arc<Shared>) {
     for stream in rx {
         shared.busy.store(true, Ordering::SeqCst);
@@ -1159,11 +1164,12 @@ fn handle_connection(stream: TcpStream, shared: &Shared, worker: &Sender<TcpStre
         }
         Request::Check { .. } => {
             shared.checks_served.fetch_add(1, Ordering::Relaxed);
-            if let Some(diagnostics) = shared.cached_if_fresh() {
-                shared.cache_hits.fetch_add(1, Ordering::Relaxed);
-                respond(&stream, &Response::checked(true, diagnostics));
-                return true;
-            }
+            // Always queued, never probed here: cached_if_fresh runs the
+            // full fingerprint walk, and on a large tree that would hold
+            // the accept thread (and the cache mutex) past the next Ping's
+            // 2s budget — the client would conclude the daemon is dead and
+            // spawn a duplicate. The worker re-probes the cache first, so a
+            // hit still skips tsgo; accept-thread latency stays O(1).
             if let Err(std::sync::mpsc::SendError(stream)) = worker.send(stream) {
                 respond(&stream, &Response::failure("daemon check worker is gone"));
             }
