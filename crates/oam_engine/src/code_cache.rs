@@ -184,8 +184,14 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// the previous scope layout.
 fn entry_hash(source: &str, kind: Kind) -> String {
     use sha2::{Digest, Sha256};
+    // The tag is a pure function of the V8 build + flags, both fixed once
+    // init has run; read it through V8 exactly once instead of paying an FFI
+    // call per key (keys are now also derived on graph-prefetch workers, and
+    // one cached read keeps the off-isolate-thread V8 surface minimal).
+    static VERSION_TAG: OnceLock<u32> = OnceLock::new();
+    let tag = *VERSION_TAG.get_or_init(v8::script_compiler::cached_data_version_tag);
     let mut hasher = Sha256::new();
-    hasher.update(v8::script_compiler::cached_data_version_tag().to_le_bytes());
+    hasher.update(tag.to_le_bytes());
     hasher.update(CODE_CACHE_FORMAT.to_le_bytes());
     hasher.update([kind.tag()]);
     if let Kind::Function = kind {

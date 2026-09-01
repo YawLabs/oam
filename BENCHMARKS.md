@@ -50,16 +50,16 @@ All times in milliseconds. Lower is better.
 
 ## TypeScript load path
 
-Commit `01bee57+wip` | release | host windows-aarch64 | oam 0.13.0 | v22.22.2
+Commit `e9358cd` | release | host windows-aarch64 | oam 0.13.0 | v22.22.2
 
 `ts-cold-start`: wall-clock from process spawn to the first stdout line of `main.ts`, the entry of a generated graph of 20 `.ts` modules (interfaces, generics, enums, `import type`, a few inner functions each) that import each other in a chain plus a fan-out from the entry. oam runs it as `oam run --no-check main.ts` in three cache states, one row each; node runs it once, as installed, for reference. Median over 20 runs per row, the rows sampled round-robin like every other case. Milliseconds, lower is better. Each label was checked rather than assumed: a no-cache run that leaves a `.v8c` blob, a cold run that leaves none, or a row whose first line disagrees with another row's fails the case instead of publishing. The stamp above is this section's own -- `--case ts-cold-start` re-measures it alone, without touching the table above.
 
 | Row | Median | Min | Max | p95 |
 |---|--:|--:|--:|--:|
-| oam no-cache | 28.38 | 26.43 | 30.87 | 30.07 |
-| oam cold | 44.86 | 40.13 | 63.01 | 46.27 |
-| oam warm | 29.20 | 27.16 | 145.72 | 31.04 |
-| node | 178.41 | 169.42 | 214.93 | 193.86 |
+| oam no-cache | 32.59 | 29.92 | 56.91 | 55.40 |
+| oam cold | 32.80 | 30.30 | 55.96 | 55.76 |
+| oam warm | 24.38 | 23.10 | 72.06 | 48.64 |
+| node | 187.09 | 174.62 | 227.78 | 227.36 |
 
 - **oam no-cache** -- `OAM_CODE_CACHE=0`, fresh `OAM_CACHE_DIR` every run: the `.ts` -> JS transpile (oxc) plus a full V8 compile; no bytecode is produced, written or read. The floor without the cache.
 - **oam cold** -- caches on, fresh `OAM_CACHE_DIR` every run: a project's first run, which also serializes and writes the bytecode. Its gap above no-cache is the price of producing the cache.
