@@ -17,16 +17,23 @@
 //! instances, which matches Node's URL-keyed ESM behavior exactly.
 
 use oam_diagnostics::{Diagnostic, Origin, Severity};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroI32;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::JsRuntime;
 
 /// What the engine needs from the embedder to load a module graph.
 /// Errors are ODIF diagnostics — the engine never invents prose errors
 /// for problems the host can describe precisely.
-pub trait ModuleHost {
+///
+/// `Sync` because the graph loader overlaps module preparation: a small
+/// worker pool calls `load` for paths the isolate thread has not popped yet
+/// (see [`GraphPrefetcher`]), so `load` must tolerate concurrent calls for
+/// DIFFERENT paths — the loader never loads one path twice concurrently.
+/// `resolve` is only ever called from the isolate thread.
+pub trait ModuleHost: Sync {
     /// Resolve `specifier` as written in the module at `referrer`.
     fn resolve(&self, specifier: &str, referrer: &Path) -> Result<PathBuf, Vec<Diagnostic>>;
     /// Read and prepare (e.g. transpile) the module at `path` as JS source.
@@ -1571,17 +1578,249 @@ fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::
     }
 }
 
+// ------------------------------------------------------------- prefetch
+
+/// Graph-prefetch off switch: `OAM_GRAPH_PREFETCH=0|off|false|no` falls back
+/// to the strictly serial load path (one inline `host.load` per pop). On by
+/// default. Read once; the env is fixed for a process lifetime.
+fn prefetch_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("OAM_GRAPH_PREFETCH").as_deref(),
+            Ok("0") | Ok("off") | Ok("false") | Ok("no")
+        )
+    })
+}
+
+/// One off-thread module preparation: everything the graph loop needs for a
+/// path BEFORE V8 gets involved. Workers produce these; the loop consumes
+/// them at pop time in place of the inline `host.load` + cache probe.
+enum Prefetched {
+    /// `host.load` succeeded; the bytecode-cache probe for that exact source
+    /// rides along (the same `key_for` + `load` calls the inline path makes,
+    /// so `OAM_CODE_CACHE=0` behaves identically).
+    Loaded {
+        code: String,
+        key: crate::code_cache::CacheKey,
+        cached: Option<crate::code_cache::Loaded>,
+    },
+    /// `host.load` failed. Parked until the path is popped so the error is
+    /// reported exactly where and when the serial loop would have reported
+    /// it — an error for a path that is never popped (an earlier pop failed
+    /// first) is dropped, matching serial behavior.
+    Failed(Vec<Diagnostic>),
+    /// The host panicked on the worker. Re-raised on the isolate thread at
+    /// pop time, where the inline call would have panicked.
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
+/// State shared between the graph loop and its prefetch workers.
+#[derive(Default)]
+struct PrefetchShared {
+    state: Mutex<PrefetchState>,
+    /// Wakes workers: a job was queued, or the loop is done (`closed`).
+    work: Condvar,
+    /// Wakes the graph loop: a result was parked.
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct PrefetchState {
+    queue: VecDeque<PathBuf>,
+    results: HashMap<PathBuf, Prefetched>,
+    closed: bool,
+}
+
+/// Lock that shrugs off poison: workers catch host panics before parking, so
+/// a poisoned mutex can only mean a panic in this file's own bookkeeping —
+/// the state is still coherent enough to shut down through, and refusing the
+/// lock would just trade one panic for a deadlocked scope join.
+fn prefetch_lock(shared: &PrefetchShared) -> std::sync::MutexGuard<'_, PrefetchState> {
+    shared.state.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Worker loop: pull a path, run `host.load` + the bytecode-cache probe,
+/// park the result. No V8 handle is touched here — `host.load` is fs + oxc,
+/// and the cache probe is SHA-256 plus a disk/seed lookup.
+fn prefetch_worker(host: &dyn ModuleHost, shared: &PrefetchShared) {
+    loop {
+        let path = {
+            let mut state = prefetch_lock(shared);
+            loop {
+                if let Some(path) = state.queue.pop_front() {
+                    break path;
+                }
+                if state.closed {
+                    return;
+                }
+                state = shared.work.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        // AssertUnwindSafe: the payload is re-raised at the consuming pop,
+        // so nothing observes state the panic may have torn.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.load(&path).map(|code| {
+                let key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
+                let cached = crate::code_cache::load(&key);
+                (code, key, cached)
+            })
+        }));
+        let result = match outcome {
+            Ok(Ok((code, key, cached))) => Prefetched::Loaded { code, key, cached },
+            Ok(Err(diags)) => Prefetched::Failed(diags),
+            Err(payload) => Prefetched::Panicked(payload),
+        };
+        prefetch_lock(shared).results.insert(path, result);
+        shared.done.notify_all();
+    }
+}
+
+/// Overlapped module preparation for [`load_module_graph`]: discovered import
+/// paths are handed to a small worker pool that runs `host.load` (fs read +
+/// transpile — thread-safe, no V8 handles) and the bytecode-cache probe ahead
+/// of the loop, parking results the loop consumes at pop time. Cold-run cost
+/// then tracks graph depth rather than module count. Scoped to ONE graph
+/// load: workers spawn lazily (a graph with no prefetchable imports spawns
+/// none) and exit when the loop finishes — Drop closes the queue,
+/// `std::thread::scope` joins.
+struct GraphPrefetcher<'scope, 'env> {
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    host: &'env dyn ModuleHost,
+    shared: Arc<PrefetchShared>,
+    /// Paths handed to the pool and not yet consumed: the dedupe set (a
+    /// diamond import is loaded once) and the `take` guard (never block on a
+    /// path that was not enqueued).
+    requested: HashSet<PathBuf>,
+    workers: usize,
+    max_workers: usize,
+}
+
+impl<'scope, 'env> GraphPrefetcher<'scope, 'env> {
+    fn new(scope: &'scope std::thread::Scope<'scope, 'env>, host: &'env dyn ModuleHost) -> Self {
+        // Small on purpose: transpile jobs are short and the isolate thread
+        // consumes serially; more threads would just contend.
+        let max_workers = if prefetch_enabled() {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(4)
+        } else {
+            0
+        };
+        Self {
+            scope,
+            host,
+            shared: Arc::default(),
+            requested: HashSet::new(),
+            workers: 0,
+            max_workers,
+        }
+    }
+
+    /// Whether the pop-time branch for `path` is the `host.load` one — the
+    /// only branch prefetch may front-run. Mirrors the loop's own branch
+    /// conditions: virtual builtins, JSON modules and CJS interop all need
+    /// the isolate and load inline.
+    fn eligible(path: &Path) -> bool {
+        if path
+            .to_str()
+            .is_some_and(|s| s.starts_with("node:") || s.starts_with("oam:"))
+        {
+            return false;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            return false;
+        }
+        oam_loader::module_kind(path) != oam_loader::ModuleKind::Cjs
+    }
+
+    /// Hand `path` to the pool if it is eligible and not already requested.
+    fn enqueue(&mut self, path: &Path) {
+        if self.max_workers == 0 || self.requested.contains(path) || !Self::eligible(path) {
+            return;
+        }
+        self.requested.insert(path.to_path_buf());
+        prefetch_lock(&self.shared)
+            .queue
+            .push_back(path.to_path_buf());
+        self.shared.work.notify_one();
+        if self.workers < self.max_workers {
+            self.workers += 1;
+            let host = self.host;
+            let shared = Arc::clone(&self.shared);
+            self.scope.spawn(move || prefetch_worker(host, &shared));
+        }
+    }
+
+    /// The parked result for `path`, blocking until its worker finishes.
+    /// `None` when the path was never enqueued (the caller loads inline —
+    /// the entry, and anything `eligible` declined). Every requested path is
+    /// eventually parked: at least one worker exists once anything is
+    /// requested, and workers park every job they take, panics included.
+    fn take(&mut self, path: &Path) -> Option<Prefetched> {
+        if !self.requested.remove(path) {
+            return None;
+        }
+        let mut state = prefetch_lock(&self.shared);
+        loop {
+            if let Some(result) = state.results.remove(path) {
+                return Some(result);
+            }
+            state = self
+                .shared
+                .done
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+impl Drop for GraphPrefetcher<'_, '_> {
+    fn drop(&mut self) {
+        let mut state = prefetch_lock(&self.shared);
+        state.closed = true;
+        // Still-queued paths will never be consumed (early error return);
+        // drop them so workers exit instead of loading modules nobody pops.
+        state.queue.clear();
+        drop(state);
+        self.shared.work.notify_all();
+    }
+}
+
 /// Compile the module graph into the isolate's ModuleMap. Explicit worklist —
 /// recursion would overflow the stack on deep (generated-code) import chains.
 /// Discovery is breadth-first in import-declaration order (FIFO): CJS
 /// modules execute eagerly at load, so discovery order is their observable
 /// side-effect order — declaration order is what Node-shaped code expects.
+/// What IS overlapped: `host.load` (fs read + transpile) and the bytecode-
+/// cache probe for discovered-but-not-yet-popped paths run on a small worker
+/// pool (see [`GraphPrefetcher`]); everything V8 stays on this thread.
 fn load_module_graph(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     host: &dyn ModuleHost,
     entry: PathBuf,
 ) -> Result<(), Vec<Diagnostic>> {
-    let mut work = std::collections::VecDeque::from([entry]);
+    // The prefetch pool borrows `host`, so it lives inside a thread scope:
+    // workers spawn lazily as prefetchable imports are discovered, and the
+    // scope joins them on every exit path (the prefetcher's Drop closes the
+    // queue, error returns included).
+    std::thread::scope(|scope| {
+        let mut prefetch = GraphPrefetcher::new(scope, host);
+        load_module_graph_overlapped(tc, host, entry, &mut prefetch)
+    })
+}
+
+/// The worklist loop behind [`load_module_graph`], with `prefetch` running
+/// `host.load` + the bytecode-cache probe ahead of the pops. V8 compile /
+/// instantiate stays here, on the isolate thread.
+fn load_module_graph_overlapped(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    host: &dyn ModuleHost,
+    entry: PathBuf,
+    prefetch: &mut GraphPrefetcher<'_, '_>,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut work = VecDeque::from([entry]);
     while let Some(path) = work.pop_front() {
         if tc
             .get_slot::<ModuleMap>()
@@ -1610,6 +1849,9 @@ fn load_module_graph(
         // runtime export names) as the module at this path. JSON files
         // ride the same branch when they arrive via npm resolution.
         let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+        // Set when the pool loaded this path: the worker's cache probe
+        // (key + blob) rides along so nothing is hashed or read twice.
+        let mut prefetched = None;
         let code = if let Some(name) = builtin {
             let Some(exports) = crate::cjs::get_builtin(tc, &name) else {
                 return Err(vec![catch_to_diagnostic(tc, &path.to_string_lossy())]);
@@ -1637,7 +1879,18 @@ fn load_module_graph(
             }
             crate::cjs::facade_source(tc, &path, exports)
         } else {
-            host.load(&path)?
+            match prefetch.take(&path) {
+                // A parked Err surfaces HERE — when the path is popped, not
+                // when the worker hit it — so error content and ordering are
+                // byte-identical to the inline call below.
+                Some(Prefetched::Loaded { code, key, cached }) => {
+                    prefetched = Some((key, cached));
+                    code
+                }
+                Some(Prefetched::Failed(diags)) => return Err(diags),
+                Some(Prefetched::Panicked(payload)) => std::panic::resume_unwind(payload),
+                None => host.load(&path)?,
+            }
         };
         let file = path.to_string_lossy().into_owned();
 
@@ -1663,8 +1916,16 @@ fn load_module_graph(
         // AND the generated builtin/CJS/JSON facades, all of which are
         // deterministic for a given source string (a different facade is a
         // different key, hence a miss, never a wrong hit).
-        let cache_key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
-        let cached = crate::code_cache::load(&cache_key);
+        let (cache_key, cached) = match prefetched {
+            // The pool already derived the key and probed the cache for this
+            // exact source; reuse both.
+            Some((key, cached)) => (key, cached),
+            None => {
+                let key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
+                let cached = crate::code_cache::load(&key);
+                (key, cached)
+            }
+        };
         let consuming = cached.is_some();
         let seeded = cached.as_ref().is_some_and(|c| c.seeded);
         let mut source = match cached {
@@ -1799,6 +2060,17 @@ fn load_module_graph(
                 .expect("module map installed")
                 .edges
                 .insert((path.clone(), specifier), resolved.clone());
+            // Paths already in the map pop straight into the `continue`
+            // above; don't load them ahead either (dyn-import re-entry,
+            // diamonds resolved by an earlier pop).
+            if !tc
+                .get_slot::<ModuleMap>()
+                .expect("module map installed")
+                .by_path
+                .contains_key(&resolved)
+            {
+                prefetch.enqueue(&resolved);
+            }
             work.push_back(resolved);
         }
     }
