@@ -57,6 +57,9 @@ const SPAWN_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long retire() waits for an old daemon that ACKED Shutdown to
+/// actually exit before falling back to kill_daemon.
+const RETIRE_EXIT_WAIT: Duration = Duration::from_secs(2);
 /// Server-side bound on reading one request line / writing one response.
 const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// After a spawn that never came up, don't try again for this long.
@@ -723,15 +726,46 @@ fn try_existing(tsconfig: &Path) -> Option<Result<Vec<Diagnostic>, String>> {
     }
 }
 
+/// Retire an outdated daemon (version skew, tsgo lookup change): ask it to
+/// shut down and WAIT (bounded) until its process is actually gone, falling
+/// back to [`kill_daemon`] like `stop()` does. Returning while the old
+/// process still runs would let a busy old daemon process the queued
+/// Shutdown minutes later and delete the NEW daemon's freshly written
+/// state file, orphaning it (the next check would then spawn a third).
 fn retire(state: &StateFile, tsconfig: &Path) {
-    let _ = request(
+    let answered = request(
         state,
         &Request::Shutdown {
             token: state.token.clone(),
         },
         SHUTDOWN_TIMEOUT,
-    );
+    )
+    .is_some_and(|r| r.ok);
+    if answered {
+        // Acked: exit is imminent (the accept loop returns right after
+        // responding); poll briefly and only then stop being polite.
+        wait_for_daemon_exit(state.pid, RETIRE_EXIT_WAIT);
+    } else {
+        // Wedged, or an old single-threaded daemon deep in a check that
+        // would only process our queued Shutdown afterwards: kill it now
+        // so its delayed cleanup can never fire.
+        kill_daemon(state.pid);
+    }
     let _ = std::fs::remove_file(state_path(tsconfig));
+}
+
+/// Poll until `pid` no longer names a live oam process, killing it at the
+/// deadline. Bounds an old daemon's delayed cleanup to BEFORE the caller
+/// proceeds to respawn.
+fn wait_for_daemon_exit(pid: u32, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    while daemon_process_alive(pid) {
+        if Instant::now() >= deadline {
+            kill_daemon(pid);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn status(target: &Path) -> DaemonStatus {
@@ -1596,6 +1630,19 @@ mod tests {
         assert!(!image_is_oam("oamd"));
         assert!(!image_is_oam("oam-helper.exe"));
         assert!(!image_is_oam(""));
+    }
+
+    #[test]
+    fn wait_for_daemon_exit_never_kills_a_non_oam_process() {
+        // Our own pid is live but names the test binary (oam_ts-<hash>),
+        // not oam: the poll must treat it as not-ours and return at once —
+        // never spin to the deadline, and never kill it.
+        let started = Instant::now();
+        wait_for_daemon_exit(std::process::id(), Duration::from_secs(10));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a foreign pid must not be polled to the deadline"
+        );
     }
 
     #[test]
