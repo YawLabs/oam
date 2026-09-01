@@ -1598,11 +1598,12 @@ fn prefetch_enabled() -> bool {
 /// them at pop time in place of the inline `host.load` + cache probe.
 enum Prefetched {
     /// `host.load` succeeded; the bytecode-cache probe for that exact source
-    /// rides along (the same `key_for` + `load` calls the inline path makes,
-    /// so `OAM_CODE_CACHE=0` behaves identically).
+    /// rides along (the same gated `key_for` + `load` calls the inline path
+    /// makes -- `key` is None when the cache is off, so `OAM_CODE_CACHE=0`
+    /// skips the SHA-256 keying identically on both paths).
     Loaded {
         code: String,
-        key: crate::code_cache::CacheKey,
+        key: Option<crate::code_cache::CacheKey>,
         cached: Option<crate::code_cache::Loaded>,
     },
     /// `host.load` failed. Parked until the path is popped so the error is
@@ -1661,8 +1662,9 @@ fn prefetch_worker(host: &dyn ModuleHost, shared: &PrefetchShared) {
         // so nothing observes state the panic may have torn.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             host.load(&path).map(|code| {
-                let key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
-                let cached = crate::code_cache::load(&key);
+                let key = crate::code_cache::enabled()
+                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+                let cached = key.as_ref().and_then(crate::code_cache::load);
                 (code, key, cached)
             })
         }));
@@ -1921,8 +1923,9 @@ fn load_module_graph_overlapped(
             // exact source; reuse both.
             Some((key, cached)) => (key, cached),
             None => {
-                let key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
-                let cached = crate::code_cache::load(&key);
+                let key = crate::code_cache::enabled()
+                    .then(|| crate::code_cache::key_for(&code, crate::code_cache::Kind::Module));
+                let cached = key.as_ref().and_then(crate::code_cache::load);
                 (key, cached)
             }
         };
@@ -1955,17 +1958,21 @@ fn load_module_graph_overlapped(
         // blob is produced AFTER the graph evaluates (store_pending_code_cache)
         // so it carries bytecode for the functions evaluation compiled, not
         // just the top level -- the same produce-after-run shape as the CJS
-        // site. Nothing is serialized here. A rejected SEED is dropped so a
-        // later load in this process is not handed the rejected bytes again.
-        // enabled() gates the bookkeeping so an off switch (OAM_CODE_CACHE=0)
-        // leaves no residual work.
+        // site. Nothing is serialized here. A rejected SEED is dropped AND
+        // recorded on disk (tombstone) so neither a later load in this
+        // process nor a later run of the same binary is handed the rejected
+        // bytes again. A None key means the cache is off (OAM_CODE_CACHE=0),
+        // which leaves no residual bookkeeping.
         let rejected = consuming
             && source
                 .get_cached_data()
                 .map(|cd| cd.rejected())
                 .unwrap_or(true);
-        if rejected && seeded {
-            crate::code_cache::forget_seed(&cache_key);
+        if rejected
+            && seeded
+            && let Some(cache_key) = &cache_key
+        {
+            crate::code_cache::record_seed_rejection(cache_key);
         }
         let refresh_cache = !consuming || rejected;
 
@@ -1980,7 +1987,7 @@ fn load_module_graph_overlapped(
                 .entry(hash)
                 .or_default()
                 .push(path.clone());
-            if refresh_cache && crate::code_cache::enabled() {
+            if refresh_cache && let Some(cache_key) = cache_key {
                 map.pending_code_cache.push((path.clone(), cache_key));
             }
         }

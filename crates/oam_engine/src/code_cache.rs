@@ -23,7 +23,11 @@
 //!
 //! Store layout: `<cache_root>/bytecode/<aa>/<rest>.v8c`, where `cache_root`
 //! is `OAM_CACHE_DIR` if set (tests), else the platform cache dir, else the
-//! system temp dir (see [`resolve_cache_root`]). The cache is a pure
+//! system temp dir (see [`resolve_cache_root`]). A sibling `<rest>.seedrej`
+//! tombstone records that V8 rejected the embedded SEED for that key, which
+//! is what lets a refreshed disk blob supersede the seed without giving the
+//! user-writable cache dir priority over a compiled binary's embedded
+//! bytecode (see [`load`]). The cache is a pure
 //! optimization: every read/write failure is swallowed, and a miss just falls
 //! through to a normal compile. Housekeeping is opportunistic and off the
 //! load path: see [`maybe_sweep`].
@@ -93,8 +97,8 @@ pub(crate) struct CacheKey(String);
 /// A blob returned by [`load`]: the raw bytes plus where they came from.
 /// `seeded` is true when the bytes are the in-process seed (embedded bytecode
 /// from `oam compile`) rather than a disk entry; a consumer that sees V8
-/// reject a seeded blob calls [`forget_seed`] so the refreshed disk blob is
-/// what later loads in this process see.
+/// reject a seeded blob calls [`record_seed_rejection`] so the refreshed disk
+/// blob is what later loads -- in this process and in later runs -- see.
 pub(crate) struct Loaded {
     pub bytes: Vec<u8>,
     pub seeded: bool,
@@ -215,6 +219,22 @@ fn path_for_key(key: &CacheKey) -> PathBuf {
         .join(format!("{}.v8c", &key.0[2..]))
 }
 
+/// Disk path for a key's seed-rejection tombstone:
+/// `<cache_root>/<aa>/<rest>.seedrej`. See [`record_seed_rejection`].
+fn tombstone_path(key: &CacheKey) -> PathBuf {
+    cache_root()
+        .join(&key.0[..2])
+        .join(format!("{}.seedrej", &key.0[2..]))
+}
+
+/// Read the disk blob for a key. `None` on miss, any I/O error, or an empty
+/// file (never worth consuming).
+fn read_blob(key: &CacheKey) -> Option<Vec<u8>> {
+    std::fs::read(path_for_key(key))
+        .ok()
+        .filter(|b| !b.is_empty())
+}
+
 /// In-process bytecode seed: blobs handed to the runtime directly (not via
 /// disk), keyed by the same content hash as the disk store. `oam compile`
 /// seeds the embedded bytecode here at startup, so a compiled binary's first
@@ -245,11 +265,28 @@ pub(crate) fn seed(source: &str, kind: Kind, blob: Vec<u8>) {
 /// mismatch): the site then refreshes the disk entry, and dropping the seed
 /// keeps a later load in this process from being handed the rejected bytes
 /// again. Across processes the seed is re-inserted at every startup, so the
-/// cross-run half of the same guarantee is [`load`]'s disk-before-seed order.
+/// cross-run half of the same guarantee is the `.seedrej` tombstone
+/// [`record_seed_rejection`] writes, which flips [`load`] to the refreshed
+/// disk blob for that key.
 pub(crate) fn forget_seed(key: &CacheKey) {
     if let Ok(mut map) = seed_map().lock() {
         map.remove(key);
     }
+}
+
+/// Record that V8 rejected the SEEDED blob for `key`: drop the in-memory seed
+/// (a later load in this process must not see it again) and write a
+/// `<key>.seedrej` tombstone next to the refreshed blob so later PROCESSES
+/// prefer the disk entry over the embedded seed for this one key. Only the
+/// rejection path writes it -- a compiled binary whose seed is accepted keeps
+/// its zero-writes property. Best-effort, like every write here.
+pub(crate) fn record_seed_rejection(key: &CacheKey) {
+    forget_seed(key);
+    let path = tombstone_path(key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"");
 }
 
 /// Load a cached bytecode blob for `key`, if one exists for the current V8
@@ -257,32 +294,40 @@ pub(crate) fn forget_seed(key: &CacheKey) {
 /// `v8::script_compiler::CachedData` to consume. `None` on miss or any I/O
 /// error (the cache is never a correctness dependency).
 ///
-/// Disk is consulted before the in-memory seed. A same-host seed is normally
-/// the only copy of its key and needs no writable cache dir (the read of a
-/// missing path is the whole cost); a disk blob under a seeded key exists only
-/// because an earlier run refreshed it after V8 rejected the seed (or a lazy
-/// `oam run` of the same source produced one), so it is the newer, accepted
-/// blob and supersedes the seed. Seed-first ordering would re-reject and
-/// re-write on every run of that binary.
+/// The in-memory seed is consulted before disk: the embedded blob ships
+/// INSIDE the binary, so it is the trusted copy -- disk-first would let any
+/// V8-header-sane blob planted in the user-writable cache dir decide what a
+/// compiled binary runs. The one case disk supersedes a seeded key is a
+/// recorded rejection (the `.seedrej` tombstone [`record_seed_rejection`]
+/// writes): the disk blob is then the newer, ACCEPTED refresh from an
+/// earlier run, and staying seed-first there would re-reject and re-write on
+/// every run of that binary.
 pub(crate) fn load(key: &CacheKey) -> Option<Loaded> {
     if !enabled() {
         return None;
     }
     maybe_sweep();
-    if let Some(bytes) = std::fs::read(path_for_key(key))
+    let seeded = seed_map()
+        .lock()
         .ok()
-        .filter(|b| !b.is_empty())
-    {
+        .and_then(|map| map.get(key).filter(|b| !b.is_empty()).cloned());
+    if let Some(bytes) = seeded {
+        if tombstone_path(key).is_file()
+            && let Some(disk) = read_blob(key)
+        {
+            return Some(Loaded {
+                bytes: disk,
+                seeded: false,
+            });
+        }
         return Some(Loaded {
             bytes,
-            seeded: false,
+            seeded: true,
         });
     }
-    let map = seed_map().lock().ok()?;
-    let bytes = map.get(key).filter(|b| !b.is_empty())?.clone();
-    Some(Loaded {
+    read_blob(key).map(|bytes| Loaded {
         bytes,
-        seeded: true,
+        seeded: false,
     })
 }
 
@@ -322,7 +367,8 @@ pub(crate) fn store(key: &CacheKey, bytes: &[u8]) {
 
 // ── housekeeping ─────────────────────────────────────────────────────────
 
-/// Stamp file in the cache root whose mtime records the last COMPLETED sweep.
+/// Stamp file in the cache root whose mtime records the last STARTED sweep.
+/// Written BEFORE the walk, doubling as a writability probe -- see [`sweep`].
 const SWEEP_STAMP: &str = ".sweep";
 /// Minimum interval between sweeps.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -339,8 +385,9 @@ const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// says the last completed sweep is older than [`SWEEP_INTERVAL`], walk the
 /// cache root on a detached thread and delete orphaned temp files older than
 /// [`TMP_MAX_AGE`] and blobs older than [`BLOB_MAX_AGE`]. Detached and never
-/// joined, so no load ever waits on it; a process that exits mid-walk leaves
-/// the stamp untouched and the next process finishes the job. Concurrent
+/// joined, so no load ever waits on it; a process that exits mid-walk has
+/// already stamped, so the leftover work waits for the next interval rather
+/// than the next process. Concurrent
 /// processes may walk at once -- a file deleted twice is a swallowed error.
 fn maybe_sweep() {
     static ONCE: Once = Once::new();
@@ -378,10 +425,17 @@ fn sweep_due(root: &Path, now: SystemTime) -> bool {
 struct SweepReport {
     tmp_files: usize,
     blobs: usize,
+    seed_tombstones: usize,
 }
 
-/// Delete stale entries under `root` (see [`maybe_sweep`]) and, once the walk
-/// completes, touch the stamp. Pure over `now` so the age rules are
+/// Delete stale entries under `root` (see [`maybe_sweep`]). The stamp is
+/// touched FIRST, doubling as a writability probe: on an unwritable root (a
+/// container image baked with a warm, read-only cache -- the exact
+/// environment the seed path serves) the walk would delete nothing, a
+/// post-walk stamp write would fail, and every subsequent process would
+/// re-walk the whole tree forever. The trade: a process killed mid-walk
+/// re-sweeps after the NEXT interval instead of immediately, which the
+/// interval semantics allow. Pure over `now` so the age rules are
 /// unit-tested against files with set mtimes. Shard directories are left in
 /// place: removing an empty one would race a concurrent `store`'s
 /// `create_dir_all` + write.
@@ -414,12 +468,21 @@ fn sweep(root: &Path, now: SystemTime) -> SweepReport {
                 && std::fs::remove_file(&path).is_ok()
             {
                 report.blobs += 1;
+            } else if name.ends_with(".seedrej")
+                && older_than(&path, now, BLOB_MAX_AGE)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                // A tombstone outliving its blob only costs one re-rejection
+                // and refresh on the next run of the binary that seeded it.
+                report.seed_tombstones += 1;
             }
         }
     }
     let mut report = SweepReport::default();
+    if std::fs::write(root.join(SWEEP_STAMP), b"").is_err() {
+        return report;
+    }
     walk(root, now, &mut report);
-    let _ = std::fs::write(root.join(SWEEP_STAMP), b"");
     report
 }
 
@@ -646,6 +709,13 @@ mod tests {
             BLOB_MAX_AGE - Duration::from_secs(60),
             now,
         );
+        // Old and fresh seed-rejection tombstones.
+        write_aged(
+            &shard.join("old.seedrej"),
+            BLOB_MAX_AGE + Duration::from_secs(1),
+            now,
+        );
+        write_aged(&shard.join("new.seedrej"), Duration::from_secs(1), now);
         // An unrelated file is never touched.
         write_aged(&shard.join("notes.txt"), BLOB_MAX_AGE * 2, now);
 
@@ -654,13 +724,16 @@ mod tests {
             report,
             SweepReport {
                 tmp_files: 1,
-                blobs: 1
+                blobs: 1,
+                seed_tombstones: 1
             }
         );
         assert!(!shard.join(".1.0.tmp").exists());
         assert!(shard.join(".2.0.tmp").exists());
         assert!(!shard.join("old.v8c").exists());
         assert!(shard.join("new.v8c").exists());
+        assert!(!shard.join("old.seedrej").exists());
+        assert!(shard.join("new.seedrej").exists());
         assert!(shard.join("notes.txt").exists());
         assert!(shard.is_dir(), "shard dirs are left in place");
         assert!(
@@ -697,6 +770,70 @@ mod tests {
         f.set_modified(now + Duration::from_secs(3600)).unwrap();
         assert!(!sweep_due(&root, now));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Probe-first ordering: when the stamp cannot be written (a read-only
+    /// root -- simulated portably by a DIRECTORY at the stamp path), the walk
+    /// must not run at all. Deletions here WOULD succeed, so surviving files
+    /// prove the skip, not permissions.
+    #[test]
+    fn sweep_skips_the_walk_when_the_stamp_cannot_be_written() {
+        let root = scratch("nostamp");
+        std::fs::create_dir_all(root.join(SWEEP_STAMP)).unwrap();
+        let shard = root.join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        let now = SystemTime::now();
+        write_aged(&shard.join(".1.0.tmp"), TMP_MAX_AGE * 2, now);
+        write_aged(
+            &shard.join("old.v8c"),
+            BLOB_MAX_AGE + Duration::from_secs(1),
+            now,
+        );
+        assert_eq!(sweep(&root, now), SweepReport::default());
+        assert!(
+            shard.join(".1.0.tmp").exists() && shard.join("old.v8c").exists(),
+            "an unwritable root must not be walked"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The compiled-binary trust order: a seeded key serves the SEED even
+    /// when a disk entry coexists (the embedded blob is the trusted copy; a
+    /// blob planted in the user-writable cache dir must not decide what a
+    /// compiled binary runs), until a recorded rejection flips that key to
+    /// the refreshed disk blob.
+    #[test]
+    fn load_prefers_seed_until_a_rejection_is_recorded() {
+        let _rt = crate::JsRuntime::new();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = format!("seedfirst-{}-{nanos}", std::process::id());
+        let key = key_for(&source, Kind::Function);
+        seed(&source, Kind::Function, b"seed-bytes".to_vec());
+        store(&key, b"disk-bytes");
+        let got = load(&key).expect("seeded key loads");
+        assert!(got.seeded, "the seed must win over a coexisting disk entry");
+        assert_eq!(got.bytes, b"seed-bytes");
+
+        record_seed_rejection(&key);
+        assert!(
+            tombstone_path(&key).is_file(),
+            "a rejection leaves a tombstone"
+        );
+        let got = load(&key).expect("disk blob loads");
+        assert!(
+            !got.seeded,
+            "after a recorded rejection the refreshed disk blob supersedes"
+        );
+        assert_eq!(got.bytes, b"disk-bytes");
+
+        // The in-process half: the seed was forgotten, so with the disk
+        // entries gone nothing serves the rejected bytes again.
+        let _ = std::fs::remove_file(path_for_key(&key));
+        let _ = std::fs::remove_file(tombstone_path(&key));
+        assert!(load(&key).is_none());
     }
 
     #[test]
