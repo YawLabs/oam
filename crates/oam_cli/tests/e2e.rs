@@ -35,6 +35,11 @@ fn oam(args: &[&str]) -> Output {
         .env("OAM_ENABLE_NATIVE_ADDONS", "1")
         .env("OAM_CACHE_DIR", cache)
         .env("OAM_DAEMON_IDLE_MS", "45000")
+        // Warn-mode `oam run` waits this long for the checker after the
+        // program exits (default 10s). Under the full-parallel suite a cold
+        // tsgo regularly missed 10s, which used to force skips (8d7b515)
+        // that hid real assertions; 60s keeps them live on loaded boxes.
+        .env("OAM_CHECK_WAIT_MS", "60000")
         .output()
         .expect("oam binary runs")
 }
@@ -5370,19 +5375,13 @@ fn run_clean_typescript_adds_no_noise() {
         eprintln!("skipping: tsgo not installed");
         return;
     }
-    if stderr.contains("daemon warming") {
-        // Human-mode twin of the OAM-TS0005 skip in the warn-mode test above:
-        // main.rs waits 10s for the checker and prints this when the deadline
-        // hits first, which under the full-parallel suite is a load artifact,
-        // not noise the run added. Measured 2026-08-23 on win-arm64, 10
-        // interleaved pairs: 2/10 failures for a static-CRT build and 2/10 for
-        // a dynamic-CRT build of the SAME commit, and near-certain failure
-        // back-to-back -- it tracks daemon warmth and nothing else. Waiting for
-        // a warm daemon and then asserting would only lower the rate, since a
-        // loaded box can miss the 10s deadline warm too.
-        eprintln!("skipping: checker did not finish before the wait deadline");
-        return;
-    }
+    // No warming skip any more: oam() lengthens the post-exit wait to 60s
+    // via OAM_CHECK_WAIT_MS, so a cold tsgo under full-parallel load
+    // finishes inside the budget and the clean-run assertion stays live.
+    // (The skip this replaces, 8d7b515, blamed "daemon warmth" -- but this
+    // fixture has no tsconfig, so the check takes the ONE-SHOT path and no
+    // daemon ever ran; the flake was a cold tsgo under load losing a 10s
+    // race, which the longer budget addresses directly.)
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
     assert_eq!(stderr.trim(), "", "clean runs stay quiet: {stderr}");
@@ -5520,6 +5519,217 @@ fn check_daemon_lifecycle_and_cache() {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false),
         "tsbuildinfo expected under the oam cache"
+    );
+}
+
+#[test]
+fn check_daemon_cache_invalidates_on_checkjs_and_nested_target_edits() {
+    // Regression (full-pass finding, measured at 01bee57): the daemon
+    // fingerprinted only ts/tsx/mts/cts and skipped ANY dir named `target`,
+    // so a type error introduced in a checkJs .js file or under src/target/
+    // was served a stale cached "clean" while --no-daemon reported
+    // OAM-TS2322.
+    let cache = write_temp("daemon-fp-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "fpproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true, \"allowJs\": true, \"checkJs\": true}}",
+    );
+    write_temp("fpproj/src/target/t.ts", "export const t: number = 1;");
+    let proj = write_temp("fpproj/src/j.js", "export const j = 1;")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let oam_d = |args: &[&str]| -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .output()
+            .expect("oam runs")
+    };
+
+    let first = oam_d(&["check", proj.to_str().unwrap()]);
+    if !tsgo_available(&first) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    // Warm the cache with an unchanged tree.
+    assert!(oam_d(&["check", proj.to_str().unwrap()]).status.success());
+
+    // A checkJs .js edit must invalidate the daemon cache.
+    write_temp(
+        "fpproj/src/j.js",
+        "/** @type {number} */\nexport const j = 'broken';",
+    );
+    let js_edit = oam_d(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        !js_edit.status.success(),
+        "stale clean served after a checkJs .js edit: {}",
+        String::from_utf8_lossy(&js_edit.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&js_edit.stderr).contains("OAM-TS2322"),
+        "stderr: {}",
+        String::from_utf8_lossy(&js_edit.stderr)
+    );
+
+    // Back to clean, then break a file under src/target/ -- `target` is a
+    // build dir only at the PROJECT root, not two levels down.
+    write_temp("fpproj/src/j.js", "export const j = 1;");
+    assert!(oam_d(&["check", proj.to_str().unwrap()]).status.success());
+    write_temp(
+        "fpproj/src/target/t.ts",
+        "export const t: number = 'broken';",
+    );
+    let target_edit = oam_d(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        !target_edit.status.success(),
+        "stale clean served after an edit under src/target/: {}",
+        String::from_utf8_lossy(&target_edit.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&target_edit.stderr).contains("OAM-TS2322"),
+        "stderr: {}",
+        String::from_utf8_lossy(&target_edit.stderr)
+    );
+
+    let _ = oam_d(&["daemon", "stop", proj.to_str().unwrap()]);
+}
+
+/// Write a fake tsgo script; returns the path to point OAM_TSGO at.
+/// `body_unix`/`body_windows` are the full script bodies.
+fn write_fake_tsgo(name: &str, body_windows: &str, body_unix: &str) -> PathBuf {
+    if cfg!(windows) {
+        write_temp(&format!("{name}/tsgo.cmd"), body_windows)
+    } else {
+        let path = write_temp(&format!("{name}/tsgo"), body_unix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+#[test]
+fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
+    // Regression (full-pass finding, measured): any exit-0 program named
+    // tsgo used to read as a CLEAN check (junk output parsed to zero
+    // diagnostics). The --version gate turns it into OAM-TS0002 on both the
+    // one-shot and the daemon path, and the failed daemon records why.
+    let fake = write_fake_tsgo(
+        "fake-tsgo",
+        "@echo off\r\necho not a compiler\r\nexit /b 0\r\n",
+        "#!/bin/sh\necho 'not a compiler'\nexit 0\n",
+    );
+    let cache = write_temp("fake-tsgo-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "fakeproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("fakeproj/bad.ts", "export const n: number = 'oops';")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let run = |args: &[&str]| -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .env("OAM_TSGO", &fake)
+            .output()
+            .expect("oam runs")
+    };
+
+    let one_shot = run(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    assert!(
+        !one_shot.status.success(),
+        "a junk-emitting exit-0 tsgo must never report clean"
+    );
+    assert!(
+        String::from_utf8_lossy(&one_shot.stderr).contains("OAM-TS0002"),
+        "stderr: {}",
+        String::from_utf8_lossy(&one_shot.stderr)
+    );
+
+    // Daemon path: serve() fails its startup probe, the client falls back,
+    // and the one-shot fallback reports the same OAM-TS0002.
+    let via_daemon = run(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(!via_daemon.status.success());
+    assert!(
+        String::from_utf8_lossy(&via_daemon.stderr).contains("OAM-TS0002"),
+        "stderr: {}",
+        String::from_utf8_lossy(&via_daemon.stderr)
+    );
+
+    // The daemon's failure is observable: status carries the recorded
+    // reason and the spawn-failure timestamp instead of a bare
+    // {"running":false}.
+    let status = run(&["daemon", "status", proj.to_str().unwrap()]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    assert_eq!(parsed["running"], false);
+    assert!(
+        parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("tsgo")),
+        "status must carry the daemon's failure reason: {parsed}"
+    );
+    assert!(
+        parsed["spawn_failed_ms_ago"].as_u64().is_some(),
+        "status must carry the spawn-failure marker: {parsed}"
+    );
+}
+
+#[test]
+fn check_tsgo_timeout_surfaces_as_a_diagnostic_not_a_hang() {
+    // A wedged tsgo must cost OAM_TSGO_TIMEOUT_MS and produce OAM-TS0006,
+    // never an unbounded hang (full-pass finding: no deadline existed
+    // anywhere). The fake answers --version like a real tsgo 7, then
+    // sleeps ~30s for anything else; the 1.5s budget kills it.
+    let fake = write_fake_tsgo(
+        "slow-tsgo",
+        "@echo off\r\nif \"%1\"==\"--version\" (\r\n  echo Version 7.0.0-fake\r\n  exit /b 0\r\n)\r\nping -n 31 127.0.0.1 >nul\r\nexit /b 0\r\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'Version 7.0.0-fake'\n  exit 0\nfi\nsleep 30\n",
+    );
+    let file = write_temp("slowproj/lonely.ts", "export const n: number = 1;");
+    let cache = write_temp("slow-tsgo-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let started = std::time::Instant::now();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["check", file.to_str().unwrap(), "--json", "--no-daemon"])
+        // Isolate the version-probe disk cache along with everything else.
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_TSGO", &fake)
+        .env("OAM_TSGO_TIMEOUT_MS", "1500")
+        .output()
+        .expect("oam runs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("OAM-TS0006") && stderr.contains("timed out"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the killed run must not wait for the sleeper's natural exit ({:?})",
+        started.elapsed()
     );
 }
 
