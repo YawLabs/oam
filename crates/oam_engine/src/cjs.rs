@@ -398,53 +398,67 @@ pub(crate) fn load_cjs<'s>(
     };
 
     let source = if needs_transpile {
-        if let Some(cached) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
-            // Already plain JS from `oam install --precompile`; do NOT re-transpile.
-            cached
-        } else if let Some(cached) = oam_loader::transpile_cache::try_get(&key, &raw) {
-            // Persistent oxc output from a previous run (either host); the
-            // artifact's self-hash was verified, so a corrupt entry
-            // re-transpiles instead of executing.
-            cached
-        } else {
-            // oxc strips TS types / lowers JSX (CommonJS-shaped, so the
-            // injected jsx-runtime import is a require()), then the CJS
-            // wrapper below compiles+runs the resulting JS. A transpile
-            // failure throws a SyntaxError carrying the loader's ODIF code
-            // and the first diagnostic's file:line:col; ESM syntax that
-            // survives stripping (e.g. a bare `export`) fails later at
-            // compile_function and surfaces as the V8 SyntaxError.
-            match oam_loader::transpile_typescript(&key, &raw) {
-                Ok(js) => {
-                    oam_loader::transpile_cache::store(&key, &raw, &js);
-                    js
-                }
-                Err(e) => {
-                    let extra = e.diagnostics.len().saturating_sub(1);
-                    let (code, message) = match e.diagnostics.first() {
-                        Some(d) => {
-                            let mut message = match d.spans.first() {
-                                Some(span) => format!(
-                                    "{}:{}:{}: {}",
-                                    span.file, span.start.line, span.start.col, d.message
-                                ),
-                                None => format!("{file}: {}", d.message),
-                            };
-                            if extra > 0 {
-                                message.push_str(&format!(" (+{extra} more)"));
+        let (js, source_map) =
+            if let Some(hit) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
+                // Already plain JS from `oam install --precompile`; do NOT re-transpile.
+                hit
+            } else if let Some(hit) = oam_loader::transpile_cache::try_get(&key, &raw) {
+                // Persistent oxc output from a previous run (either host); the
+                // artifact's self-hash was verified, so a corrupt entry
+                // re-transpiles instead of executing.
+                hit
+            } else {
+                // oxc strips TS types / lowers JSX (CommonJS-shaped, so the
+                // injected jsx-runtime import is a require()), then the CJS
+                // wrapper below compiles+runs the resulting JS. A transpile
+                // failure throws a SyntaxError carrying the loader's ODIF code
+                // and the first diagnostic's file:line:col; ESM syntax that
+                // survives stripping (e.g. a bare `export`) fails later at
+                // compile_function and surfaces as the V8 SyntaxError.
+                match oam_loader::transpile_typescript_mapped(&key, &raw) {
+                    Ok(out) => {
+                        oam_loader::transpile_cache::store(
+                            &key,
+                            &raw,
+                            &out.code,
+                            out.source_map.as_deref(),
+                        );
+                        (out.code, out.source_map)
+                    }
+                    Err(e) => {
+                        let extra = e.diagnostics.len().saturating_sub(1);
+                        let (code, message) = match e.diagnostics.first() {
+                            Some(d) => {
+                                let mut message = match d.spans.first() {
+                                    Some(span) => format!(
+                                        "{}:{}:{}: {}",
+                                        span.file, span.start.line, span.start.col, d.message
+                                    ),
+                                    None => format!("{file}: {}", d.message),
+                                };
+                                if extra > 0 {
+                                    message.push_str(&format!(" (+{extra} more)"));
+                                }
+                                (d.code.clone(), message)
                             }
-                            (d.code.clone(), message)
-                        }
-                        None => (
-                            "OAM-PARSE0002".to_string(),
-                            format!("{file}: transpile failed"),
-                        ),
-                    };
-                    throw_syntax_error_with_code(scope, &code, &message);
-                    return None;
+                            None => (
+                                "OAM-PARSE0002".to_string(),
+                                format!("{file}: transpile failed"),
+                            ),
+                        };
+                        throw_syntax_error_with_code(scope, &code, &message);
+                        return None;
+                    }
                 }
-            }
+            };
+        // Register the map (cache hits included -- warm runs must keep
+        // stack-trace fidelity) under the same canonical string the CJS
+        // wrapper's ScriptOrigin carries (`file`), so every surface that
+        // formats a V8 position for this module can remap it to the source.
+        if let Some(map) = source_map {
+            oam_loader::sourcemap::record(&file, map);
         }
+        js
     } else {
         raw
     };

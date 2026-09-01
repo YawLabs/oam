@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 16] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 17] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         (
             "fetchBodyRead",
@@ -141,6 +141,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "replayGetMode",
             v8::Function::new(scope, op_replay_get_mode).unwrap(),
+        ),
+        // Generated -> source position remap for transpiled files
+        // (Error.prepareStackTrace in js/bootstrap.js is the consumer).
+        (
+            "mapPosition",
+            v8::Function::new(scope, op_map_position).unwrap(),
         ),
     ];
     for (name, function) in internal_bindings {
@@ -193,6 +199,38 @@ pub(crate) fn spawn_op_unref(
     pending_ops_mut!(scope).park(id, resolver);
 
     rv.set(promise.into());
+}
+
+/// `__oam.mapPosition(file, line, column) -> [line, column] | null`:
+/// generated -> source position through the loader's source-map registry.
+/// `line` and `column` are 1-based on both sides (the JS `CallSite`
+/// convention; the registry speaks 0-based columns, converted here). Null
+/// when the file has no registered map or the position has no mapping --
+/// the caller keeps the generated position.
+fn op_map_position(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(v8::null(scope).into());
+    let Some(file) = args.get(0).to_string(scope) else {
+        return;
+    };
+    let file = file.to_rust_string_lossy(scope);
+    let line = args.get(1).uint32_value(scope).unwrap_or(0);
+    let column = args.get(2).uint32_value(scope).unwrap_or(0);
+    if line == 0 || column == 0 {
+        return;
+    }
+    let Some((src_line, src_col)) = oam_loader::sourcemap::lookup(&file, line, column - 1) else {
+        return;
+    };
+    let out = v8::Array::new(scope, 2);
+    let line_v8 = v8::Number::new(scope, f64::from(src_line));
+    let col_v8 = v8::Number::new(scope, f64::from(src_col + 1));
+    out.set_index(scope, 0, line_v8.into());
+    out.set_index(scope, 1, col_v8.into());
+    rv.set(out.into());
 }
 
 fn op_sleep(

@@ -1787,16 +1787,32 @@ impl oam_engine::ModuleHost for CliHost {
                 // content-addressed transpile cache (ALL transpiled sources,
                 // project files included) -> oxc, storing the fresh output
                 // so the next run skips the pipeline entirely.
-                if let Some(cached) = oam_loader::precompile::try_precompile_cache(path, &source) {
-                    Ok(cached)
-                } else if let Some(cached) = oam_loader::transpile_cache::try_get(path, &source) {
-                    Ok(cached)
+                let (js, source_map) = if let Some(hit) =
+                    oam_loader::precompile::try_precompile_cache(path, &source)
+                {
+                    hit
+                } else if let Some(hit) = oam_loader::transpile_cache::try_get(path, &source) {
+                    hit
                 } else {
-                    let js = oam_loader::transpile_typescript(path, &source)
+                    let out = oam_loader::transpile_typescript_mapped(path, &source)
                         .map_err(|e| e.diagnostics)?;
-                    oam_loader::transpile_cache::store(path, &source, &js);
-                    Ok(js)
+                    oam_loader::transpile_cache::store(
+                        path,
+                        &source,
+                        &out.code,
+                        out.source_map.as_deref(),
+                    );
+                    (out.code, out.source_map)
+                };
+                // Register the map (cache hits included -- warm runs must
+                // keep stack-trace fidelity) under the SAME string the
+                // engine hands V8 as this module's ScriptOrigin
+                // (path.to_string_lossy in load_module_graph), so runtime
+                // position remap finds it.
+                if let Some(map) = source_map {
+                    oam_loader::sourcemap::record(&path.to_string_lossy(), map);
                 }
+                Ok(js)
             }
             _ => Ok(source),
         }

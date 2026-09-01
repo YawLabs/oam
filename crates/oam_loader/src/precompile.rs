@@ -15,14 +15,14 @@
 //! oxc, so the first `oam run` after `oam install --precompile` pays no
 //! transpile cost for node_modules TypeScript.
 //!
-//! # Artifact format (v1)
+//! # Artifact format (v2)
 //!
 //! Each cache entry is a single self-describing file, written atomically
 //! (unique temp file + rename):
 //!
 //! ```text
-//! // oam-precompile v1 <64 hex chars>
-//! <transpiled JavaScript>
+//! // oam-precompile v2 <64 hex chars> <js-byte-len>
+//! <transpiled JavaScript, exactly js-byte-len bytes><source-map JSON>
 //! ```
 //!
 //! The hex value is the freshness key:
@@ -32,8 +32,13 @@
 //! settings) means a package updated in place, an oam/oxc upgrade, and a
 //! tsconfig change that retargets `jsxImportSource` all invalidate the
 //! entry. The reader recomputes the key, verifies the header, and strips
-//! it; any mismatch is a miss, so the caller re-transpiles the same
-//! source and stays correct.
+//! it; any mismatch (a v1 artifact included -- different header prefix) is
+//! a miss, so the caller re-transpiles the same source and stays correct.
+//!
+//! The source map rides in the same artifact because a cache hit that
+//! served only the JS would lose runtime stack-trace fidelity on exactly
+//! the runs the cache exists for (the map remaps codegen positions back to
+//! the .ts the user wrote; the trailing half may be empty).
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -133,11 +138,13 @@ fn ensure_gitignore(oam_dir: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Artifact header prefix. The `v1` names the HEADER LAYOUT, not the
+/// Artifact header prefix. The `v2` names the HEADER LAYOUT (freshness key
+/// plus a js-byte-length field, body = js then source map), not the
 /// transform pipeline -- transform changes are covered by the fingerprint
 /// inside the hash (`TRANSPILE_FORMAT_VERSION` and the oxc crate versions
-/// are both part of `transpile_fingerprint`).
-const HEADER_PREFIX: &str = "// oam-precompile v1 ";
+/// are both part of `transpile_fingerprint`). Every v1 artifact misses on
+/// the prefix and is rewritten.
+const HEADER_PREFIX: &str = "// oam-precompile v2 ";
 
 fn to_hex(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -165,28 +172,56 @@ fn freshness_key(ts_path: &Path, source: &str) -> String {
     to_hex(&hasher.finalize().into())
 }
 
-/// The exact header line (without trailing newline) a fresh artifact for
-/// `ts_path` + `source` must carry. Public so tests and tooling can seed
-/// cache entries without re-deriving the key derivation.
+/// The header PREFIX (without the trailing js-byte-length field or
+/// newline) a fresh artifact for `ts_path` + `source` must open with:
+/// `// oam-precompile v2 <freshness key>`. Public so tests and tooling can
+/// verify freshness without re-deriving the key; to SEED an entry, build
+/// the whole file with `artifact_payload`.
 pub fn artifact_header(ts_path: &Path, source: &str) -> String {
     format!("{HEADER_PREFIX}{}", freshness_key(ts_path, source))
 }
 
-/// A cached artifact is fresh when its first line equals the expected
-/// header -- i.e. it was produced from this exact source by this exact
-/// transpiler configuration (see `freshness_key`). Reads only the first
-/// line. A missing file, a pre-v1 artifact (no header), or any mismatch
-/// (package updated in place, oam/oxc upgraded, JSX settings changed) is
-/// stale.
+/// The complete v2 artifact for `ts_path` + `source`: header line
+/// (freshness key + js byte length), then the JS, then the source map
+/// (omitted when `None`). Public so tests and tooling can seed cache
+/// entries without re-deriving the layout.
+pub fn artifact_payload(
+    ts_path: &Path,
+    source: &str,
+    js: &str,
+    source_map: Option<&str>,
+) -> String {
+    format!(
+        "{} {}\n{js}{}",
+        artifact_header(ts_path, source),
+        js.len(),
+        source_map.unwrap_or("")
+    )
+}
+
+/// A cached artifact is fresh when its first line carries the expected
+/// header (freshness key) followed by a js-byte-length field -- i.e. it
+/// was produced from this exact source by this exact transpiler
+/// configuration (see `freshness_key`). Reads only the first line. A
+/// missing file, a v1/pre-v1 artifact (different or no header), or any
+/// mismatch (package updated in place, oam/oxc upgraded, JSX settings
+/// changed) is stale.
 fn artifact_is_fresh(cache_js: &Path, expected_header: &str) -> bool {
     let Ok(file) = std::fs::File::open(cache_js) else {
         return false;
     };
     let mut reader = std::io::BufReader::new(file);
-    let mut line = String::with_capacity(expected_header.len() + 2);
-    match reader.read_line(&mut line) {
-        Ok(_) => line.trim_end_matches(['\n', '\r']) == expected_header,
-        Err(_) => false,
+    let mut line = String::with_capacity(expected_header.len() + 16);
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    match trimmed.strip_prefix(expected_header) {
+        Some(rest) => match rest.strip_prefix(' ') {
+            Some(len) => !len.is_empty() && len.bytes().all(|b| b.is_ascii_digit()),
+            None => false,
+        },
+        None => false,
     }
 }
 
@@ -287,8 +322,8 @@ pub fn precompile_package(
             continue;
         }
 
-        let js = match crate::transpile_typescript(ts_path, &source) {
-            Ok(js) => js,
+        let out = match crate::transpile_typescript_mapped(ts_path, &source) {
+            Ok(out) => out,
             Err(e) => {
                 let message = e
                     .diagnostics
@@ -303,7 +338,8 @@ pub fn precompile_package(
             }
         };
 
-        if let Err(error) = write_atomic(&cache_path, format!("{header}\n{js}").as_bytes()) {
+        let payload = artifact_payload(ts_path, &source, &out.code, out.source_map.as_deref());
+        if let Err(error) = write_atomic(&cache_path, payload.as_bytes()) {
             errors.push(PrecompileError::Io {
                 path: cache_path.clone(),
                 error,
@@ -343,19 +379,34 @@ pub fn precompile_package(
 /// (`node_modules/react/node_modules/scheduler/index.ts`) maps to
 /// `react/node_modules/scheduler/index.ts.js`, exactly the slot the writer
 /// (keyed on the full lockfile key) wrote.
-pub fn try_precompile_cache(ts_path: &Path, source: &str) -> Option<String> {
+pub fn try_precompile_cache(ts_path: &Path, source: &str) -> Option<(String, Option<String>)> {
     // Reader and writer must agree on the extension set: anything the
     // writer would never have produced is an immediate miss.
     if !is_precompilable(ts_path) {
         return None;
     }
 
-    // Anchor on the OUTERMOST node_modules ancestor (`ancestors()` yields
-    // innermost first) -- the project-level directory install writes to.
-    let nm = ts_path
+    // Anchor on the node_modules ancestor the INSTALL actually wrote to:
+    // walk candidates innermost-to-outermost and take the first that
+    // contains a `.oam/precompile` directory. A nested package's innermost
+    // candidate (the parent package's own node_modules) never carries one,
+    // so the walk lands on the project-level dir the writer keyed against;
+    // and when the PROJECT itself sits under some outer node_modules
+    // ancestor (a package checked out inside another tree), the project's
+    // own dir wins over the foreign outer one -- anchoring on the outermost
+    // unconditionally probed a path the writer never wrote. With no
+    // `.oam/precompile` anywhere, fall back to the outermost (a clean miss
+    // either way, without paying an extra stat per candidate on the common
+    // no-cache path).
+    let candidates: Vec<&Path> = ts_path
         .ancestors()
         .filter(|p| p.file_name().is_some_and(|n| n == "node_modules"))
-        .last()?;
+        .collect();
+    let nm = candidates
+        .iter()
+        .copied()
+        .find(|nm| nm.join(".oam").join("precompile").is_dir())
+        .or_else(|| candidates.last().copied())?;
 
     // rel is e.g. "ms/index.ts", or "react/node_modules/scheduler/index.ts"
     // for a nested package.
@@ -372,13 +423,20 @@ pub fn try_precompile_cache(ts_path: &Path, source: &str) -> Option<String> {
         .join(PathBuf::from(js_rel));
 
     // Read first (a miss costs one failed open), then verify the header
-    // against the CURRENT source + fingerprint and strip it.
+    // against the CURRENT source + fingerprint, split the body at the
+    // header's js-byte-length, and hand back (js, source map).
     let artifact = std::fs::read_to_string(&cache_path).ok()?;
-    let (first_line, js) = artifact.split_once('\n')?;
-    if first_line.trim_end_matches('\r') != artifact_header(ts_path, source) {
-        return None;
-    }
-    Some(js.to_string())
+    let (first_line, body) = artifact.split_once('\n')?;
+    let expected = artifact_header(ts_path, source);
+    let rest = first_line
+        .trim_end_matches('\r')
+        .strip_prefix(expected.as_str())?;
+    let js_len: usize = rest.strip_prefix(' ')?.parse().ok()?;
+    // .get() rather than slicing: a length pointing past the end or into
+    // the middle of a UTF-8 sequence is a corrupt entry, i.e. a miss.
+    let js = body.get(..js_len)?;
+    let map = body.get(js_len..)?;
+    Some((js.to_string(), (!map.is_empty()).then(|| map.to_string())))
 }
 
 #[cfg(test)]
@@ -399,14 +457,11 @@ mod tests {
         dir
     }
 
-    /// Hand-write a fresh (correctly headered) artifact for `ts_path`.
+    /// Hand-write a fresh (correctly headered, map-less) artifact for
+    /// `ts_path`.
     fn seed_artifact(cache_file: &Path, ts_path: &Path, source: &str, js: &str) {
         fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
-        fs::write(
-            cache_file,
-            format!("{}\n{js}", artifact_header(ts_path, source)),
-        )
-        .unwrap();
+        fs::write(cache_file, artifact_payload(ts_path, source, js, None)).unwrap();
     }
 
     #[test]
@@ -433,10 +488,16 @@ mod tests {
             header.starts_with(HEADER_PREFIX),
             "self-describing header expected, got: {header}"
         );
-        assert_eq!(
-            header.len(),
-            HEADER_PREFIX.len() + 64,
-            "header carries a 64-hex sha256"
+        let rest = &header[HEADER_PREFIX.len()..];
+        let (key, js_len) = rest.split_once(' ').expect("v2 header has a length field");
+        assert_eq!(key.len(), 64, "header carries a 64-hex sha256");
+        assert!(
+            js_len.parse::<usize>().is_ok(),
+            "length field is a byte count, got: {js_len}"
+        );
+        assert!(
+            js.contains("\"mappings\""),
+            "v2 artifact embeds the source map after the JS; got: {js}"
         );
         assert!(
             !js.contains(": number"),
@@ -467,7 +528,7 @@ mod tests {
         let cached = try_precompile_cache(&jsx_path, source);
         assert!(cached.is_some(), ".jsx cache hit expected");
         assert!(
-            !cached.unwrap().contains("<div>"),
+            !cached.unwrap().0.contains("<div>"),
             "JSX should be transformed in the cached output"
         );
 
@@ -541,7 +602,7 @@ mod tests {
         let cache_root = root.join("node_modules/.oam/precompile");
         assert_eq!(precompile_package(&pkg_dir, "mypkg", &cache_root).0, 1);
         let cache_file = cache_root.join("mypkg/index.ts.js");
-        let js_body = try_precompile_cache(&ts_path, source).expect("fresh entry hits");
+        let (js_body, _) = try_precompile_cache(&ts_path, source).expect("fresh entry hits");
 
         // Simulate an artifact written by a different transpiler
         // configuration: same JS body, but a header whose hash was computed
@@ -686,10 +747,10 @@ mod tests {
         // The reader finds each from its file path alone.
         let nested_hit = try_precompile_cache(&nested_dir.join("index.ts"), nested_src);
         assert!(nested_hit.is_some(), "nested package cache hit expected");
-        assert!(nested_hit.unwrap().contains('2'));
+        assert!(nested_hit.unwrap().0.contains('2'));
         let hoisted_hit = try_precompile_cache(&hoisted_dir.join("index.ts"), hoisted_src);
         assert!(hoisted_hit.is_some(), "hoisted package cache hit expected");
-        assert!(hoisted_hit.unwrap().contains('1'));
+        assert!(hoisted_hit.unwrap().0.contains('1'));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -710,7 +771,7 @@ mod tests {
 
         let cached = try_precompile_cache(&ts_path, source);
         assert!(cached.is_some(), "cache hit expected");
-        assert_eq!(cached.unwrap(), "const x = 1;\n");
+        assert_eq!(cached.unwrap(), ("const x = 1;\n".to_string(), None));
 
         // A changed source (key mismatch) is a miss even with the .js present.
         assert!(
@@ -805,19 +866,70 @@ mod tests {
             "legacy artifact must miss"
         );
 
-        // The writer treats it as stale, rewrites it in the v1 format, and
+        // The writer treats it as stale, rewrites it in the v2 format, and
         // removes the obsolete sidecar.
         assert_eq!(precompile_package(&pkg_dir, "mypkg", &cache_root).0, 1);
         assert!(
             fs::read_to_string(&cache_file)
                 .unwrap()
                 .starts_with(HEADER_PREFIX),
-            "migrated artifact carries the v1 header"
+            "migrated artifact carries the v2 header"
         );
         assert!(!sidecar.exists(), "legacy .hash sidecar is cleaned up");
         assert!(
             try_precompile_cache(&ts_path, source).is_some(),
             "migrated artifact is served"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn artifact_roundtrips_source_map() {
+        let root = temp_dir("map-roundtrip");
+        let nm = root.join("node_modules");
+        let pkg_dir = nm.join("mypkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let source = "const pad: number = 1;\nexport const x: number = 2;\n";
+        let ts_path = pkg_dir.join("index.ts");
+        fs::write(&ts_path, source).unwrap();
+
+        let cache_root = nm.join(".oam/precompile");
+        assert_eq!(precompile_package(&pkg_dir, "mypkg", &cache_root).0, 1);
+        let (js, map) = try_precompile_cache(&ts_path, source).expect("fresh entry hits");
+        assert!(!js.contains(": number"), "types stripped: {js}");
+        let map = map.expect("v2 artifact carries the writer's source map");
+        assert!(map.contains("\"mappings\""), "map is v3 JSON: {map}");
+        assert!(
+            !map.contains("const pad"),
+            "sourcesContent is stripped from cached maps: {map}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn anchor_prefers_node_modules_with_a_precompile_dir() {
+        // The PROJECT itself sits under a foreign node_modules ancestor (a
+        // package checked out inside another tree). The install wrote to
+        // the project's own node_modules; anchoring on the OUTERMOST
+        // ancestor unconditionally probed the foreign tree and missed
+        // every lookup.
+        let root = temp_dir("anchor");
+        let project = root.join("node_modules").join("host-pkg").join("project");
+        let nm = project.join("node_modules");
+        let pkg_dir = nm.join("mypkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let source = "export const x: number = 7;\n";
+        let ts_path = pkg_dir.join("index.ts");
+        fs::write(&ts_path, source).unwrap();
+
+        let cache_root = nm.join(".oam/precompile");
+        assert_eq!(precompile_package(&pkg_dir, "mypkg", &cache_root).0, 1);
+        assert!(
+            try_precompile_cache(&ts_path, source).is_some(),
+            "reader must anchor at the node_modules holding .oam/precompile, \
+             not the outermost ancestor"
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -114,12 +114,20 @@ pub(crate) unsafe extern "C" fn message_listener(
 ) {
     v8::callback_scope!(unsafe scope, message);
     let text = message.get(scope).to_rust_string_lossy(scope);
-    let line = message.get_line_number(scope).unwrap_or(0);
+    let mut line = message.get_line_number(scope).unwrap_or(0);
     let file = message
         .get_script_resource_name(scope)
         .and_then(|name| name.to_string(scope))
         .map(|name| name.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "<unknown>".to_string());
+    // Transpiled files: remap the codegen line to the source line before
+    // the position is frozen into the report string.
+    if line > 0
+        && let Some((src_line, _)) =
+            oam_loader::sourcemap::lookup(&file, line as u32, message.get_start_column() as u32)
+    {
+        line = src_line as usize;
+    }
     let value = v8::Global::new(scope, exception);
     if let Some(ledger) = scope.get_slot_mut::<UncaughtLedger>() {
         ledger
@@ -328,6 +336,19 @@ fn source_frame(
         return None;
     }
     let src = message.get_source_line(tc)?.to_rust_string_lossy(tc);
+    // Transpiled files: V8's position AND source line are codegen text.
+    // With a source map registered, point at the line the user wrote --
+    // position from the registry, text from the file on disk. Any failure
+    // (no map, no mapping for this position, unreadable file) falls back
+    // to the generated frame below, which is at least self-consistent.
+    if let Some((src_line, src_col)) =
+        oam_loader::sourcemap::lookup(&file, line as u32, message.get_start_column() as u32)
+        && let Some(original) = read_source_line(&file, src_line)
+    {
+        let column = (src_col as usize).min(original.chars().count());
+        let caret = format!("{}^", " ".repeat(column));
+        return Some(format!("{file}:{src_line}\n{original}\n{caret}\n\n"));
+    }
     // V8 hands back a nonsense column for some synthetic messages (an ESM
     // eval wrapper reported usize::MAX, which overflowed the repeat), so
     // clamp to the line we are pointing into.
@@ -340,6 +361,16 @@ fn source_frame(
 
 "
     ))
+}
+
+/// Line `line` (1-based) of `file` on disk, CR trimmed. The uncaught
+/// report's code frame for a remapped position must show the SOURCE text
+/// -- V8 only holds the codegen line.
+fn read_source_line(file: &str, line: u32) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines()
+        .nth(line.checked_sub(1)? as usize)
+        .map(|l| l.trim_end_matches('\r').to_string())
 }
 
 /// Node prints an uncaught exception as the source frame plus
