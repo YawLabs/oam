@@ -40,7 +40,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util",
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: serde_json::Map keeps insertion order (IndexMap) instead of
+# sorting keys (BTreeMap). Load-bearing for the loader: package.json
+# `exports` / `imports` condition objects and tsconfig `paths` are matched in
+# DECLARATION order by Node and tsc -- a sorted map made `default` beat
+# `import` / `require` / `node` in every dual package. Nothing in the
+# workspace relied on the sorted order (install.rs sorts explicitly where it
+# needs determinism).
+serde_json = { version = "1", features = ["preserve_order"] }
 # WHATWG URL parsing — ada is the same C++ parser Node.js ships (3-4x
 # faster than servo url on parse benchmarks). Rust FFI bindings.
 ada-url = "3"
