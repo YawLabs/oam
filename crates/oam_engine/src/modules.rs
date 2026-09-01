@@ -61,6 +61,12 @@ struct ModuleMap {
     /// (referrer path, specifier as written) -> resolved path, recorded at
     /// preload so the V8 resolve callback is a pure lookup.
     edges: HashMap<(PathBuf, String), PathBuf>,
+    /// Modules compiled this run whose bytecode-cache lookup missed (or whose
+    /// blob V8 rejected), with the key to store under. Drained by
+    /// `store_pending_code_cache` AFTER the graph evaluates, so the produced
+    /// blob carries the inner functions evaluation compiled -- producing at
+    /// compile time captured the top level only.
+    pending_code_cache: Vec<(PathBuf, crate::code_cache::CacheKey)>,
 }
 
 /// Unhandled promise rejections, tracked via V8's reject callback so a
@@ -633,7 +639,12 @@ impl JsRuntime {
             shared.wait_for_attach();
         }
 
-        load_module_graph(tc, host, entry.clone())?;
+        if let Err(diags) = load_module_graph(tc, host, entry.clone()) {
+            // Modules compiled before the failure still have unbound scripts;
+            // cache them so the corrected run skips their compile.
+            store_pending_code_cache(tc);
+            return Err(diags);
+        }
 
         let module = {
             let map = tc.get_slot::<ModuleMap>().expect("module map installed");
@@ -642,7 +653,9 @@ impl JsRuntime {
         };
 
         if module.instantiate_module(tc, resolve_module_callback) != Some(true) {
-            return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
+            let diag = catch_to_diagnostic(tc, &entry.to_string_lossy());
+            store_pending_code_cache(tc);
+            return Err(vec![diag]);
         }
         // Arm break-on-start only NOW — graph load just ran any CJS
         // dependency bodies; arming earlier would land the pause inside
@@ -650,9 +663,15 @@ impl JsRuntime {
         if let Some(shared) = &wait {
             shared.arm_break();
         }
+        // Bytecode is produced right after evaluate, on both arms -- see
+        // store_pending_code_cache. On the throw arm the diagnostic is built
+        // first so the TryCatch is read before any further V8 call.
         let Some(value) = module.evaluate(tc) else {
-            return Err(vec![catch_to_diagnostic(tc, &entry.to_string_lossy())]);
+            let diag = catch_to_diagnostic(tc, &entry.to_string_lossy());
+            store_pending_code_cache(tc);
+            return Err(vec![diag]);
         };
+        store_pending_code_cache(tc);
         if let Some(failure) = run_ticks_and_microtasks(tc) {
             return Err(failure);
         }
@@ -1494,6 +1513,39 @@ pub(crate) fn unhandled_rejection_failures(
     if fatal.is_empty() { None } else { Some(fatal) }
 }
 
+/// Produce + store bytecode for every module compiled this run whose cache
+/// lookup missed or was rejected (`ModuleMap::pending_code_cache`). Runs AFTER
+/// the graph evaluates: V8 serializes only what has been compiled at produce
+/// time, so a post-evaluate blob also carries the inner functions evaluation
+/// compiled (class setup, registration code, IIFEs V8 did not compile
+/// eagerly), where a compile-time blob held the top level only. Called on the
+/// success AND failure arms of evaluate, and after a load or instantiate
+/// failure: the unbound module script exists in every module status (an
+/// Errored module holds its SharedFunctionInfo again), and a blob for a module
+/// that threw is as valid as any other for that source text. Functions first
+/// run after a top-level `await` resumes, or later in the event loop, are not
+/// captured -- that is the residual lazy compile. Best-effort: a failed
+/// produce/write just means the next run pays the compile. Drains the list,
+/// so a repeat call is a no-op.
+fn store_pending_code_cache(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    let pending = match tc.get_slot_mut::<ModuleMap>() {
+        Some(map) => std::mem::take(&mut map.pending_code_cache),
+        None => return,
+    };
+    for (path, key) in pending {
+        let Some(global) = tc
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.by_path.get(&path).cloned())
+        else {
+            continue;
+        };
+        let module = v8::Local::new(tc, &global);
+        if let Some(cd) = module.get_unbound_module_script(tc).create_code_cache() {
+            crate::code_cache::store(&key, &cd);
+        }
+    }
+}
+
 /// Compile the module graph into the isolate's ModuleMap. Explicit worklist —
 /// recursion would overflow the stack on deep (generated-code) import chains.
 /// Discovery is breadth-first in import-declaration order (FIFO): CJS
@@ -1578,20 +1630,23 @@ fn load_module_graph(
         );
         // V8 bytecode cache (B3b): consume a stored blob for this module
         // source if present (skips parse + top-level compile), else compile
-        // fresh. Keyed by source + V8 version, so a foreign blob is never
-        // deserialized here; V8's rejected() guards a stale one. `cached_blob`
+        // fresh. Keyed by source + V8 version + oam format, so a foreign blob
+        // is never deserialized here; V8's rejected() guards a stale one. The
+        // key is computed once and kept for the post-evaluate store. `cached`
         // is held across the compile because CachedData borrows it
         // (BufferNotOwned). Applies to every module source -- real ESM files
         // AND the generated builtin/CJS/JSON facades, all of which are
         // deterministic for a given source string (a different facade is a
         // different key, hence a miss, never a wrong hit).
-        let cached_blob = crate::code_cache::load(&code, crate::code_cache::Kind::Module);
-        let consuming = cached_blob.is_some();
-        let mut source = match cached_blob {
-            Some(ref blob) => v8::script_compiler::Source::new_with_cached_data(
+        let cache_key = crate::code_cache::key_for(&code, crate::code_cache::Kind::Module);
+        let cached = crate::code_cache::load(&cache_key);
+        let consuming = cached.is_some();
+        let seeded = cached.as_ref().is_some_and(|c| c.seeded);
+        let mut source = match cached {
+            Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
                 source_str,
                 Some(&origin),
-                v8::script_compiler::CachedData::new(blob),
+                v8::script_compiler::CachedData::new(&c.bytes),
             ),
             None => v8::script_compiler::Source::new(source_str, Some(&origin)),
         };
@@ -1610,26 +1665,23 @@ fn load_module_graph(
             return Err(vec![catch_to_diagnostic(tc, &file)]);
         };
 
-        // Produce the bytecode on a miss (or if V8 rejected a stale blob).
-        // Produced at compile time, so the cache captures top-level module
-        // bytecode -- enough to skip the parse on the next run, which is the
-        // dominant cost. Inner-function bytecode (a post-evaluation produce)
-        // is a later refinement. Best-effort: a failed produce/write just
-        // means the next run re-compiles. `module` is a Copy Local, so this
-        // does not disturb the Global::new below.
-        let refresh_cache = !consuming
-            || source
+        // On a miss (or if V8 rejected a stale blob) remember the key: the
+        // blob is produced AFTER the graph evaluates (store_pending_code_cache)
+        // so it carries bytecode for the functions evaluation compiled, not
+        // just the top level -- the same produce-after-run shape as the CJS
+        // site. Nothing is serialized here. A rejected SEED is dropped so a
+        // later load in this process is not handed the rejected bytes again.
+        // enabled() gates the bookkeeping so an off switch (OAM_CODE_CACHE=0)
+        // leaves no residual work.
+        let rejected = consuming
+            && source
                 .get_cached_data()
                 .map(|cd| cd.rejected())
                 .unwrap_or(true);
-        // enabled() skips the create_code_cache() serialize work when the cache
-        // is off, not just the read/write -- a true off switch (OAM_CODE_CACHE=0).
-        if refresh_cache
-            && crate::code_cache::enabled()
-            && let Some(cd) = module.get_unbound_module_script(tc).create_code_cache()
-        {
-            crate::code_cache::store(&code, crate::code_cache::Kind::Module, &cd);
+        if rejected && seeded {
+            crate::code_cache::forget_seed(&cache_key);
         }
+        let refresh_cache = !consuming || rejected;
 
         let hash = module.get_identity_hash();
         let global = v8::Global::new(tc, module);
@@ -1642,6 +1694,9 @@ fn load_module_graph(
                 .entry(hash)
                 .or_default()
                 .push(path.clone());
+            if refresh_cache && crate::code_cache::enabled() {
+                map.pending_code_cache.push((path.clone(), cache_key));
+            }
         }
 
         let requests = module.get_module_requests();
@@ -2009,6 +2064,7 @@ fn dyn_import_load(
 ) -> DynResult {
     // Pull the rest of the graph in (idempotent: already-loaded paths skip).
     if let Err(diags) = load_module_graph(tc, host, resolved.clone()) {
+        store_pending_code_cache(tc);
         let msg = if diags.is_empty() {
             format!("failed to load '{spec}'")
         } else {
@@ -2067,7 +2123,9 @@ fn dyn_import_load(
     if module.get_status() == v8::ModuleStatus::Uninstantiated
         && module.instantiate_module(tc, resolve_module_callback) != Some(true)
     {
-        return match dyn_caught_value(tc) {
+        let caught = dyn_caught_value(tc);
+        store_pending_code_cache(tc);
+        return match caught {
             Some(v) => DynResult::Rejected(v),
             None => DynResult::Error(format!(
                 "oam: dynamic import('{spec}'): instantiation failed"
@@ -2075,6 +2133,7 @@ fn dyn_import_load(
         };
     }
     if module.get_status() == v8::ModuleStatus::Errored {
+        store_pending_code_cache(tc);
         return DynResult::Rejected(v8::Global::new(tc, module.get_exception()));
     }
     // Cycle: the module is currently being evaluated (cycle from itself or a
@@ -2087,12 +2146,18 @@ fn dyn_import_load(
         return DynResult::Namespace(v8::Global::new(tc, module.get_module_namespace()));
     }
 
+    // Bytecode for the freshly compiled subgraph is produced right after
+    // evaluate, on both arms (see store_pending_code_cache); the caught value
+    // is read first so the TryCatch is consulted before any further V8 call.
     let Some(value) = module.evaluate(tc) else {
-        return match dyn_caught_value(tc) {
+        let caught = dyn_caught_value(tc);
+        store_pending_code_cache(tc);
+        return match caught {
             Some(v) => DynResult::Rejected(v),
             None => DynResult::Error(format!("oam: dynamic import('{spec}'): evaluation failed")),
         };
     };
+    store_pending_code_cache(tc);
     // Bare checkpoint, NO tick drain: this hook fires synchronously with
     // the importer's JS frame still on the stack, and Node never runs
     // process.nextTick callbacks mid-statement. Ticks scheduled by the

@@ -105,10 +105,23 @@ pub(crate) fn strip_shebang(source: String) -> String {
 /// The compile mirrors the require() loader -- same `CJS_PARAMS`, same origin
 /// shape, same shebang transform -- so the runtime consume path accepts the
 /// blob; a rejected blob would only trigger a recompile, never a wrong result.
-/// Returns None on a syntax error or if V8 declines to produce a cache.
+///
+/// `eager` selects `CompileOptions::EagerCompile`: V8 then compiles every
+/// inner function up front so the blob carries all of their bytecode, not just
+/// the wrapper plus whatever V8 would compile eagerly on its own. `oam compile`
+/// always passes true -- the runtime never re-produces a seeded blob (a
+/// compiled binary must not need a writable cache dir), so this one-shot
+/// produce is the only chance to capture inner functions; a lazy blob would
+/// leave every inner function to be recompiled on each run for the life of
+/// the binary. `false` exists for the evidence test that measures the gap.
+///
+/// Returns None on a syntax error (the exception is left pending on `scope`)
+/// or if V8 declines to produce a cache; a caller that must tell the two apart
+/// runs this under a TryCatch and checks `has_caught()`.
 pub(crate) fn produce_cjs_code_cache(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
+    eager: bool,
 ) -> Option<Vec<u8>> {
     let source = strip_shebang(source.to_string());
     let source_v8 = v8::String::new(scope, &source)?;
@@ -121,12 +134,17 @@ pub(crate) fn produce_cjs_code_cache(
         .iter()
         .map(|p| v8::String::new(scope, p).unwrap())
         .collect();
+    let options = if eager {
+        v8::script_compiler::CompileOptions::EagerCompile
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
     let wrapper = v8::script_compiler::compile_function(
         scope,
         &mut compiler_source,
         &params,
         &[],
-        v8::script_compiler::CompileOptions::NoCompileOptions,
+        options,
         v8::script_compiler::NoCacheReason::NoReason,
     )?;
     wrapper.create_code_cache().map(|cd| cd.to_vec())
@@ -447,16 +465,19 @@ pub(crate) fn load_cjs<'s>(
     );
     // V8 bytecode cache: consume a stored blob for this exact source if one
     // exists (skips the parse+compile) else compile fresh. The blob is keyed by
-    // source + V8 version so a foreign blob can't be served here; V8 also flags
-    // a bad blob via `rejected()` below. `cached_blob` is held for the whole
-    // compile because `CachedData` borrows it (BufferNotOwned).
-    let cached_blob = crate::code_cache::load(&source, crate::code_cache::Kind::Function);
-    let consuming = cached_blob.is_some();
-    let mut compiler_source = match cached_blob {
-        Some(ref blob) => v8::script_compiler::Source::new_with_cached_data(
+    // source + V8 version + oam format so a foreign blob can't be served here;
+    // V8 also flags a bad blob via `rejected()` below. The key is computed once
+    // and reused by the store after the body runs. `cached` is held for the
+    // whole compile because `CachedData` borrows it (BufferNotOwned).
+    let cache_key = crate::code_cache::key_for(&source, crate::code_cache::Kind::Function);
+    let cached = crate::code_cache::load(&cache_key);
+    let consuming = cached.is_some();
+    let seeded = cached.as_ref().is_some_and(|c| c.seeded);
+    let mut compiler_source = match cached {
+        Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
             source_v8,
             Some(&origin),
-            v8::script_compiler::CachedData::new(blob),
+            v8::script_compiler::CachedData::new(&c.bytes),
         ),
         None => v8::script_compiler::Source::new(source_v8, Some(&origin)),
     };
@@ -485,11 +506,18 @@ pub(crate) fn load_cjs<'s>(
     // (Re)write the cache after the body runs (below) on a miss, or if V8
     // rejected the consumed blob (stale/foreign) and recompiled. Producing
     // AFTER the call captures the body bytecode, not just the outer wrapper.
-    let refresh_cache = !consuming
-        || compiler_source
+    let rejected = consuming
+        && compiler_source
             .get_cached_data()
             .map(|cd| cd.rejected())
             .unwrap_or(true);
+    // A rejected SEED (embedded bytecode from a different V8 build or flag
+    // set) is dropped so a later load in this process is not handed the same
+    // rejected bytes ahead of the disk blob the store below refreshes.
+    if rejected && seeded {
+        crate::code_cache::forget_seed(&cache_key);
+    }
+    let refresh_cache = !consuming || rejected;
 
     let require = make_require(scope, &file)?;
     let dirname = key
@@ -524,7 +552,7 @@ pub(crate) fn load_cjs<'s>(
         && crate::code_cache::enabled()
         && let Some(cd) = wrapper.create_code_cache()
     {
-        crate::code_cache::store(&source, crate::code_cache::Kind::Function, &cd);
+        crate::code_cache::store(&cache_key, &cd);
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;

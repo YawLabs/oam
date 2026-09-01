@@ -153,14 +153,21 @@ enum Command {
         output: PathBuf,
         /// Carrier binary to embed into, instead of the running oam. Point it
         /// at an oam release binary for another OS/arch to cross-compile --
-        /// the payload is platform-independent, only the carrier is not.
+        /// the JS payload is platform-independent, only the carrier is not.
         /// Without this, compile always produces a binary for the platform it
-        /// runs on, so shipping N targets needed N machines.
+        /// runs on, so shipping N targets needed N machines. V8 bytecode is
+        /// bound to the compiling binary, so a foreign carrier gets a JS-only
+        /// payload and builds its own bytecode cache lazily on first run.
         #[arg(long, value_name = "PATH")]
         carrier: Option<PathBuf>,
         /// Reserved for future use (minify the embedded source).
         #[arg(long)]
         minify: bool,
+    },
+    /// Inspect or delete the V8 bytecode cache (`oam cache --help`).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
     /// Update oam in place to the latest release by running the canonical
     /// oamjs.org installer (verifies via the published SHA256SUMS). Updates the
@@ -176,6 +183,15 @@ enum Command {
     /// Internal: type-check daemon server process. Not for direct use.
     #[command(name = "__oamd-ts", hide = true)]
     DaemonServe { tsconfig: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print the bytecode cache directory, its entry count and total size.
+    Info,
+    /// Delete the bytecode cache. Safe at any time: the next run recompiles
+    /// and repopulates it.
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -680,6 +696,7 @@ fn dispatch(cli: Cli) -> ExitCode {
             carrier,
             minify: _,
         } => compile_command(entry, output, carrier.as_deref()),
+        Command::Cache { action } => cache_command(action, cli.json),
         Command::SelfUpdate { version, dry_run } => {
             self_update_command(version.as_deref(), *dry_run)
         }
@@ -2685,10 +2702,15 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     let tmp_file = tmp_dir.join("__oam_embedded.js");
     std::fs::write(&tmp_file, source).expect("write embedded source to temp");
 
-    // Node convention: argv[0]=binary, argv[1]=script path. Set argv[1] to
-    // the temp file so isEntryPoint checks (import.meta.url vs
-    // pathToFileURL(argv[1])) pass -- __filename is this same temp path.
-    let mut argv = vec![exe, tmp_file.to_string_lossy().into_owned()];
+    // Node convention: argv[0]=binary, argv[1]=script path. argv[1] is the
+    // temp file spelled the way the loader spells __filename (module_key:
+    // canonical, 8.3 short names and symlinks resolved), so the usual
+    // main-module check -- `process.argv[1] === __filename`, or
+    // import.meta.url against pathToFileURL(argv[1]) -- holds even on a
+    // short-name TEMP (`C:\Users\RUNNER~1\...`) or a symlinked /tmp, where
+    // the raw temp_dir() spelling and the canonical one differ.
+    let script = oam_engine::module_key(&tmp_file).unwrap_or_else(|_| tmp_file.clone());
+    let mut argv = vec![exe, script.to_string_lossy().into_owned()];
     argv.extend(script_args);
     rt.set_process_argv(argv);
 
@@ -2726,9 +2748,39 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     }
 }
 
-/// `oam compile <entry> --output <path>`: read the JS source, copy the
-/// current oam binary, and append the JS payload with a magic trailer.
+/// One-line remedy appended to every "this entry cannot be embedded" error.
+const COMPILE_ENTRY_HINT: &str = "oam compile embeds a pre-bundled CommonJS file as-is and does \
+                                  not transpile or bundle; bundle to CJS first (e.g. esbuild \
+                                  --bundle --format=cjs --platform=node) and compile the output.";
+
+/// Whether `carrier` is the running binary, however it is spelled (a relative
+/// `./oam`, a symlink, an 8.3 short name). Canonicalize both sides; if either
+/// side cannot be resolved, answer false -- the conservative outcome is a
+/// JS-only payload, which never yields a binary that rejects its own bytecode.
+fn carrier_is_running_binary(carrier: &Path) -> bool {
+    let Ok(me) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    std::fs::canonicalize(carrier).is_ok_and(|c| c == me)
+}
+
+/// `oam compile <entry> --output <path>`: read the JS source, produce its V8
+/// bytecode, copy the carrier binary, and append the payload with a magic
+/// trailer.
 fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitCode {
+    // 0. Refuse an entry that is not plain JavaScript. The embedded program
+    //    runs through the CJS loader as-is (no transpile, no bundling), so a
+    //    .ts/.tsx/.jsx entry would read fine here and die with a SyntaxError
+    //    on the binary's first run -- possibly on a machine the author never
+    //    runs it on (--carrier).
+    if oam_loader::classify(entry) != SourceKind::JavaScript {
+        eprintln!(
+            "oam compile: {} is not plain JavaScript. {COMPILE_ENTRY_HINT}",
+            entry.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
     // 1. Read the entry JS file.
     let source = match std::fs::read(entry) {
         Ok(bytes) => bytes,
@@ -2747,11 +2799,13 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         return ExitCode::FAILURE;
     }
 
-    // 2. Copy the carrier binary to the output path. Defaults to the running
-    //    oam; `--carrier` points at a different one so a release binary for
-    //    another OS/arch can be used, which is what makes cross-compiling
-    //    possible. The payload appended below is platform-independent -- only
-    //    the carrier decides the output's platform.
+    // 2. Resolve the carrier binary. Defaults to the running oam; `--carrier`
+    //    points at a different one so a release binary for another OS/arch
+    //    can be used, which is what makes cross-compiling possible. The JS
+    //    half of the payload appended below is platform-independent -- only
+    //    the carrier decides the output's platform. The bytecode half is NOT:
+    //    it is bound to the V8 build that produced it, i.e. to this binary
+    //    (step 3 embeds it only when the carrier is this binary).
     let exe = match carrier {
         Some(p) => {
             if !p.is_file() {
@@ -2791,6 +2845,41 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
             }
         },
     };
+    // Same file spelled two ways (`--carrier ./oam` from the install dir) is
+    // still self. Anything else -- another version, another platform -- gets
+    // a JS-only payload: V8 checks version, flag hash and read-only snapshot
+    // on consume, so a blob from this V8 would be rejected on every run of
+    // the output and cost a recompile plus a cache write each time.
+    let carrier_is_self = carrier.is_none_or(carrier_is_running_binary);
+
+    // 3. Produce V8 bytecode for the entry so the compiled binary's first run
+    //    skips parse+compile (v2). Before the carrier copy, so a bad entry
+    //    fails here without leaving a half-written output. Three outcomes: a
+    //    blob (v2); V8 declining to produce a cache (JS-only v1 -- the lazy
+    //    runtime cache still kicks in there); or a source that does not
+    //    compile as CommonJS at all (a SyntaxError, an ESM import/export,
+    //    TypeScript syntax) -- a hard failure carrying V8's message, since the
+    //    binary would only die with that same error on its first run.
+    let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
+    let bytecode = if carrier_is_self {
+        match oam_engine::JsRuntime::precompile_cjs_source(&entry.display().to_string(), source_str)
+        {
+            Ok(blob) => blob,
+            Err(message) => {
+                eprintln!("oam compile: {message}");
+                eprintln!("oam compile: the entry must compile as CommonJS. {COMPILE_ENTRY_HINT}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        eprintln!(
+            "oam compile: --carrier is not the running binary; embedding JS only (V8 bytecode \
+             is bound to the compiling binary, so the output builds its own cache on first run)"
+        );
+        None
+    };
+
+    // 4. Copy the carrier to the output path.
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -2809,7 +2898,8 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         return ExitCode::FAILURE;
     }
 
-    // 3. Append: [JS source bytes][u64 LE length][magic "OAMEXEC\0"]
+    // 5. Append. v2: [JS][bytecode][u64 LE js len][u64 LE bc len][magic
+    //    "OAMEXC2\0"]; v1: [JS][u64 LE js len][magic "OAMEXEC\0"].
     let mut out_file = match std::fs::OpenOptions::new().append(true).open(output) {
         Ok(f) => f,
         Err(e) => {
@@ -2821,12 +2911,6 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         }
     };
     use std::io::Write;
-
-    // Produce V8 bytecode for the entry so the compiled binary's first run
-    // skips parse+compile (v2). If production fails for any reason, fall back
-    // to a JS-only v1 binary -- the lazy runtime cache still kicks in there.
-    let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
-    let bytecode = oam_engine::JsRuntime::precompile_cjs_source(source_str);
 
     let js_len = source.len() as u64;
     let write_result = match &bytecode {
@@ -2868,9 +2952,59 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
     // binary inherits their notice obligations, and would have no way to know
     // it from a success line that only reports byte counts.
     eprintln!(
-        "oam compile: the output embeds oam's runtime (V8, ICU and others);          if you redistribute it, ship the notices from LICENSE, NOTICE and          THIRD_PARTY_LICENSES.md with it"
+        "oam compile: the output embeds oam's runtime (V8, ICU and others); if you \
+         redistribute it, ship the notices from LICENSE, NOTICE and \
+         THIRD_PARTY_LICENSES.md with it"
     );
     ExitCode::SUCCESS
+}
+
+/// `oam cache info|clean`: inspect or delete the V8 bytecode cache. The cache
+/// is a pure optimization, so `clean` is safe at any time -- the next run
+/// recompiles and repopulates it. `info` reports the directory this process
+/// would use (`OAM_CACHE_DIR` wins, then the platform cache dir), the number
+/// of blobs and their total size; `--json` emits the same as one object.
+fn cache_command(action: &CacheAction, json: bool) -> ExitCode {
+    match action {
+        CacheAction::Info => {
+            let stats = oam_engine::code_cache_stats();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": stats.path.to_string_lossy(),
+                        "entries": stats.entries,
+                        "bytes": stats.bytes,
+                    })
+                );
+            } else {
+                println!("path:    {}", stats.path.display());
+                println!("entries: {}", stats.entries);
+                println!("bytes:   {}", stats.bytes);
+            }
+            ExitCode::SUCCESS
+        }
+        CacheAction::Clean => {
+            let path = oam_engine::code_cache_dir();
+            match oam_engine::code_cache_clean() {
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "removed": path.to_string_lossy() })
+                        );
+                    } else {
+                        eprintln!("oam cache: removed {}", path.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("oam cache: could not remove {}: {e}", path.display());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
