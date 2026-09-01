@@ -268,16 +268,17 @@ pub fn install(
                 {
                     pending_scripts.push(ps);
                 }
-                if precompile
-                    && let Err(e) =
-                        crate::precompile::precompile_package(&dest, pkg_name, &cache_root)
-                {
-                    errors.push(Diagnostic::new(
-                        "OAM-PKG0008",
-                        Severity::Warning,
-                        Origin::Install,
-                        format!("precompile {pkg_name}: {e}"),
-                    ));
+                if precompile {
+                    // Cache key = the lockfile key relative to the project's
+                    // node_modules ("react/node_modules/scheduler" for a
+                    // nested package), so nested packages get distinct cache
+                    // slots and the run-time reader -- anchored on the
+                    // OUTERMOST node_modules ancestor -- derives the same
+                    // path.
+                    let cache_key = key.strip_prefix("node_modules/").unwrap_or(key);
+                    let (_, precompile_errors) =
+                        crate::precompile::precompile_package(&dest, cache_key, &cache_root);
+                    push_precompile_warning(cache_key, &precompile_errors, &mut errors);
                 }
             }
             Err(e) => {
@@ -313,6 +314,40 @@ pub fn install(
             errors,
         })
     }
+}
+
+/// Fold a package's per-file precompile failures into ONE `OAM-PKG0008`
+/// warning naming the count and the first few failing files. Precompile is
+/// an optimization -- an uncompiled file falls back to runtime transpile --
+/// so failures never fail the install, and one bad file does not hide how
+/// many others failed with it.
+fn push_precompile_warning(
+    pkg_key: &str,
+    failures: &[crate::precompile::PrecompileError],
+    errors: &mut Vec<Diagnostic>,
+) {
+    if failures.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 3;
+    let mut detail = failures
+        .iter()
+        .take(SHOWN)
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > SHOWN {
+        detail.push_str(&format!(" (+{} more)", failures.len() - SHOWN));
+    }
+    errors.push(Diagnostic::new(
+        "OAM-PKG0008",
+        Severity::Warning,
+        Origin::Install,
+        format!(
+            "precompile {pkg_key}: {} file(s) failed: {detail}",
+            failures.len()
+        ),
+    ));
 }
 
 /// Acquire the cross-process install lock (A5). Returns the held lock file

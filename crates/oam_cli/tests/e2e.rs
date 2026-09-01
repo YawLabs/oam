@@ -15622,19 +15622,20 @@ fn install_precompile_cts_cache_used_on_run() {
         .join("precompile")
         .join("fake-pkg");
     std::fs::create_dir_all(&cache_dir).unwrap();
-    std::fs::write(
-        cache_dir.join("index.cts.js"),
-        "// oam-precompile-sentinel\nexports.value = 42;\n",
-    )
-    .unwrap();
-    // B2: the cache is served only when its hash sidecar matches the current
-    // source. Hash the actual .cts bytes so the sentinel entry is considered
-    // fresh (a mismatched/missing sidecar would fall through to a real
-    // transpile of the source, printing 99 instead of the sentinel's 42).
+    // B2: the cache is served only when the artifact's first line is the
+    // freshness header, sha256(transpile_fingerprint || current source).
+    // Build it with the loader's own helper so the sentinel entry is
+    // considered fresh (a mismatched/missing header would fall through to a
+    // real transpile of the source, printing 99 instead of the sentinel's 42).
     {
-        use sha2::{Digest, Sha256};
-        let src = std::fs::read(pkg_dir.join("index.cts")).unwrap();
-        std::fs::write(cache_dir.join("index.cts.js.hash"), Sha256::digest(&src)).unwrap();
+        let src_path = pkg_dir.join("index.cts");
+        let src = std::fs::read_to_string(&src_path).unwrap();
+        let header = oam_loader::precompile::artifact_header(&src_path, &src);
+        std::fs::write(
+            cache_dir.join("index.cts.js"),
+            format!("{header}\nexports.value = 42;\n"),
+        )
+        .unwrap();
     }
 
     let entry = project_dir.join("main.cjs");
@@ -15704,12 +15705,18 @@ fn install_precompile_esm_ts_cache_used_on_run() {
         .join("precompile")
         .join("esm-pkg");
     std::fs::create_dir_all(&cache_dir).unwrap();
-    std::fs::write(cache_dir.join("index.ts.js"), "export const value = 42;\n").unwrap();
-    // Matching hash sidecar so the sentinel entry is considered fresh (B2).
+    // Matching freshness header so the sentinel entry is considered fresh
+    // (B2): the artifact's first line must carry
+    // sha256(transpile_fingerprint || current source).
     {
-        use sha2::{Digest, Sha256};
-        let src = std::fs::read(pkg_dir.join("index.ts")).unwrap();
-        std::fs::write(cache_dir.join("index.ts.js.hash"), Sha256::digest(&src)).unwrap();
+        let src_path = pkg_dir.join("index.ts");
+        let src = std::fs::read_to_string(&src_path).unwrap();
+        let header = oam_loader::precompile::artifact_header(&src_path, &src);
+        std::fs::write(
+            cache_dir.join("index.ts.js"),
+            format!("{header}\nexport const value = 42;\n"),
+        )
+        .unwrap();
     }
 
     let entry = project_dir.join("main.mjs");
