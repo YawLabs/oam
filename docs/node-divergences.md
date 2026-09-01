@@ -483,6 +483,15 @@ CommonJS there and `require()` of it works. In oam, use `.cts` for TypeScript th
 require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
 `.js`, and transpile on whichever path they land.)
 
+### 25. Source maps are always on, so `Error.prepareStackTrace` is pre-installed
+
+oam remaps stack traces for transpiled TypeScript to source positions by default —
+equivalent to running Node with `--enable-source-maps`, with no flag needed. To do it,
+oam installs its own `Error.prepareStackTrace` at startup, so reading that property
+before assigning it yields a function where Node yields `undefined`. Assigning your own
+`prepareStackTrace` still wins, exactly as in Node; `util.getCallSites` still reports
+generated (transpiled) positions.
+
 ### 10. `oam run file.js` needs `--` before script flags
 
 ```
