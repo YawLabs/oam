@@ -539,13 +539,16 @@ fn main() -> ExitCode {
             // test runner even if a file named `test` sits in the cwd.
             if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && Path::new(flag).is_file() {
                 let file = PathBuf::from(flag);
-                return match run_file_with_flags(
+                drain_loader_warnings_on_hard_exit(false);
+                let outcome = run_file_with_flags(
                     &file,
                     &raw[i + 1..],
                     None,
                     oam_engine::ReplayMode::Off,
                     &flags,
-                ) {
+                );
+                report_loader_warnings(false);
+                return match outcome {
                     Ok(code) => ExitCode::from(code),
                     Err((diagnostics, code)) => {
                         for d in &diagnostics {
@@ -879,6 +882,7 @@ fn run_command(
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
 ) -> ExitCode {
+    drain_loader_warnings_on_hard_exit(json);
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
     // their normal paths untouched.
@@ -1097,6 +1101,7 @@ fn repl_command() -> ExitCode {
         "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
         env!("CARGO_PKG_VERSION")
     );
+    drain_loader_warnings_on_hard_exit(false);
     // Same construction-time rule as `test_command`: `oam --permission` used to
     // drop into an all-granted REPL, so every line you pasted at the prompt ran
     // outside the sandbox you asked for.
@@ -1184,6 +1189,9 @@ fn repl_command() -> ExitCode {
                     Ok(rendered) => println!("{rendered}"),
                     Err(message) => eprintln!("{message}"),
                 }
+                // Loader warnings queued by this line's resolution surface at
+                // the prompt they belong to, not silently at REPL exit.
+                report_loader_warnings(false);
                 prompt(false);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1193,6 +1201,7 @@ fn repl_command() -> ExitCode {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    report_loader_warnings(false);
     ExitCode::SUCCESS
 }
 
@@ -1255,6 +1264,7 @@ fn discover_test_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// across files), results rendered pretty or as ODIF JSONL from the same
 /// data. Exit 0 only when every discovered test passed.
 fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode {
+    drain_loader_warnings_on_hard_exit(json);
     let files = discover_test_files(paths);
     if files.is_empty() {
         eprintln!(
@@ -1387,6 +1397,10 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         }
     }
 
+    // Warnings the loader queued while any file resolved or transpiled
+    // (OAM-MOD0008/0009) surface before the summary, like run/check drain.
+    report_loader_warnings(json);
+
     let elapsed = started.elapsed().as_millis();
     let failed_total = fail + file_failures;
     if json {
@@ -1460,13 +1474,28 @@ fn report_loader_warnings(json: bool) {
     }
 }
 
+/// Ensure queued loader warnings survive a HARD exit. `process.exit()` tears
+/// the process down from inside the op -- the normal end-of-command drain
+/// never runs -- so every command that constructs a JsRuntime registers the
+/// drain with the same exit-cleanup mechanism `run_eval` uses for its temp
+/// file. The sink drain is take-based, so the normal epilogue and this hook
+/// can never double-print.
+fn drain_loader_warnings_on_hard_exit(json: bool) {
+    oam_engine::register_exit_hook(move || report_loader_warnings(json));
+}
+
 /// `oam install`: frozen-lockfile package install from package-lock.json v3.
 fn install_command(frozen_lockfile: bool, precompile: bool, json: bool) -> ExitCode {
     // Walk upward from cwd to find the directory containing package-lock.json.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
 
-    match oam_loader::install::install(&project_dir, frozen_lockfile, precompile) {
+    let result = oam_loader::install::install(&project_dir, frozen_lockfile, precompile);
+    // Deferred loader warnings queued during the install (a package tsconfig
+    // the --precompile pass consulted) drain before the summary, like
+    // run/check drain theirs.
+    report_loader_warnings(json);
+    match result {
         Ok(outcome) => {
             let (installed, elapsed, errors) = match outcome {
                 oam_loader::install::InstallOutcome::Complete(summary) => {
@@ -2197,8 +2226,12 @@ const SUBCOMMANDS: &[&str] = &[
     "install",
     "trust",
     "compile",
+    "cache",
     "self-update",
     "help",
+    // The hidden daemon-server subcommand is still a subcommand: a stray cwd
+    // file named like it must not win the bare-script dispatch over clap.
+    "__oamd-ts",
 ];
 
 /// Catch the space-separated grant form (`--allow-net 127.0.0.1:5432`) that
@@ -2592,6 +2625,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     // artifact was left in the user's working directory. Register it so the
     // hard-exit path removes it too.
     oam_engine::register_exit_cleanup(tmp_dir.clone().unwrap_or_else(|| tmp_file.clone()));
+    // Queued loader warnings must survive a `process.exit()` inside the eval
+    // the same way the temp file must be removed by one.
+    drain_loader_warnings_on_hard_exit(false);
     // -p evaluates through a DIRECT eval, which yields the completion value
     // of a statement list the way node's script evaluation does
     // (`-p "a(); b"` prints b) AND inherits the enclosing module scope. It
@@ -2650,6 +2686,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
         rt.execute_cjs(&tmp_file, &CliHost)
     };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
+    report_loader_warnings(false);
     // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
     // fatal forces 1 + honors exit-handler mutations.
     match result {
@@ -2740,6 +2777,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     // and the user cannot weaken it -- an `oam build` feature, not an argv
     // parse. Until that exists, do not describe embedded binaries as
     // sandboxable.
+    drain_loader_warnings_on_hard_exit(false);
     let mut rt = oam_engine::JsRuntime::new();
     // Seed embedded bytecode (v2 binaries) now that V8 is initialized, so the
     // CJS loader consumes it without needing a writable cache dir. Keyed by the
@@ -2790,6 +2828,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
 
     let result = rt.execute_cjs(&tmp_file, &CliHost);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    report_loader_warnings(false);
     // Same fatal-path shape as run_file: sub-codes 6/7 skip the 'exit'
     // event entirely and are not handler-overridable; a regular fatal
     // forces exitCode = 1, emits 'exit', then honors handler mutations.
@@ -2935,16 +2974,25 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
     //    TypeScript syntax) -- a hard failure carrying V8's message, since the
     //    binary would only die with that same error on its first run.
     let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
-    let bytecode = if carrier_is_self {
-        match oam_engine::JsRuntime::precompile_cjs_source(&entry.display().to_string(), source_str)
-        {
-            Ok(blob) => blob,
-            Err(message) => {
-                eprintln!("oam compile: {message}");
-                eprintln!("oam compile: the entry must compile as CommonJS. {COMPILE_ENTRY_HINT}");
-                return ExitCode::FAILURE;
-            }
+    // The compile-check runs UNCONDITIONALLY: syntax validity is
+    // carrier-independent, and a broken entry behind --carrier used to exit 0
+    // and hand the author a binary that dies with that same SyntaxError on
+    // its first run -- possibly on a machine the author never touches. Only
+    // the BLOB is carrier-bound (V8 bytecode is tied to the producing build),
+    // so a foreign carrier discards it and gets the JS-only (v1) payload.
+    let blob = match oam_engine::JsRuntime::precompile_cjs_source(
+        &entry.display().to_string(),
+        source_str,
+    ) {
+        Ok(blob) => blob,
+        Err(message) => {
+            eprintln!("oam compile: {message}");
+            eprintln!("oam compile: the entry must compile as CommonJS. {COMPILE_ENTRY_HINT}");
+            return ExitCode::FAILURE;
         }
+    };
+    let bytecode = if carrier_is_self {
+        blob
     } else {
         eprintln!(
             "oam compile: --carrier is not the running binary; embedding JS only (V8 bytecode \
@@ -3224,6 +3272,34 @@ mod tests {
             assert!(
                 super::space_form_hint("--allow-env", Some(&sub.to_string())).is_none(),
                 "`--allow-env {sub}` must dispatch to the subcommand, not be read as a grant list"
+            );
+        }
+    }
+
+    /// SUBCOMMANDS and clap must not drift: the `cache` subcommand shipped
+    /// without a list entry, so `oam ... cache` could dispatch a cwd FILE
+    /// named `cache` and `oam --allow-env cache info` died with a bogus
+    /// space-form hint. Bidirectional: every clap subcommand is listed, and
+    /// every listed name (minus clap's auto `help`) is a real subcommand.
+    #[test]
+    fn subcommands_const_matches_clap_exactly() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let clap_names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        for name in &clap_names {
+            assert!(
+                super::SUBCOMMANDS.contains(&name.as_str()),
+                "clap subcommand '{name}' is missing from SUBCOMMANDS: the \
+                 bare-script dispatch and space_form_hint would mis-handle it"
+            );
+        }
+        for name in super::SUBCOMMANDS {
+            assert!(
+                *name == "help" || clap_names.iter().any(|c| c == name),
+                "SUBCOMMANDS entry '{name}' is not a clap subcommand"
             );
         }
     }

@@ -41,7 +41,10 @@ pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
 // Re-exported so the CLI can register its `-e` artifact without taking a direct
 // oam_core dependency; the hard-exit paths that drain it live in this crate.
-pub use oam_core::{exit_process, register_exit_cleanup, run_exit_cleanup, snapshot_inherited_fds};
+pub use oam_core::{
+    exit_process, register_exit_cleanup, register_exit_hook, run_exit_cleanup,
+    snapshot_inherited_fds,
+};
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 pub use replay::ReplayMode;
 

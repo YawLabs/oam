@@ -14919,6 +14919,116 @@ fn compile_foreign_carrier_embeds_js_only() {
     );
 }
 
+// --carrier used to SKIP the compile-check entirely: a broken entry exited 0
+// and produced a v1 binary that dies with a SyntaxError on its first run --
+// on whatever machine the author shipped it to. Validation is
+// carrier-independent (syntax is syntax); only the BLOB is carrier-bound.
+#[test]
+fn compile_foreign_carrier_still_validates_entry() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let carrier = std::env::temp_dir().join(format!(
+        "oam-compile-carrier-bad-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    std::fs::copy(env!("CARGO_BIN_EXE_oam"), &carrier).expect("stage a carrier copy");
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-carrier-bad-out-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let bad = write_temp("compile_carrier_bad.js", "function broken( {\n");
+    let out = oam(&[
+        "compile",
+        bad.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+        "--carrier",
+        carrier.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_file(&carrier);
+    assert!(
+        !out.status.success(),
+        "a broken entry must fail the compile even with --carrier"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("SyntaxError"),
+        "V8's message must reach the author, not the binary's first run: {stderr}"
+    );
+    assert!(!output.exists(), "no output may be left behind");
+}
+
+// A bare-package tsconfig `extends` queues OAM-MOD0008 in the loader's
+// process-wide sink. `oam run` / `oam check` drained it; every other
+// JsRuntime-constructing command silently dropped it at process exit. The
+// epilogue is shared now -- `oam test` is the representative here.
+#[test]
+fn test_command_drains_loader_warnings() {
+    let test_file = write_temp(
+        "warn-drain-test/mod8.test.ts",
+        "import { U } from '@x/util';\nconsole.log('u=' + U);\n",
+    );
+    let dir = test_file.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(dir.join("x")).unwrap();
+    std::fs::write(dir.join("x/util.ts"), "export const U = 1;\n").unwrap();
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        r#"{"extends":"@tsconfig/node20","compilerOptions":{"paths":{"@x/*":["./x/*"]}}}"#,
+    )
+    .unwrap();
+    let out = oam(&["test", test_file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a queued warning must not fail the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("OAM-MOD0008"),
+        "`oam test` must drain the loader's deferred warnings: {stderr}"
+    );
+}
+
+// The hard-exit half: `process.exit()` never returns to the normal
+// end-of-command drain, so queued warnings ride the exit-cleanup hook -- the
+// same mechanism that removes the eval temp file.
+#[test]
+fn process_exit_still_prints_queued_loader_warnings() {
+    let dir = write_temp("warn-drain-exit/x/util.cjs", "module.exports.U = 1;\n")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        r#"{"extends":"@tsconfig/node20","compilerOptions":{"paths":{"@x/*":["./x/*"]}}}"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args([
+            "-e",
+            "const { U } = require('@x/util.cjs'); process.exit(41 + U);",
+        ])
+        .current_dir(&dir)
+        .env("OAM_CACHE_DIR", &dir)
+        .output()
+        .expect("oam binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "the eval ran and hard-exited: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("OAM-MOD0008"),
+        "warnings queued before process.exit() must still print: {stderr}"
+    );
+}
+
 // In a compiled binary, process.argv[1] IS __filename: both are built from
 // module_key (canonical form -- 8.3 short names and symlinks resolved).
 // The two diverged on any host whose temp_dir() spelling is not canonical:
