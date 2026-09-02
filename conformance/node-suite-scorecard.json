@@ -1,6 +1,6 @@
 {
   "schema": "oam-node-suite/1",
-  "commit": "9d0a3b6+wip",
+  "commit": "668d72b",
   "oamVersion": "oam 0.13.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -84,7 +84,7 @@
   "deliberateFailures": [
     {
       "test": "test-process-binding-internalbinding-allowlist.js",
-      "firstDivergence": "[exit=1] oam:node_compat.js:11652",
+      "firstDivergence": "[exit=1] oam:node_compat.js:11668",
       "reason": "Asserts all 24 legacy process.binding names are truthy. oam models the ones it can back with the REAL implementation (constants, util, tty_wrap.isTTY) taken by identity off the public surface, and THROWS for the rest -- mostly libuv handle classes (TCP, UDP, Pipe, JSStream, FSEvent) it has nothing behind. Returning {} would claim them, and it is also worse for the caller than throwing: a package that feature-detects process.binding('tcp_wrap'), gets an empty object and proceeds hits a TypeError deep in its own code, where the throw sends it straight to the fallback branch that is correct for oam. See js/node_compat.js (process.binding)."
     },
     {
