@@ -75,6 +75,22 @@ fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: 
     scope.throw_exception(exception);
 }
 
+/// `throw_error_with_code`, but a SyntaxError: a source that cannot parse
+/// is SyntaxError territory in Node, and tooling switches on the
+/// constructor as well as `.code`.
+fn throw_syntax_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let message =
+        v8::String::new(scope, message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
+    let exception = v8::Exception::syntax_error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let key = v8::String::new(scope, "code").unwrap();
+        if let Some(value) = v8::String::new(scope, code) {
+            obj.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
 /// CJS wrapper parameters, in order. Shared between the require() loader and
 /// the `oam compile` bytecode producer so their compiled functions -- and thus
 /// their V8 code-cache blobs -- are interchangeable.
@@ -105,10 +121,23 @@ pub(crate) fn strip_shebang(source: String) -> String {
 /// The compile mirrors the require() loader -- same `CJS_PARAMS`, same origin
 /// shape, same shebang transform -- so the runtime consume path accepts the
 /// blob; a rejected blob would only trigger a recompile, never a wrong result.
-/// Returns None on a syntax error or if V8 declines to produce a cache.
+///
+/// `eager` selects `CompileOptions::EagerCompile`: V8 then compiles every
+/// inner function up front so the blob carries all of their bytecode, not just
+/// the wrapper plus whatever V8 would compile eagerly on its own. `oam compile`
+/// always passes true -- the runtime never re-produces a seeded blob (a
+/// compiled binary must not need a writable cache dir), so this one-shot
+/// produce is the only chance to capture inner functions; a lazy blob would
+/// leave every inner function to be recompiled on each run for the life of
+/// the binary. `false` exists for the evidence test that measures the gap.
+///
+/// Returns None on a syntax error (the exception is left pending on `scope`)
+/// or if V8 declines to produce a cache; a caller that must tell the two apart
+/// runs this under a TryCatch and checks `has_caught()`.
 pub(crate) fn produce_cjs_code_cache(
     scope: &mut v8::PinScope<'_, '_>,
     source: &str,
+    eager: bool,
 ) -> Option<Vec<u8>> {
     let source = strip_shebang(source.to_string());
     let source_v8 = v8::String::new(scope, &source)?;
@@ -121,12 +150,17 @@ pub(crate) fn produce_cjs_code_cache(
         .iter()
         .map(|p| v8::String::new(scope, p).unwrap())
         .collect();
+    let options = if eager {
+        v8::script_compiler::CompileOptions::EagerCompile
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
     let wrapper = v8::script_compiler::compile_function(
         scope,
         &mut compiler_source,
         &params,
         &[],
-        v8::script_compiler::CompileOptions::NoCompileOptions,
+        options,
         v8::script_compiler::NoCacheReason::NoReason,
     )?;
     wrapper.create_code_cache().map(|cd| cd.to_vec())
@@ -225,8 +259,8 @@ fn require_callback(
             scope,
             "ERR_REQUIRE_ESM",
             &format!(
-                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported yet — \
-                 import it instead (synchronous require(esm) is on the M2 roadmap)",
+                "[ERR_REQUIRE_ESM] require() of ES module {} from {} is not supported — \
+                 use import instead, or a .cjs/.cts module where require() is needed",
                 path.display(),
                 referrer.display()
             ),
@@ -342,12 +376,18 @@ pub(crate) fn load_cjs<'s>(
         }
     }
 
-    // TypeScript reached via require() (.ts/.cts/.mts): read the source, then
-    // consult the install-time pre-compilation cache (written by
-    // `oam install --precompile`, keyed by source hash). A cache hit skips the
-    // oxc transpile; a miss strips types inline below, mirroring the ESM host.
-    let ext = key.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_ts = matches!(ext, "ts" | "cts" | "mts");
+    // Sources the loader transpiles, reached via require(): .cts always;
+    // .tsx/.jsx when the package.json walk routes them CommonJS
+    // ("type":"commonjs", or typeless inside node_modules). .ts/.mts cannot
+    // actually get here today -- module_kind() pins them ESM, so
+    // require_callback throws ERR_REQUIRE_ESM first (a documented
+    // divergence: docs/node-divergences.md sec. 24, "TypeScript module
+    // kind") -- but deriving the gate from is_transpiled_source keeps it
+    // correct if that policy ever changes. Cache order for a transpiled
+    // source: install-time precompile cache (node_modules only, written by
+    // `oam install --precompile`) -> content-addressed transpile cache ->
+    // oxc inline, storing the fresh output for the next run.
+    let needs_transpile = oam_loader::is_transpiled_source(&key);
 
     let raw = match std::fs::read_to_string(&key) {
         Ok(source) => source,
@@ -357,34 +397,68 @@ pub(crate) fn load_cjs<'s>(
         }
     };
 
-    let source = if is_ts {
-        if let Some(cached) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
-            // Already plain JS from `oam install --precompile`; do NOT re-transpile.
-            cached
-        } else {
-            // oxc strips the TS types, then the CJS wrapper below compiles+runs
-            // the resulting JS. A transpile failure carries the loader's ODIF
-            // code/message rather than a raw oxc panic; any ESM syntax that
-            // survives stripping (e.g. a bare `export`) fails later at
-            // compile_function and surfaces as the V8 SyntaxError.
-            match oam_loader::transpile_typescript(&key, &raw) {
-                Ok(js) => js,
-                Err(e) => {
-                    let (code, message) = e
-                        .diagnostics
-                        .first()
-                        .map(|d| (d.code.clone(), d.message.clone()))
-                        .unwrap_or_else(|| {
-                            (
+    let source = if needs_transpile {
+        let (js, source_map) =
+            if let Some(hit) = oam_loader::precompile::try_precompile_cache(&key, &raw) {
+                // Already plain JS from `oam install --precompile`; do NOT re-transpile.
+                hit
+            } else if let Some(hit) = oam_loader::transpile_cache::try_get(&key, &raw) {
+                // Persistent oxc output from a previous run (either host); the
+                // artifact's self-hash was verified, so a corrupt entry
+                // re-transpiles instead of executing.
+                hit
+            } else {
+                // oxc strips TS types / lowers JSX (CommonJS-shaped, so the
+                // injected jsx-runtime import is a require()), then the CJS
+                // wrapper below compiles+runs the resulting JS. A transpile
+                // failure throws a SyntaxError carrying the loader's ODIF code
+                // and the first diagnostic's file:line:col; ESM syntax that
+                // survives stripping (e.g. a bare `export`) fails later at
+                // compile_function and surfaces as the V8 SyntaxError.
+                match oam_loader::transpile_typescript_mapped(&key, &raw) {
+                    Ok(out) => {
+                        oam_loader::transpile_cache::store(
+                            &key,
+                            &raw,
+                            &out.code,
+                            out.source_map.as_deref(),
+                        );
+                        (out.code, out.source_map)
+                    }
+                    Err(e) => {
+                        let extra = e.diagnostics.len().saturating_sub(1);
+                        let (code, message) = match e.diagnostics.first() {
+                            Some(d) => {
+                                let mut message = match d.spans.first() {
+                                    Some(span) => format!(
+                                        "{}:{}:{}: {}",
+                                        span.file, span.start.line, span.start.col, d.message
+                                    ),
+                                    None => format!("{file}: {}", d.message),
+                                };
+                                if extra > 0 {
+                                    message.push_str(&format!(" (+{extra} more)"));
+                                }
+                                (d.code.clone(), message)
+                            }
+                            None => (
                                 "OAM-PARSE0002".to_string(),
                                 format!("{file}: transpile failed"),
-                            )
-                        });
-                    throw_error_with_code(scope, &code, &message);
-                    return None;
+                            ),
+                        };
+                        throw_syntax_error_with_code(scope, &code, &message);
+                        return None;
+                    }
                 }
-            }
+            };
+        // Register the map (cache hits included -- warm runs must keep
+        // stack-trace fidelity) under the same canonical string the CJS
+        // wrapper's ScriptOrigin carries (`file`), so every surface that
+        // formats a V8 position for this module can remap it to the source.
+        if let Some(map) = source_map {
+            oam_loader::sourcemap::record(&file, map);
         }
+        js
     } else {
         raw
     };
@@ -447,16 +521,23 @@ pub(crate) fn load_cjs<'s>(
     );
     // V8 bytecode cache: consume a stored blob for this exact source if one
     // exists (skips the parse+compile) else compile fresh. The blob is keyed by
-    // source + V8 version so a foreign blob can't be served here; V8 also flags
-    // a bad blob via `rejected()` below. `cached_blob` is held for the whole
+    // source + V8 version + oam format so a foreign blob can't be served here;
+    // V8 also flags a bad blob via `rejected()` below. The key is computed once
+    // and reused by the store after the body runs -- and not at all when the
+    // cache is off (OAM_CODE_CACHE=0): a disabled cache must not pay a SHA-256
+    // over the full source per require, least of all in the cold-compile
+    // benchmarks the off switch exists for. `cached` is held for the whole
     // compile because `CachedData` borrows it (BufferNotOwned).
-    let cached_blob = crate::code_cache::load(&source, crate::code_cache::Kind::Function);
-    let consuming = cached_blob.is_some();
-    let mut compiler_source = match cached_blob {
-        Some(ref blob) => v8::script_compiler::Source::new_with_cached_data(
+    let cache_key = crate::code_cache::enabled()
+        .then(|| crate::code_cache::key_for(&source, crate::code_cache::Kind::Function));
+    let cached = cache_key.as_ref().and_then(crate::code_cache::load);
+    let consuming = cached.is_some();
+    let seeded = cached.as_ref().is_some_and(|c| c.seeded);
+    let mut compiler_source = match cached {
+        Some(ref c) => v8::script_compiler::Source::new_with_cached_data(
             source_v8,
             Some(&origin),
-            v8::script_compiler::CachedData::new(blob),
+            v8::script_compiler::CachedData::new(&c.bytes),
         ),
         None => v8::script_compiler::Source::new(source_v8, Some(&origin)),
     };
@@ -485,11 +566,23 @@ pub(crate) fn load_cjs<'s>(
     // (Re)write the cache after the body runs (below) on a miss, or if V8
     // rejected the consumed blob (stale/foreign) and recompiled. Producing
     // AFTER the call captures the body bytecode, not just the outer wrapper.
-    let refresh_cache = !consuming
-        || compiler_source
+    let rejected = consuming
+        && compiler_source
             .get_cached_data()
             .map(|cd| cd.rejected())
             .unwrap_or(true);
+    // A rejected SEED (embedded bytecode from a different V8 build or flag
+    // set) is dropped -- and the rejection recorded on disk -- so neither a
+    // later load in this process nor a later RUN of the same binary is handed
+    // the rejected bytes ahead of the disk blob the store below refreshes.
+    // (`seeded` implies a consumed blob, hence a Some key.)
+    if rejected
+        && seeded
+        && let Some(cache_key) = &cache_key
+    {
+        crate::code_cache::record_seed_rejection(cache_key);
+    }
+    let refresh_cache = !consuming || rejected;
 
     let require = make_require(scope, &file)?;
     let dirname = key
@@ -518,13 +611,13 @@ pub(crate) fn load_cjs<'s>(
 
     // Persist the bytecode now that the body has executed, so the cached blob
     // includes the body and not just the outer wrapper. Best-effort: a failed
-    // produce or write just means the next run pays the compile again. The
-    // enabled() guard skips the serialize work entirely when the cache is off.
+    // produce or write just means the next run pays the compile again. A None
+    // key means the cache is off, which skips the serialize work entirely.
     if refresh_cache
-        && crate::code_cache::enabled()
+        && let Some(cache_key) = &cache_key
         && let Some(cd) = wrapper.create_code_cache()
     {
-        crate::code_cache::store(&source, crate::code_cache::Kind::Function, &cd);
+        crate::code_cache::store(cache_key, &cd);
     }
 
     let loaded_key = v8::String::new(scope, "loaded")?;

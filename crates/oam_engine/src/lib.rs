@@ -41,7 +41,10 @@ pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
 // Re-exported so the CLI can register its `-e` artifact without taking a direct
 // oam_core dependency; the hard-exit paths that drain it live in this crate.
-pub use oam_core::{exit_process, register_exit_cleanup, run_exit_cleanup, snapshot_inherited_fds};
+pub use oam_core::{
+    exit_process, register_exit_cleanup, register_exit_hook, run_exit_cleanup,
+    snapshot_inherited_fds,
+};
 pub use permissions::{BoolOrList, Permissions, PermissionsOptions};
 pub use replay::ReplayMode;
 
@@ -622,14 +625,27 @@ impl JsRuntime {
     }
 
     /// Produce a V8 bytecode blob for `source` compiled as a CommonJS module
-    /// (the shape the `require()` path uses), WITHOUT executing it. Returns
-    /// `None` on a syntax error or if V8 declines to produce a cache. Spins up
-    /// a throwaway runtime for the isolate+context. Used by `oam compile` to
-    /// embed bytecode so a compiled binary's first run skips parse+compile.
-    pub fn precompile_cjs_source(source: &str) -> Option<Vec<u8>> {
+    /// (the shape the `require()` path uses), WITHOUT executing it. Compiled
+    /// eagerly so the blob carries every inner function's bytecode (see
+    /// `cjs::produce_cjs_code_cache`). Spins up a throwaway runtime for the
+    /// isolate+context. Used by `oam compile` to embed bytecode so a compiled
+    /// binary's first run skips parse+compile.
+    ///
+    /// `Ok(None)` when V8 declines to produce a cache -- the caller falls back
+    /// to a JS-only binary. `Err(message)` when the source does not compile as
+    /// CommonJS at all (a syntax error, an ESM `import`/`export`, TypeScript
+    /// syntax): the message is V8's own, prefixed `name:line`, so the user
+    /// sees exactly what `oam compile` saw instead of a binary that dies on
+    /// its first run. `name` is only used in that message.
+    pub fn precompile_cjs_source(name: &str, source: &str) -> Result<Option<Vec<u8>>, String> {
         let mut rt = Self::new();
         v8::scope_with_context!(let scope, &mut rt.isolate, &rt.context);
-        crate::cjs::produce_cjs_code_cache(scope, source)
+        v8::tc_scope!(let tc, scope);
+        let blob = crate::cjs::produce_cjs_code_cache(tc, source, true);
+        if blob.is_none() && tc.has_caught() {
+            return Err(exception_to_error(tc, name).to_string());
+        }
+        Ok(blob)
     }
 }
 
@@ -641,6 +657,41 @@ impl JsRuntime {
 pub fn seed_cjs_bytecode(source: &str, blob: Vec<u8>) {
     let key = crate::cjs::strip_shebang(source.to_string());
     crate::code_cache::seed(&key, crate::code_cache::Kind::Function, blob);
+}
+
+/// The canonical identity the module loader assigns to a file path: absolute,
+/// symlinks and Windows 8.3 short names resolved, verbatim (`\\?\`) prefix
+/// stripped. This is the string the loader hands a CJS module as `__filename`
+/// / `module.filename`, so a host that wants `process.argv[1]` to compare equal
+/// to `__filename` (an embedded entry checking whether it is the main module)
+/// must build argv from the same function rather than the spelled path -- on
+/// an 8.3 `TEMP` (`C:\Users\RUNNER~1\...`) or a symlinked `/tmp` the two
+/// spellings differ. Falls back to the lexical absolute form when the file
+/// cannot be canonicalized.
+pub fn module_key(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    crate::modules::module_key(path)
+}
+
+pub use crate::code_cache::CodeCacheStats;
+
+/// Location, entry count and total size of the V8 bytecode cache this process
+/// would use (`oam cache info`).
+pub fn code_cache_stats() -> CodeCacheStats {
+    crate::code_cache::stats()
+}
+
+/// The V8 bytecode cache directory this process would use (`OAM_CACHE_DIR`
+/// wins, then the platform cache dir, then the system temp dir). Cheap: no
+/// directory walk.
+pub fn code_cache_dir() -> std::path::PathBuf {
+    crate::code_cache::dir()
+}
+
+/// Delete the V8 bytecode cache directory (`oam cache clean`). Safe at any
+/// time -- the cache is a pure optimization and the next run repopulates it.
+/// A missing directory is success.
+pub fn code_cache_clean() -> std::io::Result<()> {
+    crate::code_cache::clean()
 }
 
 impl Default for JsRuntime {
@@ -699,7 +750,19 @@ pub(crate) fn exception_to_error(
         return anyhow!("{name}: unknown exception");
     };
     let text = message.get(tc).to_rust_string_lossy(tc);
-    let line = message.get_line_number(tc).unwrap_or(0);
+    let mut line = message.get_line_number(tc).unwrap_or(0);
+    // Transpiled files: V8's position is codegen output; remap to the line
+    // the user wrote. The registry only holds entries for transpiled
+    // modules, so plain JS never remaps.
+    if line > 0
+        && let Some(resource) = message.get_script_resource_name(tc)
+    {
+        let file = resource.to_rust_string_lossy(tc);
+        let column = message.get_start_column() as u32;
+        if let Some((src_line, _)) = oam_loader::sourcemap::lookup(&file, line as u32, column) {
+            line = src_line as usize;
+        }
+    }
     anyhow!("{name}:{line}: {text}")
 }
 

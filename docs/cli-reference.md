@@ -15,9 +15,11 @@ overview, plus the environment variables, which `--help` does not list.
 | `oam mcp` | Serve oam's introspection to coding agents over MCP (stdio). E.g. `claude mcp add oam -- oam mcp`. |
 | `oam serve <file>` | `oam run` with `PORT`/`HOST` set from `--port`/`--host`. |
 | `oam install` | Install from the lockfile (the `npm ci` equivalent). |
+| `oam install --precompile` | `oam install`, plus transpile the TypeScript shipped inside installed packages into `node_modules/.oam/precompile/` so the first run pays no transpile cost. Walks every package in the lockfile — a warm (already-installed) tree is populated or refreshed too, and entries invalidate automatically when a package's source, oam's transpiler, or the effective JSX settings change. |
 | `oam trust` | Manage the trust list for package lifecycle scripts. |
 | `oam compile <file>` | Embed a **pre-bundled** JS file into a standalone executable. Bundle it yourself first (esbuild/rollup); this does not bundle. |
 | `oam self-update` | Re-run the canonical installer from oamjs.org, verifying against the published `SHA256SUMS`. |
+| `oam cache info` / `oam cache clean` | Inspect or delete the V8 bytecode cache (see `OAM_CODE_CACHE` below). |
 
 Global: `--json` emits machine-readable ODIF JSONL on stderr instead of
 pretty-printed errors — the form agents should consume.
@@ -50,8 +52,9 @@ Notable ones:
 | `OAM_ENABLE_NATIVE_ADDONS=1` | Enable N-API addon loading. **Off by default and alpha**: an addon compiled against `node.exe` can deadlock the OS loader inside oam, before any oam code runs, so the default is a clean throw that lets a package's JS fallback take over. This is the *runtime* switch; there is also a *compile-time* one — the `napi` cargo feature (on by default). A binary built `--no-default-features` has no N-API layer and no exported `napi_*` ABI at all, so `require()` of a `.node` throws `OAM-NATIVE0002` and this variable does nothing. |
 | `OAM_MAX_HEAP_MB` | Cap the V8 heap. Set this to match a container memory limit. |
 | `OAM_MAX_BODY_BYTES` | Aggregate cap on queued HTTP request-body bytes across all in-flight requests (default 512MB). Past it, excess uploads are shed rather than buffered. Per-request backpressure is the first line of defence; this bounds the total once concurrency is high. |
-| `OAM_CODE_CACHE` | Control V8 code-cache reuse across runs. |
-| `OAM_CACHE_DIR` | Where oam keeps its caches. |
+| `OAM_CODE_CACHE` | V8 bytecode cache across runs. On by default; `0`, `off`, `false` or `no` turns it off entirely -- no consume, no produce, no write. Blobs live under `<cache dir>/bytecode`, content-addressed by source text + V8 build, so a stale blob is a miss, never a wrong hit. Housekeeping is automatic: at most once a day a run sweeps the directory on a background thread, deleting orphaned `.tmp` files older than 10 minutes and blobs not written in 30 days. `oam cache info` prints the directory, entry count and total size; `oam cache clean` deletes it (safe at any time -- the next run recompiles and repopulates). |
+| `OAM_TRANSPILE_CACHE` | Transpile output cache across runs (TypeScript/TSX -> JS). On by default; `0`, `off`, `false` or `no` turns it off entirely -- no read, no write. Entries live under `<cache dir>/transpile`, content-addressed by source text + transpile settings, so a stale entry is a miss, never a wrong hit. Every filesystem failure is a silent miss: the fallback (transpile again) is always correct. |
+| `OAM_CACHE_DIR` | Where oam keeps its caches (bytecode, transpile output, type-check daemon state). Default: `%LOCALAPPDATA%\oam` on Windows, `$XDG_CACHE_HOME/oam` or `~/.cache/oam` elsewhere; when none of those resolve (a scrubbed environment), the system temp dir -- never the working directory. |
 | `OAM_IO_URING` | Opt into the Linux io_uring FS path. Off by default — it benchmarked as not a win. |
 | `OAM_EXPERIMENTAL_VM_MODULES` / `OAM_EXPOSE_INTERNALS` | Env equivalents of the flags above; set by the CLI, readable by the loader. |
 
@@ -59,8 +62,11 @@ Notable ones:
 
 | Variable | Effect |
 |---|---|
-| `OAM_TSGO` | Path to the tsgo binary, when it is not the bundled one. |
+| `OAM_TSGO` | Path to the tsgo binary. Without it, oam prefers the project's `node_modules/.bin/tsgo` (nearest, walking up), then PATH. |
+| `OAM_TSGO_TIMEOUT_MS` | Wall-clock bound on one tsgo run (default 300000). A run past it is killed — whole process tree — and reported as `OAM-TS0006`. |
+| `OAM_CHECK_WAIT_MS` | How long warn-mode `oam run` waits for the concurrent checker after the program exits (default 10000). |
 | `OAM_DAEMON_IDLE_MS` | How long the type-check daemon stays warm before exiting. |
+| `OAM_DEBUG` | `1` prints why a check fell back from the daemon to one-shot (normally swallowed by the never-worse-than-one-shot contract). |
 
 ### Install and update
 

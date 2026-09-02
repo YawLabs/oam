@@ -25,6 +25,8 @@ use oam_diagnostics::{Diagnostic, Origin, Severity};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+use crate::resolver::Resolver;
+
 /// How a resolution request reached us. Import = ESM `import` statements;
 /// Require = `require()` calls inside CJS modules. They differ in exports
 /// conditions, legacy entry fields, and extension probing — parameterized
@@ -443,11 +445,28 @@ pub(crate) fn resolve_bare(
 ///
 /// Successful file resolutions are realpath'd (Node's default
 /// no-preserve-symlinks semantics) — see `resolve_import`.
+///
+/// Thin shim over `Resolver::resolve_require` on the current thread's
+/// default `Resolver`; long-lived consumers should own a `Resolver` so
+/// `clear_caches()` reaches the tsconfig state this reads.
 pub fn resolve_require(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
-    resolve_require_inner(specifier, referrer).map(crate::pathutil::finalize_resolved)
+    resolve_require_with(crate::resolver::default_resolver(), specifier, referrer)
 }
 
-fn resolve_require_inner(specifier: &str, referrer: &Path) -> Result<PathBuf, Diagnostic> {
+/// `resolve_require` against an explicit `Resolver` (its tsconfig caches).
+pub(crate) fn resolve_require_with(
+    resolver: &Resolver,
+    specifier: &str,
+    referrer: &Path,
+) -> Result<PathBuf, Diagnostic> {
+    resolve_require_inner(resolver, specifier, referrer).map(crate::pathutil::finalize_resolved)
+}
+
+fn resolve_require_inner(
+    resolver: &Resolver,
+    specifier: &str,
+    referrer: &Path,
+) -> Result<PathBuf, Diagnostic> {
     // CJS treats bare '.' and '..' as relative directory requires (Node's
     // _resolveLookupPaths: any request starting with '.' is relative, so
     // '.' is the referrer's directory and '..' its parent, each resolved
@@ -497,10 +516,18 @@ fn resolve_require_inner(specifier: &str, referrer: &Path) -> Result<PathBuf, Di
             )
         });
     }
-    // Bare specifier: tsconfig paths get first crack (mirrors lib.rs:158-176),
-    // then the Node CJS node_modules walk.
+    // Builtins bypass tsconfig paths entirely, exactly as the import side
+    // does (`Resolver::resolve_import_inner`): a catch-all `"*"` pattern
+    // (the `"*": ["node_modules/*"]` idiom) must not turn `require('fs')`
+    // into a project file while `import 'fs'` still returns the builtin --
+    // two identities for 'fs' in one run.
+    if crate::is_builtin_specifier(specifier) {
+        return resolve_bare(specifier, referrer, ResolveMode::Require);
+    }
+    // Bare specifier: tsconfig paths get first crack (mirrors
+    // `Resolver::resolve_import_inner`), then the Node CJS node_modules walk.
     let mut consulted_paths = false;
-    if let Some(config) = crate::tsconfig::load_for(referrer) {
+    if let Some(config) = crate::tsconfig::load_for_with(resolver, referrer) {
         consulted_paths = true;
         for raw in crate::tsconfig::match_specifier(&config, specifier) {
             if let Some(found) = ResolveMode::Require.probe(&raw) {
@@ -795,7 +822,9 @@ enum ExportsError {
 
 /// PACKAGE_EXPORTS_RESOLVE, the subset that matters: exact subpaths,
 /// single-* wildcards (longest-prefix wins), condition objects in
-/// declaration order, arrays as fallbacks, null blocks.
+/// declaration order (serde_json's `preserve_order` feature is what makes
+/// `Value::Object` iterate that way -- a sorted map made `default` beat
+/// every other condition), arrays as fallbacks, null blocks.
 fn exports_resolve(
     exports: &Value,
     subpath: &str,
@@ -939,6 +968,51 @@ mod tests {
             "./main.js"
         );
         assert!(exports_resolve(&string_sugar, "./sub", IMPORT).is_err());
+    }
+
+    /// Conditions are matched in DECLARATION order, as Node does. With a
+    /// key-sorted map, `default` (alphabetically first) won over `import`,
+    /// `node` and `require` in every dual package that declared it -- the
+    /// shape `{import, require, default}` with `default` LAST is the norm
+    /// (yaml, tslib, ...), so this test would have failed on the old map.
+    #[test]
+    fn exports_conditions_match_in_declaration_order_not_key_order() {
+        let exports = json!({
+            ".": { "import": "./esm.mjs", "require": "./cjs.cjs", "default": "./default.cjs" }
+        });
+        assert_eq!(
+            exports_resolve(&exports, ".", IMPORT).ok().unwrap(),
+            "./esm.mjs"
+        );
+        assert_eq!(
+            exports_resolve(&exports, ".", REQUIRE).ok().unwrap(),
+            "./cjs.cjs"
+        );
+        // {node, default}: the node build, never the browser fallback.
+        let dual_env = json!({ "node": "./node.js", "default": "./browser.js" });
+        assert_eq!(
+            exports_resolve(&dual_env, ".", IMPORT).ok().unwrap(),
+            "./node.js"
+        );
+        assert_eq!(
+            exports_resolve(&dual_env, ".", REQUIRE).ok().unwrap(),
+            "./node.js"
+        );
+        // Declared FIRST, `default` legitimately wins -- order is the rule,
+        // not a preference for named conditions.
+        let default_first = json!({ "default": "./d.js", "import": "./esm.js" });
+        assert_eq!(
+            exports_resolve(&default_first, ".", IMPORT).ok().unwrap(),
+            "./d.js"
+        );
+        // Subpath imports share the algorithm.
+        let imports = json!({
+            "#util": { "import": "./u.mjs", "require": "./u.cjs", "default": "./u-default.cjs" }
+        });
+        assert_eq!(
+            exports_resolve(&imports, "#util", IMPORT).ok().unwrap(),
+            "./u.mjs"
+        );
     }
 
     // Subpath imports (#xxx) reuse exports_resolve with #-keyed maps. Verify
@@ -1374,6 +1448,43 @@ mod tests {
         std::fs::write(&entry, "").unwrap();
         let resolved = resolve_require("@lib/util", &entry).unwrap();
         assert!(resolved.ends_with("src/util.js"), "got {resolved:?}");
+    }
+
+    /// A catch-all `"*"` paths pattern must not shadow builtins on the
+    /// require side. The import side always checked builtins first; require
+    /// consulted paths first, so `require('fs')` returned shim/fs.js (and
+    /// `require.resolve('fs')` its path) while `import 'fs'` returned the
+    /// builtin -- two identities for 'fs' in one run.
+    #[test]
+    fn resolve_require_builtins_bypass_catch_all_tsconfig_paths() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("shim")).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "*": ["./shim/*"], "fs": ["./shim/fs.js"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("shim/fs.js"), "module.exports = { shim: true };").unwrap();
+        std::fs::write(dir.join("shim/util.js"), "module.exports = { shim: true };").unwrap();
+        std::fs::write(dir.join("shim/lodash.js"), "module.exports = 'shimmed';").unwrap();
+        let entry = dir.join("entry.cjs");
+        std::fs::write(&entry, "").unwrap();
+
+        for builtin in ["fs", "node:fs", "util", "fs/promises"] {
+            let resolved =
+                resolve_require(builtin, &entry).unwrap_or_else(|e| panic!("{builtin}: {e:?}"));
+            let expected = format!("node:{}", builtin.trim_start_matches("node:"));
+            assert_eq!(
+                resolved,
+                PathBuf::from(&expected),
+                "{builtin} must resolve to the builtin, never the paths shim"
+            );
+        }
+        // Non-builtins still honor the catch-all pattern.
+        let shimmed = resolve_require("lodash", &entry).expect("lodash via paths");
+        assert!(shimmed.ends_with("shim/lodash.js"), "got {shimmed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

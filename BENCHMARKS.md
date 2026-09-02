@@ -18,7 +18,11 @@ The oam binary is copied out of `target/` and exec'd once before timing starts. 
 
 Each case is timed in-process by the harness rather than by a shell wrapper, except `cold-start` and `mcp-cold-start`, which are wall-clock from process spawn and can only be measured from outside. A runtime that is not on PATH is skipped, never estimated. The profile and host are recorded in the line below, because a debug build against release Node is not a comparison.
 
+Every figure is a MEDIAN over repeated process runs, and the per-case sample count sits in the `iterations` field of [`bench/results.json`](bench/results.json) alongside min/max/p95/p99 and the raw samples -- read those before drawing a conclusion from a gap of a few percent. Runtimes are interleaved within a run, so background load that drifts over the run lands on all of them rather than on whichever was measured last; the ratios survive it, the absolute numbers do not. Do not compare absolute figures across two runs on a machine that was doing different things each time -- compare the ratios, or re-measure both on a quiet box.
+
 Where another runtime wins, the table says so -- see [docs/why-oam.md](docs/why-oam.md) for the workloads oam is and is not aimed at.
+
+`--case <name>` (repeatable) measures only those cases and merges them into the committed files instead of rewriting them: the `Commit` line below keeps describing the last full run, every re-measured row is stamped with its own commit and listed under the table, and the TypeScript section carries its own stamp. It is how one case gets re-measured after a change without re-stamping numbers that did not move.
 
 Commit `acec008` | release | host windows-aarch64
 
@@ -44,6 +48,24 @@ All times in milliseconds. Lower is better.
 | mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
 | mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
 
+## TypeScript load path
+
+Commit `e9358cd` | release | host windows-aarch64 | oam 0.13.0 | v22.22.2
+
+`ts-cold-start`: wall-clock from process spawn to the first stdout line of `main.ts`, the entry of a generated graph of 20 `.ts` modules (interfaces, generics, enums, `import type`, a few inner functions each) that import each other in a chain plus a fan-out from the entry. oam runs it as `oam run --no-check main.ts` in three cache states, one row each; node runs it once, as installed, for reference. Median over 20 runs per row, the rows sampled round-robin like every other case. Milliseconds, lower is better. Each label was checked rather than assumed: a no-cache run that leaves a `.v8c` blob, a cold run that leaves none, or a row whose first line disagrees with another row's fails the case instead of publishing. The stamp above is this section's own -- `--case ts-cold-start` re-measures it alone, without touching the table above.
+
+| Row | Median | Min | Max | p95 |
+|---|--:|--:|--:|--:|
+| oam no-cache | 32.59 | 29.92 | 56.91 | 55.40 |
+| oam cold | 32.80 | 30.30 | 55.96 | 55.76 |
+| oam warm | 24.38 | 23.10 | 72.06 | 48.64 |
+| node | 187.09 | 174.62 | 227.78 | 227.36 |
+
+- **oam no-cache** -- `OAM_CODE_CACHE=0`, fresh `OAM_CACHE_DIR` every run: the `.ts` -> JS transpile (oxc) plus a full V8 compile; no bytecode is produced, written or read. The floor without the cache.
+- **oam cold** -- caches on, fresh `OAM_CACHE_DIR` every run: a project's first run, which also serializes and writes the bytecode. Its gap above no-cache is the price of producing the cache.
+- **oam warm** -- caches on, one `OAM_CACHE_DIR` primed by an untimed run and reused: every run after the first. Its gap below no-cache is what consuming the cache saves. The transpile itself is not cached for project files (only `node_modules` gets the install-time precompile), so this row still pays oxc on every run -- it is the row a transpile cache has to move.
+- **node** -- `node --experimental-transform-types main.ts` as installed, `NODE_COMPILE_CACHE` unset. Strip-only mode (`--experimental-strip-types`) rejects the fixture's enums with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`, so the reference is transform mode.
+
 ## Cases
 
 - **cold-start** -- wall-clock time from process spawn to exit (`console.log('ok')`). Measured by the harness, not JS.
@@ -55,3 +77,4 @@ All times in milliseconds. Lower is better.
 - **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport).
 - **mcp-idle-rss** -- resident set size (MB) after `initialize` completes and the server is idle, waiting for the next request. Measures runtime memory overhead of a hosted MCP server.
 - **mcp-first-call-latency** -- wall-clock from sending `tools/call` to receiving the response, on an already-initialized server. Measures warm-path dispatch latency (no cold-start cost).
+- **ts-cold-start** -- wall-clock from process spawn to the first stdout line of a generated 20-module TypeScript graph, one row per bytecode-cache state for oam with node as the reference. Published in the TypeScript load path section above, which carries its own stamp.

@@ -153,14 +153,21 @@ enum Command {
         output: PathBuf,
         /// Carrier binary to embed into, instead of the running oam. Point it
         /// at an oam release binary for another OS/arch to cross-compile --
-        /// the payload is platform-independent, only the carrier is not.
+        /// the JS payload is platform-independent, only the carrier is not.
         /// Without this, compile always produces a binary for the platform it
-        /// runs on, so shipping N targets needed N machines.
+        /// runs on, so shipping N targets needed N machines. V8 bytecode is
+        /// bound to the compiling binary, so a foreign carrier gets a JS-only
+        /// payload and builds its own bytecode cache lazily on first run.
         #[arg(long, value_name = "PATH")]
         carrier: Option<PathBuf>,
         /// Reserved for future use (minify the embedded source).
         #[arg(long)]
         minify: bool,
+    },
+    /// Inspect or delete the V8 bytecode cache (`oam cache --help`).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
     /// Update oam in place to the latest release by running the canonical
     /// oamjs.org installer (verifies via the published SHA256SUMS). Updates the
@@ -176,6 +183,15 @@ enum Command {
     /// Internal: type-check daemon server process. Not for direct use.
     #[command(name = "__oamd-ts", hide = true)]
     DaemonServe { tsconfig: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print the bytecode cache directory, its entry count and total size.
+    Info,
+    /// Delete the bytecode cache. Safe at any time: the next run recompiles
+    /// and repopulates it.
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -523,13 +539,16 @@ fn main() -> ExitCode {
             // test runner even if a file named `test` sits in the cwd.
             if !flag.starts_with('-') && !SUBCOMMANDS.contains(&flag) && Path::new(flag).is_file() {
                 let file = PathBuf::from(flag);
-                return match run_file_with_flags(
+                drain_loader_warnings_on_hard_exit(false);
+                let outcome = run_file_with_flags(
                     &file,
                     &raw[i + 1..],
                     None,
                     oam_engine::ReplayMode::Off,
                     &flags,
-                ) {
+                );
+                report_loader_warnings(false);
+                return match outcome {
                     Ok(code) => ExitCode::from(code),
                     Err((diagnostics, code)) => {
                         for d in &diagnostics {
@@ -680,6 +699,7 @@ fn dispatch(cli: Cli) -> ExitCode {
             carrier,
             minify: _,
         } => compile_command(entry, output, carrier.as_deref()),
+        Command::Cache { action } => cache_command(action, cli.json),
         Command::SelfUpdate { version, dry_run } => {
             self_update_command(version.as_deref(), *dry_run)
         }
@@ -786,10 +806,39 @@ fn self_update_command(version: Option<&str>, dry_run: bool) -> ExitCode {
 // result_large_err: cold path, deliberate — same stance as oam_loader/oam_ts.
 #[allow(clippy::result_large_err)]
 fn run_check(path: &Path) -> Result<Vec<Diagnostic>, Diagnostic> {
+    run_check_with(path, &oam_ts::TsgoHandle::new())
+}
+
+/// [`run_check`] whose one-shot tsgo (the fallback path) is registered on
+/// `handle`, so a caller that stops waiting can kill it instead of leaving
+/// a type-check running after `oam run` has exited. The daemon path needs
+/// no handle: its tsgo belongs to the detached daemon, which finishes the
+/// check and caches it for the next run.
+#[allow(clippy::result_large_err)]
+fn run_check_with(path: &Path, handle: &oam_ts::TsgoHandle) -> Result<Vec<Diagnostic>, Diagnostic> {
     match oam_ts::daemon::check_via_daemon(path) {
         Ok(diagnostics) => Ok(diagnostics),
-        Err(_) => oam_ts::check(path),
+        Err(reason) => {
+            // The daemon's failure is swallowed by contract; OAM_DEBUG
+            // surfaces it (a daemon that cannot start otherwise costs every
+            // check its spawn wait with no observable reason).
+            if std::env::var_os("OAM_DEBUG").is_some_and(|v| !v.is_empty() && v != "0") {
+                eprintln!("oam check: daemon unavailable ({reason}); running one-shot");
+            }
+            oam_ts::check_cancellable(path, handle)
+        }
     }
+}
+
+/// How long warn-mode `oam run` waits for the checker after the program
+/// exits: `OAM_CHECK_WAIT_MS`, default 10s (CI on a loaded box can lengthen
+/// it instead of skipping tests).
+fn check_wait() -> std::time::Duration {
+    std::env::var("OAM_CHECK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(10))
 }
 
 fn error_count(diagnostics: &[Diagnostic]) -> usize {
@@ -833,6 +882,7 @@ fn run_command(
     inspect: Option<(std::net::SocketAddr, bool)>,
     replay_mode: oam_engine::ReplayMode,
 ) -> ExitCode {
+    drain_loader_warnings_on_hard_exit(json);
     let mode = if no_check { CheckMode::Off } else { check };
     // Only TypeScript entries are checkable; .js and .tsx flow through
     // their normal paths untouched.
@@ -863,16 +913,22 @@ fn run_command(
 
     // Warn mode: the check races execution on a thread; we collect it after
     // the program finishes. Execution NEVER waits for the checker to start.
+    // The handle lets the deadline path below kill a one-shot tsgo the
+    // checker thread still owns, so no orphan outlives this process.
     let pending = (mode == CheckMode::Warn && checkable).then(|| {
         let path = file.to_path_buf();
+        let handle = oam_ts::TsgoHandle::new();
         let (tx, rx) = std::sync::mpsc::channel();
+        let checker_handle = handle.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_check(&path));
+            let _ = tx.send(run_check_with(&path, &checker_handle));
         });
-        rx
+        (rx, handle)
     });
 
-    let exit = match run_file(file, script_args, inspect, replay_mode) {
+    let outcome = run_file(file, script_args, inspect, replay_mode);
+    report_loader_warnings(json);
+    let exit = match outcome {
         Ok(code) => ExitCode::from(code),
         Err((diagnostics, code)) => {
             for d in &diagnostics {
@@ -885,8 +941,8 @@ fn run_command(
         }
     };
 
-    if let Some(rx) = pending {
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    if let Some((rx, handle)) = pending {
+        match rx.recv_timeout(check_wait()) {
             Ok(Ok(diagnostics)) => {
                 let errors = error_count(&diagnostics);
                 for d in &diagnostics {
@@ -912,28 +968,54 @@ fn run_command(
                 }
             }
             Err(_) => {
-                // Checker still running when the wait deadline hit (cold
-                // tsgo / daemon warming under load). Same contract as the
-                // unavailable case above: the json stream must say the check
-                // did not happen -- a silently empty stream reads as
-                // "typecheck ran clean" (this exact silence flaked the e2e
-                // suite under full-parallel load).
+                // Checker still running when the wait deadline hit. Same
+                // contract as the unavailable case above: the json stream
+                // must say the check did not happen -- a silently empty
+                // stream reads as "typecheck ran clean" (this exact silence
+                // flaked the e2e suite under full-parallel load).
+                //
+                // Three honest shapes. A one-shot tsgo the checker thread
+                // still owns (no tsconfig, or the daemon fell back) is
+                // killed here, so it is CANCELLED, not "still running", and
+                // nothing warms for the next run. Only a project with a
+                // tsconfig has a daemon that finishes the work and caches
+                // it. (The e2e skip commit 8d7b515 attributed its flake to
+                // "daemon warmth" for a tsconfig-less fixture, which takes
+                // the one-shot path -- there was never a daemon to warm.)
+                let killed = handle.cancel();
+                let has_tsconfig = oam_ts::find_tsconfig(file).is_some();
+                let message = if killed {
+                    format!(
+                        "type check cancelled: it did not finish within {}ms of the program exiting \
+                         (no daemon served this run); re-run `oam check {}` for results \
+                         (OAM_CHECK_WAIT_MS lengthens the wait)",
+                        check_wait().as_millis(),
+                        file.display()
+                    )
+                } else if has_tsconfig {
+                    "type check did not finish before the program exited (daemon warming); \
+                     results are instant on the next run"
+                        .to_string()
+                } else {
+                    format!(
+                        "type check did not finish before the program exited; single-file checks \
+                         have no daemon, so re-run `oam check {}` for results \
+                         (OAM_CHECK_WAIT_MS lengthens the wait)",
+                        file.display()
+                    )
+                };
                 if json {
                     render(
                         &Diagnostic::new(
                             "OAM-TS0005",
                             Severity::Warning,
                             Origin::Typecheck,
-                            "type check did not finish before the program exited (checker \
-                             warming); results are instant on the next run"
-                                .to_string(),
+                            message,
                         ),
                         json,
                     );
                 } else {
-                    eprintln!(
-                        "oam run: type check still running (daemon warming); results are instant on the next run"
-                    );
+                    eprintln!("oam run: {message}");
                 }
             }
         }
@@ -947,6 +1029,7 @@ fn check_path(path: &Path, json: bool, no_daemon: bool) -> ExitCode {
     } else {
         run_check(path)
     };
+    report_loader_warnings(json);
     match result {
         Err(failure) => {
             render(&failure, json);
@@ -1018,6 +1101,7 @@ fn repl_command() -> ExitCode {
         "oam v{} — typed REPL (TypeScript welcome; .exit or Ctrl+C to quit)",
         env!("CARGO_PKG_VERSION")
     );
+    drain_loader_warnings_on_hard_exit(false);
     // Same construction-time rule as `test_command`: `oam --permission` used to
     // drop into an all-granted REPL, so every line you pasted at the prompt ran
     // outside the sandbox you asked for.
@@ -1086,21 +1170,28 @@ fn repl_command() -> ExitCode {
                 let source = std::mem::take(&mut buffer);
                 // Typed input: strip annotations first; oxc handles plain
                 // JS identically, and its parse errors are the user's.
-                let prepared = match oam_loader::transpile_typescript(Path::new("repl.ts"), &source)
-                {
-                    Ok(stripped) => stripped,
-                    Err(e) => {
-                        for d in &e.diagnostics {
-                            eprintln!("{}", d.message);
+                let prepared =
+                    match oam_loader::transpile_typescript_rich(Path::new("repl.ts"), &source) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            for d in &e.diagnostics {
+                                eprintln!("{}", d.message);
+                            }
+                            prompt(false);
+                            continue;
                         }
-                        prompt(false);
-                        continue;
-                    }
-                };
-                match rt.repl_eval(&prepared) {
+                    };
+                match rt.repl_eval(
+                    &prepared.code,
+                    prepared.top_level_await,
+                    &prepared.top_level_bindings,
+                ) {
                     Ok(rendered) => println!("{rendered}"),
                     Err(message) => eprintln!("{message}"),
                 }
+                // Loader warnings queued by this line's resolution surface at
+                // the prompt they belong to, not silently at REPL exit.
+                report_loader_warnings(false);
                 prompt(false);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1110,6 +1201,7 @@ fn repl_command() -> ExitCode {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    report_loader_warnings(false);
     ExitCode::SUCCESS
 }
 
@@ -1172,6 +1264,7 @@ fn discover_test_files(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// across files), results rendered pretty or as ODIF JSONL from the same
 /// data. Exit 0 only when every discovered test passed.
 fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode {
+    drain_loader_warnings_on_hard_exit(json);
     let files = discover_test_files(paths);
     if files.is_empty() {
         eprintln!(
@@ -1304,6 +1397,10 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
         }
     }
 
+    // Warnings the loader queued while any file resolved or transpiled
+    // (OAM-MOD0008/0009) surface before the summary, like run/check drain.
+    report_loader_warnings(json);
+
     let elapsed = started.elapsed().as_millis();
     let failed_total = fail + file_failures;
     if json {
@@ -1352,13 +1449,39 @@ fn render(d: &Diagnostic, json: bool) {
         // would bury the stack and break the `^Error:` line tools grep for.
         eprint!("{}", d.message);
     } else {
+        let label = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        };
         let loc = d
             .spans
             .first()
             .map(|s| format!(" ({}:{}:{})", s.file, s.start.line, s.start.col))
             .unwrap_or_default();
-        eprintln!("error[{}]: {}{}", d.code, d.message, loc);
+        eprintln!("{label}[{}]: {}{}", d.code, d.message, loc);
     }
+}
+
+/// Drain the loader's deferred warnings (a tsconfig that does not parse, a
+/// package `extends` it cannot resolve yet) through `render`, so they reach
+/// stderr as ODIF like every other diagnostic -- never as prose that breaks
+/// the --json JSONL contract. Called once per command, after the work that
+/// could have queued them.
+fn report_loader_warnings(json: bool) {
+    for d in oam_loader::take_warnings() {
+        render(&d, json);
+    }
+}
+
+/// Ensure queued loader warnings survive a HARD exit. `process.exit()` tears
+/// the process down from inside the op -- the normal end-of-command drain
+/// never runs -- so every command that constructs a JsRuntime registers the
+/// drain with the same exit-cleanup mechanism `run_eval` uses for its temp
+/// file. The sink drain is take-based, so the normal epilogue and this hook
+/// can never double-print.
+fn drain_loader_warnings_on_hard_exit(json: bool) {
+    oam_engine::register_exit_hook(move || report_loader_warnings(json));
 }
 
 /// `oam install`: frozen-lockfile package install from package-lock.json v3.
@@ -1367,7 +1490,12 @@ fn install_command(frozen_lockfile: bool, precompile: bool, json: bool) -> ExitC
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_dir = find_project_dir(&cwd, "package-lock.json").unwrap_or(cwd);
 
-    match oam_loader::install::install(&project_dir, frozen_lockfile, precompile) {
+    let result = oam_loader::install::install(&project_dir, frozen_lockfile, precompile);
+    // Deferred loader warnings queued during the install (a package tsconfig
+    // the --precompile pass consulted) drain before the summary, like
+    // run/check drain theirs.
+    report_loader_warnings(json);
+    match result {
         Ok(outcome) => {
             let (installed, elapsed, errors) = match outcome {
                 oam_loader::install::InstallOutcome::Complete(summary) => {
@@ -1623,9 +1751,12 @@ impl oam_engine::ModuleHost for CliHost {
         // .json would parse as JS and die on 'Unexpected token'. CJS files
         // never reach this host — the engine routes them through interop
         // before load — so a .cjs/.cts here is an engine routing bug.
+        // The accepted set is DERIVED from the loader's own classifier —
+        // `is_transpiled_source` (.ts/.mts/.cts/.tsx/.jsx, minus the
+        // CJS-routed .cts caught first) plus the plain-JS ESM extensions —
+        // so this host cannot drift from what the loader transpiles.
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
-            "js" | "mjs" | "ts" | "mts" | "tsx" | "jsx" => {}
             "cjs" | "cts" => {
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
@@ -1651,13 +1782,14 @@ impl oam_engine::ModuleHost for CliHost {
                     ),
                 )]);
             }
+            _ if matches!(ext, "js" | "mjs") || oam_loader::is_transpiled_source(path) => {}
             other => {
                 return Err(vec![Diagnostic::new(
                     "OAM-MOD0003",
                     Severity::Error,
                     Origin::Resolve,
                     format!(
-                        "unsupported module type '.{other}' (expected .js/.mjs/.ts/.mts): {}",
+                        "unsupported module type '.{other}' (expected .js/.mjs/.ts/.mts/.tsx/.jsx): {}",
                         path.display()
                     ),
                 )]);
@@ -1679,14 +1811,37 @@ impl oam_engine::ModuleHost for CliHost {
             // (`import { jsx as _jsx } from "react/jsx-runtime"`), which
             // resolves through normal npm resolution + CJS interop.
             SourceKind::TypeScript | SourceKind::Jsx => {
-                // Install-time pre-compilation cache (oam install --precompile),
-                // keyed by source hash; a hit skips the oxc transpile. Misses
-                // (project sources, stale entries) fall through to transpile.
-                if let Some(cached) = oam_loader::precompile::try_precompile_cache(path, &source) {
-                    Ok(cached)
+                // Cache order: install-time precompile cache (node_modules
+                // only, `oam install --precompile`, keyed by source hash) ->
+                // content-addressed transpile cache (ALL transpiled sources,
+                // project files included) -> oxc, storing the fresh output
+                // so the next run skips the pipeline entirely.
+                let (js, source_map) = if let Some(hit) =
+                    oam_loader::precompile::try_precompile_cache(path, &source)
+                {
+                    hit
+                } else if let Some(hit) = oam_loader::transpile_cache::try_get(path, &source) {
+                    hit
                 } else {
-                    oam_loader::transpile_typescript(path, &source).map_err(|e| e.diagnostics)
+                    let out = oam_loader::transpile_typescript_mapped(path, &source)
+                        .map_err(|e| e.diagnostics)?;
+                    oam_loader::transpile_cache::store(
+                        path,
+                        &source,
+                        &out.code,
+                        out.source_map.as_deref(),
+                    );
+                    (out.code, out.source_map)
+                };
+                // Register the map (cache hits included -- warm runs must
+                // keep stack-trace fidelity) under the SAME string the
+                // engine hands V8 as this module's ScriptOrigin
+                // (path.to_string_lossy in load_module_graph), so runtime
+                // position remap finds it.
+                if let Some(map) = source_map {
+                    oam_loader::sourcemap::record(&path.to_string_lossy(), map);
                 }
+                Ok(js)
             }
             _ => Ok(source),
         }
@@ -2087,8 +2242,12 @@ const SUBCOMMANDS: &[&str] = &[
     "install",
     "trust",
     "compile",
+    "cache",
     "self-update",
     "help",
+    // The hidden daemon-server subcommand is still a subcommand: a stray cwd
+    // file named like it must not win the bare-script dispatch over clap.
+    "__oamd-ts",
 ];
 
 /// Catch the space-separated grant form (`--allow-net 127.0.0.1:5432`) that
@@ -2482,6 +2641,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     // artifact was left in the user's working directory. Register it so the
     // hard-exit path removes it too.
     oam_engine::register_exit_cleanup(tmp_dir.clone().unwrap_or_else(|| tmp_file.clone()));
+    // Queued loader warnings must survive a `process.exit()` inside the eval
+    // the same way the temp file must be removed by one.
+    drain_loader_warnings_on_hard_exit(false);
     // -p evaluates through a DIRECT eval, which yields the completion value
     // of a statement list the way node's script evaluation does
     // (`-p "a(); b"` prints b) AND inherits the enclosing module scope. It
@@ -2540,6 +2702,7 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
         rt.execute_cjs(&tmp_file, &CliHost)
     };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
+    report_loader_warnings(false);
     // Same fatal-path shape as run_file: sub-codes skip 'exit', a regular
     // fatal forces 1 + honors exit-handler mutations.
     match result {
@@ -2630,6 +2793,7 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     // and the user cannot weaken it -- an `oam build` feature, not an argv
     // parse. Until that exists, do not describe embedded binaries as
     // sandboxable.
+    drain_loader_warnings_on_hard_exit(false);
     let mut rt = oam_engine::JsRuntime::new();
     // Seed embedded bytecode (v2 binaries) now that V8 is initialized, so the
     // CJS loader consumes it without needing a writable cache dir. Keyed by the
@@ -2666,15 +2830,21 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     let tmp_file = tmp_dir.join("__oam_embedded.js");
     std::fs::write(&tmp_file, source).expect("write embedded source to temp");
 
-    // Node convention: argv[0]=binary, argv[1]=script path. Set argv[1] to
-    // the temp file so isEntryPoint checks (import.meta.url vs
-    // pathToFileURL(argv[1])) pass -- __filename is this same temp path.
-    let mut argv = vec![exe, tmp_file.to_string_lossy().into_owned()];
+    // Node convention: argv[0]=binary, argv[1]=script path. argv[1] is the
+    // temp file spelled the way the loader spells __filename (module_key:
+    // canonical, 8.3 short names and symlinks resolved), so the usual
+    // main-module check -- `process.argv[1] === __filename`, or
+    // import.meta.url against pathToFileURL(argv[1]) -- holds even on a
+    // short-name TEMP (`C:\Users\RUNNER~1\...`) or a symlinked /tmp, where
+    // the raw temp_dir() spelling and the canonical one differ.
+    let script = oam_engine::module_key(&tmp_file).unwrap_or_else(|_| tmp_file.clone());
+    let mut argv = vec![exe, script.to_string_lossy().into_owned()];
     argv.extend(script_args);
     rt.set_process_argv(argv);
 
     let result = rt.execute_cjs(&tmp_file, &CliHost);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+    report_loader_warnings(false);
     // Same fatal-path shape as run_file: sub-codes 6/7 skip the 'exit'
     // event entirely and are not handler-overridable; a regular fatal
     // forces exitCode = 1, emits 'exit', then honors handler mutations.
@@ -2707,9 +2877,39 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
     }
 }
 
-/// `oam compile <entry> --output <path>`: read the JS source, copy the
-/// current oam binary, and append the JS payload with a magic trailer.
+/// One-line remedy appended to every "this entry cannot be embedded" error.
+const COMPILE_ENTRY_HINT: &str = "oam compile embeds a pre-bundled CommonJS file as-is and does \
+                                  not transpile or bundle; bundle to CJS first (e.g. esbuild \
+                                  --bundle --format=cjs --platform=node) and compile the output.";
+
+/// Whether `carrier` is the running binary, however it is spelled (a relative
+/// `./oam`, a symlink, an 8.3 short name). Canonicalize both sides; if either
+/// side cannot be resolved, answer false -- the conservative outcome is a
+/// JS-only payload, which never yields a binary that rejects its own bytecode.
+fn carrier_is_running_binary(carrier: &Path) -> bool {
+    let Ok(me) = std::env::current_exe().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    std::fs::canonicalize(carrier).is_ok_and(|c| c == me)
+}
+
+/// `oam compile <entry> --output <path>`: read the JS source, produce its V8
+/// bytecode, copy the carrier binary, and append the payload with a magic
+/// trailer.
 fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitCode {
+    // 0. Refuse an entry that is not plain JavaScript. The embedded program
+    //    runs through the CJS loader as-is (no transpile, no bundling), so a
+    //    .ts/.tsx/.jsx entry would read fine here and die with a SyntaxError
+    //    on the binary's first run -- possibly on a machine the author never
+    //    runs it on (--carrier).
+    if oam_loader::classify(entry) != SourceKind::JavaScript {
+        eprintln!(
+            "oam compile: {} is not plain JavaScript. {COMPILE_ENTRY_HINT}",
+            entry.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
     // 1. Read the entry JS file.
     let source = match std::fs::read(entry) {
         Ok(bytes) => bytes,
@@ -2728,11 +2928,13 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         return ExitCode::FAILURE;
     }
 
-    // 2. Copy the carrier binary to the output path. Defaults to the running
-    //    oam; `--carrier` points at a different one so a release binary for
-    //    another OS/arch can be used, which is what makes cross-compiling
-    //    possible. The payload appended below is platform-independent -- only
-    //    the carrier decides the output's platform.
+    // 2. Resolve the carrier binary. Defaults to the running oam; `--carrier`
+    //    points at a different one so a release binary for another OS/arch
+    //    can be used, which is what makes cross-compiling possible. The JS
+    //    half of the payload appended below is platform-independent -- only
+    //    the carrier decides the output's platform. The bytecode half is NOT:
+    //    it is bound to the V8 build that produced it, i.e. to this binary
+    //    (step 3 embeds it only when the carrier is this binary).
     let exe = match carrier {
         Some(p) => {
             if !p.is_file() {
@@ -2772,6 +2974,50 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
             }
         },
     };
+    // Same file spelled two ways (`--carrier ./oam` from the install dir) is
+    // still self. Anything else -- another version, another platform -- gets
+    // a JS-only payload: V8 checks version, flag hash and read-only snapshot
+    // on consume, so a blob from this V8 would be rejected on every run of
+    // the output and cost a recompile plus a cache write each time.
+    let carrier_is_self = carrier.is_none_or(carrier_is_running_binary);
+
+    // 3. Produce V8 bytecode for the entry so the compiled binary's first run
+    //    skips parse+compile (v2). Before the carrier copy, so a bad entry
+    //    fails here without leaving a half-written output. Three outcomes: a
+    //    blob (v2); V8 declining to produce a cache (JS-only v1 -- the lazy
+    //    runtime cache still kicks in there); or a source that does not
+    //    compile as CommonJS at all (a SyntaxError, an ESM import/export,
+    //    TypeScript syntax) -- a hard failure carrying V8's message, since the
+    //    binary would only die with that same error on its first run.
+    let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
+    // The compile-check runs UNCONDITIONALLY: syntax validity is
+    // carrier-independent, and a broken entry behind --carrier used to exit 0
+    // and hand the author a binary that dies with that same SyntaxError on
+    // its first run -- possibly on a machine the author never touches. Only
+    // the BLOB is carrier-bound (V8 bytecode is tied to the producing build),
+    // so a foreign carrier discards it and gets the JS-only (v1) payload.
+    let blob = match oam_engine::JsRuntime::precompile_cjs_source(
+        &entry.display().to_string(),
+        source_str,
+    ) {
+        Ok(blob) => blob,
+        Err(message) => {
+            eprintln!("oam compile: {message}");
+            eprintln!("oam compile: the entry must compile as CommonJS. {COMPILE_ENTRY_HINT}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bytecode = if carrier_is_self {
+        blob
+    } else {
+        eprintln!(
+            "oam compile: --carrier is not the running binary; embedding JS only (V8 bytecode \
+             is bound to the compiling binary, so the output builds its own cache on first run)"
+        );
+        None
+    };
+
+    // 4. Copy the carrier to the output path.
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -2790,7 +3036,8 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         return ExitCode::FAILURE;
     }
 
-    // 3. Append: [JS source bytes][u64 LE length][magic "OAMEXEC\0"]
+    // 5. Append. v2: [JS][bytecode][u64 LE js len][u64 LE bc len][magic
+    //    "OAMEXC2\0"]; v1: [JS][u64 LE js len][magic "OAMEXEC\0"].
     let mut out_file = match std::fs::OpenOptions::new().append(true).open(output) {
         Ok(f) => f,
         Err(e) => {
@@ -2802,12 +3049,6 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
         }
     };
     use std::io::Write;
-
-    // Produce V8 bytecode for the entry so the compiled binary's first run
-    // skips parse+compile (v2). If production fails for any reason, fall back
-    // to a JS-only v1 binary -- the lazy runtime cache still kicks in there.
-    let source_str = std::str::from_utf8(&source).expect("UTF-8 validated above");
-    let bytecode = oam_engine::JsRuntime::precompile_cjs_source(source_str);
 
     let js_len = source.len() as u64;
     let write_result = match &bytecode {
@@ -2849,9 +3090,59 @@ fn compile_command(entry: &Path, output: &Path, carrier: Option<&Path>) -> ExitC
     // binary inherits their notice obligations, and would have no way to know
     // it from a success line that only reports byte counts.
     eprintln!(
-        "oam compile: the output embeds oam's runtime (V8, ICU and others);          if you redistribute it, ship the notices from LICENSE, NOTICE and          THIRD_PARTY_LICENSES.md with it"
+        "oam compile: the output embeds oam's runtime (V8, ICU and others); if you \
+         redistribute it, ship the notices from LICENSE, NOTICE and \
+         THIRD_PARTY_LICENSES.md with it"
     );
     ExitCode::SUCCESS
+}
+
+/// `oam cache info|clean`: inspect or delete the V8 bytecode cache. The cache
+/// is a pure optimization, so `clean` is safe at any time -- the next run
+/// recompiles and repopulates it. `info` reports the directory this process
+/// would use (`OAM_CACHE_DIR` wins, then the platform cache dir), the number
+/// of blobs and their total size; `--json` emits the same as one object.
+fn cache_command(action: &CacheAction, json: bool) -> ExitCode {
+    match action {
+        CacheAction::Info => {
+            let stats = oam_engine::code_cache_stats();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": stats.path.to_string_lossy(),
+                        "entries": stats.entries,
+                        "bytes": stats.bytes,
+                    })
+                );
+            } else {
+                println!("path:    {}", stats.path.display());
+                println!("entries: {}", stats.entries);
+                println!("bytes:   {}", stats.bytes);
+            }
+            ExitCode::SUCCESS
+        }
+        CacheAction::Clean => {
+            let path = oam_engine::code_cache_dir();
+            match oam_engine::code_cache_clean() {
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "removed": path.to_string_lossy() })
+                        );
+                    } else {
+                        eprintln!("oam cache: removed {}", path.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("oam cache: could not remove {}: {e}", path.display());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2997,6 +3288,34 @@ mod tests {
             assert!(
                 super::space_form_hint("--allow-env", Some(&sub.to_string())).is_none(),
                 "`--allow-env {sub}` must dispatch to the subcommand, not be read as a grant list"
+            );
+        }
+    }
+
+    /// SUBCOMMANDS and clap must not drift: the `cache` subcommand shipped
+    /// without a list entry, so `oam ... cache` could dispatch a cwd FILE
+    /// named `cache` and `oam --allow-env cache info` died with a bogus
+    /// space-form hint. Bidirectional: every clap subcommand is listed, and
+    /// every listed name (minus clap's auto `help`) is a real subcommand.
+    #[test]
+    fn subcommands_const_matches_clap_exactly() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let clap_names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        for name in &clap_names {
+            assert!(
+                super::SUBCOMMANDS.contains(&name.as_str()),
+                "clap subcommand '{name}' is missing from SUBCOMMANDS: the \
+                 bare-script dispatch and space_form_hint would mis-handle it"
+            );
+        }
+        for name in super::SUBCOMMANDS {
+            assert!(
+                *name == "help" || clap_names.iter().any(|c| c == name),
+                "SUBCOMMANDS entry '{name}' is not a clap subcommand"
             );
         }
     }

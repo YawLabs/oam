@@ -467,6 +467,31 @@ require('./thing.mjs')   // oam: ERR_REQUIRE_ESM.  Node 22: works.
 Node 22 added synchronous `require()` of an ESM graph. oam has not implemented it yet;
 use `await import()`. This is a gap, not a policy — it is on the roadmap.
 
+### 24. TypeScript module kind: `.ts`/`.mts` are always ES modules
+
+oam decides a TypeScript file's module system from its extension alone: `.ts` and `.mts`
+are ESM, `.cts` is CommonJS. The package.json `"type"` field is not consulted for them —
+including `"type": "commonjs"`.
+
+```js
+// package.json: { "type": "commonjs" }
+require('./util.ts')   // oam: ERR_REQUIRE_ESM.  Node 22 type stripping: works (CommonJS).
+```
+
+Node 22's type stripping honors the package `"type"` walk for `.ts`, so the same file is
+CommonJS there and `require()` of it works. In oam, use `.cts` for TypeScript that must be
+require()d, or `import` it. (`.tsx`/`.jsx` DO follow the package `"type"` walk, like
+`.js`, and transpile on whichever path they land.)
+
+### 25. Source maps are always on, so `Error.prepareStackTrace` is pre-installed
+
+oam remaps stack traces for transpiled TypeScript to source positions by default —
+equivalent to running Node with `--enable-source-maps`, with no flag needed. To do it,
+oam installs its own `Error.prepareStackTrace` at startup, so reading that property
+before assigning it yields a function where Node yields `undefined`. Assigning your own
+`prepareStackTrace` still wins, exactly as in Node; `util.getCallSites` still reports
+generated (transpiled) positions.
+
 ### 10. `oam run file.js` needs `--` before script flags
 
 ```
@@ -503,6 +528,21 @@ the runtime now works the way a TypeScript toolchain expects, by both routes:
 
 With no pragma and no tsconfig value, the automatic runtime targets `react/jsx-runtime`,
 matching tsc's default.
+
+**`compilerOptions.jsx` is honored, with one runtime-shaped exception.** The mode picks
+the runtime the way tsc does:
+
+| `jsx`           | oam compiles to                                                         |
+|-----------------|-------------------------------------------------------------------------|
+| `react-jsx`     | `jsx()` / `jsxs()` from `<jsxImportSource>/jsx-runtime` (the default)   |
+| `react-jsxdev`  | `jsxDEV()` from `<jsxImportSource>/jsx-dev-runtime`, with `__source` / `__self` |
+| `react`         | classic `jsxFactory(...)` calls -- `React.createElement` / `React.Fragment` unless `jsxFactory` / `jsxFragmentFactory` say otherwise; no runtime import |
+| `preserve`, `react-native` | **not honored**: treated as `react-jsx`. Both modes leave JSX in the output for a later build tool, and there is no later tool when the file is about to execute. `oam check` still type-checks under the declared mode. |
+
+`extends` chains (string or the TypeScript 5.0 array form) merge these per option like
+every other compilerOption the loader reads. A dependency's own `tsconfig.json` under
+`node_modules` is never consulted -- neither for JSX settings nor for `paths` -- because
+neither Node nor tsc applies it to the package's published files.
 
 ---
 

@@ -1,6 +1,6 @@
 //! `cargo xtask bench`: micro-benchmark harness for the oam JS runtime.
 //!
-//! Nine benchmark cases measure different layers of the stack:
+//! Ten benchmark cases measure different layers of the stack:
 //!   1. cold-start             -- process start to exit on a trivial script
 //!   2. url-parse              -- URL constructor throughput (10k parses)
 //!   3. http-throughput        -- node:http + fetch loopback (200 req)
@@ -10,9 +10,16 @@
 //!   7. mcp-cold-start         -- process spawn to first MCP initialize response
 //!   8. mcp-idle-rss           -- RSS (MB) after initialize, server idle
 //!   9. mcp-first-call-latency -- tools/call round-trip on warm server
+//!  10. ts-cold-start          -- 20-module TypeScript graph load, per cache state
 //!
 //! With `--compare`, the same scripts run under every runtime found on
 //! PATH (node, bun, deno) and the harness reports a comparison table.
+//!
+//! With `--case <name>` (repeatable) only those cases run, and their rows are
+//! MERGED into the committed files rather than replacing them: the header
+//! stamp keeps describing the last full run, each re-measured row carries its
+//! own commit, and `ts-cold-start` -- which has its own section because it
+//! publishes several rows per runtime -- carries its own stamp.
 //!
 //! Outputs: bench/results.json (machine) and BENCHMARKS.md (human),
 //! both COMMITTED -- the receipt is in the repo.
@@ -49,6 +56,51 @@ const TIMED_ITERS: usize = 15;
 const HTTP_ITERS: usize = 10;
 /// Per-sample, not per-case -- each sample is its own process spawn.
 const CASE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Every case, in the order the tables print them. `--case` names come from
+/// this list and nowhere else.
+const CASE_NAMES: [&str; 10] = [
+    "cold-start",
+    "url-parse",
+    "http-throughput",
+    "fs-read",
+    "json-parse",
+    "crypto-hash",
+    "mcp-cold-start",
+    "mcp-idle-rss",
+    "mcp-first-call-latency",
+    TS_CASE,
+];
+/// The one case that does not fit the main table (several rows per runtime),
+/// so it gets its own section in both output files.
+const TS_CASE: &str = "ts-cold-start";
+
+/// The cases that share the main `case x runtime` table.
+fn main_cases() -> impl Iterator<Item = &'static str> {
+    CASE_NAMES.iter().copied().filter(|c| *c != TS_CASE)
+}
+
+/// Resolve `--case` filters against `CASE_NAMES`, preserving table order. An
+/// unknown name is an error rather than a silent no-op run: a typo that
+/// measured nothing and then "merged" nothing would look like success.
+fn select_cases(only: &[String]) -> Result<Vec<&'static str>> {
+    if only.is_empty() {
+        return Ok(CASE_NAMES.to_vec());
+    }
+    for name in only {
+        if !CASE_NAMES.contains(&name.as_str()) {
+            bail!(
+                "unknown case `{name}` -- the cases are: {}",
+                CASE_NAMES.join(", ")
+            );
+        }
+    }
+    Ok(CASE_NAMES
+        .iter()
+        .copied()
+        .filter(|c| only.iter().any(|o| o == c))
+        .collect())
+}
 
 // ----------------------------------------------------------------- runtime
 
@@ -720,9 +772,591 @@ fn run_mcp_first_call_latency(rt: &Runtime, server_script: &Path) -> Result<Case
     })
 }
 
+// ---------------------------------------------------------- ts-cold-start
+
+/// Modules in the generated TypeScript graph, not counting the entry.
+const TS_MODULES: usize = 20;
+/// The entry imports module 1 and every `TS_FANOUT_STRIDE`th module directly
+/// (the fan-out); every module imports the next one (the chain).
+const TS_FANOUT_STRIDE: usize = 5;
+
+/// The states a TypeScript load is measured in. Each is a published row, in
+/// this order.
+///
+/// The three oam rows bracket the bytecode cache: `NoCache` is the floor with
+/// the cache switched off, `Cold` adds the cost of producing it, `Warm` shows
+/// what consuming it saves. What none of them skips is the `.ts` -> JS
+/// transpile itself: project sources have no transpile cache (only
+/// `node_modules` gets the install-time precompile, `oam_cli/src/main.rs`
+/// `try_precompile_cache`), so `Warm` still pays oxc on every run. That makes
+/// `Warm` the row a transpile cache has to move, and the reason this case
+/// exists: before it, nothing measured the TypeScript path in any state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TsState {
+    /// `OAM_CODE_CACHE=0` and a fresh `OAM_CACHE_DIR` per run: transpile plus
+    /// a full V8 compile, with no bytecode produced, written or consumed.
+    NoCache,
+    /// Caches on and a fresh `OAM_CACHE_DIR` per run: a project's first run,
+    /// which transpiles, compiles, AND serializes + writes the bytecode.
+    Cold,
+    /// Caches on and one `OAM_CACHE_DIR` primed by an untimed run, then
+    /// reused: every run after the first.
+    Warm,
+    /// The reference runtime as installed, with no cache control.
+    Reference,
+}
+
+impl TsState {
+    const OAM: [TsState; 3] = [TsState::NoCache, TsState::Cold, TsState::Warm];
+
+    fn variant(self) -> &'static str {
+        match self {
+            TsState::NoCache => "no-cache",
+            TsState::Cold => "cold",
+            TsState::Warm => "warm",
+            TsState::Reference => "reference",
+        }
+    }
+}
+
+/// One published row of the ts-cold-start case.
+struct TsRow {
+    variant: String,
+    result: CaseResult,
+}
+
+/// Everything the ts-cold-start case publishes. It has its own section in
+/// both output files rather than a line in the main table because its shape
+/// is different: several rows per runtime, one per cache state.
+struct TsSection {
+    /// The node flag that ran the fixture, when a node row exists.
+    node_flag: Option<String>,
+    rows: Vec<TsRow>,
+}
+
+/// Row label as published: `oam no-cache`, `oam cold`, `oam warm`, `node`.
+fn ts_row_label(runtime: &str, variant: &str) -> String {
+    if variant == TsState::Reference.variant() {
+        runtime.to_string()
+    } else {
+        format!("{runtime} {variant}")
+    }
+}
+
+struct TsFixture {
+    entry: PathBuf,
+}
+
+/// One module of the graph. `@N@` is the zero-padded module number, `@I@` the
+/// plain one; the `@CHILD_*@` slots link to the next module and are empty on
+/// the last. The syntax is chosen to exercise a transpiler, not a type checker:
+/// interfaces and `import type` (erased), an enum (lowered -- non-erasable,
+/// which is why node needs transform mode for it), generics on inner
+/// functions, and enough statements per module that the compile is not
+/// trivially empty.
+const TS_MODULE_TEMPLATE: &str = r#"// mod@N@.ts -- generated by `cargo xtask bench` (ts-cold-start fixture). Do not edit.
+
+@IMPORTS@
+export interface Record@N@ {
+  id: number;
+  label: string;
+  tags: readonly string[];
+@CHILD_FIELD@}
+
+export enum Stage@N@ {
+  Idle = 0,
+  Parsing = 1,
+  Bound = 2,
+  Emitted = 3,
+}
+
+export type Pair@N@<A, B> = { first: A; second: B };
+
+function scale@N@<T extends { id: number }>(value: T, factor: number): number {
+  return value.id * factor;
+}
+
+function describe@N@(record: Record@N@): string {
+  const stage: Stage@N@ = record.id % 2 === 0 ? Stage@N@.Bound : Stage@N@.Parsing;
+  return `${record.label}:${stage}:${record.tags.length}`;
+}
+
+function combine@N@<K extends string, V>(entries: ReadonlyArray<Pair@N@<K, V>>): Map<K, V> {
+  const out = new Map<K, V>();
+  for (const { first, second } of entries) {
+    out.set(first, second);
+  }
+  return out;
+}
+
+export function make@N@(id: number): Record@N@ {
+  return { id, label: 'mod@N@', tags: ['a', 'b', 'c']@CHILD_INIT@ };
+}
+
+export function run@N@(seed: number): number {
+  const record = make@N@(seed);
+  const pairs = combine@N@([
+    { first: 'x', second: seed },
+    { first: 'y', second: seed + 1 },
+  ]);
+  return scale@N@(record, @I@) + describe@N@(record).length + pairs.size@CHILD_CALL@;
+}
+"#;
+
+/// The entry. Its first stdout line is what the case times to, and every row
+/// must print the same one -- a runtime that lowered the enums differently
+/// would disagree on the total, and the harness treats that as a failure
+/// rather than a timing.
+const TS_ENTRY_TEMPLATE: &str = r#"// main.ts -- generated by `cargo xtask bench` (ts-cold-start fixture). Do not edit.
+
+@IMPORTS@
+interface Summary {
+  total: number;
+  parts: readonly number[];
+}
+
+function summarize(parts: readonly number[]): Summary {
+  let total = 0;
+  for (const part of parts) {
+    total += part;
+  }
+  return { total, parts };
+}
+
+const probe: Record01 = make01(0);
+const summary: Summary = summarize([probe.tags.length, @CALLS@]);
+console.log(`ok ${summary.total} ${summary.parts.length}`);
+"#;
+
+fn ts_module_source(i: usize, next: Option<usize>) -> String {
+    let (imports, child_field, child_init, child_call) = match next {
+        Some(j) => {
+            let nn = format!("{j:02}");
+            (
+                format!(
+                    "import {{ make{nn}, run{nn} }} from './mod{nn}.ts';\n\
+                     import type {{ Record{nn} }} from './mod{nn}.ts';\n\n"
+                ),
+                format!("  child?: Record{nn};\n"),
+                format!(", child: make{nn}(id + 1)"),
+                format!(" + run{nn}(seed + 1)"),
+            )
+        }
+        None => Default::default(),
+    };
+    TS_MODULE_TEMPLATE
+        .replace("@IMPORTS@\n", &imports)
+        .replace("@CHILD_FIELD@", &child_field)
+        .replace("@CHILD_INIT@", &child_init)
+        .replace("@CHILD_CALL@", &child_call)
+        .replace("@I@", &i.to_string())
+        .replace("@N@", &format!("{i:02}"))
+}
+
+fn ts_fanout() -> impl Iterator<Item = usize> {
+    (1..=TS_MODULES).filter(|i| *i == 1 || i.is_multiple_of(TS_FANOUT_STRIDE))
+}
+
+fn ts_entry_source() -> String {
+    let mut imports = String::from(
+        "import { make01, run01 } from './mod01.ts';\nimport type { Record01 } from './mod01.ts';\n",
+    );
+    for i in ts_fanout().skip(1) {
+        imports.push_str(&format!("import {{ run{i:02} }} from './mod{i:02}.ts';\n"));
+    }
+    imports.push('\n');
+    let calls: Vec<String> = ts_fanout().map(|i| format!("run{i:02}({i})")).collect();
+    TS_ENTRY_TEMPLATE
+        .replace("@IMPORTS@\n", &imports)
+        .replace("@CALLS@", &calls.join(", "))
+}
+
+/// Generate the module graph under `dir`. Byte-for-byte deterministic, so the
+/// bytecode cache keys are stable within a run and two runs' fixtures diff
+/// clean. Generated at bench time like every other script here; nothing in
+/// it is slow enough to be worth committing.
+fn write_ts_fixture(dir: &Path) -> Result<TsFixture> {
+    std::fs::create_dir_all(dir)?;
+    // node reads the module format of a `.ts` file from the nearest
+    // package.json; oam infers it from the source. Say it once so they agree.
+    std::fs::write(
+        dir.join("package.json"),
+        "{\"name\":\"ts-cold-start-fixture\",\"private\":true,\"type\":\"module\"}\n",
+    )?;
+    for i in 1..=TS_MODULES {
+        let next = (i < TS_MODULES).then_some(i + 1);
+        std::fs::write(dir.join(format!("mod{i:02}.ts")), ts_module_source(i, next))?;
+    }
+    let entry = dir.join("main.ts");
+    std::fs::write(&entry, ts_entry_source())?;
+    Ok(TsFixture { entry })
+}
+
+/// The command for one row. Both cache variables are set explicitly rather
+/// than inherited: the row label promises a state, and nothing in the
+/// harness's own environment may be able to change it.
+fn ts_cmd(
+    rt: &Runtime,
+    state: TsState,
+    entry: &Path,
+    cache_dir: &Path,
+    node_flag: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(&rt.exe);
+    if state == TsState::Reference {
+        if let Some(flag) = node_flag {
+            cmd.arg(flag);
+        }
+        cmd.arg(entry);
+        // Node's compile cache is opt-in via this variable; the row is node as
+        // installed, so make sure the environment has not opted in.
+        cmd.env_remove("NODE_COMPILE_CACHE");
+    } else {
+        cmd.arg("run").arg(entry).arg("--no-check");
+        cmd.env("OAM_CACHE_DIR", cache_dir);
+        cmd.env(
+            "OAM_CODE_CACHE",
+            if state == TsState::NoCache { "0" } else { "1" },
+        );
+    }
+    cmd
+}
+
+/// The line of a stderr dump worth quoting: the first one naming an error,
+/// else the first non-empty one. Node prints the offending source and a caret
+/// before the `SyntaxError [ERR_...]` line, so "first line" alone is a path.
+fn error_line(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines
+        .iter()
+        .find(|l| l.contains("Error"))
+        .or(lines.first())
+        .map(|l| l.chars().take(200).collect())
+        .unwrap_or_default()
+}
+
+/// Which of node's two TypeScript modes runs the fixture. Strip-only mode
+/// (`--experimental-strip-types`) erases annotations but rejects anything it
+/// would have to lower -- the fixture's enums included -- with
+/// `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`; transform mode lowers them. Probed
+/// against the real fixture, cheapest mode first, so the row says what it
+/// measured instead of assuming a flag that may not exist on the installed
+/// node. `Err` carries the reason for the console line.
+fn probe_node_ts_flag(node: &Runtime, entry: &Path) -> std::result::Result<String, String> {
+    let mut why = String::new();
+    for flag in [
+        "--experimental-strip-types",
+        "--experimental-transform-types",
+    ] {
+        let mut cmd = Command::new(&node.exe);
+        cmd.arg(flag).arg(entry).env_remove("NODE_COMPILE_CACHE");
+        match run_with_timeout(&mut cmd, CASE_TIMEOUT) {
+            Ok(out) if out.code == 0 && out.stdout.starts_with("ok ") => {
+                return Ok(flag.to_string());
+            }
+            Ok(out) => {
+                why = format!("{flag}: exit {} ({})", out.code, error_line(&out.stderr));
+            }
+            Err(e) => why = format!("{flag}: {e}"),
+        }
+    }
+    Err(why)
+}
+
+/// Wall-clock from process spawn to its first stdout line, then wait for a
+/// clean exit. Returns the elapsed milliseconds and that line.
+///
+/// The clock stops on the reader thread, right after `read_line` returns, so
+/// the figure carries no harness scheduling between the line landing in the
+/// pipe and the main thread noticing. The pipe is drained after the first
+/// line and stderr is drained throughout, so a chatty child cannot block on a
+/// full pipe and inflate its own number.
+fn time_to_first_line(cmd: &mut Command, timeout: Duration) -> Result<(f64, String)> {
+    use std::io::{BufRead, Read};
+    use std::sync::mpsc;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let start = Instant::now();
+    let mut child = cmd.spawn().with_context(|| format!("spawning {cmd:?}"))?;
+    let stdout = child.stdout.take().context("stdout piped")?;
+    let mut stderr = child.stderr.take().context("stderr piped")?;
+
+    let (tx, rx) = mpsc::channel();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let first = match reader.read_line(&mut line) {
+            Ok(n) if n > 0 => Some((start.elapsed(), line)),
+            _ => None,
+        };
+        let _ = tx.send(first);
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+
+    let first = match rx.recv_timeout(timeout) {
+        Ok(first) => first,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("no stdout line within {}s", timeout.as_secs());
+        }
+    };
+
+    let deadline = start + timeout;
+    let code = loop {
+        if let Some(status) = child.try_wait()? {
+            break status.code().unwrap_or(-1);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("did not exit within {}s of spawn", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let _ = stdout_thread.join();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    let Some((elapsed, line)) = first else {
+        bail!(
+            "exit {code} before any stdout line; stderr: {}",
+            error_line(&stderr)
+        );
+    };
+    if code != 0 {
+        bail!("exit {code}; stderr: {}", error_line(&stderr));
+    }
+    Ok((elapsed.as_secs_f64() * 1000.0, line.trim_end().to_string()))
+}
+
+/// Bytecode blobs under a cache root. The row labels are load-bearing, and
+/// this is how the harness checks them: a `no-cache` run must leave none, a
+/// `cold` run must leave some, a `warm` prime must have left some to consume.
+fn count_v8c(dir: &Path) -> usize {
+    fn walk(dir: &Path, n: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, n);
+            } else if path.extension().is_some_and(|e| e == "v8c") {
+                *n += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(dir, &mut n);
+    n
+}
+
+/// What every sample of the case shares.
+struct TsRun<'a> {
+    entry: &'a Path,
+    /// Per-sample fresh cache directories are created and removed under here.
+    tmp: &'a Path,
+    /// The one primed directory every `Warm` sample reuses.
+    warm_dir: &'a Path,
+    node_flag: Option<&'a str>,
+}
+
+/// One timed run of one row. `expected` is the first line every row has to
+/// agree on, set by whichever row ran first.
+fn ts_sample_once(
+    run: &TsRun<'_>,
+    rt: &Runtime,
+    state: TsState,
+    i: usize,
+    expected: &mut Option<String>,
+) -> Result<f64> {
+    let label = format!("{}/{}", rt.name, state.variant());
+    let fresh = matches!(state, TsState::NoCache | TsState::Cold);
+    let cache_dir = if fresh {
+        run.tmp.join(format!("ts-cache-{}-{i}", state.variant()))
+    } else {
+        run.warm_dir.to_path_buf()
+    };
+    if fresh {
+        std::fs::create_dir_all(&cache_dir)?;
+    }
+
+    let outcome = time_to_first_line(
+        &mut ts_cmd(rt, state, run.entry, &cache_dir, run.node_flag),
+        CASE_TIMEOUT,
+    );
+    // Inspect, then discard, the per-run cache before deciding anything else,
+    // so a failed run does not leave its directory behind.
+    let blobs = fresh.then(|| {
+        let n = count_v8c(&cache_dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        n
+    });
+
+    let (ms, line) = outcome.with_context(|| format!("{label}: iteration {i}"))?;
+    if !line.starts_with("ok ") {
+        bail!("{label}: iteration {i} printed {line:?}, not the fixture's `ok ...` line");
+    }
+    match expected {
+        Some(agreed) if *agreed != line => bail!(
+            "{label}: iteration {i} printed {line:?} where an earlier row printed {agreed:?} \
+             -- the runtimes disagree on what the fixture computes"
+        ),
+        Some(_) => {}
+        None => *expected = Some(line),
+    }
+    match (state, blobs) {
+        (TsState::NoCache, Some(n)) if n > 0 => bail!(
+            "{label}: iteration {i} wrote {n} .v8c blob(s) under OAM_CODE_CACHE=0 -- the off \
+             switch did not take, so this is not a no-cache measurement"
+        ),
+        (TsState::Cold, Some(0)) => bail!(
+            "{label}: iteration {i} wrote no .v8c blobs -- the cache is not producing, so this \
+             row would be a no-cache row in disguise"
+        ),
+        _ => {}
+    }
+    Ok(ms)
+}
+
+/// ts-cold-start: spawn to first stdout line of the generated TypeScript
+/// graph, one row per cache state for oam plus node as installed, sampled
+/// round-robin across the rows like `run_timed_case_interleaved` so drift
+/// lands on every row rather than on whichever ran last.
+fn run_ts_cold_start(runtimes: &[Runtime], fixture: &TsFixture, tmp: &Path) -> Result<TsSection> {
+    let mut plan: Vec<(&Runtime, TsState)> = Vec::new();
+    let mut node_flag: Option<String> = None;
+    for rt in runtimes {
+        match rt.name.as_str() {
+            "oam" => plan.extend(TsState::OAM.iter().map(|s| (rt, *s))),
+            "node" => match probe_node_ts_flag(rt, &fixture.entry) {
+                Ok(flag) => {
+                    println!("  node: runs the fixture with {flag}");
+                    node_flag = Some(flag);
+                    plan.push((rt, TsState::Reference));
+                }
+                Err(why) => println!("  node/{TS_CASE}: skipped -- {why}"),
+            },
+            other => println!(
+                "  {other}/{TS_CASE}: skipped (this case measures oam per cache state, with node as the reference)"
+            ),
+        }
+    }
+    if plan.is_empty() {
+        bail!("no runtime to measure");
+    }
+
+    // Prime the warm cache once, untimed. Every warm sample then consumes
+    // what this run produced.
+    let warm_dir = tmp.join("ts-cache-warm");
+    if plan.iter().any(|(_, s)| *s == TsState::Warm) {
+        let oam = runtimes
+            .iter()
+            .find(|r| r.name == "oam")
+            .context("oam runtime")?;
+        std::fs::create_dir_all(&warm_dir)?;
+        time_to_first_line(
+            &mut ts_cmd(oam, TsState::Warm, &fixture.entry, &warm_dir, None),
+            CASE_TIMEOUT,
+        )
+        .context("priming the warm cache")?;
+        let blobs = count_v8c(&warm_dir);
+        if blobs == 0 {
+            bail!("the warm-cache prime wrote no .v8c blobs, so the warm row would be a cold row");
+        }
+    }
+
+    let iters = COLD_START_ITERS;
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(iters); plan.len()];
+    let mut failed: Vec<Option<String>> = vec![None; plan.len()];
+    let mut expected: Option<String> = None;
+
+    let labels: Vec<String> = plan
+        .iter()
+        .map(|(rt, s)| format!("{}:{}", rt.name, s.variant()))
+        .collect();
+    print!("  {TS_CASE} [{}]: ", labels.join(" "));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let run = TsRun {
+        entry: &fixture.entry,
+        tmp,
+        warm_dir: &warm_dir,
+        node_flag: node_flag.as_deref(),
+    };
+    for i in 0..iters {
+        for (idx, (rt, state)) in plan.iter().enumerate() {
+            if failed[idx].is_some() {
+                continue;
+            }
+            match ts_sample_once(&run, rt, *state, i, &mut expected) {
+                Ok(v) => samples[idx].push(v),
+                Err(e) => failed[idx] = Some(format!("{e:#}")),
+            }
+        }
+        print!(".");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    println!(" done");
+    let _ = std::fs::remove_dir_all(&warm_dir);
+
+    let mut rows = Vec::new();
+    for (idx, (rt, state)) in plan.iter().enumerate() {
+        if let Some(err) = &failed[idx] {
+            println!(
+                "  {}/{TS_CASE} {}: FAILED -- {err}",
+                rt.name,
+                state.variant()
+            );
+            continue;
+        }
+        let s = std::mem::take(&mut samples[idx]);
+        let (p50, min, max, p95, p99) = stats(&s);
+        rows.push(TsRow {
+            variant: state.variant().to_string(),
+            result: CaseResult {
+                runtime: rt.name.clone(),
+                name: TS_CASE.to_string(),
+                median: p50,
+                min,
+                max,
+                p50,
+                p95,
+                p99,
+                unit: "ms".to_string(),
+                iterations: s.len(),
+                // The prime is the one run whose figure is not published.
+                warmup_iterations: usize::from(*state == TsState::Warm),
+                samples: s,
+            },
+        });
+    }
+    if rows.is_empty() {
+        bail!("every row failed");
+    }
+    // A node row with no oam rows to compare against is a reference to
+    // nothing; still worth publishing, but say so.
+    if !rows.iter().any(|r| r.result.runtime == "oam") {
+        println!("  note: no oam row survived; the section has only the reference");
+    }
+    Ok(TsSection { node_flag, rows })
+}
+
 // ------------------------------------------------------------------ entry
 
-pub fn run(release: bool, compare: bool) -> Result<()> {
+pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
     let repo = repo_root()?;
     let oam = ensure_oam_built(&repo, release)?;
     // Time a file nothing else is writing to, not a build artifact `cargo` may
@@ -761,23 +1395,40 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("oam-bench-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
 
-    let case_names = [
-        "cold-start",
-        "url-parse",
-        "http-throughput",
-        "fs-read",
-        "json-parse",
-        "crypto-hash",
-        "mcp-cold-start",
-        "mcp-idle-rss",
-        "mcp-first-call-latency",
-    ];
+    // Resolved before anything is measured so a typo fails in under a second,
+    // not after a build and a warm-up.
+    let selected = select_cases(only)?;
+    let filtered = !only.is_empty();
+    let results_path = repo.join("bench").join("results.json");
+    // A filtered run merges into the committed file; refuse up front if there
+    // is nothing to merge into, rather than after the measurements.
+    let existing: Option<serde_json::Value> = if filtered {
+        let text = std::fs::read_to_string(&results_path).with_context(|| {
+            format!(
+                "--case merges into {}, which is missing -- run once without --case first",
+                results_path.display()
+            )
+        })?;
+        Some(serde_json::from_str(&text).context("parsing bench/results.json")?)
+    } else {
+        None
+    };
 
     let scripts = write_scripts(&tmp, &repo)?;
+    let ts_fixture = write_ts_fixture(&tmp.join("ts-fixture"))?;
     let mut all_results: Vec<CaseResult> = Vec::new();
+    let mut ts_section: Option<TsSection> = None;
 
-    for case_name in &case_names {
+    for case_name in &selected {
         println!("{case_name}:");
+
+        if *case_name == TS_CASE {
+            match run_ts_cold_start(&runtimes, &ts_fixture, &tmp) {
+                Ok(section) => ts_section = Some(section),
+                Err(e) => println!("  {TS_CASE}: FAILED -- {e:#}"),
+            }
+            continue;
+        }
 
         // The script-driven timed cases sample every runtime round-robin, so
         // background load cannot bias one runtime's block relative to another's.
@@ -857,20 +1508,134 @@ pub fn run(release: bool, compare: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(&tmp);
 
     // ------------------------------------------------------------- table
-    print_table(&all_results, &runtimes, &case_names);
+    let main_selected: Vec<&str> = selected.iter().copied().filter(|c| *c != TS_CASE).collect();
+    if !main_selected.is_empty() {
+        print_table(&all_results, &runtimes, &main_selected);
+    }
+    if let Some(ts) = &ts_section {
+        print_ts_table(ts);
+    }
 
     // --------------------------------------------------------- write files
-    let json = build_json(&all_results, &runtimes, &commit, profile);
-    let bench_dir = repo.join("bench");
-    std::fs::create_dir_all(&bench_dir)?;
-    let results_path = bench_dir.join("results.json");
+    // BENCHMARKS.md is derived from the JSON, never from this run's structs
+    // directly, so a merged file and a fresh one go through the same code.
+    let fresh = build_json(
+        &all_results,
+        &runtimes,
+        ts_section.as_ref(),
+        &commit,
+        profile,
+    );
+    let json = match existing {
+        Some(existing) => {
+            let measured: Vec<&str> = runtimes.iter().map(|r| r.name.as_str()).collect();
+            merge_filtered_run(existing, fresh, &selected, &measured)?
+        }
+        None => fresh,
+    };
+    std::fs::create_dir_all(repo.join("bench"))?;
     std::fs::write(&results_path, serde_json::to_string_pretty(&json)?)?;
+    std::fs::write(repo.join("BENCHMARKS.md"), build_markdown(&json))?;
 
-    let md = build_markdown(&all_results, &runtimes, &case_names, &commit, profile);
-    std::fs::write(repo.join("BENCHMARKS.md"), md)?;
-
-    println!("wrote BENCHMARKS.md + bench/results.json");
+    if filtered {
+        println!(
+            "merged {} into BENCHMARKS.md + bench/results.json",
+            selected.join(", ")
+        );
+    } else {
+        println!("wrote BENCHMARKS.md + bench/results.json");
+    }
     Ok(())
+}
+
+/// Fold a `--case` run into the committed results.
+///
+/// The rows this run measured -- every selected case, for every runtime that
+/// took part -- are replaced, whether or not they succeeded: a case that
+/// failed shows as missing rather than as last month's number wearing today's
+/// label. Everything else is kept verbatim, including the top-level stamp,
+/// which keeps describing the last full run; each fresh row carries its own
+/// `commit` so the markdown can say which rows are from a different tree.
+/// The TypeScript section is replaced whole when it was measured and kept
+/// when it was not, since it stamps itself.
+///
+/// Profile and host must match: a debug row in a release table, or a mac row
+/// in a windows one, is a mixture the single header line cannot express.
+fn merge_filtered_run(
+    mut doc: serde_json::Value,
+    fresh: serde_json::Value,
+    selected: &[&str],
+    measured_runtimes: &[&str],
+) -> Result<serde_json::Value> {
+    for key in ["profile", "host"] {
+        if doc[key] != fresh[key] {
+            bail!(
+                "bench/results.json was measured with {key} {} and this run is {key} {} -- \
+                 a filtered run cannot merge across that; run without --case to replace the file",
+                doc[key],
+                fresh[key]
+            );
+        }
+    }
+
+    let field = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let mut rows: Vec<serde_json::Value> = doc["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            !(selected.contains(&field(r, "case").as_str())
+                && measured_runtimes.contains(&field(r, "runtime").as_str()))
+        })
+        .collect();
+    rows.extend(
+        fresh["results"]
+            .as_array()
+            .iter()
+            .flat_map(|a| a.iter().cloned()),
+    );
+
+    // Runtimes: refresh an entry only when this run put a fresh MAIN-table
+    // row under it. The list describes the binaries behind the main table, so
+    // a ts-cold-start-only run must not relabel acec-era rows with today's
+    // versions -- the TypeScript section stamps its own.
+    let mut runtimes: Vec<serde_json::Value> =
+        doc["runtimes"].as_array().cloned().unwrap_or_default();
+    let fresh_main_rows = fresh["results"].as_array().cloned().unwrap_or_default();
+    for rt in fresh["runtimes"].as_array().cloned().unwrap_or_default() {
+        if !fresh_main_rows.iter().any(|r| r["runtime"] == rt["name"]) {
+            continue;
+        }
+        match runtimes.iter_mut().find(|r| r["name"] == rt["name"]) {
+            Some(slot) => *slot = rt,
+            None => runtimes.push(rt),
+        }
+    }
+
+    // Table order: by case, then by runtime column, so the merged file diffs
+    // like a fresh one rather than growing an appendix.
+    let case_index = |r: &serde_json::Value| {
+        CASE_NAMES
+            .iter()
+            .position(|c| *c == field(r, "case"))
+            .unwrap_or(usize::MAX)
+    };
+    let rt_index = |r: &serde_json::Value| {
+        runtimes
+            .iter()
+            .position(|rt| rt["name"] == r["runtime"])
+            .unwrap_or(usize::MAX)
+    };
+    rows.sort_by_key(|r| (case_index(r), rt_index(r)));
+
+    doc["schema"] = fresh["schema"].clone();
+    doc["results"] = serde_json::Value::Array(rows);
+    doc["runtimes"] = serde_json::Value::Array(runtimes);
+    if selected.contains(&TS_CASE) && !fresh["ts_cold_start"].is_null() {
+        doc["ts_cold_start"] = fresh["ts_cold_start"].clone();
+    }
+    Ok(doc)
 }
 
 // ------------------------------------------------------------ scripts
@@ -1149,69 +1914,151 @@ fn print_table(results: &[CaseResult], runtimes: &[Runtime], case_names: &[&str]
     println!();
 }
 
+fn print_ts_table(ts: &TsSection) {
+    println!(
+        "{:<20} {:>10} {:>10} {:>10} {:>6}",
+        TS_CASE, "median", "min", "max", "unit"
+    );
+    println!("{}", "-".repeat(60));
+    for row in &ts.rows {
+        let r = &row.result;
+        println!(
+            "{:<20} {:>10.2} {:>10.2} {:>10.2} {:>6}",
+            ts_row_label(&r.runtime, &row.variant),
+            r.median,
+            r.min,
+            r.max,
+            r.unit
+        );
+    }
+    println!();
+}
+
 // -------------------------------------------------------------- JSON output
+
+fn runtime_json(rt: &Runtime) -> serde_json::Value {
+    serde_json::json!({
+        "name": rt.name,
+        "version": rt.version,
+        "exe": rt.exe.to_string_lossy(),
+    })
+}
+
+/// One result row. `commit` is per row because a `--case` run can leave rows
+/// from different trees in one file; on a full run every row's equals the
+/// header's.
+fn case_row_json(r: &CaseResult, commit: Option<&str>) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "runtime": r.runtime,
+        "case": r.name,
+        "unit": r.unit,
+        "iterations": r.iterations,
+        "warmup_iterations": r.warmup_iterations,
+        "samples": r.samples,
+        "p50": r.p50,
+        "p95": r.p95,
+        "p99": r.p99,
+        "min": r.min,
+        "max": r.max,
+    });
+    if let Some(commit) = commit {
+        row["commit"] = serde_json::Value::String(commit.to_string());
+    }
+    row
+}
 
 fn build_json(
     results: &[CaseResult],
     runtimes: &[Runtime],
+    ts: Option<&TsSection>,
     commit: &str,
     profile: &str,
 ) -> serde_json::Value {
-    let rt_info: Vec<serde_json::Value> = runtimes
-        .iter()
-        .map(|rt| {
-            serde_json::json!({
-                "name": rt.name,
-                "version": rt.version,
-                "exe": rt.exe.to_string_lossy(),
-            })
-        })
-        .collect();
-
+    let rt_info: Vec<serde_json::Value> = runtimes.iter().map(runtime_json).collect();
     let cases: Vec<serde_json::Value> = results
         .iter()
-        .map(|r| {
-            serde_json::json!({
-                "runtime": r.runtime,
-                "case": r.name,
-                "unit": r.unit,
-                "iterations": r.iterations,
-                "warmup_iterations": r.warmup_iterations,
-                "samples": r.samples,
-                "p50": r.p50,
-                "p95": r.p95,
-                "p99": r.p99,
-                "min": r.min,
-                "max": r.max,
-            })
-        })
+        .map(|r| case_row_json(r, Some(commit)))
         .collect();
 
     let timestamp = chrono_utc_now();
+    let host = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
 
-    serde_json::json!({
-        "schema": "oam-bench/3",
+    let mut doc = serde_json::json!({
+        "schema": "oam-bench/4",
         "timestamp": timestamp,
         "commit": commit,
         "ci_run_id": std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
-        "host": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "host": host,
         "hardware_class": std::env::var("BENCH_HARDWARE_CLASS").unwrap_or_else(|_| "unknown".to_string()),
         "profile": profile,
         "warmup_iterations": 0,
         "runtimes": rt_info,
         "results": cases,
-    })
+    });
+
+    // The TypeScript section stamps itself: it is re-measured on its own by
+    // `--case ts-cold-start`, and its rows are per cache state, not per
+    // runtime, so they do not belong in `results`.
+    if let Some(ts) = ts {
+        let participants: Vec<serde_json::Value> = runtimes
+            .iter()
+            .filter(|rt| ts.rows.iter().any(|r| r.result.runtime == rt.name))
+            .map(runtime_json)
+            .collect();
+        let rows: Vec<serde_json::Value> = ts
+            .rows
+            .iter()
+            .map(|r| {
+                let mut row = case_row_json(&r.result, None);
+                row["variant"] = serde_json::Value::String(r.variant.clone());
+                row
+            })
+            .collect();
+        doc["ts_cold_start"] = serde_json::json!({
+            "commit": commit,
+            "profile": profile,
+            "host": host,
+            "timestamp": timestamp,
+            "modules": TS_MODULES,
+            "iterations": COLD_START_ITERS,
+            "node_flag": ts.node_flag,
+            "runtimes": participants,
+            "rows": rows,
+        });
+    }
+    doc
 }
 
 // ---------------------------------------------------------- markdown output
 
-fn build_markdown(
-    results: &[CaseResult],
-    runtimes: &[Runtime],
-    case_names: &[&str],
-    commit: &str,
-    profile: &str,
-) -> String {
+/// Render BENCHMARKS.md from the results document. Takes the JSON rather than
+/// this run's structs so a `--case` merge and a full run render through one
+/// path, and so the file can be regenerated from `bench/results.json` alone.
+fn build_markdown(doc: &serde_json::Value) -> String {
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let num = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
+    let commit = text(doc, "commit");
+    let profile = text(doc, "profile");
+    let host = text(doc, "host");
+    let runtimes: Vec<(String, String)> = doc["runtimes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|rt| (text(rt, "name"), text(rt, "version")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let results: Vec<&serde_json::Value> = doc["results"]
+        .as_array()
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let find = |case: &str, runtime: &str| {
+        results
+            .iter()
+            .copied()
+            .find(|r| r["case"] == case && r["runtime"] == runtime)
+    };
+
     let mut md = String::new();
     md.push_str("# Benchmarks\n\n");
     // The invocation has to be one a reader can paste. `cargo xtask bench`
@@ -1258,16 +2105,18 @@ fn build_markdown(
         "Where another runtime wins, the table says so -- see ",
         "[docs/why-oam.md](docs/why-oam.md) for the workloads oam is and is not aimed ",
         "at.\n\n",
+        "`--case <name>` (repeatable) measures only those cases and merges them into the ",
+        "committed files instead of rewriting them: the `Commit` line below keeps describing ",
+        "the last full run, every re-measured row is stamped with its own commit and listed ",
+        "under the table, and the TypeScript section carries its own stamp. It is how one ",
+        "case gets re-measured after a change without re-stamping numbers that did not ",
+        "move.\n\n",
     ));
-    md.push_str(&format!(
-        "Commit `{commit}` | {profile} | host {}-{}\n\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
+    md.push_str(&format!("Commit `{commit}` | {profile} | host {host}\n\n"));
 
     md.push_str("## Runtimes\n\n");
-    for rt in runtimes {
-        md.push_str(&format!("- **{}** {}\n", rt.name, rt.version));
+    for (name, version) in &runtimes {
+        md.push_str(&format!("- **{name}** {version}\n"));
     }
     md.push('\n');
 
@@ -1277,40 +2126,37 @@ fn build_markdown(
     if runtimes.len() == 1 {
         md.push_str("| Case | Median | Min | Max |\n");
         md.push_str("|---|--:|--:|--:|\n");
-        for r in results {
-            md.push_str(&format!(
-                "| {} | {:.2} | {:.2} | {:.2} |\n",
-                r.name, r.median, r.min, r.max
-            ));
+        for case_name in main_cases() {
+            if let Some(r) = find(case_name, &runtimes[0].0) {
+                md.push_str(&format!(
+                    "| {case_name} | {:.2} | {:.2} | {:.2} |\n",
+                    num(r, "p50"),
+                    num(r, "min"),
+                    num(r, "max")
+                ));
+            }
         }
     } else {
         md.push_str("| Case |");
-        for rt in runtimes {
-            md.push_str(&format!(" {} |", rt.name));
+        for (name, _) in &runtimes {
+            md.push_str(&format!(" {name} |"));
         }
-        if runtimes.len() >= 2 {
-            md.push_str(&format!(" vs {} |", runtimes[1].name));
-        }
+        md.push_str(&format!(" vs {} |", runtimes[1].0));
         md.push_str("\n|---|");
-        for _ in runtimes {
+        for _ in &runtimes {
             md.push_str("--:|");
         }
-        if runtimes.len() >= 2 {
-            md.push_str("--:|");
-        }
-        md.push('\n');
+        md.push_str("--:|\n");
 
-        for case_name in case_names {
+        for case_name in main_cases() {
             md.push_str(&format!("| {case_name} |"));
             let mut medians: Vec<Option<f64>> = Vec::new();
-            for rt in runtimes {
-                let result = results
-                    .iter()
-                    .find(|r| r.name == *case_name && r.runtime == rt.name);
-                match result {
+            for (name, _) in &runtimes {
+                match find(case_name, name) {
                     Some(r) => {
-                        md.push_str(&format!(" {:.2} |", r.median));
-                        medians.push(Some(r.median));
+                        let median = num(r, "p50");
+                        md.push_str(&format!(" {median:.2} |"));
+                        medians.push(Some(median));
                     }
                     None => {
                         md.push_str(" -- |");
@@ -1318,19 +2164,41 @@ fn build_markdown(
                     }
                 }
             }
-            if medians.len() >= 2 {
-                if let (Some(oam), Some(baseline)) = (medians[0], medians[1]) {
-                    let ratio = oam / baseline;
-                    md.push_str(&format!(" {:.2}x |", ratio));
-                } else {
-                    md.push_str(" -- |");
-                }
+            if let (Some(oam), Some(baseline)) = (medians[0], medians[1]) {
+                let ratio = oam / baseline;
+                md.push_str(&format!(" {ratio:.2}x |"));
+            } else {
+                md.push_str(" -- |");
             }
             md.push('\n');
         }
     }
 
-    md.push_str("\n## Cases\n\n");
+    // Rows a `--case` run replaced describe a different tree than the header
+    // line. Say which, or the stamp above silently covers numbers it did not
+    // produce.
+    let remeasured: Vec<String> = main_cases()
+        .flat_map(|case| runtimes.iter().map(move |(name, _)| (case, name)))
+        .filter_map(|(case, name)| {
+            let row = find(case, name)?;
+            let row_commit = row["commit"].as_str()?;
+            (row_commit != commit).then(|| format!("{case}/{name} at `{row_commit}`"))
+        })
+        .collect();
+    if !remeasured.is_empty() {
+        md.push_str(&format!(
+            "\nRe-measured by a filtered run (`--case`), so from a different tree than the \
+             `Commit` line above: {}.\n",
+            remeasured.join(", ")
+        ));
+    }
+    md.push('\n');
+
+    if let Some(ts) = doc.get("ts_cold_start").filter(|v| !v.is_null()) {
+        push_ts_markdown(&mut md, ts);
+    }
+
+    md.push_str("## Cases\n\n");
     md.push_str("- **cold-start** -- wall-clock time from process spawn to exit (`console.log('ok')`). Measured by the harness, not JS.\n");
     md.push_str(
         "- **url-parse** -- 10,000 `new URL()` constructions across 5 representative URLs.\n",
@@ -1342,8 +2210,103 @@ fn build_markdown(
     md.push_str("- **mcp-cold-start** -- wall-clock from process spawn to the first MCP `initialize` response via stdio. oam uses the built-in `oam:mcp` virtual module; other runtimes use `@modelcontextprotocol/sdk` (same noop tool, same transport).\n");
     md.push_str("- **mcp-idle-rss** -- resident set size (MB) after `initialize` completes and the server is idle, waiting for the next request. Measures runtime memory overhead of a hosted MCP server.\n");
     md.push_str("- **mcp-first-call-latency** -- wall-clock from sending `tools/call` to receiving the response, on an already-initialized server. Measures warm-path dispatch latency (no cold-start cost).\n");
+    md.push_str(&format!(
+        "- **{TS_CASE}** -- wall-clock from process spawn to the first stdout line of a generated \
+         {TS_MODULES}-module TypeScript graph, one row per bytecode-cache state for oam with node \
+         as the reference. Published in the TypeScript load path section above, which carries \
+         its own stamp.\n"
+    ));
 
     md
+}
+
+/// The `ts-cold-start` section: its own stamp line, table and legend.
+fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let num = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
+    let versions: Vec<String> = ts["runtimes"]
+        .as_array()
+        .map(|a| a.iter().map(|rt| text(rt, "version")).collect())
+        .unwrap_or_default();
+    let rows = ts["rows"].as_array().cloned().unwrap_or_default();
+    let node_flag = ts["node_flag"].as_str();
+    let has_node = rows.iter().any(|r| r["runtime"] == "node");
+
+    md.push_str("## TypeScript load path\n\n");
+    md.push_str(&format!(
+        "Commit `{}` | {} | host {}",
+        text(ts, "commit"),
+        text(ts, "profile"),
+        text(ts, "host")
+    ));
+    for version in &versions {
+        md.push_str(&format!(" | {version}"));
+    }
+    md.push_str("\n\n");
+    md.push_str(&format!(
+        "`{TS_CASE}`: wall-clock from process spawn to the first stdout line of `main.ts`, the \
+         entry of a generated graph of {} `.ts` modules (interfaces, generics, enums, `import \
+         type`, a few inner functions each) that import each other in a chain plus a fan-out \
+         from the entry. oam runs it as `oam run --no-check main.ts` in three cache states, one \
+         row each; node runs it once, as installed, for reference. Median over {} runs per row, \
+         the rows sampled round-robin like every other case. Milliseconds, lower is better. \
+         Each label was checked rather than assumed: a no-cache run that leaves a `.v8c` blob, \
+         a cold run that leaves none, or a row whose first line disagrees with another row's \
+         fails the case instead of publishing. The stamp above is this section's own -- \
+         `--case {TS_CASE}` re-measures it alone, without touching the table above.\n\n",
+        ts["modules"], ts["iterations"]
+    ));
+
+    md.push_str("| Row | Median | Min | Max | p95 |\n|---|--:|--:|--:|--:|\n");
+    for r in &rows {
+        md.push_str(&format!(
+            "| {} | {:.2} | {:.2} | {:.2} | {:.2} |\n",
+            ts_row_label(&text(r, "runtime"), &text(r, "variant")),
+            num(r, "p50"),
+            num(r, "min"),
+            num(r, "max"),
+            num(r, "p95")
+        ));
+    }
+    md.push('\n');
+
+    md.push_str(
+        "- **oam no-cache** -- `OAM_CODE_CACHE=0`, fresh `OAM_CACHE_DIR` every run: the `.ts` -> JS \
+         transpile (oxc) plus a full V8 compile; no bytecode is produced, written or read. The floor \
+         without the cache.\n",
+    );
+    md.push_str(
+        "- **oam cold** -- caches on, fresh `OAM_CACHE_DIR` every run: a project's first run, which \
+         also serializes and writes the bytecode. Its gap above no-cache is the price of producing \
+         the cache.\n",
+    );
+    md.push_str(
+        "- **oam warm** -- caches on, one `OAM_CACHE_DIR` primed by an untimed run and reused: every \
+         run after the first. Its gap below no-cache is what consuming the cache saves. The \
+         transpile itself is not cached for project files (only `node_modules` gets the \
+         install-time precompile), so this row still pays oxc on every run -- it is the row a \
+         transpile cache has to move.\n",
+    );
+    match node_flag {
+        Some(flag) if has_node => {
+            md.push_str(&format!(
+                "- **node** -- `node {flag} main.ts` as installed, `NODE_COMPILE_CACHE` unset."
+            ));
+            if flag == "--experimental-transform-types" {
+                md.push_str(
+                    " Strip-only mode (`--experimental-strip-types`) rejects the fixture's enums with \
+                     `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`, so the reference is transform mode.",
+                );
+            }
+            md.push('\n');
+        }
+        _ => md.push_str(
+            "- **node** -- no row: node was not on PATH, `--compare` was not passed, or neither \
+             `--experimental-strip-types` nor `--experimental-transform-types` ran the fixture; the \
+             run's console output says which.\n",
+        ),
+    }
+    md.push('\n');
 }
 
 // -------------------------------------------------------- shared helpers
@@ -1547,5 +2510,257 @@ mod rss_parse_tests {
         let gone = "INFO: No tasks are running which match the specified criteria.";
         assert_eq!(parse_tasklist_rss_kb(gone), None);
         assert_eq!(parse_tasklist_rss_kb(""), None);
+    }
+}
+
+/// The `--case` path and the ts-cold-start fixture, exercised without
+/// spawning a runtime. What these protect: a filtered run must never move the
+/// header stamp (the doc-stamp test above depends on it), must never keep a
+/// stale number under a fresh label, and the fixture must be the graph the
+/// section describes.
+#[cfg(test)]
+mod filtered_runs {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn row(case: &str, runtime: &str, p50: f64, commit: Option<&str>) -> Value {
+        let mut row = json!({
+            "case": case, "runtime": runtime, "unit": "ms", "iterations": 1,
+            "warmup_iterations": 0, "samples": [p50], "p50": p50, "p95": p50,
+            "p99": p50, "min": p50, "max": p50,
+        });
+        if let Some(commit) = commit {
+            row["commit"] = json!(commit);
+        }
+        row
+    }
+
+    fn existing() -> Value {
+        json!({
+            "schema": "oam-bench/3", "commit": "acec008", "profile": "release",
+            "host": "test-host", "timestamp": "t0",
+            "runtimes": [
+                {"name": "oam", "version": "oam 0.9.0", "exe": "oam"},
+                {"name": "node", "version": "v22", "exe": "node"},
+            ],
+            "results": [
+                row("cold-start", "oam", 59.0, None),
+                row("cold-start", "node", 113.0, None),
+                row("url-parse", "oam", 6.5, None),
+            ],
+            "ts_cold_start": {"commit": "acec008", "rows": []},
+        })
+    }
+
+    fn fresh(results: Vec<Value>, ts: Option<Value>) -> Value {
+        let mut doc = json!({
+            "schema": "oam-bench/4", "commit": "01bee57+wip", "profile": "release",
+            "host": "test-host", "timestamp": "t1",
+            "runtimes": [{"name": "oam", "version": "oam 0.13.0", "exe": "oam"}],
+            "results": results,
+        });
+        if let Some(ts) = ts {
+            doc["ts_cold_start"] = ts;
+        }
+        doc
+    }
+
+    #[test]
+    fn case_filter_rejects_unknown_names_and_keeps_table_order() {
+        assert!(select_cases(&["nope".to_string()]).is_err());
+        let picked = select_cases(&["mcp-idle-rss".to_string(), "cold-start".to_string()]).unwrap();
+        assert_eq!(picked, vec!["cold-start", "mcp-idle-rss"]);
+        assert_eq!(select_cases(&[]).unwrap(), CASE_NAMES.to_vec());
+    }
+
+    #[test]
+    fn merge_replaces_only_what_was_measured_and_keeps_the_header_stamp() {
+        let fresh = fresh(
+            vec![row("cold-start", "oam", 40.0, Some("01bee57+wip"))],
+            Some(json!({"commit": "01bee57+wip", "rows": [{"runtime": "oam"}]})),
+        );
+        let merged =
+            merge_filtered_run(existing(), fresh, &["cold-start", TS_CASE], &["oam"]).unwrap();
+
+        // The header keeps describing the last full run: the doc-stamp test
+        // and the prose docs both key off it.
+        assert_eq!(merged["commit"], "acec008");
+        assert_eq!(merged["schema"], "oam-bench/4");
+
+        let rows = merged["results"].as_array().unwrap();
+        let find = |case: &str, rt: &str| {
+            rows.iter()
+                .find(|r| r["case"] == case && r["runtime"] == rt)
+                .unwrap_or_else(|| panic!("{case}/{rt} missing"))
+        };
+        assert_eq!(find("cold-start", "oam")["p50"], 40.0);
+        assert_eq!(find("cold-start", "oam")["commit"], "01bee57+wip");
+        // node was not measured (no --compare), so its row and its lack of a
+        // per-row stamp survive untouched.
+        assert_eq!(find("cold-start", "node")["p50"], 113.0);
+        assert!(find("cold-start", "node")["commit"].is_null());
+        assert_eq!(find("url-parse", "oam")["p50"], 6.5);
+        assert_eq!(rows.len(), 3);
+
+        // Runtimes: oam refreshed, node kept, so the columns do not shift.
+        let runtimes = merged["runtimes"].as_array().unwrap();
+        assert_eq!(runtimes[0]["version"], "oam 0.13.0");
+        assert_eq!(runtimes[1]["name"], "node");
+
+        assert_eq!(merged["ts_cold_start"]["commit"], "01bee57+wip");
+    }
+
+    #[test]
+    fn merge_drops_a_measured_row_that_failed_rather_than_keeping_the_old_number() {
+        let fresh = fresh(vec![], None);
+        let merged = merge_filtered_run(existing(), fresh, &["cold-start"], &["oam"]).unwrap();
+        let rows = merged["results"].as_array().unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r["case"] == "cold-start" && r["runtime"] == "oam"),
+            "a failed measurement must show as missing, not as last run's number"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r["case"] == "cold-start" && r["runtime"] == "node")
+        );
+        // The TypeScript section was not selected, so it is kept as it was.
+        assert_eq!(merged["ts_cold_start"]["commit"], "acec008");
+        // No fresh main-table row landed, so the runtimes list -- which
+        // describes the binaries behind the main table -- stays as it was.
+        assert_eq!(merged["runtimes"][0]["version"], "oam 0.9.0");
+    }
+
+    #[test]
+    fn merge_keeps_the_ts_section_when_its_measurement_failed() {
+        let fresh = fresh(vec![], None);
+        let merged = merge_filtered_run(existing(), fresh, &[TS_CASE], &["oam"]).unwrap();
+        assert_eq!(merged["ts_cold_start"]["commit"], "acec008");
+    }
+
+    #[test]
+    fn merge_refuses_to_mix_profiles_or_hosts() {
+        let mut debug = fresh(vec![], None);
+        debug["profile"] = json!("debug");
+        assert!(merge_filtered_run(existing(), debug, &["cold-start"], &["oam"]).is_err());
+        let mut other_box = fresh(vec![], None);
+        other_box["host"] = json!("macos-aarch64");
+        assert!(merge_filtered_run(existing(), other_box, &["cold-start"], &["oam"]).is_err());
+    }
+
+    #[test]
+    fn markdown_keeps_the_header_stamp_and_flags_remeasured_rows() {
+        let fresh = fresh(
+            vec![row("cold-start", "oam", 40.0, Some("01bee57+wip"))],
+            Some(json!({
+                "commit": "01bee57+wip", "profile": "release", "host": "test-host",
+                "modules": TS_MODULES, "iterations": 20,
+                "node_flag": "--experimental-transform-types",
+                "runtimes": [
+                    {"name": "oam", "version": "oam 0.13.0"},
+                    {"name": "node", "version": "v22"},
+                ],
+                "rows": [
+                    row(TS_CASE, "oam", 70.0, None).tap(|r| r["variant"] = json!("no-cache")),
+                    row(TS_CASE, "oam", 60.0, None).tap(|r| r["variant"] = json!("warm")),
+                    row(TS_CASE, "node", 90.0, None).tap(|r| r["variant"] = json!("reference")),
+                ],
+            })),
+        );
+        let merged =
+            merge_filtered_run(existing(), fresh, &["cold-start", TS_CASE], &["oam"]).unwrap();
+        let md = build_markdown(&merged);
+
+        assert!(md.contains("Commit `acec008` | release | host test-host"));
+        assert!(md.contains("| cold-start | 40.00 | 113.00 | 0.35x |"));
+        assert!(md.contains("cold-start/oam at `01bee57+wip`"));
+        assert!(md.contains("## TypeScript load path"));
+        assert!(md.contains("Commit `01bee57+wip` | release | host test-host | oam 0.13.0 | v22"));
+        assert!(md.contains("| oam no-cache | 70.00 |"));
+        assert!(md.contains("| oam warm | 60.00 |"));
+        assert!(md.contains("| node | 90.00 |"));
+        assert!(md.contains("`node --experimental-transform-types main.ts`"));
+        assert!(md.contains("rejects the fixture's enums"));
+    }
+
+    #[test]
+    fn markdown_without_a_remeasured_row_has_no_footnote() {
+        let md = build_markdown(&existing());
+        assert!(!md.contains("Re-measured by a filtered run"));
+        assert!(md.contains("| cold-start | 59.00 | 113.00 | 0.52x |"));
+    }
+
+    trait Tap: Sized {
+        fn tap(mut self, f: impl FnOnce(&mut Self)) -> Self {
+            f(&mut self);
+            self
+        }
+    }
+    impl Tap for Value {}
+
+    #[test]
+    fn ts_fixture_is_deterministic_and_shaped_as_documented() {
+        let base =
+            std::env::temp_dir().join(format!("oam-bench-ts-fixture-{}", std::process::id()));
+        let a = write_ts_fixture(&base.join("a")).unwrap();
+        let b = write_ts_fixture(&base.join("b")).unwrap();
+        let read = |dir: &Path, name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let dir_a = a.entry.parent().unwrap();
+        let dir_b = b.entry.parent().unwrap();
+
+        // Byte-identical across generations: the bytecode cache keys on
+        // source text, so a wobble here would silently turn warm into cold.
+        for i in 1..=TS_MODULES {
+            let name = format!("mod{i:02}.ts");
+            assert_eq!(read(dir_a, &name), read(dir_b, &name), "{name} differs");
+        }
+        assert_eq!(read(dir_a, "main.ts"), read(dir_b, "main.ts"));
+        assert_eq!(
+            std::fs::read_dir(dir_a).unwrap().count(),
+            TS_MODULES + 2,
+            "modules + main.ts + package.json"
+        );
+
+        // The chain: each module imports the next by value and by type; the
+        // last imports nothing.
+        let first = read(dir_a, "mod01.ts");
+        assert!(first.contains("import { make02, run02 } from './mod02.ts';"));
+        assert!(first.contains("import type { Record02 } from './mod02.ts';"));
+        assert!(first.contains("export enum Stage01"));
+        assert!(first.contains("child?: Record02;"));
+        let last = read(dir_a, &format!("mod{TS_MODULES:02}.ts"));
+        assert!(!last.contains("import "));
+        assert!(!last.contains("child"));
+
+        // The fan-out: the entry imports module 1 and every stride-th one.
+        let entry = read(dir_a, "main.ts");
+        assert!(entry.contains("import type { Record01 } from './mod01.ts';"));
+        for i in ts_fanout() {
+            assert!(
+                entry.contains(&format!("from './mod{i:02}.ts';")),
+                "entry misses mod{i:02}"
+            );
+            assert!(entry.contains(&format!("run{i:02}({i})")));
+        }
+        assert!(entry.contains("from './mod01.ts';"));
+        assert!(!entry.contains("from './mod02.ts';"));
+        assert!(read(dir_a, "package.json").contains("\"type\":\"module\""));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn row_labels_and_error_lines() {
+        assert_eq!(ts_row_label("oam", "no-cache"), "oam no-cache");
+        assert_eq!(ts_row_label("node", "reference"), "node");
+        // Node prints the offending source and a caret before the error line;
+        // the error line is the one worth quoting.
+        let node_stderr = "C:\\x\\main.ts:2\nenum Color { Red = 1 }\n^^^^\n\nSyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode\n    at parseTypeScript";
+        assert!(
+            error_line(node_stderr).starts_with("SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]")
+        );
+        assert_eq!(error_line("\n  plain failure\n"), "plain failure");
+        assert_eq!(error_line(""), "");
     }
 }

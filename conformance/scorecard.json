@@ -1,11 +1,26 @@
 {
-  "commit": "e4cb651+wip",
-  "host": "windows-aarch64",
-  "nodeVersion": "v22.22.2",
-  "oamVersion": "oam 0.12.1",
   "schema": "oam-conformance/1",
+  "commit": "9d0a3b6+wip",
+  "oamVersion": "oam 0.13.0",
+  "nodeVersion": "v22.22.2",
+  "host": "windows-aarch64",
   "suites": {
+    "wptUrl": {
+      "constructor": {
+        "pass": 888,
+        "total": 888
+      },
+      "setters": {
+        "pass": 278,
+        "total": 278
+      },
+      "failureCount": 0,
+      "failureSample": [],
+      "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
+    },
     "nodeDifferential": {
+      "pass": 95,
+      "total": 95,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -387,13 +402,107 @@
           "case": "93-fs-filehandle-surface.mjs",
           "status": "pass"
         }
-      ],
-      "pass": 95,
-      "total": 95
+      ]
     },
     "surface": {
+      "modules": {
+        "have": 44,
+        "total": 44,
+        "detail": {
+          "assert": true,
+          "async_hooks": true,
+          "buffer": true,
+          "child_process": true,
+          "cluster": true,
+          "console": true,
+          "crypto": true,
+          "dgram": true,
+          "diagnostics_channel": true,
+          "dns": true,
+          "domain": true,
+          "events": true,
+          "fs": true,
+          "fs/promises": true,
+          "http": true,
+          "http2": true,
+          "https": true,
+          "inspector": true,
+          "module": true,
+          "net": true,
+          "os": true,
+          "path": true,
+          "perf_hooks": true,
+          "process": true,
+          "punycode": true,
+          "querystring": true,
+          "readline": true,
+          "repl": true,
+          "stream": true,
+          "stream/promises": true,
+          "stream/web": true,
+          "stream/consumers": true,
+          "string_decoder": true,
+          "timers": true,
+          "timers/promises": true,
+          "tls": true,
+          "trace_events": true,
+          "tty": true,
+          "url": true,
+          "util": true,
+          "v8": true,
+          "vm": true,
+          "worker_threads": true,
+          "zlib": true
+        }
+      },
+      "globals": {
+        "have": 32,
+        "total": 32,
+        "detail": {
+          "Buffer": true,
+          "URL": true,
+          "URLSearchParams": true,
+          "TextEncoder": true,
+          "TextDecoder": true,
+          "TextEncoderStream": true,
+          "TextDecoderStream": true,
+          "ReadableStream": true,
+          "WritableStream": true,
+          "TransformStream": true,
+          "fetch": true,
+          "crypto": true,
+          "process": true,
+          "performance": true,
+          "queueMicrotask": true,
+          "setImmediate": true,
+          "setTimeout": true,
+          "setInterval": true,
+          "atob": true,
+          "btoa": true,
+          "structuredClone": true,
+          "AbortController": true,
+          "AbortSignal": true,
+          "EventTarget": true,
+          "Event": true,
+          "Blob": true,
+          "FormData": true,
+          "Headers": true,
+          "Request": true,
+          "Response": true,
+          "WebSocket": true,
+          "BroadcastChannel": true
+        }
+      },
       "exports": {
+        "skipped": false,
+        "platform": "win32",
+        "noBaseline": false,
+        "nodeTotal": 1874,
+        "knownMissing": 351,
+        "newMissing": [],
+        "staleRatchet": [],
         "absentModules": [],
+        "staleAbsentModules": [],
         "extra": [
           {
             "module": "constants",
@@ -446,98 +555,6 @@
             "names": [
               "Dirent",
               "_globAsPromise"
-            ]
-          },
-          {
-            "module": "global:AbortSignal.prototype",
-            "names": [
-              "_fire"
-            ]
-          },
-          {
-            "module": "global:Blob.prototype",
-            "names": [
-              "toString"
-            ]
-          },
-          {
-            "module": "global:Event.prototype",
-            "names": [
-              "AT_TARGET",
-              "BUBBLING_PHASE",
-              "CAPTURING_PHASE",
-              "NONE"
-            ]
-          },
-          {
-            "module": "global:FormData.prototype",
-            "names": [
-              "_normalizeValue"
-            ]
-          },
-          {
-            "module": "global:ReadableStream.prototype",
-            "names": [
-              "_cancelInternal",
-              "_maybePull"
-            ]
-          },
-          {
-            "module": "global:URL.prototype",
-            "names": [
-              "_ensure",
-              "_setSearchFromParams",
-              "_update"
-            ]
-          },
-          {
-            "module": "global:URLSearchParams.prototype",
-            "names": [
-              "_parse",
-              "_sync"
-            ]
-          },
-          {
-            "module": "global:WebSocket.prototype",
-            "names": [
-              "_fireClose",
-              "_recvLoop"
-            ]
-          },
-          {
-            "module": "global:WritableStream.prototype",
-            "names": [
-              "_controllerFor"
-            ]
-          },
-          {
-            "module": "global:crypto",
-            "names": [
-              "getRandomValues",
-              "randomUUID",
-              "subtle"
-            ]
-          },
-          {
-            "module": "global:performance",
-            "names": [
-              "clearMarks",
-              "clearMeasures",
-              "clearResourceTimings",
-              "getEntries",
-              "getEntriesByName",
-              "getEntriesByType",
-              "mark",
-              "measure",
-              "now",
-              "timeOrigin",
-              "toJSON"
-            ]
-          },
-          {
-            "module": "global:process",
-            "names": [
-              "connected"
             ]
           },
           {
@@ -616,118 +633,101 @@
               "Z_PARTIAL_FLUSH",
               "Z_SYNC_FLUSH"
             ]
+          },
+          {
+            "module": "global:URL.prototype",
+            "names": [
+              "_ensure",
+              "_setSearchFromParams",
+              "_update"
+            ]
+          },
+          {
+            "module": "global:URLSearchParams.prototype",
+            "names": [
+              "_parse",
+              "_sync"
+            ]
+          },
+          {
+            "module": "global:ReadableStream.prototype",
+            "names": [
+              "_cancelInternal",
+              "_maybePull"
+            ]
+          },
+          {
+            "module": "global:WritableStream.prototype",
+            "names": [
+              "_controllerFor"
+            ]
+          },
+          {
+            "module": "global:crypto",
+            "names": [
+              "getRandomValues",
+              "randomUUID",
+              "subtle"
+            ]
+          },
+          {
+            "module": "global:process",
+            "names": [
+              "connected"
+            ]
+          },
+          {
+            "module": "global:performance",
+            "names": [
+              "clearMarks",
+              "clearMeasures",
+              "clearResourceTimings",
+              "getEntries",
+              "getEntriesByName",
+              "getEntriesByType",
+              "mark",
+              "measure",
+              "now",
+              "timeOrigin",
+              "toJSON"
+            ]
+          },
+          {
+            "module": "global:AbortSignal.prototype",
+            "names": [
+              "_fire"
+            ]
+          },
+          {
+            "module": "global:Event.prototype",
+            "names": [
+              "AT_TARGET",
+              "BUBBLING_PHASE",
+              "CAPTURING_PHASE",
+              "NONE"
+            ]
+          },
+          {
+            "module": "global:Blob.prototype",
+            "names": [
+              "toString"
+            ]
+          },
+          {
+            "module": "global:FormData.prototype",
+            "names": [
+              "_normalizeValue"
+            ]
+          },
+          {
+            "module": "global:WebSocket.prototype",
+            "names": [
+              "_fireClose",
+              "_recvLoop"
+            ]
           }
-        ],
-        "knownMissing": 351,
-        "newMissing": [],
-        "noBaseline": false,
-        "nodeTotal": 1874,
-        "platform": "win32",
-        "skipped": false,
-        "staleAbsentModules": [],
-        "staleRatchet": []
-      },
-      "globals": {
-        "detail": {
-          "AbortController": true,
-          "AbortSignal": true,
-          "Blob": true,
-          "BroadcastChannel": true,
-          "Buffer": true,
-          "Event": true,
-          "EventTarget": true,
-          "FormData": true,
-          "Headers": true,
-          "ReadableStream": true,
-          "Request": true,
-          "Response": true,
-          "TextDecoder": true,
-          "TextDecoderStream": true,
-          "TextEncoder": true,
-          "TextEncoderStream": true,
-          "TransformStream": true,
-          "URL": true,
-          "URLSearchParams": true,
-          "WebSocket": true,
-          "WritableStream": true,
-          "atob": true,
-          "btoa": true,
-          "crypto": true,
-          "fetch": true,
-          "performance": true,
-          "process": true,
-          "queueMicrotask": true,
-          "setImmediate": true,
-          "setInterval": true,
-          "setTimeout": true,
-          "structuredClone": true
-        },
-        "have": 32,
-        "total": 32
-      },
-      "modules": {
-        "detail": {
-          "assert": true,
-          "async_hooks": true,
-          "buffer": true,
-          "child_process": true,
-          "cluster": true,
-          "console": true,
-          "crypto": true,
-          "dgram": true,
-          "diagnostics_channel": true,
-          "dns": true,
-          "domain": true,
-          "events": true,
-          "fs": true,
-          "fs/promises": true,
-          "http": true,
-          "http2": true,
-          "https": true,
-          "inspector": true,
-          "module": true,
-          "net": true,
-          "os": true,
-          "path": true,
-          "perf_hooks": true,
-          "process": true,
-          "punycode": true,
-          "querystring": true,
-          "readline": true,
-          "repl": true,
-          "stream": true,
-          "stream/consumers": true,
-          "stream/promises": true,
-          "stream/web": true,
-          "string_decoder": true,
-          "timers": true,
-          "timers/promises": true,
-          "tls": true,
-          "trace_events": true,
-          "tty": true,
-          "url": true,
-          "util": true,
-          "v8": true,
-          "vm": true,
-          "worker_threads": true,
-          "zlib": true
-        },
-        "have": 44,
-        "total": 44
+        ]
       }
-    },
-    "wptUrl": {
-      "constructor": {
-        "pass": 888,
-        "total": 888
-      },
-      "failureCount": 0,
-      "failureSample": [],
-      "setters": {
-        "pass": 278,
-        "total": 278
-      },
-      "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     }
   }
 }

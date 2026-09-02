@@ -213,9 +213,13 @@ pub async fn dns_resolve(hostname: String, rrtype: String) -> OpOutcome {
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
+                        // Key order is JS property-insertion order now that
+                        // serde_json preserves it: node (c-ares) inserts
+                        // exchange before priority, and the differential
+                        // compares JSON.stringify byte-for-byte.
                         RData::MX(mx) => Some(serde_json::json!({
-                            "priority": mx.preference,
                             "exchange": host(&mx.exchange),
+                            "priority": mx.preference,
                         })),
                         _ => None,
                     })
@@ -265,11 +269,13 @@ pub async fn dns_resolve(hostname: String, rrtype: String) -> OpOutcome {
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
+                        // node's insertion order (verified live v22.22.2:
+                        // _matrix._tcp.matrix.org): name, port, priority, weight.
                         RData::SRV(srv) => Some(serde_json::json!({
+                            "name": host(&srv.target),
+                            "port": srv.port,
                             "priority": srv.priority,
                             "weight": srv.weight,
-                            "port": srv.port,
-                            "name": host(&srv.target),
                         })),
                         _ => None,
                     })
@@ -361,13 +367,15 @@ pub async fn dns_resolve(hostname: String, rrtype: String) -> OpOutcome {
                     .answers()
                     .iter()
                     .filter_map(|rec| match &rec.data {
+                        // node's insertion order (cares_wrap.cc ParseNaptrReply):
+                        // flags, service, regexp, replacement, order, preference.
                         RData::NAPTR(naptr) => Some(serde_json::json!({
-                            "order": naptr.order,
-                            "preference": naptr.preference,
                             "flags": String::from_utf8_lossy(&naptr.flags).into_owned(),
                             "service": String::from_utf8_lossy(&naptr.services).into_owned(),
                             "regexp": String::from_utf8_lossy(&naptr.regexp).into_owned(),
                             "replacement": host(&naptr.replacement),
+                            "order": naptr.order,
+                            "preference": naptr.preference,
                         })),
                         _ => None,
                     })

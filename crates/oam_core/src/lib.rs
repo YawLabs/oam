@@ -914,9 +914,32 @@ pub fn register_exit_cleanup(path: std::path::PathBuf) {
     guard.push(path);
 }
 
-/// Remove every registered artifact. Idempotent -- the list is taken, so a
-/// normal-path cleanup followed by an exit-path drain does no double work.
+/// Callbacks the process must run before a HARD exit -- work that would
+/// otherwise be silently lost when `process.exit()` tears the process down
+/// from inside an op (the CLI registers its queued loader-warning drain
+/// here). Run before the artifact removal, each at most once.
+static EXIT_HOOKS: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a callback to run on a hard exit, before the artifact drain.
+pub fn register_exit_hook(hook: impl FnOnce() + Send + 'static) {
+    let mut guard = EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.push(Box::new(hook));
+}
+
+/// Run every registered hook, then remove every registered artifact.
+/// Idempotent -- both lists are taken, so a normal-path cleanup followed by
+/// an exit-path drain does no double work.
 pub fn run_exit_cleanup() {
+    let hooks = {
+        let mut guard = EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    for hook in hooks {
+        // A panicking hook must not abort the exit path mid-drain: swallow
+        // it and keep going -- the process is exiting either way.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
+    }
     let paths = {
         let mut guard = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
