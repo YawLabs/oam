@@ -340,6 +340,25 @@ fn stamp(meta: std::io::Result<std::fs::Metadata>) -> Stamp {
     Some((mtime, meta.len()))
 }
 
+/// Entry-set stamp for an out-of-root directory: FNV over the sorted
+/// entry names plus the entry count. Dir mtime is deliberately NOT
+/// trusted here: Linux stamps directories with the coarse clock (one
+/// jiffy — up to 10ms), so a create/delete landing in the same tick as
+/// the previous one keeps mtime identical, and ext4 dir size sits at
+/// 4096 regardless — the name set is the only signal that cannot lie.
+/// `None` = unreadable/vanished, which hashes as "missing".
+fn dir_listing_stamp(dir: &Path) -> Stamp {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut names: Vec<std::ffi::OsString> = read.flatten().map(|e| e.file_name()).collect();
+    names.sort_unstable();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for name in &names {
+        hash ^= fnv1a64(name.to_string_lossy().as_bytes());
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some((hash as u128, names.len() as u64))
+}
+
 /// Whole-project content fingerprint, FNV-mixed over (path, mtime, size)
 /// of: every file in `listed` (tsgo's own program file list — covers
 /// allowJs/checkJs, .json modules, @types, tsgo's lib .d.ts, and
@@ -347,10 +366,12 @@ fn stamp(meta: std::io::Result<std::fs::Metadata>) -> Stamp {
 /// has since vanished hashes as "missing"), plus a walk of the tsconfig
 /// dir over every tsc-loadable extension (catches NEW files the last
 /// listing predates; skips node_modules/.git/.oam anywhere and `target`
-/// only directly under the root), plus the parent DIRECTORIES of listed
-/// files outside the root (a dir's mtime changes on create/delete on
-/// NTFS/ext4/APFS, so a file ADDED under an out-of-root include/references
-/// dir — which no walk covers — still misses the cache), plus the tsconfig
+/// only directly under the root), plus an entry-listing stamp of the
+/// parent DIRECTORIES of listed files outside the root (the sorted name
+/// set changes on create/delete/rename, so a file ADDED under an
+/// out-of-root include/references dir — which no walk covers — still
+/// misses the cache; dir mtime is not trusted for this, see
+/// dir_listing_stamp), plus the tsconfig
 /// `extends`/`references` chain, plus package.json and the lockfiles on
 /// every ancestor (dependency upgrades). None = too big to fingerprint
 /// (then we simply never serve from cache — correctness first).
@@ -400,15 +421,17 @@ fn fingerprint(root: &Path, tsconfig: &Path, listed: &[PathBuf]) -> Option<u64> 
         entries.insert(path.clone(), stamp(std::fs::metadata(path)));
         // A listed file OUTSIDE the walked root (out-of-root include /
         // references / extends targets, @types and lib dirs): stamp its
-        // parent DIRECTORY too — the dir mtime changes when a sibling is
-        // created or deleted, so `../shared/new.ts` invalidates the cache
-        // even though no listing names it yet and no walk reaches it.
+        // parent DIRECTORY's entry listing too — the name set changes
+        // when a sibling is created or deleted, so `../shared/new.ts`
+        // invalidates the cache even though no listing names it yet and
+        // no walk reaches it. (Not the dir's mtime: Linux's coarse clock
+        // leaves a same-jiffy create invisible — see dir_listing_stamp.)
         if !path.starts_with(root)
             && let Some(parent) = path.parent()
         {
             entries
                 .entry(parent.to_path_buf())
-                .or_insert_with(|| stamp(std::fs::metadata(parent)));
+                .or_insert_with(|| dir_listing_stamp(parent));
         }
     }
     for path in tsconfig_chain(tsconfig) {
@@ -1383,8 +1406,10 @@ mod tests {
     fn fingerprint_catches_files_added_under_out_of_root_dirs() {
         // Regression: tsconfig `"include": ["src", "../shared"]`, then
         // create ../shared/new.ts — the walk never leaves the root and no
-        // listing names the new file, so only the parent-dir stamp of the
-        // listed ../shared files can invalidate the cached result.
+        // listing names the new file, so only the parent-dir LISTING stamp
+        // of the listed ../shared files can invalidate the cached result.
+        // (Listing, not mtime: Linux's coarse clock made the mtime version
+        // of this flake on the release builder — same-jiffy create.)
         let dir = scratch("fp-outside-add");
         let root = dir.join("proj");
         std::fs::create_dir_all(&root).unwrap();
