@@ -161,6 +161,8 @@ impl ReadGate {
         self.settled.notify_all();
     }
 
+    /// Test-only: the cancel path reads the counter under its own lock.
+    #[cfg(test)]
     fn generation(&self) -> u64 {
         self.settle
             .lock()
@@ -346,7 +348,7 @@ mod console {
             }
             let ok = GetConsoleScreenBufferInfo(handle, &mut info) != 0;
             CloseHandle(handle);
-            ok.then(|| SavedCursor {
+            ok.then_some(SavedCursor {
                 x: info.dwCursorPosition.X,
                 y: info.dwCursorPosition.Y,
                 rows: info.dwSize.Y,
