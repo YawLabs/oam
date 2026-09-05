@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "9d0a3b6+wip",
-  "oamVersion": "oam 0.13.0",
+  "commit": "5ff4b43+wip",
+  "oamVersion": "oam 0.13.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 95,
-      "total": 95,
+      "pass": 96,
+      "total": 96,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -400,6 +400,10 @@
         },
         {
           "case": "93-fs-filehandle-surface.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "94-readline-sequential-interfaces.mjs",
           "status": "pass"
         }
       ]
