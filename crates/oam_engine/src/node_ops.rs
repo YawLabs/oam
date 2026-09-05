@@ -889,12 +889,12 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     if h == 0 || h == -1 {
         return false;
     }
+    let mut mode: u32 = 0;
     // SAFETY: `h` is a console handle from win_std_handle, already rejected
     // above if 0/-1. `mode` is a live stack u32 passed by `&mut`, valid for
     // GetConsoleMode's out-write, and is only read after the return is checked
     // non-zero. SetConsoleMode takes the handle plus a by-value DWORD.
     unsafe {
-        let mut mode: u32 = 0;
         if GetConsoleMode(h, &mut mode) == 0 {
             return false;
         }
@@ -943,8 +943,18 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     // returned line discarded, a fresh read queued under the new mode);
     // oam_core::stdin does the same. After the flip, on purpose: the re-issued
     // read must start under the NEW mode.
+    //
+    // Both directions: a read issued RAW keeps raw semantics across the
+    // switch back too, and would hand the next cooked prompt its first
+    // keystroke immediately and un-echoed. What differs is the echo: only a
+    // read issued under LINE_INPUT + ECHO_INPUT has its Enter echoed as a
+    // newline, so only then is there a cursor to put back -- a raw read
+    // returns the injected `\r` as one silent byte. The PRE-flip `mode` is
+    // what the pending read was issued under.
     if fd == 0 {
-        oam_core::stdin::cancel_pending_console_read();
+        let from_cooked_echo = mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+            == (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+        oam_core::stdin::cancel_pending_console_read(from_cooked_echo);
     }
     true
 }

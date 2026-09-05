@@ -23,6 +23,15 @@
 //! the cooked line buffer is lost with the cancelled read, and the newline the
 //! console echoed for the synthetic Enter is undone by restoring the cursor.
 //!
+//! The cancel runs in BOTH directions, because a read issued raw keeps raw
+//! semantics across the switch back just the same, and would deliver the
+//! first keystroke of the next cooked prompt immediately and un-echoed. But
+//! only a cooked, echoing read has an Enter the console echoes: a raw read
+//! returns the injected `\r` as one silent byte and nothing on screen moves.
+//! So the raw-mode op passes the PRE-flip mode along, and the cursor is
+//! saved and put back (with libuv's "the echo scrolled the last row" row
+//! adjustment) only when the cancelled read was cooked and echoing.
+//!
 //! Unix needs none of this: a read blocked in canonical mode picks up a
 //! termios change on its own (Linux wakes the reader from `tcsetattr`; BSD
 //! re-checks `ICANON` when the next byte arrives), which is also all libuv
@@ -49,12 +58,18 @@ const DISCARD: u8 = 2;
 /// How long a cancel waits for the discarded read to settle (consume the
 /// injected Enter and restore the cursor). Console latency is well under a
 /// millisecond; the bound only keeps a wedged console from wedging the
-/// isolate thread.
+/// isolate thread. (The cancel side -- this, `arm_cancel`, `wait_settled`,
+/// `disarm_cancel` -- is driven by the Windows console half; on unix nothing
+/// cancels, so those are dead there while the tests still cover them.)
+#[cfg_attr(not(windows), allow(dead_code))]
 const SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Where the cursor was when the cancel was injected. Restored once the
 /// discarded read returns, undoing the newline the console echoed for the
-/// synthetic Enter (libuv does the same from its read thread).
+/// synthetic Enter (libuv does the same from its read thread). Only
+/// constructed by the Windows console half (and the tests); the state
+/// machine around it is shared so the decisions are testable everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SavedCursor {
     x: i16,
@@ -64,7 +79,23 @@ struct SavedCursor {
     rows: i16,
 }
 
+impl SavedCursor {
+    /// Where the cursor goes back to: one row higher when it sat on the
+    /// buffer's last row, because the echoed Enter scrolled the buffer up
+    /// (libuv's adjustment in uv_tty_line_read_thread). Never above row 0.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn restore_target(self) -> (i16, i16) {
+        let mut y = self.y;
+        if self.y == self.rows - 1 && y > 0 {
+            y -= 1;
+        }
+        (self.x, y)
+    }
+}
+
 struct Settle {
+    /// Set by `arm_cancel` for a cooked, echoing read; None for a raw one,
+    /// whose injected Enter echoes nothing.
     saved_cursor: Option<SavedCursor>,
     /// Bumped each time a discarded read settles. The cancelling thread waits
     /// for the bump so that output its caller writes right after the mode
@@ -132,11 +163,38 @@ impl ReadGate {
     /// Undo `mark_discard` when nothing will wake the read early, so it
     /// delivers its line as it would have instead of swallowing the user's
     /// next Enter. Fails (harmlessly) if the read settled in between.
-    #[cfg(windows)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn unmark_discard(&self) -> bool {
         self.state
             .compare_exchange(DISCARD, PENDING, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+    }
+
+    /// Arm a cancel: mark the read in flight for discard and remember where
+    /// the cursor is, so the newline the console echoes for the synthetic
+    /// Enter can be undone. `cursor` is consulted only once a read is
+    /// actually marked, and returns None for a raw read (nothing echoes).
+    /// Returns the settle generation to wait on, or None when nothing was
+    /// pending.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn arm_cancel(&self, cursor: impl FnOnce() -> Option<SavedCursor>) -> Option<u64> {
+        if !self.mark_discard() {
+            return None;
+        }
+        let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
+        settle.saved_cursor = cursor();
+        Some(settle.generation)
+    }
+
+    /// Undo `arm_cancel` when the wake-up could not be sent: the read stays
+    /// live and delivers as it would have, and no cursor is put back.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn disarm_cancel(&self) {
+        self.unmark_discard();
+        self.settle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saved_cursor = None;
     }
 
     /// Whether a read is blocked in the OS right now.
@@ -144,21 +202,23 @@ impl ReadGate {
         self.state.load(Ordering::SeqCst) != IDLE
     }
 
-    fn settle_discard(&self, bytes_read: usize) {
+    /// A marked read returned `bytes_read` bytes. Puts the cursor back when
+    /// there is one to put back, bumps the settle generation, and wakes the
+    /// cancelling thread. Returns the cursor that was restored: only a
+    /// cooked, echoing read (the one `arm_cancel` saved a cursor for) that
+    /// actually returned its Enter echoed a newline; a raw read's injected
+    /// `\r` and a cancelled read that failed moved nothing. The decision is
+    /// platform-independent; the SetConsoleCursorPosition behind it is not.
+    fn settle_discard(&self, bytes_read: usize) -> Option<SavedCursor> {
         let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
-        let cursor = settle.saved_cursor.take();
-        // The console only echoed a newline if the read actually returned the
-        // Enter; a cancelled read that failed moved nothing.
+        let restored = settle.saved_cursor.take().filter(|_| bytes_read > 0);
         #[cfg(windows)]
-        if let Some(cursor) = cursor
-            && bytes_read > 0
-        {
+        if let Some(cursor) = restored {
             console::restore_cursor(cursor);
         }
-        #[cfg(not(windows))]
-        let _ = (cursor, bytes_read);
         settle.generation = settle.generation.wrapping_add(1);
         self.settled.notify_all();
+        restored
     }
 
     /// Test-only: the cancel path reads the counter under its own lock.
@@ -172,6 +232,7 @@ impl ReadGate {
 
     /// Block until a discarded read has settled past `generation`, or
     /// `timeout` elapses. Returns whether it settled.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn wait_settled(&self, generation: u64, timeout: Duration) -> bool {
         let guard = self.settle.lock().unwrap_or_else(|e| e.into_inner());
         let (guard, _) = self
@@ -188,22 +249,21 @@ impl ReadGate {
     /// discard, inject a synthetic Enter so it returns, and wait for it to
     /// settle. Returns whether a read was cancelled. Call AFTER the console
     /// mode has been switched, so the read the loop re-issues runs under the
-    /// new mode.
-    pub fn cancel_console_read(&self) -> bool {
-        if !self.mark_discard() {
+    /// new mode. `from_cooked_echo` says what the read was issued under:
+    /// only then does its Enter echo a newline worth undoing.
+    pub fn cancel_console_read(&self, from_cooked_echo: bool) -> bool {
+        let cursor = || {
+            if from_cooked_echo {
+                console::cursor_position()
+            } else {
+                None
+            }
+        };
+        let Some(generation) = self.arm_cancel(cursor) else {
             return false;
-        }
-        let generation = {
-            let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
-            settle.saved_cursor = console::cursor_position();
-            settle.generation
         };
         if !console::inject_enter() {
-            self.unmark_discard();
-            self.settle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .saved_cursor = None;
+            self.disarm_cancel();
             return false;
         }
         self.wait_settled(generation, SETTLE_TIMEOUT);
@@ -215,10 +275,12 @@ impl ReadGate {
 pub static STDIN_GATE: ReadGate = ReadGate::new();
 
 /// Cancel the stdin read in flight, if any, after a console-mode switch. See
-/// the module docs. Returns whether a read was cancelled.
+/// the module docs. `from_cooked_echo`: the mode the read was issued under
+/// had ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT set, so its Enter echoes a
+/// newline that must be undone. Returns whether a read was cancelled.
 #[cfg(windows)]
-pub fn cancel_pending_console_read() -> bool {
-    STDIN_GATE.cancel_console_read()
+pub fn cancel_pending_console_read(from_cooked_echo: bool) -> bool {
+    STDIN_GATE.cancel_console_read(from_cooked_echo)
 }
 
 /// Read into `buf` through the gate. A result marked for discard while the
@@ -360,13 +422,8 @@ mod console {
     /// when the echoed Enter scrolled the buffer (libuv's adjustment).
     pub(super) fn restore_cursor(cursor: SavedCursor) {
         let name = conout_name();
-        let mut pos = COORD {
-            X: cursor.x,
-            Y: cursor.y,
-        };
-        if cursor.y == cursor.rows - 1 && pos.Y > 0 {
-            pos.Y -= 1;
-        }
+        let (x, y) = cursor.restore_target();
+        let pos = COORD { X: x, Y: y };
         // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the
         // call; the other CreateFileW arguments are by-value flags and the
         // null pointers it documents as optional. SetConsoleCursorPosition
@@ -506,6 +563,86 @@ mod tests {
             "a stray cancel must not poison the next read"
         );
         assert!(!gate.mark_discard(), "the read settled; nothing to cancel");
+    }
+
+    const CURSOR: SavedCursor = SavedCursor {
+        x: 7,
+        y: 3,
+        rows: 40,
+    };
+
+    #[test]
+    fn cooked_cancel_restores_the_cursor_once_the_enter_lands() {
+        // cooked -> raw: the pending read is a cooked, echoing one; its
+        // injected Enter echoes "\r\n", so the cursor goes back.
+        let gate = ReadGate::new();
+        gate.begin();
+        assert_eq!(gate.arm_cancel(|| Some(CURSOR)), Some(0));
+        assert_eq!(gate.settle_discard(2), Some(CURSOR));
+        assert_eq!(gate.generation(), 1);
+    }
+
+    #[test]
+    fn raw_cancel_leaves_the_cursor_alone() {
+        // raw -> cooked: the pending read is raw; the injected Enter comes
+        // back as one silent byte and nothing on screen moved.
+        let gate = ReadGate::new();
+        gate.begin();
+        assert_eq!(gate.arm_cancel(|| None), Some(0));
+        assert_eq!(gate.settle_discard(1), None);
+        assert_eq!(gate.generation(), 1, "the discard still settled");
+    }
+
+    #[test]
+    fn cooked_cancel_whose_read_returned_nothing_restores_nothing() {
+        let gate = ReadGate::new();
+        gate.begin();
+        assert!(gate.arm_cancel(|| Some(CURSOR)).is_some());
+        assert_eq!(gate.settle_discard(0), None, "no Enter came back, no echo");
+    }
+
+    #[test]
+    fn arm_cancel_without_a_pending_read_is_a_noop() {
+        let gate = ReadGate::new();
+        assert_eq!(
+            gate.arm_cancel(|| unreachable!("cursor is read only for a marked read")),
+            None
+        );
+        let mut reader = scripted(&gate, vec![(false, Ok(b"ok"))]);
+        let mut buf = [0u8; 8];
+        let n = read_through_gate(&gate, &mut reader, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        assert_eq!(gate.generation(), 0);
+    }
+
+    #[test]
+    fn disarm_cancel_lets_the_read_deliver_and_forgets_the_cursor() {
+        let gate = ReadGate::new();
+        gate.begin();
+        assert!(gate.arm_cancel(|| Some(CURSOR)).is_some());
+        gate.disarm_cancel();
+        assert!(gate.end(4), "the read is live again and delivers");
+        assert_eq!(gate.generation(), 0, "nothing was discarded");
+        gate.begin();
+        assert!(gate.arm_cancel(|| None).is_some());
+        assert_eq!(gate.settle_discard(2), None, "the disarmed cursor is gone");
+    }
+
+    #[test]
+    fn restore_target_steps_up_one_row_only_from_the_last_row() {
+        assert_eq!(CURSOR.restore_target(), (7, 3));
+        let last_row = SavedCursor {
+            x: 7,
+            y: 39,
+            rows: 40,
+        };
+        assert_eq!(last_row.restore_target(), (7, 38), "the echo scrolled");
+        let one_row = SavedCursor {
+            x: 0,
+            y: 0,
+            rows: 1,
+        };
+        assert_eq!(one_row.restore_target(), (0, 0), "never above row 0");
     }
 
     #[test]
