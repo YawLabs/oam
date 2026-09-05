@@ -8103,6 +8103,113 @@ console.log('isTTY:', process.stdin.isTTY);
     );
 }
 
+// bug: readline's Interface paused stdin on close() -- as node's does -- but
+// never resumed it in the constructor (node does, last thing), and close()
+// left its 'data'/'end' listeners on the stream. A paused Readable is not
+// restarted by a new 'data' listener, so a SECOND interface over
+// process.stdin -- a CLI that prompts, closes, then prompts again -- never
+// received a byte. Each answer goes in only after its prompt shows, as a
+// terminal user's would, so the three lines reach the child as three reads.
+#[test]
+fn readline_second_interface_after_close_still_reads_stdin() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let f = write_temp(
+        "readline_sequential.mjs",
+        r#"
+import * as readline from 'node:readline/promises';
+function prompter() {
+  let rl = null;
+  return {
+    ask(p) {
+      if (rl === null) rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      return rl.question(p);
+    },
+    close() { rl?.close(); rl = null; },
+  };
+}
+const a = prompter();
+console.log('[got1]', JSON.stringify(await a.ask('Q1? ')));
+console.log('[got2]', JSON.stringify(await a.ask('Q2? ')));
+a.close();
+const b = prompter();
+console.log('[got3]', JSON.stringify(await b.ask('Q3? ')));
+b.close();
+"#,
+    );
+    let cache = write_temp("oam-cache-readline-seq/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", f.to_str().unwrap(), "--no-check"])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oam");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let pump = {
+        let seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+    };
+    fn wait_for(seen: &Mutex<Vec<u8>>, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if String::from_utf8_lossy(&seen.lock().unwrap()).contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for (prompt, answer) in [("Q1? ", "\n"), ("Q2? ", "\n"), ("Q3? ", "2\n")] {
+        assert!(
+            wait_for(&seen, prompt),
+            "never prompted {prompt:?}; stdout so far: {}",
+            String::from_utf8_lossy(&seen.lock().unwrap())
+        );
+        stdin.write_all(answer.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(stdin);
+
+    let status = child.wait().expect("oam exits");
+    pump.join().unwrap();
+    let stdout = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .ok();
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    for expected in ["[got1] \"\"", "[got2] \"\"", "[got3] \"2\""] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn fs_watch_detects_file_change() {
     let stdout = run_ok(
