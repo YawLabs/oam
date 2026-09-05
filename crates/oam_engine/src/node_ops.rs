@@ -898,7 +898,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
         if GetConsoleMode(h, &mut mode) == 0 {
             return false;
         }
-        if enable {
+        let target = if enable {
             // Save the pre-raw mode once so setRawMode(false)/exit restores it.
             let _ = WIN_STDIN_ORIG_MODE.compare_exchange(
                 u32::MAX,
@@ -910,20 +910,43 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
             // CTRL_C_EVENT: it arrives as a 0x03 data byte and the console
             // ctrl handler (owned by the signals-in item) never fires -- this
             // is Node's documented raw-mode behavior and the coordination point.
-            let raw = (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
-                | ENABLE_VIRTUAL_TERMINAL_INPUT;
-            SetConsoleMode(h, raw) != 0
+            (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT
         } else {
             let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
-            let restore = if orig == u32::MAX {
+            if orig == u32::MAX {
                 (mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
                     & !ENABLE_VIRTUAL_TERMINAL_INPUT
             } else {
                 orig
-            };
-            SetConsoleMode(h, restore) != 0
+            }
+        };
+        // libuv's uv_tty_set_mode returns early when the console is already
+        // in the requested mode, and so does this. It matters for the cancel
+        // below: a no-op switch must not cancel -- and so drop the type-ahead
+        // of -- a read that is blocked and would have completed fine.
+        if target == mode {
+            return true;
+        }
+        if SetConsoleMode(h, target) == 0 {
+            return false;
         }
     }
+    // The mode is flipped, but a stdin read that was ALREADY blocked keeps the
+    // semantics it was issued with: a cooked (ENABLE_LINE_INPUT) ReadConsoleW
+    // returns only on Enter no matter what SetConsoleMode did after it. And
+    // one is nearly always blocked, because node's Readable refills the moment
+    // a chunk is pushed -- so right after a readline answer the next cooked
+    // read is pending, and a TUI that now goes raw saw nothing the user typed
+    // until they pressed Enter. libuv cancels the pending read from
+    // uv_tty_set_mode (uv__cancel_read_console: a synthetic VK_RETURN, the
+    // returned line discarded, a fresh read queued under the new mode);
+    // oam_core::stdin does the same. After the flip, on purpose: the re-issued
+    // read must start under the NEW mode.
+    if fd == 0 {
+        oam_core::stdin::cancel_pending_console_read();
+    }
+    true
 }
 
 #[cfg(windows)]
@@ -980,6 +1003,17 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
 
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+    // No pending-read cancel here, unlike the Windows impl above. A stdin
+    // read blocked in canonical mode picks up the termios change on its own:
+    // Linux's n_tty_set_termios wakes tty->read_wait, and n_tty_read
+    // re-evaluates icanon on every wakeup, so the blocked read returns the
+    // very next byte typed after tcsetattr (verified on a 6.6 kernel: a read
+    // blocked under ICANON returned a single 'h', no Enter, once the caller
+    // cleared ICANON). BSD/XNU's ttread does not wake on TIOCSETA, but it
+    // re-checks ICANON when the next byte arrives, so that byte is delivered
+    // raw as well. That is also all libuv does on unix -- uv_tty_set_mode is
+    // a bare tcsetattr -- so node and oam agree.
+    //
     // SAFETY: `termios` is POSIX plain-old-data, so `zeroed()` is a valid
     // initial value that tcgetattr overwrites; its return is checked before
     // `term` is read. `&mut term` / `&raw_term` point at live stack storage

@@ -19161,7 +19161,7 @@
         if (this.input && typeof this.input.on === "function") {
           const dec = new TextDecoder();
           let buf = "";
-          this.input.on("data", (chunk) => {
+          const onData = (chunk) => {
             if (this._closed) return;
             buf += typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true });
             const parts = buf.split(/\r?\n/);
@@ -19170,23 +19170,39 @@
               this.line = line;
               this.emit("line", line);
             }
-          });
-          this.input.on("end", () => {
+          };
+          const onEnd = () => {
             if (buf.length) {
               this.line = buf;
               this.emit("line", buf);
               buf = "";
             }
             this.close();
+          };
+          this.input.on("data", onData);
+          this.input.on("end", onEnd);
+          // Node detaches its input listeners on close (onSelfCloseWithout-
+          // Terminal), so a closed interface stops being a consumer of the
+          // stream and a later one over the same input is its only reader.
+          this.once("close", () => {
+            this.input.removeListener("data", onData);
+            this.input.removeListener("end", onEnd);
           });
+          // Node ends its constructor with input.resume(). close() pauses the
+          // input, and a paused stream (readableFlowing === false) is NOT
+          // restarted by a new 'data' listener -- so without this a second
+          // interface over process.stdin, created after the first was closed
+          // (a CLI that prompts, closes, then prompts again), never received
+          // a byte: the answer sat echoed on the terminal and nothing ran.
+          if (typeof this.input.resume === "function") this.input.resume();
         }
       }
       close() {
         if (this._closed) return;
+        // Node's order: pause the input (emitting 'pause' unless already
+        // paused), mark closed, emit 'close' -- which detaches the listeners.
+        this.pause();
         this._closed = true;
-        if (this.input && typeof this.input.pause === "function") {
-          try { this.input.pause(); } catch (_e) { /* ignore */ }
-        }
         this.emit("close");
       }
       question(prompt, cb) {
