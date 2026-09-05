@@ -1001,6 +1001,82 @@ fn tty_win_size(fd: i32) -> Option<(i32, i32)> {
     }
 }
 
+/// The part of a termios that setRawMode(true) changes: the four flag words
+/// and VMIN/VTIME. Pulled out so the raw recipe is a pure function a unit
+/// test can drive without a `termios`, which has no safe constructor and a
+/// per-platform field list.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TtyModeBits {
+    iflag: libc::tcflag_t,
+    oflag: libc::tcflag_t,
+    cflag: libc::tcflag_t,
+    lflag: libc::tcflag_t,
+    vmin: libc::cc_t,
+    vtime: libc::cc_t,
+}
+
+#[cfg(unix)]
+impl TtyModeBits {
+    fn of(term: &libc::termios) -> Self {
+        Self {
+            iflag: term.c_iflag,
+            oflag: term.c_oflag,
+            cflag: term.c_cflag,
+            lflag: term.c_lflag,
+            vmin: term.c_cc[libc::VMIN],
+            vtime: term.c_cc[libc::VTIME],
+        }
+    }
+
+    fn apply_to(self, term: &mut libc::termios) {
+        term.c_iflag = self.iflag;
+        term.c_oflag = self.oflag;
+        term.c_cflag = self.cflag;
+        term.c_lflag = self.lflag;
+        term.c_cc[libc::VMIN] = self.vmin;
+        term.c_cc[libc::VTIME] = self.vtime;
+    }
+}
+
+/// Node's raw mode is NOT cfmakeraw. libuv's `uv_tty_set_mode`
+/// (src/unix/tty.c, v1.51.0 -- the libuv node v22.22.2 ships; node's
+/// `setRawMode(true)` asks for UV_TTY_MODE_RAW_VT, which that function
+/// folds into UV_TTY_MODE_RAW: "There is only a single raw TTY mode on
+/// UNIX") applies exactly this to the terminal's ORIGINAL termios, and
+/// reserves cfmakeraw for UV_TTY_MODE_IO:
+///
+/// ```c
+/// tmp.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+/// tmp.c_oflag |= (ONLCR);
+/// tmp.c_cflag |= (CS8);
+/// tmp.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+/// tmp.c_cc[VMIN] = 1;
+/// tmp.c_cc[VTIME] = 0;
+/// ```
+///
+/// The difference that shows: cfmakeraw also clears OPOST, and with output
+/// processing off a bare "\n" only moves the cursor down. Every TUI that
+/// writes one "\r" per frame and "\n" between rows -- the common shape --
+/// stair-stepped under oam on macOS and Linux while node drew it straight.
+/// Keeping OPOST as inherited and forcing ONLCR is what makes "\n" reach
+/// the terminal as "\r\n" (a Linux pty receives "row1\nrow2" from a
+/// cfmakeraw'd writer and "row1\r\nrow2" from this). With ISIG off, Ctrl-C
+/// arrives as a 0x03 data byte (no SIGINT) -- the coordination point with
+/// the signals-in item.
+#[cfg(unix)]
+fn raw_mode_bits(cooked: TtyModeBits) -> TtyModeBits {
+    TtyModeBits {
+        iflag: cooked.iflag
+            & !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON),
+        oflag: cooked.oflag | libc::ONLCR,
+        cflag: cooked.cflag | libc::CS8,
+        lflag: cooked.lflag & !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG),
+        vmin: 1,
+        vtime: 0,
+    }
+}
+
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     // No pending-read cancel here, unlike the Windows impl above. A stdin
@@ -1016,10 +1092,10 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     //
     // SAFETY: `termios` is POSIX plain-old-data, so `zeroed()` is a valid
     // initial value that tcgetattr overwrites; its return is checked before
-    // `term` is read. `&mut term` / `&raw_term` point at live stack storage
-    // for the duration of each tc*attr call, and cfmakeraw only mutates the
-    // struct in place. `fd` is the caller-supplied descriptor; a bad fd makes
-    // the syscalls fail cleanly (non-zero return), never UB.
+    // `term` is read. `&mut term` / `&raw_term` / `&o` point at live stack
+    // storage for the duration of each tc*attr call. `fd` is the
+    // caller-supplied descriptor; a bad fd makes the syscalls fail cleanly
+    // (non-zero return), never UB.
     unsafe {
         if enable {
             let mut term: libc::termios = std::mem::zeroed();
@@ -1033,19 +1109,85 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
                 *g = Some(term);
             }
             let mut raw_term = term;
-            // cfmakeraw == Node's raw mode (libuv uses it): clears
-            // ICANON|ECHO|ISIG|IEXTEN, ICRNL|IXON etc, sets CS8, VMIN=1/VTIME=0.
-            // With ISIG off, Ctrl-C arrives as a 0x03 data byte (no SIGINT) --
-            // the coordination point with the signals-in item.
-            libc::cfmakeraw(&mut raw_term);
-            libc::tcsetattr(fd, libc::TCSANOW, &raw_term) == 0
+            raw_mode_bits(TtyModeBits::of(&term)).apply_to(&mut raw_term);
+            // TCSADRAIN, as libuv: output already queued finishes under the
+            // flags it was written for before the switch lands.
+            libc::tcsetattr(fd, libc::TCSADRAIN, &raw_term) == 0
         } else {
             let orig = UNIX_STDIN_ORIG_TERMIOS.lock().ok().and_then(|g| *g);
             match orig {
-                Some(o) => libc::tcsetattr(fd, libc::TCSANOW, &o) == 0,
+                Some(o) => libc::tcsetattr(fd, libc::TCSADRAIN, &o) == 0,
                 None => true,
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod raw_mode_tests {
+    use super::{TtyModeBits, raw_mode_bits};
+
+    /// A cooked terminal as a shell hands it over: the POSIX defaults that
+    /// bear on the recipe, plus a few flags cfmakeraw would have touched
+    /// and libuv leaves alone.
+    fn cooked() -> TtyModeBits {
+        TtyModeBits {
+            iflag: libc::BRKINT | libc::ICRNL | libc::IXON | libc::IMAXBEL,
+            oflag: libc::OPOST | libc::ONLCR,
+            cflag: libc::CS8 | libc::CREAD | libc::HUPCL,
+            lflag: libc::ISIG
+                | libc::ICANON
+                | libc::ECHO
+                | libc::ECHOE
+                | libc::ECHOK
+                | libc::IEXTEN,
+            vmin: 4,
+            vtime: 0,
+        }
+    }
+
+    #[test]
+    fn keeps_output_processing_so_a_bare_newline_lands_at_column_0() {
+        let raw = raw_mode_bits(cooked());
+        assert_ne!(
+            raw.oflag & libc::OPOST,
+            0,
+            "OPOST must survive raw mode (cfmakeraw cleared it)"
+        );
+        assert_ne!(
+            raw.oflag & libc::ONLCR,
+            0,
+            "ONLCR turns a bare LF into CR LF"
+        );
+        // Forced on even when the terminal came without it.
+        let mut without = cooked();
+        without.oflag &= !libc::ONLCR;
+        assert_ne!(raw_mode_bits(without).oflag & libc::ONLCR, 0);
+    }
+
+    #[test]
+    fn is_libuv_uv_tty_mode_raw_not_cfmakeraw() {
+        let raw = raw_mode_bits(cooked());
+        assert_eq!(
+            raw.iflag & (libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON),
+            0
+        );
+        assert_eq!(
+            raw.lflag & (libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG),
+            0
+        );
+        assert_eq!(raw.cflag & libc::CSIZE, libc::CS8);
+        assert_eq!((raw.vmin, raw.vtime), (1, 0), "one byte, no timer");
+        // What cfmakeraw would also have cleared stays as the terminal had it.
+        assert_ne!(raw.iflag & libc::IMAXBEL, 0);
+        assert_eq!(
+            raw.lflag & (libc::ECHOE | libc::ECHOK),
+            libc::ECHOE | libc::ECHOK
+        );
+        assert_eq!(
+            raw.cflag & (libc::CREAD | libc::HUPCL),
+            libc::CREAD | libc::HUPCL
+        );
     }
 }
 
