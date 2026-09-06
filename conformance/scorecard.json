@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "5ff4b43+wip",
+  "commit": "c4bd47b+wip",
   "oamVersion": "oam 0.13.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 96,
-      "total": 96,
+      "pass": 98,
+      "total": 98,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -404,6 +404,14 @@
         },
         {
           "case": "94-readline-sequential-interfaces.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "95-readline-cr-terminators.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "96-readline-question-close-abort.mjs",
           "status": "pass"
         }
       ]
