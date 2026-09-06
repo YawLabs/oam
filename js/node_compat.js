@@ -5002,7 +5002,11 @@
         } finally {
           ictx.indentationLvl -= 2;
         }
-        return reduceToSingleString(res, "", ["Proxy [", "]"], inner, true, undefined);
+        // `false` for arrayish, matching node's formatProxy, which passes
+        // kObjectType. It is unobservable today -- arrayish only gates
+        // `entries > 6` grouping and this always emits exactly 2 -- but
+        // `true` would be wrong the moment the output shape grew.
+        return reduceToSingleString(res, "", ["Proxy [", "]"], inner, false, undefined);
       }
       function walk(v, level) {
         if (v === null) return stylize("null", "null");

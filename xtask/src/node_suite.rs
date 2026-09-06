@@ -1042,10 +1042,33 @@ fn read_flags_header(path: &Path) -> Option<String> {
 fn first_error_line(out: &Captured) -> String {
     let clip = |l: &str| l.chars().take(140).collect::<String>();
     let diagnostic = |s: &str| {
-        s.lines()
+        let mut lines = s
+            .lines()
             .map(str::trim)
-            .find(|l| !l.is_empty() && !is_process_warning(l))
-            .map(clip)
+            .filter(|l| !l.is_empty() && !is_process_warning(l))
+            .peekable();
+        // Step over oam's code-frame preamble so the receipt records the
+        // rendered error rather than the throw SITE. The frame is a bare
+        // `<file>:<line>` header, the offending source line, then a caret
+        // row; the message follows. Recording the header instead made the
+        // committed receipt churn on any edit that MOVED the throw, and it
+        // told a triager the least useful half of the failure -- `oam:
+        // node_compat.js:7640` where `AssertionError [ERR_ASSERTION]:
+        // Expected values to be strictly deep-equal` was two lines below.
+        // A `<file>:<line>` header carrying no message of its own is the
+        // only shape skipped, so an ordinary one-line error is untouched.
+        if lines.peek().is_some_and(|l| is_code_frame_header(l)) {
+            lines.next();
+            // The source line, then the caret row. Both are best-effort:
+            // a frame missing either one still lands on the message.
+            if lines.peek().is_some_and(|l| !is_caret_row(l)) {
+                lines.next();
+            }
+            if lines.peek().is_some_and(|l| is_caret_row(l)) {
+                lines.next();
+            }
+        }
+        lines.next().map(clip)
     };
     let any = |s: &str| s.lines().map(str::trim).find(|l| !l.is_empty()).map(clip);
     diagnostic(&out.stderr)
@@ -1069,6 +1092,28 @@ fn is_process_warning(line: &str) -> bool {
         return true;
     }
     line.starts_with("(Use `") && line.contains("--trace-warnings")
+}
+
+/// The first row of oam's code frame: a bare `<file>:<line>` location with no
+/// message after it (`oam:node_compat.js:7640`, or an absolute path when the
+/// throw is in the test file itself). Requiring the tail after the LAST colon
+/// to be all digits, and nothing to follow it, is what keeps a real one-line
+/// error such as `Error: connect ECONNREFUSED 127.0.0.1:8080` from matching:
+/// that line has text before the location, so its last segment is not the
+/// whole remainder.
+fn is_code_frame_header(line: &str) -> bool {
+    let Some((path, lineno)) = line.rsplit_once(':') else {
+        return false;
+    };
+    !path.is_empty()
+        && !lineno.is_empty()
+        && lineno.chars().all(|c| c.is_ascii_digit())
+        && !path.contains(char::is_whitespace)
+}
+
+/// The caret row under a code frame's source line: carets and spaces only.
+fn is_caret_row(line: &str) -> bool {
+    !line.is_empty() && line.chars().all(|c| c == '^' || c == ' ')
 }
 
 /// Everything one run publishes into the two committed receipts.
@@ -1918,6 +1963,62 @@ mod tests {
             first_error_line(&c),
             "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array"
         );
+    }
+
+    #[test]
+    fn first_error_line_steps_over_oams_code_frame() {
+        // Verbatim shape of `oam test-process-versions.js` on this tree. The
+        // header alone is what the receipt used to record, which both churned
+        // the committed file whenever an unrelated edit moved the throw and
+        // told a triager nothing about the failure.
+        let c = cap(concat!(
+            "oam:node_compat.js:7640\n",
+            "      throw new AssertionError({ actual, expected, message, operator, stackStartFn });\n",
+            "      ^\n",
+            "\n",
+            "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n",
+        ));
+        assert_eq!(
+            first_error_line(&c),
+            "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:"
+        );
+    }
+
+    #[test]
+    fn first_error_line_steps_over_a_code_frame_behind_warnings() {
+        // The two fixes compose: warnings are dropped first, then the frame.
+        let c = cap(concat!(
+            "(node:8212) internal/test/binding: These APIs are for internal testing only.\n",
+            "C:\\repo\\conformance\\vendor\\node\\test\\parallel\\test-x.js:42\n",
+            "  assert.strictEqual(a, b);\n",
+            "  ^\n",
+            "\n",
+            "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array\n",
+        ));
+        assert_eq!(
+            first_error_line(&c),
+            "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array"
+        );
+    }
+
+    #[test]
+    fn first_error_line_keeps_a_one_line_error_that_ends_in_a_port() {
+        // The frame header is `<path>:<line>` and NOTHING else. An ordinary
+        // error whose message merely ends in `:<digits>` must survive, or the
+        // skip would eat the only line the receipt has.
+        let c = cap("Error: connect ECONNREFUSED 127.0.0.1:8080\n");
+        assert_eq!(
+            first_error_line(&c),
+            "Error: connect ECONNREFUSED 127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn first_error_line_survives_a_frame_with_nothing_after_it() {
+        // A truncated frame (killed process, clipped output) must not fall
+        // through to an empty detail -- report what there is.
+        let c = cap("oam:node_compat.js:7640\n      throw new Error('x');\n      ^\n");
+        assert!(!first_error_line(&c).is_empty());
     }
 
     #[test]
