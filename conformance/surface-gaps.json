@@ -448,7 +448,6 @@
           "setDefaultCACertificates"
         ],
         "url": [
-          "domainToUnicode",
           "fileURLToPathBuffer"
         ],
         "util": [
@@ -951,7 +950,6 @@
           "setDefaultCACertificates"
         ],
         "url": [
-          "domainToUnicode",
           "fileURLToPathBuffer"
         ],
         "util": [
@@ -1439,7 +1437,6 @@
           "setDefaultCACertificates"
         ],
         "url": [
-          "domainToUnicode",
           "fileURLToPathBuffer"
         ],
         "util": [

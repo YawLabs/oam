@@ -190,6 +190,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("urlCanParse", op_url_can_parse),
         ("urlParse", op_url_parse),
         ("urlUpdate", op_url_update),
+        // UTS #46 IDNA, straight off the same ada_idna the URL parser uses --
+        // so `url.domainToASCII` / `domainToUnicode` and the legacy
+        // `url.parse()` hostname step agree with `new URL()` by construction.
+        // Both return "" on invalid input, which is what Node's
+        // encoding_binding.toASCII does and what its callers branch on.
+        ("idnaToASCII", op_idna_to_ascii),
+        ("idnaToUnicode", op_idna_to_unicode),
+        // url.domainToASCII / domainToUnicode: the host-parser route, not
+        // bare IDNA -- see domain_via_host_parser.
+        ("urlDomainToASCII", op_url_domain_to_ascii),
+        ("urlDomainToUnicode", op_url_domain_to_unicode),
         // AsyncLocalStorage substrate: V8's continuation-preserved embedder
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
@@ -3122,6 +3133,73 @@ fn update_url(href: &str, part: &str, value: &str) -> Result<ada_url::Url, Strin
         other => return Err(format!("urlUpdate: unknown part '{other}'")),
     }
     Ok(parsed)
+}
+
+/// UTS #46 ToASCII. `""` on invalid input -- ada's contract, and Node's:
+/// `internalBinding('encoding_binding').toASCII` is the same `ada::idna`
+/// entry point, and `lib/url.js` treats the empty result as "hostname
+/// spoofing attempt" and throws ERR_INVALID_URL.
+fn op_idna_to_ascii(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &ada_url::Idna::ascii(&input)) {
+        rv.set(s.into());
+    }
+}
+
+/// UTS #46 ToUnicode. `""` on invalid input, matching ada and Node's
+/// `url.domainToUnicode`.
+fn op_idna_to_unicode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &ada_url::Idna::unicode(&input)) {
+        rv.set(s.into());
+    }
+}
+
+/// Run a domain through the WHATWG *host parser* the way Node's
+/// `url.domainToASCII` / `domainToUnicode` do: assign it as the hostname of a
+/// throwaway special-scheme URL and read back what the parser made of it,
+/// with `""` for a domain the setter rejects. This is deliberately NOT bare
+/// UTS #46 -- host parsing also percent-decodes, stops at the first `/?#`,
+/// and rejects forbidden host code points, so `'a/b'` is `'a'` and `'a:80'`
+/// is `""` where bare ToASCII would hand both straight back.
+fn domain_via_host_parser(input: &str) -> Option<String> {
+    let mut url = ada_url::Url::parse("http://x", None).ok()?;
+    url.set_hostname(Some(input)).ok()?;
+    Some(url.hostname().to_owned())
+}
+
+fn op_url_domain_to_ascii(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    let out = domain_via_host_parser(&input).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
+}
+
+fn op_url_domain_to_unicode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    let out = domain_via_host_parser(&input)
+        .map(|host| ada_url::Idna::unicode(&host))
+        .unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
 }
 
 /// Read the current continuation frame (an immutable Map of

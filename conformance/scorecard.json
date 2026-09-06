@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "55fa51b+wip",
-  "oamVersion": "oam 0.13.1",
+  "commit": "beffd94+wip",
+  "oamVersion": "oam 0.13.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -514,7 +514,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 351,
+        "knownMissing": 350,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
