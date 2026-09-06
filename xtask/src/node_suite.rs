@@ -15,7 +15,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -39,11 +39,41 @@ const MODULES: &[&str] = &[
     "path",
 ];
 
+#[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Pass,
-    Skip,
+    /// The test self-skipped: it printed the TAP `1..0 # Skipped` marker AND
+    /// exited 0. Carries the reason `common.skip()` already puts on the wire
+    /// (common/index.js:548) so the committed receipt can NAME every test that
+    /// left the denominator instead of publishing a bare per-module integer.
+    Skip(String),
     Fail(String),
-    Unrunnable(String),
+    Unrunnable(String, UnrunnableKind),
+}
+
+/// Why a test never produced a verdict. Published beside the reason so a
+/// reader can tell an oam-side gap (a module oam does not implement) from a
+/// harness/vendoring one (an explicit manifest entry, an unsupported flag)
+/// without re-deriving it from prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnrunnableKind {
+    /// An explicit `"skip": true` entry in manifest.json.
+    Manifest,
+    /// A `// Flags:` header naming at least one flag oam does not implement.
+    Flags,
+    /// The test imports a `node:`/`internal/` module -- or an internalBinding
+    /// namespace -- that oam does not provide.
+    MissingModule,
+}
+
+impl UnrunnableKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            UnrunnableKind::Manifest => "manifest",
+            UnrunnableKind::Flags => "flags",
+            UnrunnableKind::MissingModule => "missing-module",
+        }
+    }
 }
 
 pub(crate) fn run(release: bool) -> Result<()> {
@@ -61,7 +91,7 @@ pub(crate) fn run(release: bool) -> Result<()> {
         );
     }
 
-    let manifest = load_manifest(&vendor.join("manifest.json"));
+    let manifest = load_manifest(&vendor.join("manifest.json"))?;
 
     let mut tests: Vec<PathBuf> = std::fs::read_dir(&parallel_dir)?
         .flatten()
@@ -75,12 +105,36 @@ pub(crate) fn run(release: bool) -> Result<()> {
         .collect();
     tests.sort();
 
+    // Pin the denominator. The corpus is enumerated with read_dir, so a file
+    // silently dropped from (or added to) the vendored tree moves the
+    // population every published rate divides by, with nothing to notice --
+    // the ratchets floor the PASS count, not the corpus it is drawn from.
+    // `expectedTotal` makes that population a committed, reviewable number.
+    // Checked BEFORE the run so a drifted corpus fails in a second rather than
+    // after 476 subprocesses. Offline by construction: no git, no network.
+    if let Some(expected) = manifest.expected_total
+        && tests.len() != expected
+    {
+        bail!("{}", corpus_drift_message(&tests, expected, &manifest));
+    }
+
     // per-module tallies: [pass, fail, skip, unrunnable]
     let mut by_module: BTreeMap<String, [usize; 4]> = BTreeMap::new();
     let mut failures: Vec<(String, String)> = Vec::new();
     // (name, first divergence, why it is intentional) -- see the Fail arm below.
     let mut deliberate_failures: Vec<(String, String, String)> = Vec::new();
-    let (mut pass, mut fail, mut skip, mut unrunnable) = (0usize, 0usize, 0usize, 0usize);
+    // The two exclusion lists, NAMED. Per-module integers told a reader that 22
+    // tests left the denominator but not WHICH, so a compensating change that
+    // skipped one test and un-skipped another was invisible to every number in
+    // the receipt. These carry the reason (and, for unrunnables, the kind) into
+    // both committed receipts.
+    let mut skips: Vec<(String, String)> = Vec::new();
+    let mut unrunnables: Vec<(String, String, UnrunnableKind)> = Vec::new();
+    // manifest key -> did the run actually see the TAP skip marker the
+    // partialSkip entry claims is there? An entry that no longer matches is
+    // reported STALE below, the same as a deliberate entry that stopped failing.
+    let mut partial_skip_marker_seen: BTreeSet<String> = BTreeSet::new();
+    let (mut pass, mut fail) = (0usize, 0usize);
 
     for test in &tests {
         let name = test
@@ -88,9 +142,11 @@ pub(crate) fn run(release: bool) -> Result<()> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let module = module_of(&name);
+        let key = format!("parallel/{name}");
+        let partial_skip = manifest.partial_skips.contains_key(&key);
 
-        let outcome = if let Some(reason) = manifest.skips.get(&format!("parallel/{name}")) {
-            Outcome::Unrunnable(reason.clone())
+        let outcome = if let Some(reason) = manifest.skips.get(&key) {
+            Outcome::Unrunnable(reason.clone(), UnrunnableKind::Manifest)
         } else {
             // A `// Flags:` header is only disqualifying when oam cannot
             // honor the flags. Excluding EVERY flagged test shrank the
@@ -98,9 +154,23 @@ pub(crate) fn run(release: bool) -> Result<()> {
             // that flatters the runtime for free. Pass through what we
             // support; exclude only the genuinely unsupported.
             match classify_flags(test) {
-                FlagSupport::None => run_test(&oam, test, &vendor, &cache, &[]),
-                FlagSupport::Supported(flags) => run_test(&oam, test, &vendor, &cache, &flags),
-                FlagSupport::Unsupported(raw) => Outcome::Unrunnable(format!("// Flags:{raw}")),
+                FlagSupport::Unsupported(raw) => {
+                    Outcome::Unrunnable(format!("// Flags:{raw}"), UnrunnableKind::Flags)
+                }
+                // `None` and `Supported` differ only in the flag vector;
+                // classify_flags never returns an empty `Supported`, so the
+                // empty slice still selects run_test's `oam run <file>` form.
+                supported => {
+                    let flags = match supported {
+                        FlagSupport::Supported(flags) => flags,
+                        _ => Vec::new(),
+                    };
+                    let result = run_test(&oam, test, &vendor, &cache, &flags, partial_skip);
+                    if partial_skip && result.saw_skip_marker {
+                        partial_skip_marker_seen.insert(key.clone());
+                    }
+                    result.outcome
+                }
             }
         };
 
@@ -111,10 +181,10 @@ pub(crate) fn run(release: bool) -> Result<()> {
                 slot[0] += 1;
                 println!("  PASS   {name}");
             }
-            Outcome::Skip => {
-                skip += 1;
+            Outcome::Skip(reason) => {
                 slot[2] += 1;
-                println!("  SKIP   {name}");
+                println!("  SKIP   {name}  ({reason})");
+                skips.push((name.clone(), reason));
             }
             Outcome::Fail(detail) => {
                 fail += 1;
@@ -141,10 +211,10 @@ pub(crate) fn run(release: bool) -> Result<()> {
                     None => failures.push((name.clone(), detail)),
                 }
             }
-            Outcome::Unrunnable(reason) => {
-                unrunnable += 1;
+            Outcome::Unrunnable(reason, kind) => {
                 slot[3] += 1;
-                println!("  UNRUN  {name}  ({reason})");
+                println!("  UNRUN  {name}  [{}] ({reason})", kind.as_str());
+                unrunnables.push((name.clone(), reason, kind));
             }
         }
     }
@@ -164,19 +234,33 @@ pub(crate) fn run(release: bool) -> Result<()> {
         }
     };
 
-    let rewrote = write_scorecard(
-        &repo,
-        &oam,
-        &by_module,
-        &failures,
-        &deliberate_failures,
+    // The partial-skip lever, NAMED in the receipt for the same reason the two
+    // exclusion lists are: it moves a test INTO the scored denominator over its
+    // own TAP marker, so a reader must be able to see which file and why
+    // without re-deriving it from manifest.json.
+    let partial_skip_entries: Vec<(String, String)> = manifest
+        .partial_skips
+        .iter()
+        .map(|(key, reason)| {
+            (
+                key.rsplit('/').next().unwrap_or(key).to_string(),
+                reason.clone(),
+            )
+        })
+        .collect();
+
+    let card = Scorecard {
+        by_module: &by_module,
+        failures: &failures,
+        deliberate: &deliberate_failures,
+        skips: &skips,
+        partial_skips: &partial_skip_entries,
+        unrunnable: &unrunnables,
         total,
-        scored,
         pass,
         fail,
-        skip,
-        unrunnable,
-    )?;
+    };
+    let rewrote = write_scorecard(&repo, &oam, &card)?;
 
     println!();
     println!("node-suite (vendored Node v22.22.2 subset):");
@@ -185,7 +269,11 @@ pub(crate) fn run(release: bool) -> Result<()> {
         pct(pass, scored),
         pct(pass, total)
     );
-    println!("  {pass} pass  {fail} fail  {skip} skip  {unrunnable} unrunnable-by-harness");
+    println!(
+        "  {pass} pass  {fail} fail  {} skip  {} unrunnable-by-harness",
+        skips.len(),
+        unrunnables.len()
+    );
     println!(
         "{}",
         if rewrote {
@@ -240,82 +328,158 @@ pub(crate) fn run(release: bool) -> Result<()> {
             println!("  STALE  {name} is marked deliberate but did not fail -- drop the entry");
         }
     }
-    if let Some(msg) = ratchet_violation(
-        manifest_skips,
-        manifest.known_issues,
-        deliberate_failures.len(),
+    if !manifest.partial_skips.is_empty() {
+        println!(
+            "partial skips: {}/{} (ratchet ceiling) -- marker ignored, scored by exit code, IN the denominator",
+            manifest.partial_skips.len(),
+            manifest
+                .max_partial_skips
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    // Same staleness rule as `deliberate` above: an entry that no longer
+    // describes the test it names is a claim about nothing. A partialSkip
+    // overrides a marker, so an entry whose test prints no marker (it was
+    // fixed, it stopped feature-detecting, it never ran) is overriding nothing
+    // and should be dropped rather than left to rot.
+    for name in manifest.partial_skips.keys() {
+        if !partial_skip_marker_seen.contains(name) {
+            println!(
+                "  STALE  {name} is marked partialSkip but printed no TAP skip marker -- drop the entry"
+            );
+        }
+    }
+    if let Some(msg) = ratchet_violation(&Ratchet {
+        skips: manifest_skips,
+        known_issues: manifest.known_issues,
+        deliberate: deliberate_failures.len(),
+        partial_skips: manifest.partial_skips.len(),
         pass,
-        manifest.max_skips,
-        manifest.max_known_issues,
-        manifest.max_deliberate,
+        max_skips: manifest.max_skips,
+        max_known_issues: manifest.max_known_issues,
+        max_deliberate: manifest.max_deliberate,
+        max_partial_skips: manifest.max_partial_skips,
         min_pass,
-    ) {
+    }) {
         bail!("{msg}");
     }
     Ok(())
 }
 
-/// Pure ratchet check (extracted for unit testing): returns Some(message) when
-/// the discretionary skip count, the known-issues count or the
-/// deliberate-divergence count exceeds its ceiling, OR the pass count falls
-/// below its floor. None = all within limits / unset.
-/// `== ceiling` and `== floor` are allowed; only strictly past them violates.
-// Four measured counts paired with their four ceilings; splitting them into a
-// struct would only move the same eight values behind a name the tests then
-// have to construct. Same call as write_scorecard below.
-#[allow(clippy::too_many_arguments)]
-fn ratchet_violation(
+/// What one run measured, paired with the committed limits it must respect.
+///
+/// Was eight positional arguments behind an `#[allow(too_many_arguments)]`, on
+/// the reasoning that a struct would only rename the same values. Adding the
+/// partial-skip lever takes it to ten -- five bare `usize` counts followed by
+/// five bare `Option<usize>` limits, every one of them transposable at a call
+/// site with nothing to catch it, in the function whose whole job is to be the
+/// integrity check. Named fields cost the tests one `..Ratchet` literal each
+/// and make a transposition a compile error.
+#[derive(Default)]
+struct Ratchet {
+    /// discretionary manifest skips (auto-detected unrunnables excluded).
     skips: usize,
     known_issues: usize,
     deliberate: usize,
+    partial_skips: usize,
     pass: usize,
+    /// ceilings and floors; None = not enforced.
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
     max_deliberate: Option<usize>,
+    max_partial_skips: Option<usize>,
     min_pass: Option<usize>,
-) -> Option<String> {
-    if let Some(max) = max_skips
-        && skips > max
+}
+
+/// Pure ratchet check (extracted for unit testing): returns Some(message) when
+/// the discretionary skip count, the known-issues count, the
+/// deliberate-divergence count or the partial-skip count exceeds its ceiling,
+/// OR the pass count falls below its floor. None = all within limits / unset.
+/// `== ceiling` and `== floor` are allowed; only strictly past them violates.
+fn ratchet_violation(r: &Ratchet) -> Option<String> {
+    if let Some(max) = r.max_skips
+        && r.skips > max
     {
         return Some(format!(
-            "skip-ratchet violation: {skips} manifest skips > ceiling {max}. \
-             Fix the tests, or (with review) raise ratchet.maxSkips in manifest.json -- it should only ever go DOWN."
+            "skip-ratchet violation: {} manifest skips > ceiling {max}. \
+             Fix the tests, or (with review) raise ratchet.maxSkips in manifest.json -- it should only ever go DOWN.",
+            r.skips
         ));
     }
-    if let Some(max) = max_known_issues
-        && known_issues > max
+    if let Some(max) = r.max_known_issues
+        && r.known_issues > max
     {
         return Some(format!(
-            "known-issues ceiling violation: {known_issues} known_issues/flaky skips > ceiling {max}."
+            "known-issues ceiling violation: {} known_issues/flaky skips > ceiling {max}.",
+            r.known_issues
         ));
     }
-    if let Some(max) = max_deliberate
-        && deliberate > max
+    if let Some(max) = r.max_deliberate
+        && r.deliberate > max
     {
         return Some(format!(
-            "deliberate-divergence ceiling violation: {deliberate} > ceiling {max}. A test that              fails on purpose needs an explicit ratchet bump, so a real regression cannot be              relabelled as intentional."
+            "deliberate-divergence ceiling violation: {} > ceiling {max}. A test that fails on \
+             purpose needs an explicit ratchet bump, so a real regression cannot be relabelled \
+             as intentional.",
+            r.deliberate
         ));
     }
-    if let Some(min) = min_pass
-        && pass < min
+    if let Some(max) = r.max_partial_skips
+        && r.partial_skips > max
     {
         return Some(format!(
-            "pass-floor violation: {pass} passing < floor {min}. A node-compat regression \
-             dropped the pass count. Fix it, or (with review) lower ratchet.minPass -- it should only ever go UP."
+            "partial-skip ceiling violation: {} > ceiling {max}. A partialSkip entry overrides a \
+             test's own TAP skip marker and scores it by exit code, which puts it back INTO the \
+             denominator -- so each one is a reviewed claim about a specific file, not a rule. \
+             Raising ratchet.maxPartialSkips needs that review; it should only ever go DOWN.",
+            r.partial_skips
+        ));
+    }
+    if let Some(min) = r.min_pass
+        && r.pass < min
+    {
+        return Some(format!(
+            "pass-floor violation: {} passing < floor {min}. A node-compat regression \
+             dropped the pass count. Fix it, or (with review) lower ratchet.minPass -- it should only ever go UP.",
+            r.pass
         ));
     }
     None
 }
 
+/// One test's verdict, plus the one fact about HOW it got there that the
+/// caller cannot re-derive from the outcome: whether the winning attempt
+/// printed a TAP skip marker. Read only for `partialSkip` manifest entries --
+/// an entry naming a test that no longer prints one describes nothing, and is
+/// reported STALE the same way a no-longer-failing `deliberate` entry is.
+struct TestResult {
+    outcome: Outcome,
+    saw_skip_marker: bool,
+}
+
 /// Run one test, with a 3x flaky rerun: a Pass on any attempt wins; otherwise
 /// the last Fail/Skip stands.
+///
+/// `partial_skip` comes from the manifest and means "this test's TAP skip
+/// marker does not describe how its run ended" -- see `classify_attempt`.
 ///
 /// `cwd` is the VENDOR root, not the oam repo: Node runs its suite from the
 /// Node repo root, and the vendored tree is our stand-in for it (same
 /// `test/`, `lib/`, package.json layout). A handful of tests read
 /// `process.cwd()` directly.
-fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path, flags: &[String]) -> Outcome {
-    let mut last = Outcome::Fail("no attempt".to_string());
+fn run_test(
+    oam: &Path,
+    test: &Path,
+    cwd: &Path,
+    cache: &Path,
+    flags: &[String],
+    partial_skip: bool,
+) -> TestResult {
+    let mut last = TestResult {
+        outcome: Outcome::Fail("no attempt".to_string()),
+        saw_skip_marker: false,
+    };
     for _ in 0..3 {
         // Node-level flags go BEFORE the file, in the bare `oam <flags>
         // <file>` form -- that is the shape oam's node-style parser reads,
@@ -338,31 +502,117 @@ fn run_test(oam: &Path, test: &Path, cwd: &Path, cache: &Path, flags: &[String])
             Duration::from_secs(150),
         ) {
             Ok(c) => c,
-            Err(e) => return Outcome::Fail(format!("harness error: {e}")),
+            Err(e) => {
+                return TestResult {
+                    outcome: Outcome::Fail(format!("harness error: {e}")),
+                    saw_skip_marker: false,
+                };
+            }
         };
 
-        // common.skip() prints "1..0 # Skipped" and exits 0; the TAP marker is
-        // authoritative over the exit code (else a skip inflates pass).
-        let skipped = out
-            .stdout
-            .lines()
-            .any(|l| l.contains("1..0 # Skipped") || l.contains("1..0 # SKIP"));
-        if skipped {
-            return Outcome::Skip;
+        let saw_skip_marker = skip_marker_reason(&out.stdout).is_some();
+        // Only a Fail is worth re-running; everything else is settled.
+        match classify_attempt(&out, partial_skip) {
+            Outcome::Fail(detail) => {
+                last = TestResult {
+                    outcome: Outcome::Fail(detail),
+                    saw_skip_marker,
+                };
+            }
+            settled => {
+                return TestResult {
+                    outcome: settled,
+                    saw_skip_marker,
+                };
+            }
         }
-        if out.timed_out {
-            last = Outcome::Fail("[TIMEOUT]".to_string());
-            continue;
-        }
-        if out.code == 0 {
-            return Outcome::Pass;
-        }
-        if let Some(builtin) = missing_builtin(&out) {
-            return Outcome::Unrunnable(format!("needs unimplemented {builtin}"));
-        }
-        last = Outcome::Fail(format!("[exit={}] {}", out.code, first_error_line(&out)));
     }
     last
+}
+
+/// Score ONE finished attempt. Pure over the captured output, so the ordering
+/// rule below is unit-testable without spawning anything.
+///
+/// common.skip() prints `1..0 # Skipped` and THEN exits. The marker alone is
+/// NOT authoritative -- common.printSkipMessage() prints the same line without
+/// exiting -- so how the process ENDED decides first, and the marker only
+/// picks Skip-vs-Pass on a process that actually exited 0:
+///
+/// * marker + exit 0    -> Skip (keep the reason it put on the wire)
+/// * marker + exit != 0 -> Fail (the run did NOT end on the skip)
+/// * marker + timeout   -> Fail (ditto, and it hung)
+///
+/// The last two used to be scored Skip, i.e. silently dropped out of the
+/// denominator: a test that printed a skip marker and then CRASHED, or hung
+/// until the 150s deadline, left no trace in any published number.
+///
+/// `partial_skip` is the one case where the marker is NOT consulted at all: a
+/// PARTIAL skip that then finishes. test-buffer-alloc.js calls
+/// printSkipMessage() at :1076, runs its remaining ~120 lines of Buffer
+/// assertions, and exits 0 -- and its stdout is then byte-identical to
+/// test-stream-pipeline-http2.js, which common.skip()s at the top and asserts
+/// nothing: one `1..0 # Skipped: missing crypto` line, exit 0. (Both because
+/// `common.hasCrypto` is `Boolean(process.versions.openssl)`,
+/// common/index.js:54, and oam links ring and rustls rather than OpenSSL.) No
+/// output-only rule separates them, and scoring exit-0-with-marker as a Pass in
+/// general would count the second test -- which asserted NOTHING -- as a pass,
+/// inflating the very number minPass floors.
+///
+/// So the default is unchanged (marker + exit 0 = Skip), and the separation is
+/// made by a human instead: a `"partialSkip": true` entry in manifest.json
+/// names ONE file as a test that really does assert past its marker, and for
+/// that file the exit code decides as if no marker had been printed. It is a
+/// reviewable diff, ratcheted by maxPartialSkips, and it names the test in both
+/// receipts -- not a rule that could mint a false PASS on the next test that
+/// happens to skip transitively in some helper's module body.
+///
+/// Carve-out to re-check if the corpus ever widens: common.skip() exits 1 for
+/// tests under test/known_issues/, where marker + non-zero exit IS a
+/// legitimate skip. Only test/parallel is vendored (see the parallel_dir bail
+/// in run()), so today that combination is unambiguously a bug -- vendoring a
+/// known_issues tranche would need a path guard here.
+fn classify_attempt(out: &Captured, partial_skip: bool) -> Outcome {
+    if out.timed_out {
+        return Outcome::Fail("[TIMEOUT]".to_string());
+    }
+    if out.code == 0 {
+        return match skip_marker_reason(&out.stdout) {
+            Some(reason) if !partial_skip => Outcome::Skip(reason),
+            _ => Outcome::Pass,
+        };
+    }
+    if let Some(builtin) = missing_builtin(out) {
+        return Outcome::Unrunnable(
+            format!("needs unimplemented {builtin}"),
+            UnrunnableKind::MissingModule,
+        );
+    }
+    Outcome::Fail(format!("[exit={}] {}", out.code, first_error_line(out)))
+}
+
+/// The reason from a TAP skip marker, if the test printed one.
+///
+/// `common.printSkipMessage` emits `1..0 # Skipped: <msg>` (common/index.js:548)
+/// and the harness used to throw the `<msg>` away, leaving the receipt able to
+/// say only how MANY tests self-skipped. Some tests hand-roll the bare
+/// `1..0 # SKIP` spelling with no reason at all -- hence the fallback text
+/// rather than an Option the callers would have to re-describe.
+fn skip_marker_reason(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        // Longest first: "1..0 # SKIP" is a prefix of "1..0 # Skipped".
+        for marker in ["1..0 # Skipped", "1..0 # SKIP"] {
+            if let Some(idx) = line.find(marker) {
+                let rest = line[idx + marker.len()..].trim_start();
+                let reason = rest.strip_prefix(':').unwrap_or(rest).trim();
+                return Some(if reason.is_empty() {
+                    "no reason given".to_string()
+                } else {
+                    reason.to_string()
+                });
+            }
+        }
+    }
+    None
 }
 
 /// A test that fails purely because oam lacks a node: builtin it imports is
@@ -398,7 +648,74 @@ fn missing_builtin(out: &Captured) -> Option<String> {
             return Some(rest[..end].to_string());
         }
     }
-    None
+    // Same class again, one layer down: `internalBinding('ns').member` where
+    // oam has nothing real behind `ns` (or behind that member of it). The
+    // throwing proxy in js/node_compat.js reports it as
+    //   oam: no native binding for 'ns.member'
+    // -- a deliberately distinctive prefix, and the ONLY string matched here.
+    // A bare "No such module" would also swallow genuine failures, and an
+    // unbacked binding that returned `{}` instead of throwing would be worse
+    // still: the test would run on against a surface oam does not have.
+    no_binding_name(&hay)
+}
+
+/// The prefix the throwing internalBinding proxy (js/node_compat.js) puts on
+/// the wire. Deliberately distinctive so nothing else can match it.
+const NO_BINDING: &str = "oam: no native binding for '";
+
+/// The binding name out of a THROWN `oam: no native binding for '<ns>.<member>'`
+/// message -- read from the rendered error line, never from an echoed source
+/// line.
+///
+/// A bare substring search over the captured output does not work here, because
+/// oam's fatal report prints a CODE FRAME first: the source line of the throw
+/// site, verbatim, template literal and all.
+///
+///     oam:node_compat.js:22667
+///             throw new Error(`oam: no native binding for '${id}'`);
+///             ^
+///
+///     Error: oam: no native binding for 'js_stream'
+///
+/// So the FIRST occurrence in the stream is the uninterpolated template, and
+/// the committed receipt published `needs unimplemented ${id}` /
+/// `needs unimplemented ${ns}.${String(prop)}` for four tests. It was only ever
+/// four because the bug is occurrence-order dependent: a throw site whose frame
+/// oam does not echo (test-buffer-fill, where the binding error is nested inside
+/// an AssertionError's inspected `actual:`) extracted the real name.
+///
+/// The anchor is therefore the error RENDERING immediately before the message --
+/// `Error: `, `TypeError: `, `AssertionError: `, and the `actual: Error: ` form
+/// util.inspect uses for a nested throw -- which the echoed `throw new Error(`
+/// source line can never match. A candidate still carrying `${` is rejected
+/// outright as a second, independent guard.
+///
+/// Classification does NOT depend on the parse succeeding: if the prefix is
+/// present but no line renders it as a message we can name, the test is still
+/// unrunnable, just unnameable. Anything else would let a truncated pipe turn an
+/// oam gap into a correctness failure.
+fn no_binding_name(hay: &str) -> Option<String> {
+    let mut seen_anywhere = false;
+    for line in hay.lines() {
+        let line = line.trim();
+        let Some(idx) = line.find(NO_BINDING) else {
+            continue;
+        };
+        seen_anywhere = true;
+        if !line[..idx].ends_with("Error: ") {
+            continue;
+        }
+        let rest = &line[idx + NO_BINDING.len()..];
+        let Some(end) = rest.find('\'') else {
+            continue;
+        };
+        let name = &rest[..end];
+        if name.is_empty() || name.contains("${") {
+            continue;
+        }
+        return Some(name.to_string());
+    }
+    seen_anywhere.then(|| "an internalBinding namespace".to_string())
 }
 
 fn module_of(name: &str) -> String {
@@ -415,10 +732,15 @@ fn module_of(name: &str) -> String {
 
 /// manifest.json:
 /// {
-///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "minPass": K,
+///   "ratchet": { "maxSkips": N, "maxKnownIssues": M, "maxDeliberate": D,
+///                "maxPartialSkips": P, "minPass": K,
 ///                "minPassByHost": { "<os>-<arch>": K2, ... } },
 ///   "tests": { "parallel/test-x.js": { "skip": true, "reason": "...", "category": "known_issues" } }
 /// }
+///
+/// A `tests` entry carries exactly ONE flavour -- `"skip"`, `"deliberate"` or
+/// `"partialSkip"` -- each with its own ceiling; two on one entry is a hard
+/// error, not a precedence rule (see load_manifest).
 ///
 /// minPassByHost overrides minPass for a specific `{OS}-{ARCH}` host label
 /// (e.g. "linux-x86_64") -- pass counts are platform-specific, so each
@@ -436,10 +758,23 @@ struct Manifest {
     /// denominator, so this cannot be used to flatter the pass rate the way a
     /// skip could. Ratcheted by `maxDeliberate` all the same.
     deliberate: BTreeMap<String, String>,
+    /// path -> why the test's TAP skip marker does NOT describe how its run
+    /// ended. `common.printSkipMessage()` prints `1..0 # Skipped: <msg>`
+    /// WITHOUT exiting, so a test can skip one section part-way through and
+    /// then assert its way to the end of the file (test-buffer-alloc.js:1076,
+    /// then ~120 more lines of Buffer assertions, then exit 0). Its output is
+    /// byte-identical to a test that `common.skip()`s at the top and asserts
+    /// NOTHING, so no output-only rule can separate them -- see
+    /// `classify_attempt`. This is the explicit, reviewable opt-in instead: for
+    /// a named test the marker is ignored and the exit code decides, which puts
+    /// it back in pass/fail. Ratcheted by `maxPartialSkips` so it cannot grow
+    /// into a general "score it as a pass" escape hatch.
+    partial_skips: BTreeMap<String, String>,
     /// ratchet ceilings; None = not enforced.
     max_skips: Option<usize>,
     max_known_issues: Option<usize>,
     max_deliberate: Option<usize>,
+    max_partial_skips: Option<usize>,
     /// pass-count FLOOR: the suite fails if fewer tests pass than this. The
     /// counterpart to the skip ceiling -- it should only ever be RAISED, so a
     /// node-compat regression that drops the pass count reddens CI. None = off.
@@ -447,25 +782,40 @@ struct Manifest {
     /// per-host overrides of `min_pass`, keyed by the `{OS}-{ARCH}` host
     /// label (matches the scorecard's `host` field).
     min_pass_by_host: BTreeMap<String, usize>,
+    /// how many test files the vendored corpus is expected to contain. The
+    /// corpus is enumerated with read_dir, so without this the population every
+    /// rate divides by is whatever happens to be on disk. None = not pinned.
+    expected_total: Option<usize>,
 }
 
-fn load_manifest(path: &Path) -> Manifest {
+fn load_manifest(path: &Path) -> Result<Manifest> {
     let mut m = Manifest {
         skips: BTreeMap::new(),
         known_issues: 0,
         deliberate: BTreeMap::new(),
+        partial_skips: BTreeMap::new(),
         max_skips: None,
         max_known_issues: None,
         max_deliberate: None,
+        max_partial_skips: None,
         min_pass: None,
         min_pass_by_host: BTreeMap::new(),
+        expected_total: None,
     };
     let Ok(text) = std::fs::read_to_string(path) else {
-        return m;
+        return Ok(m);
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return m;
+        return Ok(m);
     };
+    // Top level, next to nodeVersion -- it describes the vendored CORPUS, not a
+    // ratchet on oam's behavior. Accepted under "ratchet" too so a reader who
+    // files it with the other numbers still gets the check rather than silence.
+    m.expected_total = v
+        .get("expectedTotal")
+        .or_else(|| v.get("ratchet").and_then(|r| r.get("expectedTotal")))
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize);
     if let Some(r) = v.get("ratchet") {
         m.max_skips = r
             .get("maxSkips")
@@ -477,6 +827,14 @@ fn load_manifest(path: &Path) -> Manifest {
             .map(|x| x as usize);
         m.max_deliberate = r
             .get("maxDeliberate")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize);
+        // Deliberately NOT maxSkips: that ceiling is 0 and means "no test may
+        // leave the denominator by manifest fiat". A partialSkip does the
+        // opposite -- it puts one back IN -- so folding the two into one number
+        // would let a skip be traded for a partial skip with nothing to review.
+        m.max_partial_skips = r
+            .get("maxPartialSkips")
             .and_then(|x| x.as_u64())
             .map(|x| x as usize);
         m.min_pass = r
@@ -493,31 +851,105 @@ fn load_manifest(path: &Path) -> Manifest {
     }
     if let Some(tests) = v.get("tests").and_then(|t| t.as_object()) {
         for (k, cfg) in tests {
-            if cfg.get("skip").and_then(|s| s.as_bool()) == Some(true) {
-                let reason = cfg
-                    .get("reason")
+            let flag = |name: &str| cfg.get(name).and_then(|b| b.as_bool()) == Some(true);
+            let (skip, deliberate, partial) =
+                (flag("skip"), flag("deliberate"), flag("partialSkip"));
+            // The three flavours put a test in three DIFFERENT places -- skip
+            // leaves the denominator entirely, deliberate stays in it as a
+            // failure, partialSkip is scored by exit code -- and each is
+            // ratcheted by its own ceiling. Carrying two would make the
+            // outcome depend on the order this parser happens to test them in,
+            // which is exactly the silent-drop the ceilings exist to prevent.
+            let carried: Vec<&str> = [
+                ("skip", skip),
+                ("deliberate", deliberate),
+                ("partialSkip", partial),
+            ]
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name)
+            .collect();
+            if carried.len() > 1 {
+                bail!(
+                    "manifest.json: \"{k}\" carries {} -- the per-test flavours are mutually \
+                     exclusive. A `skip` leaves the denominator, a `deliberate` divergence stays \
+                     in it as a failure, and a `partialSkip` is scored by its exit code; pick one.",
+                    carried.join(" + ")
+                );
+            }
+            let reason = |fallback: &str| {
+                cfg.get("reason")
                     .and_then(|r| r.as_str())
-                    .unwrap_or("manifest skip")
-                    .to_string();
+                    .unwrap_or(fallback)
+                    .to_string()
+            };
+            if skip {
                 let category = cfg.get("category").and_then(|c| c.as_str()).unwrap_or("");
                 if category == "known_issues" || category == "flaky" {
                     m.known_issues += 1;
                 }
-                m.skips.insert(k.clone(), reason);
-            } else if cfg.get("deliberate").and_then(|d| d.as_bool()) == Some(true) {
-                // Mutually exclusive with `skip` by construction: a deliberate
-                // divergence must still RUN and still FAIL, so marking one as
-                // both would silently drop it from the denominator.
-                let reason = cfg
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("deliberate divergence")
-                    .to_string();
-                m.deliberate.insert(k.clone(), reason);
+                m.skips.insert(k.clone(), reason("manifest skip"));
+            } else if deliberate {
+                m.deliberate
+                    .insert(k.clone(), reason("deliberate divergence"));
+            } else if partial {
+                m.partial_skips.insert(k.clone(), reason("partial skip"));
             }
         }
     }
-    m
+    Ok(m)
+}
+
+/// The bail text for a corpus whose file count no longer matches
+/// `manifest.expectedTotal`. Pure (and unit-tested) so the guidance a
+/// once-a-year failure prints is not itself untested.
+///
+/// A bare integer can prove that the population MOVED but cannot name a file
+/// that was added -- nothing in the repo enumerates the intended corpus, and
+/// this check stays offline (no git, no network) so it works on a release host
+/// with a detached tree. What it CAN name is the other direction: a manifest
+/// entry (skip or deliberate) pointing at a test that is no longer on disk,
+/// which is exactly the shape a dropped file leaves behind.
+fn corpus_drift_message(on_disk: &[PathBuf], expected: usize, manifest: &Manifest) -> String {
+    let names: BTreeSet<String> = on_disk
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let orphaned: Vec<&str> = manifest
+        .skips
+        .keys()
+        .chain(manifest.deliberate.keys())
+        .filter(|key| {
+            let base = key.rsplit('/').next().unwrap_or(key);
+            !names.contains(base)
+        })
+        .map(String::as_str)
+        .collect();
+
+    let found = on_disk.len();
+    let drift = if found > expected {
+        format!("{} MORE than expected", found - expected)
+    } else {
+        format!("{} FEWER than expected", expected - found)
+    };
+    let mut msg = format!(
+        "corpus drift: {found} test files in conformance/vendor/node/test/parallel, \
+         manifest expectedTotal = {expected} ({drift}). Every published rate divides by this \
+         population, so a vendored file added or dropped moves the number with nothing to notice. \
+         Re-vendor the corpus, or (with review) update expectedTotal in \
+         conformance/vendor/node/manifest.json."
+    );
+    if !orphaned.is_empty() {
+        msg.push_str(&format!(
+            "\n  missing (manifest names it, no file on disk): {}",
+            orphaned.join(", ")
+        ));
+    }
+    msg.push_str(
+        "\n  unexpected: a bare count cannot name an ADDED file -- list \
+         conformance/vendor/node/test/parallel and compare it against the tracked tree.",
+    );
+    msg
 }
 
 /// What a test's `// Flags:` header means for runnability.
@@ -590,32 +1022,95 @@ fn read_flags_header(path: &Path) -> Option<String> {
     None
 }
 
+/// The first line of captured output that says something about the FAILURE.
+///
+/// Node emits process warnings to stderr AHEAD of everything the run later
+/// prints, so "first non-empty line of stderr" is not the same thing as "first
+/// divergence". `require('internal/test/binding')` emits one on every load, and
+/// it shadowed the real error for every test that touches that module -- in the
+/// console AND in the CONFORMANCE-NODE.md failures section, which is the receipt
+/// a reader triages from:
+///
+///     (node:13288) internal/test/binding: These APIs are for internal testing only. Do not use them.
+///
+/// Skipped shapes: `(node:<pid>) <text>`, its `[DEP0XXX] DeprecationWarning`
+/// variant, and the `(Use \`node --trace-warnings ...\`)` follow-up node appends
+/// to the first warning of a run. stderr still outranks stdout at BOTH levels:
+/// a diagnostic line anywhere beats a warning, and a warning beats nothing --
+/// if every line of both streams is a warning the first one is still reported,
+/// because "no detail at all" is a worse receipt than a warning.
 fn first_error_line(out: &Captured) -> String {
-    let pick = |s: &str| {
+    let clip = |l: &str| l.chars().take(140).collect::<String>();
+    let diagnostic = |s: &str| {
         s.lines()
             .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(|l| l.chars().take(140).collect::<String>())
+            .find(|l| !l.is_empty() && !is_process_warning(l))
+            .map(clip)
     };
-    pick(&out.stderr)
-        .or_else(|| pick(&out.stdout))
+    let any = |s: &str| s.lines().map(str::trim).find(|l| !l.is_empty()).map(clip);
+    diagnostic(&out.stderr)
+        .or_else(|| diagnostic(&out.stdout))
+        .or_else(|| any(&out.stderr))
+        .or_else(|| any(&out.stdout))
         .unwrap_or_default()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_scorecard(
-    repo: &Path,
-    oam: &Path,
-    by_module: &BTreeMap<String, [usize; 4]>,
-    failures: &[(String, String)],
-    deliberate: &[(String, String, String)],
+/// A node process-warning line: `(node:<pid>) ...` (which covers the
+/// `[DEP0XXX] DeprecationWarning: ...` spelling too, same prefix) and the
+/// `(Use \`node --trace-warnings ...\`)` hint that follows the first one.
+/// The pid is required to be digits so a test printing a literal `(node:` of
+/// its own does not get silently swallowed.
+fn is_process_warning(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("(node:")
+        && let Some(end) = rest.find(')')
+        && !rest[..end].is_empty()
+        && rest[..end].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    line.starts_with("(Use `") && line.contains("--trace-warnings")
+}
+
+/// Everything one run publishes into the two committed receipts.
+///
+/// Was eleven positional arguments behind an `#[allow(too_many_arguments)]`;
+/// naming the exclusion lists took it to thirteen, at which point `total,
+/// runnable, pass, fail, skip, unrunnable` was six bare integers in a row that
+/// a caller could transpose silently. As a struct the counts that are DERIVED
+/// stop being passed at all: `runnable` is `pass + fail`, `skip` is
+/// `skips.len()`, `unrunnable` is `unrunnable.len()` -- three fewer places for
+/// a published number to disagree with the list beside it.
+struct Scorecard<'a> {
+    by_module: &'a BTreeMap<String, [usize; 4]>,
+    failures: &'a [(String, String)],
+    deliberate: &'a [(String, String, String)],
+    /// self-skips: (test, the reason it printed on the wire).
+    skips: &'a [(String, String)],
+    /// manifest partialSkip entries: (test, why its marker is not the verdict).
+    /// These are scored by exit code, so they are already counted in `pass` or
+    /// `fail` -- listed for the same reason the exclusions are, because the
+    /// entry is a discretionary lever on the denominator.
+    partial_skips: &'a [(String, String)],
+    /// harness exclusions: (test, reason, why-class).
+    unrunnable: &'a [(String, String, UnrunnableKind)],
+    /// every test file in the corpus, scored or not.
     total: usize,
-    runnable: usize,
     pass: usize,
     fail: usize,
-    skip: usize,
-    unrunnable: usize,
-) -> Result<bool> {
+}
+
+fn write_scorecard(repo: &Path, oam: &Path, card: &Scorecard) -> Result<bool> {
+    let Scorecard {
+        by_module,
+        failures,
+        deliberate,
+        skips,
+        partial_skips,
+        unrunnable,
+        total,
+        pass,
+        fail,
+    } = *card;
     let oam_version = Command::new(oam)
         .arg("--version")
         .output()
@@ -653,14 +1148,39 @@ fn write_scorecard(
         "corpus": "test/parallel: core modules (buffer, events, assert, util, querystring, string_decoder, url, path) + I/O-adjacent (stream, process, timers); fs/net/http vendored in later tranches",
         "total": total,
         // pass + fail. Must stay the denominator `passOverRunnable` divides by.
-        "runnable": runnable,
+        "runnable": scored,
         "pass": pass,
         "fail": fail,
-        "skip": skip,
-        "unrunnable": unrunnable,
+        // Counts, kept for the existing readers; `skips` / `unrunnables` below
+        // are the same two populations NAMED, and are the same length by
+        // construction (both derive from these lists).
+        "skip": skips.len(),
+        "unrunnable": unrunnable.len(),
         "passOverRunnable": format!("{:.1}%", pct(pass, scored)),
         "passOverTotal": format!("{:.1}%", pct(pass, total)),
         "byModule": modules_json,
+        // The 45-odd tests that left the denominator, by name. Previously only
+        // a per-module integer, which meant a compensating change -- one test
+        // starting to self-skip while another stopped -- moved nothing in the
+        // receipt and nothing in minPass. Now it is a reviewable diff.
+        "skips": skips
+            .iter()
+            .map(|(name, reason)| json!({ "test": name, "reason": reason }))
+            .collect::<Vec<_>>(),
+        "unrunnables": unrunnable
+            .iter()
+            .map(|(name, reason, kind)| json!({
+                "test": name, "reason": reason, "kind": kind.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+        // NOT an excluded population: these are IN `runnable` and in pass/fail.
+        // Published because the entry is the one lever that moves a test the
+        // other way -- over its own TAP skip marker -- so it has to be as
+        // auditable as the levers that move tests out.
+        "partialSkips": partial_skips
+            .iter()
+            .map(|(name, reason)| json!({ "test": name, "reason": reason }))
+            .collect::<Vec<_>>(),
         // A SUBSET of `fail`, not a sibling of it: these are counted in `fail`
         // and in `runnable` above. Published so the machine twin carries the
         // reason too, rather than leaving it only in the markdown.
@@ -683,14 +1203,17 @@ fn write_scorecard(
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
-    md.push_str("Oracle: a vendored Node core test passes when it runs to **exit 0** (Node tests self-assert via `require('../common')` + `assert`). `1..0 # Skipped` reclassifies a runtime skip; `// Flags:` and manifest entries are unrunnable-by-harness.\n\n");
+    md.push_str("Oracle: a vendored Node core test passes when it runs to **exit 0** (Node tests self-assert via `require('../common')` + `assert`). `1..0 # Skipped` reclassifies a runtime skip, except for the `partialSkip` entries listed below; `// Flags:` and manifest entries are unrunnable-by-harness.\n\n");
     md.push_str(&format!(
         "**pass/runnable = {pass}/{scored} ({:.1}%)** &nbsp; pass/total = {pass}/{total} ({:.1}%)\n\n",
         pct(pass, scored),
         pct(pass, total)
     ));
     md.push_str(&format!(
-        "{pass} pass &middot; {fail} fail &middot; {skip} skip &middot; {unrunnable} unrunnable-by-harness\n\n"
+        "{pass} pass &middot; {fail} fail &middot; {} skip &middot; {} unrunnable-by-harness \
+         (both excluded populations are named in full below)\n\n",
+        skips.len(),
+        unrunnable.len()
     ));
     md.push_str("## By module\n\n");
     md.push_str(
@@ -726,6 +1249,53 @@ fn write_scorecard(
             md.push_str(&format!("- `{name}` -- {detail}\n  - {reason}\n"));
         }
     }
+    if !partial_skips.is_empty() {
+        md.push_str("\n## Partial skips (scored by exit code, INSIDE the denominator)\n\n");
+        md.push_str(
+            "Each of these prints a TAP `1..0 # Skipped` marker part-way through -- \
+             `common.printSkipMessage()` does not exit -- and then keeps asserting to the end of \
+             the file, so the marker does not describe how the run ended. For these the marker is \
+             ignored and the exit code decides, which lands them in pass or fail above instead of \
+             the self-skipped list below. No output-only rule can tell such a test from one that \
+             `common.skip()`s at the top and asserts nothing (their stdout is byte-identical), so \
+             this is a per-file manifest opt-in, ratcheted by `maxPartialSkips`, not a heuristic.\n\n",
+        );
+        for (name, reason) in partial_skips {
+            md.push_str(&format!("- `{name}` -- {reason}\n"));
+        }
+    }
+    // The two excluded populations, by name. Failures and deliberate
+    // divergences were already named in full; these were per-module integers,
+    // so nobody reading the receipt could audit WHICH tests left the
+    // denominator -- and a swap (one test starts self-skipping, another stops)
+    // was invisible to every published number, minPass included.
+    if !skips.is_empty() {
+        md.push_str("\n## Self-skipped at runtime (outside the denominator)\n\n");
+        md.push_str(
+            "Each of these printed a TAP `1..0 # Skipped` marker AND exited 0, so it reached no \
+             verdict about oam and is not counted in pass/runnable. The reason is the one the \
+             test itself put on the wire. A skip here is usually the test declining a platform \
+             or a build option -- but a skip that appears WITHOUT a corresponding change to the \
+             test is a regression in whatever it feature-detects, so this list is worth diffing.\n\n",
+        );
+        for (name, reason) in skips {
+            md.push_str(&format!("- `{name}` -- {reason}\n"));
+        }
+    }
+    if !unrunnable.is_empty() {
+        md.push_str("\n## Unrunnable by harness (outside the denominator)\n\n");
+        md.push_str(
+            "Excluded before or during the run, by kind: `manifest` (an explicit entry in \
+             conformance/vendor/node/manifest.json -- the one discretionary lever, ratcheted by \
+             maxSkips), `flags` (a `// Flags:` header naming a flag oam does not implement), \
+             `missing-module` (the test imports a `node:`/`internal/` module, or an \
+             internalBinding namespace, that oam does not provide -- an oam-side gap, not a \
+             correctness failure, since the test never reaches an assertion about oam).\n\n",
+        );
+        for (name, reason, kind) in unrunnable {
+            md.push_str(&format!("- `{name}` -- [{}] {reason}\n", kind.as_str()));
+        }
+    }
     crate::conformance::write_receipts(&[
         (
             repo.join("conformance/node-suite-scorecard.json"),
@@ -748,30 +1318,125 @@ mod tests {
         }
     }
 
+    /// A finished attempt: what the test printed on stdout, and how it ended.
+    fn attempt(stdout: &str, code: i32, timed_out: bool) -> Captured {
+        Captured {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            code,
+            timed_out,
+        }
+    }
+
+    fn manifest_naming(paths: &[&str]) -> Manifest {
+        Manifest {
+            skips: paths
+                .iter()
+                .map(|p| ((*p).to_string(), "because".to_string()))
+                .collect(),
+            known_issues: 0,
+            deliberate: BTreeMap::new(),
+            partial_skips: BTreeMap::new(),
+            max_skips: None,
+            max_known_issues: None,
+            max_deliberate: None,
+            max_partial_skips: None,
+            min_pass: None,
+            min_pass_by_host: BTreeMap::new(),
+            expected_total: None,
+        }
+    }
+
+    /// Every ceiling and floor enforced, at the values the suite runs with, so
+    /// each test below overrides only the one lever it is about. Named fields
+    /// mean a test cannot silently transpose a count with a limit.
+    fn ratchet() -> Ratchet {
+        Ratchet {
+            skips: 0,
+            known_issues: 0,
+            deliberate: 0,
+            partial_skips: 0,
+            pass: 81,
+            max_skips: Some(0),
+            max_known_issues: Some(0),
+            max_deliberate: Some(0),
+            max_partial_skips: Some(0),
+            min_pass: Some(81),
+        }
+    }
+
     // -- skip-ratchet: the integrity mechanism against denominator-gaming --
 
     #[test]
     fn ratchet_within_or_at_ceiling_is_ok() {
-        assert!(ratchet_violation(0, 0, 0, 81, Some(0), Some(0), Some(0), Some(81)).is_none());
-        assert!(ratchet_violation(3, 1, 1, 90, Some(5), Some(2), Some(2), Some(81)).is_none());
+        assert!(ratchet_violation(&ratchet()).is_none());
+        assert!(
+            ratchet_violation(&Ratchet {
+                skips: 3,
+                known_issues: 1,
+                deliberate: 1,
+                partial_skips: 1,
+                pass: 90,
+                max_skips: Some(5),
+                max_known_issues: Some(2),
+                max_deliberate: Some(2),
+                max_partial_skips: Some(2),
+                min_pass: Some(81),
+            })
+            .is_none()
+        );
         // == ceiling / == floor is allowed; only strictly past them violates.
-        assert!(ratchet_violation(5, 2, 2, 81, Some(5), Some(2), Some(2), Some(81)).is_none());
+        assert!(
+            ratchet_violation(&Ratchet {
+                skips: 5,
+                known_issues: 2,
+                deliberate: 2,
+                partial_skips: 2,
+                pass: 81,
+                max_skips: Some(5),
+                max_known_issues: Some(2),
+                max_deliberate: Some(2),
+                max_partial_skips: Some(2),
+                min_pass: Some(81),
+            })
+            .is_none()
+        );
         // Unset ceilings/floor = unenforced, even with extreme counts.
-        assert!(ratchet_violation(99, 99, 99, 0, None, None, None, None).is_none());
+        assert!(
+            ratchet_violation(&Ratchet {
+                skips: 99,
+                known_issues: 99,
+                deliberate: 99,
+                partial_skips: 99,
+                pass: 0,
+                ..Ratchet::default()
+            })
+            .is_none()
+        );
     }
 
     #[test]
     fn ratchet_skips_over_ceiling_violates() {
-        let msg =
-            ratchet_violation(1, 0, 0, 81, Some(0), Some(0), Some(0), None).expect("must violate");
+        let msg = ratchet_violation(&Ratchet {
+            skips: 1,
+            min_pass: None,
+            ..ratchet()
+        })
+        .expect("must violate");
         assert!(msg.contains("skip-ratchet violation"));
         assert!(msg.contains("1 manifest skips > ceiling 0"));
     }
 
     #[test]
     fn ratchet_known_issues_over_ceiling_violates() {
-        let msg =
-            ratchet_violation(0, 3, 0, 81, Some(10), Some(2), Some(0), None).expect("must violate");
+        let msg = ratchet_violation(&Ratchet {
+            known_issues: 3,
+            max_skips: Some(10),
+            max_known_issues: Some(2),
+            min_pass: None,
+            ..ratchet()
+        })
+        .expect("must violate");
         assert!(msg.contains("known-issues ceiling violation"));
         assert!(msg.contains("3 known_issues/flaky skips > ceiling 2"));
     }
@@ -780,9 +1445,20 @@ mod tests {
     fn deliberate_ceiling_is_ratcheted() {
         // At the ceiling is fine; one past it is not. This is what stops a real
         // regression being relabelled "intentional" without a reviewable bump.
-        assert!(ratchet_violation(0, 0, 2, 81, Some(0), Some(0), Some(2), Some(81)).is_none());
-        let msg = ratchet_violation(0, 0, 3, 81, Some(0), Some(0), Some(2), Some(81))
-            .expect("must violate");
+        assert!(
+            ratchet_violation(&Ratchet {
+                deliberate: 2,
+                max_deliberate: Some(2),
+                ..ratchet()
+            })
+            .is_none()
+        );
+        let msg = ratchet_violation(&Ratchet {
+            deliberate: 3,
+            max_deliberate: Some(2),
+            ..ratchet()
+        })
+        .expect("must violate");
         assert!(msg.contains("deliberate-divergence ceiling violation"));
         assert!(msg.contains("3 > ceiling 2"));
     }
@@ -793,16 +1469,60 @@ mod tests {
         // a FAILURE, not a skip. If it ever stopped counting, the pass rate
         // would silently improve by annotating tests -- exactly what the skip
         // ceiling exists to prevent. A pass floor must still fire underneath it.
-        let msg = ratchet_violation(0, 0, 2, 80, Some(0), Some(0), Some(2), Some(81))
-            .expect("must violate");
+        let msg = ratchet_violation(&Ratchet {
+            deliberate: 2,
+            max_deliberate: Some(2),
+            pass: 80,
+            ..ratchet()
+        })
+        .expect("must violate");
         assert!(msg.contains("pass-floor violation"));
+    }
+
+    #[test]
+    fn partial_skip_ceiling_is_ratcheted_separately_from_maxskips() {
+        // At the ceiling is fine.
+        assert!(
+            ratchet_violation(&Ratchet {
+                partial_skips: 1,
+                max_partial_skips: Some(1),
+                ..ratchet()
+            })
+            .is_none()
+        );
+        // One past it is not: a partialSkip promotes a marker-printing test
+        // back INTO the scored denominator, which is exactly the direction a
+        // ceiling has to govern.
+        let msg = ratchet_violation(&Ratchet {
+            partial_skips: 2,
+            max_partial_skips: Some(1),
+            ..ratchet()
+        })
+        .expect("must violate");
+        assert!(msg.contains("partial-skip ceiling violation"), "{msg}");
+        assert!(msg.contains("2 > ceiling 1"), "{msg}");
+        // And it must NOT be governed by maxSkips, which is 0 and means the
+        // opposite thing (no test may LEAVE the denominator by fiat). A
+        // partialSkip under a generous maxPartialSkips passes with maxSkips 0.
+        assert!(
+            ratchet_violation(&Ratchet {
+                partial_skips: 1,
+                max_skips: Some(0),
+                max_partial_skips: Some(1),
+                ..ratchet()
+            })
+            .is_none()
+        );
     }
 
     #[test]
     fn ratchet_pass_below_floor_violates() {
         // A node-compat regression that drops the pass count must redden CI.
-        let msg = ratchet_violation(0, 0, 0, 80, Some(0), Some(0), Some(0), Some(81))
-            .expect("must violate");
+        let msg = ratchet_violation(&Ratchet {
+            pass: 80,
+            ..ratchet()
+        })
+        .expect("must violate");
         assert!(msg.contains("pass-floor violation"));
         assert!(msg.contains("80 passing < floor 81"));
     }
@@ -830,5 +1550,400 @@ mod tests {
     fn missing_builtin_none_for_ordinary_assertion_failure() {
         let c = cap("AssertionError: 1 strictEqual 2");
         assert!(missing_builtin(&c).is_none());
+    }
+
+    #[test]
+    fn missing_builtin_extracts_unbacked_internal_binding() {
+        // The throwing internalBinding proxy in js/node_compat.js. An unbacked
+        // binding must stay UNRUNNABLE: it is an oam gap the test never gets
+        // past, not a divergence the test measured.
+        let c = cap(
+            "Error: oam: no native binding for 'tcp_wrap.TCP'\n    at internalBinding (node:internal/test/binding:3:9)",
+        );
+        assert_eq!(missing_builtin(&c).as_deref(), Some("tcp_wrap.TCP"));
+    }
+
+    #[test]
+    fn missing_builtin_names_the_binding_even_when_the_message_is_truncated() {
+        let c = cap("Error: oam: no native binding for 'fs_event_wrap");
+        assert_eq!(
+            missing_builtin(&c).as_deref(),
+            Some("an internalBinding namespace")
+        );
+    }
+
+    #[test]
+    fn missing_builtin_ignores_a_generic_module_error() {
+        // Scoped to the DISTINCTIVE prefix on purpose. A bare "No such module"
+        // is what a genuine oam bug looks like too, and matching it would move
+        // real failures out of the denominator.
+        assert!(missing_builtin(&cap("Error: No such module")).is_none());
+        assert!(missing_builtin(&cap("Error: no native binding available")).is_none());
+    }
+
+    // -- classify_attempt: the TAP marker is NOT authoritative over the exit --
+
+    #[test]
+    fn marker_with_exit_zero_is_a_skip_carrying_its_reason() {
+        let out = attempt("1..0 # Skipped: no crypto\n", 0, false);
+        assert_eq!(
+            classify_attempt(&out, false),
+            Outcome::Skip("no crypto".to_string())
+        );
+    }
+
+    #[test]
+    fn a_partial_skip_that_finishes_is_still_scored_a_skip_by_default() {
+        // Documents why the manifest opt-in exists, measured rather than
+        // assumed. On oam these two produce BYTE-IDENTICAL output --
+        // `1..0 # Skipped: missing crypto` on stdout, nothing else, exit 0:
+        //
+        //   test-stream-pipeline-http2.js  common.skip('missing crypto') at
+        //                                  the top; asserts NOTHING.
+        //   test-buffer-alloc.js           common.printSkipMessage() at :1076
+        //                                  (no exit), then ~120 more lines of
+        //                                  Buffer assertions, then exit 0.
+        //
+        // (Both because common.hasCrypto is `Boolean(process.versions.openssl)`
+        // -- common/index.js:54 -- and oam publishes the deps it really links.)
+        // So NO output-only rule separates them, and scoring exit-0-with-marker
+        // as a Pass in general would score the first test -- which asserted
+        // nothing -- as a pass. Skip stays the default for both.
+        let ran_on = attempt("1..0 # Skipped: missing crypto\n", 0, false);
+        let skipped_out = attempt("1..0 # Skipped: missing crypto\n", 0, false);
+        assert_eq!(
+            classify_attempt(&ran_on, false),
+            classify_attempt(&skipped_out, false)
+        );
+        assert!(matches!(classify_attempt(&ran_on, false), Outcome::Skip(_)));
+    }
+
+    #[test]
+    fn a_manifest_partial_skip_is_scored_by_its_exit_code() {
+        // The opt-in half of the pair above: the marker is not consulted, so
+        // the SAME bytes that scored Skip now score by how the process ended.
+        let finished = attempt("1..0 # Skipped: missing crypto\n", 0, false);
+        assert_eq!(classify_attempt(&finished, true), Outcome::Pass);
+
+        // Overriding the marker must not override the exit code: a partialSkip
+        // that starts failing has to fail, or the entry would be a blanket
+        // "score this file a pass".
+        let died = attempt("1..0 # Skipped: missing crypto\n", 1, false);
+        match classify_attempt(&died, true) {
+            Outcome::Fail(detail) => assert!(detail.contains("[exit=1]"), "{detail}"),
+            other => panic!("a failing partialSkip must FAIL, got {other:?}"),
+        }
+        let hung = attempt("1..0 # Skipped: missing crypto\n", -2, true);
+        assert_eq!(
+            classify_attempt(&hung, true),
+            Outcome::Fail("[TIMEOUT]".to_string())
+        );
+    }
+
+    #[test]
+    fn marker_with_nonzero_exit_is_a_failure() {
+        // The process printed the marker and then died. Under the old ordering
+        // this was scored a Skip and vanished from the denominator.
+        let out = attempt("1..0 # Skipped: no ipv6\nAssertionError\n", 1, false);
+        match classify_attempt(&out, false) {
+            Outcome::Fail(detail) => assert!(detail.contains("[exit=1]"), "{detail}"),
+            other => panic!("marker + non-zero exit must FAIL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marker_with_timeout_is_a_failure() {
+        let out = attempt("1..0 # Skipped: whatever\n", -2, true);
+        assert_eq!(
+            classify_attempt(&out, false),
+            Outcome::Fail("[TIMEOUT]".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_exit_without_a_marker_is_a_pass() {
+        assert_eq!(
+            classify_attempt(&attempt("ok\n", 0, false), false),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn missing_module_outranks_a_plain_failure_but_not_the_exit_code() {
+        let mut out = attempt("", 1, false);
+        out.stderr = "error[OAM-MOD0006]: 'node:test' is not a known node: builtin module".into();
+        assert_eq!(
+            classify_attempt(&out, false),
+            Outcome::Unrunnable(
+                "needs unimplemented node:test".to_string(),
+                UnrunnableKind::MissingModule
+            )
+        );
+        // ... but a timeout is still a failure, not an exclusion.
+        out.timed_out = true;
+        assert_eq!(
+            classify_attempt(&out, false),
+            Outcome::Fail("[TIMEOUT]".to_string())
+        );
+    }
+
+    // -- skip_marker_reason: the reason common.skip() already puts on the wire --
+
+    #[test]
+    fn skip_reason_survives_both_marker_spellings() {
+        assert_eq!(
+            skip_marker_reason("1..0 # Skipped: missing crypto\n").as_deref(),
+            Some("missing crypto")
+        );
+        // "1..0 # SKIP" is a PREFIX of "1..0 # Skipped" -- matching it first
+        // would leave the reason as "ped: missing crypto".
+        assert_eq!(
+            skip_marker_reason("1..0 # SKIP no ipv6 support\n").as_deref(),
+            Some("no ipv6 support")
+        );
+        // Windows CRLF must not ride along into the receipt.
+        assert_eq!(
+            skip_marker_reason("1..0 # Skipped: no ipv6\r\n").as_deref(),
+            Some("no ipv6")
+        );
+    }
+
+    #[test]
+    fn skip_reason_falls_back_when_the_test_printed_none() {
+        assert_eq!(
+            skip_marker_reason("1..0 # Skipped\n").as_deref(),
+            Some("no reason given")
+        );
+        assert_eq!(skip_marker_reason("all good\n"), None);
+    }
+
+    // -- corpus pin: the denominator is a committed number, not whatever is on disk --
+
+    #[test]
+    fn corpus_drift_message_reports_the_direction_and_the_orphans() {
+        let on_disk = [PathBuf::from("test/parallel/test-buffer-alloc.js")];
+        let manifest = manifest_naming(&["parallel/test-buffer-alloc.js", "parallel/test-gone.js"]);
+
+        let msg = corpus_drift_message(&on_disk, 2, &manifest);
+        assert!(msg.contains("1 test files"), "{msg}");
+        assert!(msg.contains("expectedTotal = 2"), "{msg}");
+        assert!(msg.contains("1 FEWER than expected"), "{msg}");
+        // The one side a bare count CAN name: a manifest entry with no file.
+        assert!(msg.contains("parallel/test-gone.js"), "{msg}");
+        assert!(!msg.contains("test-buffer-alloc.js\n"), "{msg}");
+
+        let msg = corpus_drift_message(&on_disk, 0, &manifest);
+        assert!(msg.contains("1 MORE than expected"), "{msg}");
+    }
+
+    #[test]
+    fn corpus_pin_reads_expected_total_from_either_home() {
+        let dir =
+            std::env::temp_dir().join(format!("oam-node-suite-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+
+        let top = dir.join("top.json");
+        std::fs::write(&top, r#"{"expectedTotal": 476, "tests": {}}"#).expect("write");
+        assert_eq!(
+            load_manifest(&top).expect("parse").expected_total,
+            Some(476)
+        );
+
+        // Filed with the other numbers instead -- still checked, not silently
+        // ignored, because a pin that quietly does nothing is worse than none.
+        let nested = dir.join("nested.json");
+        std::fs::write(&nested, r#"{"ratchet": {"expectedTotal": 12}}"#).expect("write");
+        assert_eq!(
+            load_manifest(&nested).expect("parse").expected_total,
+            Some(12)
+        );
+
+        // Absent = unpinned (the check is opt-in).
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"{"tests": {}}"#).expect("write");
+        assert_eq!(load_manifest(&bare).expect("parse").expected_total, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- partialSkip: the reviewable opt-in that overrides a TAP marker --
+
+    #[test]
+    fn manifest_parses_the_three_test_flavours_into_separate_buckets() {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-node-suite-flavours-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("manifest.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "ratchet": { "maxSkips": 0, "maxPartialSkips": 1 },
+              "tests": {
+                "parallel/test-a.js": { "skip": true, "reason": "no fixture", "category": "flaky" },
+                "parallel/test-b.js": { "deliberate": true, "reason": "honest surface" },
+                "parallel/test-c.js": { "partialSkip": true, "reason": "asserts past its marker" }
+              }
+            }"#,
+        )
+        .expect("write");
+
+        let m = load_manifest(&path).expect("parse");
+        assert_eq!(m.skips.len(), 1);
+        assert_eq!(m.known_issues, 1);
+        assert_eq!(m.deliberate.len(), 1);
+        assert_eq!(
+            m.partial_skips
+                .get("parallel/test-c.js")
+                .map(String::as_str),
+            Some("asserts past its marker")
+        );
+        assert_eq!(m.max_partial_skips, Some(1));
+        // maxPartialSkips is its own lever, NOT maxSkips (which is 0 and means
+        // the opposite thing) -- reusing it would let one be traded for the
+        // other with nothing to review.
+        assert_eq!(m.max_skips, Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_rejects_a_test_carrying_two_flavours() {
+        let dir = std::env::temp_dir().join(format!(
+            "oam-node-suite-conflict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("manifest.json");
+        // Silently letting `skip` win would drop the test out of the
+        // denominator while the entry claimed it was being scored.
+        std::fs::write(
+            &path,
+            r#"{"tests": {"parallel/test-x.js": {"skip": true, "partialSkip": true}}}"#,
+        )
+        .expect("write");
+
+        // `expect_err` would need Debug on Manifest, which lives here only for
+        // this assertion -- match instead.
+        let msg = match load_manifest(&path) {
+            Ok(_) => panic!("a test carrying two flavours must be an error, not a precedence rule"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("parallel/test-x.js"), "{msg}");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        assert!(msg.contains("skip + partialSkip"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- no_binding_name: read the THROWN message, never the echoed source --
+
+    #[test]
+    fn no_binding_name_ignores_the_code_frame_and_reads_the_message() {
+        // oam's real fatal report, verbatim: the code frame echoes the throw
+        // site's SOURCE (template literal intact) ahead of the rendered error.
+        // A substring search over this extracted "${id}" and the committed
+        // receipt read "needs unimplemented ${id}".
+        let c = cap(concat!(
+            "oam:node_compat.js:22667\n",
+            "        throw new Error(`oam: no native binding for '${id}'`);\n",
+            "        ^\n",
+            "\n",
+            "Error: oam: no native binding for 'js_stream'\n",
+            "    at internalBinding (oam:node_compat.js:22667:15)\n",
+        ));
+        assert_eq!(missing_builtin(&c).as_deref(), Some("js_stream"));
+
+        // Same shape for the proxy's per-member throw, whose source line
+        // carries TWO interpolations.
+        let c = cap(concat!(
+            "oam:node_compat.js:22607\n",
+            "          throw new Error(`oam: no native binding for '${ns}.${String(prop)}'`);\n",
+            "          ^\n",
+            "\n",
+            "Error: oam: no native binding for 'timers.scheduleTimer'\n",
+        ));
+        assert_eq!(missing_builtin(&c).as_deref(), Some("timers.scheduleTimer"));
+    }
+
+    #[test]
+    fn no_binding_name_still_reads_a_message_only_report() {
+        // The shape that always worked -- it must not regress. Includes the
+        // nested `actual: Error: ...` form util.inspect prints when the binding
+        // error is captured inside an AssertionError diff (test-buffer-fill),
+        // which is how that one test extracted correctly while four did not.
+        assert_eq!(
+            missing_builtin(&cap("Error: oam: no native binding for 'tcp_wrap.TCP'")).as_deref(),
+            Some("tcp_wrap.TCP")
+        );
+        assert_eq!(
+            missing_builtin(&cap(
+                "  actual: Error: oam: no native binding for 'buffer.fill'"
+            ))
+            .as_deref(),
+            Some("buffer.fill")
+        );
+    }
+
+    #[test]
+    fn no_binding_name_never_publishes_an_uninterpolated_template() {
+        // Classification must NOT depend on the parse: a report carrying only
+        // the code frame is still unrunnable (an oam gap the test never got
+        // past), it is just unnameable. What must never happen is `${id}`
+        // reaching the receipt as a binding name.
+        let c = cap("        throw new Error(`oam: no native binding for '${id}'`);");
+        assert_eq!(
+            missing_builtin(&c).as_deref(),
+            Some("an internalBinding namespace")
+        );
+    }
+
+    // -- first_error_line: a process warning is not the first divergence --
+
+    #[test]
+    fn first_error_line_skips_node_process_warnings() {
+        // require('internal/test/binding') emits this on every load, so it
+        // shadowed the real error for every test that touches that module --
+        // in the console AND in CONFORMANCE-NODE.md's failures section.
+        let c = cap(concat!(
+            "(node:13288) internal/test/binding: These APIs are for internal testing only. Do not use them.\n",
+            "(node:13288) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.\n",
+            "(Use `node --trace-warnings ...` to show where the warning was created)\n",
+            "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array\n",
+        ));
+        assert_eq!(
+            first_error_line(&c),
+            "AssertionError [ERR_ASSERTION]: mismatch: false vs true for Uint8Array"
+        );
+    }
+
+    #[test]
+    fn first_error_line_falls_back_when_every_line_is_a_warning() {
+        // No detail at all is a worse receipt than a warning, so the warning
+        // still gets reported rather than an empty string.
+        let c = cap("(node:1) internal/test/binding: These APIs are for internal testing only.\n");
+        let line = first_error_line(&c);
+        assert!(line.starts_with("(node:1)"), "{line}");
+
+        // A diagnostic line on stdout still outranks a warning-only stderr.
+        let mut c =
+            cap("(node:1) internal/test/binding: These APIs are for internal testing only.\n");
+        c.stdout = "not ok 3 - buffer fill\n".into();
+        assert_eq!(first_error_line(&c), "not ok 3 - buffer fill");
+    }
+
+    #[test]
+    fn first_error_line_does_not_swallow_a_tests_own_parenthesised_output() {
+        // The pid must be digits: `(node:foo)` is a test printing, not a
+        // warning, and silently dropping it would hide a real divergence.
+        let c = cap("(node:foo) something the test itself printed\n");
+        assert_eq!(
+            first_error_line(&c),
+            "(node:foo) something the test itself printed"
+        );
+        assert!(!is_process_warning("(Use `strict`) not a warning hint"));
     }
 }

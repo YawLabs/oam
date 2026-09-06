@@ -270,6 +270,34 @@
     };
   });
 
+  d("internal/timers", (require, module) => {
+    // --expose-internals only. Node's internal/timers is mostly a description
+    // of NODE's own JS timer storage -- the TimersList priority queue, the
+    // kRefed/kTimerId symbols, insert()/active(), the async_hooks plumbing.
+    // oam's timer queue is a Rust structure with no JS list behind it, so
+    // none of that has an honest counterpart here and none of it is claimed.
+    // setUnrefTimeout is the one export that describes behavior oam really
+    // has, so it is the one export published.
+    const { validateFunction } = require("internal/validators");
+
+    // Node v22.22.2's signature is `function setUnrefTimeout(callback, after)`
+    // -- two parameters, no rest arg, so extra arguments are DROPPED rather
+    // than forwarded to the callback. Backed by oam's real Timeout (the same
+    // object global setTimeout returns) and its real .unref(), which calls the
+    // native timerUnref op that clears the ref flag on the Rust timer queue --
+    // so the timer still fires but stops pinning the event loop, exactly as
+    // node's unrefed timer does.
+    function setUnrefTimeout(callback, after) {
+      validateFunction(callback, "callback");
+      const timers = globalThis.__oamNode.get("timers");
+      const timer = timers.setTimeout(callback, after);
+      timer.unref();
+      return timer;
+    }
+
+    module.exports = { setUnrefTimeout };
+  });
+
   d("internal/assert", (require, module) => {
     module.exports = function assert(value, message) {
       if (!value) {

@@ -1527,7 +1527,7 @@
         encoding = end;
         end = this.length;
       }
-      if (start < 0 || end > this.length || start > end) {
+      if (start < 0 || end < 0 || end > this.length) {
         throw Object.assign(
           new RangeError(
             `The value of "offset" is out of range. It must be >= 0 and <= ${this.length}. Received ${start < 0 ? start : end}`,
@@ -1535,6 +1535,15 @@
           { code: "ERR_OUT_OF_RANGE" },
         );
       }
+      // An `end` at or before `offset` is an EMPTY range, not an error: node
+      // returns the buffer untouched (probe-verified on v22.22.2 --
+      // buf.fill('abc', 4, 1) and buf.fill('a', 100) both come back unchanged,
+      // because node range-checks offset and end independently and then
+      // bails on `end <= offset`). Collapsing end onto start keeps the value
+      // and encoding validation below running, which is also node's order --
+      // fill('a', 4, 1, 'bogus') is ERR_UNKNOWN_ENCODING there, not a silent
+      // no-op. Previously `start > end` threw ERR_OUT_OF_RANGE here.
+      if (end < start) end = start;
       // Node value coercion: undefined/null -> 0; boolean -> 0/1; number -> &255.
       if (value === undefined || value === null) {
         Uint8Array.prototype.fill.call(this, 0, start, end);
@@ -4448,6 +4457,12 @@
       result += str.slice(last);
       return quoteChar + result + quoteChar;
     }
+    // internalBinding('util').getProxyDetails: V8's Proxy [target, handler]
+    // slots, read WITHOUT touching the proxy. Node uses it so inspecting a
+    // value can never be observed by that value -- see the call in `walk`.
+    // Guarded because an older oam binary's op table has no such native; the
+    // walker then behaves as it did before, trap-firing and all.
+    const proxyDetails = typeof natives.getProxyDetails === "function" ? natives.getProxyDetails : undefined;
     function inspect(value, options = {}) {
       // `depth` is mutable: the Node output-budget clamp sets it to -1 when a
       // pathological object accumulates ~2^27 chars at one indentation level.
@@ -4973,6 +4988,22 @@
         return entriesTail(v, keys, base, level);
       }
 
+      function formatProxy(details, level) {
+        // Port of Node formatProxy: `Proxy [ target, handler ]`, the two
+        // halves formatted as ordinary values one level deeper. Node reaches
+        // straight for reduceToSingleString here (no `sorted`, no output
+        // budget) and never sets ictx.currentDepth, so neither does this.
+        if (depth !== null && level > depth) return stylize("Proxy [Array]", "special");
+        const inner = level + 1;
+        ictx.indentationLvl += 2;
+        let res;
+        try {
+          res = [walk(details[0], inner), walk(details[1], inner)];
+        } finally {
+          ictx.indentationLvl -= 2;
+        }
+        return reduceToSingleString(res, "", ["Proxy [", "]"], inner, true, undefined);
+      }
       function walk(v, level) {
         if (v === null) return stylize("null", "null");
         const t = typeof v;
@@ -4985,6 +5016,31 @@
         if (t === "bigint") return stylize(`${v}n`, "bigint");
         if (t === "symbol") return stylize(v.toString(), "symbol");
         // ---------------- object-like values from here on ----------------
+        // Node reads a Proxy's [target, handler] out of band and never touches
+        // the proxy itself. Walking one would fire its traps, so a counting or
+        // logging handler would run just because the value got console.log'd:
+        // inspecting a value must not be observable to that value. With
+        // showProxy on, the pair is what gets rendered; with it off (the
+        // default) the TARGET is inspected in the proxy's place, which is the
+        // object the proxy would have reported anyway.
+        //
+        // `receiver` keeps the ORIGINAL proxy as the `this` a user's
+        // [util.inspect.custom] hook sees (Node's `context`), while `v`
+        // becomes the target everything below formats.
+        let receiver = v;
+        if (proxyDetails !== undefined) {
+          const details = proxyDetails(v, !!options.showProxy);
+          if (details !== undefined) {
+            // A revoked proxy has neither target nor handler and throws on
+            // every operation -- report the state rather than detonating
+            // mid-render. Inspecting a value must never throw.
+            if (details === null || details[0] === null) {
+              return stylize("<Revoked Proxy>", "special");
+            }
+            if (options.showProxy) return formatProxy(details, level);
+            v = details;
+          }
+        }
         if (seen.includes(v)) return markCircular(v);
         // User-supplied [util.inspect.custom] hook (Node formatValue). Skipped
         // when customInspect is off, when the hook IS util.inspect, and on the
@@ -5002,9 +5058,16 @@
             Object.getOwnPropertyDescriptor(v, "constructor")?.value?.prototype !== v
           ) {
             const customDepth = depth === null ? null : depth - level;
-            const ret = maybeCustom.call(v, customDepth, userOptionsSnapshot(), inspect);
+            // `receiver`, not `v`: for a proxy the hook found on the target is
+            // still called with the proxy as `this` (Node's `context`), so a
+            // hook that identity-checks its receiver sees what the caller
+            // actually passed to inspect.
+            const ret = maybeCustom.call(receiver, customDepth, userOptionsSnapshot(), inspect);
             // Returning `this` means "render me normally" -- avoids recursion.
-            if (ret !== v) {
+            // Compared against the receiver: a proxy's hook returns the proxy,
+            // and re-walking that would resolve to the target and call the
+            // hook again, forever.
+            if (ret !== receiver) {
               if (typeof ret !== "string") return walk(ret, level);
               return ret.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
             }
@@ -5512,12 +5575,29 @@
             const isObj = arg !== null && typeof arg === "object";
             let builtIn = false;
             if (isObj) {
-              const ts = arg.toString;
-              // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
-              // so it counts as built-in here.
-              const hasToPrim = typeof arg[Symbol.toPrimitive] === "function" && !(arg instanceof Date);
-              builtIn = !hasToPrim &&
-                (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || arg instanceof Date);
+              // Node hasBuiltInToString resolves a Proxy to its TARGET before
+              // probing: reading `.toString` or Symbol.toPrimitive off the
+              // proxy would fire its get trap, and formatting a value must not
+              // be observable to that value. A revoked proxy has no target to
+              // probe and counts as built-in, so it inspects to
+              // <Revoked Proxy> instead of throwing out of String().
+              let probe = arg;
+              let revoked = false;
+              if (proxyDetails !== undefined) {
+                const target = proxyDetails(arg, false);
+                if (target === null) revoked = true;
+                else if (target !== undefined) probe = target;
+              }
+              if (revoked) {
+                builtIn = true;
+              } else {
+                const ts = probe.toString;
+                // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
+                // so it counts as built-in here.
+                const hasToPrim = typeof probe[Symbol.toPrimitive] === "function" && !(probe instanceof Date);
+                builtIn = !hasToPrim &&
+                  (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || probe instanceof Date);
+              }
             }
             if (!builtIn) return String(arg);
             return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, compact: 3, bare: true });
@@ -6808,6 +6888,15 @@
             validateStream,
           );
         }
+        // Node DECIDES here and APPLIES at the end -- it does not return
+        // early. The format-table walk below still runs either way, so an
+        // unknown format is ERR_INVALID_ARG_VALUE even when the answer is
+        // "no colour". Probe-verified on v22.22.2 with stdout piped:
+        // styleText('red','hello') -> "hello", styleText('nope','hello') ->
+        // ERR_INVALID_ARG_VALUE. An early return here would swallow that
+        // throw (and break conformance case 39 / the e2e unknown_throws
+        // assertion, which is exactly what that case exists to catch).
+        let skipColorize = false;
         if (validateStream) {
           // A stream-shaped object has write()/on(); reject anything else
           // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
@@ -6826,9 +6915,15 @@
               stream,
             );
           }
+          // oam used to colorize unconditionally once the stream SHAPE checked
+          // out, never asking whether the destination could render colour. So
+          // `oam script.js | cat` emitted raw SGR where node emits plain text
+          // -- the divergence chalk, supports-color, ora and cli-table3 all
+          // ride on. validateStream:false still colorizes, which is node's
+          // behaviour too: opting out of the stream check opts out of the
+          // decision that check feeds.
+          skipColorize = !shouldColorize(stream);
         }
-        // oam cannot meaningfully introspect the stream's TTY-ness here; once a
-        // valid stream is present, colorize (validateStream:false skips this).
 
         const formatArray = Array.isArray(format) ? format : [format];
         const codeList = [];
@@ -6873,7 +6968,10 @@
         for (let i = codeList.length - 1; i >= 0; i--) {
           closeCodes += escapeStyleCode(codeList[i][1]);
         }
-        return `${openCodes}${processedText}${closeCodes}`;
+        // node returns the ORIGINAL text on the skip path, not processedText:
+        // with no codes to open there is nothing for the embedded-close-code
+        // rewrite above to have been for.
+        return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
       },
       log: function utilLog() {
         var d = new Date();
@@ -6949,49 +7047,73 @@
     };
   };
 
+  // ---- colour capability (port of node internal/util/colors.js) -----------
+  // THREE surfaces have to agree about whether this process may emit SGR:
+  // assert's diff colours, util.styleText, and tty.WriteStream#hasColors.
+  // They used to disagree -- assert consulted this pair while styleText
+  // colorized unconditionally and hasColors() was hardcoded true -- so a
+  // piped `oam script.js | cat` got a plain assert diff next to a
+  // fully-escaped styleText string. One definition, at module scope, is the
+  // fix; the assert factory now consumes these rather than owning them.
+  //
+  // process.env is re-read on every call so a test that flips NO_COLOR /
+  // NODE_DISABLE_COLORS mid-run is honored.
+  function colorDepthFor(stream) {
+    const env = process.env;
+    // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
+    if (env.FORCE_COLOR !== undefined) {
+      switch (env.FORCE_COLOR) {
+        case "":
+        case "1":
+        case "true":
+          return 4;
+        case "2":
+          return 8;
+        case "3":
+          return 24;
+        default:
+          return 1;
+      }
+    }
+    if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+      return 1;
+    }
+    if (!stream || !stream.isTTY) return 1;
+    if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
+    return 4;
+  }
+
+  function shouldColorize(stream) {
+    if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
+    return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
+  }
+
   // --------------------------------------------------------------- assert
   registry.factories["util/types"] = () => registry.get("util").types;
 
   registry.factories["assert/strict"] = () => registry.get("assert").strict;
+
+  // node's internal/assert/myers_diff export set, published by the assert
+  // factory below (see registry.factories["internal/assert/myers_diff"]).
+  // The port cannot be hoisted out of that factory: it closes over the
+  // factory-local colors / codes / kNopLinesToCollapse / OP_* state, and
+  // those are the same values that shape oam's real assert output.
+  let myersDiffModule;
 
     registry.factories.assert = () => {
     const util = registry.get("util");
     const deepEqual = util._deepEqual;
 
     // ---- colors (port of node internal/util/colors.js) ----------------------
-    // Re-read from process.env on every refresh() so a test that flips
-    // NO_COLOR / NODE_DISABLE_COLORS mid-run is honored.
-    function colorDepthFor(stream) {
-      const env = process.env;
-      // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
-      if (env.FORCE_COLOR !== undefined) {
-        switch (env.FORCE_COLOR) {
-          case "":
-          case "1":
-          case "true":
-            return 4;
-          case "2":
-            return 8;
-          case "3":
-            return 24;
-          default:
-            return 1;
-        }
-      }
-      if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
-        return 1;
-      }
-      if (!stream || !stream.isTTY) return 1;
-      if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
-      return 4;
-    }
+    // colorDepthFor / shouldColorize are module scope now (search "colour
+    // capability" above) -- util.styleText and the tty WriteStream decorator
+    // answer from the SAME pair, so the three surfaces cannot disagree.
+    // Kept as an own property here because refresh() and node's own
+    // internal/util/colors shape both expose it off the colors object.
     const colors = {
       blue: "", green: "", white: "", red: "", gray: "", yellow: "", clear: "", reset: "",
       hasColors: false,
-      shouldColorize(stream) {
-        if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
-        return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
-      },
+      shouldColorize,
       refresh() {
         let hasColors = false;
         try {
@@ -8406,6 +8528,12 @@
       },
     );
     assert.strict.strict = assert.strict;
+
+    // Exactly node's three internal/assert/myers_diff exports -- no more, no
+    // less. Deliberately NOT attached to `assert` itself: extra own
+    // enumerable keys there would change the public export surface and trip
+    // the builtin export-parity gate.
+    myersDiffModule = { myersDiff, printMyersDiff, printSimpleMyersDiff };
     return assert;
   };
 
@@ -11158,7 +11286,17 @@
       stream.fd = fd;
       if (!isTTY) return stream; // non-TTY: plain Writable, no isTTY/columns (node parity)
       stream.isTTY = true;
-      stream.hasColors = () => true;
+      // node: hasColors([count][, env]) -> count <= 2 ** getColorDepth(),
+      // count defaulting to 16. This was hardcoded `() => true`, which
+      // claimed 16-colour support even under NO_COLOR / NODE_DISABLE_COLORS
+      // / TERM=dumb, and answered true for hasColors(2 ** 24) on a plain
+      // 4-bit terminal. Same colorDepthFor that assert's colours and
+      // util.styleText consult, so the three agree. isTTY is untouched --
+      // this stream IS a TTY, it just may not be allowed to colour.
+      stream.hasColors = (count) => {
+        const n = typeof count === "number" ? count : 16;
+        return n <= 2 ** colorDepthFor(stream);
+      };
       const readSize = () => natives.ttyGetWinSize(fd);
       Object.defineProperties(stream, {
         columns: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[0] : undefined; } },
@@ -11563,11 +11701,25 @@
       },
       hrtime: Object.assign(
         (prev) => {
+          // Node validates the optional previous tuple before reading the
+          // clock (probe-verified against v22.22.2): anything that is not an
+          // Array is ERR_INVALID_ARG_TYPE, and an Array whose length is not
+          // exactly 2 is ERR_OUT_OF_RANGE. `undefined` -- not falsiness -- is
+          // what means "no argument" there, so hrtime(null) is a type error
+          // rather than a silent no-diff.
+          if (prev !== undefined) {
+            if (!Array.isArray(prev)) {
+              throw codes.ERR_INVALID_ARG_TYPE("time", "Array", prev);
+            }
+            if (prev.length !== 2) {
+              throw codes.ERR_OUT_OF_RANGE("time", 2, prev.length);
+            }
+          }
           const ns = natives.hrtimeNanos();
           const total = Number(ns);
           let secs = Math.floor(total / 1e9);
           let nanos = total % 1e9;
-          if (prev) {
+          if (prev !== undefined) {
             secs -= prev[0];
             nanos -= prev[1];
             if (nanos < 0) {
@@ -20393,24 +20545,73 @@
   };
 
   // ------------------------------------------------------------ inspector
-  // Node's `inspector` module: wire-level CDP is implemented in oam's Rust
-  // core; the JS module surface exposes open/close/url and a Session class
-  // so library detection code (clinic, node --inspect integrations) works.
+  // Node's `inspector` module, as a SURFACE-ONLY stub: the module and the
+  // Session class exist so library capability-detection (clinic, profiler
+  // wrappers, node --inspect integrations) can construct one and branch,
+  // but there is NO in-process CDP backend behind it. Everything here is
+  // shaped so a caller learns that rather than being told a comfortable
+  // lie -- see the two fabrications this replaced, documented inline.
+  //
+  // Attaching a real debugger is a CLI concern: `oam run --inspect` /
+  // `oam run --inspect-brk`.
   registry.factories.inspector = () => {
     const EventEmitter = registry.get("events");
+
+    // One message, one code, from both the post() errback and (should it ever
+    // gain one) any other seam that has to admit there is no session.
+    const notAvailable = () =>
+      applyNodeErrorShape(
+        new Error(
+          "Inspector is not available. oam has no in-process inspector " +
+            "session, so this command was never dispatched; run the script " +
+            "under `oam run --inspect` or `oam run --inspect-brk` to attach " +
+            "a debugger.",
+        ),
+        "ERR_INSPECTOR_NOT_AVAILABLE",
+      );
+
     class Session extends EventEmitter {
+      // Deliberately a working no-op: node throws ERR_INSPECTOR_NOT_CONNECTED
+      // from post() when connect() was never called, and a library that only
+      // constructs + connects a Session to see whether it can must still get
+      // through. Nothing is claimed by returning undefined.
       connect() {}
+      // Left exactly as found: a no-op. Node throws ERR_INSPECTOR_NOT_WORKER
+      // here when called off a worker thread, and this stub asserts nothing
+      // by returning undefined, but changing it is outside this change's
+      // scope -- flagged rather than silently altered.
       connectToMainThread() {}
       disconnect() {}
       post(method, params, cb) {
-        if (typeof params === "function") { cb = params; }
-        if (typeof cb === "function") queueMicrotask(() => cb(null, {}));
+        if (typeof params === "function") { cb = params; params = undefined; }
+        // WAS: `cb(null, {})` -- an errback saying "your CDP command
+        // succeeded" and handing back {} as the RESULT, for a command that
+        // was never sent anywhere. That is worse than a failure: a caller
+        // reads {} as the debugger's real answer (no scripts, no profile, no
+        // heap snapshot) and proceeds on it. Fail instead, and say why.
+        //
+        // Delivered on the same queueMicrotask tick the old success used, so
+        // callers' async shape is unchanged -- only the verdict is.
+        const err = notAvailable();
+        if (typeof cb === "function") { queueMicrotask(() => cb(err)); return; }
+        // No callback means the caller opted out of the response, exactly as
+        // in node, where a post() with no callback registers no handler and a
+        // failure is simply never observed. Nothing is claimed either way, so
+        // there is nothing to correct here -- and throwing out of a microtask
+        // would be an uncatchable crash node never produces.
       }
     }
-    let _opened = false;
-    function open(_port, _host, _wait) { _opened = true; }
-    function close() { _opened = false; }
-    function url() { return _opened ? "ws://127.0.0.1:9229/0" : undefined; }
+
+    // open()/close() stay no-ops. WAS: open() set a flag and url() then
+    // returned a hardcoded "ws://127.0.0.1:9229/0" -- a debugger endpoint for
+    // a socket nothing ever bound, which a caller would print, log, or hand
+    // to a client that then fails to connect for no visible reason. url() now
+    // answers undefined unconditionally, which is both the truth (no server
+    // was started) and a value every consumer already handles: it is exactly
+    // what node returns whenever no inspector is active.
+    function open(_port, _host, _wait) {}
+    function close() {}
+    function url() { return undefined; }
     function waitForDebugger() {}
     return { Session, open, close, url, waitForDebugger, console: globalThis.console || {} };
   };
@@ -22433,6 +22634,143 @@
 
   // internal/errors -- some packages (readable-stream, undici) import this
   registry.factories["internal/errors"] = () => ({ codes });
+
+  // internal/assert/myers_diff (--expose-internals) -- the SAME port that
+  // produces oam's real assert diffs, published under node's internal id.
+  // Registering it here short-circuits the internal/* vendor path in
+  // registry.get(), which would otherwise reach the "Cannot find module"
+  // throw. Forcing the assert factory first is what fills myersDiffModule.
+  registry.factories["internal/assert/myers_diff"] = () => {
+    registry.get("assert");
+    return myersDiffModule;
+  };
+
+  // internal/test/binding (--expose-internals) -- node's own door onto the
+  // native binding table. Export shape is exactly ['internalBinding',
+  // 'primordials'] (probe-verified against v22.22.2), and requiring it emits
+  // node's warning verbatim.
+  //
+  // THE CONTRACT: every namespace this returns is a Proxy that THROWS for any
+  // member oam does not genuinely back, and an unknown namespace throws too.
+  // Answering `undefined` would be the dishonest option -- a caller that
+  // feature-detects a native would walk on believing oam implements it, and a
+  // conformance test would fail somewhere far away from the real reason. The
+  // throw names exactly what is missing:
+  //   oam: no native binding for '<ns>.<member>'
+  //   oam: no native binding for '<ns>'
+  // Backed members are taken BY IDENTITY off the public surface that already
+  // implements them, so a binding cannot drift from its module.
+  registry.factories["internal/test/binding"] = (natives) => {
+    process.emitWarning(
+      "These APIs are for internal testing only. Do not use them.",
+      "internal/test/binding",
+    );
+
+    // Only string keys throw: symbol lookups (Symbol.toPrimitive,
+    // Symbol.toStringTag, ...) and Object.prototype plumbing are JS object
+    // mechanics, not claimed natives, so they resolve normally.
+    const bindingNamespace = (ns, backed) =>
+      new Proxy(backed, {
+        get(target, prop, receiver) {
+          if (typeof prop === "symbol" || Reflect.has(target, prop)) {
+            return Reflect.get(target, prop, receiver);
+          }
+          throw new Error(`oam: no native binding for '${ns}.${String(prop)}'`);
+        },
+      });
+
+    // __proto__: null so a namespace name that collides with an
+    // Object.prototype key ("constructor", "toString") is still unknown.
+    const builders = {
+      __proto__: null,
+
+      // Constants only. node's binding also carries fill/swap16/swap32/swap64,
+      // but node's take the buffer AS AN ARGUMENT ((buf, value, start, end,
+      // encoding) for fill); oam has only the Buffer.prototype methods, so
+      // publishing them under node's names would be wrong-arity adapters
+      // wearing a native's identity. They throw instead.
+      buffer: () => {
+        const buffer = registry.get("buffer");
+        return {
+          kMaxLength: buffer.kMaxLength,
+          kStringMaxLength: buffer.kStringMaxLength,
+          // node's byteLengthUtf8(str) -> utf8 byte length, string-only.
+          // Same signature, same answer, oam's real measurement behind it.
+          byteLengthUtf8: (str) => {
+            if (typeof str !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
+            }
+            return globalThis.Buffer.byteLength(str, "utf8");
+          },
+        };
+      },
+
+      // getLibuvNow only. node's binding also holds scheduleTimer /
+      // toggleTimerRef / toggleImmediateRef, which drive node's own JS timer
+      // list; oam's timer queue lives in Rust and has no such entry points.
+      timers: () => ({
+        // Node returns uv_now() -- the loop's cached millisecond clock, an
+        // integer that starts near zero. oam's uptime clock is the same
+        // shape and the same monotonic source the timer queue runs on.
+        getLibuvNow: () => Math.trunc(natives.uptimeMs()),
+      }),
+
+      // The isX predicates process.binding('util') already answers with, taken
+      // from that same call so the two cannot diverge, plus the two extra
+      // natives oam really has. node's other members (previewEntries,
+      // getCallSites, ...) have nothing behind them here.
+      util: () => {
+        const out = process.binding("util");
+        if (typeof natives.arrayBufferViewHasBuffer === "function") {
+          out.arrayBufferViewHasBuffer = natives.arrayBufferViewHasBuffer;
+        }
+        if (typeof natives.getProxyDetails === "function") {
+          // V8's Proxy [target, handler] slots -- the same native util.inspect
+          // reads so it can format a proxy without firing its traps. node's
+          // shape: one argument (or an explicit `true`) yields
+          // [target, handler], anything else yields just the target, a revoked
+          // proxy yields nulls, and a non-proxy yields undefined. The arity
+          // half of that rule has to live here, where the argument count is
+          // visible.
+          out.getProxyDetails = function getProxyDetails(value, showDetailed) {
+            return natives.getProxyDetails(value, arguments.length < 2 || showDetailed === true);
+          };
+        }
+        return out;
+      },
+    };
+
+    // node's internalBinding is memoized per namespace; match that.
+    const cache = new Map();
+    const internalBinding = (name) => {
+      const id = String(name);
+      if (cache.has(id)) return cache.get(id);
+      const build = builders[id];
+      if (typeof build !== "function") {
+        throw new Error(`oam: no native binding for '${id}'`);
+      }
+      const ns = bindingNamespace(id, build());
+      cache.set(id, ns);
+      return ns;
+    };
+
+    return {
+      internalBinding,
+      // oam's REAL primordials -- the 35-name set the vendored streams port
+      // runs on (js/vendor/oam-shims/primordials.js), not node's ~400. Behind
+      // the same honesty proxy: a name oam does not have throws instead of
+      // reading undefined. Enumeration (ObjectKeys/ReflectOwnKeys) is
+      // untrapped and reports the real set.
+      primordials: new Proxy(globalThis.__oamVendor._primordials, {
+        get(target, prop, receiver) {
+          if (typeof prop === "symbol" || Reflect.has(target, prop)) {
+            return Reflect.get(target, prop, receiver);
+          }
+          throw new Error(`oam: no primordial '${String(prop)}'`);
+        },
+      }),
+    };
+  };
 
   // ------------------------------------------------------------------ http2
   registry.factories.http2 = (natives) => {

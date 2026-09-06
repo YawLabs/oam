@@ -287,6 +287,7 @@ fn main() -> ExitCode {
         let mut eval_source: Option<String> = None;
         let mut saw_eval_flag = false;
         let mut bad_flag: Option<&str> = None;
+        let mut warned_abort_on_uncaught = false;
         while i < raw.len() {
             let arg = raw[i].as_str();
             if arg == "--pending-deprecation" {
@@ -442,6 +443,42 @@ fn main() -> ExitCode {
                         return ExitCode::from(9);
                     }
                 }
+            } else if arg == "--abort-on-uncaught-exception" {
+                // Recognized so a node-shaped launcher does not die at clap
+                // with exit 2, NOT implemented -- and the difference is worth
+                // one line of stderr.
+                //
+                // The whole value of this flag is that V8 aborts AT the throw
+                // site, with the throwing frame still on the stack, so a
+                // debugger breaks there or the OS writes a core dump. oam has
+                // no primitive to build that on: process.abort() is
+                // processExit(134) in js/node_compat.js -- not a raised
+                // SIGABRT, and not Windows' 0x80000003 exception breakpoint --
+                // and anything reachable from the uncaught-exception path
+                // already runs after the stack unwound. Forwarding the token
+                // to V8 is worse than doing nothing: oam catches on the Rust
+                // side, so V8 sees CAUGHT_BY_EXTERNAL, which is inside its
+                // abort condition -- it would abort on exceptions JS goes on
+                // to catch -- and rusty_v8 150 binds no
+                // SetAbortOnUncaughtExceptionCallback to narrow that.
+                //
+                // Hence: accepted, inert, and said out loud. Silent acceptance
+                // would be its own small lie -- somebody passing this flag is
+                // asking for a crash dump, and would otherwise get a clean
+                // exit code, no dump, and nothing explaining the gap.
+                // NODE_OPTIONS already tolerates the token (it falls through
+                // the allowlist in `apply_node_options_env`); this is the
+                // spelling a user types deliberately, so it gets the notice.
+                if !warned_abort_on_uncaught {
+                    warned_abort_on_uncaught = true;
+                    eprintln!(
+                        "oam: --abort-on-uncaught-exception is accepted for launcher \
+                         compatibility but is not implemented: oam reports the uncaught \
+                         exception and exits, it does not abort at the throw site, so no \
+                         core dump or debugger break is produced."
+                    );
+                }
+                i += 1;
             } else if let Some(v) = arg.strip_prefix("--eval=") {
                 saw_eval_flag = true;
                 eval_source = Some(v.to_string());

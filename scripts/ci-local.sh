@@ -179,11 +179,22 @@ else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/12 Clippy (-D warnings)"
+say "2/12 Clippy (-D warnings, --all-features)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
-if cargo clippy --workspace --all-targets -- -D warnings; then
-  ok "clippy clean"
+#
+# --all-features is load-bearing for step 10. The unsafe-budget scanner is
+# LEXICAL -- it counts every `unsafe` under src/ and tests/ whether or not the
+# current feature set compiles it. Without --all-features the 12 ConPTY unsafe
+# blocks in crates/oam_cli/tests/e2e.rs (cfg(all(windows, feature =
+# "conpty-e2e"))) count toward the oam_cli ceiling while never being seen by
+# undocumented_unsafe_blocks = deny -- i.e. the ratchet gates code the safety
+# lint never checked. The workspace has exactly two features (napi, already
+# default, and conpty-e2e), and the ConPTY module plus its windows-sys
+# dev-dependency are both cfg(windows)-gated, so this is a clean superset on
+# every leg.
+if cargo clippy --workspace --all-targets --all-features -- -D warnings; then
+  ok "clippy clean (all features)"
 else
   ko "clippy warnings above"
 fi

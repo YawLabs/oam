@@ -10694,6 +10694,19 @@ console.log('clone_deep_ref=' + (clone.c !== obj.c));
 clone.a = 99;
 console.log('original_a=' + obj.a);
 
+// util.styleText into a PIPE. Node suppresses the escapes here: styleText
+// consults shouldColorize(stream) on its default stream (process.stdout),
+// and this child's stdout is captured, so it is not a TTY. Asserting the
+// escapes were present was asserting oam's old always-colorize bug.
+const piped = util.styleText('red', 'hello');
+console.log('piped_has_escape=' + piped.includes('\x1b[31m'));
+console.log('piped_text=' + piped);
+
+// The same call with FORCE_COLOR set, which overrides the TTY check in
+// Node. Both directions are asserted so a regression in EITHER one --
+// colorizing into a pipe again, or losing colour entirely -- is caught.
+process.env.FORCE_COLOR = '1';
+
 // util.styleText single format
 const red = util.styleText('red', 'hello');
 console.log('red_has_escape=' + red.includes('\x1b[31m'));
@@ -10704,6 +10717,8 @@ console.log('red_has_text=' + red.includes('hello'));
 const boldRed = util.styleText(['bold', 'red'], 'hi');
 console.log('bold_red_has_bold=' + boldRed.includes('\x1b[1m'));
 console.log('bold_red_has_red=' + boldRed.includes('\x1b[31m'));
+
+delete process.env.FORCE_COLOR;
 
 // util.styleText with unknown format throws ERR_INVALID_ARG_VALUE (Node parity)
 let unknownCode = 'none';
@@ -10737,6 +10752,8 @@ console.log('clone_null=' + (structuredClone(null) === null));
         "clone_ref=true",
         "clone_deep_ref=true",
         "original_a=1",
+        "piped_has_escape=false",
+        "piped_text=hello",
         "red_has_escape=true",
         "red_has_reset=true",
         "red_has_text=true",
