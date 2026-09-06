@@ -41,6 +41,11 @@ tar = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 
+# Unix pty e2e (tests/e2e.rs, mod unix_pty): openpty + tcgetattr to put
+# `oam run` on a real terminal and check what setRawMode does to it.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"
