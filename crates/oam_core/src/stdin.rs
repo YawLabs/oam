@@ -616,6 +616,32 @@ mod tests {
     }
 
     #[test]
+    fn second_cancel_before_the_first_settles_is_a_noop() {
+        // DISCARD -> DISCARD: a switch back before the first discarded read
+        // has returned. The read is already marked, so the second cancel
+        // must not re-mark it, must not even read its cursor, and must leave
+        // the first cancel's cursor for the settle -- which happens once.
+        let gate = ReadGate::new();
+        gate.begin();
+        assert_eq!(gate.arm_cancel(|| Some(CURSOR)), Some(0));
+        assert_eq!(
+            gate.arm_cancel(|| unreachable!("a second cancel must not consult its cursor")),
+            None
+        );
+        assert!(gate.is_pending(), "still marked, still in flight");
+        assert_eq!(
+            gate.settle_discard(2),
+            Some(CURSOR),
+            "the first cancel's cursor survives the second"
+        );
+        assert_eq!(gate.generation(), 1, "settled exactly once");
+        assert!(
+            !gate.mark_discard(),
+            "nothing left to cancel after the settle"
+        );
+    }
+
+    #[test]
     fn disarm_cancel_lets_the_read_deliver_and_forgets_the_cursor() {
         let gate = ReadGate::new();
         gate.begin();
