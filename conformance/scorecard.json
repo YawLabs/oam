@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "c4bd47b+wip",
+  "commit": "55fa51b+wip",
   "oamVersion": "oam 0.13.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 98,
-      "total": 98,
+      "pass": 99,
+      "total": 99,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -412,6 +412,10 @@
         },
         {
           "case": "96-readline-question-close-abort.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "97-stdin-ref-and-destroy.mjs",
           "status": "pass"
         }
       ]
