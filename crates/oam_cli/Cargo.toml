@@ -18,6 +18,11 @@ default = ["napi"]
 # With it off, no `.def` / `--export-dynamic` link arg is emitted and the
 # binary exports no `napi_*` symbol at all.
 napi = ["oam_engine/napi"]
+# The Windows pseudoconsole e2e (tests/e2e.rs, mod conpty). Off by default:
+# the harness is real but unfinished -- it cannot yet hand the child a
+# writable console input handle, so the raw-mode assertions are ignored.
+# YawLabs/oam#109.
+conpty-e2e = []
 
 [dependencies]
 # default-features = false so `--no-default-features` on THIS crate actually
@@ -45,6 +50,18 @@ base64 = { workspace = true }
 # `oam run` on a real terminal and check what setRawMode does to it.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# Windows pseudoconsole e2e (tests/e2e.rs, mod conpty): CreatePseudoConsole +
+# an EXTENDED_STARTUPINFO child, so the raw-mode switch is exercised against a
+# real console rather than a pipe (a piped stdin never reaches the cancel).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
