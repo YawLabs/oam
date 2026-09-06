@@ -34,8 +34,10 @@
 //!
 //! Unix needs none of this: a read blocked in canonical mode picks up a
 //! termios change on its own (Linux wakes the reader from `tcsetattr`; BSD
-//! re-checks `ICANON` when the next byte arrives), which is also all libuv
-//! does there. See the unix `tty_set_raw_mode` in oam_engine's node_ops.
+//! does not wake, and re-checks `ICANON` when the next byte arrives), which
+//! is also all libuv does there. The Linux half is measured, the BSD half is
+//! read off the source -- see the unix `tty_set_raw_mode` in oam_engine's
+//! node_ops, which carries the full caveat.
 //!
 //! One reader is assumed: the JS Readable never has two `_read`s in flight,
 //! and nothing else in the runtime reads stdin while a program runs.

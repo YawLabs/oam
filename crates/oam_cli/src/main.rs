@@ -2215,6 +2215,12 @@ fn run_file_with_flags(
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
             if let Some(code) = sub_code {
+                // This return skips `emit_process_exit`, so the JS 'exit'
+                // listeners never run -- including the one that puts the
+                // terminal back into cooked mode. Drain the hooks by hand.
+                // Hooks only: the caller still renders `diagnostics`, and the
+                // artifact sweep can wait for the normal exit path.
+                oam_engine::run_exit_hooks();
                 return Err((diagnostics, code));
             }
             // Regular fatal: Node forces process.exitCode = 1 at
@@ -2759,6 +2765,8 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
             if let Some(code) = sub_code {
+                // Skips `emit_process_exit` -- see the run_file site above.
+                oam_engine::run_exit_hooks();
                 return ExitCode::from(code);
             }
             let _ = rt.execute_script(
@@ -2902,6 +2910,8 @@ fn run_embedded(source: &str, bytecode: Option<Vec<u8>>, args: Vec<String>) -> E
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok());
             if let Some(code) = sub_code {
+                // Skips `emit_process_exit` -- see the run_file site above.
+                oam_engine::run_exit_hooks();
                 return ExitCode::from(code);
             }
             let _ = rt.execute_script(

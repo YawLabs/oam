@@ -8253,9 +8253,21 @@ mod unix_pty {
             )
         };
         assert_eq!(rc, 0, "openpty");
+        // `openpty` takes no flags, so unlike anything Rust opens it hands back
+        // two INHERITABLE descriptors: every `oam` spawned below would get the
+        // raw master and slave on top of its three stdio dups, and -- these
+        // tests run concurrently -- the other tests' ptys too. Nothing depends
+        // on that today, which is exactly why it is worth closing: it is the
+        // invariant that makes "wait for the master to EOF" impossible, since
+        // the last slave would not close until every unrelated child exited.
+        // The child's own stdio is unaffected: `Stdio::from(OwnedFd)` lands via
+        // dup2, and a dup2'd descriptor does not carry FD_CLOEXEC.
+        //
         // SAFETY: both descriptors were just handed out by openpty and are
-        // owned by nothing else.
+        // owned by nothing else; F_SETFD takes an integer flag, no pointers.
         unsafe {
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
             Pty {
                 master: OwnedFd::from_raw_fd(master),
                 slave: OwnedFd::from_raw_fd(slave),
@@ -8281,18 +8293,131 @@ mod unix_pty {
         assert_eq!(rc, 0, "tcsetattr");
     }
 
-    fn same_termios(a: &libc::termios, b: &libc::termios) -> bool {
-        a.c_iflag == b.c_iflag
-            && a.c_oflag == b.c_oflag
-            && a.c_cflag == b.c_cflag
-            && a.c_lflag == b.c_lflag
-            && a.c_cc[..] == b.c_cc[..]
+    /// The `c_lflag` bits the BSD kernel maintains behind the caller's back.
+    ///
+    /// XNU's `ttioctl_locked` sets `PENDIN` ("retype the pending input at the
+    /// next read") when an incoming termios flips `ICANON` from off to on --
+    /// guarded on the TRANSITION, `ISSET(t->c_lflag, ICANON) !=
+    /// ISSET(tp->t_lflag, ICANON)`, not on the incoming value -- and then ends
+    /// with `tp->t_lflag = t->c_lflag | ISSET(tp->t_lflag, PENDIN)`
+    /// (bsd/kern/tty.c; FreeBSD's tty.c is the same lineage). That trailing OR
+    /// is also why no later `tcsetattr` can scrub the bit back off.
+    ///
+    /// So every raw-mode restore reads it back. One call would dodge it -- the
+    /// kernel skips the branch for `TIOCSETAF`, i.e. `TCSAFLUSH` -- and
+    /// restoring that way would be worse, not better: `TIOCSETAF` runs
+    /// `ttyflush(tp, FREAD)`, destroying the type-ahead entered while the raw
+    /// program was running, and libuv restores with `TCSADRAIN`
+    /// (src/unix/tty.c), which is what oam matches. The strict comparison this
+    /// replaces was one only a non-node-faithful restore could have passed.
+    ///
+    /// That this is kernel bookkeeping rather than an oam bug is measured, not
+    /// assumed: on macOS 26.6 / arm64, node v22.23.1 driving the same script
+    /// through the same pty leaves a termios identical to oam's in every field
+    /// compared here -- `PENDIN` and all. Linux's n_tty never writes the bit
+    /// back into the termios, so this is zero there and the Linux leg goes on
+    /// comparing `c_lflag` whole either way.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    const KERNEL_LFLAG: libc::tcflag_t = libc::PENDIN;
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
+    const KERNEL_LFLAG: libc::tcflag_t = 0;
+
+    /// Every field of `actual` that differs from `expected`, named.
+    ///
+    /// The naming is the point: the first macOS run of these tests failed on a
+    /// bare "they differ", which said nothing about WHICH of six flag words and
+    /// twenty control characters had moved, and pinning it to one bit took a
+    /// hand-built pty probe on the mac leg. A future divergence reads its own
+    /// diagnosis out of the panic.
+    fn termios_diff(
+        actual: &libc::termios,
+        expected: &libc::termios,
+        ignore_kernel_lflag: bool,
+    ) -> Vec<String> {
+        let mut diffs = Vec::new();
+        let lflag = |l: libc::tcflag_t| {
+            if ignore_kernel_lflag {
+                l & !KERNEL_LFLAG
+            } else {
+                l
+            }
+        };
+        for (name, a, e) in [
+            ("c_iflag", actual.c_iflag, expected.c_iflag),
+            ("c_oflag", actual.c_oflag, expected.c_oflag),
+            ("c_cflag", actual.c_cflag, expected.c_cflag),
+            ("c_lflag", lflag(actual.c_lflag), lflag(expected.c_lflag)),
+        ] {
+            if a != e {
+                diffs.push(format!(
+                    "{name} {a:#010x} != {e:#010x} (xor {:#010x})",
+                    a ^ e
+                ));
+            }
+        }
+        for (i, (a, e)) in actual.c_cc.iter().zip(expected.c_cc.iter()).enumerate() {
+            if a != e {
+                diffs.push(format!("c_cc[{i}] {a:#04x} != {e:#04x}"));
+            }
+        }
+        // The speeds are what a BSD `TIOCSETA` handler is likeliest to
+        // normalise rather than store verbatim (a zero `c_ispeed` gets filled
+        // in from `c_ospeed`), so they belong inside a restore check.
+        for (name, a, e) in [
+            ("c_ispeed", actual.c_ispeed, expected.c_ispeed),
+            ("c_ospeed", actual.c_ospeed, expected.c_ospeed),
+        ] {
+            if a != e {
+                diffs.push(format!("{name} {a} != {e}"));
+            }
+        }
+        diffs
+    }
+
+    /// A termios the runtime RESTORED matches the one it found.
+    ///
+    /// `KERNEL_LFLAG` is excluded: a restore necessarily flips `ICANON` back
+    /// on, and on BSD that transition sets `PENDIN` whatever was written.
+    fn assert_termios_restored(actual: &libc::termios, expected: &libc::termios, what: &str) {
+        let diffs = termios_diff(actual, expected, true);
+        assert!(diffs.is_empty(), "{what}: {}", diffs.join(", "));
+    }
+
+    /// A termios NOTHING touched is byte-identical, `PENDIN` included.
+    ///
+    /// Deliberately strict, and the asymmetry with `assert_termios_restored` is
+    /// the whole point: with no enable there is no `ICANON` transition, so on
+    /// BSD the bit turning up here IS the kernel's receipt that a switch
+    /// happened -- the precise negation of what the caller is asserting.
+    /// Masking it would discard the one signal this check exists to read.
+    fn assert_termios_untouched(actual: &libc::termios, expected: &libc::termios, what: &str) {
+        let diffs = termios_diff(actual, expected, false);
+        assert!(diffs.is_empty(), "{what}: {}", diffs.join(", "));
     }
 
     struct Session {
         child: Child,
         master: std::fs::File,
         seen: Arc<Mutex<Vec<u8>>>,
+        /// Why the pump stopped, once it has. A dead pump makes every later
+        /// `wait_for` burn its whole deadline and report "never saw ...",
+        /// which reads as a runtime hang rather than a harness fault -- the
+        /// most expensive way for a remote leg to fail. Naming the cause turns
+        /// that into a one-line diagnosis.
+        pump_stopped: Arc<Mutex<Option<String>>>,
     }
 
     /// `oam run <script>` with the pty slave as all three stdio, and a pump
@@ -8314,23 +8439,35 @@ mod unix_pty {
             .expect("spawn oam on the pty");
         let master = std::fs::File::from(pty.master.try_clone().expect("dup master"));
         let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let pump_stopped = Arc::new(Mutex::new(None::<String>));
         {
             let mut reader = std::fs::File::from(pty.master.try_clone().expect("dup master"));
             let seen = Arc::clone(&seen);
+            let stopped = Arc::clone(&pump_stopped);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
-                loop {
+                let reason = loop {
                     match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                        Ok(n) if n > 0 => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                        // Transient, and it must NOT end the pump: one EINTR
+                        // used to kill it for the rest of the session.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        // Both unreachable while the parent holds `pty.slave`:
+                        // the master only reports the LAST slave closing, which
+                        // is EOF on macOS and EIO on linux. Kept apart anyway,
+                        // so the two never get conflated again.
+                        Ok(_) => break "the master reported EOF".to_string(),
+                        Err(e) => break format!("the master read failed: {e}"),
                     }
-                }
+                };
+                *stopped.lock().unwrap() = Some(reason);
             });
         }
         Session {
             child,
             master,
             seen,
+            pump_stopped,
         }
     }
 
@@ -8347,10 +8484,15 @@ mod unix_pty {
                 if out.contains(needle) {
                     return out;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "never saw {needle:?}; terminal so far: {out:?}"
-                );
+                if Instant::now() >= deadline {
+                    let pump = self
+                        .pump_stopped
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "still running".to_string());
+                    panic!("never saw {needle:?} (pump: {pump}); terminal so far: {out:?}");
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -8361,9 +8503,35 @@ mod unix_pty {
             self.master.flush().unwrap();
         }
 
-        fn finish(mut self) -> String {
-            let status = self.child.wait().expect("oam exits");
+        /// Wait for oam and hand back whatever status it exited with.
+        fn finish_status(mut self) -> (std::process::ExitStatus, String) {
+            // Bounded, where a bare `wait()` was not. The child's last act on
+            // the pty is a TCSADRAIN restore, which blocks until the output
+            // queue drains -- i.e. until the pump reads it -- so a stalled pump
+            // wedges this forever. The mac leg is where that hurts most:
+            // build-remote.sh warns the host may carry neither `timeout` nor
+            // `gtimeout`, and there an unbounded wedge hangs the whole release
+            // run with no attribution instead of failing one named test.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                match self.child.try_wait().expect("try_wait") {
+                    Some(status) => break status,
+                    None if Instant::now() >= deadline => {
+                        let out = self.output();
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        panic!("oam never exited within 30s; terminal so far: {out:?}");
+                    }
+                    None => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
             let out = self.output();
+            (status, out)
+        }
+
+        /// The common case: oam is expected to exit 0.
+        fn finish(self) -> String {
+            let (status, out) = self.finish_status();
             assert!(status.success(), "oam exited {status}: {out:?}");
             out
         }
@@ -8421,9 +8589,10 @@ process.stdin.once('data', (d) => {
         );
         s.wait_for("[raw off]");
         s.finish();
-        assert!(
-            same_termios(&termios_of(&pty.slave), &original),
-            "setRawMode(false) restores the termios the pty had"
+        assert_termios_restored(
+            &termios_of(&pty.slave),
+            &original,
+            "setRawMode(false) restores the termios the pty had",
         );
     }
 
@@ -8431,35 +8600,155 @@ process.stdin.once('data', (d) => {
     fn a_process_that_exits_raw_leaves_the_termios_restored() {
         let pty = open_pty();
         let original = termios_of(&pty.slave);
+        // The child blocks on a keystroke rather than exiting on a timer, so
+        // the raw window stays open until this thread closes it. With a 100 ms
+        // timer the "raw while it runs" assertion below had that whole budget
+        // to be scheduled, minus up to 20 ms of `wait_for` poll latency -- a
+        // wall-clock race, on the leg that runs ~390 tests and their children
+        // concurrently. Losing it restores the termios early and fails on
+        // ICANON: a second, more confusing failure in the test that just failed
+        // for a real reason.
         let script = write_temp(
             "pty_exit_raw.mjs",
             r#"
 process.stdin.setRawMode(true);
 process.stdout.write('[raw]');
-setTimeout(() => process.exit(0), 100);
+process.stdin.resume();
+process.stdin.once('data', () => process.exit(0));
 "#,
         );
-        let s = spawn_on_pty(&pty, &script);
+        let mut s = spawn_on_pty(&pty, &script);
         s.wait_for("[raw]");
         assert_eq!(
             termios_of(&pty.slave).c_lflag & libc::ICANON,
             0,
             "raw while it runs"
         );
+        s.send(b"x");
         s.finish();
-        assert!(
-            same_termios(&termios_of(&pty.slave), &original),
-            "the exit hook restores the termios a raw program left behind"
+        assert_termios_restored(
+            &termios_of(&pty.slave),
+            &original,
+            "the exit hook restores the termios a raw program left behind",
+        );
+    }
+
+    /// A second raw cycle restores what IT found, not what the first one saw.
+    ///
+    /// libuv re-reads the pre-raw termios into `tty->orig_termios` on every
+    /// cooked->raw transition; oam keeps a single snapshot, so the question is
+    /// whether the second enable picks up a tty that changed while it was
+    /// cooked. Holding the first snapshot forever silently reverted whatever
+    /// had touched the terminal since -- a child's `stty`, an inherited-stdio
+    /// editor, another library's tcsetattr -- and the shape that hits it is
+    /// the idiomatic defensive `process.on('exit', () =>
+    /// process.stdin.setRawMode(false))` every TUI ships.
+    ///
+    /// The parent standing in for "something else changed the tty" is the only
+    /// way to write this: nothing the child can do from JS is visible to the
+    /// runtime's own snapshot.
+    #[test]
+    fn a_second_raw_cycle_restores_what_it_found_not_the_first_snapshot() {
+        let pty = open_pty();
+        let script = write_temp(
+            "pty_two_cycles.mjs",
+            r#"
+process.stdin.setRawMode(true);
+process.stdin.setRawMode(false);
+process.stdout.write('[cycle1]');
+process.stdin.resume();
+process.stdin.once('data', () => {
+  process.stdin.setRawMode(true);
+  process.stdout.write('[on2]');
+  process.stdin.setRawMode(false);
+  // A redundant disable must be a no-op, not a second restore.
+  process.stdin.setRawMode(false);
+  process.stdout.write('[off2]');
+  process.exit(0);
+});
+"#,
+        );
+        let mut s = spawn_on_pty(&pty, &script);
+        s.wait_for("[cycle1]");
+        // Between the cycles, with the tty cooked: exactly where another
+        // writer would land.
+        let mut changed = termios_of(&pty.slave);
+        changed.c_lflag &= !libc::ECHOE;
+        set_termios(&pty.slave, &changed);
+        let changed = termios_of(&pty.slave);
+        // With a newline: between the cycles the tty is COOKED, so a bare byte
+        // sits in the line buffer (and gets echoed) instead of waking the
+        // child's read. That is the whole point of the state being restored.
+        s.send(
+            b"x
+",
+        );
+        s.wait_for("[off2]");
+        s.finish();
+        assert_termios_restored(
+            &termios_of(&pty.slave),
+            &changed,
+            "the second cycle restores the termios IT found, not the first cycle's",
+        );
+    }
+
+    /// Cooked mode comes back even on an exit that never emits `'exit'`.
+    ///
+    /// The fatal sub-codes skip the event by design (node's
+    /// TriggerUncaughtException refuses to run when `_fatalException` is not a
+    /// function, and exits 6 without emitting), so the JS listener that
+    /// restores the terminal never runs. Only the runtime's own exit hook
+    /// covers it -- and a shell left raw is the one failure a user cannot
+    /// undo by waiting.
+    #[test]
+    fn a_fatal_sub_code_exit_still_restores_the_termios() {
+        let pty = open_pty();
+        let original = termios_of(&pty.slave);
+        let script = write_temp(
+            "pty_fatal_subcode.mjs",
+            r#"
+process.stdin.setRawMode(true);
+process.stdout.write('[raw]');
+process._fatalException = 1;
+setTimeout(() => { throw new Error('fatal'); }, 10);
+"#,
+        );
+        let s = spawn_on_pty(&pty, &script);
+        s.wait_for("[raw]");
+        let (status, out) = s.finish_status();
+        assert_eq!(
+            status.code(),
+            Some(6),
+            "want the fatal sub-code path, not a normal exit: {out:?}"
+        );
+        assert_termios_restored(
+            &termios_of(&pty.slave),
+            &original,
+            "the exit hook restores cooked mode even when 'exit' never fires",
         );
     }
 
     #[test]
     fn disabling_raw_mode_that_was_never_enabled_touches_nothing() {
         let pty = open_pty();
-        let mut marked = termios_of(&pty.slave);
+        let original = termios_of(&pty.slave);
+        let mut marked = original;
         // Something a restore-to-defaults would undo: no erase/kill echo.
         marked.c_lflag &= !(libc::ECHOE | libc::ECHOK);
         set_termios(&pty.slave, &marked);
+        // Re-read, so the baseline is what the kernel STORED and not what it
+        // was handed: a BSD `TIOCSETA` handler is free to write back something
+        // other than its argument -- the whole `PENDIN` story, one `tcsetattr`
+        // earlier. Baselining on the argument lets this test pass or fail for
+        // a reason that has nothing to do with oam.
+        let marked = termios_of(&pty.slave);
+        // ...and the mark has to have taken, or the assertion below is a
+        // tautology. It clears two bits on linux and one on macOS, whose
+        // TTYDEF_LFLAG carries ECHOKE rather than ECHOK.
+        assert_ne!(
+            marked.c_lflag, original.c_lflag,
+            "the mark must change something for this test to mean anything"
+        );
         let script = write_temp(
             "pty_off_only.mjs",
             r#"
@@ -8471,9 +8760,10 @@ process.exit(0);
         let s = spawn_on_pty(&pty, &script);
         s.wait_for("[off true false]");
         s.finish();
-        assert!(
-            same_termios(&termios_of(&pty.slave), &marked),
-            "nothing was enabled, so nothing is restored: the marks survive"
+        assert_termios_untouched(
+            &termios_of(&pty.slave),
+            &marked,
+            "nothing was enabled, so nothing is restored: the marks survive",
         );
     }
 }

@@ -979,10 +979,15 @@ pub fn register_exit_hook(hook: impl FnOnce() + Send + 'static) {
     guard.push(Box::new(hook));
 }
 
-/// Run every registered hook, then remove every registered artifact.
-/// Idempotent -- both lists are taken, so a normal-path cleanup followed by
-/// an exit-path drain does no double work.
-pub fn run_exit_cleanup() {
+/// Run every registered hook, leaving the artifact list alone.
+///
+/// Split out of `run_exit_cleanup` for the exit paths that must restore
+/// PROCESS state -- the terminal's cooked mode, above all -- while a caller
+/// further up is still holding paths it may want on disk. `main`'s fatal
+/// sub-code returns render their diagnostics around this call, and the signal
+/// re-raise runs it with the process about to die by signal. Idempotent: the
+/// list is taken, so a later `run_exit_cleanup` does no double work.
+pub fn run_exit_hooks() {
     let hooks = {
         let mut guard = EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
@@ -992,6 +997,13 @@ pub fn run_exit_cleanup() {
         // it and keep going -- the process is exiting either way.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
     }
+}
+
+/// Run every registered hook, then remove every registered artifact.
+/// Idempotent -- both lists are taken, so a normal-path cleanup followed by
+/// an exit-path drain does no double work.
+pub fn run_exit_cleanup() {
+    run_exit_hooks();
     let paths = {
         let mut guard = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)

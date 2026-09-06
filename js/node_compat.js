@@ -11492,12 +11492,43 @@
         // echo and PROCESSED_INPUT/ISIG are OFF, so each keypress arrives as a
         // stdin 'data' byte and Ctrl-C is delivered as 0x03 (no SIGINT) -- the
         // signals-in item's console-ctrl handler naturally won't fire.
-        const okRaw = natives.ttySetRawMode(fd, enable);
-        if (okRaw) stream.isRaw = enable;
+        // 0 or the negative libuv errno, matching uv_tty_set_mode. Node's
+        // tty.ReadStream#setRawMode emits on failure and leaves isRaw alone
+        // (lib/tty.js); swallowing it left the program believing it was raw.
+        //
+        // Deliberate divergence in the ERROR OBJECT only: node builds it as
+        // `new ERR_SYSTEM_ERROR(err)` with `err` the bare integer, so its
+        // SystemError constructor destructures a number and every field comes
+        // out undefined ("A system error occurred: undefined returned
+        // undefined (undefined)"). The `code` is what programs branch on and
+        // it matches; the rest is populated here from the same libuv table
+        // getSystemErrorName reads, because a garbage message helps nobody.
+        const rawErrno = natives.ttySetRawMode(fd, enable);
+        if (rawErrno !== 0) {
+          const entry = uvErrnoTable(natives).get(rawErrno);
+          const name = entry === undefined ? "UNKNOWN" : entry[0];
+          const text = entry === undefined ? "unknown error" : entry[1];
+          const err = new Error(
+            `A system error occurred: uv_tty_set_mode returned ${name} (${text})`,
+          );
+          err.code = "ERR_SYSTEM_ERROR";
+          err.errno = rawErrno;
+          err.syscall = "uv_tty_set_mode";
+          err.info = { errno: rawErrno, code: name, message: text, syscall: "uv_tty_set_mode" };
+          stream.emit("error", err);
+          return stream;
+        }
+        stream.isRaw = enable;
         // Restore cooked mode on graceful exit so the shell isn't left raw
-        // (Node restores internally). Hard kills can't be covered.
+        // (Node restores internally). The exits that never emit 'exit' -- the
+        // stdout/stderr EPIPE bails, the OOM banner, a fatal sub-code, a
+        // re-raised signal -- are covered by the runtime's own exit hook
+        // instead. A true hard kill (SIGKILL) still cannot be.
         if (enable && !exitHooked) {
           exitHooked = true;
+          // Native-side is idempotent (a disable with nothing saved is a
+          // no-op), and the runtime arms its own hook for the exits that
+          // never emit 'exit' at all -- see arm_tty_restore_hook.
           process.on("exit", () => { if (stream.isRaw) natives.ttySetRawMode(fd, false); });
         }
         return stream;

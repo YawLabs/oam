@@ -135,6 +135,15 @@ pub fn start_signal(
                 // re-raise so the process dies exactly as it would have,
                 // and the parent observes the right terminating signal.
                 if default_terminates(signum) {
+                    // The process is about to die by signal, and a signal
+                    // death emits no JS 'exit' -- so the listeners that would
+                    // normally put the terminal back into cooked mode never
+                    // run. Drain the hooks first: a shell left raw by a
+                    // Ctrl-C'd TUI does not recover on its own. Hooks only,
+                    // not the artifact sweep -- what a terminating signal
+                    // should do about on-disk artifacts is a separate policy
+                    // question this does not answer.
+                    crate::run_exit_hooks();
                     // SAFETY: `libc::signal`/`libc::raise` take only the integer
                     // signal number and the well-known SIG_DFL constant -- no
                     // pointers into our memory. This runs only when the signal's

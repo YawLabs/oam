@@ -863,6 +863,48 @@ static WIN_STDIN_ORIG_MODE: std::sync::atomic::AtomicU32 =
 static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
     std::sync::Mutex::new(None);
 
+/// Whether the cooked-mode restore has been armed for this process.
+static TTY_RESTORE_HOOKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the cooked-mode restore for the exits JS never sees.
+///
+/// `process.on('exit')` in node_compat covers the graceful path, but oam has
+/// in-process exits that never emit it: the stdout/stderr EPIPE bails
+/// (`op_stdout_write` / `op_stderr_write`), the near-heap-limit OOM banner,
+/// `main`'s fatal sub-code returns, and the SIG_DFL re-raise for a signal
+/// whose JS listener was removed. Every one of those drains oam_core's exit
+/// hooks, so a single registration covers the lot -- and a terminal left raw
+/// is the one failure mode a shell never recovers from by itself.
+///
+/// Registered AT MOST ONCE. Hooks are drained, never deduplicated, so arming
+/// per enable would grow the list without bound under a TUI that toggles raw
+/// mode thousands of times.
+fn arm_tty_restore_hook(fd: i32) {
+    use std::sync::atomic::Ordering;
+    if TTY_RESTORE_HOOKED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    oam_core::register_exit_hook(move || {
+        // A no-op when the program already restored: a successful disable
+        // clears the saved mode, and both impls treat "nothing saved" as
+        // "already cooked".
+        let _ = tty_set_raw_mode(fd, false);
+    });
+}
+
+/// The last OS error in the shape node reports for a failed tty switch: the
+/// negative libuv number, which is what `uv_tty_set_mode` returns and what
+/// `ERR_SYSTEM_ERROR` formats. Call it IMMEDIATELY after the failing syscall,
+/// before anything else can move `errno` / `GetLastError`.
+fn last_os_tty_errno() -> i32 {
+    let err = std::io::Error::last_os_error();
+    let code = oam_core::node_error_code(&err);
+    // libuv's UV_UNKNOWN, which is also what node reports for an errno it
+    // cannot name.
+    oam_core::node_errno(code, &err).unwrap_or(-4094)
+}
+
 #[cfg(windows)]
 fn win_std_handle(fd: i32) -> isize {
     // ABI: the declared signature matches the Win32 GetStdHandle ABI
@@ -944,7 +986,7 @@ fn plan_console_switch(mode: u32, enable: bool, saved: Option<u32>) -> ConsoleSw
 }
 
 #[cfg(windows)]
-fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
     use std::sync::atomic::Ordering;
     // ABI: the signatures match the Win32 console ABI (GetConsoleMode:
     // HANDLE + out DWORD*; SetConsoleMode: HANDLE + by-value DWORD). Pointer
@@ -956,7 +998,8 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     }
     let h = win_std_handle(fd);
     if h == 0 || h == -1 {
-        return false;
+        // libuv's Windows EBADF: no console handle behind this descriptor.
+        return -4083;
     }
     let mut mode: u32 = 0;
     let from_cooked_echo;
@@ -966,7 +1009,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     // non-zero. SetConsoleMode takes the handle plus a by-value DWORD.
     unsafe {
         if GetConsoleMode(h, &mut mode) == 0 {
-            return false;
+            return last_os_tty_errno();
         }
         let saved = if enable {
             // Save the pre-raw mode once so setRawMode(false)/exit restores it.
@@ -982,7 +1025,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
             (orig != u32::MAX).then_some(orig)
         };
         let target = match plan_console_switch(mode, enable, saved) {
-            ConsoleSwitch::Keep => return true,
+            ConsoleSwitch::Keep => return 0,
             ConsoleSwitch::Set {
                 target,
                 from_cooked_echo: echo,
@@ -992,7 +1035,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
             }
         };
         if SetConsoleMode(h, target) == 0 {
-            return false;
+            return last_os_tty_errno();
         }
     }
     // The mode is flipped, but a stdin read that was ALREADY blocked keeps the
@@ -1017,7 +1060,13 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     if fd == 0 {
         oam_core::stdin::cancel_pending_console_read(from_cooked_echo);
     }
-    true
+    // Last, with the switch fully landed: the console is raw from here, so
+    // this is the point past which an exit that never reaches JS would strand
+    // it that way.
+    if enable {
+        arm_tty_restore_hook(fd);
+    }
+    0
 }
 
 #[cfg(all(test, windows))]
@@ -1231,17 +1280,36 @@ fn raw_mode_bits(cooked: TtyModeBits) -> TtyModeBits {
 }
 
 #[cfg(unix)]
-fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
+fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
     // No pending-read cancel here, unlike the Windows impl above. A stdin
     // read blocked in canonical mode picks up the termios change on its own:
     // Linux's n_tty_set_termios wakes tty->read_wait, and n_tty_read
     // re-evaluates icanon on every wakeup, so the blocked read returns the
     // very next byte typed after tcsetattr (verified on a 6.6 kernel: a read
     // blocked under ICANON returned a single 'h', no Enter, once the caller
-    // cleared ICANON). BSD/XNU's ttread does not wake on TIOCSETA, but it
-    // re-checks ICANON when the next byte arrives, so that byte is delivered
-    // raw as well. That is also all libuv does on unix -- uv_tty_set_mode is
-    // a bare tcsetattr -- so node and oam agree.
+    // cleared ICANON). BSD/XNU's ttread does NOT wake on TIOCSETA; the next
+    // byte to arrive is what re-checks ICANON, so that byte is delivered raw.
+    //
+    // That BSD sentence is read off the source, not measured the way the
+    // Linux one was, and it understates the case: bytes typed BEFORE the
+    // switch are sitting in the canonical queue too, so they are not
+    // delivered until a further byte arrives either. No test here can tell
+    // the two behaviours apart -- the pty case
+    // (`raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing`)
+    // sends its keystroke right after the switch, which satisfies both
+    // "woken at tcsetattr" and "woken by the next byte". Treat it as sourced.
+    //
+    // Either way it is all libuv does on unix -- uv_tty_set_mode is a bare
+    // tcsetattr -- so node and oam agree.
+    //
+    // The saved termios doubles as the mode: `Some` while raw, `None` while
+    // cooked. That is what gives libuv's two properties, which this used to
+    // lack -- `if (tty->mode == (int) mode) return 0;` (an unchanged mode does
+    // no ioctl at all) and a fresh `tcgetattr` into `tty->orig_termios` on
+    // every cooked->raw transition. Holding the FIRST-ever snapshot forever
+    // meant a later restore reverted whatever the tty had become since -- a
+    // child's `stty`, an inherited-stdio editor, another library's tcsetattr
+    // -- instead of what this enable actually found.
     //
     // SAFETY: `termios` is POSIX plain-old-data, so `zeroed()` is a valid
     // initial value that tcgetattr overwrites; its return is checked before
@@ -1250,35 +1318,68 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     // caller-supplied descriptor; a bad fd makes the syscalls fail cleanly
     // (non-zero return), never UB.
     unsafe {
+        // Held across the whole switch, so the mode check and the mode change
+        // cannot interleave. Poisoning is recovered rather than swallowed: a
+        // dropped `PoisonError` here used to skip the SAVE while still
+        // applying raw mode, after which every restore took the "nothing
+        // saved" arm and reported success with the terminal still raw.
+        let mut saved = UNIX_STDIN_ORIG_TERMIOS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if enable {
+            if saved.is_some() {
+                return 0; // already raw
+            }
             let mut term: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(fd, &mut term) != 0 {
-                return false;
-            }
-            // Save the pre-raw termios once so setRawMode(false)/exit restores it.
-            if let Ok(mut g) = UNIX_STDIN_ORIG_TERMIOS.lock()
-                && g.is_none()
-            {
-                *g = Some(term);
+                return last_os_tty_errno();
             }
             let mut raw_term = term;
             raw_mode_bits(TtyModeBits::of(&term)).apply_to(&mut raw_term);
             // TCSADRAIN, as libuv: output already queued finishes under the
             // flags it was written for before the switch lands.
-            libc::tcsetattr(fd, libc::TCSADRAIN, &raw_term) == 0
-        } else {
-            let orig = UNIX_STDIN_ORIG_TERMIOS.lock().ok().and_then(|g| *g);
-            match orig {
-                Some(o) => libc::tcsetattr(fd, libc::TCSADRAIN, &o) == 0,
-                None => true,
+            if libc::tcsetattr(fd, libc::TCSADRAIN, &raw_term) != 0 {
+                return last_os_tty_errno();
             }
+            // Only once the switch actually landed: a failed enable leaves
+            // the tty cooked, so there is nothing to restore and nothing to
+            // remember.
+            *saved = Some(term);
+            drop(saved);
+            arm_tty_restore_hook(fd);
+            0
+        } else {
+            let Some(orig) = *saved else {
+                return 0; // never enabled, or already restored
+            };
+            if libc::tcsetattr(fd, libc::TCSADRAIN, &orig) != 0 {
+                // Keep the snapshot: the tty is still raw, so a later attempt
+                // -- the exit hook, say -- must still be able to put it back.
+                return last_os_tty_errno();
+            }
+            *saved = None;
+            0
         }
     }
 }
 
 #[cfg(all(test, unix))]
 mod raw_mode_tests {
-    use super::{TtyModeBits, raw_mode_bits};
+    use super::{TtyModeBits, raw_mode_bits, tty_set_raw_mode};
+
+    /// The op's contract is `uv_tty_set_mode`'s: 0, or the negative libuv
+    /// errno the JS side turns into node's `ERR_SYSTEM_ERROR`. It used to be a
+    /// bare bool, and the JS side dropped the failure on the floor -- the
+    /// program went on believing it had a raw terminal.
+    ///
+    /// A descriptor that was never opened makes `tcgetattr` fail `EBADF`,
+    /// which libuv numbers `-EBADF` on POSIX. Nothing else in this binary
+    /// touches a real tty, so the saved-mode slot is empty and the call
+    /// reaches the syscall rather than the already-raw early return.
+    #[test]
+    fn a_failed_switch_reports_the_negative_libuv_errno() {
+        assert_eq!(tty_set_raw_mode(i32::MAX, true), -libc::EBADF);
+    }
 
     /// A cooked terminal as a shell hands it over: the POSIX defaults that
     /// bear on the recipe, plus a few flags cfmakeraw would have touched
@@ -1385,7 +1486,10 @@ fn op_tty_set_raw_mode(
 ) {
     let fd = args.get(0).int32_value(scope).unwrap_or(0);
     let enable = args.get(1).boolean_value(scope);
-    rv.set_bool(tty_set_raw_mode(fd, enable));
+    // 0 on success, else the negative libuv errno -- `uv_tty_set_mode`'s own
+    // contract, so the JS side can raise node's ERR_SYSTEM_ERROR shape rather
+    // than swallowing a bare `false`.
+    rv.set_int32(tty_set_raw_mode(fd, enable));
 }
 
 fn op_tty_get_win_size(
