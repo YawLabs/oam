@@ -869,7 +869,7 @@ entries below were executed on both runtimes unless marked.
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`. EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `x25519`, `ed448`, `x448`; all named curves. |
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
-| `TextDecoder` | **utf-8 only** (`fatal` and `ignoreBOM` honored). Any other label throws. | Full WHATWG label set. |
+| `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams queuing strategy | `highWaterMark` counts chunks; a custom `size()` is never called. | `size()` is consulted. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
 | `worker_threads.moveMessagePortToContext` | Throws `not supported in oam`. | Supported. |

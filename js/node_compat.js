@@ -82,15 +82,54 @@
     }
   }
 
+  // WHATWG Encoding "get an encoding": labels are ASCII-whitespace-trimmed
+  // and ASCII-lowercased before lookup. oam implements two of the standard's
+  // encodings -- utf-8 and windows-1252 -- and every label the standard maps
+  // onto them; every other label still throws, so the surface never claims an
+  // encoding oam cannot actually decode.
+  const encodingLabels = new Map();
+  for (const l of [
+    "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8",
+    "x-unicode20utf8",
+  ]) encodingLabels.set(l, "utf-8");
+  for (const l of [
+    "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819",
+    "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1",
+    "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252",
+  ]) encodingLabels.set(l, "windows-1252");
+
+  // index-windows-1252, pointers 0-31 (bytes 0x80-0x9F). Everything outside
+  // that window is its own code point, which is where windows-1252 and
+  // ISO-8859-1 differ -- the standard aliases the latter onto the former, so
+  // 0x80 is the euro sign, not U+0080.
+  const WIN1252_C1 = [
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+    0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+  ];
+
   class TextDecoder {
     constructor(label = "utf-8", options = {}) {
-      const canonical = String(label).toLowerCase();
-      if (canonical !== "utf-8" && canonical !== "utf8" && canonical !== "unicode-1-1-utf-8") {
-        throw new RangeError(
-          `TextDecoder: only utf-8 is supported in oam today (got '${label}')`,
+      // ASCII whitespace per the Encoding Standard: tab, LF, FF, CR, space.
+      const canonical = String(label)
+        .replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "")
+        .toLowerCase();
+      const encoding = encodingLabels.get(canonical);
+      if (encoding === undefined) {
+        // Node's shape for an unknown label: a RangeError carrying
+        // ERR_ENCODING_NOT_SUPPORTED, which feature-detecting callers branch
+        // on. The suffix is oam's own -- an encoding the standard defines but
+        // oam has not implemented (utf-16le, gbk, ...) lands here too, and
+        // saying so is more useful than pretending the label is unknown.
+        const err = new RangeError(
+          `The "${label}" encoding is not supported` +
+            " (oam implements utf-8 and windows-1252)",
         );
+        err.code = "ERR_ENCODING_NOT_SUPPORTED";
+        throw err;
       }
-      this.encoding = "utf-8";
+      this.encoding = encoding;
       this.fatal = options.fatal === true;
       this.ignoreBOM = options.ignoreBOM === true;
       this._pending = null; // carry-over bytes between stream:true chunks
@@ -104,6 +143,20 @@
       else if (ArrayBuffer.isView(input))
         bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
       else bytes = new Uint8Array(input);
+
+      if (this.encoding === "windows-1252") {
+        // Single-byte and total: every one of the 256 bytes maps to a code
+        // point, so there is no incomplete trailer to hold across a
+        // stream:true chunk, nothing for `fatal` to reject, and no BOM to
+        // strip (the Encoding Standard sniffs a BOM only for the UTF
+        // encodings).
+        let out = "";
+        for (let i = 0; i < bytes.length; i++) {
+          const b = bytes[i];
+          out += String.fromCharCode(b >= 0x80 && b <= 0x9f ? WIN1252_C1[b - 0x80] : b);
+        }
+        return out;
+      }
 
       if (this._pending !== null && this._pending.length > 0) {
         const joined = new Uint8Array(this._pending.length + bytes.length);
@@ -12374,6 +12427,12 @@
           // test-process-versions' hasUndici/hasAmaro with false, which
           // is the truth).
           node_builtin_shareable_builtins: Object.freeze([]),
+          // oam links V8 with its bundled FULL ICU (see icu_versions() in
+          // oam_engine/build.rs, which reads U_ICU_VERSION out of the pinned
+          // v8 crate's own headers), so every Intl constructor, locale-aware
+          // collation/casing and NFKD normalization is really there. Node's
+          // gypi publishes the integer 1; consumers coerce with !!.
+          v8_enable_i18n_support: 1,
         }),
       }),
       // Key ORDER is node's, not alphabetical: process.features is commonly
@@ -13732,90 +13791,81 @@
     // Legacy url.format: a WHATWG URL stringifies to .href; a plain object is
     // assembled from its components; a string is reparsed via the WHATWG URL.
     // Non-string/non-object input throws ERR_INVALID_ARG_TYPE.
+    // Serialize a WHATWG URL under url.format()'s four switches. Mirrors
+    // node's bindingUrl.format: drop the pieces that are switched off, then
+    // re-serialize -- but done as surgery on `href` rather than on component
+    // setters, because assigning a unicode hostname back to a URL would just
+    // re-run IDNA ToASCII and undo the `unicode: true` the caller asked for.
+    function formatWhatwgUrl(u, fragment, unicode, search, auth) {
+      let out = u.href;
+      if (u.hash) out = out.slice(0, out.length - u.hash.length);
+      if (u.search) out = out.slice(0, out.length - u.search.length);
+      const proto = u.protocol;
+      const rest = out.slice(proto.length);
+      // No "//" means an opaque path (tel:, data:, mailto:) -- no authority
+      // to rewrite, so unicode/auth are both no-ops, exactly as in node.
+      if (rest.startsWith("//")) {
+        const body = rest.slice(2);
+        const slash = body.indexOf("/");
+        const authority = slash === -1 ? body : body.slice(0, slash);
+        const tail = slash === -1 ? "" : body.slice(slash);
+        const at = authority.lastIndexOf("@");
+        let creds = at === -1 ? "" : authority.slice(0, at + 1);
+        let hostPort = at === -1 ? authority : authority.slice(at + 1);
+        if (!auth) creds = "";
+        if (unicode && u.hostname !== "") {
+          // "" means ToUnicode rejected it (an IP literal, a bracketed ipv6);
+          // keep the ASCII form rather than dropping the host on the floor.
+          const uni = globalThis.__oam.node.idnaToUnicode(u.hostname);
+          hostPort = (uni || u.hostname) + (u.port ? `:${u.port}` : "");
+        }
+        out = `${proto}//${creds}${hostPort}${tail}`;
+      }
+      if (search) out += u.search;
+      if (fragment) out += u.hash;
+      return out;
+    }
+
     function legacyFormat(urlObject, options) {
       if (typeof urlObject === "string") {
         // Node's legacy url.format(string) parses with the LEGACY parser and
         // formats with the LEGACY Url.format -- this round-trips slash-exactly
         // (e.g. 'fred:///s' stays 'fred:///s'), unlike the WHATWG URL which
-        // normalizes. (The WHATWG-URL-instance path below is unchanged.)
-        if (urlObject === "") return "";
-        return urlParse(urlObject, false, false).format();
-      } else if (urlObject instanceof Url) {
-        // A legacy Url instance (e.g. a resolveObject result) formats via its
-        // own faithful method, not the plain-object hand-assembly below.
-        return urlObject.format();
-      } else if (urlObject instanceof globalThis.URL) {
-        // fall through to WHATWG serializer below
-      } else if (urlObject === null || typeof urlObject !== "object") {
+        // normalizes.
+        urlObject = urlParse(urlObject);
+      } else if (typeof urlObject !== "object" || urlObject === null) {
         throw new codes.ERR_INVALID_ARG_TYPE(
           "urlObject",
           ["object", "string"],
           urlObject,
         );
-      }
-      if (urlObject instanceof globalThis.URL) {
-        const o = options || {};
-        const auth = o.auth !== false;
-        const fragment = o.fragment !== false;
-        const search = o.search !== false;
-        let ret = "";
-        ret += urlObject.protocol;
-        if (urlObject.host) {
-          ret += "//";
-          if (auth && (urlObject.username || urlObject.password)) {
-            ret += urlObject.username;
-            if (urlObject.password) ret += `:${urlObject.password}`;
-            ret += "@";
+      } else if (urlObject instanceof globalThis.URL) {
+        let fragment = true;
+        let unicode = false;
+        let search = true;
+        let auth = true;
+        if (options) {
+          if (
+            options === null ||
+            Array.isArray(options) ||
+            typeof options !== "object"
+          ) {
+            throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
           }
-          ret += urlObject.host;
-        } else if (urlObject.protocol === "file:") {
-          ret += "//";
+          // `!= null` on purpose: an explicitly-undefined switch keeps its
+          // default, but every other falsy value means false.
+          if (options.fragment != null) fragment = Boolean(options.fragment);
+          if (options.unicode != null) unicode = Boolean(options.unicode);
+          if (options.search != null) search = Boolean(options.search);
+          if (options.auth != null) auth = Boolean(options.auth);
         }
-        ret += urlObject.pathname;
-        if (search) ret += urlObject.search;
-        if (fragment) ret += urlObject.hash;
-        return ret;
+        return formatWhatwgUrl(urlObject, fragment, unicode, search, auth);
       }
-      // Legacy object form: assemble from components (subset Node supports).
-      let result = "";
-      let protocol = urlObject.protocol || "";
-      if (protocol && !protocol.endsWith(":")) protocol += ":";
-      result += protocol;
-      let host = "";
-      if (urlObject.host) host = urlObject.host;
-      else if (urlObject.hostname) {
-        host =
-          urlObject.hostname.includes(":") && urlObject.hostname[0] !== "["
-            ? `[${urlObject.hostname}]`
-            : urlObject.hostname;
-        if (urlObject.port) host += `:${urlObject.port}`;
-      }
-      let auth = "";
-      if (urlObject.auth) auth = urlObject.auth;
-      if (host || (protocol && protocol !== "" && urlObject.slashes !== false && host)) {
-        result += "//";
-      }
-      if (host) {
-        if (auth) result += `${auth}@`;
-        result += host;
-      }
-      let pathname = urlObject.pathname || "";
-      if (pathname && pathname[0] !== "/" && host) pathname = `/${pathname}`;
-      result += pathname;
-      let query = "";
-      if (urlObject.search) query = urlObject.search;
-      else if (urlObject.query && typeof urlObject.query === "object") {
-        const sp = new globalThis.URLSearchParams(urlObject.query);
-        const s = sp.toString();
-        if (s) query = `?${s}`;
-      } else if (typeof urlObject.query === "string" && urlObject.query) {
-        query = `?${urlObject.query}`;
-      }
-      if (query) result += query[0] === "?" ? query : `?${query}`;
-      let hash = urlObject.hash || "";
-      if (hash && hash[0] !== "#") hash = `#${hash}`;
-      result += hash;
-      return result;
+      // Legacy Url instances AND plain objects go through the same
+      // serializer node uses -- the one that knows 'mailto:' keeps its
+      // single colon while 'file:' grows a '//', which a from-scratch
+      // component assembly kept getting wrong.
+      return Url.prototype.format.call(urlObject);
     }
 
     function urlToHttpOptions(url) {
@@ -13858,28 +13908,91 @@
       "file", "file:", "ws", "ws:", "wss", "wss:",
     ]);
     // chars
-    const C_TAB = 9, C_LF = 10, C_FF = 12, C_CR = 13, C_SPACE = 32, C_DQUOTE = 34,
+    const C_TAB = 9, C_LF = 10, C_CR = 13, C_SPACE = 32, C_DQUOTE = 34,
       C_HASH = 35, C_PERCENT = 37, C_SQUOTE = 39, C_FSLASH = 47, C_QUESTION = 63,
       C_AT = 64, C_BSLASH = 92, C_CARET = 94, C_GRAVE = 96, C_LCURLY = 123,
       C_PIPE = 124, C_RCURLY = 125, C_SEMI = 59, C_LT = 60, C_GT = 62,
       C_NBSP = 160, C_ZWNBSP = 65279, C_COLON = 58;
-    // autoEscape set: chars in the path that must be percent-encoded.
-    const autoEscapeMap = {
-      "\t": "%09", "\n": "%0A", "\r": "%0D", " ": "%20", '"': "%22",
-      "'": "%27", "<": "%3C", ">": "%3E", "`": "%60",
-    };
+    // autoEscape set: every RFC 2396 delimiter/unwise char that must be
+    // percent-encoded in the post-host remainder, indexed by char code.
+    // Single quote is in there against XSS. Note '\' (%5C), '^' (%5E),
+    // '{|}' (%7B-%7D) and '`' (%60): a backslash AFTER the ?/# split is not
+    // rewritten to '/' by the loop above, so this is the only thing that
+    // encodes it.
+    const escapedCodes = [
+      /* 0 - 9 */ "", "", "", "", "", "", "", "", "", "%09",
+      /* 10 - 19 */ "%0A", "", "", "%0D", "", "", "", "", "", "",
+      /* 20 - 29 */ "", "", "", "", "", "", "", "", "", "",
+      /* 30 - 39 */ "", "", "%20", "", "%22", "", "", "", "", "%27",
+      /* 40 - 49 */ "", "", "", "", "", "", "", "", "", "",
+      /* 50 - 59 */ "", "", "", "", "", "", "", "", "", "",
+      /* 60 - 69 */ "%3C", "", "%3E", "", "", "", "", "", "", "",
+      /* 70 - 79 */ "", "", "", "", "", "", "", "", "", "",
+      /* 80 - 89 */ "", "", "", "", "", "", "", "", "", "",
+      /* 90 - 99 */ "", "", "%5C", "", "%5E", "", "%60", "", "", "",
+      /* 100 - 109 */ "", "", "", "", "", "", "", "", "", "",
+      /* 110 - 119 */ "", "", "", "", "", "", "", "", "", "",
+      /* 120 - 125 */ "", "", "", "%7B", "%7C", "%7D",
+    ];
     function autoEscapeStr(rest) {
-      let out = "";
-      for (let i = 0; i < rest.length; i++) {
-        const c = rest[i];
-        const esc = autoEscapeMap[c];
-        out += esc !== undefined ? esc : c;
+      let escaped = "";
+      let lastEscapedPos = 0;
+      for (let i = 0; i < rest.length; ++i) {
+        const escapedChar = escapedCodes[rest.charCodeAt(i)];
+        if (escapedChar) {
+          if (i > lastEscapedPos) escaped += rest.slice(lastEscapedPos, i);
+          escaped += escapedChar;
+          lastEscapedPos = i + 1;
+        }
       }
-      return out;
+      if (lastEscapedPos === 0) return rest;
+      if (lastEscapedPos < rest.length) escaped += rest.slice(lastEscapedPos);
+      return escaped;
     }
     function isIpv6Hostname(hostname) {
       return hostname.charCodeAt(0) === 91 /* [ */ &&
         hostname.charCodeAt(hostname.length - 1) === 93 /* ] */;
+    }
+
+    // The intersection of WHATWG "forbidden host code point" with the chars
+    // the host loop above scans for, plus ':' (protocol spoofing), '@' (auth
+    // confusion) and '[' / ']' (a non-ipv6 host reading as ipv6).
+    const forbiddenHostChars = /[\0\t\n\r #%/:<>?@[\\\]^|]/;
+    // ipv6 needs '[', ']' and ':' to be legal.
+    const forbiddenHostCharsIpv6 = /[\0\t\n\r #%/<>?@\\^|]/;
+
+    // UTS #46, off the same ada_idna the WHATWG parser uses. "" means
+    // "not a valid domain" -- the caller treats that as a spoofing attempt.
+    const toASCII = (domain) => globalThis.__oam.node.idnaToASCII(domain);
+
+    // DEP0170 fires exactly once per process, on the FIRST hostname the
+    // legacy parser truncates at a ':' -- i.e. a string carrying something
+    // that looks like a port but is not one ('https://evil.com:.example.com').
+    let warnInvalidPort = true;
+    // Truncate the hostname at the first char that cannot appear in one,
+    // moving the remainder to the front of the path. Deliberately a DENYLIST
+    // (/ \ # ? :) and not an allowlist: '*', '$' and ',' are not valid domain
+    // chars either, but the legacy parser leaves them for IDNA to reject, and
+    // an allowlist here silently rewrote 'x://0.0,1.1/' to host '0.0'.
+    function getHostname(self, rest, hostname, url) {
+      for (let i = 0; i < hostname.length; ++i) {
+        const code = hostname.charCodeAt(i);
+        const isValid = code !== C_FSLASH && code !== C_BSLASH &&
+          code !== C_HASH && code !== C_QUESTION && code !== C_COLON;
+        if (!isValid) {
+          if (warnInvalidPort && code === C_COLON) {
+            warnInvalidPort = false;
+            process.emitWarning(
+              `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
+              "DeprecationWarning",
+              "DEP0170",
+            );
+          }
+          self.hostname = hostname.slice(0, i);
+          return `/${hostname.slice(i)}${rest}`;
+        }
+      }
+      return rest;
     }
 
     function Url() {
@@ -13902,14 +14015,17 @@
         throw new codes.ERR_INVALID_ARG_TYPE("url", "string", url);
       }
       let hasHash = false;
+      let hasAt = false;
       let start = -1;
       let end = -1;
       let rest = "";
       let lastPos = 0;
       for (let i = 0, inWs = false, split = false; i < url.length; ++i) {
         const code = url.charCodeAt(i);
-        const isWs = code === C_SPACE || code === C_TAB || code === C_CR ||
-          code === C_LF || code === C_FF || code === C_NBSP || code === C_ZWNBSP;
+        // Node trims on EVERY C0 control plus space (`code < 33`), not just
+        // the named whitespace five -- so '\bhttp://example.com/\b' parses as
+        // a URL rather than a relative path.
+        const isWs = code < 33 || code === C_NBSP || code === C_ZWNBSP;
         if (start === -1) {
           if (isWs) continue;
           lastPos = start = i;
@@ -13921,6 +14037,9 @@
         }
         if (!split) {
           switch (code) {
+            case C_AT:
+              hasAt = true;
+              break;
             case C_HASH:
               hasHash = true;
             // falls through
@@ -13951,7 +14070,9 @@
         }
       }
 
-      if (!slashesDenoteHost && !hasHash) {
+      // `!hasAt` keeps '//user@host/path' off the fast path: an @ means the
+      // leading '//' is an authority, not two path segments.
+      if (!slashesDenoteHost && !hasHash && !hasAt) {
         const simplePath = simplePathPattern.exec(rest);
         if (simplePath) {
           this.path = rest;
@@ -13995,14 +14116,23 @@
         let nonHost = -1;
         for (let i = 0; i < rest.length; ++i) {
           switch (rest.charCodeAt(i)) {
-            case C_TAB: case C_LF: case C_CR: case C_SPACE: case C_DQUOTE:
+            case C_TAB: case C_LF: case C_CR:
+              // WHATWG URL strips tab/LF/CR outright; the legacy parser
+              // follows, so 'http://c\r\nd/e' has host 'cd'.
+              rest = rest.slice(0, i) + rest.slice(i + 1);
+              i -= 1;
+              break;
+            case C_SPACE: case C_DQUOTE:
             case C_PERCENT: case C_SQUOTE: case C_SEMI: case C_LT: case C_GT:
             case C_BSLASH: case C_CARET: case C_GRAVE: case C_LCURLY:
             case C_PIPE: case C_RCURLY:
               if (nonHost === -1) nonHost = i;
               break;
             case C_HASH: case C_FSLASH: case C_QUESTION:
-              if (hostEnd === -1) hostEnd = i;
+              // A host-ending char is ALSO a nonHost boundary -- without that
+              // the '@' case below could clear nonHost and swallow the path.
+              if (nonHost === -1) nonHost = i;
+              hostEnd = i;
               break;
             case C_AT:
               atSign = i;
@@ -14017,17 +14147,8 @@
           start = atSign + 1;
         }
         if (nonHost === -1) {
-          // No forbidden char in the host region: the host ends at the first
-          // host-ending char (hostEnd = first / ? #), or extends to the end of
-          // `rest` if there is none. (The loop broke at hostEnd, so anything
-          // past it is the path/query/hash and must stay in `rest`.)
-          if (hostEnd === -1) {
-            this.host = rest.slice(start);
-            rest = "";
-          } else {
-            this.host = rest.slice(start, hostEnd);
-            rest = rest.slice(hostEnd);
-          }
+          this.host = rest.slice(start);
+          rest = "";
         } else {
           this.host = rest.slice(start, nonHost);
           rest = rest.slice(nonHost);
@@ -14036,37 +14157,21 @@
         if (typeof this.hostname !== "string") this.hostname = "";
         const hostname = this.hostname;
         const ipv6Hostname = isIpv6Hostname(hostname);
-        // Host validation, matched to the LIVE node v22.22.2 binary
-        // (battery-probed; the published lib/url.js diverges, same story as
-        // node_dotenv.cc). Rules:
-        // 1. A bracket in a NON-ipv6 hostname is a hard ERR_INVALID_URL
-        //    (spoofing: could make a non-ipv6 host read as ipv6) -- checked
-        //    BEFORE truncation, or the evidence is gone ('a[b].com' throws).
-        // 2. A well-formed ipv6 [..] hostname throws if forbidden chars sit
-        //    inside the brackets ('[127.0.0.1 c8763]' throws, '[]' is fine).
-        // 3. Everything else truncates LENIENTLY at the first invalid char,
-        //    remainder to path ('evil.com:.example.com' -> path
-        //    '/:.example.com'), with a strict post-truncation backstop.
+        // Host validation. A non-ipv6 hostname truncates LENIENTLY at the
+        // first host-ending char and the remainder moves to the path
+        // ('evil.com:.example.com' -> hostname 'evil.com', path
+        // '/:.example.com'); everything else -- '*', '$', ',' included --
+        // stays in the hostname and is handed to IDNA, which is what decides
+        // whether it is a real domain. Brackets are NOT truncated on: they
+        // survive into the forbiddenHostChars backstop below, so a
+        // non-ipv6 'a[b].com' throws rather than being silently cut (that
+        // would let a hostname read as ipv6 to the next parser).
         const throwInvalidUrl = () => {
           const e = new codes.ERR_INVALID_URL();
           e.input = url;
           throw e;
         };
-        if (!ipv6Hostname) {
-          if (/[[\]]/.test(this.hostname)) throwInvalidUrl();
-          let cut = -1;
-          for (let i = 0; i < this.hostname.length; i++) {
-            const c = this.hostname.charCodeAt(i);
-            const valid = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
-              (c >= 48 && c <= 57) || c === 46 || c === 45 || c === 43 ||
-              c === 95 || c > 127;
-            if (!valid) { cut = i; break; }
-          }
-          if (cut !== -1) {
-            rest = "/" + this.hostname.slice(cut) + rest;
-            this.hostname = this.hostname.slice(0, cut);
-          }
-        }
+        if (!ipv6Hostname) rest = getHostname(this, rest, hostname, url);
         if (this.hostname.length > hostnameMaxLen) {
           this.hostname = "";
         } else {
@@ -14074,9 +14179,20 @@
         }
         if (this.hostname !== "") {
           if (ipv6Hostname) {
-            if (/[\0\t\n\r #%/<>?@\\^|]/.test(this.hostname)) throwInvalidUrl();
-          } else if (/[\0\t\n\r #%/:<>?@[\\\]^|]/.test(this.hostname)) {
-            throwInvalidUrl();
+            if (forbiddenHostCharsIpv6.test(this.hostname)) throwInvalidUrl();
+          } else {
+            // IDNA (UTS #46 ToASCII): punycode only the labels that need it,
+            // so the legacy parser agrees with `new URL()` on 'bücher.com'.
+            this.hostname = toASCII(this.hostname);
+            // Two spoofing routes close here. An EMPTY result can only come
+            // from toASCII (the hostname was non-empty above), and a
+            // forbidden char can only have been INTRODUCED by toASCII
+            // (getHostname would have cut it otherwise) -- e.g. '℀' whose
+            // NFKD contains '/'. Neither is safe to repair by moving text to
+            // the pathname, so both throw.
+            if (this.hostname === "" || forbiddenHostChars.test(this.hostname)) {
+              throwInvalidUrl();
+            }
           }
         }
         const pp = this.port ? ":" + this.port : "";
@@ -14147,10 +14263,63 @@
       if (host) this.hostname = host;
     };
 
+    // Chars that survive auth serialization unescaped: alnum, "!'()*-._~"
+    // and ':' (the user:pass separator). Same set as encodeURIComponent plus
+    // ':', but unlike encodeURIComponent a LONE SURROGATE is replaced rather
+    // than thrown on -- url.format() must not fail on a wonky auth field.
+    const noEscapeAuth = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x00 - 0x0F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x10 - 0x1F
+      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 0x20 - 0x2F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, // 0x30 - 0x3F
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x40 - 0x4F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 0x50 - 0x5F
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x60 - 0x6F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 0x70 - 0x7F
+    ]);
+    const HEX = "0123456789ABCDEF";
+    function percentEncodeByte(b) {
+      return `%${HEX[b >> 4]}${HEX[b & 15]}`;
+    }
+    function encodeAuth(str) {
+      let out = "";
+      for (let i = 0; i < str.length; ++i) {
+        const c = str.charCodeAt(i);
+        if (c < 0x80) {
+          out += noEscapeAuth[c] ? str[i] : percentEncodeByte(c);
+          continue;
+        }
+        let cp = c;
+        if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+          const lo = str.charCodeAt(i + 1);
+          if (lo >= 0xdc00 && lo <= 0xdfff) {
+            cp = (c - 0xd800) * 0x400 + lo - 0xdc00 + 0x10000;
+            i++;
+          }
+        }
+        // Unpaired surrogate -> U+FFFD, the same substitution the UTF-8
+        // encoder makes; encodeURIComponent would throw URIError here.
+        if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+        if (cp < 0x800) {
+          out += percentEncodeByte(0xc0 | (cp >> 6)) + percentEncodeByte(0x80 | (cp & 63));
+        } else if (cp < 0x10000) {
+          out += percentEncodeByte(0xe0 | (cp >> 12)) +
+            percentEncodeByte(0x80 | ((cp >> 6) & 63)) +
+            percentEncodeByte(0x80 | (cp & 63));
+        } else {
+          out += percentEncodeByte(0xf0 | (cp >> 18)) +
+            percentEncodeByte(0x80 | ((cp >> 12) & 63)) +
+            percentEncodeByte(0x80 | ((cp >> 6) & 63)) +
+            percentEncodeByte(0x80 | (cp & 63));
+        }
+      }
+      return out;
+    }
+
     Url.prototype.format = function () {
       let auth = this.auth || "";
       if (auth) {
-        auth = encodeURIComponent(auth).replace(/%3A/gi, ":");
+        auth = encodeAuth(auth);
         auth += "@";
       }
       let protocol = this.protocol || "";
@@ -14413,26 +14582,14 @@
       return result;
     };
 
-    let dep0170Warned = false;
     function urlParse(url, parseQueryString, slashesDenoteHost) {
       if (url instanceof Url) return url;
       const u = new Url();
       u.parse(url, parseQueryString, slashesDenoteHost);
-      // DEP0170: the legacy parser accepted a string WHATWG rejects.
-      // Warn once per process (node dedupes deprecation warnings by code).
-      if (
-        !dep0170Warned &&
-        typeof url === "string" &&
-        typeof globalThis.URL?.canParse === "function" &&
-        !globalThis.URL.canParse(url)
-      ) {
-        dep0170Warned = true;
-        process.emitWarning(
-          `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
-          "DeprecationWarning",
-          "DEP0170",
-        );
-      }
+      // DEP0170 is emitted from getHostname, on the narrower trigger node
+      // actually uses (a hostname truncated at ':'), not on every string the
+      // WHATWG parser would reject -- `url.parse('//some_path')` is a legal
+      // legacy parse and must not warn.
       return u;
     }
     function urlResolve(source, relative) {
@@ -14454,13 +14611,13 @@
       parse: urlParse,
       resolve: urlResolve,
       resolveObject: urlResolveObject,
-      domainToASCII: (domain) => {
-        try {
-          return new globalThis.URL(`http://${domain}`).hostname;
-        } catch {
-          return "";
-        }
-      },
+      // Both run the domain through the WHATWG HOST parser (not bare IDNA)
+      // and return "" when it rejects -- node's exact algorithm, so
+      // 'a/b' -> 'a', 'a:80' -> '' and '%41' -> 'a'. Going through
+      // `new URL('http://' + domain)` instead got 'a:80' wrong (it parsed
+      // ':80' as a port rather than rejecting it).
+      domainToASCII: (domain) => globalThis.__oam.node.urlDomainToASCII(`${domain}`),
+      domainToUnicode: (domain) => globalThis.__oam.node.urlDomainToUnicode(`${domain}`),
     };
   };
 
