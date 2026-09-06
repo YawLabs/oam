@@ -423,6 +423,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("dnsGetServers", op_dns_get_servers),
         // stdin
         ("stdinRead", op_stdin_read),
+        ("stdinSetRef", op_stdin_set_ref),
         // os extended
         ("osRelease", op_os_release),
         ("osTotalMem", op_os_total_mem),
@@ -6032,7 +6033,20 @@ fn op_stdin_read(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    crate::ops::spawn_op(scope, &mut rv, oam_core::stdin_read());
+    crate::ops::spawn_stdin_op(scope, &mut rv, oam_core::stdin_read());
+}
+
+/// `__oam.node.stdinSetRef(referenced)`: node's `process.stdin.ref()` /
+/// `.unref()`, and what destroying the stream does. A blocking stdin read
+/// cannot be cancelled, so retiring it means dropping it from the event
+/// loop's in-flight count -- the read still completes if data arrives.
+fn op_stdin_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let referenced = args.get(0).boolean_value(scope);
+    core_runtime_mut!(scope).set_stdin_ref(referenced);
 }
 
 // ============================================================== os extended

@@ -543,6 +543,15 @@ pub struct CoreRuntime {
     /// happen; counting it in `inflight` pins the process forever. Same
     /// rationale as SIGNAL_OP_ID, but per-op rather than a fixed id.
     unref_ops: HashSet<OpId>,
+    /// The `process.stdin` read in flight, if any, and whether it counts
+    /// toward `inflight`. Tracked apart from every other op because stdin is
+    /// the one op JS can RETIRE while it is still blocked in the OS: node's
+    /// `stdin.unref()` and destroying the stream both release the loop while
+    /// the read itself cannot be cancelled. Knowing the live id is what makes
+    /// [`Self::set_stdin_ref`] safe -- flipping the ref-ness of an op that has
+    /// already settled would corrupt `inflight`.
+    stdin_op: Option<OpId>,
+    stdin_referenced: bool,
     /// Installed OS-signal watchers keyed by Node signal name (SIGTERM, ...).
     /// Each value keeps a native handler alive; dropping it uninstalls (Unix
     /// aborts the tokio recv task, Windows removes the name from the active
@@ -612,6 +621,8 @@ impl CoreRuntime {
             next_id: 1,
             inflight: 0,
             unref_ops: HashSet::new(),
+            stdin_op: None,
+            stdin_referenced: true,
             signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_bodies: std::sync::Arc::new(std::sync::Mutex::new(
@@ -799,20 +810,75 @@ impl CoreRuntime {
         id
     }
 
+    /// Spawn the `process.stdin` read, remembering its id so JS can retire it
+    /// later, and honouring the ref-ness set by [`Self::set_stdin_ref`] -- a
+    /// read issued while stdin is unref'd must not pin the loop either.
+    ///
+    /// One op spans the whole of [`crate::stdin::stdin_read`], the retries the
+    /// pending-read gate drives included: when a console-mode switch cancels
+    /// the blocked read, the discarded result is dropped and the read
+    /// re-issued INSIDE this same op. So the id stays valid across a cancel,
+    /// the gate and this bookkeeping never race over it, a read retired here
+    /// stays retired across those retries, and a cancel never resurrects one.
+    pub fn spawn_stdin_op<F>(&mut self, op: F) -> OpId
+    where
+        F: Future<Output = OpOutcome> + Send + 'static,
+    {
+        let id = if self.stdin_referenced {
+            self.spawn_op(op)
+        } else {
+            self.spawn_op_unref(op)
+        };
+        self.stdin_op = Some(id);
+        id
+    }
+
+    /// node's `stdin.ref()` / `stdin.unref()`, and what destroying the stream
+    /// does: stop (or resume) the stdin read holding the loop open. Applies to
+    /// the read in flight AND to the ones issued after it. The blocking read
+    /// is not cancelled -- as in node, where the fd stays readable -- it just
+    /// no longer counts.
+    pub fn set_stdin_ref(&mut self, referenced: bool) {
+        self.stdin_referenced = referenced;
+        let Some(id) = self.stdin_op else {
+            return;
+        };
+        if referenced {
+            // Only re-count it if it is genuinely still in flight: a settled
+            // op has already been removed from `unref_ops`.
+            if self.unref_ops.remove(&id) {
+                self.inflight += 1;
+            }
+        } else if self.unref_ops.insert(id) {
+            self.inflight -= 1;
+        }
+    }
+
     pub fn has_inflight(&self) -> bool {
         self.inflight > 0
     }
 
+    /// Bookkeeping shared by `try_recv` and `recv_deadline`: a settled op
+    /// stops counting, and a settled STDIN op stops being retirable (its id
+    /// must never be handed to `set_stdin_ref` again).
+    fn note_settled(&mut self, completion: &OpCompletion) {
+        if completion.id == SIGNAL_OP_ID {
+            // Never counted in `inflight` (a bare listener must not pin the
+            // loop), so it must not decrement -- that would underflow at 0.
+            return;
+        }
+        if self.stdin_op == Some(completion.id) {
+            self.stdin_op = None;
+        }
+        if !self.unref_ops.remove(&completion.id) {
+            self.inflight -= 1;
+        }
+    }
+
     pub fn try_recv(&mut self) -> Option<OpCompletion> {
         let completion = self.rx.try_recv().ok();
-        // A signal completion (SIGNAL_OP_ID) was never counted in `inflight`
-        // (a bare listener must not pin the loop), so it must not decrement —
-        // decrementing here would underflow when inflight == 0.
-        if let Some(ref c) = completion
-            && c.id != SIGNAL_OP_ID
-            && !self.unref_ops.remove(&c.id)
-        {
-            self.inflight -= 1;
+        if let Some(ref c) = completion {
+            self.note_settled(c);
         }
         completion
     }
@@ -831,14 +897,8 @@ impl CoreRuntime {
             }
             None => self.rx.recv().ok(),
         };
-        // See try_recv: a SIGNAL_OP_ID completion was never counted, so must
-        // not decrement `inflight` (which would underflow at 0 — this is the
-        // path the no-inflight event-loop idle arm now waits on for signals).
-        if let Some(ref c) = completion
-            && c.id != SIGNAL_OP_ID
-            && !self.unref_ops.remove(&c.id)
-        {
-            self.inflight -= 1;
+        if let Some(ref c) = completion {
+            self.note_settled(c);
         }
         completion
     }
@@ -3820,6 +3880,62 @@ mod tests {
             .expect("op completes");
         assert_eq!(completion.id, id);
         assert!(matches!(completion.outcome, OpOutcome::Done));
+        assert!(!core.has_inflight());
+    }
+
+    #[test]
+    fn set_stdin_ref_retires_and_restores_the_live_read() {
+        let mut core = CoreRuntime::new().unwrap();
+        let id = core.spawn_stdin_op(ops::sleep(60_000));
+        assert!(core.has_inflight(), "a stdin read pins the loop by default");
+
+        // stdin.unref(): the read is still blocked in the OS, but the loop is
+        // free to exit.
+        core.set_stdin_ref(false);
+        assert!(!core.has_inflight());
+        // Idempotent -- a second unref must not double-count.
+        core.set_stdin_ref(false);
+        assert!(!core.has_inflight());
+
+        // stdin.ref() puts it back.
+        core.set_stdin_ref(true);
+        assert!(core.has_inflight());
+        core.set_stdin_ref(true);
+        assert!(core.has_inflight());
+
+        // The next read inherits the ref-ness in force when it is issued.
+        core.set_stdin_ref(false);
+        let next = core.spawn_stdin_op(ops::sleep(60_000));
+        assert_ne!(next, id);
+        assert!(
+            !core.has_inflight(),
+            "issued while unref'd, so it does not count"
+        );
+    }
+
+    #[test]
+    fn set_stdin_ref_after_the_read_settled_does_not_corrupt_inflight() {
+        let mut core = CoreRuntime::new().unwrap();
+        core.spawn_stdin_op(ops::sleep(5));
+        let completion = core
+            .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("the stdin read settles");
+        assert!(!core.has_inflight());
+        // A destroy() landing after the read came back: the id is stale, so
+        // both directions must be no-ops rather than underflow `inflight` or
+        // resurrect a settled op.
+        core.set_stdin_ref(false);
+        assert!(!core.has_inflight());
+        core.set_stdin_ref(true);
+        assert!(!core.has_inflight());
+        // An unrelated op still settles cleanly afterwards.
+        let other = core.spawn_op(ops::sleep(5));
+        assert!(core.has_inflight());
+        let settled = core
+            .recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("op completes");
+        assert_eq!(settled.id, other);
+        assert_ne!(settled.id, completion.id);
         assert!(!core.has_inflight());
     }
 

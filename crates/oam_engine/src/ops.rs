@@ -179,6 +179,29 @@ pub(crate) fn spawn_op(
     rv.set(promise.into());
 }
 
+/// Like `spawn_op`, but for the `process.stdin` read: the runtime remembers
+/// the op's id so `stdin.unref()` / destroying the stream can retire it while
+/// it is still blocked in the OS (see `CoreRuntime::set_stdin_ref`).
+pub(crate) fn spawn_stdin_op(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    op: impl Future<Output = OpOutcome> + Send + 'static,
+) {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        let message = v8::String::new(scope, "failed to create promise").unwrap();
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver = v8::Global::new(scope, resolver);
+
+    let id = core_runtime_mut!(scope).spawn_stdin_op(op);
+    pending_ops_mut!(scope).park(id, resolver);
+
+    rv.set(promise.into());
+}
+
 /// Like `spawn_op`, but the op does NOT keep the event loop alive. For
 /// passive watchers whose trigger may never arrive.
 pub(crate) fn spawn_op_unref(

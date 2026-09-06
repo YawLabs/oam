@@ -12265,7 +12265,7 @@
       });
       lazyStdio("stdin", () => {
         const { Readable } = registry.get("stream");
-        return decorateTtyReadStream(new Readable({
+        const stdin = new Readable({
           autoDestroy: false,
           read() {
             natives.stdinRead().then(
@@ -12276,7 +12276,30 @@
               () => this.push(null),
             );
           },
-        }), 0, stdinIsTTY);
+          // Destroying stdin closes the handle in node, so the process stops
+          // waiting on it. Here the blocking read cannot be cancelled -- it
+          // just stops counting toward the event loop, which is what lets
+          // `for await (const c of process.stdin) break` exit at once
+          // (breaking out of the iterator destroys the stream) instead of
+          // hanging until the pipe closes.
+          destroy(err, cb) {
+            natives.stdinSetRef(false);
+            cb(err);
+          },
+        });
+        // node's net.Socket / tty.ReadStream carry ref() and unref(); stdin
+        // had neither, so `process.stdin.unref()` -- the documented way to
+        // stop stdin holding the process open -- threw TypeError and killed
+        // the program. Both return the stream, as node's do.
+        stdin.unref = function unref() {
+          natives.stdinSetRef(false);
+          return this;
+        };
+        stdin.ref = function ref() {
+          natives.stdinSetRef(true);
+          return this;
+        };
+        return decorateTtyReadStream(stdin, 0, stdinIsTTY);
       });
     }
 
