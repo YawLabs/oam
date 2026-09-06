@@ -572,7 +572,7 @@ pub unsafe extern "C" fn napi_create_string_utf8(
         if length == usize::MAX {
             std::ffi::CStr::from_ptr(string).to_bytes()
         } else {
-            std::slice::from_raw_parts(string as *const u8, length)
+            std::slice::from_raw_parts(string.cast::<u8>(), length)
         }
     };
     let text = String::from_utf8_lossy(bytes);
@@ -877,7 +877,7 @@ pub unsafe extern "C" fn napi_get_value_string_utf8(
     let copy_len = text.len().min(bufsize - 1);
     // SAFETY: `buf` is the caller's out buffer with `bufsize` >= copy_len+1 (enforced above); copies `copy_len` UTF-8 bytes, writes the NUL terminator, and reports the length via the null-checked `result`.
     unsafe {
-        std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, copy_len);
+        std::ptr::copy_nonoverlapping(text.as_ptr(), buf.cast::<u8>(), copy_len);
         *buf.add(copy_len) = 0;
         if !result.is_null() {
             *result = copy_len;
@@ -3187,7 +3187,7 @@ pub unsafe extern "C" fn napi_create_string_latin1(
         if length == usize::MAX {
             std::ffi::CStr::from_ptr(str_ptr).to_bytes()
         } else {
-            std::slice::from_raw_parts(str_ptr as *const u8, length)
+            std::slice::from_raw_parts(str_ptr.cast::<u8>(), length)
         }
     };
     let Some(s) = v8::String::new_from_one_byte(scope, bytes, v8::NewStringType::Normal) else {
@@ -3279,7 +3279,7 @@ pub unsafe extern "C" fn napi_get_value_string_latin1(
     // Write latin-1 bytes via write_one_byte_v2.
     let copy_len = char_len.min(bufsize - 1);
     // SAFETY: `buf` points to at least `copy_len` caller-owned writable elements; from_raw_parts_mut forms the out-slice written below.
-    let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, copy_len) };
+    let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), copy_len) };
     string.write_one_byte_v2(scope, 0, buf_slice, v8::WriteFlags::empty());
     // SAFETY: writes the trailing NUL into the caller's `buf` at the copy length (within the `bufsize` bound checked above).
     unsafe { *(buf.add(copy_len)) = 0 };

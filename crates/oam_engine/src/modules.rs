@@ -212,7 +212,7 @@ pub(crate) fn flush_handled_rejections(
     }
     let drained: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
-        .map(|ledger| ledger.unhandled.drain(..).collect())
+        .map(|ledger| std::mem::take(&mut ledger.unhandled))
         .unwrap_or_default();
     let ran_listener = !drained.is_empty();
     for (promise, reason) in drained {
@@ -491,7 +491,7 @@ pub(crate) fn drain_uncaught(
     loop {
         let captured: Vec<(v8::Global<v8::Value>, String)> = tc
             .get_slot_mut::<UncaughtLedger>()
-            .map(|ledger| ledger.entries.drain(..).collect())
+            .map(|ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default();
         if captured.is_empty() {
             break;
@@ -1543,7 +1543,7 @@ pub(crate) fn unhandled_rejection_failures(
 ) -> Option<Vec<Diagnostic>> {
     let unhandled: Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)> = tc
         .get_slot_mut::<RejectionLedger>()
-        .map(|ledger| ledger.unhandled.drain(..).collect())
+        .map(|ledger| std::mem::take(&mut ledger.unhandled))
         .unwrap_or_default();
     if unhandled.is_empty() {
         return None;
