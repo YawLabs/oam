@@ -165,6 +165,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("vmRunInContext", op_vm_run_in_context),
         ("vmRunInThisContext", op_vm_run_in_this_context),
         ("v8Is", op_v8_is),
+        ("arrayBufferViewHasBuffer", op_array_buffer_view_has_buffer),
+        ("getProxyDetails", op_get_proxy_details),
         ("posixGetId", op_posix_get_id),
         ("posixSetId", op_posix_set_id),
         ("posixGetGroups", op_posix_get_groups),
@@ -188,6 +190,17 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("urlCanParse", op_url_can_parse),
         ("urlParse", op_url_parse),
         ("urlUpdate", op_url_update),
+        // UTS #46 IDNA, straight off the same ada_idna the URL parser uses --
+        // so `url.domainToASCII` / `domainToUnicode` and the legacy
+        // `url.parse()` hostname step agree with `new URL()` by construction.
+        // Both return "" on invalid input, which is what Node's
+        // encoding_binding.toASCII does and what its callers branch on.
+        ("idnaToASCII", op_idna_to_ascii),
+        ("idnaToUnicode", op_idna_to_unicode),
+        // url.domainToASCII / domainToUnicode: the host-parser route, not
+        // bare IDNA -- see domain_via_host_parser.
+        ("urlDomainToASCII", op_url_domain_to_ascii),
+        ("urlDomainToUnicode", op_url_domain_to_unicode),
         // AsyncLocalStorage substrate: V8's continuation-preserved embedder
         // data, propagated across promise continuations by V8 itself.
         ("getContinuationData", op_get_continuation_data),
@@ -1437,6 +1450,93 @@ fn op_v8_is(
         _ => false,
     };
     rv.set_bool(answer);
+}
+
+/// `op_array_buffer_view_has_buffer(view) -> boolean`
+///
+/// V8's `ArrayBufferView::HasBuffer`: whether the view's backing ArrayBuffer
+/// OBJECT has been materialized yet -- a distinction nothing in JS can read
+/// without forcing it, which is why Node exposes it as
+/// `internalBinding('util').arrayBufferViewHasBuffer` for
+/// test-buffer-backing-arraybuffer.js to observe on-heap vs off-heap typed
+/// array allocation.
+///
+/// This op reports whatever the LINKED V8 says and nothing else. That is not
+/// the same answer Node gives: on node v22.22.2 (V8 12.4) a short typed array
+/// still lives on the V8 heap with no buffer object (measured false at 0 and
+/// 48 bytes, true at 96), while the V8 we link (15.x) has dropped on-heap
+/// typed arrays entirely and answers true for every live view. The gap is
+/// V8's, and faking the small-array case would be inventing a heap layout we
+/// do not have.
+///
+/// Node CHECKs the argument (a fatal abort); here a non-view answers false,
+/// matching `op_v8_is` -- a predicate that cannot decide says no rather than
+/// killing the process.
+fn op_array_buffer_view_has_buffer(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // `has_buffer` is a safe method on the v8 crate's ArrayBufferView: the
+    // FFI call it wraps is inside that crate, so this adds no unsafe here.
+    let answer =
+        v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)).is_ok_and(|view| view.has_buffer());
+    rv.set_bool(answer);
+}
+
+/// `op_get_proxy_details(value, detailed) -> [target, handler] | target | undefined`
+///
+/// V8's `Proxy::GetTarget` / `GetHandler` -- the pair Node publishes as
+/// `internalBinding('util').getProxyDetails`. Reading a proxy's two slots out
+/// of band is the ONLY way to inspect one without running its traps: walking
+/// the proxy itself makes `util.inspect` observable to the inspected program,
+/// so a counting or logging handler fires just because something got
+/// console.log'd. That is a side effect a formatter must not have, which is
+/// why Node reaches for the native here instead of touching the proxy.
+///
+/// `detailed` selects Node's two shapes: true hands back `[target, handler]`,
+/// false just the target (the arity rule -- one argument means detailed --
+/// lives JS-side, where the argument count is visible).
+///
+/// A revoked proxy has neither slot: ES2015 has `Proxy.revoke` set
+/// `[[ProxyTarget]]` and `[[ProxyHandler]]` to null, and every operation on it
+/// throws. So it answers `null` / `[null, null]` rather than asking V8 for
+/// handles it no longer holds -- that is the signal `util.inspect` turns into
+/// `<Revoked Proxy>` instead of throwing out of a render.
+///
+/// A non-proxy answers `undefined`, matching Node and `op_v8_is`: a question
+/// this cannot answer says so rather than aborting the process.
+fn op_get_proxy_details(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    // `try_from` is V8's own IsProxy check, and get_target/get_handler/
+    // is_revoked are safe methods on the v8 crate's Proxy -- the FFI they wrap
+    // lives inside that crate, so this op adds no unsafe here.
+    let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(args.get(0)) else {
+        rv.set_undefined();
+        return;
+    };
+    let detailed = args.get(1).boolean_value(scope);
+    if proxy.is_revoked() {
+        if !detailed {
+            rv.set_null();
+            return;
+        }
+        let null: v8::Local<v8::Value> = v8::null(scope).into();
+        let details = v8::Array::new_with_elements(scope, &[null, null]);
+        rv.set(details.into());
+        return;
+    }
+    let target = proxy.get_target(scope);
+    if !detailed {
+        rv.set(target);
+        return;
+    }
+    let handler = proxy.get_handler(scope);
+    let details = v8::Array::new_with_elements(scope, &[target, handler]);
+    rv.set(details.into());
 }
 
 fn op_posix_get_id(
@@ -3033,6 +3133,73 @@ fn update_url(href: &str, part: &str, value: &str) -> Result<ada_url::Url, Strin
         other => return Err(format!("urlUpdate: unknown part '{other}'")),
     }
     Ok(parsed)
+}
+
+/// UTS #46 ToASCII. `""` on invalid input -- ada's contract, and Node's:
+/// `internalBinding('encoding_binding').toASCII` is the same `ada::idna`
+/// entry point, and `lib/url.js` treats the empty result as "hostname
+/// spoofing attempt" and throws ERR_INVALID_URL.
+fn op_idna_to_ascii(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &ada_url::Idna::ascii(&input)) {
+        rv.set(s.into());
+    }
+}
+
+/// UTS #46 ToUnicode. `""` on invalid input, matching ada and Node's
+/// `url.domainToUnicode`.
+fn op_idna_to_unicode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &ada_url::Idna::unicode(&input)) {
+        rv.set(s.into());
+    }
+}
+
+/// Run a domain through the WHATWG *host parser* the way Node's
+/// `url.domainToASCII` / `domainToUnicode` do: assign it as the hostname of a
+/// throwaway special-scheme URL and read back what the parser made of it,
+/// with `""` for a domain the setter rejects. This is deliberately NOT bare
+/// UTS #46 -- host parsing also percent-decodes, stops at the first `/?#`,
+/// and rejects forbidden host code points, so `'a/b'` is `'a'` and `'a:80'`
+/// is `""` where bare ToASCII would hand both straight back.
+fn domain_via_host_parser(input: &str) -> Option<String> {
+    let mut url = ada_url::Url::parse("http://x", None).ok()?;
+    url.set_hostname(Some(input)).ok()?;
+    Some(url.hostname().to_owned())
+}
+
+fn op_url_domain_to_ascii(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    let out = domain_via_host_parser(&input).unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
+}
+
+fn op_url_domain_to_unicode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let input = arg_string(scope, &args, 0).unwrap_or_default();
+    let out = domain_via_host_parser(&input)
+        .map(|host| ada_url::Idna::unicode(&host))
+        .unwrap_or_default();
+    if let Some(s) = v8::String::new(scope, &out) {
+        rv.set(s.into());
+    }
 }
 
 /// Read the current continuation frame (an immutable Map of

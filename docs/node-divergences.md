@@ -28,32 +28,43 @@ Related: [CONFORMANCE-NODE.md](../CONFORMANCE-NODE.md) (the Node test-suite scor
 
 ## The conformance number, qualified
 
-oam passes **429/431 (99.5%)** of the vendored Node core tests it can run on
-windows-aarch64, **438/440 (99.5%)** on macos-aarch64, and **439/441 (99.5%)**
-on linux-x86_64 — every platform down to the same two deliberate failures.
-Read those with the denominator in view:
+oam passes **439/442 (99.3%)** of the vendored Node core tests it can run on
+windows-aarch64, measured at the head of this branch. The macos-aarch64 and
+linux-x86_64 figures are re-measured on their own hosts at release time — both
+run the same gate, and their pass floors live in
+`conformance/vendor/node/manifest.json` under `ratchet.minPassByHost`. Every
+platform bottoms out on the same three deliberate failures, each one recorded
+below. Read the rate with the denominator in view:
 
 - **The corpus is a subset.** It currently covers `assert`, `buffer`, `events`, `path`,
   `process`, `querystring`, `stream`, `string_decoder`, `timers`, `url`, and `util`. The
   socket- and fixture-heavy modules — `fs`, `net`, `http`, `child_process`, `tls` — are
   not in it yet. They land in later tranches, and the percentage will move when they do.
 - **Those are pass/runnable, not pass/total.** Against every vendored file Windows is
-  **429/476 (90.1%)**: 22 tests skip themselves at runtime and 23 are unrunnable by the
-  harness. Most of the 23 need a `node:internal/*` module oam does not have — 14 of them
-  `internal/test/binding`, Node's C++ test hooks. Inventing those to score would be
-  the same fabrication refused for `process.versions`.
+  **439/476 (92.2%)**: 22 tests skip themselves at runtime and 12 are unrunnable by the
+  harness. `internal/test/binding` — Node's C++ test hooks — now resolves, backed only by
+  the members oam can serve honestly, so 10 of the 12 are tests that reach for a specific
+  `internal/*` module or binding member oam has nothing behind (`internal/js_stream_socket`,
+  `internal/linkedlist`, `tty_wrap`, `js_stream`, `timers.scheduleTimer`, `buffer.fill`,
+  `util.privateSymbols`). The other 2 carry an unsupported `// Flags:` header. Inventing
+  any of them to score would be the same fabrication refused for `process.versions`.
 - **Most of the runtime skips are not oam gaps at all** — real Node, run against the
   same vendored tree on the same host, skips them identically (the POSIX-only `execve`
   tests on Windows, `styletext` without a TTY, `process-config` without a `config.gypi`).
-  Four of the rest skip on `common.hasCrypto`, which is `Boolean(process.versions.openssl)`
+  Three of the rest skip on `common.hasCrypto`, which is `Boolean(process.versions.openssl)`
   — they are skipped by the refusal to publish an OpenSSL version, not by missing crypto.
+  A fourth file used to be counted with them and is not a skip at all: `test-buffer-alloc.js`
+  prints the same marker *mid-run* and then finishes its body, so it is scored on its exit
+  code like any other test (divergence 26).
 - **Windows runs the FEWEST tests of the three platforms**, so its ratio alone is not
   the picture; the POSIX hosts carry larger denominators because they run the POSIX-only
   tests Windows skips. See "POSIX-only gaps" near the end.
-- **Both remaining failures on every platform are deliberate** — `process-versions`
-  and `internalbinding-allowlist` (which wants `internalBinding('async_wrap')` and 20
-  other bindings that are libuv handle classes oam has nothing behind). There are no
-  known open correctness bugs in the suite on any platform.
+- **Every remaining failure on every platform is deliberate** — `process-versions`,
+  `internalbinding-allowlist` (which wants `internalBinding('async_wrap')` and 20
+  other bindings that are libuv handle classes oam has nothing behind), and
+  `buffer-backing-arraybuffer` (which asserts a V8 12 heap layout the V8 oam links no
+  longer has — divergence 31). There are no known open correctness bugs in the suite on
+  any platform.
   (The denominator in these ratios is pass+fail — the tests that reached a verdict.
   Self-skips are excluded from it and counted separately.)
 - **The oracle is exit 0.** Node core tests self-assert; a test "passes" when it runs to
@@ -417,6 +428,170 @@ passes them. Whether they should be dropped for strict parity is an open decisio
 until then no conformance case may exercise them in a shape where the two runtimes
 disagree.
 
+### 26. `common.hasCrypto` is false, and that is not a crypto gap
+
+Node's own test suite decides whether a machine has crypto with one line
+(`conformance/vendor/node/test/common/index.js:54`):
+
+```js
+const hasCrypto = Boolean(process.versions.openssl) && !process.env.NODE_SKIP_CRYPTO;
+```
+
+oam has crypto. It links `ring` 0.17.14 and `rustls` 0.23.40, and `node:crypto` publishes
+58 working exports — hashes, HMAC, `createCipheriv`/`createDecipheriv`, key generation,
+`sign`/`verify`, `randomUUID`, `getRandomValues`, `webcrypto` and `subtle`. What it does
+not publish is an `openssl` key, because `process.versions` carries the real dependency
+tree and OpenSSL is not in the binary (divergence 1). Node's probe therefore reads
+`undefined`, and everything behind it stands down.
+
+There is no honest way to flip it. `hasCrypto` is not a boolean the suite treats as a
+boolean: `common/crypto.js:110-118` semver-**parses** the very same string to derive
+`hasOpenSSL(major, minor, patch)`, and gates cipher lists, PEM shapes and provider
+behavior on the answer. A sentinel value would satisfy the first check and then mis-steer
+the second — the crypto suite would run against a version claim describing nothing, and
+its failures would point away from the reason.
+
+Three tests in the corpus self-skip on it: `test-stream-pipeline-http2.js` and
+`test-process-threadCpuUsage-worker-threads.js` call `common.skip('missing crypto')`
+themselves, and `test-process-env-allowed-flags-are-documented.js` inherits the skip by
+requiring `../common/crypto`, which skips at module load. All three print
+`1..0 # Skipped: missing crypto` on oam and are counted as skips, never as passes. That
+is the standing cost of divergence 1, recorded rather than engineered around.
+
+A fourth file prints that exact line and is **not** a skip. `test-buffer-alloc.js` reaches
+`common.hasCrypto` at its line 1076 of 1195, for a single sha1-digest comparison, and the
+else branch calls `common.printSkipMessage('missing crypto')` — which writes the marker
+**without exiting** (`common/index.js:548`), unlike `common.skip()`. The remaining ~120
+lines run, the module body finishes, and oam exits 0, with 10,352 assertion calls executed
+(measured by counting through the `assert` module; a floor, since bare `assert(...)` calls
+route through the callable itself and are not counted). Scoring it on the marker threw
+~1100 lines of real Buffer coverage out of the denominator, so the suite manifest marks it
+`partialSkip` and scores it on exit code. That has to be a per-file opt-in rather than a
+rule: `test-stream-pipeline-http2.js` emits a byte-identical line, also exits 0, and
+asserts nothing, so nothing reading only the output can tell the two apart.
+
+### 27. `--abort-on-uncaught-exception` is accepted and does nothing
+
+```
+$ oam --abort-on-uncaught-exception app.js
+oam: --abort-on-uncaught-exception is accepted for launcher compatibility but is not
+implemented: oam reports the uncaught exception and exits, it does not abort at the
+throw site, so no core dump or debugger break is produced.
+```
+
+The flag is recognized so a node-shaped launcher does not die at argument parsing, and
+the line of stderr is the rest of the bargain. Whoever passes it is asking for a crash
+dump; silent acceptance would hand them a clean exit code, no dump, and nothing
+explaining the gap.
+
+oam has no abort primitive to build it on. `process.abort()` is `processExit(134)`
+(`js/node_compat.js`) — not a raised `SIGABRT`, not Windows' `0x80000003` exception
+breakpoint — and everything reachable from oam's uncaught-exception path already runs
+after the stack unwound, which is precisely the frame this flag exists to preserve.
+Forwarding the token to V8 would be worse than inert: oam catches on the Rust side, so
+V8 sees `CAUGHT_BY_EXTERNAL`, which is inside its abort condition — it would abort on
+exceptions the program goes on to catch.
+
+So the flag is deliberately **not** in the node-suite harness's `SUPPORTED_FLAGS`
+(`xtask/src/node_suite.rs`), and `test-process-exception-capture.js` and
+`test-process-exception-capture-should-abort-on-uncaught.js` classify as **unrunnable**
+rather than running under a flag that is not doing what they name. Listing it there would
+book two passes for a behavior oam does not have.
+
+### 28. There is no `StreamBase` / `JSStream` layer to expose
+
+Node's `internal/js_stream_socket` wraps a JS `Duplex` in a `StreamBase` so the native
+layer can consume it as though it were a libuv handle. oam has nothing for that to plug
+into: its TLS and HTTP/2 engines are Rust-native and take a host and port or a native
+handle id, never a JS byte stream. There is no handle layer for a JS stream to become.
+
+That closes a whole surface rather than one API. `internal/js_stream_socket` has exactly
+three consumers in Node v22.22.2 — `_stream_wrap` (a deprecated re-export, DEP0125),
+`internal/tls/wrap`, and `internal/http2/core`, probe-verified against a v22.22.2 binary's
+own builtin sources — and none of them has an analogue here. `_stream_wrap` is already on
+the absent-module list below, and `process.binding('js_stream')` (`{ JSStream }` in Node)
+throws `No such module: js_stream` for the same reason the other libuv handle classes do.
+
+Five tests are unrunnable because of it, and stay that way by design rather than as
+backlog:
+
+| Test | What it needs |
+|---|---|
+| `test-stream-wrap.js` | `internal/js_stream_socket` |
+| `test-stream-wrap-drain.js` | `internal/js_stream_socket` |
+| `test-stream-wrap-encoding.js` | `internal/js_stream_socket` |
+| `test-stream-base-prototype-accessors-enumerability.js` | `internalBinding('tty_wrap').TTY`, to assert `StreamBase::AddMethods` left its accessors non-enumerable |
+| `test-timers-fast-calls.js` | the `internalBinding('timers')` fast-call entry points |
+
+`test-timers-fast-calls.js` is the one worth spelling out, because it is where a stub
+would look like progress. Its body calls `scheduleTimer`, `toggleTimerRef` and
+`toggleImmediateRef` and asserts nothing about them; every real assertion sits inside
+`if (common.isDebug)`, and `common.isDebug` is `process.features.debug`, which is false on
+oam exactly as on any released Node binary. **Three no-op stubs would turn this test green
+while it verified nothing observable** — which is the reason it must not ship that way.
+oam's `internal/test/binding` proxy throws
+`oam: no native binding for 'timers.scheduleTimer'` instead, under the same rule that
+keeps `internalBinding` from answering `undefined` for a native oam does not have, and the
+test is booked unrunnable.
+
+### 29. `Buffer.allocUnsafe` is always zero-filled
+
+`allocUnsafe`, `allocUnsafeSlow` and `SlowBuffer` hand back zeroed memory in oam, pooled
+and unpooled alike. Node hands back whatever was in the allocation, which is routinely
+some earlier buffer's contents:
+
+```js
+Buffer.allocUnsafe(Buffer.poolSize + 1).every((b) => b === 0)
+// oam: true, on every allocation.  Node v22.22.2: false.
+```
+
+This is a **stronger** guarantee than Node's, not a weaker one — oam never returns another
+allocation's residue — so nothing that reads before writing can break on it. It is
+documented because it is observable: "unsafe" in the name is a promise about speed that
+oam keeps and a promise about contents that oam does not make.
+
+The two tests that pin Node's behavior measure neither direction here.
+`test-buffer-alloc-unsafe-is-uninitialized.js` and
+`test-buffer-alloc-unsafe-is-initialized-with-zero-fill-flag.js` both
+`common.skip('Only works in debug mode')` unless `common.isDebug` —
+`process.features.debug` — is true, because the real assertion is a native allocator usage
+counter read out of `internalBinding('debug')`, not the buffer's contents. That is false
+on oam, and false on a released Node binary: real Node v22.22.2 skips both from this same
+vendored tree.
+
+### 31. Every `ArrayBufferView` has a buffer, because V8 15 dropped on-heap typed arrays
+
+V8 12 kept a short typed array's bytes inside the object on the V8 heap and materialized
+the backing `ArrayBuffer` **object** only when something asked for it. The V8 oam links —
+**15.0.245.2** — no longer does that at any size, so every live view genuinely has a
+buffer. Node v22.22.2 links V8 **12.4.254.21**, which still did.
+
+Nothing in ordinary JS can see the difference: reading `.buffer` materializes it on demand
+in both engines, and every other observable is identical. The state is only readable
+through the internal predicate Node exposes for exactly this purpose, and its answers are
+the whole divergence:
+
+```js
+// internalBinding('util').arrayBufferViewHasBuffer(new Uint8Array(len))
+//  len:      0      48      96    1024
+//  Node:  false   false    true    true    (V8 12.4.254.21-node.39)
+//   oam:   true    true    true    true    (V8 15.0.245.2)
+```
+
+oam's op wraps `v8::ArrayBufferView::has_buffer()`
+(`op_array_buffer_view_has_buffer`, `crates/oam_engine/src/node_ops.rs`) and reports what
+the linked V8 says, so the oam column is correct *for this engine*. What expired is the
+expectation, not the implementation.
+
+`test-buffer-backing-arraybuffer.js` asserts the Node column — false at 0 and 48, true at
+96 and 1024, across `Uint8Array` through `Float64Array`, `Buffer.alloc` and
+`Buffer.allocUnsafeSlow` — so it fails here and is recorded **deliberate** in the suite
+manifest. Passing it would mean answering `false` for a buffer that demonstrably exists,
+which is inventing a heap layout this V8 does not have, and it would immediately
+contradict the test's own next assertion: it reads `.buffer` and requires the answer to be
+`true`. If a later V8 brings on-heap typed arrays back, the test starts passing by itself
+and this entry goes away.
+
 ---
 
 ## Module loading and the CLI
@@ -612,7 +787,7 @@ Node-on-Windows.
 On Windows, oam returns `"10.0.26200"` (the same string as `os.release()`); Node returns
 `"Windows 11 Pro"`.
 
-### 16. `dns.setServers()` refuses instead of pretending
+### 30. `dns.setServers()` refuses instead of pretending
 
 Node accepts a nameserver list and honours it. oam throws an `Error` with `code: 'ENOSYS'`
 from both `dns.setServers()` and `dns.Resolver.prototype.setServers()`.
@@ -694,7 +869,7 @@ entries below were executed on both runtimes unless marked.
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`. EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `x25519`, `ed448`, `x448`; all named curves. |
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
-| `TextDecoder` | **utf-8 only** (`fatal` and `ignoreBOM` honored). Any other label throws. | Full WHATWG label set. |
+| `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams queuing strategy | `highWaterMark` counts chunks; a custom `size()` is never called. | `size()` is consulted. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
 | `worker_threads.moveMessagePortToContext` | Throws `not supported in oam`. | Supported. |
@@ -704,7 +879,7 @@ entries below were executed on both runtimes unless marked.
 | `os.cpus()[n].times` | All zeroes. | Real tick counters. |
 | `os.loadavg()` | Always `[0, 0, 0]` _(source)_. Matches Node on Windows; diverges on Linux/macOS. | Real load average on POSIX. |
 | `node:v8` `serialize`/`deserialize` | JSON under a V8-shaped header — a `Map` does not round-trip as a `Map`. | Real structured serialization. |
-| `node:inspector` `Session.post()` | The JS `Session` is a stub; the callback never delivers a CDP result. Use `oam run --inspect` / `--inspect-brk`, which drive the real inspector from the CLI. | Full CDP over the in-process session. |
+| `node:inspector` `Session` | **Not backed in-process.** `post()` fails the request with `ERR_INSPECTOR_NOT_AVAILABLE` rather than invoking the callback with an empty CDP result — a fabricated success is worse than a refusal, because the caller reads it as "the command ran and returned nothing". `url()` no longer answers a fixed `ws://127.0.0.1:9229/0` for a socket that was never bound. The real inspector is a CLI flag: `oam run --inspect` / `--inspect-brk`. | Full CDP over the in-process session. |
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl`, `node:readline` | Minimal: enough to import, construct, and iterate lines. | Full. |
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
@@ -807,13 +982,14 @@ The largest per-module gaps (counts from windows-aarch64), all tracked in that f
 
 ## Known failures in the vendored suite
 
-The two failures behind the windows-aarch64 number, triaged honestly.
+The failures behind the windows-aarch64 number, triaged honestly.
 Per-platform numbers differ because the harness skips POSIX-only tests on
 Windows — see "POSIX-only gaps" below, where the third POSIX failure lives.
 
 | Test | Status |
 |---|---|
 | `test-process-versions.js` | **Deliberate.** Divergence 1 above — oam will not publish version strings for libraries it does not contain. This test is expected to fail forever. It genuinely runs: the `deps/acorn`, `deps/cjs-module-lexer`, and `deps/undici` package.json fixtures are vendored verbatim from upstream v22.22.2, real Node passes it (exit 0) from this tree, and oam fails at the key-set assertion — whose diff prints exactly the honest key set oam publishes instead. |
+| `test-buffer-backing-arraybuffer.js` | **Deliberate.** Divergence 31 above — the test asserts V8 12's on-heap typed-array layout (`arrayBufferViewHasBuffer` false at lengths 0 and 48), and the V8 oam links, 15.0.245.2, has no such layout, so every view has a buffer and the op answers true. Real Node v22.22.2 (V8 12.4.254.21) reproduces the expected table and exits 0 from this tree; oam fails at the first case. The op is a faithful wrapper over `v8::ArrayBufferView::has_buffer()` — it is the expectation that expired, not the implementation. |
 | `test-process-dlopen-error-message-crash.js` | **Reclassified unrunnable, not a failure.** The test's actual assertion — that a `%s`-bearing filename is never passed to a format function — passes in oam. It then calls `fs.accessSync('test/addons/not-a-binding')`, a compiled-addon fixture the vendored subset does not ship, and dies there. Verified: real Node v22.22.2 fails this test identically from the same vendored tree. |
 
 `test-stream-pipeline.js` used to sit in this table as a real bug (it hung

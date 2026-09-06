@@ -82,15 +82,54 @@
     }
   }
 
+  // WHATWG Encoding "get an encoding": labels are ASCII-whitespace-trimmed
+  // and ASCII-lowercased before lookup. oam implements two of the standard's
+  // encodings -- utf-8 and windows-1252 -- and every label the standard maps
+  // onto them; every other label still throws, so the surface never claims an
+  // encoding oam cannot actually decode.
+  const encodingLabels = new Map();
+  for (const l of [
+    "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8",
+    "x-unicode20utf8",
+  ]) encodingLabels.set(l, "utf-8");
+  for (const l of [
+    "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819",
+    "iso-8859-1", "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1",
+    "iso_8859-1:1987", "l1", "latin1", "us-ascii", "windows-1252", "x-cp1252",
+  ]) encodingLabels.set(l, "windows-1252");
+
+  // index-windows-1252, pointers 0-31 (bytes 0x80-0x9F). Everything outside
+  // that window is its own code point, which is where windows-1252 and
+  // ISO-8859-1 differ -- the standard aliases the latter onto the former, so
+  // 0x80 is the euro sign, not U+0080.
+  const WIN1252_C1 = [
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+    0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+  ];
+
   class TextDecoder {
     constructor(label = "utf-8", options = {}) {
-      const canonical = String(label).toLowerCase();
-      if (canonical !== "utf-8" && canonical !== "utf8" && canonical !== "unicode-1-1-utf-8") {
-        throw new RangeError(
-          `TextDecoder: only utf-8 is supported in oam today (got '${label}')`,
+      // ASCII whitespace per the Encoding Standard: tab, LF, FF, CR, space.
+      const canonical = String(label)
+        .replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "")
+        .toLowerCase();
+      const encoding = encodingLabels.get(canonical);
+      if (encoding === undefined) {
+        // Node's shape for an unknown label: a RangeError carrying
+        // ERR_ENCODING_NOT_SUPPORTED, which feature-detecting callers branch
+        // on. The suffix is oam's own -- an encoding the standard defines but
+        // oam has not implemented (utf-16le, gbk, ...) lands here too, and
+        // saying so is more useful than pretending the label is unknown.
+        const err = new RangeError(
+          `The "${label}" encoding is not supported` +
+            " (oam implements utf-8 and windows-1252)",
         );
+        err.code = "ERR_ENCODING_NOT_SUPPORTED";
+        throw err;
       }
-      this.encoding = "utf-8";
+      this.encoding = encoding;
       this.fatal = options.fatal === true;
       this.ignoreBOM = options.ignoreBOM === true;
       this._pending = null; // carry-over bytes between stream:true chunks
@@ -104,6 +143,20 @@
       else if (ArrayBuffer.isView(input))
         bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
       else bytes = new Uint8Array(input);
+
+      if (this.encoding === "windows-1252") {
+        // Single-byte and total: every one of the 256 bytes maps to a code
+        // point, so there is no incomplete trailer to hold across a
+        // stream:true chunk, nothing for `fatal` to reject, and no BOM to
+        // strip (the Encoding Standard sniffs a BOM only for the UTF
+        // encodings).
+        let out = "";
+        for (let i = 0; i < bytes.length; i++) {
+          const b = bytes[i];
+          out += String.fromCharCode(b >= 0x80 && b <= 0x9f ? WIN1252_C1[b - 0x80] : b);
+        }
+        return out;
+      }
 
       if (this._pending !== null && this._pending.length > 0) {
         const joined = new Uint8Array(this._pending.length + bytes.length);
@@ -1527,7 +1580,7 @@
         encoding = end;
         end = this.length;
       }
-      if (start < 0 || end > this.length || start > end) {
+      if (start < 0 || end < 0 || end > this.length) {
         throw Object.assign(
           new RangeError(
             `The value of "offset" is out of range. It must be >= 0 and <= ${this.length}. Received ${start < 0 ? start : end}`,
@@ -1535,6 +1588,15 @@
           { code: "ERR_OUT_OF_RANGE" },
         );
       }
+      // An `end` at or before `offset` is an EMPTY range, not an error: node
+      // returns the buffer untouched (probe-verified on v22.22.2 --
+      // buf.fill('abc', 4, 1) and buf.fill('a', 100) both come back unchanged,
+      // because node range-checks offset and end independently and then
+      // bails on `end <= offset`). Collapsing end onto start keeps the value
+      // and encoding validation below running, which is also node's order --
+      // fill('a', 4, 1, 'bogus') is ERR_UNKNOWN_ENCODING there, not a silent
+      // no-op. Previously `start > end` threw ERR_OUT_OF_RANGE here.
+      if (end < start) end = start;
       // Node value coercion: undefined/null -> 0; boolean -> 0/1; number -> &255.
       if (value === undefined || value === null) {
         Uint8Array.prototype.fill.call(this, 0, start, end);
@@ -4448,32 +4510,94 @@
       result += str.slice(last);
       return quoteChar + result + quoteChar;
     }
+    // internalBinding('util').getProxyDetails: V8's Proxy [target, handler]
+    // slots, read WITHOUT touching the proxy. Node uses it so inspecting a
+    // value can never be observed by that value -- see the call in `walk`.
+    // Guarded because an older oam binary's op table has no such native; the
+    // walker then behaves as it did before, trap-firing and all.
+    const proxyDetails = typeof natives.getProxyDetails === "function" ? natives.getProxyDetails : undefined;
+    // Captured the way Node captures its ObjectKeys primordial: inspect()'s
+    // option merge runs on a user-supplied bag, and
+    // test-util-primordial-monkeypatching pins that a monkeypatched Object.keys
+    // must not break util.inspect.
+    const objectKeys = Object.keys;
     function inspect(value, options = {}) {
+      // Port of Node's inspect() context seeding. Every option starts at the
+      // value held by the LIVE `inspect.defaultOptions` object -- read fresh on
+      // each call, never snapshotted at factory time -- so a mutation of
+      // util.inspect.defaultOptions takes effect on the NEXT inspect(), while an
+      // option the caller passes explicitly still beats the configured default.
+      // This object's key set doubles as the whitelist of user-settable options:
+      // it is what Node's merge loop tests the `opts` keys against.
+      const defaults = inspect.defaultOptions;
+      const resolved = {
+        __proto__: null,
+        showHidden: defaults.showHidden,
+        depth: defaults.depth,
+        colors: defaults.colors,
+        customInspect: defaults.customInspect,
+        showProxy: defaults.showProxy,
+        maxArrayLength: defaults.maxArrayLength,
+        maxStringLength: defaults.maxStringLength,
+        breakLength: defaults.breakLength,
+        compact: defaults.compact,
+        sorted: defaults.sorted,
+        getters: defaults.getters,
+        numericSeparator: defaults.numericSeparator,
+      };
+      if (arguments.length > 1) {
+        // Legacy positional form inspect(value, showHidden, depth, colors). Node
+        // applies it BEFORE the options bag, so argument 2 still wins when it is
+        // a bag rather than the legacy showHidden boolean.
+        if (arguments.length > 2) {
+          if (arguments[2] !== undefined) resolved.depth = arguments[2];
+          if (arguments.length > 3 && arguments[3] !== undefined) resolved.colors = arguments[3];
+        }
+        if (typeof options === "boolean") {
+          resolved.showHidden = options;
+        } else if (options !== null && options !== undefined) {
+          // Node merges ObjectKeys(opts): OWN and ENUMERABLE keys only (an
+          // inherited `depth` is ignored), and a key that is PRESENT wins even
+          // when its value is `undefined` -- `{ depth: undefined }` means
+          // unlimited depth, not "fall back to the default".
+          // `resolved` has a null prototype, so `in` IS the own-key test and
+          // neither a patched Object.prototype nor hasOwnProperty can skew it.
+          for (const key of objectKeys(options)) {
+            if (key in resolved) resolved[key] = options[key];
+          }
+        }
+      }
+      // `bare` is an oam-internal flag, never a defaultOptions key, so it is read
+      // off the raw bag instead of through the merge above.
+      const bare = options !== null && typeof options === "object" ? options.bare : undefined;
       // `depth` is mutable: the Node output-budget clamp sets it to -1 when a
       // pathological object accumulates ~2^27 chars at one indentation level.
-      let depth = options.depth === undefined ? 2 : options.depth;
-      const showHidden = options.showHidden === undefined ? false : !!options.showHidden;
-      const getters = options.getters === undefined ? false : options.getters;
-      const breakLength = options.breakLength === undefined ? 80 : options.breakLength;
-      const compact = options.compact === undefined ? 3 : options.compact;
-      const maxArrayLength =
-        options.maxArrayLength === null ? Infinity : options.maxArrayLength === undefined ? 100 : options.maxArrayLength;
-      const maxStringLength =
-        options.maxStringLength === null ? Infinity : options.maxStringLength === undefined ? 10000 : options.maxStringLength;
+      let depth = resolved.depth;
+      const showHidden = !!resolved.showHidden;
+      const getters = resolved.getters;
+      const breakLength = resolved.breakLength;
+      const compact = resolved.compact;
+      const colors = !!resolved.colors;
+      const showProxy = resolved.showProxy;
+      const numericSeparator = resolved.numericSeparator;
+      // Node maps only `null` to Infinity, and does it AFTER the merge -- so a
+      // defaultOptions of null is unlimited too.
+      const maxArrayLength = resolved.maxArrayLength === null ? Infinity : resolved.maxArrayLength;
+      const maxStringLength = resolved.maxStringLength === null ? Infinity : resolved.maxStringLength;
       // Node sorts the FORMATTED entry strings (not the keys). For object-type
       // renders the whole output is sorted; for array-type only the trailing
       // non-index key entries are.
-      const sorted = options.sorted === undefined ? false : options.sorted;
+      const sorted = resolved.sorted;
       const sortCmp = sorted === true ? undefined : typeof sorted === "function" ? sorted : undefined;
       // `customInspect: false` suppresses the built-in custom renderers too --
       // Buffer's `<Buffer ..>` form is Buffer.prototype[inspect.custom] in Node.
-      const customInspect = options.customInspect === undefined ? true : !!options.customInspect;
+      const customInspect = !!resolved.customInspect;
       const seen = [];
       // object -> ref id; minted the first time a revisit is detected
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
       const circular = new Map();
       const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
-      const stylize = options.colors
+      const stylize = colors
         ? (str, type) => {
             const name = INSPECT_STYLES[type];
             if (!name) return str;
@@ -4482,7 +4606,7 @@
           }
         : (str) => str;
       const ansiRe = /\u001b\[\d{1,3}m/g;
-      const width = (s) => (options.colors ? s.replace(ansiRe, "").length : s.length);
+      const width = (s) => (colors ? s.replace(ansiRe, "").length : s.length);
       // Node keyStrRegExp -- note: no `$`, so `$foo` keys are quoted.
       const identKeyRe = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
       // Port of Node getUserOptions: the options bag handed to a user's
@@ -4492,16 +4616,16 @@
           stylize,
           showHidden,
           depth,
-          colors: !!options.colors,
+          colors,
           customInspect,
-          showProxy: options.showProxy === undefined ? false : options.showProxy,
+          showProxy,
           maxArrayLength,
           maxStringLength,
           breakLength,
           compact,
           sorted,
           getters,
-          numericSeparator: options.numericSeparator,
+          numericSeparator,
         };
       }
 
@@ -4795,8 +4919,8 @@
         // is not a listed primitive falls into Symbol.prototype.toString and
         // throws -- exactly like Node (the caller's catch renders it).
         if (typeof tmp === "string") return formatString(tmp);
-        if (typeof tmp === "number") return stylize(Object.is(tmp, -0) ? "-0" : String(tmp), "number");
-        if (typeof tmp === "bigint") return stylize(`${tmp}n`, "bigint");
+        if (typeof tmp === "number") return stylize(inspectNumberStr(tmp, numericSeparator), "number");
+        if (typeof tmp === "bigint") return stylize(inspectBigIntStr(tmp, numericSeparator), "bigint");
         if (typeof tmp === "boolean") return stylize(String(tmp), "boolean");
         if (typeof tmp === "undefined") return stylize("undefined", "undefined");
         return stylize(Symbol.prototype.toString.call(tmp), "symbol");
@@ -4888,7 +5012,7 @@
             const desc = Object.getOwnPropertyDescriptor(obj, key);
             if (typeof desc.value === "function") continue;
             const entry = formatProperty(obj, key, desc, level, false, main);
-            if (options.colors) out.push(`\u001b[2m${entry}\u001b[22m`);
+            if (colors) out.push(`\u001b[2m${entry}\u001b[22m`);
             else out.push(entry);
           }
           seen.pop();
@@ -4973,18 +5097,63 @@
         return entriesTail(v, keys, base, level);
       }
 
+      function formatProxy(details, level) {
+        // Port of Node formatProxy: `Proxy [ target, handler ]`, the two
+        // halves formatted as ordinary values one level deeper. Node reaches
+        // straight for reduceToSingleString here (no `sorted`, no output
+        // budget) and never sets ictx.currentDepth, so neither does this.
+        if (depth !== null && level > depth) return stylize("Proxy [Array]", "special");
+        const inner = level + 1;
+        ictx.indentationLvl += 2;
+        let res;
+        try {
+          res = [walk(details[0], inner), walk(details[1], inner)];
+        } finally {
+          ictx.indentationLvl -= 2;
+        }
+        // `false` for arrayish, matching node's formatProxy, which passes
+        // kObjectType. It is unobservable today -- arrayish only gates
+        // `entries > 6` grouping and this always emits exactly 2 -- but
+        // `true` would be wrong the moment the output shape grew.
+        return reduceToSingleString(res, "", ["Proxy [", "]"], inner, false, undefined);
+      }
       function walk(v, level) {
         if (v === null) return stylize("null", "null");
         const t = typeof v;
         if (t === "string") {
-          return level === 0 && options.bare ? stylize(v, "string") : formatString(v);
+          return level === 0 && bare ? stylize(v, "string") : formatString(v);
         }
-        if (t === "number") return stylize(Object.is(v, -0) ? "-0" : String(v), "number");
+        if (t === "number") return stylize(inspectNumberStr(v, numericSeparator), "number");
         if (t === "boolean") return stylize(String(v), "boolean");
         if (t === "undefined") return stylize("undefined", "undefined");
-        if (t === "bigint") return stylize(`${v}n`, "bigint");
+        if (t === "bigint") return stylize(inspectBigIntStr(v, numericSeparator), "bigint");
         if (t === "symbol") return stylize(v.toString(), "symbol");
         // ---------------- object-like values from here on ----------------
+        // Node reads a Proxy's [target, handler] out of band and never touches
+        // the proxy itself. Walking one would fire its traps, so a counting or
+        // logging handler would run just because the value got console.log'd:
+        // inspecting a value must not be observable to that value. With
+        // showProxy on, the pair is what gets rendered; with it off (the
+        // default) the TARGET is inspected in the proxy's place, which is the
+        // object the proxy would have reported anyway.
+        //
+        // `receiver` keeps the ORIGINAL proxy as the `this` a user's
+        // [util.inspect.custom] hook sees (Node's `context`), while `v`
+        // becomes the target everything below formats.
+        let receiver = v;
+        if (proxyDetails !== undefined) {
+          const details = proxyDetails(v, !!showProxy);
+          if (details !== undefined) {
+            // A revoked proxy has neither target nor handler and throws on
+            // every operation -- report the state rather than detonating
+            // mid-render. Inspecting a value must never throw.
+            if (details === null || details[0] === null) {
+              return stylize("<Revoked Proxy>", "special");
+            }
+            if (showProxy) return formatProxy(details, level);
+            v = details;
+          }
+        }
         if (seen.includes(v)) return markCircular(v);
         // User-supplied [util.inspect.custom] hook (Node formatValue). Skipped
         // when customInspect is off, when the hook IS util.inspect, and on the
@@ -5002,9 +5171,16 @@
             Object.getOwnPropertyDescriptor(v, "constructor")?.value?.prototype !== v
           ) {
             const customDepth = depth === null ? null : depth - level;
-            const ret = maybeCustom.call(v, customDepth, userOptionsSnapshot(), inspect);
+            // `receiver`, not `v`: for a proxy the hook found on the target is
+            // still called with the proxy as `this` (Node's `context`), so a
+            // hook that identity-checks its receiver sees what the caller
+            // actually passed to inspect.
+            const ret = maybeCustom.call(receiver, customDepth, userOptionsSnapshot(), inspect);
             // Returning `this` means "render me normally" -- avoids recursion.
-            if (ret !== v) {
+            // Compared against the receiver: a proxy's hook returns the proxy,
+            // and re-walking that would resolve to the target and call the
+            // hook again, forever.
+            if (ret !== receiver) {
               if (typeof ret !== "string") return walk(ret, level);
               return ret.split("\n").join(`\n${" ".repeat(ictx.indentationLvl)}`);
             }
@@ -5132,7 +5308,7 @@
             if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
             items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
           }
-          items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
+          items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
           return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
         }
         if (Array.isArray(v)) {
@@ -5251,8 +5427,8 @@
               const el = v[idx];
               items.push(
                 isBig
-                  ? stylize(`${el}n`, "bigint")
-                  : stylize(Object.is(el, -0) ? "-0" : String(el), "number"),
+                  ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
+                  : stylize(inspectNumberStr(el, numericSeparator), "number"),
               );
             }
             if (taLen > limit) {
@@ -5275,8 +5451,8 @@
           const items = [];
           ictx.indentationLvl += 2;
           try {
-            items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
-            items.push(`[byteOffset]: ${stylize(String(v.byteOffset), "number")}`);
+            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+            items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
             items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
             for (const k of getKeys(v, showHidden)) {
               items.push(formatProperty(v, k, undefined, level + 1, false, v));
@@ -5311,7 +5487,14 @@
             const ctor = safeCtorName(v);
             let base = `[${boxType}`;
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(String(prim), boxType.toLowerCase())}]`;
+            // Node formatPrimitive for the boxed base. Only the separator-ON
+            // branch routes through inspectNumberStr: with the separator off Node
+            // prints `[Number: -0]` where this String(prim) prints `[Number: 0]`,
+            // a PRE-EXISTING -0 divergence left alone on purpose, because closing
+            // it here would change default-path output.
+            const primStr =
+              typeof prim === "number" && numericSeparator ? inspectNumberStr(prim, true) : String(prim);
+            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(primStr, boxType.toLowerCase())}]`;
             const tg = tagOf(v);
             if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
             let bkeys = getKeys(v, showHidden);
@@ -5391,10 +5574,17 @@
       return walk(value, 0);
     }
 
-    // util.inspect.defaultOptions / .custom -- present so code that reads or
-    // mutates them (the conformance corpus does) doesn't crash. Not all of
-    // these options are honored by the walker yet.
-    inspect.defaultOptions = {
+    // util.inspect.defaultOptions -- Node's ONE live options object behind an
+    // accessor pair. The getter always hands back the same object, so mutating a
+    // single key is picked up by the next inspect() call; the setter MERGES
+    // (ObjectAssign) instead of replacing, so `inspect.defaultOptions = { depth:
+    // 0 }` keeps every other option rather than blanking it. The object is
+    // sealed, so an unrecognized key throws instead of silently doing nothing,
+    // and a non-object (null, an array, a function) is an ERR_INVALID_ARG_TYPE.
+    // All three are Node parity. numericSeparator is stored and reported but not
+    // yet applied by the walker (Node's formatNumber/formatBigInt separator port
+    // is missing); that gap is per-call too, not specific to defaultOptions.
+    const inspectDefaultOptions = Object.seal({
       showHidden: false,
       depth: 2,
       colors: false,
@@ -5407,51 +5597,74 @@
       sorted: false,
       getters: false,
       numericSeparator: false,
-    };
+    });
+    Object.defineProperty(inspect, "defaultOptions", {
+      __proto__: null,
+      enumerable: false,
+      configurable: false,
+      get() {
+        return inspectDefaultOptions;
+      },
+      set(options) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        return Object.assign(inspectDefaultOptions, options);
+      },
+    });
     inspect.custom = Symbol.for("nodejs.util.inspect.custom");
 
-    // Number -> string preserving negative zero ("-0"), the way Node's
-    // formatters do (String(-0) is "0", which loses the sign).
-    function numToStr(n) {
-      if (Object.is(n, -0)) return "-0";
-      return String(n);
+    // Node addNumericSeparator: group an integer-part string in 3s from the
+    // RIGHT, skipping a leading '-'. Node applies it to whatever string it is
+    // handed, digits or not -- see inspectNumberStr for why that matters.
+    function numSepStart(str) {
+      let result = "";
+      let i = str.length;
+      const start = str.startsWith("-") ? 1 : 0;
+      for (; i >= start + 4; i -= 3) {
+        result = `_${str.slice(i - 3, i)}${result}`;
+      }
+      return i === str.length ? str : `${str.slice(0, i)}${result}`;
     }
-
-    // Node's numericSeparator: group integer digits in 3s (from the right) and
-    // fractional digits in 3s (from the left) with '_'. Exponential / non-finite
-    // strings are left untouched. Gated by inspect.defaultOptions.numericSeparator.
-    function numSep(str) {
-      if (typeof str !== "string") return str;
-      let neg = false;
-      let body = str;
-      if (body[0] === "-") { neg = true; body = body.slice(1); }
-      const dot = body.indexOf(".");
-      const intPart = dot >= 0 ? body.slice(0, dot) : body;
-      const fracPart = dot >= 0 ? body.slice(dot + 1) : "";
-      // Only plain decimal digit runs are groupable (no e/E, NaN, Infinity).
-      const allDigits = (t) => t.length > 0 && [...t].every((c) => c >= "0" && c <= "9");
-      if (!allDigits(intPart) || (dot >= 0 && !allDigits(fracPart))) return str;
-      let gi = "";
-      for (let i = 0; i < intPart.length; i++) {
-        if (i > 0 && (intPart.length - i) % 3 === 0) gi += "_";
-        gi += intPart[i];
+    // Node addNumericSeparatorEnd: group a fraction string in 3s from the LEFT.
+    function numSepEnd(str) {
+      let result = "";
+      let i = 0;
+      for (; i < str.length - 3; i += 3) {
+        result += `${str.slice(i, i + 3)}_`;
       }
-      let out = gi;
-      if (dot >= 0) {
-        let gf = "";
-        for (let i = 0; i < fracPart.length; i++) {
-          if (i > 0 && i % 3 === 0) gf += "_";
-          gf += fracPart[i];
-        }
-        out += "." + gf;
+      return i === 0 ? str : `${result}${str.slice(i)}`;
+    }
+    // Node formatNumber: how util.inspect renders a number. Two Node quirks
+    // here are deliberate, both diffed against node v22.22.2:
+    //   * with the separator ON, -0 loses its sign and prints "0" -- Node runs
+    //     the value through MathTrunc/String before grouping, so the sign only
+    //     survives on the separator-off path;
+    //   * when String(n) carries an exponent the split is taken at that text's
+    //     decimal point, and for a value with no '.' at all the index is -1, so
+    //     the halves OVERLAP: 1e-7 renders as "1e-.1e-_7", 1.23e-10 as
+    //     "1.23e_-10". That is genuinely what Node prints, so it is what we
+    //     print -- a "tidier" answer here would be a divergence.
+    function inspectNumberStr(n, numericSeparator) {
+      if (!numericSeparator) return Object.is(n, -0) ? "-0" : String(n);
+      const integer = Math.trunc(n);
+      const string = String(integer);
+      if (integer === n) {
+        if (!Number.isFinite(n) || string.includes("e")) return string;
+        return numSepStart(string);
       }
-      return (neg ? "-" : "") + out;
+      // NaN fails `integer === n` and has no fraction to group.
+      if (Number.isNaN(n)) return string;
+      const full = String(n);
+      const dot = full.indexOf(".");
+      return `${numSepStart(full.slice(0, dot))}.${numSepEnd(full.slice(dot + 1))}`;
+    }
+    // Node formatBigInt. BigInt has no -0, so only the grouping differs.
+    function inspectBigIntStr(v, numericSeparator) {
+      const string = String(v);
+      return numericSeparator ? `${numSepStart(string)}n` : `${string}n`;
     }
     let _fmtOpts = {};
-    function maybeSep(str) {
-      return _fmtOpts.numericSeparator ? numSep(str) : str;
-    }
-
     function formatValue(v) {
       if (typeof v === "string") return v;
       return inspect(v);
@@ -5504,33 +5717,54 @@
         const arg = args[i++];
         switch (spec) {
           case "%s": {
-            if (typeof arg === "number") return maybeSep(numToStr(arg));
-            if (typeof arg === "bigint") return (maybeSep(String(arg)) + "n");
+            if (typeof arg === "number") return inspectNumberStr(arg, _fmtOpts.numericSeparator);
+            if (typeof arg === "bigint") return inspectBigIntStr(arg, _fmtOpts.numericSeparator);
             // Node %s: only an object with a BUILT-IN toString (plain object /
             // array) inspects at depth 0; everything else (primitives, functions,
             // symbols, objects with a custom toString) is String()-coerced.
             const isObj = arg !== null && typeof arg === "object";
             let builtIn = false;
             if (isObj) {
-              const ts = arg.toString;
-              // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
-              // so it counts as built-in here.
-              const hasToPrim = typeof arg[Symbol.toPrimitive] === "function" && !(arg instanceof Date);
-              builtIn = !hasToPrim &&
-                (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || arg instanceof Date);
+              // Node hasBuiltInToString resolves a Proxy to its TARGET before
+              // probing: reading `.toString` or Symbol.toPrimitive off the
+              // proxy would fire its get trap, and formatting a value must not
+              // be observable to that value. A revoked proxy has no target to
+              // probe and counts as built-in, so it inspects to
+              // <Revoked Proxy> instead of throwing out of String().
+              let probe = arg;
+              let revoked = false;
+              if (proxyDetails !== undefined) {
+                const target = proxyDetails(arg, false);
+                if (target === null) revoked = true;
+                else if (target !== undefined) probe = target;
+              }
+              if (revoked) {
+                builtIn = true;
+              } else {
+                const ts = probe.toString;
+                // Date has a Symbol.toPrimitive but Node %s INSPECTS it (ISO form),
+                // so it counts as built-in here.
+                const hasToPrim = typeof probe[Symbol.toPrimitive] === "function" && !(probe instanceof Date);
+                builtIn = !hasToPrim &&
+                  (typeof ts !== "function" || ts === Object.prototype.toString || ts === Array.prototype.toString || probe instanceof Date);
+              }
             }
             if (!builtIn) return String(arg);
             return inspect(arg, { ..._fmtOpts, depth: 0, colors: false, compact: 3, bare: true });
           }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
-            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(Number(arg)));
+            return typeof arg === "bigint"
+              ? inspectBigIntStr(arg, _fmtOpts.numericSeparator)
+              : inspectNumberStr(Number(arg), _fmtOpts.numericSeparator);
           case "%i":
             if (typeof arg === "symbol") return "NaN";
-            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(parseInt(arg, 10)));
+            return typeof arg === "bigint"
+              ? inspectBigIntStr(arg, _fmtOpts.numericSeparator)
+              : inspectNumberStr(parseInt(arg, 10), _fmtOpts.numericSeparator);
           case "%f":
             if (typeof arg === "symbol") return "NaN";
-            return maybeSep(numToStr(parseFloat(arg)));
+            return inspectNumberStr(parseFloat(arg), _fmtOpts.numericSeparator);
           case "%j":
             return tryStringify(arg);
           case "%o":
@@ -6808,6 +7042,15 @@
             validateStream,
           );
         }
+        // Node DECIDES here and APPLIES at the end -- it does not return
+        // early. The format-table walk below still runs either way, so an
+        // unknown format is ERR_INVALID_ARG_VALUE even when the answer is
+        // "no colour". Probe-verified on v22.22.2 with stdout piped:
+        // styleText('red','hello') -> "hello", styleText('nope','hello') ->
+        // ERR_INVALID_ARG_VALUE. An early return here would swallow that
+        // throw (and break conformance case 39 / the e2e unknown_throws
+        // assertion, which is exactly what that case exists to catch).
+        let skipColorize = false;
         if (validateStream) {
           // A stream-shaped object has write()/on(); reject anything else
           // (e.g. a bare {}). Node validates ReadableStream/WritableStream/
@@ -6826,9 +7069,15 @@
               stream,
             );
           }
+          // oam used to colorize unconditionally once the stream SHAPE checked
+          // out, never asking whether the destination could render colour. So
+          // `oam script.js | cat` emitted raw SGR where node emits plain text
+          // -- the divergence chalk, supports-color, ora and cli-table3 all
+          // ride on. validateStream:false still colorizes, which is node's
+          // behaviour too: opting out of the stream check opts out of the
+          // decision that check feeds.
+          skipColorize = !shouldColorize(stream);
         }
-        // oam cannot meaningfully introspect the stream's TTY-ness here; once a
-        // valid stream is present, colorize (validateStream:false skips this).
 
         const formatArray = Array.isArray(format) ? format : [format];
         const codeList = [];
@@ -6873,7 +7122,10 @@
         for (let i = codeList.length - 1; i >= 0; i--) {
           closeCodes += escapeStyleCode(codeList[i][1]);
         }
-        return `${openCodes}${processedText}${closeCodes}`;
+        // node returns the ORIGINAL text on the skip path, not processedText:
+        // with no codes to open there is nothing for the embedded-close-code
+        // rewrite above to have been for.
+        return skipColorize ? text : `${openCodes}${processedText}${closeCodes}`;
       },
       log: function utilLog() {
         var d = new Date();
@@ -6949,49 +7201,73 @@
     };
   };
 
+  // ---- colour capability (port of node internal/util/colors.js) -----------
+  // THREE surfaces have to agree about whether this process may emit SGR:
+  // assert's diff colours, util.styleText, and tty.WriteStream#hasColors.
+  // They used to disagree -- assert consulted this pair while styleText
+  // colorized unconditionally and hasColors() was hardcoded true -- so a
+  // piped `oam script.js | cat` got a plain assert diff next to a
+  // fully-escaped styleText string. One definition, at module scope, is the
+  // fix; the assert factory now consumes these rather than owning them.
+  //
+  // process.env is re-read on every call so a test that flips NO_COLOR /
+  // NODE_DISABLE_COLORS mid-run is honored.
+  function colorDepthFor(stream) {
+    const env = process.env;
+    // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
+    if (env.FORCE_COLOR !== undefined) {
+      switch (env.FORCE_COLOR) {
+        case "":
+        case "1":
+        case "true":
+          return 4;
+        case "2":
+          return 8;
+        case "3":
+          return 24;
+        default:
+          return 1;
+      }
+    }
+    if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
+      return 1;
+    }
+    if (!stream || !stream.isTTY) return 1;
+    if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
+    return 4;
+  }
+
+  function shouldColorize(stream) {
+    if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
+    return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
+  }
+
   // --------------------------------------------------------------- assert
   registry.factories["util/types"] = () => registry.get("util").types;
 
   registry.factories["assert/strict"] = () => registry.get("assert").strict;
+
+  // node's internal/assert/myers_diff export set, published by the assert
+  // factory below (see registry.factories["internal/assert/myers_diff"]).
+  // The port cannot be hoisted out of that factory: it closes over the
+  // factory-local colors / codes / kNopLinesToCollapse / OP_* state, and
+  // those are the same values that shape oam's real assert output.
+  let myersDiffModule;
 
     registry.factories.assert = () => {
     const util = registry.get("util");
     const deepEqual = util._deepEqual;
 
     // ---- colors (port of node internal/util/colors.js) ----------------------
-    // Re-read from process.env on every refresh() so a test that flips
-    // NO_COLOR / NODE_DISABLE_COLORS mid-run is honored.
-    function colorDepthFor(stream) {
-      const env = process.env;
-      // Node checks FORCE_COLOR first -- it wins over NO_COLOR.
-      if (env.FORCE_COLOR !== undefined) {
-        switch (env.FORCE_COLOR) {
-          case "":
-          case "1":
-          case "true":
-            return 4;
-          case "2":
-            return 8;
-          case "3":
-            return 24;
-          default:
-            return 1;
-        }
-      }
-      if (env.NODE_DISABLE_COLORS !== undefined || env.NO_COLOR !== undefined || env.TERM === "dumb") {
-        return 1;
-      }
-      if (!stream || !stream.isTTY) return 1;
-      if (typeof stream.getColorDepth === "function") return stream.getColorDepth();
-      return 4;
-    }
+    // colorDepthFor / shouldColorize are module scope now (search "colour
+    // capability" above) -- util.styleText and the tty WriteStream decorator
+    // answer from the SAME pair, so the three surfaces cannot disagree.
+    // Kept as an own property here because refresh() and node's own
+    // internal/util/colors shape both expose it off the colors object.
     const colors = {
       blue: "", green: "", white: "", red: "", gray: "", yellow: "", clear: "", reset: "",
       hasColors: false,
-      shouldColorize(stream) {
-        if (process.env.FORCE_COLOR !== undefined) return colorDepthFor(stream) > 2;
-        return !!(stream && stream.isTTY) && colorDepthFor(stream) > 2;
-      },
+      shouldColorize,
       refresh() {
         let hasColors = false;
         try {
@@ -8406,6 +8682,12 @@
       },
     );
     assert.strict.strict = assert.strict;
+
+    // Exactly node's three internal/assert/myers_diff exports -- no more, no
+    // less. Deliberately NOT attached to `assert` itself: extra own
+    // enumerable keys there would change the public export surface and trip
+    // the builtin export-parity gate.
+    myersDiffModule = { myersDiff, printMyersDiff, printSimpleMyersDiff };
     return assert;
   };
 
@@ -11158,7 +11440,17 @@
       stream.fd = fd;
       if (!isTTY) return stream; // non-TTY: plain Writable, no isTTY/columns (node parity)
       stream.isTTY = true;
-      stream.hasColors = () => true;
+      // node: hasColors([count][, env]) -> count <= 2 ** getColorDepth(),
+      // count defaulting to 16. This was hardcoded `() => true`, which
+      // claimed 16-colour support even under NO_COLOR / NODE_DISABLE_COLORS
+      // / TERM=dumb, and answered true for hasColors(2 ** 24) on a plain
+      // 4-bit terminal. Same colorDepthFor that assert's colours and
+      // util.styleText consult, so the three agree. isTTY is untouched --
+      // this stream IS a TTY, it just may not be allowed to colour.
+      stream.hasColors = (count) => {
+        const n = typeof count === "number" ? count : 16;
+        return n <= 2 ** colorDepthFor(stream);
+      };
       const readSize = () => natives.ttyGetWinSize(fd);
       Object.defineProperties(stream, {
         columns: { configurable: true, enumerable: true, get() { const s = readSize(); return s ? s[0] : undefined; } },
@@ -11563,11 +11855,25 @@
       },
       hrtime: Object.assign(
         (prev) => {
+          // Node validates the optional previous tuple before reading the
+          // clock (probe-verified against v22.22.2): anything that is not an
+          // Array is ERR_INVALID_ARG_TYPE, and an Array whose length is not
+          // exactly 2 is ERR_OUT_OF_RANGE. `undefined` -- not falsiness -- is
+          // what means "no argument" there, so hrtime(null) is a type error
+          // rather than a silent no-diff.
+          if (prev !== undefined) {
+            if (!Array.isArray(prev)) {
+              throw codes.ERR_INVALID_ARG_TYPE("time", "Array", prev);
+            }
+            if (prev.length !== 2) {
+              throw codes.ERR_OUT_OF_RANGE("time", 2, prev.length);
+            }
+          }
           const ns = natives.hrtimeNanos();
           const total = Number(ns);
           let secs = Math.floor(total / 1e9);
           let nanos = total % 1e9;
-          if (prev) {
+          if (prev !== undefined) {
             secs -= prev[0];
             nanos -= prev[1];
             if (nanos < 0) {
@@ -12121,6 +12427,12 @@
           // test-process-versions' hasUndici/hasAmaro with false, which
           // is the truth).
           node_builtin_shareable_builtins: Object.freeze([]),
+          // oam links V8 with its bundled FULL ICU (see icu_versions() in
+          // oam_engine/build.rs, which reads U_ICU_VERSION out of the pinned
+          // v8 crate's own headers), so every Intl constructor, locale-aware
+          // collation/casing and NFKD normalization is really there. Node's
+          // gypi publishes the integer 1; consumers coerce with !!.
+          v8_enable_i18n_support: 1,
         }),
       }),
       // Key ORDER is node's, not alphabetical: process.features is commonly
@@ -13479,90 +13791,81 @@
     // Legacy url.format: a WHATWG URL stringifies to .href; a plain object is
     // assembled from its components; a string is reparsed via the WHATWG URL.
     // Non-string/non-object input throws ERR_INVALID_ARG_TYPE.
+    // Serialize a WHATWG URL under url.format()'s four switches. Mirrors
+    // node's bindingUrl.format: drop the pieces that are switched off, then
+    // re-serialize -- but done as surgery on `href` rather than on component
+    // setters, because assigning a unicode hostname back to a URL would just
+    // re-run IDNA ToASCII and undo the `unicode: true` the caller asked for.
+    function formatWhatwgUrl(u, fragment, unicode, search, auth) {
+      let out = u.href;
+      if (u.hash) out = out.slice(0, out.length - u.hash.length);
+      if (u.search) out = out.slice(0, out.length - u.search.length);
+      const proto = u.protocol;
+      const rest = out.slice(proto.length);
+      // No "//" means an opaque path (tel:, data:, mailto:) -- no authority
+      // to rewrite, so unicode/auth are both no-ops, exactly as in node.
+      if (rest.startsWith("//")) {
+        const body = rest.slice(2);
+        const slash = body.indexOf("/");
+        const authority = slash === -1 ? body : body.slice(0, slash);
+        const tail = slash === -1 ? "" : body.slice(slash);
+        const at = authority.lastIndexOf("@");
+        let creds = at === -1 ? "" : authority.slice(0, at + 1);
+        let hostPort = at === -1 ? authority : authority.slice(at + 1);
+        if (!auth) creds = "";
+        if (unicode && u.hostname !== "") {
+          // "" means ToUnicode rejected it (an IP literal, a bracketed ipv6);
+          // keep the ASCII form rather than dropping the host on the floor.
+          const uni = globalThis.__oam.node.idnaToUnicode(u.hostname);
+          hostPort = (uni || u.hostname) + (u.port ? `:${u.port}` : "");
+        }
+        out = `${proto}//${creds}${hostPort}${tail}`;
+      }
+      if (search) out += u.search;
+      if (fragment) out += u.hash;
+      return out;
+    }
+
     function legacyFormat(urlObject, options) {
       if (typeof urlObject === "string") {
         // Node's legacy url.format(string) parses with the LEGACY parser and
         // formats with the LEGACY Url.format -- this round-trips slash-exactly
         // (e.g. 'fred:///s' stays 'fred:///s'), unlike the WHATWG URL which
-        // normalizes. (The WHATWG-URL-instance path below is unchanged.)
-        if (urlObject === "") return "";
-        return urlParse(urlObject, false, false).format();
-      } else if (urlObject instanceof Url) {
-        // A legacy Url instance (e.g. a resolveObject result) formats via its
-        // own faithful method, not the plain-object hand-assembly below.
-        return urlObject.format();
-      } else if (urlObject instanceof globalThis.URL) {
-        // fall through to WHATWG serializer below
-      } else if (urlObject === null || typeof urlObject !== "object") {
+        // normalizes.
+        urlObject = urlParse(urlObject);
+      } else if (typeof urlObject !== "object" || urlObject === null) {
         throw new codes.ERR_INVALID_ARG_TYPE(
           "urlObject",
           ["object", "string"],
           urlObject,
         );
-      }
-      if (urlObject instanceof globalThis.URL) {
-        const o = options || {};
-        const auth = o.auth !== false;
-        const fragment = o.fragment !== false;
-        const search = o.search !== false;
-        let ret = "";
-        ret += urlObject.protocol;
-        if (urlObject.host) {
-          ret += "//";
-          if (auth && (urlObject.username || urlObject.password)) {
-            ret += urlObject.username;
-            if (urlObject.password) ret += `:${urlObject.password}`;
-            ret += "@";
+      } else if (urlObject instanceof globalThis.URL) {
+        let fragment = true;
+        let unicode = false;
+        let search = true;
+        let auth = true;
+        if (options) {
+          if (
+            options === null ||
+            Array.isArray(options) ||
+            typeof options !== "object"
+          ) {
+            throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
           }
-          ret += urlObject.host;
-        } else if (urlObject.protocol === "file:") {
-          ret += "//";
+          // `!= null` on purpose: an explicitly-undefined switch keeps its
+          // default, but every other falsy value means false.
+          if (options.fragment != null) fragment = Boolean(options.fragment);
+          if (options.unicode != null) unicode = Boolean(options.unicode);
+          if (options.search != null) search = Boolean(options.search);
+          if (options.auth != null) auth = Boolean(options.auth);
         }
-        ret += urlObject.pathname;
-        if (search) ret += urlObject.search;
-        if (fragment) ret += urlObject.hash;
-        return ret;
+        return formatWhatwgUrl(urlObject, fragment, unicode, search, auth);
       }
-      // Legacy object form: assemble from components (subset Node supports).
-      let result = "";
-      let protocol = urlObject.protocol || "";
-      if (protocol && !protocol.endsWith(":")) protocol += ":";
-      result += protocol;
-      let host = "";
-      if (urlObject.host) host = urlObject.host;
-      else if (urlObject.hostname) {
-        host =
-          urlObject.hostname.includes(":") && urlObject.hostname[0] !== "["
-            ? `[${urlObject.hostname}]`
-            : urlObject.hostname;
-        if (urlObject.port) host += `:${urlObject.port}`;
-      }
-      let auth = "";
-      if (urlObject.auth) auth = urlObject.auth;
-      if (host || (protocol && protocol !== "" && urlObject.slashes !== false && host)) {
-        result += "//";
-      }
-      if (host) {
-        if (auth) result += `${auth}@`;
-        result += host;
-      }
-      let pathname = urlObject.pathname || "";
-      if (pathname && pathname[0] !== "/" && host) pathname = `/${pathname}`;
-      result += pathname;
-      let query = "";
-      if (urlObject.search) query = urlObject.search;
-      else if (urlObject.query && typeof urlObject.query === "object") {
-        const sp = new globalThis.URLSearchParams(urlObject.query);
-        const s = sp.toString();
-        if (s) query = `?${s}`;
-      } else if (typeof urlObject.query === "string" && urlObject.query) {
-        query = `?${urlObject.query}`;
-      }
-      if (query) result += query[0] === "?" ? query : `?${query}`;
-      let hash = urlObject.hash || "";
-      if (hash && hash[0] !== "#") hash = `#${hash}`;
-      result += hash;
-      return result;
+      // Legacy Url instances AND plain objects go through the same
+      // serializer node uses -- the one that knows 'mailto:' keeps its
+      // single colon while 'file:' grows a '//', which a from-scratch
+      // component assembly kept getting wrong.
+      return Url.prototype.format.call(urlObject);
     }
 
     function urlToHttpOptions(url) {
@@ -13605,28 +13908,91 @@
       "file", "file:", "ws", "ws:", "wss", "wss:",
     ]);
     // chars
-    const C_TAB = 9, C_LF = 10, C_FF = 12, C_CR = 13, C_SPACE = 32, C_DQUOTE = 34,
+    const C_TAB = 9, C_LF = 10, C_CR = 13, C_SPACE = 32, C_DQUOTE = 34,
       C_HASH = 35, C_PERCENT = 37, C_SQUOTE = 39, C_FSLASH = 47, C_QUESTION = 63,
       C_AT = 64, C_BSLASH = 92, C_CARET = 94, C_GRAVE = 96, C_LCURLY = 123,
       C_PIPE = 124, C_RCURLY = 125, C_SEMI = 59, C_LT = 60, C_GT = 62,
       C_NBSP = 160, C_ZWNBSP = 65279, C_COLON = 58;
-    // autoEscape set: chars in the path that must be percent-encoded.
-    const autoEscapeMap = {
-      "\t": "%09", "\n": "%0A", "\r": "%0D", " ": "%20", '"': "%22",
-      "'": "%27", "<": "%3C", ">": "%3E", "`": "%60",
-    };
+    // autoEscape set: every RFC 2396 delimiter/unwise char that must be
+    // percent-encoded in the post-host remainder, indexed by char code.
+    // Single quote is in there against XSS. Note '\' (%5C), '^' (%5E),
+    // '{|}' (%7B-%7D) and '`' (%60): a backslash AFTER the ?/# split is not
+    // rewritten to '/' by the loop above, so this is the only thing that
+    // encodes it.
+    const escapedCodes = [
+      /* 0 - 9 */ "", "", "", "", "", "", "", "", "", "%09",
+      /* 10 - 19 */ "%0A", "", "", "%0D", "", "", "", "", "", "",
+      /* 20 - 29 */ "", "", "", "", "", "", "", "", "", "",
+      /* 30 - 39 */ "", "", "%20", "", "%22", "", "", "", "", "%27",
+      /* 40 - 49 */ "", "", "", "", "", "", "", "", "", "",
+      /* 50 - 59 */ "", "", "", "", "", "", "", "", "", "",
+      /* 60 - 69 */ "%3C", "", "%3E", "", "", "", "", "", "", "",
+      /* 70 - 79 */ "", "", "", "", "", "", "", "", "", "",
+      /* 80 - 89 */ "", "", "", "", "", "", "", "", "", "",
+      /* 90 - 99 */ "", "", "%5C", "", "%5E", "", "%60", "", "", "",
+      /* 100 - 109 */ "", "", "", "", "", "", "", "", "", "",
+      /* 110 - 119 */ "", "", "", "", "", "", "", "", "", "",
+      /* 120 - 125 */ "", "", "", "%7B", "%7C", "%7D",
+    ];
     function autoEscapeStr(rest) {
-      let out = "";
-      for (let i = 0; i < rest.length; i++) {
-        const c = rest[i];
-        const esc = autoEscapeMap[c];
-        out += esc !== undefined ? esc : c;
+      let escaped = "";
+      let lastEscapedPos = 0;
+      for (let i = 0; i < rest.length; ++i) {
+        const escapedChar = escapedCodes[rest.charCodeAt(i)];
+        if (escapedChar) {
+          if (i > lastEscapedPos) escaped += rest.slice(lastEscapedPos, i);
+          escaped += escapedChar;
+          lastEscapedPos = i + 1;
+        }
       }
-      return out;
+      if (lastEscapedPos === 0) return rest;
+      if (lastEscapedPos < rest.length) escaped += rest.slice(lastEscapedPos);
+      return escaped;
     }
     function isIpv6Hostname(hostname) {
       return hostname.charCodeAt(0) === 91 /* [ */ &&
         hostname.charCodeAt(hostname.length - 1) === 93 /* ] */;
+    }
+
+    // The intersection of WHATWG "forbidden host code point" with the chars
+    // the host loop above scans for, plus ':' (protocol spoofing), '@' (auth
+    // confusion) and '[' / ']' (a non-ipv6 host reading as ipv6).
+    const forbiddenHostChars = /[\0\t\n\r #%/:<>?@[\\\]^|]/;
+    // ipv6 needs '[', ']' and ':' to be legal.
+    const forbiddenHostCharsIpv6 = /[\0\t\n\r #%/<>?@\\^|]/;
+
+    // UTS #46, off the same ada_idna the WHATWG parser uses. "" means
+    // "not a valid domain" -- the caller treats that as a spoofing attempt.
+    const toASCII = (domain) => globalThis.__oam.node.idnaToASCII(domain);
+
+    // DEP0170 fires exactly once per process, on the FIRST hostname the
+    // legacy parser truncates at a ':' -- i.e. a string carrying something
+    // that looks like a port but is not one ('https://evil.com:.example.com').
+    let warnInvalidPort = true;
+    // Truncate the hostname at the first char that cannot appear in one,
+    // moving the remainder to the front of the path. Deliberately a DENYLIST
+    // (/ \ # ? :) and not an allowlist: '*', '$' and ',' are not valid domain
+    // chars either, but the legacy parser leaves them for IDNA to reject, and
+    // an allowlist here silently rewrote 'x://0.0,1.1/' to host '0.0'.
+    function getHostname(self, rest, hostname, url) {
+      for (let i = 0; i < hostname.length; ++i) {
+        const code = hostname.charCodeAt(i);
+        const isValid = code !== C_FSLASH && code !== C_BSLASH &&
+          code !== C_HASH && code !== C_QUESTION && code !== C_COLON;
+        if (!isValid) {
+          if (warnInvalidPort && code === C_COLON) {
+            warnInvalidPort = false;
+            process.emitWarning(
+              `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
+              "DeprecationWarning",
+              "DEP0170",
+            );
+          }
+          self.hostname = hostname.slice(0, i);
+          return `/${hostname.slice(i)}${rest}`;
+        }
+      }
+      return rest;
     }
 
     function Url() {
@@ -13649,14 +14015,17 @@
         throw new codes.ERR_INVALID_ARG_TYPE("url", "string", url);
       }
       let hasHash = false;
+      let hasAt = false;
       let start = -1;
       let end = -1;
       let rest = "";
       let lastPos = 0;
       for (let i = 0, inWs = false, split = false; i < url.length; ++i) {
         const code = url.charCodeAt(i);
-        const isWs = code === C_SPACE || code === C_TAB || code === C_CR ||
-          code === C_LF || code === C_FF || code === C_NBSP || code === C_ZWNBSP;
+        // Node trims on EVERY C0 control plus space (`code < 33`), not just
+        // the named whitespace five -- so '\bhttp://example.com/\b' parses as
+        // a URL rather than a relative path.
+        const isWs = code < 33 || code === C_NBSP || code === C_ZWNBSP;
         if (start === -1) {
           if (isWs) continue;
           lastPos = start = i;
@@ -13668,6 +14037,9 @@
         }
         if (!split) {
           switch (code) {
+            case C_AT:
+              hasAt = true;
+              break;
             case C_HASH:
               hasHash = true;
             // falls through
@@ -13698,7 +14070,9 @@
         }
       }
 
-      if (!slashesDenoteHost && !hasHash) {
+      // `!hasAt` keeps '//user@host/path' off the fast path: an @ means the
+      // leading '//' is an authority, not two path segments.
+      if (!slashesDenoteHost && !hasHash && !hasAt) {
         const simplePath = simplePathPattern.exec(rest);
         if (simplePath) {
           this.path = rest;
@@ -13742,14 +14116,23 @@
         let nonHost = -1;
         for (let i = 0; i < rest.length; ++i) {
           switch (rest.charCodeAt(i)) {
-            case C_TAB: case C_LF: case C_CR: case C_SPACE: case C_DQUOTE:
+            case C_TAB: case C_LF: case C_CR:
+              // WHATWG URL strips tab/LF/CR outright; the legacy parser
+              // follows, so 'http://c\r\nd/e' has host 'cd'.
+              rest = rest.slice(0, i) + rest.slice(i + 1);
+              i -= 1;
+              break;
+            case C_SPACE: case C_DQUOTE:
             case C_PERCENT: case C_SQUOTE: case C_SEMI: case C_LT: case C_GT:
             case C_BSLASH: case C_CARET: case C_GRAVE: case C_LCURLY:
             case C_PIPE: case C_RCURLY:
               if (nonHost === -1) nonHost = i;
               break;
             case C_HASH: case C_FSLASH: case C_QUESTION:
-              if (hostEnd === -1) hostEnd = i;
+              // A host-ending char is ALSO a nonHost boundary -- without that
+              // the '@' case below could clear nonHost and swallow the path.
+              if (nonHost === -1) nonHost = i;
+              hostEnd = i;
               break;
             case C_AT:
               atSign = i;
@@ -13764,17 +14147,8 @@
           start = atSign + 1;
         }
         if (nonHost === -1) {
-          // No forbidden char in the host region: the host ends at the first
-          // host-ending char (hostEnd = first / ? #), or extends to the end of
-          // `rest` if there is none. (The loop broke at hostEnd, so anything
-          // past it is the path/query/hash and must stay in `rest`.)
-          if (hostEnd === -1) {
-            this.host = rest.slice(start);
-            rest = "";
-          } else {
-            this.host = rest.slice(start, hostEnd);
-            rest = rest.slice(hostEnd);
-          }
+          this.host = rest.slice(start);
+          rest = "";
         } else {
           this.host = rest.slice(start, nonHost);
           rest = rest.slice(nonHost);
@@ -13783,37 +14157,21 @@
         if (typeof this.hostname !== "string") this.hostname = "";
         const hostname = this.hostname;
         const ipv6Hostname = isIpv6Hostname(hostname);
-        // Host validation, matched to the LIVE node v22.22.2 binary
-        // (battery-probed; the published lib/url.js diverges, same story as
-        // node_dotenv.cc). Rules:
-        // 1. A bracket in a NON-ipv6 hostname is a hard ERR_INVALID_URL
-        //    (spoofing: could make a non-ipv6 host read as ipv6) -- checked
-        //    BEFORE truncation, or the evidence is gone ('a[b].com' throws).
-        // 2. A well-formed ipv6 [..] hostname throws if forbidden chars sit
-        //    inside the brackets ('[127.0.0.1 c8763]' throws, '[]' is fine).
-        // 3. Everything else truncates LENIENTLY at the first invalid char,
-        //    remainder to path ('evil.com:.example.com' -> path
-        //    '/:.example.com'), with a strict post-truncation backstop.
+        // Host validation. A non-ipv6 hostname truncates LENIENTLY at the
+        // first host-ending char and the remainder moves to the path
+        // ('evil.com:.example.com' -> hostname 'evil.com', path
+        // '/:.example.com'); everything else -- '*', '$', ',' included --
+        // stays in the hostname and is handed to IDNA, which is what decides
+        // whether it is a real domain. Brackets are NOT truncated on: they
+        // survive into the forbiddenHostChars backstop below, so a
+        // non-ipv6 'a[b].com' throws rather than being silently cut (that
+        // would let a hostname read as ipv6 to the next parser).
         const throwInvalidUrl = () => {
           const e = new codes.ERR_INVALID_URL();
           e.input = url;
           throw e;
         };
-        if (!ipv6Hostname) {
-          if (/[[\]]/.test(this.hostname)) throwInvalidUrl();
-          let cut = -1;
-          for (let i = 0; i < this.hostname.length; i++) {
-            const c = this.hostname.charCodeAt(i);
-            const valid = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
-              (c >= 48 && c <= 57) || c === 46 || c === 45 || c === 43 ||
-              c === 95 || c > 127;
-            if (!valid) { cut = i; break; }
-          }
-          if (cut !== -1) {
-            rest = "/" + this.hostname.slice(cut) + rest;
-            this.hostname = this.hostname.slice(0, cut);
-          }
-        }
+        if (!ipv6Hostname) rest = getHostname(this, rest, hostname, url);
         if (this.hostname.length > hostnameMaxLen) {
           this.hostname = "";
         } else {
@@ -13821,9 +14179,20 @@
         }
         if (this.hostname !== "") {
           if (ipv6Hostname) {
-            if (/[\0\t\n\r #%/<>?@\\^|]/.test(this.hostname)) throwInvalidUrl();
-          } else if (/[\0\t\n\r #%/:<>?@[\\\]^|]/.test(this.hostname)) {
-            throwInvalidUrl();
+            if (forbiddenHostCharsIpv6.test(this.hostname)) throwInvalidUrl();
+          } else {
+            // IDNA (UTS #46 ToASCII): punycode only the labels that need it,
+            // so the legacy parser agrees with `new URL()` on 'bücher.com'.
+            this.hostname = toASCII(this.hostname);
+            // Two spoofing routes close here. An EMPTY result can only come
+            // from toASCII (the hostname was non-empty above), and a
+            // forbidden char can only have been INTRODUCED by toASCII
+            // (getHostname would have cut it otherwise) -- e.g. '℀' whose
+            // NFKD contains '/'. Neither is safe to repair by moving text to
+            // the pathname, so both throw.
+            if (this.hostname === "" || forbiddenHostChars.test(this.hostname)) {
+              throwInvalidUrl();
+            }
           }
         }
         const pp = this.port ? ":" + this.port : "";
@@ -13894,10 +14263,63 @@
       if (host) this.hostname = host;
     };
 
+    // Chars that survive auth serialization unescaped: alnum, "!'()*-._~"
+    // and ':' (the user:pass separator). Same set as encodeURIComponent plus
+    // ':', but unlike encodeURIComponent a LONE SURROGATE is replaced rather
+    // than thrown on -- url.format() must not fail on a wonky auth field.
+    const noEscapeAuth = new Int8Array([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x00 - 0x0F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x10 - 0x1F
+      0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, // 0x20 - 0x2F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, // 0x30 - 0x3F
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x40 - 0x4F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, // 0x50 - 0x5F
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 0x60 - 0x6F
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, // 0x70 - 0x7F
+    ]);
+    const HEX = "0123456789ABCDEF";
+    function percentEncodeByte(b) {
+      return `%${HEX[b >> 4]}${HEX[b & 15]}`;
+    }
+    function encodeAuth(str) {
+      let out = "";
+      for (let i = 0; i < str.length; ++i) {
+        const c = str.charCodeAt(i);
+        if (c < 0x80) {
+          out += noEscapeAuth[c] ? str[i] : percentEncodeByte(c);
+          continue;
+        }
+        let cp = c;
+        if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+          const lo = str.charCodeAt(i + 1);
+          if (lo >= 0xdc00 && lo <= 0xdfff) {
+            cp = (c - 0xd800) * 0x400 + lo - 0xdc00 + 0x10000;
+            i++;
+          }
+        }
+        // Unpaired surrogate -> U+FFFD, the same substitution the UTF-8
+        // encoder makes; encodeURIComponent would throw URIError here.
+        if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
+        if (cp < 0x800) {
+          out += percentEncodeByte(0xc0 | (cp >> 6)) + percentEncodeByte(0x80 | (cp & 63));
+        } else if (cp < 0x10000) {
+          out += percentEncodeByte(0xe0 | (cp >> 12)) +
+            percentEncodeByte(0x80 | ((cp >> 6) & 63)) +
+            percentEncodeByte(0x80 | (cp & 63));
+        } else {
+          out += percentEncodeByte(0xf0 | (cp >> 18)) +
+            percentEncodeByte(0x80 | ((cp >> 12) & 63)) +
+            percentEncodeByte(0x80 | ((cp >> 6) & 63)) +
+            percentEncodeByte(0x80 | (cp & 63));
+        }
+      }
+      return out;
+    }
+
     Url.prototype.format = function () {
       let auth = this.auth || "";
       if (auth) {
-        auth = encodeURIComponent(auth).replace(/%3A/gi, ":");
+        auth = encodeAuth(auth);
         auth += "@";
       }
       let protocol = this.protocol || "";
@@ -14160,26 +14582,14 @@
       return result;
     };
 
-    let dep0170Warned = false;
     function urlParse(url, parseQueryString, slashesDenoteHost) {
       if (url instanceof Url) return url;
       const u = new Url();
       u.parse(url, parseQueryString, slashesDenoteHost);
-      // DEP0170: the legacy parser accepted a string WHATWG rejects.
-      // Warn once per process (node dedupes deprecation warnings by code).
-      if (
-        !dep0170Warned &&
-        typeof url === "string" &&
-        typeof globalThis.URL?.canParse === "function" &&
-        !globalThis.URL.canParse(url)
-      ) {
-        dep0170Warned = true;
-        process.emitWarning(
-          `The URL ${url} is invalid. Future versions of Node.js will throw an error.`,
-          "DeprecationWarning",
-          "DEP0170",
-        );
-      }
+      // DEP0170 is emitted from getHostname, on the narrower trigger node
+      // actually uses (a hostname truncated at ':'), not on every string the
+      // WHATWG parser would reject -- `url.parse('//some_path')` is a legal
+      // legacy parse and must not warn.
       return u;
     }
     function urlResolve(source, relative) {
@@ -14201,13 +14611,13 @@
       parse: urlParse,
       resolve: urlResolve,
       resolveObject: urlResolveObject,
-      domainToASCII: (domain) => {
-        try {
-          return new globalThis.URL(`http://${domain}`).hostname;
-        } catch {
-          return "";
-        }
-      },
+      // Both run the domain through the WHATWG HOST parser (not bare IDNA)
+      // and return "" when it rejects -- node's exact algorithm, so
+      // 'a/b' -> 'a', 'a:80' -> '' and '%41' -> 'a'. Going through
+      // `new URL('http://' + domain)` instead got 'a:80' wrong (it parsed
+      // ':80' as a port rather than rejecting it).
+      domainToASCII: (domain) => globalThis.__oam.node.urlDomainToASCII(`${domain}`),
+      domainToUnicode: (domain) => globalThis.__oam.node.urlDomainToUnicode(`${domain}`),
     };
   };
 
@@ -20393,24 +20803,73 @@
   };
 
   // ------------------------------------------------------------ inspector
-  // Node's `inspector` module: wire-level CDP is implemented in oam's Rust
-  // core; the JS module surface exposes open/close/url and a Session class
-  // so library detection code (clinic, node --inspect integrations) works.
+  // Node's `inspector` module, as a SURFACE-ONLY stub: the module and the
+  // Session class exist so library capability-detection (clinic, profiler
+  // wrappers, node --inspect integrations) can construct one and branch,
+  // but there is NO in-process CDP backend behind it. Everything here is
+  // shaped so a caller learns that rather than being told a comfortable
+  // lie -- see the two fabrications this replaced, documented inline.
+  //
+  // Attaching a real debugger is a CLI concern: `oam run --inspect` /
+  // `oam run --inspect-brk`.
   registry.factories.inspector = () => {
     const EventEmitter = registry.get("events");
+
+    // One message, one code, from both the post() errback and (should it ever
+    // gain one) any other seam that has to admit there is no session.
+    const notAvailable = () =>
+      applyNodeErrorShape(
+        new Error(
+          "Inspector is not available. oam has no in-process inspector " +
+            "session, so this command was never dispatched; run the script " +
+            "under `oam run --inspect` or `oam run --inspect-brk` to attach " +
+            "a debugger.",
+        ),
+        "ERR_INSPECTOR_NOT_AVAILABLE",
+      );
+
     class Session extends EventEmitter {
+      // Deliberately a working no-op: node throws ERR_INSPECTOR_NOT_CONNECTED
+      // from post() when connect() was never called, and a library that only
+      // constructs + connects a Session to see whether it can must still get
+      // through. Nothing is claimed by returning undefined.
       connect() {}
+      // Left exactly as found: a no-op. Node throws ERR_INSPECTOR_NOT_WORKER
+      // here when called off a worker thread, and this stub asserts nothing
+      // by returning undefined, but changing it is outside this change's
+      // scope -- flagged rather than silently altered.
       connectToMainThread() {}
       disconnect() {}
       post(method, params, cb) {
-        if (typeof params === "function") { cb = params; }
-        if (typeof cb === "function") queueMicrotask(() => cb(null, {}));
+        if (typeof params === "function") { cb = params; params = undefined; }
+        // WAS: `cb(null, {})` -- an errback saying "your CDP command
+        // succeeded" and handing back {} as the RESULT, for a command that
+        // was never sent anywhere. That is worse than a failure: a caller
+        // reads {} as the debugger's real answer (no scripts, no profile, no
+        // heap snapshot) and proceeds on it. Fail instead, and say why.
+        //
+        // Delivered on the same queueMicrotask tick the old success used, so
+        // callers' async shape is unchanged -- only the verdict is.
+        const err = notAvailable();
+        if (typeof cb === "function") { queueMicrotask(() => cb(err)); return; }
+        // No callback means the caller opted out of the response, exactly as
+        // in node, where a post() with no callback registers no handler and a
+        // failure is simply never observed. Nothing is claimed either way, so
+        // there is nothing to correct here -- and throwing out of a microtask
+        // would be an uncatchable crash node never produces.
       }
     }
-    let _opened = false;
-    function open(_port, _host, _wait) { _opened = true; }
-    function close() { _opened = false; }
-    function url() { return _opened ? "ws://127.0.0.1:9229/0" : undefined; }
+
+    // open()/close() stay no-ops. WAS: open() set a flag and url() then
+    // returned a hardcoded "ws://127.0.0.1:9229/0" -- a debugger endpoint for
+    // a socket nothing ever bound, which a caller would print, log, or hand
+    // to a client that then fails to connect for no visible reason. url() now
+    // answers undefined unconditionally, which is both the truth (no server
+    // was started) and a value every consumer already handles: it is exactly
+    // what node returns whenever no inspector is active.
+    function open(_port, _host, _wait) {}
+    function close() {}
+    function url() { return undefined; }
     function waitForDebugger() {}
     return { Session, open, close, url, waitForDebugger, console: globalThis.console || {} };
   };
@@ -22433,6 +22892,143 @@
 
   // internal/errors -- some packages (readable-stream, undici) import this
   registry.factories["internal/errors"] = () => ({ codes });
+
+  // internal/assert/myers_diff (--expose-internals) -- the SAME port that
+  // produces oam's real assert diffs, published under node's internal id.
+  // Registering it here short-circuits the internal/* vendor path in
+  // registry.get(), which would otherwise reach the "Cannot find module"
+  // throw. Forcing the assert factory first is what fills myersDiffModule.
+  registry.factories["internal/assert/myers_diff"] = () => {
+    registry.get("assert");
+    return myersDiffModule;
+  };
+
+  // internal/test/binding (--expose-internals) -- node's own door onto the
+  // native binding table. Export shape is exactly ['internalBinding',
+  // 'primordials'] (probe-verified against v22.22.2), and requiring it emits
+  // node's warning verbatim.
+  //
+  // THE CONTRACT: every namespace this returns is a Proxy that THROWS for any
+  // member oam does not genuinely back, and an unknown namespace throws too.
+  // Answering `undefined` would be the dishonest option -- a caller that
+  // feature-detects a native would walk on believing oam implements it, and a
+  // conformance test would fail somewhere far away from the real reason. The
+  // throw names exactly what is missing:
+  //   oam: no native binding for '<ns>.<member>'
+  //   oam: no native binding for '<ns>'
+  // Backed members are taken BY IDENTITY off the public surface that already
+  // implements them, so a binding cannot drift from its module.
+  registry.factories["internal/test/binding"] = (natives) => {
+    process.emitWarning(
+      "These APIs are for internal testing only. Do not use them.",
+      "internal/test/binding",
+    );
+
+    // Only string keys throw: symbol lookups (Symbol.toPrimitive,
+    // Symbol.toStringTag, ...) and Object.prototype plumbing are JS object
+    // mechanics, not claimed natives, so they resolve normally.
+    const bindingNamespace = (ns, backed) =>
+      new Proxy(backed, {
+        get(target, prop, receiver) {
+          if (typeof prop === "symbol" || Reflect.has(target, prop)) {
+            return Reflect.get(target, prop, receiver);
+          }
+          throw new Error(`oam: no native binding for '${ns}.${String(prop)}'`);
+        },
+      });
+
+    // __proto__: null so a namespace name that collides with an
+    // Object.prototype key ("constructor", "toString") is still unknown.
+    const builders = {
+      __proto__: null,
+
+      // Constants only. node's binding also carries fill/swap16/swap32/swap64,
+      // but node's take the buffer AS AN ARGUMENT ((buf, value, start, end,
+      // encoding) for fill); oam has only the Buffer.prototype methods, so
+      // publishing them under node's names would be wrong-arity adapters
+      // wearing a native's identity. They throw instead.
+      buffer: () => {
+        const buffer = registry.get("buffer");
+        return {
+          kMaxLength: buffer.kMaxLength,
+          kStringMaxLength: buffer.kStringMaxLength,
+          // node's byteLengthUtf8(str) -> utf8 byte length, string-only.
+          // Same signature, same answer, oam's real measurement behind it.
+          byteLengthUtf8: (str) => {
+            if (typeof str !== "string") {
+              throw new codes.ERR_INVALID_ARG_TYPE("str", "string", str);
+            }
+            return globalThis.Buffer.byteLength(str, "utf8");
+          },
+        };
+      },
+
+      // getLibuvNow only. node's binding also holds scheduleTimer /
+      // toggleTimerRef / toggleImmediateRef, which drive node's own JS timer
+      // list; oam's timer queue lives in Rust and has no such entry points.
+      timers: () => ({
+        // Node returns uv_now() -- the loop's cached millisecond clock, an
+        // integer that starts near zero. oam's uptime clock is the same
+        // shape and the same monotonic source the timer queue runs on.
+        getLibuvNow: () => Math.trunc(natives.uptimeMs()),
+      }),
+
+      // The isX predicates process.binding('util') already answers with, taken
+      // from that same call so the two cannot diverge, plus the two extra
+      // natives oam really has. node's other members (previewEntries,
+      // getCallSites, ...) have nothing behind them here.
+      util: () => {
+        const out = process.binding("util");
+        if (typeof natives.arrayBufferViewHasBuffer === "function") {
+          out.arrayBufferViewHasBuffer = natives.arrayBufferViewHasBuffer;
+        }
+        if (typeof natives.getProxyDetails === "function") {
+          // V8's Proxy [target, handler] slots -- the same native util.inspect
+          // reads so it can format a proxy without firing its traps. node's
+          // shape: one argument (or an explicit `true`) yields
+          // [target, handler], anything else yields just the target, a revoked
+          // proxy yields nulls, and a non-proxy yields undefined. The arity
+          // half of that rule has to live here, where the argument count is
+          // visible.
+          out.getProxyDetails = function getProxyDetails(value, showDetailed) {
+            return natives.getProxyDetails(value, arguments.length < 2 || showDetailed === true);
+          };
+        }
+        return out;
+      },
+    };
+
+    // node's internalBinding is memoized per namespace; match that.
+    const cache = new Map();
+    const internalBinding = (name) => {
+      const id = String(name);
+      if (cache.has(id)) return cache.get(id);
+      const build = builders[id];
+      if (typeof build !== "function") {
+        throw new Error(`oam: no native binding for '${id}'`);
+      }
+      const ns = bindingNamespace(id, build());
+      cache.set(id, ns);
+      return ns;
+    };
+
+    return {
+      internalBinding,
+      // oam's REAL primordials -- the 35-name set the vendored streams port
+      // runs on (js/vendor/oam-shims/primordials.js), not node's ~400. Behind
+      // the same honesty proxy: a name oam does not have throws instead of
+      // reading undefined. Enumeration (ObjectKeys/ReflectOwnKeys) is
+      // untrapped and reports the real set.
+      primordials: new Proxy(globalThis.__oamVendor._primordials, {
+        get(target, prop, receiver) {
+          if (typeof prop === "symbol" || Reflect.has(target, prop)) {
+            return Reflect.get(target, prop, receiver);
+          }
+          throw new Error(`oam: no primordial '${String(prop)}'`);
+        },
+      }),
+    };
+  };
 
   // ------------------------------------------------------------------ http2
   registry.factories.http2 = (natives) => {
