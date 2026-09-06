@@ -871,12 +871,67 @@ fn win_std_handle(fd: i32) -> isize {
 }
 
 #[cfg(windows)]
+const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+#[cfg(windows)]
+const ENABLE_LINE_INPUT: u32 = 0x0002;
+#[cfg(windows)]
+const ENABLE_ECHO_INPUT: u32 = 0x0004;
+#[cfg(windows)]
+const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+/// What a setRawMode call does to the console.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleSwitch {
+    /// Nothing: no SetConsoleMode and -- what matters -- no cancel of a
+    /// read in flight, which would drop its type-ahead for nothing.
+    Keep,
+    /// Set `target`; `from_cooked_echo` says whether the read blocked under
+    /// the OLD mode was a cooked, echoing one (its Enter echoes a newline).
+    Set { target: u32, from_cooked_echo: bool },
+}
+
+/// The decision behind the Windows `tty_set_raw_mode`, as a pure function of
+/// the mode the console is in now, the direction, and `saved` -- the mode
+/// the first setRawMode(true) stashed, None when raw was never enabled.
+///
+/// Two early returns mirror libuv's `uv_tty_set_mode` (src/win/tty.c):
+/// `if (!!mode == !!(tty->flags & UV_HANDLE_TTY_RAW)) return 0;` -- asking
+/// for the mode the tty is already in is a no-op, and NORMAL when raw was
+/// never enabled is that no-op too. libuv keys it off its own flag; here the
+/// console's current mode and the saved-original slot carry the same
+/// information. Synthesising a cooked mode from the current one instead
+/// (what this used to do) is not harmless: on a console that starts with
+/// VT input on, a stray setRawMode(false) flipped it to a different mode and
+/// cancelled the read in flight.
+#[cfg(windows)]
+fn plan_console_switch(mode: u32, enable: bool, saved: Option<u32>) -> ConsoleSwitch {
+    let target = if enable {
+        // Clearing PROCESSED_INPUT means Ctrl-C is NOT turned into a
+        // CTRL_C_EVENT: it arrives as a 0x03 data byte and the console ctrl
+        // handler (owned by the signals-in item) never fires -- this is
+        // Node's documented raw-mode behavior and the coordination point.
+        (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+    } else {
+        match saved {
+            Some(orig) => orig,
+            None => return ConsoleSwitch::Keep,
+        }
+    };
+    if target == mode {
+        return ConsoleSwitch::Keep;
+    }
+    ConsoleSwitch::Set {
+        target,
+        from_cooked_echo: mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+            == (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT),
+    }
+}
+
+#[cfg(windows)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     use std::sync::atomic::Ordering;
-    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
-    const ENABLE_LINE_INPUT: u32 = 0x0002;
-    const ENABLE_ECHO_INPUT: u32 = 0x0004;
-    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
     // ABI: the signatures match the Win32 console ABI (GetConsoleMode:
     // HANDLE + out DWORD*; SetConsoleMode: HANDLE + by-value DWORD). Pointer
     // validity for the actual calls is established at the call site below,
@@ -890,6 +945,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
         return false;
     }
     let mut mode: u32 = 0;
+    let from_cooked_echo;
     // SAFETY: `h` is a console handle from win_std_handle, already rejected
     // above if 0/-1. `mode` is a live stack u32 passed by `&mut`, valid for
     // GetConsoleMode's out-write, and is only read after the return is checked
@@ -898,7 +954,7 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
         if GetConsoleMode(h, &mut mode) == 0 {
             return false;
         }
-        let target = if enable {
+        let saved = if enable {
             // Save the pre-raw mode once so setRawMode(false)/exit restores it.
             let _ = WIN_STDIN_ORIG_MODE.compare_exchange(
                 u32::MAX,
@@ -906,28 +962,21 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
-            // Clearing PROCESSED_INPUT means Ctrl-C is NOT turned into a
-            // CTRL_C_EVENT: it arrives as a 0x03 data byte and the console
-            // ctrl handler (owned by the signals-in item) never fires -- this
-            // is Node's documented raw-mode behavior and the coordination point.
-            (mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
-                | ENABLE_VIRTUAL_TERMINAL_INPUT
+            None
         } else {
             let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
-            if orig == u32::MAX {
-                (mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
-                    & !ENABLE_VIRTUAL_TERMINAL_INPUT
-            } else {
-                orig
+            (orig != u32::MAX).then_some(orig)
+        };
+        let target = match plan_console_switch(mode, enable, saved) {
+            ConsoleSwitch::Keep => return true,
+            ConsoleSwitch::Set {
+                target,
+                from_cooked_echo: echo,
+            } => {
+                from_cooked_echo = echo;
+                target
             }
         };
-        // libuv's uv_tty_set_mode returns early when the console is already
-        // in the requested mode, and so does this. It matters for the cancel
-        // below: a no-op switch must not cancel -- and so drop the type-ahead
-        // of -- a read that is blocked and would have completed fine.
-        if target == mode {
-            return true;
-        }
         if SetConsoleMode(h, target) == 0 {
             return false;
         }
@@ -952,11 +1001,91 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> bool {
     // returns the injected `\r` as one silent byte. The PRE-flip `mode` is
     // what the pending read was issued under.
     if fd == 0 {
-        let from_cooked_echo = mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
-            == (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
         oam_core::stdin::cancel_pending_console_read(from_cooked_echo);
     }
     true
+}
+
+#[cfg(all(test, windows))]
+mod console_switch_tests {
+    use super::{
+        ConsoleSwitch, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, plan_console_switch,
+    };
+
+    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    /// A console as a shell hands it over.
+    const COOKED: u32 = ENABLE_PROCESSED_INPUT
+        | ENABLE_LINE_INPUT
+        | ENABLE_ECHO_INPUT
+        | ENABLE_WINDOW_INPUT
+        | ENABLE_EXTENDED_FLAGS;
+    const RAW: u32 = (COOKED & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+        | ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+    #[test]
+    fn enabling_from_cooked_flips_and_cancels_an_echoing_read() {
+        assert_eq!(
+            plan_console_switch(COOKED, true, None),
+            ConsoleSwitch::Set {
+                target: RAW,
+                from_cooked_echo: true
+            }
+        );
+    }
+
+    #[test]
+    fn enabling_when_already_raw_is_a_noop_that_cancels_nothing() {
+        assert_eq!(plan_console_switch(RAW, true, None), ConsoleSwitch::Keep);
+    }
+
+    #[test]
+    fn disabling_without_a_prior_enable_is_a_noop_like_libuv() {
+        // A console that starts with VT input on: synthesising a cooked mode
+        // from it would have produced a DIFFERENT mode, flipped the console
+        // and cancelled the read in flight. libuv returns early instead.
+        let vt_console = COOKED | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        assert_eq!(
+            plan_console_switch(vt_console, false, None),
+            ConsoleSwitch::Keep
+        );
+        assert_eq!(
+            plan_console_switch(COOKED, false, None),
+            ConsoleSwitch::Keep
+        );
+    }
+
+    #[test]
+    fn disabling_restores_the_saved_mode_and_the_raw_read_echoed_nothing() {
+        assert_eq!(
+            plan_console_switch(RAW, false, Some(COOKED)),
+            ConsoleSwitch::Set {
+                target: COOKED,
+                from_cooked_echo: false
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_when_the_saved_mode_is_already_in_force_is_a_noop() {
+        assert_eq!(
+            plan_console_switch(COOKED, false, Some(COOKED)),
+            ConsoleSwitch::Keep
+        );
+    }
+
+    #[test]
+    fn a_line_read_without_echo_has_no_newline_to_undo() {
+        let silent_cooked = COOKED & !ENABLE_ECHO_INPUT;
+        assert_eq!(
+            plan_console_switch(silent_cooked, true, None),
+            ConsoleSwitch::Set {
+                target: RAW,
+                from_cooked_echo: false
+            }
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1154,6 +1283,22 @@ mod raw_mode_tests {
             vmin: 4,
             vtime: 0,
         }
+    }
+
+    #[test]
+    fn inherits_a_cleared_opost_and_only_ors_onlcr() {
+        // `stty -opost` before the program ran: libuv inherits OPOST as it
+        // finds it and only ORs ONLCR in; it never forces output processing
+        // back on.
+        let mut no_opost = cooked();
+        no_opost.oflag &= !(libc::OPOST | libc::ONLCR);
+        let raw = raw_mode_bits(no_opost);
+        assert_eq!(
+            raw.oflag & libc::OPOST,
+            0,
+            "OPOST stays as the caller left it"
+        );
+        assert_ne!(raw.oflag & libc::ONLCR, 0, "ONLCR is still ORed in");
     }
 
     #[test]
