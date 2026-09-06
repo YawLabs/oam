@@ -4463,32 +4463,88 @@
     // Guarded because an older oam binary's op table has no such native; the
     // walker then behaves as it did before, trap-firing and all.
     const proxyDetails = typeof natives.getProxyDetails === "function" ? natives.getProxyDetails : undefined;
+    // Captured the way Node captures its ObjectKeys primordial: inspect()'s
+    // option merge runs on a user-supplied bag, and
+    // test-util-primordial-monkeypatching pins that a monkeypatched Object.keys
+    // must not break util.inspect.
+    const objectKeys = Object.keys;
     function inspect(value, options = {}) {
+      // Port of Node's inspect() context seeding. Every option starts at the
+      // value held by the LIVE `inspect.defaultOptions` object -- read fresh on
+      // each call, never snapshotted at factory time -- so a mutation of
+      // util.inspect.defaultOptions takes effect on the NEXT inspect(), while an
+      // option the caller passes explicitly still beats the configured default.
+      // This object's key set doubles as the whitelist of user-settable options:
+      // it is what Node's merge loop tests the `opts` keys against.
+      const defaults = inspect.defaultOptions;
+      const resolved = {
+        __proto__: null,
+        showHidden: defaults.showHidden,
+        depth: defaults.depth,
+        colors: defaults.colors,
+        customInspect: defaults.customInspect,
+        showProxy: defaults.showProxy,
+        maxArrayLength: defaults.maxArrayLength,
+        maxStringLength: defaults.maxStringLength,
+        breakLength: defaults.breakLength,
+        compact: defaults.compact,
+        sorted: defaults.sorted,
+        getters: defaults.getters,
+        numericSeparator: defaults.numericSeparator,
+      };
+      if (arguments.length > 1) {
+        // Legacy positional form inspect(value, showHidden, depth, colors). Node
+        // applies it BEFORE the options bag, so argument 2 still wins when it is
+        // a bag rather than the legacy showHidden boolean.
+        if (arguments.length > 2) {
+          if (arguments[2] !== undefined) resolved.depth = arguments[2];
+          if (arguments.length > 3 && arguments[3] !== undefined) resolved.colors = arguments[3];
+        }
+        if (typeof options === "boolean") {
+          resolved.showHidden = options;
+        } else if (options !== null && options !== undefined) {
+          // Node merges ObjectKeys(opts): OWN and ENUMERABLE keys only (an
+          // inherited `depth` is ignored), and a key that is PRESENT wins even
+          // when its value is `undefined` -- `{ depth: undefined }` means
+          // unlimited depth, not "fall back to the default".
+          // `resolved` has a null prototype, so `in` IS the own-key test and
+          // neither a patched Object.prototype nor hasOwnProperty can skew it.
+          for (const key of objectKeys(options)) {
+            if (key in resolved) resolved[key] = options[key];
+          }
+        }
+      }
+      // `bare` is an oam-internal flag, never a defaultOptions key, so it is read
+      // off the raw bag instead of through the merge above.
+      const bare = options !== null && typeof options === "object" ? options.bare : undefined;
       // `depth` is mutable: the Node output-budget clamp sets it to -1 when a
       // pathological object accumulates ~2^27 chars at one indentation level.
-      let depth = options.depth === undefined ? 2 : options.depth;
-      const showHidden = options.showHidden === undefined ? false : !!options.showHidden;
-      const getters = options.getters === undefined ? false : options.getters;
-      const breakLength = options.breakLength === undefined ? 80 : options.breakLength;
-      const compact = options.compact === undefined ? 3 : options.compact;
-      const maxArrayLength =
-        options.maxArrayLength === null ? Infinity : options.maxArrayLength === undefined ? 100 : options.maxArrayLength;
-      const maxStringLength =
-        options.maxStringLength === null ? Infinity : options.maxStringLength === undefined ? 10000 : options.maxStringLength;
+      let depth = resolved.depth;
+      const showHidden = !!resolved.showHidden;
+      const getters = resolved.getters;
+      const breakLength = resolved.breakLength;
+      const compact = resolved.compact;
+      const colors = !!resolved.colors;
+      const showProxy = resolved.showProxy;
+      const numericSeparator = resolved.numericSeparator;
+      // Node maps only `null` to Infinity, and does it AFTER the merge -- so a
+      // defaultOptions of null is unlimited too.
+      const maxArrayLength = resolved.maxArrayLength === null ? Infinity : resolved.maxArrayLength;
+      const maxStringLength = resolved.maxStringLength === null ? Infinity : resolved.maxStringLength;
       // Node sorts the FORMATTED entry strings (not the keys). For object-type
       // renders the whole output is sorted; for array-type only the trailing
       // non-index key entries are.
-      const sorted = options.sorted === undefined ? false : options.sorted;
+      const sorted = resolved.sorted;
       const sortCmp = sorted === true ? undefined : typeof sorted === "function" ? sorted : undefined;
       // `customInspect: false` suppresses the built-in custom renderers too --
       // Buffer's `<Buffer ..>` form is Buffer.prototype[inspect.custom] in Node.
-      const customInspect = options.customInspect === undefined ? true : !!options.customInspect;
+      const customInspect = !!resolved.customInspect;
       const seen = [];
       // object -> ref id; minted the first time a revisit is detected
       // (Node's deferred `<ref *N>` / `[Circular *N]` anchor scheme).
       const circular = new Map();
       const ictx = { indentationLvl: 0, currentDepth: 0, budget: {} };
-      const stylize = options.colors
+      const stylize = colors
         ? (str, type) => {
             const name = INSPECT_STYLES[type];
             if (!name) return str;
@@ -4497,7 +4553,7 @@
           }
         : (str) => str;
       const ansiRe = /\u001b\[\d{1,3}m/g;
-      const width = (s) => (options.colors ? s.replace(ansiRe, "").length : s.length);
+      const width = (s) => (colors ? s.replace(ansiRe, "").length : s.length);
       // Node keyStrRegExp -- note: no `$`, so `$foo` keys are quoted.
       const identKeyRe = /^[a-zA-Z_][a-zA-Z_0-9]*$/;
       // Port of Node getUserOptions: the options bag handed to a user's
@@ -4507,16 +4563,16 @@
           stylize,
           showHidden,
           depth,
-          colors: !!options.colors,
+          colors,
           customInspect,
-          showProxy: options.showProxy === undefined ? false : options.showProxy,
+          showProxy,
           maxArrayLength,
           maxStringLength,
           breakLength,
           compact,
           sorted,
           getters,
-          numericSeparator: options.numericSeparator,
+          numericSeparator,
         };
       }
 
@@ -4810,8 +4866,8 @@
         // is not a listed primitive falls into Symbol.prototype.toString and
         // throws -- exactly like Node (the caller's catch renders it).
         if (typeof tmp === "string") return formatString(tmp);
-        if (typeof tmp === "number") return stylize(Object.is(tmp, -0) ? "-0" : String(tmp), "number");
-        if (typeof tmp === "bigint") return stylize(`${tmp}n`, "bigint");
+        if (typeof tmp === "number") return stylize(inspectNumberStr(tmp, numericSeparator), "number");
+        if (typeof tmp === "bigint") return stylize(inspectBigIntStr(tmp, numericSeparator), "bigint");
         if (typeof tmp === "boolean") return stylize(String(tmp), "boolean");
         if (typeof tmp === "undefined") return stylize("undefined", "undefined");
         return stylize(Symbol.prototype.toString.call(tmp), "symbol");
@@ -4903,7 +4959,7 @@
             const desc = Object.getOwnPropertyDescriptor(obj, key);
             if (typeof desc.value === "function") continue;
             const entry = formatProperty(obj, key, desc, level, false, main);
-            if (options.colors) out.push(`\u001b[2m${entry}\u001b[22m`);
+            if (colors) out.push(`\u001b[2m${entry}\u001b[22m`);
             else out.push(entry);
           }
           seen.pop();
@@ -5012,12 +5068,12 @@
         if (v === null) return stylize("null", "null");
         const t = typeof v;
         if (t === "string") {
-          return level === 0 && options.bare ? stylize(v, "string") : formatString(v);
+          return level === 0 && bare ? stylize(v, "string") : formatString(v);
         }
-        if (t === "number") return stylize(Object.is(v, -0) ? "-0" : String(v), "number");
+        if (t === "number") return stylize(inspectNumberStr(v, numericSeparator), "number");
         if (t === "boolean") return stylize(String(v), "boolean");
         if (t === "undefined") return stylize("undefined", "undefined");
-        if (t === "bigint") return stylize(`${v}n`, "bigint");
+        if (t === "bigint") return stylize(inspectBigIntStr(v, numericSeparator), "bigint");
         if (t === "symbol") return stylize(v.toString(), "symbol");
         // ---------------- object-like values from here on ----------------
         // Node reads a Proxy's [target, handler] out of band and never touches
@@ -5033,7 +5089,7 @@
         // becomes the target everything below formats.
         let receiver = v;
         if (proxyDetails !== undefined) {
-          const details = proxyDetails(v, !!options.showProxy);
+          const details = proxyDetails(v, !!showProxy);
           if (details !== undefined) {
             // A revoked proxy has neither target nor handler and throws on
             // every operation -- report the state rather than detonating
@@ -5041,7 +5097,7 @@
             if (details === null || details[0] === null) {
               return stylize("<Revoked Proxy>", "special");
             }
-            if (options.showProxy) return formatProxy(details, level);
+            if (showProxy) return formatProxy(details, level);
             v = details;
           }
         }
@@ -5199,7 +5255,7 @@
             if (remaining > 0) hex += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
             items.push(`${stylize("[Uint8Contents]", "special")}: <${hex}>`);
           }
-          items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
+          items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
           return reduce(items, refPrefix(v, ""), [`${pfx}{`, "}"], level + 1, false, v);
         }
         if (Array.isArray(v)) {
@@ -5318,8 +5374,8 @@
               const el = v[idx];
               items.push(
                 isBig
-                  ? stylize(`${el}n`, "bigint")
-                  : stylize(Object.is(el, -0) ? "-0" : String(el), "number"),
+                  ? stylize(inspectBigIntStr(el, numericSeparator), "bigint")
+                  : stylize(inspectNumberStr(el, numericSeparator), "number"),
               );
             }
             if (taLen > limit) {
@@ -5342,8 +5398,8 @@
           const items = [];
           ictx.indentationLvl += 2;
           try {
-            items.push(`[byteLength]: ${stylize(String(v.byteLength), "number")}`);
-            items.push(`[byteOffset]: ${stylize(String(v.byteOffset), "number")}`);
+            items.push(`[byteLength]: ${stylize(inspectNumberStr(v.byteLength, numericSeparator), "number")}`);
+            items.push(`[byteOffset]: ${stylize(inspectNumberStr(v.byteOffset, numericSeparator), "number")}`);
             items.push(`[buffer]: ${walk(v.buffer, level + 1)}`);
             for (const k of getKeys(v, showHidden)) {
               items.push(formatProperty(v, k, undefined, level + 1, false, v));
@@ -5378,7 +5434,14 @@
             const ctor = safeCtorName(v);
             let base = `[${boxType}`;
             if (boxType !== ctor) base += ctor === undefined ? " (null prototype)" : ` (${ctor})`;
-            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(String(prim), boxType.toLowerCase())}]`;
+            // Node formatPrimitive for the boxed base. Only the separator-ON
+            // branch routes through inspectNumberStr: with the separator off Node
+            // prints `[Number: -0]` where this String(prim) prints `[Number: 0]`,
+            // a PRE-EXISTING -0 divergence left alone on purpose, because closing
+            // it here would change default-path output.
+            const primStr =
+              typeof prim === "number" && numericSeparator ? inspectNumberStr(prim, true) : String(prim);
+            base += `: ${typeof prim === "string" ? formatString(prim) : stylize(primStr, boxType.toLowerCase())}]`;
             const tg = tagOf(v);
             if (tg !== "" && tg !== ctor) base += ` [${tg}]`;
             let bkeys = getKeys(v, showHidden);
@@ -5458,10 +5521,17 @@
       return walk(value, 0);
     }
 
-    // util.inspect.defaultOptions / .custom -- present so code that reads or
-    // mutates them (the conformance corpus does) doesn't crash. Not all of
-    // these options are honored by the walker yet.
-    inspect.defaultOptions = {
+    // util.inspect.defaultOptions -- Node's ONE live options object behind an
+    // accessor pair. The getter always hands back the same object, so mutating a
+    // single key is picked up by the next inspect() call; the setter MERGES
+    // (ObjectAssign) instead of replacing, so `inspect.defaultOptions = { depth:
+    // 0 }` keeps every other option rather than blanking it. The object is
+    // sealed, so an unrecognized key throws instead of silently doing nothing,
+    // and a non-object (null, an array, a function) is an ERR_INVALID_ARG_TYPE.
+    // All three are Node parity. numericSeparator is stored and reported but not
+    // yet applied by the walker (Node's formatNumber/formatBigInt separator port
+    // is missing); that gap is per-call too, not specific to defaultOptions.
+    const inspectDefaultOptions = Object.seal({
       showHidden: false,
       depth: 2,
       colors: false,
@@ -5474,51 +5544,74 @@
       sorted: false,
       getters: false,
       numericSeparator: false,
-    };
+    });
+    Object.defineProperty(inspect, "defaultOptions", {
+      __proto__: null,
+      enumerable: false,
+      configurable: false,
+      get() {
+        return inspectDefaultOptions;
+      },
+      set(options) {
+        if (options === null || typeof options !== "object" || Array.isArray(options)) {
+          throw new codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        return Object.assign(inspectDefaultOptions, options);
+      },
+    });
     inspect.custom = Symbol.for("nodejs.util.inspect.custom");
 
-    // Number -> string preserving negative zero ("-0"), the way Node's
-    // formatters do (String(-0) is "0", which loses the sign).
-    function numToStr(n) {
-      if (Object.is(n, -0)) return "-0";
-      return String(n);
+    // Node addNumericSeparator: group an integer-part string in 3s from the
+    // RIGHT, skipping a leading '-'. Node applies it to whatever string it is
+    // handed, digits or not -- see inspectNumberStr for why that matters.
+    function numSepStart(str) {
+      let result = "";
+      let i = str.length;
+      const start = str.startsWith("-") ? 1 : 0;
+      for (; i >= start + 4; i -= 3) {
+        result = `_${str.slice(i - 3, i)}${result}`;
+      }
+      return i === str.length ? str : `${str.slice(0, i)}${result}`;
     }
-
-    // Node's numericSeparator: group integer digits in 3s (from the right) and
-    // fractional digits in 3s (from the left) with '_'. Exponential / non-finite
-    // strings are left untouched. Gated by inspect.defaultOptions.numericSeparator.
-    function numSep(str) {
-      if (typeof str !== "string") return str;
-      let neg = false;
-      let body = str;
-      if (body[0] === "-") { neg = true; body = body.slice(1); }
-      const dot = body.indexOf(".");
-      const intPart = dot >= 0 ? body.slice(0, dot) : body;
-      const fracPart = dot >= 0 ? body.slice(dot + 1) : "";
-      // Only plain decimal digit runs are groupable (no e/E, NaN, Infinity).
-      const allDigits = (t) => t.length > 0 && [...t].every((c) => c >= "0" && c <= "9");
-      if (!allDigits(intPart) || (dot >= 0 && !allDigits(fracPart))) return str;
-      let gi = "";
-      for (let i = 0; i < intPart.length; i++) {
-        if (i > 0 && (intPart.length - i) % 3 === 0) gi += "_";
-        gi += intPart[i];
+    // Node addNumericSeparatorEnd: group a fraction string in 3s from the LEFT.
+    function numSepEnd(str) {
+      let result = "";
+      let i = 0;
+      for (; i < str.length - 3; i += 3) {
+        result += `${str.slice(i, i + 3)}_`;
       }
-      let out = gi;
-      if (dot >= 0) {
-        let gf = "";
-        for (let i = 0; i < fracPart.length; i++) {
-          if (i > 0 && i % 3 === 0) gf += "_";
-          gf += fracPart[i];
-        }
-        out += "." + gf;
+      return i === 0 ? str : `${result}${str.slice(i)}`;
+    }
+    // Node formatNumber: how util.inspect renders a number. Two Node quirks
+    // here are deliberate, both diffed against node v22.22.2:
+    //   * with the separator ON, -0 loses its sign and prints "0" -- Node runs
+    //     the value through MathTrunc/String before grouping, so the sign only
+    //     survives on the separator-off path;
+    //   * when String(n) carries an exponent the split is taken at that text's
+    //     decimal point, and for a value with no '.' at all the index is -1, so
+    //     the halves OVERLAP: 1e-7 renders as "1e-.1e-_7", 1.23e-10 as
+    //     "1.23e_-10". That is genuinely what Node prints, so it is what we
+    //     print -- a "tidier" answer here would be a divergence.
+    function inspectNumberStr(n, numericSeparator) {
+      if (!numericSeparator) return Object.is(n, -0) ? "-0" : String(n);
+      const integer = Math.trunc(n);
+      const string = String(integer);
+      if (integer === n) {
+        if (!Number.isFinite(n) || string.includes("e")) return string;
+        return numSepStart(string);
       }
-      return (neg ? "-" : "") + out;
+      // NaN fails `integer === n` and has no fraction to group.
+      if (Number.isNaN(n)) return string;
+      const full = String(n);
+      const dot = full.indexOf(".");
+      return `${numSepStart(full.slice(0, dot))}.${numSepEnd(full.slice(dot + 1))}`;
+    }
+    // Node formatBigInt. BigInt has no -0, so only the grouping differs.
+    function inspectBigIntStr(v, numericSeparator) {
+      const string = String(v);
+      return numericSeparator ? `${numSepStart(string)}n` : `${string}n`;
     }
     let _fmtOpts = {};
-    function maybeSep(str) {
-      return _fmtOpts.numericSeparator ? numSep(str) : str;
-    }
-
     function formatValue(v) {
       if (typeof v === "string") return v;
       return inspect(v);
@@ -5571,8 +5664,8 @@
         const arg = args[i++];
         switch (spec) {
           case "%s": {
-            if (typeof arg === "number") return maybeSep(numToStr(arg));
-            if (typeof arg === "bigint") return (maybeSep(String(arg)) + "n");
+            if (typeof arg === "number") return inspectNumberStr(arg, _fmtOpts.numericSeparator);
+            if (typeof arg === "bigint") return inspectBigIntStr(arg, _fmtOpts.numericSeparator);
             // Node %s: only an object with a BUILT-IN toString (plain object /
             // array) inspects at depth 0; everything else (primitives, functions,
             // symbols, objects with a custom toString) is String()-coerced.
@@ -5608,13 +5701,17 @@
           }
           case "%d":
             if (typeof arg === "symbol") return "NaN"; // Number(Symbol) throws; Node prints NaN
-            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(Number(arg)));
+            return typeof arg === "bigint"
+              ? inspectBigIntStr(arg, _fmtOpts.numericSeparator)
+              : inspectNumberStr(Number(arg), _fmtOpts.numericSeparator);
           case "%i":
             if (typeof arg === "symbol") return "NaN";
-            return typeof arg === "bigint" ? (maybeSep(String(arg)) + "n") : maybeSep(numToStr(parseInt(arg, 10)));
+            return typeof arg === "bigint"
+              ? inspectBigIntStr(arg, _fmtOpts.numericSeparator)
+              : inspectNumberStr(parseInt(arg, 10), _fmtOpts.numericSeparator);
           case "%f":
             if (typeof arg === "symbol") return "NaN";
-            return maybeSep(numToStr(parseFloat(arg)));
+            return inspectNumberStr(parseFloat(arg), _fmtOpts.numericSeparator);
           case "%j":
             return tryStringify(arg);
           case "%o":
