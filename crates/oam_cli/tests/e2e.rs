@@ -8103,6 +8103,381 @@ console.log('isTTY:', process.stdin.isTTY);
     );
 }
 
+// bug: readline's Interface paused stdin on close() -- as node's does -- but
+// never resumed it in the constructor (node does, last thing), and close()
+// left its 'data'/'end' listeners on the stream. A paused Readable is not
+// restarted by a new 'data' listener, so a SECOND interface over
+// process.stdin -- a CLI that prompts, closes, then prompts again -- never
+// received a byte. Each answer goes in only after its prompt shows, as a
+// terminal user's would, so the three lines reach the child as three reads.
+#[test]
+fn readline_second_interface_after_close_still_reads_stdin() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let f = write_temp(
+        "readline_sequential.mjs",
+        r#"
+import * as readline from 'node:readline/promises';
+function prompter() {
+  let rl = null;
+  return {
+    ask(p) {
+      if (rl === null) rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      return rl.question(p);
+    },
+    close() { rl?.close(); rl = null; },
+  };
+}
+const a = prompter();
+console.log('[got1]', JSON.stringify(await a.ask('Q1? ')));
+console.log('[got2]', JSON.stringify(await a.ask('Q2? ')));
+a.close();
+const b = prompter();
+console.log('[got3]', JSON.stringify(await b.ask('Q3? ')));
+b.close();
+"#,
+    );
+    let cache = write_temp("oam-cache-readline-seq/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(["run", f.to_str().unwrap(), "--no-check"])
+        .env("OAM_CACHE_DIR", &cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oam");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let pump = {
+        let seen = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+    };
+    fn wait_for(seen: &Mutex<Vec<u8>>, needle: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if String::from_utf8_lossy(&seen.lock().unwrap()).contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for (prompt, answer) in [("Q1? ", "\n"), ("Q2? ", "\n"), ("Q3? ", "2\n")] {
+        assert!(
+            wait_for(&seen, prompt),
+            "never prompted {prompt:?}; stdout so far: {}",
+            String::from_utf8_lossy(&seen.lock().unwrap())
+        );
+        stdin.write_all(answer.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+    drop(stdin);
+
+    let status = child.wait().expect("oam exits");
+    pump.join().unwrap();
+    let stdout = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .ok();
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    for expected in ["[got1] \"\"", "[got2] \"\"", "[got3] \"2\""] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+/// Unix: the raw-mode switch on a real pty. Only Windows builds on the dev
+/// box, so this is the coverage the Linux and macOS legs give the unix
+/// `tty_set_raw_mode`. Four things, each libuv's UV_TTY_MODE_RAW behaviour
+/// rather than cfmakeraw's:
+///
+/// - one keystroke arrives without Enter, and un-echoed;
+/// - a bare "\n" written under raw mode still reaches the terminal as
+///   "\r\n" (OPOST kept, ONLCR forced);
+/// - setRawMode(false), and a process exit that never switched back, both
+///   restore the termios the pty had;
+/// - setRawMode(false) with no prior enable touches nothing.
+#[cfg(unix)]
+mod unix_pty {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::write_temp;
+
+    struct Pty {
+        master: OwnedFd,
+        slave: OwnedFd,
+    }
+
+    fn open_pty() -> Pty {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes two descriptors into the live stack ints it
+        // is handed and accepts null for the name, termios and winsize it
+        // documents as optional; the return is checked before either fd is
+        // used.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        // SAFETY: both descriptors were just handed out by openpty and are
+        // owned by nothing else.
+        unsafe {
+            Pty {
+                master: OwnedFd::from_raw_fd(master),
+                slave: OwnedFd::from_raw_fd(slave),
+            }
+        }
+    }
+
+    fn termios_of(fd: &OwnedFd) -> libc::termios {
+        // SAFETY: termios is plain data, so zeroed is a valid value for
+        // tcgetattr to overwrite; the out pointer is a live stack struct and
+        // the return is checked before it is read.
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut term), 0, "tcgetattr");
+            term
+        }
+    }
+
+    fn set_termios(fd: &OwnedFd, term: &libc::termios) {
+        // SAFETY: `term` is a live, fully initialised termios (it came from
+        // tcgetattr) passed by pointer for the duration of the call.
+        let rc = unsafe { libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, term) };
+        assert_eq!(rc, 0, "tcsetattr");
+    }
+
+    fn same_termios(a: &libc::termios, b: &libc::termios) -> bool {
+        a.c_iflag == b.c_iflag
+            && a.c_oflag == b.c_oflag
+            && a.c_cflag == b.c_cflag
+            && a.c_lflag == b.c_lflag
+            && a.c_cc[..] == b.c_cc[..]
+    }
+
+    struct Session {
+        child: Child,
+        master: std::fs::File,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    /// `oam run <script>` with the pty slave as all three stdio, and a pump
+    /// draining the master side into `seen`.
+    fn spawn_on_pty(pty: &Pty, script: &Path) -> Session {
+        let cache = write_temp("oam-cache-pty/.keep", "")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let stdio = || Stdio::from(pty.slave.try_clone().expect("dup slave"));
+        let child = Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(["run", script.to_str().unwrap(), "--no-check"])
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio())
+            .spawn()
+            .expect("spawn oam on the pty");
+        let master = std::fs::File::from(pty.master.try_clone().expect("dup master"));
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        {
+            let mut reader = std::fs::File::from(pty.master.try_clone().expect("dup master"));
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+                    }
+                }
+            });
+        }
+        Session {
+            child,
+            master,
+            seen,
+        }
+    }
+
+    impl Session {
+        fn output(&self) -> String {
+            String::from_utf8_lossy(&self.seen.lock().unwrap()).into_owned()
+        }
+
+        /// Everything the terminal has received once `needle` shows up.
+        fn wait_for(&self, needle: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let out = self.output();
+                if out.contains(needle) {
+                    return out;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "never saw {needle:?}; terminal so far: {out:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Type into the terminal.
+        fn send(&mut self, bytes: &[u8]) {
+            self.master.write_all(bytes).unwrap();
+            self.master.flush().unwrap();
+        }
+
+        fn finish(mut self) -> String {
+            let status = self.child.wait().expect("oam exits");
+            let out = self.output();
+            assert!(status.success(), "oam exited {status}: {out:?}");
+            out
+        }
+    }
+
+    #[test]
+    fn raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing() {
+        let pty = open_pty();
+        let original = termios_of(&pty.slave);
+        let script = write_temp(
+            "pty_raw.mjs",
+            r#"
+import * as readline from 'node:readline/promises';
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const name = await rl.question('name? ');
+rl.close();
+process.stdout.write('[answer ' + JSON.stringify(name) + ']');
+// Let the Readable's refill read go pending before the switch, the shape a
+// TUI that starts after a prompt has.
+await new Promise((r) => setTimeout(r, 200));
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdout.write('[raw on]\nrow2');
+process.stdin.once('data', (d) => {
+  process.stdout.write('[key ' + JSON.stringify(d.toString()) + ']');
+  process.stdin.setRawMode(false);
+  process.stdout.write('[raw off]');
+  process.exit(0);
+});
+"#,
+        );
+        let mut s = spawn_on_pty(&pty, &script);
+        s.wait_for("name? ");
+        s.send(b"bob\n");
+        s.wait_for("[answer \"bob\"]");
+        let out = s.wait_for("row2");
+        assert!(
+            out.contains("[raw on]\r\nrow2"),
+            "a bare LF must reach the terminal as CR LF under raw mode (OPOST kept, \
+             ONLCR forced): {out:?}"
+        );
+        let raw = termios_of(&pty.slave);
+        assert_eq!(raw.c_lflag & libc::ICANON, 0, "the pty is raw now");
+        assert_ne!(
+            raw.c_oflag & libc::OPOST,
+            0,
+            "output processing survives raw mode"
+        );
+        s.send(b"h");
+        let out = s.wait_for("[key \"h\"]");
+        let after_row2 = &out[out.find("row2").unwrap() + "row2".len()..];
+        assert!(
+            after_row2.starts_with("[key \"h\"]"),
+            "one keystroke, no Enter, and the tty must not echo it: {after_row2:?}"
+        );
+        s.wait_for("[raw off]");
+        s.finish();
+        assert!(
+            same_termios(&termios_of(&pty.slave), &original),
+            "setRawMode(false) restores the termios the pty had"
+        );
+    }
+
+    #[test]
+    fn a_process_that_exits_raw_leaves_the_termios_restored() {
+        let pty = open_pty();
+        let original = termios_of(&pty.slave);
+        let script = write_temp(
+            "pty_exit_raw.mjs",
+            r#"
+process.stdin.setRawMode(true);
+process.stdout.write('[raw]');
+setTimeout(() => process.exit(0), 100);
+"#,
+        );
+        let s = spawn_on_pty(&pty, &script);
+        s.wait_for("[raw]");
+        assert_eq!(
+            termios_of(&pty.slave).c_lflag & libc::ICANON,
+            0,
+            "raw while it runs"
+        );
+        s.finish();
+        assert!(
+            same_termios(&termios_of(&pty.slave), &original),
+            "the exit hook restores the termios a raw program left behind"
+        );
+    }
+
+    #[test]
+    fn disabling_raw_mode_that_was_never_enabled_touches_nothing() {
+        let pty = open_pty();
+        let mut marked = termios_of(&pty.slave);
+        // Something a restore-to-defaults would undo: no erase/kill echo.
+        marked.c_lflag &= !(libc::ECHOE | libc::ECHOK);
+        set_termios(&pty.slave, &marked);
+        let script = write_temp(
+            "pty_off_only.mjs",
+            r#"
+const r = process.stdin.setRawMode(false);
+process.stdout.write('[off ' + (r === process.stdin) + ' ' + process.stdin.isRaw + ']');
+process.exit(0);
+"#,
+        );
+        let s = spawn_on_pty(&pty, &script);
+        s.wait_for("[off true false]");
+        s.finish();
+        assert!(
+            same_termios(&termios_of(&pty.slave), &marked),
+            "nothing was enabled, so nothing is restored: the marks survive"
+        );
+    }
+}
+
 #[test]
 fn fs_watch_detects_file_change() {
     let stdout = run_ok(

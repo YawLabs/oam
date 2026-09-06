@@ -29,6 +29,10 @@ pub mod inspector;
 /// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine
 /// dispatches to process's JS listeners.
 pub mod signal;
+/// `process.stdin`'s blocking read and the pending-read gate that lets a
+/// Windows console-mode switch cancel a read already blocked under the old
+/// mode (libuv's `uv__cancel_read_console`).
+pub mod stdin;
 pub mod tcp;
 pub mod tls;
 pub mod udp;
@@ -883,19 +887,7 @@ impl Drop for CoreRuntime {
     }
 }
 
-pub async fn stdin_read() -> OpOutcome {
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut buf = vec![0u8; 65536];
-    match stdin.read(&mut buf).await {
-        Ok(0) => OpOutcome::Done,
-        Ok(n) => {
-            buf.truncate(n);
-            OpOutcome::Bytes(buf)
-        }
-        Err(e) => OpOutcome::Failed(format!("stdin read: {e}")),
-    }
-}
+pub use stdin::stdin_read;
 
 /// Artifacts the process must delete before a HARD exit.
 ///

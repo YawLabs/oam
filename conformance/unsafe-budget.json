@@ -5,10 +5,10 @@
       "unsafe_count": 24
     },
     "oam_cli": {
-      "unsafe_count": 3
+      "unsafe_count": 7
     },
     "oam_core": {
-      "unsafe_count": 45
+      "unsafe_count": 48
     },
     "oam_diagnostics": {
       "unsafe_count": 0

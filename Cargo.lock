@@ -1867,6 +1867,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "libc",
  "oam_diagnostics",
  "oam_engine",
  "oam_loader",

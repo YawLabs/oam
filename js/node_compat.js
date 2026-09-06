@@ -19144,8 +19144,35 @@
   // -------------------------------------------------------------- readline
   // Minimal stub: enough for `readline.createInterface` and the async-
   // iterator line-reading pattern used by CLI utilities.
+  // node's internal AbortError: a real Error SUBCLASS (name 'AbortError',
+  // code ABORT_ERR) carrying the signal's reason as `cause`. What
+  // readline's question() rejects with on an aborted signal -- NOT a
+  // DOMException: `if (err.code !== 'ABORT_ERR') throw err` is the idiom
+  // callers branch on, and a DOMException's numeric code 20 crashed it.
+  // Shared by node:readline and node:readline/promises.
+  class ReadlineAbortError extends Error {
+    constructor(options) {
+      super("The operation was aborted", options);
+      this.code = "ABORT_ERR";
+      this.name = "AbortError";
+    }
+  }
+  function readlineAbortError(signal) {
+    return new ReadlineAbortError({ cause: signal.reason });
+  }
+
   registry.factories.readline = () => {
     const EventEmitter = registry.get("events");
+    // node's kMincrlfDelay: a smaller crlfDelay option is clamped UP to it.
+    const MIN_CRLF_DELAY = 100;
+    // node's lineEnding: "\r\n", "\n", or a lone "\r" not followed by "\n".
+    // A "\r" that CLOSES a chunk is a terminator on its own (progress bars
+    // write "10%\r20%\r"); whether a "\n" OPENING the next chunk is the same
+    // terminator or a fresh empty line is crlfDelay's call -- _normalWrite.
+    const LINE_ENDING = /\r?\n|\r(?!\n)/g;
+    // node's ERR_USE_AFTER_CLOSE('readline'): message '%s was closed'.
+    const useAfterClose = () =>
+      applyNodeErrorShape(new Error("readline was closed"), "ERR_USE_AFTER_CLOSE");
     class Interface extends EventEmitter {
       constructor(options) {
         super();
@@ -19153,56 +19180,177 @@
         this.input = opts.input || null;
         this.output = opts.output || null;
         this.terminal = opts.terminal != null ? opts.terminal === true : !!(opts.output && opts.output.isTTY);
-        this._closed = false;
+        // node: `closed` is an own data property that close() sets to true;
+        // it does not exist before that (rl.closed === undefined).
         this._paused = false;
         this._prompt = typeof opts.prompt === "string" ? opts.prompt : "> ";
-        this.crlfDelay = typeof opts.crlfDelay === "number" ? opts.crlfDelay : 100;
+        this.crlfDelay = opts.crlfDelay ? Math.max(MIN_CRLF_DELAY, opts.crlfDelay) : MIN_CRLF_DELAY;
         this.line = "";
+        // node's kQuestionCallback / kOldPrompt / kLine_buffer / kSawReturnAt.
+        this._questionCallback = null;
+        this._oldPrompt = null;
+        this._lineBuffer = null;
+        this._sawReturnAt = 0;
         if (this.input && typeof this.input.on === "function") {
           const dec = new TextDecoder();
-          let buf = "";
-          this.input.on("data", (chunk) => {
-            if (this._closed) return;
-            buf += typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true });
-            const parts = buf.split(/\r?\n/);
-            buf = parts.pop() || "";
-            for (const line of parts) {
-              this.line = line;
-              this.emit("line", line);
-            }
-          });
-          this.input.on("end", () => {
-            if (buf.length) {
-              this.line = buf;
-              this.emit("line", buf);
-              buf = "";
+          const onData = (chunk) => {
+            if (this.closed) return;
+            this._normalWrite(typeof chunk === "string" ? chunk : dec.decode(chunk, { stream: true }));
+          };
+          const onEnd = () => {
+            // node's onend: the unterminated tail goes straight to 'line'
+            // (not through the question routing), then the interface closes.
+            if (typeof this._lineBuffer === "string" && this._lineBuffer.length > 0) {
+              this.emit("line", this._lineBuffer);
             }
             this.close();
+          };
+          this.input.on("data", onData);
+          this.input.on("end", onEnd);
+          // Node detaches its input listeners on close (onSelfCloseWithout-
+          // Terminal), so a closed interface stops being a consumer of the
+          // stream and a later one over the same input is its only reader.
+          this.once("close", () => {
+            this.input.removeListener("data", onData);
+            this.input.removeListener("end", onEnd);
           });
+          // Node ends its constructor with input.resume(). close() pauses the
+          // input, and a paused stream (readableFlowing === false) is NOT
+          // restarted by a new 'data' listener -- so without this a second
+          // interface over process.stdin, created after the first was closed
+          // (a CLI that prompts, closes, then prompts again), never received
+          // a byte: the answer sat echoed on the terminal and nothing ran.
+          if (typeof this.input.resume === "function") this.input.resume();
+        }
+      }
+      // node's kNormalWrite, ported line for line. The regex is stateful
+      // (/g): node resets lastIndex before re-scanning the buffered string,
+      // and every scan runs to exhaustion, which leaves it at 0 for the next
+      // chunk.
+      _normalWrite(string) {
+        if (this._sawReturnAt && Date.now() - this._sawReturnAt <= this.crlfDelay) {
+          // The "\n" completing a "\r" from the previous chunk within
+          // crlfDelay is the same terminator, not a fresh empty line.
+          if (string.codePointAt(0) === 10) string = string.slice(1);
+          this._sawReturnAt = 0;
+        }
+        // Run the search on the new chunk, not on the whole line buffer.
+        LINE_ENDING.lastIndex = 0;
+        let newPartContainsEnding = LINE_ENDING.exec(string);
+        if (newPartContainsEnding !== null) {
+          if (this._lineBuffer) {
+            string = this._lineBuffer + string;
+            this._lineBuffer = null;
+            LINE_ENDING.lastIndex = 0; // Start the search from the beginning of the string.
+            newPartContainsEnding = LINE_ENDING.exec(string);
+          }
+          this._sawReturnAt = string.endsWith("\r") ? Date.now() : 0;
+          const indexes = [0, newPartContainsEnding.index, LINE_ENDING.lastIndex];
+          let nextMatch;
+          while ((nextMatch = LINE_ENDING.exec(string)) !== null) {
+            indexes.push(nextMatch.index, LINE_ENDING.lastIndex);
+          }
+          const lastIndex = indexes.length - 1;
+          // Either '' or (conceivably) the unfinished portion of the next line.
+          this._lineBuffer = string.slice(indexes[lastIndex]);
+          for (let i = 1; i < lastIndex; i += 2) {
+            this._onLine(string.slice(indexes[i - 1], indexes[i]));
+          }
+        } else if (string) {
+          // No line ending this time; keep what there is for the next chunk.
+          this._lineBuffer = this._lineBuffer ? this._lineBuffer + string : string;
+        }
+      }
+      // node's kOnLine: a pending question() OWNS the line -- its callback
+      // gets it and no 'line' event fires; only an unclaimed line is emitted.
+      _onLine(line) {
+        if (this._questionCallback) {
+          const cb = this._questionCallback;
+          this._questionCallback = null;
+          this.setPrompt(this._oldPrompt);
+          cb(line);
+        } else {
+          this.emit("line", line);
+        }
+      }
+      // node's kQuestion. A question asked while one is pending re-prompts
+      // (the FIRST question's prompt) and its callback is dropped.
+      _question(query, cb) {
+        if (this.closed) throw useAfterClose();
+        if (this._questionCallback) {
+          this.prompt();
+        } else {
+          this._oldPrompt = this._prompt;
+          this.setPrompt(query);
+          this._questionCallback = cb;
+          this.prompt();
+        }
+      }
+      // node's kQuestionCancel: an aborted question gives its line back to
+      // the 'line' event and ends the prompt line on screen.
+      _questionCancel() {
+        if (this._questionCallback) {
+          this._questionCallback = null;
+          this.setPrompt(this._oldPrompt);
+          this.clearLine();
+        }
+      }
+      clearLine() {
+        // node moves the cursor past the edited line first; the terminal
+        // does the editing here, so only the newline is written.
+        this._writeOutput("\r\n");
+        this.line = "";
+      }
+      _writeOutput(data) {
+        if (this.output && typeof this.output.write === "function" && data != null) {
+          this.output.write(data);
         }
       }
       close() {
-        if (this._closed) return;
-        this._closed = true;
-        if (this.input && typeof this.input.pause === "function") {
-          try { this.input.pause(); } catch (_e) { /* ignore */ }
-        }
+        if (this.closed) return;
+        // Node's order: pause the input (emitting 'pause' unless already
+        // paused), mark closed, emit 'close' -- which detaches the listeners.
+        this.pause();
+        this.closed = true;
         this.emit("close");
       }
-      question(prompt, cb) {
-        if (this.output && typeof this.output.write === "function") this.output.write(prompt);
-        const cleanup = () => { this.removeListener("line", onLine); };
-        const onLine = (line) => { this.removeListener("close", cleanup); cb(line); };
-        this.once("line", onLine);
-        this.once("close", cleanup);
+      // question(query[, options], callback) -- node's signature: an already
+      // aborted signal returns without writing the prompt; an abort after
+      // it cancels the question (the callback never runs).
+      question(query, options, cb) {
+        cb = typeof options === "function" ? options : cb;
+        if (options === null || typeof options !== "object") options = {};
+        if (options.signal) {
+          const signal = options.signal;
+          if (signal.aborted) return;
+          const onAbort = () => {
+            this._questionCancel();
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          const cleanup = () => {
+            signal.removeEventListener("abort", onAbort);
+          };
+          const originalCb = cb;
+          cb =
+            typeof cb === "function"
+              ? (answer) => {
+                  cleanup();
+                  return originalCb(answer);
+                }
+              : cleanup;
+        }
+        if (typeof cb === "function") this._question(query, cb);
       }
       setPrompt(prompt) {
-        this._prompt = typeof prompt === "string" ? prompt : "> ";
+        this._prompt = prompt;
+      }
+      getPrompt() {
+        return this._prompt;
       }
       prompt(preserveCursor) {
-        if (this.output && typeof this.output.write === "function") {
-          this.output.write(this._prompt);
-        }
+        // node: prompting resumes a paused input.
+        if (this._paused) this.resume();
+        this._writeOutput(this._prompt);
       }
       write(data, key) {
         if (this.output && typeof this.output.write === "function" && data != null) {
@@ -19324,20 +19472,32 @@
   registry.factories["readline/promises"] = () => {
     var rl = registry.get("readline");
     class Interface extends rl.Interface {
-      question(prompt, options) {
-        var signal = options && options.signal ? options.signal : null;
-        return new Promise(function (resolve, reject) {
-          if (signal && signal.aborted) { reject(new DOMException("The operation was aborted", "AbortError")); return; }
-          var onAbort;
-          rl.Interface.prototype.question.call(this, prompt, function(answer) {
-            if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-            resolve(answer);
-          });
+      // node's promises Interface.question: an already aborted signal rejects
+      // before the prompt is written; an abort after it cancels the question
+      // and rejects; both with node's AbortError (code ABORT_ERR, the
+      // signal's reason as cause). A closed interface rejects with
+      // ERR_USE_AFTER_CLOSE -- the throw happens inside the executor.
+      question(query, options) {
+        return new Promise((resolve, reject) => {
+          let cb = resolve;
+          const signal = options && options.signal ? options.signal : null;
           if (signal) {
-            onAbort = function() { reject(new DOMException("The operation was aborted", "AbortError")); };
+            if (signal.aborted) {
+              reject(readlineAbortError(signal));
+              return;
+            }
+            const onAbort = () => {
+              this._questionCancel();
+              reject(readlineAbortError(signal));
+            };
             signal.addEventListener("abort", onAbort, { once: true });
+            cb = (answer) => {
+              signal.removeEventListener("abort", onAbort);
+              resolve(answer);
+            };
           }
-        }.bind(this));
+          this._question(query, cb);
+        });
       }
     }
     return {
