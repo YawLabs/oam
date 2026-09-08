@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -127,6 +128,45 @@ pub fn run(release: bool) -> Result<()> {
         );
     }
     let exports = compare_exports(gaps.as_ref(), &surface, node_surface.as_ref());
+
+    // ------------------------------------------- oam module declarations
+    // The other direction of the same contract: not "does oam have Node's
+    // exports" but "does oam's own TYPE surface have oam's own exports".
+    // crates/oam_ts injects crates/oam_ts/types/oam.d.ts into every check, so
+    // a name js/mcp.js exports and that file does not declare is a TS2305 on
+    // a program that runs -- the runtime rejecting its own module -- and a
+    // name declared there that the JS does not export is an API promise
+    // nothing implements. Both fail below. Node takes no part: these modules
+    // are oam's, so the oracle is the runtime itself.
+    println!("suite: oam-module-types");
+    let modules_runner = repo.join("conformance/runners/oam_modules.mjs");
+    let output = run_with_timeout(
+        Command::new(&oam)
+            .arg("run")
+            .arg(&modules_runner)
+            .arg("--no-check")
+            .env("OAM_CACHE_DIR", &cache)
+            .current_dir(&repo),
+        Duration::from_secs(60),
+    )?;
+    let live_modules: Value = serde_json::from_str(output.stdout.trim())
+        .with_context(|| format!("oam_modules runner failed; stderr: {}", output.stderr))?;
+    let declarations_path = repo.join("crates/oam_ts/types/oam.d.ts");
+    let declarations = std::fs::read_to_string(&declarations_path).with_context(|| {
+        format!(
+            "{} is missing. oam_ts compiles it in, so without it every `oam check` \
+             is back to TS2307 on `oam:` imports; restore it from git.",
+            declarations_path.display()
+        )
+    })?;
+    let declared = declared_names(&declarations)?;
+    let types_ratchet_path = repo.join("conformance/oam-module-types.json");
+    let types_ratchet: Value = serde_json::from_str(
+        &std::fs::read_to_string(&types_ratchet_path)
+            .with_context(|| format!("{} is a committed artifact and this gate cannot run without it; restore it from git", types_ratchet_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", types_ratchet_path.display()))?;
+    let module_types = compare_declarations(&types_ratchet, &live_modules, &declared);
 
     // --------------------------------------------------- node-differential
     println!("suite: node-differential");
@@ -271,6 +311,20 @@ pub fn run(release: bool) -> Result<()> {
                         .collect::<Vec<_>>(),
                 },
             },
+            "oamModuleTypes": {
+                "liveTotal": module_types.live_total,
+                "deliberatelyUndeclared": module_types.allowed,
+                "missing": module_types.missing.iter()
+                    .map(|(m, k)| json!({ "module": m, "names": k }))
+                    .collect::<Vec<_>>(),
+                "extra": module_types.extra.iter()
+                    .map(|(m, k)| json!({ "module": m, "names": k }))
+                    .collect::<Vec<_>>(),
+                "staleRatchet": module_types.stale.iter()
+                    .map(|(m, k)| json!({ "module": m, "names": k }))
+                    .collect::<Vec<_>>(),
+                "detail": live_modules["exportNames"].clone(),
+            },
         },
     });
     let scorecard_path = repo.join("conformance/scorecard.json");
@@ -357,6 +411,28 @@ pub fn run(release: bool) -> Result<()> {
              known list to shrink.\n",
         );
     }
+    md.push_str("\n### oam's own modules\n\n");
+    md.push_str(&format!(
+        "**{} export names across `oam:mcp`, `oam:test`, `oam:ai`, `oam:permissions` and the \
+         `oam` global**, every one of them declared in \
+         [`crates/oam_ts/types/oam.d.ts`](crates/oam_ts/types/oam.d.ts){}.\n\n",
+        module_types.live_total,
+        if module_types.allowed == 0 {
+            String::new()
+        } else {
+            format!(
+                " except {} deliberately left undeclared (with reasons, in \
+                 [`conformance/oam-module-types.json`](conformance/oam-module-types.json))",
+                module_types.allowed
+            )
+        }
+    ));
+    md.push_str(
+        "oam_ts injects those declarations into every check, so an undeclared export is a \
+         TS2305 on a program that runs and a declared name the module does not export is an \
+         API promise nothing implements. The gate fails on both.\n",
+    );
+
     let rewrote = write_receipts(&[
         (scorecard_path, scorecard_json),
         (repo.join("CONFORMANCE.md"), md),
@@ -390,6 +466,22 @@ pub fn run(release: bool) -> Result<()> {
                 + exports.stale_absent_modules.len(),
         );
     }
+    println!(
+        "oam-module-types: {} export name(s) declared ({} deliberately undeclared, {} missing, \
+         {} declared-but-absent)",
+        module_types.live_total - module_types.allowed,
+        module_types.allowed,
+        module_types
+            .missing
+            .iter()
+            .map(|(_, n)| n.len())
+            .sum::<usize>(),
+        module_types
+            .extra
+            .iter()
+            .map(|(_, n)| n.len())
+            .sum::<usize>(),
+    );
     println!(
         "{}",
         if rewrote {
@@ -465,6 +557,41 @@ pub fn run(release: bool) -> Result<()> {
                 problems.join("\n")
             );
         }
+    }
+
+    // Gate: oam's own declarations. Hand-written types rot within a release,
+    // and the failure is silent -- the runtime keeps working while its own
+    // checker rejects it -- so drift fails the run in both directions.
+    let mut problems = Vec::new();
+    for (module, names) in &module_types.missing {
+        problems.push(format!(
+            "  {module} exports {} name(s) crates/oam_ts/types/oam.d.ts does not declare: {}",
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    for (module, names) in &module_types.extra {
+        problems.push(format!(
+            "  crates/oam_ts/types/oam.d.ts declares {} for {module}, which does not export it",
+            names.join(", ")
+        ));
+    }
+    for (module, names) in &module_types.stale {
+        problems.push(format!(
+            "  {module}: {} is recorded in conformance/oam-module-types.json but is now declared \
+             (or no longer exported) -- remove the entry (ratchet down)",
+            names.join(", ")
+        ));
+    }
+    if !problems.is_empty() {
+        bail!(
+            "oam module declarations:\n{}\n\nThose declarations are injected into every \
+             `oam check`, so an undeclared export type-errors code that runs and a declared \
+             name nothing exports type-checks code that cannot. Fix the declarations, or -- \
+             for a name that is deliberately not API -- record it in \
+             conformance/oam-module-types.json with a reason.",
+            problems.join("\n")
+        );
     }
     Ok(())
 }
@@ -672,6 +799,446 @@ fn compare_exports(ratchet: Option<&Value>, oam: &Value, node: Option<&Value>) -
         .filter(|m| node_map.get(**m).and_then(Value::as_array).is_some())
         .map(|m| (*m).to_string())
         .collect();
+
+    out
+}
+
+// ------------------------------------------ oam's own module declarations
+
+/// `crates/oam_ts/types/oam.d.ts` with comments blanked out, plus a
+/// per-byte "this is inside a string literal" mask.
+///
+/// Comments become spaces rather than disappearing so every offset still
+/// matches the original file, and the mask is what keeps a brace or a
+/// semicolon inside a string from being read as structure.
+struct Declarations {
+    text: String,
+    in_string: Vec<bool>,
+}
+
+/// Blank the comments and mark the string literals of a .d.ts.
+///
+/// ASCII-only by construction (the repo's rule for source and docs), and
+/// enforced here because everything below indexes by BYTE: a multi-byte
+/// character would make those indices land mid-character and panic.
+fn scan_declarations(raw: &str) -> Result<Declarations> {
+    if !raw.is_ascii() {
+        bail!("oam.d.ts must be ASCII (see the repo's terminal-output rule)");
+    }
+    let bytes = raw.as_bytes();
+    let mut text = String::with_capacity(raw.len());
+    let mut in_string = vec![false; raw.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Comments: blanked, newlines kept so line numbers survive.
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                text.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let end = raw[i + 2..]
+                .find("*/")
+                .map(|at| i + 2 + at + 2)
+                .unwrap_or(bytes.len());
+            for byte in &bytes[i..end] {
+                text.push(if *byte == b'\n' { '\n' } else { ' ' });
+            }
+            i = end;
+            continue;
+        }
+        if c == b'"' || c == b'\'' || c == b'`' {
+            text.push(c as char);
+            i += 1;
+            while i < bytes.len() && bytes[i] != c {
+                // A backslash escapes the next byte, closing quote included.
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    in_string[i] = true;
+                    text.push(bytes[i] as char);
+                    i += 1;
+                }
+                in_string[i] = true;
+                text.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() {
+                text.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
+        text.push(c as char);
+        i += 1;
+    }
+    Ok(Declarations { text, in_string })
+}
+
+impl Declarations {
+    /// Is `word` present at `at` as a whole token (not the tail of an
+    /// identifier, not inside a string)?
+    fn word_at(&self, at: usize, word: &str) -> bool {
+        if self.in_string.get(at).copied().unwrap_or(true) {
+            return false;
+        }
+        if !self.text[at..].starts_with(word) {
+            return false;
+        }
+        let before_ok = at == 0 || !is_ident_byte(self.text.as_bytes()[at - 1]);
+        let after = self.text.as_bytes().get(at + word.len()).copied();
+        before_ok && !after.is_some_and(is_ident_byte)
+    }
+
+    /// The identifier starting at `at`, and the offset just past it.
+    fn ident_at(&self, at: usize) -> Option<(String, usize)> {
+        let bytes = self.text.as_bytes();
+        let mut end = at;
+        while end < bytes.len() && is_ident_byte(bytes[end]) {
+            end += 1;
+        }
+        (end > at).then(|| (self.text[at..end].to_string(), end))
+    }
+
+    /// Skip whitespace forward from `at`.
+    fn skip_space(&self, mut at: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    }
+
+    /// The body of the block whose `{` is at `open`: (first byte, byte after
+    /// the last). None = unbalanced.
+    fn body(&self, open: usize) -> Option<(usize, usize)> {
+        let bytes = self.text.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            if !self.in_string[i] {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((open + 1, i));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The next code (non-string) occurrence of `needle` at or after `at`.
+    fn find_code(&self, at: usize, needle: char) -> Option<usize> {
+        let bytes = self.text.as_bytes();
+        (at..bytes.len()).find(|i| !self.in_string[*i] && bytes[*i] == needle as u8)
+    }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// The VALUE names a `declare module` block exports.
+///
+/// Types are excluded deliberately: an `interface` or `type` has no key on
+/// the module object at runtime, so counting it would report every exported
+/// type as a name the JS is missing.
+fn module_value_names(decls: &Declarations, start: usize, end: usize) -> Result<Vec<String>> {
+    let bytes = decls.text.as_bytes();
+    let mut exported: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < end {
+        if decls.in_string[i] {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' | b'(' | b'[' => depth += 1,
+            b'}' | b')' | b']' => depth -= 1,
+            _ => {}
+        }
+        if depth != 0 {
+            i += 1;
+            continue;
+        }
+        // A nested `export` is not legal TypeScript, so only the block's own
+        // top level can carry one.
+        for keyword in ["interface", "type"] {
+            if decls.word_at(i, keyword)
+                && let Some((name, _)) = decls.ident_at(decls.skip_space(i + keyword.len()))
+            {
+                types.push(name);
+            }
+        }
+        if !decls.word_at(i, "export") {
+            i += 1;
+            continue;
+        }
+        let after = decls.skip_space(i + "export".len());
+        if decls.word_at(after, "default") {
+            exported.push("default".to_string());
+            i = decls.find_code(after, ';').map_or(end, |at| at + 1);
+            continue;
+        }
+        if bytes.get(after) == Some(&b'{') {
+            let (list_start, list_end) = decls
+                .body(after)
+                .context("unbalanced export list in oam.d.ts")?;
+            for entry in decls.text[list_start..list_end].split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                // `export { a as b }` would make the declared name differ
+                // from the local one; nothing in this file needs it, and
+                // guessing which side the module object publishes is exactly
+                // the kind of drift this gate exists to catch.
+                if entry.split_whitespace().count() != 1 {
+                    bail!("oam.d.ts export entry {entry:?} is not a bare name");
+                }
+                exported.push(entry.to_string());
+            }
+            i = list_end + 1;
+            continue;
+        }
+        // `export <kind> <name>`: the name is the identifier after the kind.
+        let Some((kind, kind_end)) = decls.ident_at(after) else {
+            bail!("oam.d.ts has an `export` this gate cannot read");
+        };
+        if !matches!(
+            kind.as_str(),
+            "const" | "let" | "var" | "function" | "class" | "interface" | "type" | "enum"
+        ) {
+            bail!("oam.d.ts has an unsupported `export {kind}` -- teach the gate about it");
+        }
+        let Some((name, name_end)) = decls.ident_at(decls.skip_space(kind_end)) else {
+            bail!("oam.d.ts has an `export {kind}` with no name");
+        };
+        if matches!(kind.as_str(), "interface" | "type") {
+            types.push(name.clone());
+        }
+        exported.push(name);
+        i = name_end;
+    }
+    let mut values: Vec<String> = exported
+        .into_iter()
+        .filter(|name| !types.contains(name))
+        .collect();
+    values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+/// The member names of an interface body -- the `oam` global's surface.
+fn interface_member_names(decls: &Declarations, start: usize, end: usize) -> Result<Vec<String>> {
+    let bytes = decls.text.as_bytes();
+    let mut names = Vec::new();
+    let mut depth = 0i32;
+    let mut member_start = start;
+    let mut i = start;
+    while i <= end {
+        let terminator = i == end || (!decls.in_string[i] && bytes[i] == b';' && depth == 0);
+        if i < end && !decls.in_string[i] {
+            // Angle brackets are deliberately NOT counted: `=>` in a member
+            // type would close a group that never opened, and a `;` can only
+            // reach depth 0 inside a generic argument through a braces group
+            // that IS counted.
+            match bytes[i] {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        if terminator {
+            let mut at = decls.skip_space(member_start);
+            if decls.word_at(at, "readonly") {
+                at = decls.skip_space(at + "readonly".len());
+            }
+            if at < i.min(end) {
+                let Some((name, _)) = decls.ident_at(at) else {
+                    bail!(
+                        "oam.d.ts interface member {:?} does not start with a name",
+                        decls.text[member_start..i.min(end)].trim()
+                    );
+                };
+                names.push(name);
+            }
+            member_start = i + 1;
+        }
+        i += 1;
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Value names `crates/oam_ts/types/oam.d.ts` declares, keyed by the
+/// specifier they belong to (`oam:mcp`, ..., and `oam` for the global).
+///
+/// A hand-rolled scan rather than a TypeScript parse. tsgo could answer this
+/// exactly, but it is an OPTIONAL external toolchain -- a gate that skips
+/// itself when it is absent is not a gate -- and no TS parser exists in this
+/// workspace. The scan is narrow on purpose: every `export` form it does not
+/// recognize is an error, so a future edit in another style fails loudly
+/// here instead of quietly reporting its names as undeclared.
+fn declared_names(source: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let decls = scan_declarations(source)?;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut i = 0;
+    while i < decls.text.len() {
+        if decls.word_at(i, "declare") {
+            let after = decls.skip_space(i + "declare".len());
+            if decls.word_at(after, "module") {
+                let quote = decls
+                    .find_code(after, '"')
+                    .context("declare module with no specifier in oam.d.ts")?;
+                let name_end = decls.text[quote + 1..]
+                    .find('"')
+                    .map(|at| quote + 1 + at)
+                    .context("unterminated specifier in oam.d.ts")?;
+                let name = decls.text[quote + 1..name_end].to_string();
+                let open = decls
+                    .find_code(name_end, '{')
+                    .context("declare module with no body in oam.d.ts")?;
+                let (start, end) = decls.body(open).context("unbalanced module body")?;
+                out.insert(name, module_value_names(&decls, start, end)?);
+                i = end + 1;
+                continue;
+            }
+        }
+        // The global's surface is the OamGlobal interface `declare const oam`
+        // is typed with; `oam` keys the map so it lines up with the runner's
+        // own name for it.
+        if decls.word_at(i, "interface") {
+            let after = decls.skip_space(i + "interface".len());
+            if decls.word_at(after, "OamGlobal") {
+                let open = decls
+                    .find_code(after, '{')
+                    .context("interface OamGlobal with no body")?;
+                let (start, end) = decls.body(open).context("unbalanced OamGlobal body")?;
+                out.insert(
+                    "oam".to_string(),
+                    interface_member_names(&decls, start, end)?,
+                );
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !out.contains_key("oam") {
+        bail!("oam.d.ts declares no `interface OamGlobal` -- the global is ungated");
+    }
+    Ok(out)
+}
+
+/// Outcome of diffing the declarations against the modules oam publishes.
+#[derive(Default)]
+struct DeclParity {
+    /// Exported at runtime, declared nowhere, not recorded as deliberate.
+    /// Each one is a TS2305 (or TS2339 for the global) on code that RUNS.
+    /// GATING.
+    missing: Vec<(String, Vec<String>)>,
+    /// Declared but not exported: an API promise nothing implements, which
+    /// type-checks and then fails at runtime. GATING.
+    extra: Vec<(String, Vec<String>)>,
+    /// Recorded-as-deliberate entries that are now declared, or that the
+    /// module no longer exports. GATING, so the list can only shrink.
+    stale: Vec<(String, Vec<String>)>,
+    /// Names deliberately left undeclared and still exported.
+    allowed: usize,
+    /// Export names compared across every module.
+    live_total: usize,
+}
+
+/// Diff the runtime's own export names against what oam.d.ts declares,
+/// filtered through conformance/oam-module-types.json.
+///
+/// Pure, like `compare_exports`, so the gating decisions are unit-testable
+/// without a runtime or a checker.
+fn compare_declarations(
+    ratchet: &Value,
+    live: &Value,
+    declared: &BTreeMap<String, Vec<String>>,
+) -> DeclParity {
+    let empty = serde_json::Map::new();
+    let live_map = live["exportNames"].as_object().unwrap_or(&empty);
+    let mut out = DeclParity::default();
+
+    for (module, names) in live_map {
+        let live_names: Vec<&str> = names
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        out.live_total += live_names.len();
+        let declared_names: Vec<&str> = declared
+            .get(module)
+            .map(|names| names.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let deliberate: Vec<&str> = ratchet["undeclared"][module]
+            .as_object()
+            .map(|entries| entries.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+
+        let mut missing = Vec::new();
+        for name in &live_names {
+            if declared_names.contains(name) {
+                continue;
+            }
+            if deliberate.contains(name) {
+                out.allowed += 1;
+            } else {
+                missing.push((*name).to_string());
+            }
+        }
+        if !missing.is_empty() {
+            out.missing.push((module.clone(), missing));
+        }
+
+        let extra: Vec<String> = declared_names
+            .iter()
+            .filter(|name| !live_names.contains(name))
+            .map(|name| (*name).to_string())
+            .collect();
+        if !extra.is_empty() {
+            out.extra.push((module.clone(), extra));
+        }
+
+        let stale: Vec<String> = deliberate
+            .iter()
+            .filter(|name| declared_names.contains(name) || !live_names.contains(name))
+            .map(|name| (*name).to_string())
+            .collect();
+        if !stale.is_empty() {
+            out.stale.push((module.clone(), stale));
+        }
+    }
+
+    // A recorded module the runtime no longer publishes at all: the entry
+    // outlived its module and would otherwise excuse a future name silently.
+    if let Some(entries) = ratchet["undeclared"].as_object() {
+        for (module, names) in entries {
+            if live_map.contains_key(module) {
+                continue;
+            }
+            out.stale.push((
+                module.clone(),
+                names
+                    .as_object()
+                    .map(|n| n.keys().cloned().collect())
+                    .unwrap_or_default(),
+            ));
+        }
+    }
 
     out
 }
@@ -1162,5 +1729,249 @@ mod tests {
         );
         assert!(out.new_missing.is_empty());
         assert_eq!(out.extra, vec![("oamx".to_string(), vec!["b".to_string()])]);
+    }
+
+    // ---------------------------------- oam's own module declarations ----
+
+    /// The shipped declarations, read from the repo the same way the gate
+    /// reads them.
+    fn shipped_declarations() -> String {
+        let path = repo_root().unwrap().join("crates/oam_ts/types/oam.d.ts");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn live(entries: &[(&str, &[&str])]) -> Value {
+        let mut map = serde_json::Map::new();
+        for (module, names) in entries {
+            map.insert((*module).to_string(), json!(names));
+        }
+        json!({ "exportNames": map })
+    }
+
+    fn undeclared(entries: &[(&str, &[&str])]) -> Value {
+        let mut map = serde_json::Map::new();
+        for (module, names) in entries {
+            let mut reasons = serde_json::Map::new();
+            for name in *names {
+                reasons.insert((*name).to_string(), json!("because"));
+            }
+            map.insert((*module).to_string(), Value::Object(reasons));
+        }
+        json!({ "undeclared": map })
+    }
+
+    #[test]
+    fn declared_names_reads_export_lists_defaults_and_declaration_forms() {
+        let source = r#"
+declare module "oam:demo" {
+  interface Config { name: string; }
+  type Result = string | number;
+  class Thing { constructor(c: Config); }
+  const VERSION: string;
+  export function helper(r: Result): void;
+  const moduleObject: { VERSION: typeof VERSION };
+  export { Thing, VERSION };
+  export default moduleObject;
+}
+
+interface OamGlobal {
+  readonly version: string;
+  sleep(ms: number): Promise<void>;
+}
+
+declare const oam: OamGlobal;
+"#;
+        let out = declared_names(source).expect("parses");
+        assert_eq!(
+            out["oam:demo"],
+            vec![
+                "Thing".to_string(),
+                "VERSION".to_string(),
+                "default".to_string(),
+                "helper".to_string(),
+            ],
+        );
+        assert_eq!(out["oam"], vec!["sleep".to_string(), "version".to_string()]);
+    }
+
+    #[test]
+    fn declared_names_ignores_types_and_comments_and_strings() {
+        // The traps: an exported TYPE has no runtime key; a `{` or an
+        // `export` inside a comment or a string is not structure.
+        let source = r#"
+declare module "oam:demo" {
+  // export { ghost };  and a stray { brace
+  /* export default alsoGhost; { */
+  interface Shape { kind: string; }
+  const marker: string;
+  const opener: string;
+  export { marker, opener };
+  export type Shape2 = Shape;
+  export interface Shape3 { kind: string; }
+}
+
+interface OamGlobal {
+  version: string;
+}
+"#;
+        let out = declared_names(source).expect("parses");
+        assert_eq!(
+            out["oam:demo"],
+            vec!["marker".to_string(), "opener".to_string()],
+            "exported types carry no runtime key, and comments are not code",
+        );
+    }
+
+    #[test]
+    fn declared_names_refuses_a_form_it_cannot_read() {
+        // Loud, not silent: an unreadable export must fail the gate rather
+        // than report its names as missing from the JS.
+        let renamed = r#"
+declare module "oam:demo" { const a: string; export { a as b }; }
+interface OamGlobal { version: string; }
+"#;
+        assert!(declared_names(renamed).is_err(), "renamed export");
+        let exotic = r#"
+declare module "oam:demo" { export namespace inner {} }
+interface OamGlobal { version: string; }
+"#;
+        assert!(declared_names(exotic).is_err(), "unsupported export kind");
+        let no_global = "declare module \"oam:demo\" { const a: string; export { a }; }";
+        assert!(
+            declared_names(no_global).is_err(),
+            "a file with no OamGlobal leaves the global ungated"
+        );
+    }
+
+    #[test]
+    fn shipped_declarations_cover_every_oam_module() {
+        // Guards the gate's own input: a rename or a lost block here would
+        // otherwise read as "that module declares nothing" and only surface
+        // as a wall of missing names.
+        let out = declared_names(&shipped_declarations()).expect("the shipped file parses");
+        for module in ["oam:mcp", "oam:test", "oam:ai", "oam:permissions", "oam"] {
+            assert!(
+                out.get(module).is_some_and(|names| !names.is_empty()),
+                "{module} declares nothing"
+            );
+        }
+        assert!(out["oam:mcp"].contains(&"McpServer".to_string()));
+        assert!(
+            out["oam:mcp"].contains(&"default".to_string()),
+            "the loader publishes a default export for every oam: module"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_export_is_a_gate_failure() {
+        let out = compare_declarations(
+            &undeclared(&[]),
+            &live(&[("oam:mcp", &["McpServer", "PROTOCOL_VERSION"])]),
+            &BTreeMap::from([("oam:mcp".to_string(), vec!["McpServer".to_string()])]),
+        );
+        assert_eq!(
+            out.missing,
+            vec![("oam:mcp".to_string(), vec!["PROTOCOL_VERSION".to_string()])]
+        );
+        assert!(out.extra.is_empty());
+        assert_eq!(out.live_total, 2);
+    }
+
+    #[test]
+    fn a_declaration_the_module_does_not_export_is_a_gate_failure() {
+        // The fabrication direction: types that promise an API nobody wrote.
+        let out = compare_declarations(
+            &undeclared(&[]),
+            &live(&[("oam:ai", &["streamChat"])]),
+            &BTreeMap::from([(
+                "oam:ai".to_string(),
+                vec!["streamChat".to_string(), "streamChatV2".to_string()],
+            )]),
+        );
+        assert_eq!(
+            out.extra,
+            vec![("oam:ai".to_string(), vec!["streamChatV2".to_string()])]
+        );
+        assert!(out.missing.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_undeclared_name_passes_until_it_is_declared_or_dropped() {
+        let ratchet = undeclared(&[("oam:test", &["__run"])]);
+        let declared = BTreeMap::from([("oam:test".to_string(), vec!["test".to_string()])]);
+        let out = compare_declarations(
+            &ratchet,
+            &live(&[("oam:test", &["test", "__run"])]),
+            &declared,
+        );
+        assert!(out.missing.is_empty(), "recorded, so not a new gap");
+        assert_eq!(out.allowed, 1);
+        assert!(out.stale.is_empty());
+
+        // Declared after all: the entry must go, or it would excuse the next
+        // one silently.
+        let now_declared = BTreeMap::from([(
+            "oam:test".to_string(),
+            vec!["__run".to_string(), "test".to_string()],
+        )]);
+        let out = compare_declarations(
+            &ratchet,
+            &live(&[("oam:test", &["test", "__run"])]),
+            &now_declared,
+        );
+        assert_eq!(
+            out.stale,
+            vec![("oam:test".to_string(), vec!["__run".to_string()])]
+        );
+
+        // No longer exported: same verdict, different reason.
+        let out = compare_declarations(&ratchet, &live(&[("oam:test", &["test"])]), &declared);
+        assert_eq!(
+            out.stale,
+            vec![("oam:test".to_string(), vec!["__run".to_string()])]
+        );
+    }
+
+    #[test]
+    fn a_module_with_no_declarations_at_all_reports_every_name() {
+        // The shape of the bug this gate ships with: `oam:mcp` typed while
+        // `oam:test` is not.
+        let out = compare_declarations(
+            &undeclared(&[]),
+            &live(&[("oam:test", &["describe", "test"])]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            out.missing,
+            vec![(
+                "oam:test".to_string(),
+                vec!["describe".to_string(), "test".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn the_shipped_ratchet_only_records_names_that_are_really_undeclared() {
+        // conformance/oam-module-types.json is checked in; a stale entry
+        // there is a hole in the gate, so it is verified here too rather
+        // than only when the whole conformance run executes.
+        let repo = repo_root().unwrap();
+        let raw = std::fs::read_to_string(repo.join("conformance/oam-module-types.json")).unwrap();
+        let ratchet: Value = serde_json::from_str(&raw).expect("valid JSON");
+        let declared = declared_names(&shipped_declarations()).unwrap();
+        for (module, names) in ratchet["undeclared"].as_object().expect("undeclared map") {
+            let entries = names.as_object().expect("name -> reason");
+            assert!(!entries.is_empty(), "{module} has an empty entry");
+            for (name, reason) in entries {
+                assert!(
+                    reason.as_str().is_some_and(|r| r.len() > 20),
+                    "{module}.{name} needs a real reason, not {reason}"
+                );
+                assert!(
+                    !declared[module].contains(name),
+                    "{module}.{name} IS declared -- drop the entry"
+                );
+            }
+        }
     }
 }

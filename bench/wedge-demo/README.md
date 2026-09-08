@@ -53,9 +53,10 @@ with an LLM and you have the production loop.
 
 ## Notes
 
-- `project/oam-globals.d.ts` carries ambient types for the `oam` global —
-  this file becomes the published types package with M2's npm work. (The
-  demo itself surfaced that gap: without it, tsgo rightly reported
-  TS2304 for `oam.readTextFile`.)
+- The `oam` global needs no ambient types in the project any more. The demo
+  used to carry `project/oam-globals.d.ts` for it (without one, tsgo rightly
+  reported TS2304 for `oam.readTextFile`); oam now injects its own
+  declarations -- the `oam:` modules and the global -- into every check, so
+  the demo checks clean with nothing in the project but its own sources.
 - tsconfig uses `paths` aliases and JSONC comments on purpose: the loader
   and tsgo resolve them identically.

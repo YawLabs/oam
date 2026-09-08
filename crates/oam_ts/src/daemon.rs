@@ -508,7 +508,7 @@ fn tsconfig_chain(tsconfig: &Path) -> Vec<PathBuf> {
 /// `./x` / `../x` / absolute -> that file (`.json` appended if needed, a dir
 /// means its tsconfig.json); anything else -> `node_modules/<spec>` walking
 /// up.
-fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
     fn existing(base: PathBuf) -> Option<PathBuf> {
         // Lexically folded (`pkg/../base.json` -> `base.json`) so one file
         // reached through two configs dedupes to one fingerprint entry.
@@ -547,7 +547,7 @@ fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
 /// trailing commas before serde sees it. Twin of the loader's
 /// `oam_loader::tsconfig::strip_jsonc`, duplicated for the same
 /// no-dependency reason as `find_tsconfig`.
-fn strip_jsonc(input: &str) -> String {
+pub(crate) fn strip_jsonc(input: &str) -> String {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());

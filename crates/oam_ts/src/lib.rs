@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub mod daemon;
+mod decls;
 
 /// tsgo not found / not runnable. Stable code so tooling (and our own e2e
 /// skip logic) can detect the condition.
@@ -653,6 +654,15 @@ pub fn check_cancellable(
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join(format!("{}.tsbuildinfo", daemon::project_key(tsconfig))))
     });
+    // oam's own `oam:` module declarations, attached the way tsgo will take
+    // them: a wrapper config for a project, one more root file for a bare
+    // file. Both degrade to None (check without them) rather than failing --
+    // see decls.rs.
+    let wrapper = tsconfig.as_deref().and_then(decls::project_config);
+    let declarations = match tsconfig {
+        Some(_) => None,
+        None => decls::declarations_file(),
+    };
     let common: [&OsStr; 3] = ["--pretty".as_ref(), "false".as_ref(), "--noEmit".as_ref()];
     let (args, base): (Vec<&OsStr>, PathBuf) = match (&tsconfig, target.is_file()) {
         (Some(tsconfig), _) => {
@@ -667,13 +677,16 @@ pub fn check_cancellable(
                 args.push(build_info.as_os_str());
             }
             args.push("-p".as_ref());
-            args.push(tsconfig.as_os_str());
+            args.push(wrapper.as_deref().unwrap_or(tsconfig).as_os_str());
             (args, base)
         }
         (None, true) => {
             let base = target.parent().expect("file has a parent").to_path_buf();
             let mut args = common.to_vec();
             args.push(target.as_os_str());
+            if let Some(declarations) = declarations.as_deref() {
+                args.push(declarations.as_os_str());
+            }
             (args, base)
         }
         (None, false) => {
@@ -728,11 +741,18 @@ pub(crate) fn list_files(tsconfig: &Path, handle: &TsgoHandle) -> Result<Vec<Pat
         .ok_or_else(|| ts_error("OAM-TS0002", "tsconfig has no parent".to_string()))?;
     // --noEmit matters: without it a checkJs project fails TS5055 ("would
     // overwrite input file") before listing anything (probed).
+    //
+    // Listed through the SAME wrapper the check runs (decls.rs), so oam's own
+    // declaration file is one of the listed paths and its stamp joins the
+    // fingerprint: upgrading oam changes the declarations' content-hashed
+    // name, which invalidates the daemon's cache instead of serving the
+    // previous release's diagnostics.
+    let wrapper = decls::project_config(tsconfig);
     let args: [&OsStr; 4] = [
         "--listFilesOnly".as_ref(),
         "--noEmit".as_ref(),
         "-p".as_ref(),
-        tsconfig.as_os_str(),
+        wrapper.as_deref().unwrap_or(tsconfig).as_os_str(),
     ];
     let output = run_tsgo(&args, base, base, handle)?;
     let stdout = String::from_utf8_lossy(&output.stdout);

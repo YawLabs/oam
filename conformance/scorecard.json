@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "beffd94+wip",
-  "oamVersion": "oam 0.13.2",
+  "commit": "4a80320+wip",
+  "oamVersion": "oam 0.14.0",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -742,6 +742,52 @@
               "_recvLoop"
             ]
           }
+        ]
+      }
+    },
+    "oamModuleTypes": {
+      "liveTotal": 27,
+      "deliberatelyUndeclared": 1,
+      "missing": [],
+      "extra": [],
+      "staleRatchet": [],
+      "detail": {
+        "oam:mcp": [
+          "McpServer",
+          "PROTOCOL_VERSION",
+          "default"
+        ],
+        "oam:test": [
+          "__run",
+          "afterAll",
+          "afterEach",
+          "beforeAll",
+          "beforeEach",
+          "default",
+          "describe",
+          "expect",
+          "it",
+          "mock",
+          "test"
+        ],
+        "oam:ai": [
+          "anthropic",
+          "default",
+          "defaultExtractDelta",
+          "openai",
+          "parseSSEStream",
+          "runToolLoop",
+          "streamChat"
+        ],
+        "oam:permissions": [
+          "default",
+          "permissions"
+        ],
+        "oam": [
+          "readTextFile",
+          "serve",
+          "sleep",
+          "version"
         ]
       }
     }

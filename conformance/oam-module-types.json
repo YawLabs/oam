@@ -1,0 +1,8 @@
+{
+  "_comment": "Export names of oam's OWN modules (the `oam:` family and the `oam` global) that crates/oam_ts/types/oam.d.ts deliberately does not declare, each with the reason. Those declarations are injected into every `oam check`, so an undeclared name is a TS2305 on code that runs, and a DECLARED name the module does not publish is a promise nobody implemented -- `cargo run -p xtask -- conformance` fails on both. Unlike surface-gaps.json this list is not a backlog and has no per-platform sections: both sides are oam's own, the modules are platform-independent, and a gap is a bug to fix rather than debt to track. It gates in both directions: a listed name that gets declared, or that the module stops exporting, fails the run too, so the list can only shrink.",
+  "undeclared": {
+    "oam:test": {
+      "__run": "The entry point the Rust test runner calls after a test file evaluates (js/test_runner.js registers it on the module object so globalThis.__oamTestRun can reach it). Writing a test never means calling it; declaring it would advertise the runner's internal handshake as API."
+    }
+  }
+}
