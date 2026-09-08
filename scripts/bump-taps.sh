@@ -31,9 +31,24 @@
 # committed: a WRONG published hash is worse than a stale one, because it trains
 # people to ignore a mismatch.
 #
+# Not a copy of the @yawlabs/*-mcp house script (scripts/update-manifests.mjs,
+# shared verbatim across seven MCP-server repos), because both of that script's
+# load-bearing mechanisms assume a shape oam does not have. It derives the
+# command name, repo slug, license and description from package.json -- oam is a
+# Rust workspace with no package.json at its root -- and it reads hashes from
+# per-asset `.sha256` sidecars, which an oam release does not publish: the
+# authority here is the single combined SHA256SUMS that install.sh and
+# install.ps1 already verify against. What IS shared is the model (manifest
+# repos checked out as siblings, pushed with the gh_woods key, no cross-repo CI
+# token) and the env-var names below.
+#
 # Env knobs:
 #   OAM_HOMEBREW_DIR   path to the homebrew-yaw checkout (default: search)
 #   OAM_SCOOP_DIR      path to the scoop-yaw checkout (default: search)
+#   YAW_HOMEBREW_DIR / YAW_SCOOP_DIR
+#                      the org-wide spellings the @yawlabs/*-mcp scripts read,
+#                      honored as a fallback so one export works everywhere.
+#                      The OAM_-prefixed names win when both are set.
 #   OAM_TAPS_OPTIONAL  1 = warn and exit 0 when a checkout is missing
 #                      (release-local.sh sets this: a release is still valid
 #                      without a tap bump, and the verification says so loudly)
@@ -77,8 +92,8 @@ find_tap() {
   return 1
 }
 
-HOMEBREW_DIR="$(find_tap homebrew-yaw "${OAM_HOMEBREW_DIR:-}")" || HOMEBREW_DIR=""
-SCOOP_DIR="$(find_tap scoop-yaw "${OAM_SCOOP_DIR:-}")" || SCOOP_DIR=""
+HOMEBREW_DIR="$(find_tap homebrew-yaw "${OAM_HOMEBREW_DIR:-${YAW_HOMEBREW_DIR:-}}")" || HOMEBREW_DIR=""
+SCOOP_DIR="$(find_tap scoop-yaw "${OAM_SCOOP_DIR:-${YAW_SCOOP_DIR:-}}")" || SCOOP_DIR=""
 
 if [ -z "$HOMEBREW_DIR" ] || [ -z "$SCOOP_DIR" ]; then
   msg="tap checkout missing (homebrew-yaw='${HOMEBREW_DIR:-NOT FOUND}' scoop-yaw='${SCOOP_DIR:-NOT FOUND}') -- clone them beside yaw_terminal, or set OAM_HOMEBREW_DIR / OAM_SCOOP_DIR"
