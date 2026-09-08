@@ -377,6 +377,47 @@
     return err;
   }
 
+  /// Coerce an fs path argument the way node does: string, Buffer, or a
+  /// WHATWG `URL` with the `file:` protocol.
+  ///
+  /// `String(path)` -- what every fs entry point used to do -- is right for the
+  /// first two and silently wrong for the third: it yields the HREF, so
+  /// `readFileSync(new URL('./x', import.meta.url))` asked the OS to open a
+  /// file literally named `file:///C:/...` and failed with an ENOENT naming a
+  /// URL. That is the mandated ESM replacement for `__dirname`, so it is not an
+  /// exotic call shape, and the error blamed the filesystem for a coercion the
+  /// runtime got wrong.
+  ///
+  /// A non-`file:` URL is refused rather than stringified: `http://x/y` has no
+  /// filesystem meaning, and turning it into a relative-looking path is how a
+  /// fetch-shaped mistake becomes a file write somewhere unexpected.
+  ///
+  /// Buffer stays explicit even though `String(buf)` happened to produce the
+  /// same bytes -- that worked only because Buffer's toString defaults to utf8,
+  /// which is a coincidence of the class, not a decision this code made.
+  function toPath(path) {
+    if (typeof path === "string") return path;
+    // Duck-typed, not `instanceof URL`: a URL minted in another realm (a vm
+    // context, a worker message) fails the instanceof and would fall through
+    // to String(). Node checks the protocol the same way.
+    if (path && typeof path === "object" && typeof path.protocol === "string" && typeof path.href === "string") {
+      if (path.protocol !== "file:") {
+        const err = new TypeError("The URL must be of scheme file");
+        err.code = "ERR_INVALID_URL_SCHEME";
+        throw err;
+      }
+      return registry.get("url").fileURLToPath(path);
+    }
+    if (path instanceof Uint8Array) return bufferToUtf8Path(path);
+    return String(path);
+  }
+
+  /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
+  /// dispatch table rather than a mix of dispatch and decoding.
+  function bufferToUtf8Path(buf) {
+    return new TextDecoder("utf-8").decode(buf);
+  }
+
   /// ERR_INVALID_ARG_TYPE and friends are TypeErrors in node, not plain
   /// Errors -- `instanceof TypeError` and assert.throws({ name: "TypeError" })
   /// both key off that, so makeNodeError (which builds an Error) is the wrong
@@ -9696,7 +9737,7 @@
           // there was no open to report.
           construct(callback) {
             if (supplied) { callback(); return; }
-            Promise.resolve(natives.fsOpen(String(path), "r")).then(
+            Promise.resolve(natives.fsOpen(toPath(path), "r")).then(
               (r) => {
                 handle = r.handle;
                 this.emit("open", handle);
@@ -9779,7 +9820,7 @@
           async write(chunk, _encoding, cb) {
             try {
               if (handle === null) {
-                handle = (await natives.fsOpen(String(path), flags)).handle;
+                handle = (await natives.fsOpen(toPath(path), flags)).handle;
                 this.emit("open", handle);
                 this.emit("ready");
               }
@@ -9797,7 +9838,7 @@
               // Unreachable when the descriptor was supplied -- it is already
               // open, and `path` is undefined there.
               if (handle === null) {
-                handle = (await natives.fsOpen(String(path), flags)).handle;
+                handle = (await natives.fsOpen(toPath(path), flags)).handle;
               }
               if (autoClose) await closeFd();
               cb();
@@ -9822,26 +9863,26 @@
     const isWin = natives.platform === "win32";
     return {
       readFile: async (path, options) => {
-        const bytes = await natives.fsReadFile(String(path));
+        const bytes = await natives.fsReadFile(toPath(path));
         return decodeRead(bytes, readOptions(options).encoding ?? null);
       },
       writeFile: (path, data, options) =>
-        natives.fsWriteFile(String(path), encodeWrite(data, options), false),
+        natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
       appendFile: (path, data, options) =>
-        natives.fsWriteFile(String(path), encodeWrite(data, options), true),
-      stat: async (path) => wrapStat(await natives.fsStat(String(path), false)),
-      lstat: async (path) => wrapStat(await natives.fsStat(String(path), true)),
-      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(String(path)), options),
+        natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
+      stat: async (path) => wrapStat(await natives.fsStat(toPath(path), false)),
+      lstat: async (path) => wrapStat(await natives.fsStat(toPath(path), true)),
+      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(toPath(path)), options),
       readdir: async (path, options) => {
         const { withFileTypes } = readOptions(options);
-        const entries = await natives.fsReaddir(String(path));
-        return wrapDirents(String(path), entries, withFileTypes === true);
+        const entries = await natives.fsReaddir(toPath(path));
+        return wrapDirents(toPath(path), entries, withFileTypes === true);
       },
       mkdir: async (path, options) => {
-        await natives.fsMkdir(String(path), readOptions(options).recursive === true);
+        await natives.fsMkdir(toPath(path), readOptions(options).recursive === true);
       },
       rm: async (path, options = {}) => {
-        await natives.fsRm(String(path), options.recursive === true, options.force === true);
+        await natives.fsRm(toPath(path), options.recursive === true, options.force === true);
       },
       rmdir: async (path) => {
         // Node never deletes a FILE through rmdir (code-probing callers
@@ -9850,7 +9891,7 @@
         // rather than leaking `lstat` (same as the sync twin).
         let raw;
         try {
-          raw = await natives.fsStat(String(path), true);
+          raw = await natives.fsStat(toPath(path), true);
         } catch (e) {
           if (e && e.syscall === "lstat") e.syscall = "rmdir";
           throw e;
@@ -9859,11 +9900,11 @@
           // As in the sync twin: node's full system-error shape.
           throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", path);
         }
-        await natives.fsRm(String(path), false, false);
+        await natives.fsRm(toPath(path), false, false);
       },
-      unlink: (path) => natives.fsUnlink(String(path)),
-      rename: (from, to) => natives.fsRename(String(from), String(to)),
-      copyFile: (from, to) => natives.fsCopyFile(String(from), String(to)),
+      unlink: (path) => natives.fsUnlink(toPath(path)),
+      rename: (from, to) => natives.fsRename(toPath(from), toPath(to)),
+      copyFile: (from, to) => natives.fsCopyFile(toPath(from), toPath(to)),
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -9871,20 +9912,20 @@
       // calls .then on the result). Hide this from users -- the public
       // promises API is the AsyncIterable form above.
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
-      access: (path, mode) => natives.fsAccess(String(path), mode ?? 0),
-      realpath: (path) => natives.fsRealpath(String(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(String(prefix)),
-      symlink: (target, path) => natives.fsSymlink(String(target), String(path)),
-      readlink: (path) => natives.fsReadlink(String(path)),
-      link: (existing, newPath) => natives.fsLink(String(existing), String(newPath)),
-      chmod: (path, mode) => natives.fsChmod(String(path), mode),
-      truncate: (path, len) => natives.fsTruncate(String(path), len ?? 0),
-      chown: (path, uid, gid) => natives.fsChown(String(path), uid, gid),
-      lchown: (path, uid, gid) => natives.fsLchown(String(path), uid, gid),
+      access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
+      realpath: (path) => natives.fsRealpath(toPath(path)),
+      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix)),
+      symlink: (target, path) => natives.fsSymlink(toPath(target), toPath(path)),
+      readlink: (path) => natives.fsReadlink(toPath(path)),
+      link: (existing, newPath) => natives.fsLink(toPath(existing), toPath(newPath)),
+      chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
+      truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
+      chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
+      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), uid, gid),
       utimes: (path, atime, mtime) =>
-        natives.fsUtimes(String(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+        natives.fsUtimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
       lutimes: (path, atime, mtime) =>
-        natives.fsLutimes(String(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+        natives.fsLutimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
       // lchmod diverges between the two modules, which is easy to get wrong.
       // In `node:fs` the name is bound to UNDEFINED off macOS. Here in
       // `fs/promises` it is ALWAYS a function, and off macOS it REJECTS.
@@ -9892,18 +9933,18 @@
       // and calling it rejects with a plain Error carrying only a `code` own
       // property -- name "Error", not a subclass.
       lchmod: (path, mode) => {
-        if (natives.platform === "darwin") return natives.fsLchmod(String(path), mode);
+        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), mode);
         const err = new Error("The lchmod() method is not implemented");
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
       },
       opendir: async function (path) {
-        var dirPath = String(path);
+        var dirPath = toPath(path);
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
       },
       cp: async function cpRecursive(src, dest, options) {
-        var srcStr = String(src);
-        var destStr = String(dest);
+        var srcStr = toPath(src);
+        var destStr = toPath(dest);
         var opts = options || {};
         var raw;
         try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
@@ -9921,7 +9962,7 @@
       },
       open: async function (path, flags, mode) {
         flags = flags || "r";
-        var info = await natives.fsOpen(String(path), String(flags));
+        var info = await natives.fsOpen(toPath(path), String(flags));
         var h = info.handle;
         var closed = false;
         // readableWebStream() locks the handle to its stream FOR LIFE -- see
@@ -10301,7 +10342,7 @@
       var opts = options || {};
       var EventEmitter = registry.get("events");
       var watcher = new EventEmitter();
-      var filePath = String(filename);
+      var filePath = toPath(filename);
       var prevMtime = 0;
       var closed = false;
       try {
@@ -10358,7 +10399,7 @@
 
     function fsUnwatchFile(filename, listener) {
       stopWatchEntries(
-        String(filename),
+        toPath(filename),
         // No listener means "stop watching this path entirely" (node).
         listener === undefined ? () => true : (entry) => entry.listener === listener,
       );
@@ -10377,7 +10418,7 @@
         );
       }
       var opts = options || {};
-      var filePath = String(filename);
+      var filePath = toPath(filename);
       var interval = opts.interval || 5007;
       var prev;
       try {
@@ -10444,35 +10485,35 @@
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
         if (enc === "utf8" || enc === "utf-8") {
-          return natives.fsReadFileUtf8Sync(String(path));
+          return natives.fsReadFileUtf8Sync(toPath(path));
         }
-        const bytes = natives.fsReadFileSync(String(path));
+        const bytes = natives.fsReadFileSync(toPath(path));
         return decodeRead(bytes, enc ?? null);
       },
       writeFileSync: (path, data, options) => {
-        natives.fsWriteFileSync(String(path), encodeWrite(data, options), false);
+        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
       },
       appendFileSync: (path, data, options) => {
-        natives.fsWriteFileSync(String(path), encodeWrite(data, options), true);
+        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
       },
-      existsSync: (path) => natives.fsExistsSync(String(path)),
-      statSync: (path) => wrapStat(natives.fsStatSync(String(path), false)),
-      lstatSync: (path) => wrapStat(natives.fsStatSync(String(path), true)),
-      statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(String(path)), options),
+      existsSync: (path) => natives.fsExistsSync(toPath(path)),
+      statSync: (path) => wrapStat(natives.fsStatSync(toPath(path), false)),
+      lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
+      statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
       readdirSync: (path, options) => {
         const { withFileTypes } = readOptions(options);
         return wrapDirents(
-          String(path),
-          natives.fsReaddirSync(String(path)),
+          toPath(path),
+          natives.fsReaddirSync(toPath(path)),
           withFileTypes === true,
         );
       },
       globSync: (pattern, options) => globSyncRaw(pattern, options, natives),
       mkdirSync: (path, options) => {
-        natives.fsMkdirSync(String(path), readOptions(options).recursive === true);
+        natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
       },
       rmSync: (path, options = {}) => {
-        natives.fsRmSync(String(path), options.recursive === true, options.force === true);
+        natives.fsRmSync(toPath(path), options.recursive === true, options.force === true);
       },
       rmdirSync: (path) => {
         // The kind probe is an implementation detail: node reports `rmdir` as
@@ -10480,7 +10521,7 @@
         // surface as `syscall: "lstat"`.
         let raw;
         try {
-          raw = natives.fsStatSync(String(path), true);
+          raw = natives.fsStatSync(toPath(path), true);
         } catch (e) {
           if (e && e.syscall === "lstat") e.syscall = "rmdir";
           throw e;
@@ -10494,24 +10535,24 @@
             path,
           );
         }
-        natives.fsRmSync(String(path), false, false);
+        natives.fsRmSync(toPath(path), false, false);
       },
-      unlinkSync: (path) => natives.fsUnlinkSync(String(path)),
-      renameSync: (from, to) => natives.fsRenameSync(String(from), String(to)),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(String(from), String(to)),
-      accessSync: (path, mode) => natives.fsAccessSync(String(path), mode ?? 0),
-      realpathSync: (path) => natives.fsRealpathSync(String(path)),
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(String(prefix)),
-      symlinkSync: (target, path) => natives.fsSymlinkSync(String(target), String(path)),
-      readlinkSync: (path) => natives.fsReadlinkSync(String(path)),
-      linkSync: (existing, newPath) => natives.fsLinkSync(String(existing), String(newPath)),
-      chmodSync: (path, mode) => natives.fsChmodSync(String(path), mode),
-      truncateSync: (path, len) => natives.fsTruncateSync(String(path), len ?? 0),
+      unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
+      renameSync: (from, to) => natives.fsRenameSync(toPath(from), toPath(to)),
+      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from), toPath(to)),
+      accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
+      realpathSync: (path) => natives.fsRealpathSync(toPath(path)),
+      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix)),
+      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target), toPath(path)),
+      readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
+      linkSync: (existing, newPath) => natives.fsLinkSync(toPath(existing), toPath(newPath)),
+      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
+      truncateSync: (path, len) => natives.fsTruncateSync(toPath(path), len ?? 0),
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
       openSync: (path, flags, _mode) =>
-        natives.fsOpenSync(String(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
+        natives.fsOpenSync(toPath(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
       closeSync: (fd) => { natives.fsCloseSync(fd); },
       fstatSync: (fd) => wrapStat(natives.fsFstatSync(fd)),
       readSync: (fd, buffer, offset, length, position) => {
@@ -10552,12 +10593,12 @@
         }
       },
       opendirSync: function (path) {
-        var dirPath = String(path);
+        var dirPath = toPath(path);
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
       cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = String(src);
-        var destStr = String(dest);
+        var srcStr = toPath(src);
+        var destStr = toPath(dest);
         var opts = options || {};
         var raw;
         try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
@@ -10600,7 +10641,7 @@
       cp: callbackify1(promises.cp),
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild.
-        cb(natives.fsExistsSync(String(path)));
+        cb(natives.fsExistsSync(toPath(path)));
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
@@ -10613,11 +10654,11 @@
         if (typeof cb !== "function") throw new TypeError("Callback must be a function");
         var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
         var token = fsReqStart();
-        // String(path) can throw (a poisoned toString) -- drop the token
+        // toPath(path) can throw (a poisoned toString) -- drop the token
         // before the throw escapes, or it is stranded forever.
         var p;
         try {
-          p = Promise.resolve(natives.fsOpen(String(path), String(flagStr)));
+          p = Promise.resolve(natives.fsOpen(toPath(path), String(flagStr)));
         } catch (e) {
           fsReqEnd(token);
           throw e;
