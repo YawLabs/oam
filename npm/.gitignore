@@ -1,0 +1,11 @@
+# Staged by npm/stage.mjs from a cut release, never committed: a 60 MB binary
+# per target per version is not what git is for, and a binary in the tree would
+# be a second source of truth about what actually shipped.
+oamjs-*/bin/
+oamjs-*/LICENSE
+oamjs-*/NOTICE
+oamjs-*/THIRD_PARTY_LICENSES.md
+oamjs/LICENSE
+
+# npm pack output.
+*.tgz

@@ -1,0 +1,25 @@
+{
+  "name": "oamjs-darwin-x64",
+  "version": "0.14.0",
+  "description": "The oam binary for darwin x64 (x86_64-apple-darwin). Installed as an optional dependency of oamjs; not useful on its own.",
+  "license": "Apache-2.0",
+  "homepage": "https://oamjs.org",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/oam.git",
+    "directory": "npm/oamjs-darwin-x64"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md"
+  ],
+  "preferUnplugged": true
+}

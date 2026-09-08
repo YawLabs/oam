@@ -1,0 +1,12 @@
+{
+  "name": "oam-npm-packaging",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Build and test harness for the oamjs npm packages. Never published; see npm/README.md.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "sync": "node sync-packages.mjs",
+    "check": "node sync-packages.mjs --check"
+  }
+}
