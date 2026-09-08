@@ -94,8 +94,18 @@ peak throughput, and it is why the numbers above are the ones that matter.
 protocol. Yaw MCP runs its sidecars on oam by default, and every oam release is
 gated on a matrix that boots each one and requires it to serve a non-empty tool
 list (`scripts/mcp-sidecar-matrix.mjs`). Booting is not enough — a sidecar that
-starts and advertises nothing is still broken — but note the gate stops at
-`tools/list` and does not invoke a tool.
+starts and advertises nothing is still broken — and neither is advertising: a
+sidecar with a tool that needs no credential, no network and no external
+service gets that tool CALLED, and the result asserted. Every such call is made
+on node too, so a sidecar that broke upstream is reported as broken upstream
+rather than failing an oam release.
+
+Three of the nine sidecars qualify today (memory, fetch, ctxlint). The other six
+are boot-only and the gate names them, with the reason, on every run: four
+advertise nothing but calls into a credentialed API or a live database, and two
+drive a real browser that installs out of band. So a tool call is verified for a
+third of the set, and for the rest the gate still says only that the sidecar
+boots and serves its tools.
 
 ## Honesty notes
 
