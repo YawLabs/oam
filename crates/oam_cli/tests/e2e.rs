@@ -19440,3 +19440,157 @@ fn permission_is_enforced_in_the_repl() {
          nothing:\n{granted}"
     );
 }
+
+/// fs accepts a WHATWG `URL` path, which is the mandated ESM replacement for
+/// `__dirname`. Every fs entry point used to coerce with `String(path)`, which
+/// is right for a string and silently wrong for a URL: it yields the href, so
+/// the call asked the OS to open a file literally named `file:///C:/...` and
+/// failed with an ENOENT naming a URL. That blamed the filesystem for a
+/// coercion the runtime got wrong, and it broke the ordinary
+/// `new URL('./x', import.meta.url)` idiom that modern ESM packages are built
+/// on.
+///
+/// Covers sync, promises, and callback forms, both path positions of a
+/// two-path op, and the non-`file:` rejection -- the surface has to move
+/// together or a caller discovers that `readFileSync` takes a URL and
+/// `rename` does not.
+#[test]
+fn fs_accepts_whatwg_url_paths() {
+    let stdout = run_ok(
+        "fs_url_paths.mjs",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         \n\
+         const here = (name) => new URL('./' + name, import.meta.url);\n\
+         \n\
+         // sync round-trip through a URL in both directions\n\
+         fs.writeFileSync(here('u-sync.txt'), 'sync-ok');\n\
+         console.log('sync:', fs.readFileSync(here('u-sync.txt'), 'utf8'));\n\
+         console.log('existsSync:', fs.existsSync(here('u-sync.txt')));\n\
+         console.log('statSync:', fs.statSync(here('u-sync.txt')).size);\n\
+         \n\
+         // promises form\n\
+         await fsp.writeFile(here('u-async.txt'), 'async-ok');\n\
+         console.log('promises:', await fsp.readFile(here('u-async.txt'), 'utf8'));\n\
+         \n\
+         // BOTH path positions of a two-path op\n\
+         await fsp.rename(here('u-async.txt'), here('u-renamed.txt'));\n\
+         console.log('rename:', await fsp.readFile(here('u-renamed.txt'), 'utf8'));\n\
+         await fsp.copyFile(here('u-renamed.txt'), here('u-copy.txt'));\n\
+         console.log('copyFile:', await fsp.readFile(here('u-copy.txt'), 'utf8'));\n\
+         \n\
+         // callback form goes through the same coercion\n\
+         await new Promise((resolve, reject) =>\n\
+           fs.readFile(here('u-sync.txt'), 'utf8', (e, d) => {\n\
+             if (e) reject(e); else { console.log('callback:', d); resolve(); }\n\
+           }));\n\
+         \n\
+         // a Buffer path still works -- it did before only because Buffer's\n\
+         // toString defaults to utf8, and the rewrite must not regress it\n\
+         const url = here('u-sync.txt');\n\
+         const asPath = fs.realpathSync(url);\n\
+         console.log('buffer:', fs.readFileSync(Buffer.from(asPath, 'utf8'), 'utf8'));\n\
+         \n\
+         // a non-file: URL has no filesystem meaning and is refused rather\n\
+         // than stringified into a relative-looking path\n\
+         try {\n\
+           fs.readFileSync(new URL('https://example.invalid/x'));\n\
+           console.log('scheme:', 'NOT REJECTED');\n\
+         } catch (e) {\n\
+           console.log('scheme:', e.code);\n\
+         }\n",
+    );
+    assert!(stdout.contains("sync: sync-ok"), "sync URL path: {stdout}");
+    assert!(
+        stdout.contains("existsSync: true"),
+        "existsSync URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("statSync: 7"),
+        "statSync URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("promises: async-ok"),
+        "promises URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("rename: async-ok"),
+        "rename both positions: {stdout}"
+    );
+    assert!(
+        stdout.contains("copyFile: async-ok"),
+        "copyFile both positions: {stdout}"
+    );
+    assert!(
+        stdout.contains("callback: sync-ok"),
+        "callback URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("buffer: sync-ok"),
+        "Buffer path not regressed: {stdout}"
+    );
+    assert!(
+        stdout.contains("scheme: ERR_INVALID_URL_SCHEME"),
+        "a non-file: URL must be refused, not stringified: {stdout}"
+    );
+}
+
+/// `fetch` negotiates and decodes a compressed response.
+///
+/// The client used to advertise no `accept-encoding` at all AND to do no
+/// decoding, so a server that compressed anyway -- httpbin, any CDN doing it
+/// unsolicited -- handed JavaScript the raw DEFLATE bytes with
+/// `content-encoding: gzip` still on the response. Not an error, just a body
+/// that is not the body: silent corruption of the most-used web API, on the
+/// path both an MCP sidecar and an HTTP service take to call an upstream.
+///
+/// Hermetic on purpose: the origin is a local `node:http` server, so the gate
+/// does not depend on a third party's compression policy. The advertised set is
+/// asserted too, because it is wire-visible and is what makes a server compress
+/// in the first place.
+#[test]
+fn fetch_negotiates_and_decodes_content_encoding() {
+    let stdout = run_ok(
+        "fetch_gzip.mjs",
+        "import http from 'node:http';\n\
+         import zlib from 'node:zlib';\n\
+         \n\
+         const payload = JSON.stringify({ hello: 'compressed world', n: 42 });\n\
+         let advertised = null;\n\
+         const srv = http.createServer((req, res) => {\n\
+           advertised = req.headers['accept-encoding'] ?? null;\n\
+           const body = zlib.gzipSync(Buffer.from(payload, 'utf8'));\n\
+           res.writeHead(200, {\n\
+             'content-type': 'application/json',\n\
+             'content-encoding': 'gzip',\n\
+             'content-length': String(body.length),\n\
+           });\n\
+           res.end(body);\n\
+         });\n\
+         await new Promise((r) => srv.listen(0, '127.0.0.1', r));\n\
+         const port = srv.address().port;\n\
+         \n\
+         const res = await fetch('http://127.0.0.1:' + port + '/');\n\
+         const text = await res.text();\n\
+         console.log('advertised:', advertised);\n\
+         console.log('decoded:', text === payload);\n\
+         console.log('parsed:', JSON.parse(text).hello);\n\
+         srv.close();\n",
+    );
+    // The exact list Node's fetch advertises, modulo the optional whitespace
+    // after the comma. Asserting on the members rather than the whole string
+    // keeps this from failing on that spacing, which is not meaningful to any
+    // RFC 9110 parser -- see divergence 32.
+    assert!(
+        stdout.contains("advertised: gzip") && stdout.contains("deflate"),
+        "fetch must advertise gzip and deflate, or no server will compress: {stdout}"
+    );
+    assert!(
+        stdout.contains("decoded: true"),
+        "a gzip-encoded response must reach JavaScript decoded, not as raw DEFLATE bytes: {stdout}"
+    );
+    assert!(
+        stdout.contains("parsed: compressed world"),
+        "the decoded body must survive JSON.parse: {stdout}"
+    );
+}
