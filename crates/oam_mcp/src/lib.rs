@@ -307,7 +307,8 @@ fn tool_text(text: &str, is_error: bool) -> Value {
     })
 }
 
-/// The seed of oam.sh/e/<code>: offline explanations for ODIF codes.
+/// The offline twin of https://oamjs.org/docs/errors: explanations for
+/// ODIF codes that need no network.
 fn explain_code(code: &str) -> String {
     let known: &[(&str, &str)] = &[
         (

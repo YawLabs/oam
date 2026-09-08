@@ -22,7 +22,9 @@ overview, plus the environment variables, which `--help` does not list.
 | `oam cache info` / `oam cache clean` | Inspect or delete the V8 bytecode cache (see `OAM_CODE_CACHE` below). |
 
 Global: `--json` emits machine-readable ODIF JSONL on stderr instead of
-pretty-printed errors — the form agents should consume.
+pretty-printed errors — the form agents should consume. The envelope is
+documented at <https://oamjs.org/docs/odif>, and every code it can carry at
+<https://oamjs.org/docs/errors>.
 
 ## Node compatibility flags
 
@@ -42,6 +44,27 @@ Notable ones:
 | `--expose-gc`, `--no-warnings`, `--no-deprecation`, `--pending-deprecation` | As in Node. |
 | `--env-file=<path>`, `--env-file-if-exists=<path>` | As in Node. |
 | `-e` / `--eval`, `-p` / `--print`, `-pe` | As in Node, including the bundled form. |
+
+## Debugging
+
+`oam run` and `oam serve` take the V8 Inspector flags, and so do executables
+built by `oam compile`. `oam test`, `oam check` and `oam repl` do not, and
+reject them rather than ignoring them.
+
+| Flag | Notes |
+|---|---|
+| `--inspect[=[host:]port]` | Attach the V8 Inspector (Chrome DevTools Protocol) and run immediately. Default `127.0.0.1:9229`; a bare port binds loopback. |
+| `--inspect-brk[=[host:]port]` | As `--inspect`, but execute nothing until a debugger attaches, then break on the first statement. Wins if both are given. |
+
+One debugger at a time: a second concurrent client is refused with 503, and
+reconnecting after the first disconnects is supported. CDP has no
+authentication, so a non-loopback bind hands the process to the network.
+
+A TypeScript entry is transpiled before V8 compiles it and oam attaches no
+source map for the debugger, so the Sources panel shows generated JavaScript
+with reflowed line numbers. Printed stack traces are mapped back to the `.ts`
+line; the debugger is not. Full story:
+<https://oamjs.org/docs/inspector>.
 
 ## Environment variables
 
@@ -96,3 +119,9 @@ Notable ones:
 - [node-divergences.md](node-divergences.md) — every place oam knowingly differs
   from Node, and why.
 - [../BENCHMARKS.md](../BENCHMARKS.md) — numbers, and how to reproduce them.
+- <https://oamjs.org/docs/inspector> -- debugging with `--inspect` /
+  `--inspect-brk`, in full.
+- <https://oamjs.org/docs/errors> -- every `OAM-*` diagnostic code, by family.
+  Diagnostics link here themselves, anchored at the code.
+- <https://oamjs.org/docs/odif> -- the ODIF envelope behind `--json`, field by
+  field.

@@ -5,7 +5,7 @@
 //! results, install events. JSON is the source of truth; the human
 //! pretty-printer is a renderer over the same stream and can never drift.
 //!
-//! Spec home (once docs ship): https://oam.sh/odif
+//! Spec: https://oamjs.org/docs/odif
 
 // AI-POLICY gate 5: this crate carries no `unsafe`. `forbid` (not `deny`) so it
 // can never be silently reintroduced under an inner `#[allow(unsafe_code)]`.
@@ -108,11 +108,35 @@ pub struct Diagnostic {
     /// Dedup / flake-correlation hash, stable across runs for "the same" problem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
-    /// Offline-resolvable docs URL: https://oam.sh/e/<code>
+    /// The published page for this code, from [`docs_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repairs: Vec<Repair>,
+}
+
+/// The published reference page for every diagnostic code.
+const ERROR_REFERENCE_URL: &str = "https://oamjs.org/docs/errors";
+
+/// The page a diagnostic points a reader at, anchored at its code.
+///
+/// TypeScript diagnostics pass through as `OAM-TS<n>` carrying tsgo's own
+/// number, so that family is unbounded and no page can carry an anchor per
+/// member. oam's own codes are always zero-padded to four digits
+/// (`OAM-TS0000`, `OAM-RT0001`) and no TypeScript diagnostic number starts
+/// with a zero, so the leading zero is what separates a code the page
+/// documents from one it can only explain as a family. A pass-through code
+/// therefore lands on the family section rather than on an anchor that is
+/// not there -- a fragment the page cannot honour reads as a published page
+/// and behaves like a dead link.
+pub fn docs_url(code: &str) -> String {
+    if let Some(number) = code.strip_prefix("OAM-TS")
+        && !number.starts_with('0')
+        && number.parse::<u32>().is_ok()
+    {
+        return format!("{ERROR_REFERENCE_URL}#OAM-TS");
+    }
+    format!("{ERROR_REFERENCE_URL}#{code}")
 }
 
 impl Diagnostic {
@@ -123,7 +147,7 @@ impl Diagnostic {
         message: impl Into<String>,
     ) -> Self {
         let code = code.into();
-        let docs = Some(format!("https://oam.sh/e/{code}"));
+        let docs = Some(docs_url(&code));
         Self {
             odif: ODIF_VERSION.to_string(),
             code,
@@ -165,6 +189,34 @@ mod tests {
         let back: Diagnostic = serde_json::from_str(&line).unwrap();
         assert_eq!(d, back);
         assert!(line.contains("\"odif\":\"1\""));
-        assert!(line.contains("oam.sh/e/OAM-RT0001"));
+        assert!(line.contains("oamjs.org/docs/errors#OAM-RT0001"));
+    }
+
+    #[test]
+    fn docs_url_anchors_oam_codes_and_folds_typescript_passthrough() {
+        // oam's own codes are zero-padded, so each has an anchor of its own.
+        assert_eq!(
+            docs_url("OAM-RT0001"),
+            "https://oamjs.org/docs/errors#OAM-RT0001"
+        );
+        assert_eq!(
+            docs_url("OAM-TS0000"),
+            "https://oamjs.org/docs/errors#OAM-TS0000"
+        );
+        // tsgo's own numbers never start with a zero and the page cannot
+        // anchor all of them, so they fold onto the family section.
+        assert_eq!(
+            docs_url("OAM-TS2345"),
+            "https://oamjs.org/docs/errors#OAM-TS"
+        );
+        assert_eq!(
+            docs_url("OAM-TS18048"),
+            "https://oamjs.org/docs/errors#OAM-TS"
+        );
+        // Not a number after the prefix: not a pass-through code.
+        assert_eq!(
+            docs_url("OAM-TSFOO"),
+            "https://oamjs.org/docs/errors#OAM-TSFOO"
+        );
     }
 }
