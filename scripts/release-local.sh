@@ -666,6 +666,31 @@ else
   fi
 fi
 
+# --- bump the package-manager taps ----------------------------------------------
+# Homebrew and Scoop are release channels exactly like oamjs.org above, and for
+# most of this project's life they were the only step nothing owned: the formula
+# was hand-written once at v0.8.0 and never bumped, so `brew install oam` served
+# 0.8.1 while the project shipped 0.14.0. That is worse than having no tap --
+# it hands users a stale binary and calls it current, and `oam self-update`
+# cannot fix it because a brew-managed prefix is not the installer's per-user
+# directory.
+#
+# Runs after the release is cut because it reads the release's own published
+# SHA256SUMS. Non-fatal when the tap checkouts are absent (OAM_TAPS_OPTIONAL) for
+# the same reason the site step is: the release is already valid without it. Any
+# other failure IS fatal inside the script -- a wrong hash is worse than a stale
+# one -- but a fatal there must not abort a release that has already published,
+# so the outcome is reported here rather than propagated.
+step "Bump the Homebrew formula + Scoop manifest"
+if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
+  ok "DRY RUN -- taps not bumped"
+elif OAM_TAPS_OPTIONAL=1 "$SCRIPT_DIR/bump-taps.sh" "$TAG"; then
+  ok "package-manager taps are current for $TAG"
+else
+  warn "tap bump FAILED -- brew/scoop still serve the previous release."
+  warn "repair with: ./scripts/bump-taps.sh $TAG"
+fi
+
 # The gate regenerated these at this version and commit; restore_gate_artifacts
 # then threw them away so the remote legs would build a tree byte-identical to
 # the tag. Land them NOW, after the release is published, so the committed
