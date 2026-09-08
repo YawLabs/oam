@@ -63,7 +63,7 @@ Commit `e9358cd` | release | host windows-aarch64 | oam 0.13.0 | v22.22.2
 
 - **oam no-cache** -- `OAM_CODE_CACHE=0`, fresh `OAM_CACHE_DIR` every run: the `.ts` -> JS transpile (oxc) plus a full V8 compile; no bytecode is produced, written or read. The floor without the cache.
 - **oam cold** -- caches on, fresh `OAM_CACHE_DIR` every run: a project's first run, which also serializes and writes the bytecode. Its gap above no-cache is the price of producing the cache.
-- **oam warm** -- caches on, one `OAM_CACHE_DIR` primed by an untimed run and reused: every run after the first. Its gap below no-cache is what consuming the cache saves. The transpile itself is not cached for project files (only `node_modules` gets the install-time precompile), so this row still pays oxc on every run -- it is the row a transpile cache has to move.
+- **oam warm** -- caches on, one `OAM_CACHE_DIR` primed by an untimed run and reused: every run after the first. Its gap below no-cache is what consuming the cache saves. Both caches are warm on this row: the V8 bytecode cache and, since the transpile cache shipped, the oxc output for project files too (`OAM_TRANSPILE_CACHE`, on by default, content-addressed by source text plus transpile settings). The measurement above predates the transpile cache and so still describes a row that re-ran oxc every time; re-measure with `--case ts-cold-start` before quoting this row.
 - **node** -- `node --experimental-transform-types main.ts` as installed, `NODE_COMPILE_CACHE` unset. Strip-only mode (`--experimental-strip-types`) rejects the fixture's enums with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`, so the reference is transform mode.
 
 ## Cases

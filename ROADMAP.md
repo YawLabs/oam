@@ -4,13 +4,31 @@ Strategy: hybrid adoption — every phase is adoptable inside an existing Node p
 switching production runtimes, until 1.0 makes switching boring. Full plan and rationale live
 in the project planning docs; this is the operating summary.
 
-| Phase | Target | Ships | Gate |
+Status as of v0.14.0: P0 through M3 have shipped. M4 is where the open work is.
+
+| Phase | Status | Ships | Gate |
 |---|---|---|---|
-| **P0** (now) | month 0-1 | Workspace, governance docs, 6-target CI, V8 hello-world, snapshot pipeline seed, ECMA-429 harness skeleton | CI green on all 6 tier-1 targets |
-| **M1 / v0.1** | month ~6 | `oam run` + `oam check`: demo-critical ECMA-429 subset (console, fetch, URL, timers, encoding, core streams), ESM loader, oxc TS strip/transform + tsconfig paths, tsgo sidecar streaming diagnostics, ODIF v1, <=20ms cold start | the demo Node userland cannot replicate: an agent consuming ODIF over MCP runs check->fix->test in one loop |
-| **M2 / v0.2-0.3** | month ~11 | `oam test` (mocking + fake timers day 1, fork-isolated files), node: compat wave 1 incl. AsyncLocalStorage, remaining ECMA-429 (WebCrypto etc.), public conformance dashboard, N-API alpha, agent-context sandboxing, MCP server, V8 Inspector/DevTools attach, REPL | real projects' suites pass; first external users |
-| **M3 / v0.4-0.6** | month ~17 | `oam install` (correctness-first; provenance verification; scripts-off with `oam trust`), `oam serve` (opt-in worker isolates, io_uring fast path), first published benchmarks, `oam.fork()` checkpoint pools, record-replay beta, `oam:ai` + SSE helpers, install-time pre-compilation, **MCP-server host positioning** (see below) | win the published benchmark axes; Windows install 2-4x Bun |
-| **M4 / v0.7-1.0** | month ~26 | node: wave 2, N-API beta (sharp/better-sqlite3/esbuild unmodified), `oam compile` (signed binaries), >85% Node-suite pass, LTS effective, Windows perf-parity audit, docs site + update channel | v1.0 GA |
+| **P0** | **done** | Workspace, governance docs, cross-platform CI, V8 hello-world, startup snapshot, ECMA-429 harness skeleton | gate green on every tier-1 target |
+| **M1 / v0.1** | **done** | `oam run` + `oam check`: demo-critical ECMA-429 subset (console, fetch, URL, timers, encoding, core streams), ESM loader, oxc TS strip/transform + tsconfig paths, tsgo sidecar streaming diagnostics, ODIF v1, <=20ms cold start | the demo Node userland cannot replicate: an agent consuming ODIF over MCP runs check->fix->test in one loop |
+| **M2 / v0.2-0.3** | **done** | `oam test` (mocking + fake timers day 1, fork-isolated files), node: compat wave 1 incl. AsyncLocalStorage, remaining ECMA-429 (WebCrypto etc.), conformance scorecards, N-API alpha, agent-context sandboxing, MCP server, V8 Inspector/DevTools attach, REPL | real projects' suites pass; first external users |
+| **M3 / v0.4-0.6** | **done** | `oam install` (correctness-first; provenance verification; scripts-off with `oam trust`), `oam serve` (opt-in worker isolates, io_uring fast path), first published benchmarks, `oam.fork()` checkpoint pools, record-replay beta, `oam:ai` + SSE helpers, install-time pre-compilation, **MCP-server host positioning** (see below) | win the published benchmark axes; Windows install 2-4x Bun |
+| **M4 / v0.7-1.0** | in flight | node: wave 2, N-API beta (sharp/better-sqlite3/esbuild unmodified), `oam compile` (signed binaries), LTS effective, Windows perf-parity audit, docs site + update channel | v1.0 GA |
+
+Two entries above changed rather than completed, and saying so is the point of a roadmap
+nobody has to reverse-engineer:
+
+- **The CI shape.** P0 promised "6-target CI" gated by GitHub Actions. Actions were removed
+  from every YawLabs repo; the gate is now `scripts/ci-local.sh` run by the maintainer plus
+  the remote build legs in `scripts/release-local.sh`. Five targets ship binaries
+  (windows-x64, windows-arm64, macos-x64, macos-arm64, linux-x64). linux-arm64 builds from
+  the same tree but has never been released -- the V8 snapshot forbids cross-compiling, so it
+  needs a native ARM builder.
+- **The >85% Node-suite gate is retired**, not met-and-forgotten. It was dropped as a release
+  gate because a percentage over a corpus we choose is a number we can move by choosing
+  differently; the bar is MCP-server hosting plus TypeScript support. The suite stays as an
+  internal regression harness with a ratchet that may only go up: it currently sits at
+  **439/442 runnable (99.3%)** and both remaining failures are deliberate. See
+  CONFORMANCE-NODE.md and docs/node-divergences.md, which qualify the denominator.
 
 ### MCP: two roles, both ours
 
@@ -31,6 +49,36 @@ The TS wedge is a positioning bet, not a feature checklist; the *quality* of the
 - **Shipped, except the signing half:** `oam compile` embeds a pre-bundled JS file into a standalone executable (`e2e.rs:13033`; it does not bundle for you — see [cli-reference](docs/cli-reference.md)), and install-time pre-compilation landed as a V8 bytecode code-cache. Both reduce cold-start cost for TS-heavy MCP servers hosted via oam, which is the M3 positioning. Signed binaries remain outstanding — releases are checksummed, not signed.
 
 The TS-optimization expansion is "raise the floor on what runs correctly" (M1/M2 work above) and "raise the ceiling on what runs fast" (M3 install path), not "invent a new type system at runtime."
+
+### Shipped, and retired from the planning docs
+
+A roadmap that still lists shipped work as pending is worse than a stale one: it sends the
+next person to build something that exists. Each entry below was re-verified in the tree at
+v0.14.0 rather than taken from a status note, with the evidence that settled it.
+
+- **V8 startup snapshot.** Not a "pipeline seed" -- a real snapshot with compiled code
+  retained (`FunctionCodeHandling::Keep`), generated by `crates/oam_engine/build.rs` and
+  deserialized at every start (`crates/oam_engine/src/lib.rs:61,306,386`).
+- **Transpile caching for project files.** `OAM_TRANSPILE_CACHE` is on by default and
+  content-addressed; a warm project `.ts` run does not re-run oxc. BENCHMARKS.md said the
+  opposite until this was corrected.
+- **The wedge demo.** `bench/wedge-demo/` exists in both a human (`demo.sh`, `demo.ps1`) and
+  an agent-driven (`agent-loop.mjs`) edition. Both plan docs listed it as never built.
+- **worker_threads, http2, tls, WebSocket client, HTTP upgrade, cluster, dgram.** All real;
+  worker_threads is native-backed thread spawning (`js/node_compat.js:23720`), not a shim.
+- **Full ICU/Intl and WebAssembly.** The real remaining surface gaps are `CompressionStream`,
+  `node:sqlite` and `node:wasi`.
+- **prom-client and OpenTelemetry tracing run on oam**, including context propagation across
+  `await`. Their event-loop and GC numbers are still zeros -- that is a `perf_hooks` gap, and
+  it is open work, not a missing integration.
+- **Source-mapped TypeScript stacks, and V8 Inspector debugging** via `--inspect` and
+  `--inspect-brk` (Chrome DevTools Protocol). Only the documentation was missing.
+- **The `oam:` built-in modules** -- `oam:mcp` (an MCP server SDK with stdio and HTTP/SSE
+  transports), `oam:test`, `oam:ai`, `oam:permissions`. They are undocumented, which is why
+  they read as unbuilt.
+- **`process.stdin` pause semantics** (issue #108) were re-measured against Node in both
+  shapes the issue described: 3913 ms vs 3918 ms, and 3921 ms vs 3968 ms. Node does not exit
+  early either, so there was no divergence to fix. Closed as not-planned.
 
 Cut order under constraint: AI-starter features -> own bundler (bless Rolldown) -> slip
 `oam install` past 1.0 -> macOS perf tuning. Never cut: the Windows gate
