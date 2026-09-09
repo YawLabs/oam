@@ -45,9 +45,17 @@ const shapes = [
 
 for (const [name, body] of shapes) {
   const file = path.join(dir, "child.mjs");
-  writeFileSync(file, `${body}\n`);
-  const started = Date.now();
-  const child = spawn(process.execPath, [file], { stdio: ["pipe", "ignore", "inherit"] });
+  // The ready marker goes FIRST, before the shape registers anything, so the
+  // clock starts once the runtime is up and the only thing left to measure is
+  // whether stdin holds the loop.
+  writeFileSync(file, `process.stdout.write("R\\n");\n${body}\n`);
+  const child = spawn(process.execPath, [file], { stdio: ["pipe", "pipe", "inherit"] });
+  const started = await new Promise((ready) => {
+    child.stdout.on("data", function first() {
+      child.stdout.off("data", first);
+      ready(Date.now());
+    });
+  });
   child.stdin.write("x\n");
   const hold = setTimeout(() => {
     try {
