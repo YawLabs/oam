@@ -19665,3 +19665,83 @@ fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
         "wrapping must preserve fn.name and fn.length -- node's own tests read them: {stdout}"
     );
 }
+
+/// The promises wrapper must not re-type what it wraps, and must not reach the
+/// callback layer.
+///
+/// Three regressions the first version of `asAlwaysRejecting` introduced, all
+/// measured against v22.22.2:
+///
+/// 1. `fs/promises.glob` returns an AsyncIterable and validates lazily -- it is
+///    the one member that does not return a promise. Wrapping it was SILENT
+///    data loss rather than an error: `for await` failed loudly, but the
+///    documented `await Array.fromAsync(fsp.glob(...))` saw a Promise, took
+///    Array.fromAsync's array-like branch, read `length === undefined`, and
+///    resolved to `[]`. A build step globbing for files found none and carried
+///    on.
+/// 2. The callback forms are built from the same functions, and node's callback
+///    forms THROW synchronously on a bad path while the promise forms reject.
+///    Wrapping in place made them report through the callback instead.
+/// 3. Ten path-based ops (the chown/utimes/lchmod family) and `openAsBlob` sat
+///    outside the range the original conversion swept and still stringified
+///    their path, so `fs.utimesSync(url)` failed where `fsp.utimes(url)` worked.
+#[test]
+fn fs_promises_wrapper_preserves_glob_callbacks_and_paths() {
+    let stdout = run_ok(
+        "fs_wrapper_shape.mjs",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         import { pathToFileURL } from 'node:url';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         \n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-wrap-'));\n\
+         fs.writeFileSync(path.join(dir, 'a.js'), '');\n\
+         fs.writeFileSync(path.join(dir, 'b.js'), '');\n\
+         const pattern = path.join(dir, '*.js');\n\
+         \n\
+         // 1. glob stays an AsyncIterable, through BOTH documented idioms.\n\
+         console.log('fromAsync:', (await Array.fromAsync(fsp.glob(pattern))).length);\n\
+         let n = 0;\n\
+         for await (const _ of fsp.glob(pattern)) n++;\n\
+         console.log('forAwait:', n);\n\
+         \n\
+         // 2. a callback form still throws SYNCHRONOUSLY, as node does.\n\
+         const bad = new URL('https://example.invalid/x');\n\
+         let threw = false;\n\
+         try { fs.unlink(bad, () => {}); } catch { threw = true; }\n\
+         console.log('callbackThrewSync:', threw);\n\
+         \n\
+         // ...while the promise form still REJECTS rather than throwing.\n\
+         let rejected = false;\n\
+         try { await fsp.unlink(bad); } catch (e) { rejected = e.code === 'ERR_INVALID_URL_SCHEME'; }\n\
+         console.log('promiseRejected:', rejected);\n\
+         \n\
+         // 3. the ops outside the original conversion range take a URL too.\n\
+         const file = path.join(dir, 'a.js');\n\
+         const url = pathToFileURL(file);\n\
+         fs.utimesSync(url, new Date(), new Date());\n\
+         console.log('utimesSync:', true);\n\
+         console.log('openAsBlob:', (await fs.openAsBlob(url)).size === 0);\n",
+    );
+    assert!(
+        stdout.contains("fromAsync: 2"),
+        "Array.fromAsync(glob) must yield the files, not [] -- a Promise here is silent data loss: {stdout}"
+    );
+    assert!(
+        stdout.contains("forAwait: 2"),
+        "glob must stay async-iterable: {stdout}"
+    );
+    assert!(
+        stdout.contains("callbackThrewSync: true"),
+        "a callback form must throw synchronously on a bad path, as node does: {stdout}"
+    );
+    assert!(
+        stdout.contains("promiseRejected: true"),
+        "the promise form must still reject rather than throw: {stdout}"
+    );
+    assert!(
+        stdout.contains("utimesSync: true") && stdout.contains("openAsBlob: true"),
+        "the ops outside the original conversion range must accept a URL path: {stdout}"
+    );
+}

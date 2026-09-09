@@ -434,30 +434,57 @@
   /// added to the object. The sync path stays sync on purpose: `fs.unlinkSync`
   /// and the callback forms DO throw synchronously in node (verified), and
   /// this wrapper is applied only to the promises module.
+  /// Members of `fs/promises` that do NOT return a promise, and so must not be
+  /// touched. `glob` returns an AsyncIterable and validates lazily on the first
+  /// iteration -- measured on v22.22.2: `fsp.glob(badUrl)` returns an
+  /// async-iterable and throws only when iterated. Wrapping it was silent data
+  /// loss, not an error: `for await` failed loudly, but the documented
+  /// collection idiom `await Array.fromAsync(fsp.glob(...))` saw a Promise,
+  /// took Array.fromAsync's array-like branch, read `length === undefined` and
+  /// resolved to `[]` -- so a build step that globs for files found none and
+  /// carried on.
+  const NOT_PROMISE_RETURNING = new Set(["glob"]);
+
+  /// The UNWRAPPED `fs/promises` methods, set when that factory runs. The
+  /// callback layer builds on these so a bad path still throws synchronously,
+  /// as node does; only the exported module object is wrapped.
+  let rawFsPromises = null;
+
   function asAlwaysRejecting(api) {
+    const out = {};
     for (const key of Object.keys(api)) {
       const fn = api[key];
-      if (typeof fn !== "function") continue;
+      if (typeof fn !== "function" || NOT_PROMISE_RETURNING.has(key)) {
+        out[key] = fn;
+        continue;
+      }
       // `Dirent` rides in this object and is a CLASS, which is also typeof
       // "function". Wrapping it would replace the constructor with something
       // that returns a promise, breaking `new` and `instanceof` for every
       // caller of `opendir`. Only real methods get wrapped.
-      if (/^class[\s{]/.test(Function.prototype.toString.call(fn))) continue;
+      if (/^class[\s{]/.test(Function.prototype.toString.call(fn))) {
+        out[key] = fn;
+        continue;
+      }
       // Named + arity-preserving: `fsp.unlink.name` and `.length` are
       // observable, and node's own tests read them.
       const wrapped = {
         [key]: function (...args) {
+          // The RETURN VALUE is passed through untouched -- only a synchronous
+          // THROW is converted. `Promise.resolve(...)` on the way out would
+          // silently re-type any future non-promise member the set above has
+          // not caught yet, which is exactly how `glob` broke.
           try {
-            return Promise.resolve(fn.apply(this, args));
+            return fn.apply(this, args);
           } catch (e) {
             return Promise.reject(e);
           }
         },
       }[key];
       Object.defineProperty(wrapped, "length", { value: fn.length, configurable: true });
-      api[key] = wrapped;
+      out[key] = wrapped;
     }
-    return api;
+    return out;
   }
 
   /// ERR_INVALID_ARG_TYPE and friends are TypeErrors in node, not plain
@@ -9903,7 +9930,14 @@
 
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
-    return asAlwaysRejecting({
+    // The callback module is built from these same functions, and node's
+    // callback forms THROW synchronously on a bad path (measured: all 20 do on
+    // v22.22.2) while the promise forms reject. Wrapping in place made every
+    // callback form report through the callback instead -- the opposite of
+    // node, and the opposite of what this branch's own e2e docstring claims.
+    // So the raw object is stashed for `registry.factories.fs` and only the
+    // exported copy is wrapped.
+    rawFsPromises = {
       readFile: async (path, options) => {
         const bytes = await natives.fsReadFile(toPath(path));
         return decodeRead(bytes, readOptions(options).encoding ?? null);
@@ -10329,11 +10363,17 @@
         UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
       },
       Dirent,
-    });
+    };
+    return asAlwaysRejecting(rawFsPromises);
   };
 
   registry.factories.fs = (natives) => {
-    const promises = registry.get("fs/promises");
+    // `registry.get` returns the WRAPPED module object, whose methods can no
+    // longer throw. The callback forms need the raw ones to keep node's
+    // synchronous-throw contract; the get() call stays because it is what
+    // forces the factory to run and populate the slot.
+    registry.get("fs/promises");
+    const promises = rawFsPromises;
 
     // Active-request tracking for process._getActiveRequests() /
     // process.getActiveResourcesInfo(). Node's callback-form fs ops each hold a
@@ -10900,22 +10940,22 @@
     //
     // The `l` forms act on a symlink itself rather than its target, which is
     // the only reason they exist.
-    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(String(p), uid, gid));
-    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(String(p), uid, gid));
+    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid));
+    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid));
     fs.utimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsUtimes(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
     );
     fs.lutimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsLutimes(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
     );
 
-    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(String(p), uid, gid); };
-    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(String(p), uid, gid); };
+    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), uid, gid); };
+    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), uid, gid); };
     fs.utimesSync = (p, atime, mtime) => {
-      natives.fsUtimesSync(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+      natives.fsUtimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
     };
     fs.lutimesSync = (p, atime, mtime) => {
-      natives.fsLutimesSync(String(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+      natives.fsLutimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
     };
 
     // lchmod is macOS-only. node gates its own on O_SYMLINK -- which the BSD
@@ -10931,8 +10971,8 @@
     // what node gives. A throwing stub would link the same and then diverge on
     // the message.
     if (process.platform === "darwin") {
-      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(String(p), mode));
-      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(String(p), mode); };
+      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode));
+      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), mode); };
     } else {
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
@@ -11039,7 +11079,7 @@
       }
       let bytes;
       try {
-        bytes = await natives.fsReadFile(String(p));
+        bytes = await natives.fsReadFile(toPath(p));
       } catch {
         // Deliberately swallowing the underlying error: node reports none of
         // it, and leaking ENOENT here would be a divergence, not a courtesy.
