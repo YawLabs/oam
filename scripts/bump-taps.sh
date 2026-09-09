@@ -112,7 +112,48 @@ fi
 # --- the published SHA256SUMS is the only hash authority -------------------
 step "Read the published SHA256SUMS for $TAG"
 SUMS_DIR="$(mktemp -d -t oam-taps-XXXXXX)"
-trap 'rm -rf "$SUMS_DIR"' EXIT
+
+# Which files this run has rewritten, and which have been published. A rewrite
+# that never got published must not be left behind in a SHARED checkout: the
+# next run's sync_tap refuses to touch a dirty file and blames the operator for
+# this script's own leftover, so the documented repair path is dead until a
+# human works out that the dirt is ours and discards it by hand.
+#
+# An EXIT trap rather than a revert at each failure site, because the failure
+# sites are the problem: `fail` is called from eight places and from inside
+# publish_tap, and every one of them that forgets to revert reintroduces this.
+# The trap cannot be forgotten. Publishing is one-way, so a published tap is
+# recorded and never reverted -- only the un-published remainder is undone.
+BREW_REWRITTEN=0; BREW_PUBLISHED=0
+SCOOP_REWRITTEN=0; SCOOP_PUBLISHED=0
+
+cleanup() {
+  local rc=$?
+  rm -rf "$SUMS_DIR"
+  # A clean exit leaves the tree as the run intended -- including --dry-run,
+  # which deliberately keeps the rewrite and prints how to discard it.
+  if [ "$rc" -eq 0 ]; then return; fi
+  revert_unpublished "${HOMEBREW_DIR:-}" "$BREW_FILE" "$BREW_REWRITTEN" "$BREW_PUBLISHED"
+  revert_unpublished "${SCOOP_DIR:-}" "$SCOOP_FILE" "$SCOOP_REWRITTEN" "$SCOOP_PUBLISHED"
+}
+
+# Undo one un-published rewrite, and say so only if there was something to undo.
+# `git checkout --` on an already-committed file is a silent no-op, so an
+# unconditional "reverted ..." would claim work that did not happen -- and here
+# that matters: a committed-but-unpushed file is the recoverable state the next
+# run pushes, not a leftover, and telling the operator it was reverted would
+# send them looking for work that is still pending.
+revert_unpublished() {
+  local dir="$1" file="$2" rewritten="$3" published="$4"
+  [ "$rewritten" = "1" ] && [ "$published" = "0" ] && [ -n "$dir" ] || return 0
+  git -C "$dir" diff --quiet -- "$file" && return 0
+  if git -C "$dir" checkout -- "$file" 2>/dev/null; then
+    warn "reverted the un-published rewrite of $file"
+  else
+    warn "could not revert $file in $dir -- discard it by hand before re-running"
+  fi
+}
+trap cleanup EXIT
 gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS --dir "$SUMS_DIR" \
   || fail "no published SHA256SUMS for $TAG -- cut the release before bumping taps"
 SUMS="$SUMS_DIR/SHA256SUMS"
@@ -316,6 +357,7 @@ node -e '
       "${BREW_ASSETS[1]}" "$(hash_of "${BREW_ASSETS[1]}")" \
       "${BREW_ASSETS[2]}" "$(hash_of "${BREW_ASSETS[2]}")")" \
   || fail "could not rewrite $BREW_FILE"
+BREW_REWRITTEN=1
 
 # --- Scoop manifest ---------------------------------------------------------
 step "Rewrite bucket/oam.json"
@@ -338,6 +380,7 @@ node -e '
 ' "$SCOOP_DIR/$SCOOP_FILE" "$VERSION" "$TAG" \
   "$(hash_of oam-x86_64-pc-windows-msvc.exe)" "$(hash_of oam-aarch64-pc-windows-msvc.exe)" \
   || fail "could not rewrite $SCOOP_FILE"
+SCOOP_REWRITTEN=1
 
 # --- fail closed on a stale version string ----------------------------------
 # The rewrite is asset-keyed and total, so any surviving reference to another
@@ -345,23 +388,22 @@ node -e '
 # missed. Catching it here is the difference between "no bump" and "a manifest
 # that mixes two releases".
 # Both files are rewritten before either is published, so an abort here must
-# undo BOTH -- reverting only the file that tripped left the other rewritten and
-# uncommitted in a SHARED checkout, and sync_tap then refused the documented
-# repair run, blaming the operator for this script's own leftover.
-revert_all_rewrites() {
-  git -C "$HOMEBREW_DIR" checkout -- "$BREW_FILE" || warn "could not revert $BREW_FILE in $HOMEBREW_DIR -- check it by hand"
-  git -C "$SCOOP_DIR" checkout -- "$SCOOP_FILE" || warn "could not revert $SCOOP_FILE in $SCOOP_DIR -- check it by hand"
-}
+# undo every un-published rewrite -- which the EXIT trap above now does for
+# EVERY abort path, not just this one. Reverting only the file that tripped left
+# the other rewritten and uncommitted in a SHARED checkout, and sync_tap then
+# refused the documented repair run, blaming the operator for this script's own
+# leftover.
 for spec in "$HOMEBREW_DIR/$BREW_FILE" "$SCOOP_DIR/$SCOOP_FILE"; do
   if grep -oE 'releases/download/v[0-9][^/"]*' "$spec" | grep -qv "releases/download/$TAG"; then
-    revert_all_rewrites
-    fail "$(basename "$spec") still references a release other than $TAG after rewrite -- BOTH files reverted, nothing pushed"
+    fail "$(basename "$spec") still references a release other than $TAG after rewrite -- nothing pushed, and every un-published rewrite is reverted"
   fi
 done
 
 step "Publish"
 publish_tap "$HOMEBREW_DIR" "$BREW_FILE" "Homebrew formula"
+BREW_PUBLISHED=1
 publish_tap "$SCOOP_DIR" "$SCOOP_FILE" "Scoop manifest"
+SCOOP_PUBLISHED=1
 
 # --- verify what the taps actually serve ------------------------------------
 # raw.githubusercontent caches a push for up to ~5 minutes, so a mismatch here
