@@ -1,0 +1,42 @@
+{
+  "name": "oamjs",
+  "version": "0.14.0",
+  "description": "oam -- a Rust + V8 runtime that runs TypeScript directly and hosts MCP servers",
+  "license": "Apache-2.0",
+  "homepage": "https://oamjs.org",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/oam.git",
+    "directory": "npm/oamjs"
+  },
+  "bugs": {
+    "url": "https://github.com/YawLabs/oam/issues"
+  },
+  "keywords": [
+    "oam",
+    "typescript",
+    "runtime",
+    "mcp",
+    "model-context-protocol",
+    "v8"
+  ],
+  "bin": {
+    "oamjs": "bin/oamjs.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "oamjs-win32-x64": "0.14.0",
+    "oamjs-win32-arm64": "0.14.0",
+    "oamjs-darwin-x64": "0.14.0",
+    "oamjs-darwin-arm64": "0.14.0",
+    "oamjs-linux-x64": "0.14.0"
+  }
+}
