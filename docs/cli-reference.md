@@ -26,6 +26,18 @@ pretty-printed errors — the form agents should consume. The envelope is
 documented at <https://oamjs.org/docs/odif>, and every code it can carry at
 <https://oamjs.org/docs/errors>.
 
+Every check -- `oam check`, and the concurrent one behind `oam run` and
+`oam test` -- also sees oam's own declarations for the `oam:` modules
+(`oam:mcp`, `oam:test`, `oam:ai`, `oam:permissions`) and the `oam` global.
+Nothing to install and no `tsconfig.json` edit: for a project they arrive
+through a generated config in oam's cache that `extends` yours, so your
+`compilerOptions`, `include` and `paths` still decide what is checked and
+how. Node's own globals are a separate question -- `process`, `Buffer` and
+friends still want `@types/node` in the project, because those are Node's
+types to publish, not oam's. A project that carries its own ambient
+`declare const oam` (hand-written, or copied from oam's demo before 0.14)
+should drop it -- two declarations of one global are a redeclaration error.
+
 ## Node compatibility flags
 
 oam accepts the Node flags it implements, so existing invocations keep working.

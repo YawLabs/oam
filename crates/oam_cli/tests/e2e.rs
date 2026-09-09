@@ -6266,6 +6266,117 @@ fn check_single_file_without_tsconfig() {
     );
 }
 
+/// A bare file that imports every `oam:` module and touches the `oam`
+/// global must type-check. Before oam shipped its own declarations this was
+/// four TS2307s and a TS2304 on code that RUNS -- the runtime rejecting its
+/// own flagship modules.
+#[test]
+fn check_types_oam_modules_for_a_bare_file() {
+    let file = write_temp(
+        "oam_modules_bare.ts",
+        "import { McpServer, PROTOCOL_VERSION } from 'oam:mcp';\n\
+         import { describe, test, expect, mock } from 'oam:test';\n\
+         import { parseSSEStream, openai } from 'oam:ai';\n\
+         import { permissions } from 'oam:permissions';\n\
+         const server = new McpServer({ name: 'demo', version: '1.0.0' });\n\
+         server.tool('now', { handler: async () => 'sunny' });\n\
+         describe('s', () => {\n\
+         \x20 test('t', () => { expect(mock.fn()).toBeDefined(); });\n\
+         });\n\
+         const status = await permissions.query({ name: 'read', path: '/tmp' });\n\
+         console.log(PROTOCOL_VERSION, status.state, parseSSEStream, openai, oam.version);\n\
+         await oam.sleep(0);\n",
+    );
+    let out = oam(&["check", file.to_str().unwrap(), "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The same, inside a project. tsgo refuses a file argument next to `-p`
+/// (TS5042), so this is the generated-wrapper path -- and the wrapper must
+/// add oam's declarations WITHOUT dropping the project's own file set, which
+/// a config declaring neither `files` nor `include` gets from the default
+/// glob.
+#[test]
+fn check_types_oam_modules_inside_a_project_without_losing_its_files() {
+    write_temp(
+        "oam_modules_proj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    write_temp(
+        "oam_modules_proj/server.ts",
+        "import { McpServer } from 'oam:mcp';\n\
+         export const server = new McpServer({ name: 'demo' });\n\
+         export const version: string = oam.version;\n",
+    );
+    // A planted error in a SECOND file: it can only be reported if the
+    // project's own sources are still in the program.
+    let dir = write_temp(
+        "oam_modules_proj/planted.ts",
+        "export const n: number = 'no';",
+    )
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", dir.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("OAM-TS2307") && !stderr.contains("OAM-TS2304"),
+        "oam: modules and the oam global must resolve: {stderr}"
+    );
+    let codes: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|d| d["code"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(codes, vec!["OAM-TS2322"], "stderr: {stderr}");
+}
+
+/// A project that declares `include` keeps it: the wrapper adds a root file
+/// and must not widen (or narrow) what the user chose to check.
+#[test]
+fn check_keeps_a_projects_own_include_when_adding_declarations() {
+    write_temp(
+        "oam_modules_include/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+    );
+    write_temp(
+        "oam_modules_include/src/main.ts",
+        "import { test } from 'oam:test';\nexport const t = test;\n",
+    );
+    // Outside `include`: excluded before this change, and still excluded.
+    let dir = write_temp(
+        "oam_modules_include/scratch/broken.ts",
+        "const n: number = 'no';",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", dir.to_str().unwrap(), "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "the excluded file must stay excluded: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn mcp_serves_the_agent_loop_over_stdio() {
     use std::io::{BufRead, BufReader, Write};
