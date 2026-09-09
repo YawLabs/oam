@@ -118,3 +118,48 @@ test('OAMJS_BINARY wins over the packages, and is checked before it is exec\'d',
     /OAMJS_BINARY is set to \/tmp\/gone, which does not exist/,
   );
 });
+
+// A package that IS installed but shipped without its binary must not be
+// reported as "not installed". That advice sends the user round a reinstall
+// loop which reproduces the same state forever, because the install already
+// succeeded -- the two states need opposite instructions.
+test('an installed package missing its binary is not blamed on the install', () => {
+  assert.throws(
+    () => resolveBinary(stub({
+      platform: 'linux',
+      arch: 'x64',
+      glibcVersionRuntime: '2.39',
+      // package.json resolves (the package IS installed); the bin request does
+      // not (the tarball shipped without it).
+      resolve: (request) => {
+        if (request.endsWith('/package.json')) return '/nm/oamjs-linux-x64/package.json';
+        const e = new Error('not found');
+        e.code = 'MODULE_NOT_FOUND';
+        throw e;
+      },
+    })),
+    (err) => {
+      assert.match(err.message, /does not contain bin\//);
+      assert.doesNotMatch(err.message, /Reinstall with optional dependencies/);
+      return true;
+    },
+  );
+});
+
+// ...and the genuinely-skipped optional dependency keeps the advice that does
+// help it.
+test('a skipped optional dependency still says to reinstall with optionals', () => {
+  assert.throws(
+    () => resolveBinary(stub({
+      platform: 'linux',
+      arch: 'x64',
+      glibcVersionRuntime: '2.39',
+      resolve: () => {
+        const e = new Error('not found');
+        e.code = 'MODULE_NOT_FOUND';
+        throw e;
+      },
+    })),
+    /Reinstall with optional dependencies/,
+  );
+});

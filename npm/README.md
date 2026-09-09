@@ -155,3 +155,23 @@ Notes for whoever wires it:
   under `@yawlabs/oam` and as "a thin postinstall wrapper". Both are wrong now:
   the name is `oamjs` and there is no postinstall. A docs pass owns those files.
 - Nothing is published. The names are unregistered.
+
+## Windows: stop the server by closing stdin, not by killing the PID
+
+On POSIX the launcher forwards `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`,
+`SIGUSR1` and `SIGUSR2` to oam and then reproduces the child's death, so an MCP
+host that stops a server by killing the PID it spawned gets the behaviour it
+expects.
+
+Windows has no equivalent. A PID-directed kill there is `TerminateProcess`,
+which runs no JavaScript and does not touch descendants: the launcher dies
+instantly and `oam.exe` keeps running with the host's stdio handles open. The
+host may never see EOF on the pipe it was reading, and each restart leaks
+another runtime process.
+
+There is no fix available to this package. Node cannot exec-replace itself, and
+containing a process tree on Windows needs a job object, which needs a native
+addon -- and this package ships no postinstall and no build step by design.
+
+So on Windows, stop an oam-hosted MCP server by **closing its stdin**, which oam
+handles as a clean shutdown, rather than by killing the launcher's PID.

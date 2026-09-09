@@ -9,7 +9,31 @@ const { SUPPORTED, KNOWN_UNSUPPORTED } = require('./targets.js');
 // exec'ing it fails in the dynamic loader with a bare "No such file or
 // directory" that names the loader, not the missing libc. Catching it here
 // turns that into a sentence someone can act on.
+// Callers distinguish three answers only: null (musl -- no glibc), a non-null
+// value (glibc present), and undefined (could not tell). The VALUE of a
+// non-null answer is never read, which is what lets the cheap probe below
+// return a marker instead of a version.
+//
+// The cheap probe exists because this runs before every Linux launch, on the
+// happy path, and `process.report.getReport()` is not cheap: it walks the
+// native stack, the libuv handles and the whole environment to build a full
+// diagnostic report, all of it discarded except one header field. On a runtime
+// whose pitch is cold start, that is milliseconds per launch to answer a
+// question that only matters when the exec is about to fail. An `existsSync`
+// on the dynamic loader answers it in microseconds for both of the common
+// cases, and getReport stays as the fallback for anything unrecognized.
 function detectGlibc() {
+  try {
+    const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+    if (fs.existsSync(`/lib/ld-musl-${arch}.so.1`)) return null;
+    for (const loader of ['/lib64/ld-linux-x86-64.so.2', '/lib/ld-linux-aarch64.so.1',
+      '/lib/x86_64-linux-gnu/libc.so.6', '/lib/aarch64-linux-gnu/libc.so.6']) {
+      if (fs.existsSync(loader)) return 'present';
+    }
+  } catch {
+    // Fall through to the authoritative probe rather than guessing from an
+    // fs error -- a sandbox that hides /lib is not a musl signal.
+  }
   try {
     return process.report.getReport().header.glibcVersionRuntime || null;
   } catch {
@@ -81,6 +105,29 @@ function resolveBinary(opts = {}) {
       // optional dependency SILENTLY on a download failure or under
       // --no-optional / --omit=optional. So a missing package here says nothing
       // about the platform -- it says the install was partial.
+      // Two different states reach this branch and they need opposite advice.
+      // If the package resolves but its binary does not, the tarball shipped
+      // without one -- telling that user to "reinstall with optional
+      // dependencies enabled" sends them round a loop that reproduces the same
+      // state forever, because the install already succeeded.
+      let packagePresent = false;
+      try {
+        // The INJECTED resolver, not require.resolve: this is the same seam the
+        // lookup above uses, so the tests drive the shipped code path rather
+        // than a parallel one that only runs in production.
+        resolve(`${target.pkg}/package.json`);
+        packagePresent = true;
+      } catch {
+        packagePresent = false;
+      }
+      if (packagePresent) {
+        throw new Error(
+          `${target.pkg} is installed but does not contain bin/${target.bin}. That package was `
+          + 'published without its binary, so reinstalling will not fix it -- please report it at '
+          + 'https://github.com/YawLabs/oam/issues. To keep working now, set OAMJS_BINARY to an '
+          + 'oam binary on this machine.',
+        );
+      }
       throw new Error(
         `${target.pkg} is not installed. oam's per-platform binaries are optionalDependencies, `
         + 'which npm skips silently when a download fails or when installing with --no-optional. '

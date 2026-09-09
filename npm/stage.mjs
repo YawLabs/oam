@@ -36,9 +36,34 @@ const { SUPPORTED } = (await import(
   new URL('./oamjs/lib/targets.js', import.meta.url).href
 )).default;
 
+// Parse the flag AND its value out before picking the positional. Taking the
+// first non-flag argument meant `--only <pkg> <dir>` swallowed <pkg> as the
+// release dir and reported "no such release dir: oamjs-win32-arm64" -- naming
+// something the operator never passed as a directory. A valueless `--only` used
+// to yield [undefined], match no target, stage nothing, and exit 0.
 const args = process.argv.slice(2);
-const releaseDir = args.find((a) => !a.startsWith('--'));
-const only = args.reduce((acc, a, i) => (a === '--only' ? [...acc, args[i + 1]] : acc), []);
+const only = [];
+const positional = [];
+for (let i = 0; i < args.length; i += 1) {
+  if (args[i] === '--only') {
+    if (i + 1 >= args.length) diePreflight('--only needs a package name');
+    only.push(args[i + 1]);
+    i += 1;
+  } else if (args[i].startsWith('--')) {
+    diePreflight(`unknown flag: ${args[i]}`);
+  } else {
+    positional.push(args[i]);
+  }
+}
+const releaseDir = positional[0];
+
+// `die` is defined below and this parse runs above it; a second tiny exit keeps
+// the parse where it reads naturally instead of hoisting the whole block.
+function diePreflight(message) {
+  process.stderr.write(`oam-npm-stage: error: ${message}
+`);
+  process.exit(1);
+}
 
 function die(message) {
   process.stderr.write(`oam-npm-stage: error: ${message}\n`);
@@ -46,6 +71,15 @@ function die(message) {
 }
 
 if (!releaseDir) die('usage: node npm/stage.mjs <release-dir> [--only <package>]');
+// SUPPORTED is keyed by "<platform> <arch>"; --only names the PACKAGE, which is
+// the `pkg` field. Validating against the wrong set is why a correct package
+// name was rejected here a moment ago.
+const PACKAGE_NAMES = Object.values(SUPPORTED).map((t) => t.pkg);
+for (const name of only) {
+  if (!PACKAGE_NAMES.includes(name)) {
+    die(`--only ${name} is not a platform package. One of: ${PACKAGE_NAMES.join(', ')}`);
+  }
+}
 if (!existsSync(releaseDir)) die(`no such release dir: ${releaseDir}`);
 
 for (const f of ATTRIBUTION) {
@@ -68,10 +102,27 @@ for (const target of Object.values(SUPPORTED)) {
   mkdirSync(join(pkgDir, 'bin'), { recursive: true });
   const dest = join(pkgDir, 'bin', target.bin);
   copyFileSync(src, dest);
-  // npm preserves the mode it finds in the tarball, and a binary that arrives
-  // 0644 is a permission-denied on first run. Harmless on Windows, where the
-  // mode is ignored and the .exe suffix is what makes it executable.
+  // npm packs the mode it finds on disk, and a binary that arrives 0644 is a
+  // permission-denied on the user's first run.
+  //
+  // chmod cannot deliver that mode from Windows: libuv's uv_fs_chmod only
+  // toggles FILE_ATTRIBUTE_READONLY, so the execute bit is a silent no-op and
+  // the tarball ships 0644. Measured on this box -- staging the linux binary
+  // and packing produced `-rw-r--r--  package/bin/oam`. The release box IS
+  // Windows (scripts/release-local.sh runs there), so the default path would
+  // have published three broken POSIX packages, and npm forbids re-publishing a
+  // version: the only fix after the fact is a new release.
+  //
+  // So refuse rather than warn. The .exe targets are unaffected -- Windows has
+  // no execute bit and the suffix is what makes them runnable -- which is why
+  // this gate is per-target and not a blanket "do not stage on Windows".
   chmodSync(dest, 0o755);
+  if (process.platform === 'win32' && !target.bin.endsWith('.exe')) {
+    die(`cannot stage ${target.pkg} from Windows: chmod cannot set the execute bit here, `
+      + `so the packed binary would be mode 0644 and every user of that platform would get a `
+      + `permission denied. Stage and publish the POSIX packages from the mac or linux release `
+      + `leg. (Set OAM_NPM_ALLOW_UNEXECUTABLE=1 to override, for a local pack you will not publish.)`);
+  }
   for (const f of ATTRIBUTION) copyFileSync(join(releaseDir, f), join(pkgDir, f));
 
   process.stdout.write(`staged ${asset} -> npm/${target.pkg}/bin/${target.bin} `
@@ -83,9 +134,14 @@ for (const target of Object.values(SUPPORTED)) {
 // Apache-2.0 code and npm shows the license file on the package page.
 copyFileSync(join(releaseDir, 'LICENSE'), join(REPO_ROOT, 'npm/oamjs/LICENSE'));
 
+// Fail, do not warn. A release script runs under `set -e` and sees exit 0, and
+// a warning in a long release log is not a gate: the outcome is a published
+// platform package with no binary, which npm does not allow un-publishing after
+// 72 hours. --only is a local-verification tool, so it refuses here too rather
+// than let a partially staged tree reach `npm publish`.
 if (staged !== Object.keys(SUPPORTED).length) {
-  process.stderr.write(
-    `oam-npm-stage: warning: staged ${staged} of ${Object.keys(SUPPORTED).length} platforms `
-    + '-- publishing now would put empty packages on the registry\n',
-  );
+  die(`staged ${staged} of ${Object.keys(SUPPORTED).length} platforms. This tree is now `
+    + `PARTIALLY staged and must NOT be published -- the unstaged packages would reach the `
+    + `registry with no binary, and npm does not allow re-publishing a version. `
+    + `A release stages every platform; --only is for local verification only.`);
 }

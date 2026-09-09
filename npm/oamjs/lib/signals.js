@@ -39,6 +39,18 @@ function forwardSignals(child, opts = {}) {
     // So hold the event and do nothing with it: without a listener the launcher
     // dies first and the shell reports the launcher's exit code while oam is
     // still flushing.
+    // What this canNOT cover, stated because the POSIX branch below does cover
+    // it: an MCP host that stops a server by killing the PID it spawned. On
+    // Windows that kill is TerminateProcess, which does not run JS and does not
+    // touch descendants -- so the launcher dies instantly and oam.exe keeps
+    // running with the host's stdio handles open. The host may never see EOF,
+    // and each restart leaks another runtime process.
+    //
+    // There is no pure-Node fix: Node cannot exec-replace itself, and a job
+    // object needs a native addon, which this package deliberately does not
+    // have (no postinstall, no build step). Saying so is the honest option;
+    // a host on Windows should stop the server by closing its stdin, which oam
+    // handles, rather than by PID. Recorded in npm/README.md too.
     for (const sig of WINDOWS_HELD) listen(sig, () => {});
   } else {
     for (const sig of POSIX_FORWARDED) {
