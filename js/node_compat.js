@@ -418,6 +418,48 @@
     return new TextDecoder("utf-8").decode(buf);
   }
 
+  /// Every `fs/promises` method returns a promise, including on bad arguments.
+  ///
+  /// Node validates a path argument INSIDE the promise, so
+  /// `fsPromises.unlink(new URL("https://x/y"))` REJECTS with
+  /// ERR_INVALID_URL_SCHEME. Most of the methods below are plain arrows that
+  /// hand back whatever the native returns, so an argument check that throws --
+  /// `toPath` on a non-`file:` URL, or a poisoned `toString` -- escaped
+  /// synchronously instead, past the `.catch()` and `.then(ok, fail)` the
+  /// caller had already attached. Measured against v22.22.2: node rejects,
+  /// oam threw.
+  ///
+  /// Wrapping at the module boundary rather than making ~30 arrows `async`
+  /// keeps the fix in one place and cannot be forgotten by the next method
+  /// added to the object. The sync path stays sync on purpose: `fs.unlinkSync`
+  /// and the callback forms DO throw synchronously in node (verified), and
+  /// this wrapper is applied only to the promises module.
+  function asAlwaysRejecting(api) {
+    for (const key of Object.keys(api)) {
+      const fn = api[key];
+      if (typeof fn !== "function") continue;
+      // `Dirent` rides in this object and is a CLASS, which is also typeof
+      // "function". Wrapping it would replace the constructor with something
+      // that returns a promise, breaking `new` and `instanceof` for every
+      // caller of `opendir`. Only real methods get wrapped.
+      if (/^class[\s{]/.test(Function.prototype.toString.call(fn))) continue;
+      // Named + arity-preserving: `fsp.unlink.name` and `.length` are
+      // observable, and node's own tests read them.
+      const wrapped = {
+        [key]: function (...args) {
+          try {
+            return Promise.resolve(fn.apply(this, args));
+          } catch (e) {
+            return Promise.reject(e);
+          }
+        },
+      }[key];
+      Object.defineProperty(wrapped, "length", { value: fn.length, configurable: true });
+      api[key] = wrapped;
+    }
+    return api;
+  }
+
   /// ERR_INVALID_ARG_TYPE and friends are TypeErrors in node, not plain
   /// Errors -- `instanceof TypeError` and assert.throws({ name: "TypeError" })
   /// both key off that, so makeNodeError (which builds an Error) is the wrong
@@ -9861,7 +9903,7 @@
 
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
-    return {
+    return asAlwaysRejecting({
       readFile: async (path, options) => {
         const bytes = await natives.fsReadFile(toPath(path));
         return decodeRead(bytes, readOptions(options).encoding ?? null);
@@ -10287,7 +10329,7 @@
         UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
       },
       Dirent,
-    };
+    });
   };
 
   registry.factories.fs = (natives) => {

@@ -19594,3 +19594,74 @@ fn fetch_negotiates_and_decodes_content_encoding() {
         "the decoded body must survive JSON.parse: {stdout}"
     );
 }
+
+/// `fs/promises` rejects on a bad path argument; it does not throw.
+///
+/// Node validates the path INSIDE the promise, so
+/// `fsPromises.unlink(new URL('https://x/y'))` rejects with
+/// ERR_INVALID_URL_SCHEME (measured on v22.22.2). Most of oam's promises
+/// methods are plain arrows that hand back the native's promise, so the
+/// argument check introduced with URL path support escaped SYNCHRONOUSLY
+/// instead -- past the `.catch()` the caller had already attached, and past
+/// `Promise.all`, which is how a supervisor loses a whole batch to one bad
+/// path. The sync and callback forms are deliberately NOT covered here: node
+/// throws synchronously for both, and oam matches that.
+///
+/// `unlink` is the specific shape that broke (a non-async arrow); `readFile`
+/// is async and rejected correctly all along, so it pins the half that was
+/// already right against a fix that over-corrects.
+#[test]
+fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
+    let stdout = run_ok(
+        "fs_promises_reject.mjs",
+        "import fsp from 'node:fs/promises';\n\
+         const bad = new URL('https://example.invalid/x');\n\
+         \n\
+         // A plain-arrow method: the one that threw.\n\
+         try {\n\
+           const p = fsp.unlink(bad);\n\
+           console.log('unlink returned a promise:', p instanceof Promise);\n\
+           await p.then(() => console.log('unlink: RESOLVED?!'),\n\
+                        (e) => console.log('unlink rejected:', e.code));\n\
+         } catch (e) {\n\
+           console.log('unlink THREW SYNCHRONOUSLY:', e.code);\n\
+         }\n\
+         \n\
+         // An async method: correct before the fix, must stay correct.\n\
+         try {\n\
+           await fsp.readFile(bad);\n\
+           console.log('readFile: RESOLVED?!');\n\
+         } catch (e) {\n\
+           console.log('readFile rejected:', e.code);\n\
+         }\n\
+         \n\
+         // The wrapper must not have eaten the class that rides in the same\n\
+         // object, nor the observable function metadata.\n\
+         console.log('Dirent still a class:', /^class/.test(String(fsp.Dirent)));\n\
+         console.log('name:', fsp.unlink.name, 'arity:', fsp.readFile.length);\n",
+    );
+    assert!(
+        stdout.contains("unlink returned a promise: true"),
+        "a promises method must return a promise even for a rejected argument: {stdout}"
+    );
+    assert!(
+        stdout.contains("unlink rejected: ERR_INVALID_URL_SCHEME"),
+        "unlink must REJECT, matching node -- a synchronous throw escapes the caller's .catch(): {stdout}"
+    );
+    assert!(
+        !stdout.contains("THREW SYNCHRONOUSLY"),
+        "no promises method may throw synchronously: {stdout}"
+    );
+    assert!(
+        stdout.contains("readFile rejected: ERR_INVALID_URL_SCHEME"),
+        "the already-async path must keep rejecting: {stdout}"
+    );
+    assert!(
+        stdout.contains("Dirent still a class: true"),
+        "the wrapper must skip the class that shares the object, or `new` and instanceof break: {stdout}"
+    );
+    assert!(
+        stdout.contains("name: unlink arity: 2"),
+        "wrapping must preserve fn.name and fn.length -- node's own tests read them: {stdout}"
+    );
+}
