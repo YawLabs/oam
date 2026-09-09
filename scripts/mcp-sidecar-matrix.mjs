@@ -342,6 +342,25 @@ function installAll(pkgs, install = npmInstall) {
  *    verified -- oam answered and the answer holds
  *    fail     -- oam is at fault; this is the one state that reddens a release
  *    upstream -- the sidecar is broken on node too, so oam is not the suspect */
+/** Adjudicate a BOOT failure against the node control.
+ *
+ * Split out of the run loop so it is testable without spawning a sidecar --
+ * the same reason classifyCall below is a pure function. It decides whether a
+ * release goes red, and it was the one verdict nothing could exercise.
+ */
+function classifyBoot(oam, node) {
+  if (!node.ok) {
+    const same = node.why === oam.why;
+    return {
+      state: "upstream",
+      why: same
+        ? `${oam.why}; node fails identically -- broken sidecar, not oam`
+        : `${oam.why}; node also fails, differently (${node.why}) -- broken sidecar, not oam`,
+    };
+  }
+  return { state: "fail", why: `${oam.why}; the node control booted fine, so this is oam` };
+}
+
 function classifyCall(oam, node, deterministic) {
   // No usable control. oam's failure stands on its own rather than being
   // excused by an arm that never reached the tool.
@@ -615,6 +634,54 @@ function selfTest() {
           classifyCall({ ok: true, text: "9ms" }, { ok: true, text: "8ms" }, false).state,
           "verified",
           "a tool declared non-deterministic is judged on its assertion alone",
+        );
+      },
+    },
+    {
+      name: "a boot failure reproduced on node is upstream, not oam's",
+      run() {
+        const v = classifyBoot(
+          { ok: false, why: "exited early (code 1) awaiting tools/list" },
+          { ok: false, why: "exited early (code 1) awaiting tools/list" },
+        );
+        assertDeep(v.state, "upstream", "both runtimes fail to boot it -- the sidecar is broken");
+        assertDeep(/node fails identically/.test(v.why), true, "and the log says why");
+      },
+    },
+    {
+      name: "a boot failure the control does NOT reproduce is oam's",
+      run() {
+        const v = classifyBoot({ ok: false, why: "no tools/list response within 90s" }, { ok: true });
+        assertDeep(v.state, "fail", "node booted it fine, so this one is ours");
+      },
+    },
+    {
+      name: "two runtimes wording the same boot failure differently is still upstream",
+      run() {
+        const v = classifyBoot(
+          { ok: false, why: "exited early (code 1)" },
+          { ok: false, why: "exited early (code 9009)" },
+        );
+        assertDeep(v.state, "upstream", "a differing errno spelling does not make it oam's bug");
+        assertDeep(/differently/.test(v.why), true, "and the difference is stated, not papered over");
+      },
+    },
+    {
+      name: "an initialize ERROR is diagnosed at once, not waited out",
+      run() {
+        // The dispatcher used to match only `id === 1 && result`, so an error
+        // reply fell through and the probe sat out the full 90s boot timeout
+        // before reporting the WRONG phase.
+        const line = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code: -32602, message: "Unsupported protocol version: 2024-11-05" },
+        });
+        const msg = JSON.parse(line);
+        assertDeep(
+          msg.id === 1 && Boolean(msg.error),
+          true,
+          "the shape the dispatcher must recognize before it can report it",
         );
       },
     },
@@ -977,18 +1044,11 @@ for (const s of selected) {
     // most likely to be upstream was the one never checked.
     process.stderr.write(`  ${s.name.padEnd(12)} control (boot)...`);
     const bootControl = await probe("node", entry, { ...shared, call });
-    if (!bootControl.ok) {
-      const same = bootControl.why === oam.why;
-      const why = same
-        ? `${oam.why}; node fails identically -- broken sidecar, not oam`
-        : `${oam.why}; node also fails, differently (${bootControl.why}) -- broken sidecar, not oam`;
-      emit("UPSTREAM", why, [diagnosis(oam.stderr)]);
-      results.push({ name: s.name, state: "upstream", why });
-      continue;
-    }
-    const why = `${oam.why}; the node control booted fine, so this is oam`;
-    emit("FAIL", why, [diagnosis(oam.stderr)]);
-    results.push({ name: s.name, state: "fail", why });
+    const bootVerdict = classifyBoot(oam, bootControl);
+    emit(bootVerdict.state === "upstream" ? "UPSTREAM" : "FAIL", bootVerdict.why, [
+      diagnosis(oam.stderr),
+    ]);
+    results.push({ name: s.name, state: bootVerdict.state, why: bootVerdict.why });
     continue;
   }
   if (!call) {
