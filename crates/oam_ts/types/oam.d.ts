@@ -12,14 +12,28 @@
 // module TypeScript cannot resolve, and the ambient declarations would stop
 // applying.
 //
-// The web types used below -- ReadableStream, Headers, Response,
-// AbortSignal -- are the ones oam's own runtime installs, and they are taken
-// from the checker's lib rather than redeclared here: a private structural
-// copy would not be assignable from the real thing a user already holds. A
-// project that narrows `lib` to exclude them (and installs no @types/node,
-// which republishes them) will see the error inside THIS file, which is the
-// honest place for it -- the project has told TypeScript its runtime has no
-// fetch, and oam's does.
+// The web types used below -- ReadableStream, Headers, Response, AbortSignal --
+// are the ones oam's own runtime installs. They are DECLARED EMPTY here so that
+// this file never depends on the user's `lib` choice.
+//
+// Interface declaration merging is what makes that safe: when the checker's lib
+// already has these (the common case), an empty `interface X {}` merges into it
+// and adds nothing, so a real `Response` stays a real `Response` and every
+// member is still there. When the project has narrowed `lib` -- say
+// `"lib": ["es2023"]` on a server with no DOM -- the same declaration supplies
+// an opaque stand-in, which is all these positions need.
+//
+// The alternative, relying on the user's lib, was measured and is worse: a
+// project with `"lib": ["es2023"]` and no @types/node got five TS2304s pointing
+// INSIDE this generated file, at a hash-named path under the cache dir that the
+// user has never seen and cannot edit. Before the declarations shipped, that
+// same project got one honest TS2307 on the import. Making a user's check fail
+// somewhere they cannot reach is not the honest place for the error; it is just
+// a worse place.
+interface AbortSignal {}
+interface Headers {}
+interface Response {}
+interface ReadableStream<R = any> {}
 //
 // PARITY IS GATED. `cargo run -p xtask -- conformance` diffs the value names
 // declared here against the module objects the runtime actually publishes
@@ -34,14 +48,14 @@
 
 declare module "oam:mcp" {
   /** JSON Schema for a tool's arguments, passed through to the client verbatim. */
-  interface McpJsonSchema {
+  export interface McpJsonSchema {
     type?: string;
     properties?: Record<string, unknown>;
     required?: string[];
     [key: string]: unknown;
   }
 
-  interface McpContentBlock {
+  export interface McpContentBlock {
     type: string;
     text?: string;
     [key: string]: unknown;
@@ -50,13 +64,13 @@ declare module "oam:mcp" {
   /** What a tool handler may return. A string or a plain value is wrapped in
    *  a single text block by the server; an object that already carries
    *  `content` is passed through unchanged. */
-  interface McpToolResult {
+  export interface McpToolResult {
     content: McpContentBlock[];
     isError?: boolean;
     [key: string]: unknown;
   }
 
-  interface McpToolConfig<Args = Record<string, unknown>> {
+  export interface McpToolConfig<Args = Record<string, unknown>> {
     description?: string;
     /** `parameters` is the documented spelling; `inputSchema` is accepted as
      *  an alias. Neither is required -- an omitted schema is published as an
@@ -69,9 +83,9 @@ declare module "oam:mcp" {
   /** A resource handler's return value. `Uint8Array` and `ArrayBuffer` are
    *  base64-encoded into a blob; anything else that is not a string and does
    *  not already carry `contents` is JSON-stringified into a text block. */
-  type McpResourceResult = string | Uint8Array | ArrayBuffer | { contents: unknown[] } | unknown;
+  export type McpResourceResult = string | Uint8Array | ArrayBuffer | { contents: unknown[] } | unknown;
 
-  interface McpResourceConfig {
+  export interface McpResourceConfig {
     name?: string;
     description?: string;
     /** Defaults to "text/plain". */
@@ -79,7 +93,7 @@ declare module "oam:mcp" {
     handler: (uri: string) => McpResourceResult | Promise<McpResourceResult>;
   }
 
-  interface McpResourceTemplateConfig {
+  export interface McpResourceTemplateConfig {
     name?: string;
     description?: string;
     mimeType?: string;
@@ -90,19 +104,19 @@ declare module "oam:mcp" {
     ) => McpResourceResult | Promise<McpResourceResult>;
   }
 
-  interface McpPromptArgument {
+  export interface McpPromptArgument {
     name: string;
     description?: string;
     required?: boolean;
     [key: string]: unknown;
   }
 
-  interface McpPromptMessage {
+  export interface McpPromptMessage {
     role: string;
     content: McpContentBlock;
   }
 
-  interface McpPromptConfig<Args = Record<string, unknown>> {
+  export interface McpPromptConfig<Args = Record<string, unknown>> {
     description?: string;
     arguments?: McpPromptArgument[];
     handler: (
@@ -115,7 +129,7 @@ declare module "oam:mcp" {
       | Promise<string | McpPromptMessage[] | { messages: McpPromptMessage[] } | unknown>;
   }
 
-  interface McpServeOptions {
+  export interface McpServeOptions {
     /** Omitted: stdio when stdin is not a TTY, else http. */
     transport?: "stdio" | "http";
     /** http only. Defaults to $PORT, then 3000. */
@@ -128,7 +142,7 @@ declare module "oam:mcp" {
    *  node:http Server; it is `unknown` because oam ships no node:http
    *  declarations of its own and a reference to @types/node here would make
    *  every check fail on a project that does not install them. */
-  interface McpHttpServer {
+  export interface McpHttpServer {
     server: unknown;
     port: number;
     host: string;
@@ -167,7 +181,7 @@ declare module "oam:mcp" {
 // ------------------------------------------------------------- oam:test --
 
 declare module "oam:test" {
-  interface Matchers {
+  export interface Matchers {
     not: Matchers;
     /** Awaits the value under test, then applies the matcher to what it
      *  resolved with; rejects the assertion if the promise threw. */
@@ -207,7 +221,7 @@ declare module "oam:test" {
   }
 
   /** The same matcher set behind `.resolves` / `.rejects`, awaited. */
-  interface AsyncMatchers {
+  export interface AsyncMatchers {
     not: AsyncMatchers;
     toBe(expected: unknown): Promise<void>;
     toEqual(expected: unknown): Promise<void>;
@@ -237,13 +251,13 @@ declare module "oam:test" {
     toHaveBeenLastCalledWith(...args: unknown[]): Promise<void>;
   }
 
-  type TestBody = () => void | Promise<void>;
-  type HookBody = () => void | Promise<void>;
+  export type TestBody = () => void | Promise<void>;
+  export type HookBody = () => void | Promise<void>;
 
   /** A bare number is the timeout in ms (default 5000). */
-  type TestOptions = number | { timeout?: number };
+  export type TestOptions = number | { timeout?: number };
 
-  interface TestFn {
+  export interface TestFn {
     (name: string, fn: TestBody, options?: TestOptions): void;
     skip(name: string, fn: TestBody, options?: TestOptions): void;
     /** Restricts the run to `.only` tests and suites across the whole file. */
@@ -252,24 +266,24 @@ declare module "oam:test" {
     todo(name: string): void;
   }
 
-  interface DescribeFn {
+  export interface DescribeFn {
     (name: string, fn: () => void): void;
     skip(name: string, fn: () => void): void;
     only(name: string, fn: () => void): void;
   }
 
-  interface ExpectFn {
+  export interface ExpectFn {
     (actual: unknown): Matchers;
     /** Fails the current test outright. */
     fail(message?: string): never;
   }
 
-  interface MockResult {
+  export interface MockResult {
     type: "return" | "throw";
     value: unknown;
   }
 
-  interface MockFn<Args extends any[] = any[], Return = any> {
+  export interface MockFn<Args extends any[] = any[], Return = any> {
     (...args: Args): Return;
     mock: { calls: Args[]; results: MockResult[]; contexts: unknown[] };
     mockImplementation(fn: (...args: Args) => Return): MockFn<Args, Return>;
@@ -288,13 +302,13 @@ declare module "oam:test" {
     mockReset(): MockFn<Args, Return>;
   }
 
-  interface SpyFn<Args extends any[] = any[], Return = any> extends MockFn<Args, Return> {
+  export interface SpyFn<Args extends any[] = any[], Return = any> extends MockFn<Args, Return> {
     /** Puts the original property back. Also done for every spy after each
      *  test, so a leaked spy cannot reach the next one. */
     mockRestore(): void;
   }
 
-  interface FakeTimers {
+  export interface FakeTimers {
     /** Replaces the global timer functions and Date.now until `restore()`. */
     enable(options?: { now?: number }): void;
     /** Advances the clock by `ms`, firing due callbacks in due order --
@@ -310,7 +324,7 @@ declare module "oam:test" {
     restore(): void;
   }
 
-  interface Mock {
+  export interface Mock {
     fn<Args extends any[] = any[], Return = any>(
       impl?: (...args: Args) => Return,
     ): MockFn<Args, Return>;
@@ -368,7 +382,7 @@ declare module "oam:test" {
 // --------------------------------------------------------------- oam:ai --
 
 declare module "oam:ai" {
-  interface SSEEvent {
+  export interface SSEEvent {
     /** The `event:` field, or "message" when the frame carried none. */
     event: string;
     data: string;
@@ -380,7 +394,7 @@ declare module "oam:ai" {
    *  never reconnects). */
   function parseSSEStream(readableStream: ReadableStream<Uint8Array>): AsyncGenerator<SSEEvent>;
 
-  interface StreamChatOptions {
+  export interface StreamChatOptions {
     url: string;
     headers?: Record<string, string>;
     /** A string is sent as-is; anything else is JSON-stringified. */
@@ -396,12 +410,12 @@ declare module "oam:ai" {
    *  response and stops at the `[DONE]` sentinel. */
   function streamChat(options: StreamChatOptions): AsyncGenerator<string>;
 
-  interface ChatMessage {
+  export interface ChatMessage {
     role: string;
     content: unknown;
   }
 
-  interface ProviderChatOptions {
+  export interface ProviderChatOptions {
     model?: string;
     signal?: AbortSignal;
     [key: string]: unknown;
@@ -409,7 +423,7 @@ declare module "oam:ai" {
 
   /** A provider preset: `chat` streams deltas over that provider's URL and
    *  auth-header shape. */
-  interface Provider {
+  export interface Provider {
     chat(messages: ChatMessage[], options?: ProviderChatOptions): AsyncGenerator<string>;
   }
 
@@ -420,13 +434,13 @@ declare module "oam:ai" {
    *  `max_tokens` (4096) are passed through `options`. */
   function anthropic(apiKey: string, baseURL?: string): Provider;
 
-  interface ToolCall {
+  export interface ToolCall {
     id: string;
     name: string;
     input: unknown;
   }
 
-  interface RunToolLoopOptions {
+  export interface RunToolLoopOptions {
     /** Called as `chat(messages, options)` and AWAITED as a whole response
      *  (`stream: false` is forced), so the streaming `chat` returned by
      *  openai() / anthropic() is not a drop-in here -- pass a non-streaming
@@ -444,7 +458,7 @@ declare module "oam:ai" {
     chatOptions?: Record<string, unknown>;
   }
 
-  interface ToolLoopResult {
+  export interface ToolLoopResult {
     text: string;
     response: unknown;
     iterations: number;
@@ -483,7 +497,7 @@ declare module "oam:ai" {
 // ------------------------------------------------------ oam:permissions --
 
 declare module "oam:permissions" {
-  interface PermissionDescriptor {
+  export interface PermissionDescriptor {
     /** The runtime answers "read", "write", "net", "env", "child" and "ffi";
      *  every other name is reported denied rather than rejected. */
     name: string;
@@ -495,13 +509,13 @@ declare module "oam:permissions" {
 
   /** oam has no interactive prompt, so the state is decided by the flags the
    *  process started with: there is no "prompt" state to observe. */
-  interface PermissionStatus {
+  export interface PermissionStatus {
     state: "granted" | "denied";
     onchange: null;
     toString(): string;
   }
 
-  interface Permissions {
+  export interface Permissions {
     query(descriptor: PermissionDescriptor): Promise<PermissionStatus>;
     /** No dynamic prompting: this is `query` under the Deno-shaped name. */
     request(descriptor: PermissionDescriptor): Promise<PermissionStatus>;

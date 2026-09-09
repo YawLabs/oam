@@ -53,6 +53,33 @@ fn decls_dir() -> PathBuf {
     cache_root().join("ts-decls")
 }
 
+/// The declarations directory as a string, for recognizing a diagnostic that
+/// landed inside oam's own generated file. `None` when the cache dir cannot be
+/// resolved, which just means the hint is skipped.
+pub(crate) fn declarations_dir_for_hint() -> Option<String> {
+    Some(dts_dir().to_string_lossy().into_owned())
+}
+
+/// The declarations file's own directory.
+///
+/// Deliberately NOT the same directory as the per-project wrappers. tsgo lists
+/// the .d.ts as a program file outside the project root, so the daemon
+/// fingerprints its parent directory's entry listing -- and if the wrappers
+/// lived there too, checking one project for the first time would write a new
+/// `project-<key>.json`, change that listing, and evict every OTHER project's
+/// warm daemon cache. In a monorepo where each package has its own tsconfig,
+/// interleaved checks would keep evicting each other until every wrapper
+/// happened to exist. This directory changes only when oam itself changes.
+fn dts_dir() -> PathBuf {
+    decls_dir().join("dts")
+}
+
+/// Where the per-project wrapper configs go: a sibling of the .d.ts, so their
+/// churn never reaches the fingerprinted listing above.
+fn projects_dir() -> PathBuf {
+    decls_dir().join("projects")
+}
+
 /// Write `contents` to `path` if it is not already exactly that.
 ///
 /// Two checks of the same project can run concurrently (an editor and a
@@ -87,7 +114,7 @@ fn write_if_changed(path: &Path, contents: &str) -> Option<bool> {
 /// new entry and the cached diagnostics of the previous oam cannot survive
 /// an upgrade that changed what the declarations say.
 pub(crate) fn declarations_file() -> Option<PathBuf> {
-    let path = decls_dir().join(format!(
+    let path = dts_dir().join(format!(
         "oam-{:016x}.d.ts",
         fnv1a64(DECLARATIONS.as_bytes())
     ));
@@ -103,7 +130,24 @@ pub(crate) fn declarations_file() -> Option<PathBuf> {
 }
 
 fn prune_older_declarations(keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(decls_dir()) else {
+    // Sweep the pre-split layout too. Until the dts/ and projects/ split, both
+    // the .d.ts and the per-project wrappers sat directly in ts-decls/; an
+    // upgraded install still has those files, and nothing else would ever
+    // collect them -- the pruner below only walks dts/, so they would sit in
+    // the cache forever. Only oam's own two shapes are touched, never a
+    // stranger's file.
+    if let Ok(entries) = std::fs::read_dir(decls_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let ours = (name.starts_with("oam-") && name.ends_with(".d.ts"))
+                || (name.starts_with("project-") && name.ends_with(".json"));
+            if ours && entry.path().is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dts_dir()) else {
         return;
     };
     for entry in entries.flatten() {
@@ -265,7 +309,7 @@ fn wrapper_json(tsconfig: &Path, declarations: &Path, facts: &ChainFacts) -> Str
 pub(crate) fn project_config(tsconfig: &Path) -> Option<PathBuf> {
     let declarations = declarations_file()?;
     let facts = read_chain(tsconfig)?;
-    let path = decls_dir().join(format!("project-{}.json", project_key(tsconfig)));
+    let path = projects_dir().join(format!("project-{}.json", project_key(tsconfig)));
     let contents = wrapper_json(tsconfig, &declarations, &facts);
     write_if_changed(&path, &contents).map(|_| path)
 }
