@@ -1,0 +1,57 @@
+# Every URL oam's compiled sources can put in front of a user.
+#
+# The failure this file exists to stop: the binary printed
+# "For help, see: https://oamjs.org/docs/inspector" on every --inspect run
+# and that page did not exist, while ODIF's `docs` field pointed every
+# diagnostic at oam.sh/e/<code> -- a domain that is no longer the project's
+# and now redirects to somebody else's site. Both shipped for months because
+# nothing in the gate ever asked whether a printed URL resolves, and nothing
+# can: a gate that fetches URLs fails on a plane.
+#
+# So the gate asks the cheaper question instead -- is this URL one a human
+# consciously published? Adding a line here IS that assertion. Do not add
+# one until the page is live; xtask/tests/published_urls.rs enforces the
+# file, not the web.
+#
+# Scope: crates/*/src, js/ (excluding js/vendor), xtask/src -- what compiles
+# into the binary and its V8 snapshot. install/install.sh and install.ps1
+# build their URLs out of shell variables, so a textual scan cannot say what
+# they resolve to; scripts/release-local.sh fetches those live on every
+# release instead.
+#
+# Two sections, because the two kinds of URL earn different scrutiny:
+#
+#   [urls]  Full URLs on a project host. Each must be published, and each
+#           needs a note saying what prints it. Fragments are stripped
+#           before matching -- a fragment never changes what the server
+#           returns, so "#OAM-RT0001" and "#OAM-TS" are both this one page.
+#
+#   [hosts] Hosts that appear for some reason other than pointing a reader
+#           at documentation: API endpoint defaults, registry URLs in
+#           lockfile fixtures, parser scaffolds, and the reserved example
+#           names. Host-level, because adding one more example.com literal
+#           to a URL-parsing test is not a decision worth a review cycle.
+#
+# Both are checked in both directions: an entry that no longer occurs in the
+# sources fails too, so this file cannot rot into a list of URLs the code
+# stopped printing years ago.
+#
+# oam.sh and 0am.sh are rejected outright and CANNOT be listed here.
+
+[urls]
+https://oamjs.org/install.sh      # `oam self-update` on Linux and macOS: the command it runs, echoed before it runs
+https://oamjs.org/install.ps1     # `oam self-update` on Windows: the command it runs, echoed before it runs
+https://oamjs.org/docs/inspector  # stderr on every --inspect / --inspect-brk run, the line after "Debugger listening on"
+https://oamjs.org/docs/errors     # the ODIF `docs` field on every diagnostic, anchored at the code
+https://oamjs.org/docs/odif       # the ODIF envelope spec, cited by the oam_diagnostics module docs
+
+[hosts]
+api.anthropic.com    # js/ai.js: default baseURL for the Anthropic provider
+api.openai.com       # js/ai.js: default baseURL for the OpenAI provider
+example.com          # reserved example name (RFC 2606), in fixtures and unit tests
+example.invalid      # reserved example name (RFC 2606), in the install fixtures
+example.org          # reserved example name (RFC 2606), in the bench URL corpus
+localhost            # the bench URL corpus
+registry.npmjs.org   # the `resolved` field of lockfile fixtures; never fetched
+x                    # oam_engine node_ops: a throwaway base for ada_url::Url::parse, never fetched
+127.0.0.1            # loopback, in the bench and MCP fixtures

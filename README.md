@@ -114,6 +114,11 @@ sidecar, inspector) lands per the roadmap; crates are created when their workstr
 - [RELIABILITY.md](RELIABILITY.md) — the scorecard: what we measure, publish, and gate on.
 
 Domain: https://oamjs.org — the installer and update channel serve from there exclusively.
+It also carries the pages the binary itself links to: [debugging with the
+inspector](https://oamjs.org/docs/inspector), the [diagnostic code
+reference](https://oamjs.org/docs/errors) that every `--json` diagnostic points
+at, and the [ODIF envelope](https://oamjs.org/docs/odif). Everything else lives
+here, beside the code it describes.
 
 Distribution: the install script is canonical. An npm package is planned under
 **@yawlabs/oam** — that name is not published yet, so install via the script above (bare

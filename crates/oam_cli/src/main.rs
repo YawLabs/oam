@@ -51,12 +51,18 @@ enum Command {
         #[arg(long)]
         no_check: bool,
         /// Attach the V8 Inspector (Chrome DevTools Protocol). Optional
-        /// value is `[host:]port` (default 127.0.0.1:9229).
-        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        /// value is `[host:]port` (default 127.0.0.1:9229), given with `=`.
+        ///
+        /// require_equals matches node (`node --inspect=9229`) and is load
+        /// bearing: without it clap greedily takes the next argument as the
+        /// value, so `oam run --inspect app.ts` consumed the FILE and failed
+        /// with "the following required arguments were not provided: <FILE>".
+        /// That is the first line of the published docs page.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect: Option<String>,
         /// Like --inspect, but wait for a debugger to attach and break on the
         /// first line. Optional value is `[host:]port`.
-        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect_brk: Option<String>,
         /// Record all non-deterministic I/O to FILE (JSON Lines). Mutually
         /// exclusive with --replay.
@@ -117,11 +123,11 @@ enum Command {
         workers: u16,
         /// Attach the V8 Inspector (Chrome DevTools Protocol). Optional
         /// value is `[host:]port` (default 127.0.0.1:9229).
-        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect: Option<String>,
         /// Like --inspect, but wait for a debugger to attach and break on the
         /// first line. Optional value is `[host:]port`.
-        #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "127.0.0.1:9229", value_name = "[host:]port")]
         inspect_brk: Option<String>,
     },
     /// Install packages from the lockfile (npm ci equivalent).
@@ -136,9 +142,12 @@ enum Command {
     },
     /// Manage the trust list for lifecycle scripts.
     ///
-    /// oam install skips all lifecycle scripts (postinstall, preinstall, install)
-    /// by default. Trust a package to see its skipped scripts; script execution
-    /// is not yet supported, but trusted packages suppress the OAM-PKG0007 warning.
+    /// oam install skips all lifecycle scripts (preinstall, install, postinstall)
+    /// by default. Trusting a package makes `oam install` RUN that package's
+    /// scripts, through the platform shell, with your privileges -- it is not a
+    /// way to quiet the OAM-PKG0007 warning. Trust a package only if you would
+    /// run its install script by hand. OAM_IGNORE_SCRIPTS=1 skips every script
+    /// regardless of the trust list.
     Trust {
         #[command(subcommand)]
         action: TrustAction,
@@ -210,7 +219,10 @@ enum DaemonAction {
 
 #[derive(Subcommand)]
 enum TrustAction {
-    /// Allow a package to suppress the OAM-PKG0007 lifecycle-script warning.
+    /// Allow a package's lifecycle scripts to RUN during `oam install`.
+    ///
+    /// This executes arbitrary code from the package through the platform shell
+    /// at install time. It is not a warning-suppression switch.
     Add {
         /// npm package name (e.g. "esbuild" or "@scope/pkg").
         package: String,
