@@ -263,7 +263,22 @@ fn current_cgroup_limit_bytes() -> Option<u64> {
 /// container limit", and a malformed file is exactly that from our side.
 #[cfg(target_os = "linux")]
 fn read_cgroup_limit_bytes(path: &str) -> Option<u64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    parse_cgroup_limit(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The CONTENTS of a cgroup limit file -> bytes.
+///
+/// Split from the read, and deliberately not `cfg(linux)`, so the parsing is
+/// compiled and tested on every host. Gated, it existed only on the platform
+/// oam is DEPLOYED to and on no platform where the tests actually run -- the
+/// one function here with real input variety, and the one nothing could reach.
+///
+/// The allow is scoped to exactly the platforms where the non-test caller does
+/// not exist. It is reachable everywhere -- the tests below call it on every
+/// host, which is the entire point of the split -- but off Linux nothing in the
+/// shipping binary does, and `-D warnings` is right to say so.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cgroup_limit(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     // v2 spells "no limit" as the literal `max`; v1 spells it as a sentinel so
     // large it exceeds any real machine (commonly 2^63-1 rounded to a page).
@@ -1022,6 +1037,63 @@ mod tests {
             }
             HeapCapSource::User => panic!("env var is unset; source cannot be User"),
         }
+    }
+
+    #[test]
+    fn cgroup_limit_file_contents_parse_the_way_the_kernel_writes_them() {
+        // A real v2 file is a decimal followed by a newline.
+        assert_eq!(
+            parse_cgroup_limit(
+                "536870912
+"
+            ),
+            Some(536_870_912)
+        );
+        assert_eq!(parse_cgroup_limit("  536870912  "), Some(536_870_912));
+        // v2's "no limit" is a word, not a number, and must not parse as one.
+        assert_eq!(
+            parse_cgroup_limit(
+                "max
+"
+            ),
+            None
+        );
+        // v1 has no such word: it writes a sentinel bigger than any real
+        // machine. Treating that as a limit would cap the heap at petabytes and
+        // claim a container said so.
+        assert_eq!(parse_cgroup_limit("9223372036854771712"), None);
+        assert_eq!(parse_cgroup_limit(&u64::MAX.to_string()), None);
+        // Zero is not a limit anyone can honour, and it is what an empty or
+        // partially-written file reads as.
+        assert_eq!(parse_cgroup_limit("0"), None);
+        // Anything unparseable is "no limit", never a panic: this runs during
+        // isolate creation, where a malformed file must not take the process
+        // down.
+        assert_eq!(parse_cgroup_limit(""), None);
+        assert_eq!(parse_cgroup_limit("   "), None);
+        assert_eq!(parse_cgroup_limit("not-a-number"), None);
+        assert_eq!(parse_cgroup_limit("-1"), None);
+        assert_eq!(parse_cgroup_limit("12.5"), None);
+        assert_eq!(parse_cgroup_limit("1e9"), None);
+    }
+
+    #[test]
+    fn a_parsed_container_limit_reaches_the_heap_policy() {
+        // The two halves joined: the bytes a 512Mi file holds, through the
+        // policy, land on the cap the OOM banner would report.
+        assert_eq!(
+            parse_cgroup_limit(
+                "536870912
+"
+            )
+            .and_then(heap_mb_from_limit_bytes),
+            Some(384),
+        );
+        // ...and "no limit" declines all the way through rather than becoming 0.
+        assert_eq!(
+            parse_cgroup_limit("max").and_then(heap_mb_from_limit_bytes),
+            None
+        );
     }
 
     #[test]

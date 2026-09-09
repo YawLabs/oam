@@ -117,7 +117,8 @@ for (const target of Object.values(SUPPORTED)) {
   // no execute bit and the suffix is what makes them runnable -- which is why
   // this gate is per-target and not a blanket "do not stage on Windows".
   chmodSync(dest, 0o755);
-  if (process.platform === 'win32' && !target.bin.endsWith('.exe')) {
+  if (process.platform === 'win32' && !target.bin.endsWith('.exe')
+      && process.env.OAM_NPM_ALLOW_UNEXECUTABLE !== '1') {
     die(`cannot stage ${target.pkg} from Windows: chmod cannot set the execute bit here, `
       + `so the packed binary would be mode 0644 and every user of that platform would get a `
       + `permission denied. Stage and publish the POSIX packages from the mac or linux release `
