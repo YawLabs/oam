@@ -684,11 +684,21 @@ fi
 step "Bump the Homebrew formula + Scoop manifest"
 if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
   ok "DRY RUN -- taps not bumped"
-elif OAM_TAPS_OPTIONAL=1 "$SCRIPT_DIR/bump-taps.sh" "$TAG"; then
-  ok "package-manager taps are current for $TAG"
 else
-  warn "tap bump FAILED -- brew/scoop still serve the previous release."
-  warn "repair with: ./scripts/bump-taps.sh $TAG"
+  # Exit 3 is bump-taps.sh's "skipped, nothing done" (no tap checkout on this
+  # box). It exits 0 under OAM_TAPS_OPTIONAL so it cannot abort a release, but
+  # printing "taps are current" for it contradicted the `taps NOT bumped`
+  # warning two lines above in the same log -- and the green line is the one an
+  # operator skimming a long release keeps.
+  taps_rc=0
+  OAM_TAPS_OPTIONAL=1 "$SCRIPT_DIR/bump-taps.sh" "$TAG" || taps_rc=$?
+  case "$taps_rc" in
+    0) ok "package-manager taps are current for $TAG" ;;
+    3) warn "taps SKIPPED -- brew/scoop still serve the PREVIOUS release."
+       warn "run ./scripts/bump-taps.sh $TAG on a box with the tap checkouts" ;;
+    *) warn "tap bump FAILED -- brew/scoop still serve the previous release."
+       warn "repair with: ./scripts/bump-taps.sh $TAG" ;;
+  esac
 fi
 
 # The gate regenerated these at this version and commit; restore_gate_artifacts

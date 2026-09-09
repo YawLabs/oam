@@ -27,7 +27,7 @@ nobody has to reverse-engineer:
   gate because a percentage over a corpus we choose is a number we can move by choosing
   differently; the bar is MCP-server hosting plus TypeScript support. The suite stays as an
   internal regression harness with a ratchet that may only go up: it currently sits at
-  **439/442 runnable (99.3%)** and both remaining failures are deliberate. See
+  **439/442 runnable (99.3%)** and all three remaining failures are deliberate. See
   CONFORMANCE-NODE.md and docs/node-divergences.md, which qualify the denominator.
 
 ### MCP: two roles, both ours

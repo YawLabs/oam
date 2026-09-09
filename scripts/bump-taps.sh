@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
 # Bump the Homebrew formula and Scoop manifest to a published oam release.
 # =============================================================================
@@ -84,7 +84,13 @@ find_tap() {
   local name="$1" override="$2" c
   if [ -n "$override" ]; then
     [ -d "$override/.git" ] || fail "$name override '$override' is not a git checkout"
-    printf '%s' "$override"; return 0
+    # Absolutized, because a RELATIVE override silently broke the stale-version
+    # guard's revert: its pathspec is resolved relative to the directory `git -C`
+    # switched into, so `./homebrew-yaw` became `<dir>/<dir>/...`, checkout
+    # errored, and the error was swallowed while the message claimed the file
+    # had been reverted. The house script (mcp_servers/*/scripts/
+    # update-manifests.mjs) resolves these the same way.
+    (cd "$override" && pwd); return 0
   fi
   for c in "$REPO_DIR/../$name" "$REPO_DIR/../../$name" "$REPO_DIR/../../yaw_terminal/$name" "$HOME/yaw/$name" "$HOME/yaw/yaw_terminal/$name"; do
     if [ -d "$c/.git" ]; then (cd "$c" && pwd); return 0; fi
@@ -97,7 +103,9 @@ SCOOP_DIR="$(find_tap scoop-yaw "${OAM_SCOOP_DIR:-${YAW_SCOOP_DIR:-}}")" || SCOO
 
 if [ -z "$HOMEBREW_DIR" ] || [ -z "$SCOOP_DIR" ]; then
   msg="tap checkout missing (homebrew-yaw='${HOMEBREW_DIR:-NOT FOUND}' scoop-yaw='${SCOOP_DIR:-NOT FOUND}') -- clone them beside yaw_terminal, or set OAM_HOMEBREW_DIR / OAM_SCOOP_DIR"
-  if [ "${OAM_TAPS_OPTIONAL:-0}" = "1" ]; then warn "$msg"; warn "taps NOT bumped -- brew/scoop users stay on the previous release"; exit 0; fi
+  # Exit 3, not 0: the caller must be able to tell "skipped" from "done", or it
+  # prints a success line directly under this warning.
+  if [ "${OAM_TAPS_OPTIONAL:-0}" = "1" ]; then warn "$msg"; warn "taps NOT bumped -- brew/scoop users stay on the previous release"; exit 3; fi
   fail "$msg"
 fi
 
@@ -108,6 +116,25 @@ trap 'rm -rf "$SUMS_DIR"' EXIT
 gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS --dir "$SUMS_DIR" \
   || fail "no published SHA256SUMS for $TAG -- cut the release before bumping taps"
 SUMS="$SUMS_DIR/SHA256SUMS"
+
+# A tag older than the newest published release would rewrite BOTH public taps
+# downward, push, and report success -- the verify step confirms it, because it
+# only greps for the version it was told. That is a silent downgrade for every
+# brew and scoop user, and the standalone repair path in the header (paste a tag
+# from an older release log) is exactly how someone gets there by accident.
+LATEST="$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)"
+if [ -n "$LATEST" ] && [ "$LATEST" != "$TAG" ]; then
+  newest="$(printf '%s
+%s
+' "${LATEST#v}" "${VERSION}" | sort -V | tail -1)"
+  if [ "$newest" != "$VERSION" ]; then
+    if [ "${OAM_ALLOW_DOWNGRADE:-0}" = "1" ]; then
+      warn "$TAG is OLDER than the latest release $LATEST -- proceeding because OAM_ALLOW_DOWNGRADE=1"
+    else
+      fail "$TAG is older than the latest published release ($LATEST). Bumping the taps to it would DOWNGRADE every brew and scoop user, and the verify step would report success. Re-run with OAM_ALLOW_DOWNGRADE=1 if that is genuinely what you want."
+    fi
+  fi
+fi
 
 # hash_for <asset>: the sha256 for one asset name, or empty. sha256sum's
 # binary-mode "*" prefix is stripped so the field matches the plain name.
@@ -121,22 +148,58 @@ hash_for() {
 BREW_ASSETS=(oam-aarch64-apple-darwin oam-x86_64-apple-darwin oam-x86_64-unknown-linux-gnu)
 SCOOP_ASSETS=(oam-x86_64-pc-windows-msvc.exe oam-aarch64-pc-windows-msvc.exe)
 
-declare -A HASH
+# Deliberately NOT an associative array: `declare -A` is bash 4, and macOS
+# ships bash 3.2.57. The tailnet Mac is a release host and the header advertises
+# this script as the standalone repair path, so a bash-4 feature would make that
+# path exist only on this Windows box. Two parallel indexed arrays work
+# everywhere, and `hash_of` is the lookup.
+HASH_KEYS=()
+HASH_VALS=()
+hash_of() {
+  local want="$1" i=0
+  while [ "$i" -lt "${#HASH_KEYS[@]}" ]; do
+    if [ "${HASH_KEYS[$i]}" = "$want" ]; then printf '%s' "${HASH_VALS[$i]}"; return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
 for a in "${BREW_ASSETS[@]}" "${SCOOP_ASSETS[@]}"; do
   h="$(hash_for "$a")"
   [ -n "$h" ] || fail "SHA256SUMS for $TAG has no entry for $a -- refusing to publish a manifest with a missing hash"
-  [[ "$h" =~ ^[0-9a-f]{64}$ ]] || fail "hash for $a is not 64 hex chars (got '$h')"
-  HASH["$a"]="$h"
-  ok "$a  ${h:0:12}..."
+  case "$h" in
+    *[!0-9a-f]* | "") fail "hash for $a is not 64 lowercase hex chars (got '$h')" ;;
+  esac
+  [ "${#h}" -eq 64 ] || fail "hash for $a is not 64 hex chars (got '$h')"
+  HASH_KEYS+=("$a")
+  HASH_VALS+=("$h")
+  ok "$a  $(printf '%.12s' "$h")..."
 done
 
 # --- helper: pull, rewrite, commit, push -----------------------------------
 # Shared by both taps. The rewrite is done by the caller (different formats);
 # this owns the git half so the two paths cannot drift.
 publish_tap() {
-  local dir="$1" file="$2" label="$3"
-  if git -C "$dir" diff --quiet -- "$file"; then
+  local dir="$1" file="$2" label="$3" branch unpushed
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD)" || return 1
+  unpushed="$(git -C "$dir" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo 0)"
+  # "Already current" means current AT ORIGIN, not merely in the worktree. A
+  # previous run whose push failed leaves the commit local and the file clean,
+  # so a worktree-only check reported success and early-returned PAST the push:
+  # the documented repair re-run exited 0 while brew kept serving the old
+  # release. That is the exact drift this script exists to end, with a green
+  # checkmark on top. Ahead of origin now falls through to the push.
+  if [ "$unpushed" = "0" ] && git -C "$dir" diff --quiet -- "$file"; then
     ok "$label already at $VERSION with matching hashes"
+    return 0
+  fi
+  # Clean tree + unpushed commits = an earlier run committed and then failed to
+  # push. There is nothing to commit, so go straight to the push; falling
+  # through to `git commit` here fails with "nothing to commit" and turns a
+  # recoverable state into a hard error on the documented repair path.
+  if [ "$unpushed" != "0" ] && git -C "$dir" diff --quiet -- "$file"; then
+    warn "$label: $unpushed commit(s) never reached origin (an earlier push failed) -- pushing now"
+    git -C "$dir" push -q origin HEAD       || fail "$label push failed -- finish by hand: git -C $dir push origin HEAD"
+    ok "$label pushed (already committed by an earlier run)"
     return 0
   fi
   git -C "$dir" --no-pager diff --stat -- "$file" >&2
@@ -144,8 +207,15 @@ publish_tap() {
     warn "DRY RUN -- $label rewritten but not committed; run 'git -C $dir checkout -- $file' to discard"
     return 0
   fi
-  git -C "$dir" add "$file"
-  git -C "$dir" commit -q -m "oam: bump to $TAG" \
+  # Pathspec form, and NO `git add`: a bare `git commit` commits the whole
+  # INDEX, and these checkouts are SHARED -- homebrew-yaw also carries
+  # Casks/yaw.rb for Yaw Terminal. Another session with an unrelated file
+  # staged mid-edit would have had it swept into oam's commit and pushed to
+  # the live tap, invisibly: the diffstat printed above is scoped to our
+  # file, so it would not have shown the passenger. Committing the path
+  # directly ignores the rest of the index, which is what this script's own
+  # header promises and what the old shape quietly broke.
+  git -C "$dir" commit -q -m "oam: bump to $TAG" -- "$file" \
     || fail "could not commit $label"
   # Idempotent: the commit is already local, so re-pushing the same ref is a
   # no-op. A blip here leaves this tap on the previous release while everything
@@ -174,13 +244,27 @@ sync_tap() {
     fail "$file already has uncommitted changes in $dir -- refusing to overwrite work in progress"
   fi
 
-  behind="$(git -C "$dir" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo 0)"
+  # An absent origin/<branch> must NOT read as "not behind". A shared checkout
+  # parked on a local-only branch sailed through, and `push origin HEAD` then
+  # CREATED that branch on the tap instead of updating the one people install
+  # from -- exit 0, "bumped and pushed", origin/main still on the old release.
+  # The verify step hardcodes main, which is the tell that this whole script
+  # assumes it.
+  if ! git -C "$dir" rev-parse --verify --quiet "origin/$branch" >/dev/null; then
+    fail "$label checkout is on '$branch', which has no origin/$branch -- pushing would create a new branch on the tap instead of updating the one users install from. Switch it to the tap's default branch, then re-run."
+  fi
+  behind="$(git -C "$dir" rev-list --count "HEAD..origin/$branch")"
   if [ "$behind" = "0" ]; then return 0; fi
 
   # Behind origin, so a push would be rejected and a rebase is required -- which
   # git refuses with a dirty tree, and which we refuse to force by stashing
   # another session's changes.
-  dirty="$(git -C "$dir" status --porcelain | awk '{print $NF}' | tr '\n' ' ')"
+  # --untracked-files=no: `git rebase` does not care about untracked files, so
+  # a stray .bak or editor scratch file must not abort a release's tap bump.
+  # The advice this printed was wrong for that case too -- `git stash` without
+  # -u leaves untracked files exactly where they were, so an operator who
+  # followed the instruction hit the identical failure on the re-run.
+  dirty="$(git -C "$dir" status --porcelain --untracked-files=no | awk '{print $NF}' | tr '\n' ' ')"
   if [ -n "$dirty" ]; then
     fail "$label is $behind commit(s) behind origin/$branch AND has uncommitted changes ($dirty). Not stashing another session's work -- commit or stash them yourself, then re-run."
   fi
@@ -228,9 +312,9 @@ node -e '
   fs.writeFileSync(path, lines.join("\n"));
 ' "$HOMEBREW_DIR/$BREW_FILE" "$VERSION" "$TAG" \
   "$(printf '{"%s":"%s","%s":"%s","%s":"%s"}' \
-      "${BREW_ASSETS[0]}" "${HASH[${BREW_ASSETS[0]}]}" \
-      "${BREW_ASSETS[1]}" "${HASH[${BREW_ASSETS[1]}]}" \
-      "${BREW_ASSETS[2]}" "${HASH[${BREW_ASSETS[2]}]}")" \
+      "${BREW_ASSETS[0]}" "$(hash_of "${BREW_ASSETS[0]}")" \
+      "${BREW_ASSETS[1]}" "$(hash_of "${BREW_ASSETS[1]}")" \
+      "${BREW_ASSETS[2]}" "$(hash_of "${BREW_ASSETS[2]}")")" \
   || fail "could not rewrite $BREW_FILE"
 
 # --- Scoop manifest ---------------------------------------------------------
@@ -252,7 +336,7 @@ node -e '
   set("arm64", "oam-aarch64-pc-windows-msvc.exe", arm64);
   fs.writeFileSync(path, JSON.stringify(m, null, 2) + "\n");
 ' "$SCOOP_DIR/$SCOOP_FILE" "$VERSION" "$TAG" \
-  "${HASH[oam-x86_64-pc-windows-msvc.exe]}" "${HASH[oam-aarch64-pc-windows-msvc.exe]}" \
+  "$(hash_of oam-x86_64-pc-windows-msvc.exe)" "$(hash_of oam-aarch64-pc-windows-msvc.exe)" \
   || fail "could not rewrite $SCOOP_FILE"
 
 # --- fail closed on a stale version string ----------------------------------
@@ -260,10 +344,18 @@ node -e '
 # release means a shape this script did not understand -- e.g. a URL the regex
 # missed. Catching it here is the difference between "no bump" and "a manifest
 # that mixes two releases".
-for pair in "$HOMEBREW_DIR/$BREW_FILE" "$SCOOP_DIR/$SCOOP_FILE"; do
-  if grep -oE 'releases/download/v[0-9][^/"]*' "$pair" | grep -qv "releases/download/$TAG"; then
-    git -C "$(dirname "$(dirname "$pair")")" checkout -- "$pair" 2>/dev/null || true
-    fail "$(basename "$pair") still references a release other than $TAG after rewrite -- reverted, nothing pushed"
+# Both files are rewritten before either is published, so an abort here must
+# undo BOTH -- reverting only the file that tripped left the other rewritten and
+# uncommitted in a SHARED checkout, and sync_tap then refused the documented
+# repair run, blaming the operator for this script's own leftover.
+revert_all_rewrites() {
+  git -C "$HOMEBREW_DIR" checkout -- "$BREW_FILE" || warn "could not revert $BREW_FILE in $HOMEBREW_DIR -- check it by hand"
+  git -C "$SCOOP_DIR" checkout -- "$SCOOP_FILE" || warn "could not revert $SCOOP_FILE in $SCOOP_DIR -- check it by hand"
+}
+for spec in "$HOMEBREW_DIR/$BREW_FILE" "$SCOOP_DIR/$SCOOP_FILE"; do
+  if grep -oE 'releases/download/v[0-9][^/"]*' "$spec" | grep -qv "releases/download/$TAG"; then
+    revert_all_rewrites
+    fail "$(basename "$spec") still references a release other than $TAG after rewrite -- BOTH files reverted, nothing pushed"
   fi
 done
 
@@ -284,6 +376,22 @@ for spec in "homebrew-yaw/main/Formula/oam.rb" "scoop-yaw/main/bucket/oam.json";
   elif printf '%s' "$live" | grep -q "\"$VERSION\""; then
     ok "$spec serves $VERSION"
   else
-    warn "$spec does not serve $VERSION yet (raw.githubusercontent caches for ~5 min)"
+    # CDN lag is ONE cause and was previously reported as the only one, which
+    # sent operators off to wait out a cache that would never change while the
+    # real reason -- an unpushed commit, or a push that landed on a non-default
+    # branch -- sat one free git command away. Check the local facts first.
+    case "$spec" in
+      homebrew-yaw/*) vdir="$HOMEBREW_DIR" ;;
+      *)              vdir="$SCOOP_DIR" ;;
+    esac
+    vbranch="$(git -C "$vdir" symbolic-ref --quiet --short HEAD || echo '?')"
+    vahead="$(git -C "$vdir" rev-list --count "origin/$vbranch..HEAD" 2>/dev/null || echo '?')"
+    if [ "$vahead" != "0" ] && [ "$vahead" != "?" ]; then
+      warn "$spec does not serve $VERSION: $vahead commit(s) in $vdir never reached origin/$vbranch. Push them: git -C $vdir push origin $vbranch"
+    elif [ "$vbranch" != "main" ]; then
+      warn "$spec does not serve $VERSION: $vdir is on '$vbranch', not main -- the push went to the wrong branch."
+    else
+      warn "$spec does not serve $VERSION yet; local state looks correct, so this is most likely raw.githubusercontent's cache (~5 min)."
+    fi
   fi
 done
