@@ -343,6 +343,14 @@ function installAll(pkgs, install = npmInstall) {
  *    fail     -- oam is at fault; this is the one state that reddens a release
  *    upstream -- the sidecar is broken on node too, so oam is not the suspect */
 function classifyCall(oam, node, deterministic) {
+  // No usable control. oam's failure stands on its own rather than being
+  // excused by an arm that never reached the tool.
+  if (!oam.ok && node.probeFailed) {
+    return {
+      state: "fail",
+      why: `${oam.why}; the node control could not run (${node.why}), so nothing exonerates oam`,
+    };
+  }
   if (!oam.ok && !node.ok) {
     // The two arms often word a failure differently even when the cause is the
     // same -- an errno spelling, a path that is per-host by construction. That
@@ -611,6 +619,33 @@ function selfTest() {
       },
     },
     {
+      name: "a control that could not RUN never exonerates oam",
+      run() {
+        const v = classifyCall(
+          { ok: false, why: "tool call threw" },
+          { ok: false, probeFailed: true, why: "node control could not probe: exited early (code 1)" },
+          false,
+        );
+        assertDeep(
+          v.state,
+          "fail",
+          "an arm that never reached the tool is no evidence -- folding it in with "
+            + "'the control ran it and it failed' let a real oam regression read as upstream",
+        );
+      },
+    },
+    {
+      name: "a control that RAN and failed the same way is still upstream",
+      run() {
+        const v = classifyCall(
+          { ok: false, why: "tool call threw" },
+          { ok: false, why: "tool call threw" },
+          false,
+        );
+        assertDeep(v.state, "upstream", "both arms reached the tool and both failed");
+      },
+    },
+    {
       name: "a failing node control does not redden a release oam passed",
       run() {
         const v = classifyCall(
@@ -770,6 +805,17 @@ function probe(host, entry, { env = {}, scriptArgs = [], call = null, loopbackUr
         } catch {
           continue; // sidecars sometimes log non-JSON to stdout
         }
+        if (msg.id === 1 && msg.error) {
+          // An ERROR reply to initialize used to match nothing here and be
+          // discarded, so the probe sat out the full boot timeout and then
+          // reported the wrong phase ("no tools/list response within 90s") --
+          // throwing away the one sentence that said what actually happened.
+          // The likeliest cause is the hardcoded protocolVersion below being
+          // refused, which is a 90-second stall and a misleading red for a
+          // sidecar that is working fine.
+          done({ ok: false, why: `initialize error: ${msg.error.message}`, stderr });
+          return;
+        }
         if (msg.id === 1 && msg.result) {
           send({ jsonrpc: "2.0", method: "notifications/initialized" });
           send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
@@ -923,8 +969,26 @@ for (const s of selected) {
   };
 
   if (!oam.ok) {
-    emit("FAIL", oam.why, [diagnosis(oam.stderr)]);
-    results.push({ name: s.name, state: "fail", why: oam.why });
+    // Ask the control here too. A sidecar that fails at boot, initialize or
+    // tools/list is the MOST common upstream break -- a bad publish, a missing
+    // peer dep, an engines bump -- and blaming oam for it means a release is
+    // blocked by somebody else's broken package, with the log saying oam did
+    // it. Only the tools/call arm used to be adjudicated, so exactly the shape
+    // most likely to be upstream was the one never checked.
+    process.stderr.write(`  ${s.name.padEnd(12)} control (boot)...`);
+    const bootControl = await probe("node", entry, { ...shared, call });
+    if (!bootControl.ok) {
+      const same = bootControl.why === oam.why;
+      const why = same
+        ? `${oam.why}; node fails identically -- broken sidecar, not oam`
+        : `${oam.why}; node also fails, differently (${bootControl.why}) -- broken sidecar, not oam`;
+      emit("UPSTREAM", why, [diagnosis(oam.stderr)]);
+      results.push({ name: s.name, state: "upstream", why });
+      continue;
+    }
+    const why = `${oam.why}; the node control booted fine, so this is oam`;
+    emit("FAIL", why, [diagnosis(oam.stderr)]);
+    results.push({ name: s.name, state: "fail", why });
     continue;
   }
   if (!call) {
@@ -946,9 +1010,15 @@ for (const s of selected) {
   // is how "oam broke it" gets asserted first and checked second.
   process.stderr.write(`\r  ${s.name.padEnd(12)} control...`);
   const control = await probe("node", entry, { ...shared, call });
+  // probeFailed keeps two very different facts apart. "The control ran the tool
+  // and it failed" is evidence the sidecar is broken; "the control never got far
+  // enough to invoke anything" is no evidence at all, and folding them together
+  // let a REAL oam regression be excused as upstream whenever the control host
+  // could not boot the sidecar (an engines bump past the release box's node,
+  // say). A missing control must never exonerate oam.
   const nodeVerdict = control.ok
     ? (control.call ?? { ok: false, why: "node control returned no verdict" })
-    : { ok: false, why: `node control could not probe: ${control.why}` };
+    : { ok: false, probeFailed: true, why: `node control could not probe: ${control.why}` };
 
   const verdict = classifyCall(oam.call, nodeVerdict, call.deterministic === true);
   const banner = { verified: "PASS", fail: "FAIL", upstream: "UPSTREAM" }[verdict.state];
@@ -984,7 +1054,14 @@ if (fail.length) parts.push(`${fail.length} FAILED on oam`);
 if (skip.length) parts.push(`${skip.length} could not install`);
 console.error(`\n${results.length} sidecars on oam: ${parts.join(", ")}`);
 if (count("boot") > 0) {
-  console.error(`  boot only (no credential-free, side-effect-free tool): ${named("boot")}`);
+  // Print each row's OWN reason rather than one hardcoded parenthetical. A
+  // sidecar demoted at runtime -- fetch, when the loopback bind its probe needs
+  // is refused -- is not "a sidecar with no credential-free tool"; it has
+  // fifteen, and the summary said otherwise while the gate's strongest
+  // assertion had silently stopped running.
+  for (const r of results.filter((x) => x.state === "boot")) {
+    console.error(`  boot only: ${r.name} -- ${r.why}`);
+  }
 }
 
 // Neither a skip nor an upstream break is a pass: both mean the matrix could
