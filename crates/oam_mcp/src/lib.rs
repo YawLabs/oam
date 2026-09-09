@@ -403,7 +403,15 @@ fn explain_code(code: &str) -> String {
     if let Some((_, explanation)) = known.iter().find(|(k, _)| *k == code) {
         return format!("{code}: {explanation}");
     }
+    // Zero-padded OAM-TS codes are oam's OWN (OAM-TS0004 is "tsgo exited
+    // abnormally", OAM-TS0005 the concurrent-check warning), not tsgo
+    // pass-throughs. Without this guard the fallback below answered them as
+    // TypeScript diagnostics and told the reader to search the TypeScript docs
+    // for "TS0005", which does not exist -- confidently wrong, in a tool the
+    // new errors page now points readers at. A miss on one of those falls
+    // through to the family text, which at least says it does not know.
     if let Some(ts) = code.strip_prefix("OAM-TS")
+        && !ts.starts_with('0')
         && ts.parse::<u32>().is_ok()
     {
         return format!(

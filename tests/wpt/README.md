@@ -7,7 +7,7 @@ Two suites gate oam's compatibility claims (RELIABILITY.md):
    web-platform-tests subset into `checkout/` (gitignored) and run it against `oam run`.
    Pass rates are ratchet-only in CI: a PR may not reduce them.
 2. **Node's own test suite** (`tests/node-suite/`, arrives with M2's node: wave 1) —
-   per-module pass rates feed the public dashboard at oam.sh/compat (Deno's
+   per-module pass rates are published in CONFORMANCE.md (Deno's
    node-test-viewer model: publish the honest rising curve, even at 20%).
 
 Status: harness skeleton. First wired subset (console, URL, TextEncoder/Decoder, timers)

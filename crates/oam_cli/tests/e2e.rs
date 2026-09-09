@@ -5872,11 +5872,38 @@ fn check_daemon_lifecycle_and_cache() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let status = oam_d(&["daemon", "status", proj.to_str().unwrap()]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    // The daemon SERVES checks -- not "wins a 5s spawn race on the first one".
+    //
+    // `check` has a never-worse-than-one-shot contract: if the daemon is not
+    // ready within SPAWN_WAIT (5s, a production timeout tuned for how long a
+    // user should wait before falling back, not a test knob), the check runs
+    // one-shot and succeeds with checks_served still 0. On a loaded box -- a
+    // release build running underneath, which is the normal state of this one
+    // -- losing that race is expected behaviour, so demanding it on the FIRST
+    // check made a correct runtime look broken. Measured here: 1 pass in 3 with
+    // this change absent, and it fails the same way on main.
+    //
+    // So allow a second check to be the one the daemon serves. The property
+    // under test is unchanged and still load-bearing: the daemon comes up, and
+    // it serves checks. A daemon that never serves one still fails.
+    let mut parsed: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&oam_d(&["daemon", "status", proj.to_str().unwrap()]).stdout)
+            .trim(),
+    )
+    .unwrap();
+    if parsed["checks_served"].as_u64().unwrap_or(0) == 0 {
+        let _ = oam_d(&["check", proj.to_str().unwrap()]);
+        parsed = serde_json::from_str(
+            String::from_utf8_lossy(&oam_d(&["daemon", "status", proj.to_str().unwrap()]).stdout)
+                .trim(),
+        )
+        .unwrap();
+    }
     assert_eq!(parsed["running"], true, "daemon should be up: {parsed}");
-    assert!(parsed["checks_served"].as_u64().unwrap() >= 1);
+    assert!(
+        parsed["checks_served"].as_u64().unwrap() >= 1,
+        "the daemon came up but served no check across two attempts: {parsed}"
+    );
 
     // Unchanged tree: second check must be served from the daemon cache.
     let second = oam_d(&["check", proj.to_str().unwrap()]);

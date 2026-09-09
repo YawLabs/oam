@@ -226,9 +226,15 @@ fn scanned_files(root: &Path) -> Vec<PathBuf> {
             collect(&entry.path().join("src"), "rs", &mut out);
         }
     }
-    // js/vendor is Node's own source, verbatim and never edited here; the
-    // upstream provenance URLs at the top of every file are the point of it.
-    out.retain(|p| !p.components().any(|c| c.as_os_str() == "vendor"));
+    // Skip only the genuinely-upstream subtree. js/vendor/node-streams is Node's
+    // own source, verbatim and never edited here, and the upstream provenance
+    // URLs at the top of every file are the point of it. js/vendor/oam-shims is
+    // NOT that: it is oam's own hand-written snapshot code (errors.js,
+    // validators.js, util.js, primordials.js, loader-prelude.js), compiled into
+    // the V8 snapshot like everything else in js/, and a URL added there -- to
+    // the file that builds oam's Node-shaped ERR_* messages, exactly where a
+    // docs link belongs -- escaped this gate entirely.
+    out.retain(|p| !p.components().any(|c| c.as_os_str() == "node-streams"));
     out.sort();
     assert!(
         out.len() > 20,
