@@ -37,7 +37,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util",
 # compiles clean on every tier-1 target (same choice Deno ships).
 # "stream": Body::wrap_stream, for streaming outbound request bodies
 # (docs/design/streaming-bodies.md slice 4).
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
+# "gzip"/"deflate": content-encoding negotiation and decoding. Without them
+# reqwest neither advertises an encoding nor decodes one, so a server that
+# compressed anyway (httpbin.org/gzip, any CDN doing it unsolicited) handed
+# JavaScript the raw DEFLATE bytes with `content-encoding: gzip` still on the
+# response -- silent corruption of the most-used web API, not an error. The set
+# is exactly what Node v22.22.2's fetch advertises ("gzip, deflate"), measured
+# rather than assumed: adding "brotli" here would also add `br` to the request
+# header and make oam ask for something Node does not, trading one divergence
+# for another. flate2 was already in the tree for node:zlib; this adds
+# async-compression over it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "gzip", "deflate"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: serde_json::Map keeps insertion order (IndexMap) instead of

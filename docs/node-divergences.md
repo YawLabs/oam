@@ -803,6 +803,38 @@ to its own fallback branch, which is the behavior that is right for oam.
 `dns.getServers()` is NOT narrowed: it reports the real configured nameservers, taken from
 the same `ResolverConfig` the resolver was built from, so the two stay coherent.
 
+### 32. A decoded `fetch` response drops `content-encoding` and `content-length`
+
+`fetch` negotiates and decodes compressed responses in both runtimes, and both hand
+JavaScript the decoded body. They disagree about what the response headers then say.
+Measured against `https://httpbin.org/gzip`:
+
+| | `content-encoding` | `content-length` | body |
+|---|---|---|---|
+| Node v22.22.2 | `gzip` | `247` (the COMPRESSED size) | decoded |
+| oam | absent | absent | decoded |
+
+Node keeps what the server sent, which is what browsers do, so a caller reading
+`content-length` after a compressed `fetch` gets a number that does not describe the body
+it is holding. oam removes both, which is self-consistent but is a real difference from
+Node and from a browser: code that branches on `res.headers.get('content-encoding')` takes
+the other path here.
+
+This is a property of the decoding layer rather than a decision made per response --
+`reqwest` strips both headers as it decodes, and the pre-strip values are not recoverable
+above it. Restoring Node's shape means decoding in oam's own body pump instead, keeping the
+original header map; that is the fix if this ever bites, and it is not free, because the
+body streams a chunk per op and the decoder has to hold state across them.
+
+What is NOT divergent: the decoded bytes. Before the negotiation shipped, oam advertised no
+encoding at all and did not decode, so a server that compressed anyway handed JavaScript
+raw DEFLATE bytes with `content-encoding: gzip` still attached -- silent corruption rather
+than an error. oam now advertises exactly what Node's `fetch` advertises, `gzip` and
+`deflate`, differing only in that oam omits the optional whitespace after the comma
+(`gzip,deflate` against Node's `gzip, deflate`; both are the same list to any RFC 9110
+parser). Brotli is deliberately not advertised -- Node's `fetch` does not ask for it either,
+and adding it would trade this divergence for a request-header one.
+
 ### 22. An invalid `napi_ref` is refused, where Node's behavior is undefined
 
 _(N-API is alpha and off by default -- see divergence 2.)_ Node's reference API takes the

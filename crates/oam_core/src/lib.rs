@@ -597,6 +597,15 @@ impl CoreRuntime {
             .map_err(|e| format!("tokio runtime: {e}"))?;
         let http = reqwest::Client::builder()
             .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
+            // Stated rather than inherited from the cargo features: reqwest
+            // turns these on by default once the feature is compiled in, so an
+            // implicit version would silently stop negotiating if that default
+            // ever changed, and the symptom -- a body of raw DEFLATE bytes --
+            // does not look like a networking regression. Written out, a
+            // dropped feature is a compile error instead. Matches Node's
+            // advertised set; see the Cargo.toml note for why not brotli.
+            .gzip(true)
+            .deflate(true)
             // `localhost` IPv4-first. Measured: oam's first request to
             // localhost cost ~317ms against Node's ~6ms, because resolution
             // yields ::1 first, the common case is a server bound to
@@ -3151,6 +3160,13 @@ pub mod ops {
         let addr = std::net::SocketAddr::new(ip, port);
         reqwest::Client::builder()
             .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
+            // The pinned client is a second, separately-built client for
+            // connect-hook fetches. Every transport-visible behaviour has to
+            // match the shared one above or a pinned request decodes
+            // differently from an ordinary one -- the kind of divergence that
+            // only shows up in whichever code path the test suite forgot.
+            .gzip(true)
+            .deflate(true)
             .resolve(&pin.host, addr)
             .build()
             .map_err(|e| format!("pinned http client: {e}"))

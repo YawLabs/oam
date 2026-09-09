@@ -147,6 +147,10 @@ enum HeapCapSource {
     User,
     /// Built-in 4 GiB default (env var unset, empty, or "0").
     Default,
+    /// Derived from this process's cgroup memory limit, because the env var
+    /// was unset and we are running under a container limit smaller than the
+    /// built-in default.
+    Cgroup,
 }
 
 thread_local! {
@@ -171,6 +175,109 @@ struct HeapCap {
     source: HeapCapSource,
 }
 
+/// Share of a container's memory limit the V8 heap may occupy.
+///
+/// The heap is not the process. Outside it sit the binary and its V8 snapshot,
+/// thread stacks (tokio's pool plus every worker isolate), ArrayBuffer backing
+/// stores, the transpile and bytecode caches' buffers, and V8's own off-heap
+/// bookkeeping. Handing the whole limit to the heap guarantees the kernel kills
+/// the process before V8 ever notices it is near its ceiling -- which is the
+/// exact failure this code exists to prevent, just at a different threshold.
+///
+/// 75% leaves that headroom while staying well clear of the "cap so small the
+/// runtime cannot boot" end. It is a heuristic, not a measurement, and it is
+/// stated here rather than buried as a literal so the next person can argue
+/// with it on the right grounds.
+const CGROUP_HEAP_FRACTION: u64 = 75;
+
+/// Floor for a cgroup-derived cap, in MiB. Below this the runtime cannot
+/// reliably finish booting (snapshot deserialization plus the node: builtins
+/// need room before user code runs), and an unbootable process is a worse
+/// answer than one that risks the kernel's OOM killer. A limit this small is
+/// a misconfiguration, so we decline to derive from it and fall through to the
+/// default rather than pretending we can honour it.
+const CGROUP_HEAP_FLOOR_MB: usize = 128;
+
+/// This process's cgroup memory limit, converted to a V8 heap cap in MiB.
+///
+/// `None` when there is no limit to read: not Linux, not in a container, the
+/// cgroup files absent or unreadable, the limit unset ("max"), or a limit so
+/// large or so small that deriving from it is not useful. Every one of those
+/// falls back to [`DEFAULT_HEAP_MB`], so this can only ever tighten the cap on
+/// a machine that genuinely declared one -- it never loosens it.
+///
+/// Both cgroup generations are read because both are still deployed: v2's
+/// unified `memory.max` (the default on current distributions and on GKE
+/// nodes) and v1's `memory/memory.limit_in_bytes`. v1 reports "unlimited" as a
+/// huge sentinel rather than a word, so an absurd value is treated as absent.
+fn cgroup_heap_mb() -> Option<usize> {
+    heap_mb_from_limit_bytes(current_cgroup_limit_bytes()?)
+}
+
+/// The active container memory limit in bytes, or `None` where the concept
+/// does not apply.
+///
+/// The platform split lives HERE rather than around the policy above, so the
+/// fraction/floor rules stay compiled and unit-tested on every host. Gating the
+/// policy instead left it dead code on Windows and macOS, which `-D warnings`
+/// correctly rejects and which would have meant the rules were only ever
+/// verified on one leg of the matrix.
+#[cfg(target_os = "linux")]
+fn current_cgroup_limit_bytes() -> Option<u64> {
+    // v2 first: on a hybrid host both trees can exist, and the unified
+    // hierarchy is the one actually enforcing the limit there.
+    read_cgroup_limit_bytes("/sys/fs/cgroup/memory.max")
+        .or_else(|| read_cgroup_limit_bytes("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+}
+
+/// Container memory limit (bytes) -> heap cap (MiB), or `None` to decline.
+///
+/// Split from the file reading so the policy -- the fraction, the floor, and
+/// the "a limit above our own default tells us nothing" rule -- is testable
+/// without a cgroup filesystem. Every host that runs the test suite would
+/// otherwise exercise only whichever branch its own machine happens to be in.
+fn heap_mb_from_limit_bytes(bytes: u64) -> Option<usize> {
+    let mb = (bytes / (1024 * 1024)) * CGROUP_HEAP_FRACTION / 100;
+    let mb = usize::try_from(mb).ok()?;
+
+    // Act only inside the band the policy declares: at or above the built-in
+    // default there is nothing to learn -- that is already the ceiling we would
+    // choose, and claiming the cgroup decided it would mislabel the OOM banner
+    // -- and below the floor the runtime cannot finish booting.
+    if !(CGROUP_HEAP_FLOOR_MB..DEFAULT_HEAP_MB).contains(&mb) {
+        return None;
+    }
+    Some(mb)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_cgroup_limit_bytes() -> Option<u64> {
+    // cgroups are a Linux kernel feature. Docker Desktop on macOS and Windows
+    // runs containers inside a Linux VM, so a container built from this binary
+    // still gets the branch above -- it is the LINUX build that runs there.
+    None
+}
+
+/// One cgroup limit file -> bytes. `None` for absent, unreadable, "max", or
+/// anything that does not parse: every caller treats a missing limit as "no
+/// container limit", and a malformed file is exactly that from our side.
+#[cfg(target_os = "linux")]
+fn read_cgroup_limit_bytes(path: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = raw.trim();
+    // v2 spells "no limit" as the literal `max`; v1 spells it as a sentinel so
+    // large it exceeds any real machine (commonly 2^63-1 rounded to a page).
+    if raw == "max" {
+        return None;
+    }
+    let bytes: u64 = raw.parse().ok()?;
+    // 2^53 bytes is 8 PiB -- past any real limit and into sentinel territory.
+    if bytes == 0 || bytes > (1 << 53) {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Parse `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
 ///
 /// Node parity: this is oam's `--max-old-space-size` analogue. Resolution:
@@ -186,6 +293,24 @@ fn resolve_heap_cap() -> HeapCap {
     let raw = match raw {
         Some(s) if !s.is_empty() => s,
         _ => {
+            // Nothing asked for. Prefer what the CONTAINER says over the
+            // built-in default: a 512Mi pod running a heap that believes it
+            // has 4 GiB does not OOM through V8's callback, it gets killed by
+            // the kernel -- exit 137, no banner, no crash file, no ODIF, and
+            // nothing in the logs tying the death to memory. Reading the
+            // cgroup turns that back into the deterministic, attributable exit
+            // the OOM path already knows how to render.
+            //
+            // Node does not do this (its --max-old-space-size default ignores
+            // cgroups), which is exactly why every Node-on-Kubernetes runbook
+            // carries a hand-set flag. Doing it by default is a real difference
+            // in oam's favour, not parity work.
+            if let Some(mb) = cgroup_heap_mb() {
+                return HeapCap {
+                    mb: Some(mb),
+                    source: HeapCapSource::Cgroup,
+                };
+            }
             return HeapCap {
                 mb: Some(DEFAULT_HEAP_MB),
                 source: HeapCapSource::Default,
@@ -244,6 +369,13 @@ unsafe extern "C" fn near_heap_limit_oom(
     let source = HEAP_CAP_SOURCE.with(|s| match s.get() {
         HeapCapSource::User => "set by OAM_MAX_HEAP_MB",
         HeapCapSource::Default => "default 4 GiB",
+        // Names the mechanism AND the override, because this is the one source
+        // the operator did not choose: someone meeting this banner for the
+        // first time is looking at a pod that just died and needs to know both
+        // where the number came from and how to move it.
+        HeapCapSource::Cgroup => {
+            "derived from the container memory limit; set OAM_MAX_HEAP_MB to override"
+        }
     });
     let banner = format!(
         "error[OAM-RT-OOM]: JavaScript heap out of memory -- reached the {mb} MB cap ({source})\n"
@@ -865,17 +997,63 @@ mod tests {
     #[test]
     fn heap_cap_defaults_to_4gib_when_unset() {
         let _g = HeapCapEnvGuard::unset();
+        let cap = resolve_heap_cap();
+        // Written as a two-branch assertion on purpose. This test used to
+        // demand 4 GiB unconditionally, which was correct only because nothing
+        // consulted the container limit; run inside a memory-limited container
+        // (the CI leg's own future, and any `docker run -m`) the honest answer
+        // is the derived cap, and a test that failed there would be reporting
+        // the feature working as if it were a regression.
+        match cap.source {
+            HeapCapSource::Default => assert_eq!(
+                cap.mb,
+                Some(4096),
+                "unset OAM_MAX_HEAP_MB with no container limit must default to \
+                 4 GiB; the pre-default behavior (no cap) is what caused the \
+                 1.4 GiB mark-compact OOMs in the crash log",
+            ),
+            HeapCapSource::Cgroup => {
+                let mb = cap.mb.expect("a cgroup-derived cap is always Some");
+                assert!(
+                    (CGROUP_HEAP_FLOOR_MB..DEFAULT_HEAP_MB).contains(&mb),
+                    "a cgroup-derived cap must sit inside the band the policy \
+                     declares it will act on, got {mb} MB",
+                );
+            }
+            HeapCapSource::User => panic!("env var is unset; source cannot be User"),
+        }
+    }
+
+    #[test]
+    fn cgroup_limit_becomes_a_fraction_of_itself() {
+        // 512Mi, the pod size that motivated this: 75% of 512 is 384.
         assert_eq!(
-            resolve_heap_cap().mb,
-            Some(4096),
-            "unset OAM_MAX_HEAP_MB must default to 4 GiB; the pre-default \
-             behavior (no cap) is what caused the 1.4 GiB mark-compact OOMs \
-             in the crash log",
+            heap_mb_from_limit_bytes(512 * 1024 * 1024),
+            Some(384),
+            "a 512Mi container must yield a heap cap below its own limit, or \
+             the kernel OOM-kills the process before V8's callback can render \
+             the banner",
         );
-        assert!(
-            matches!(resolve_heap_cap().source, HeapCapSource::Default),
-            "unset -> Default source",
+    }
+
+    #[test]
+    fn cgroup_limit_at_or_above_the_default_is_declined() {
+        // Nothing to act on: our own default is already this tight or tighter,
+        // and claiming the cgroup decided it would mislabel the OOM banner.
+        assert_eq!(heap_mb_from_limit_bytes(64 * 1024 * 1024 * 1024), None);
+        assert_eq!(
+            heap_mb_from_limit_bytes(u64::MAX),
+            None,
+            "must not overflow or wrap on a v1 unlimited sentinel",
         );
+    }
+
+    #[test]
+    fn cgroup_limit_below_the_boot_floor_is_declined() {
+        // 64Mi: 75% is 48 MB, under the floor. The runtime cannot finish
+        // booting in that, and an unbootable process is a worse answer than
+        // one that risks the kernel's OOM killer.
+        assert_eq!(heap_mb_from_limit_bytes(64 * 1024 * 1024), None);
     }
 
     #[test]

@@ -19440,3 +19440,308 @@ fn permission_is_enforced_in_the_repl() {
          nothing:\n{granted}"
     );
 }
+
+/// fs accepts a WHATWG `URL` path, which is the mandated ESM replacement for
+/// `__dirname`. Every fs entry point used to coerce with `String(path)`, which
+/// is right for a string and silently wrong for a URL: it yields the href, so
+/// the call asked the OS to open a file literally named `file:///C:/...` and
+/// failed with an ENOENT naming a URL. That blamed the filesystem for a
+/// coercion the runtime got wrong, and it broke the ordinary
+/// `new URL('./x', import.meta.url)` idiom that modern ESM packages are built
+/// on.
+///
+/// Covers sync, promises, and callback forms, both path positions of a
+/// two-path op, and the non-`file:` rejection -- the surface has to move
+/// together or a caller discovers that `readFileSync` takes a URL and
+/// `rename` does not.
+#[test]
+fn fs_accepts_whatwg_url_paths() {
+    let stdout = run_ok(
+        "fs_url_paths.mjs",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         \n\
+         const here = (name) => new URL('./' + name, import.meta.url);\n\
+         \n\
+         // sync round-trip through a URL in both directions\n\
+         fs.writeFileSync(here('u-sync.txt'), 'sync-ok');\n\
+         console.log('sync:', fs.readFileSync(here('u-sync.txt'), 'utf8'));\n\
+         console.log('existsSync:', fs.existsSync(here('u-sync.txt')));\n\
+         console.log('statSync:', fs.statSync(here('u-sync.txt')).size);\n\
+         \n\
+         // promises form\n\
+         await fsp.writeFile(here('u-async.txt'), 'async-ok');\n\
+         console.log('promises:', await fsp.readFile(here('u-async.txt'), 'utf8'));\n\
+         \n\
+         // BOTH path positions of a two-path op\n\
+         await fsp.rename(here('u-async.txt'), here('u-renamed.txt'));\n\
+         console.log('rename:', await fsp.readFile(here('u-renamed.txt'), 'utf8'));\n\
+         await fsp.copyFile(here('u-renamed.txt'), here('u-copy.txt'));\n\
+         console.log('copyFile:', await fsp.readFile(here('u-copy.txt'), 'utf8'));\n\
+         \n\
+         // callback form goes through the same coercion\n\
+         await new Promise((resolve, reject) =>\n\
+           fs.readFile(here('u-sync.txt'), 'utf8', (e, d) => {\n\
+             if (e) reject(e); else { console.log('callback:', d); resolve(); }\n\
+           }));\n\
+         \n\
+         // a Buffer path still works -- it did before only because Buffer's\n\
+         // toString defaults to utf8, and the rewrite must not regress it\n\
+         const url = here('u-sync.txt');\n\
+         const asPath = fs.realpathSync(url);\n\
+         console.log('buffer:', fs.readFileSync(Buffer.from(asPath, 'utf8'), 'utf8'));\n\
+         \n\
+         // a non-file: URL has no filesystem meaning and is refused rather\n\
+         // than stringified into a relative-looking path\n\
+         try {\n\
+           fs.readFileSync(new URL('https://example.invalid/x'));\n\
+           console.log('scheme:', 'NOT REJECTED');\n\
+         } catch (e) {\n\
+           console.log('scheme:', e.code);\n\
+         }\n",
+    );
+    assert!(stdout.contains("sync: sync-ok"), "sync URL path: {stdout}");
+    assert!(
+        stdout.contains("existsSync: true"),
+        "existsSync URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("statSync: 7"),
+        "statSync URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("promises: async-ok"),
+        "promises URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("rename: async-ok"),
+        "rename both positions: {stdout}"
+    );
+    assert!(
+        stdout.contains("copyFile: async-ok"),
+        "copyFile both positions: {stdout}"
+    );
+    assert!(
+        stdout.contains("callback: sync-ok"),
+        "callback URL path: {stdout}"
+    );
+    assert!(
+        stdout.contains("buffer: sync-ok"),
+        "Buffer path not regressed: {stdout}"
+    );
+    assert!(
+        stdout.contains("scheme: ERR_INVALID_URL_SCHEME"),
+        "a non-file: URL must be refused, not stringified: {stdout}"
+    );
+}
+
+/// `fetch` negotiates and decodes a compressed response.
+///
+/// The client used to advertise no `accept-encoding` at all AND to do no
+/// decoding, so a server that compressed anyway -- httpbin, any CDN doing it
+/// unsolicited -- handed JavaScript the raw DEFLATE bytes with
+/// `content-encoding: gzip` still on the response. Not an error, just a body
+/// that is not the body: silent corruption of the most-used web API, on the
+/// path both an MCP sidecar and an HTTP service take to call an upstream.
+///
+/// Hermetic on purpose: the origin is a local `node:http` server, so the gate
+/// does not depend on a third party's compression policy. The advertised set is
+/// asserted too, because it is wire-visible and is what makes a server compress
+/// in the first place.
+#[test]
+fn fetch_negotiates_and_decodes_content_encoding() {
+    let stdout = run_ok(
+        "fetch_gzip.mjs",
+        "import http from 'node:http';\n\
+         import zlib from 'node:zlib';\n\
+         \n\
+         const payload = JSON.stringify({ hello: 'compressed world', n: 42 });\n\
+         let advertised = null;\n\
+         const srv = http.createServer((req, res) => {\n\
+           advertised = req.headers['accept-encoding'] ?? null;\n\
+           const body = zlib.gzipSync(Buffer.from(payload, 'utf8'));\n\
+           res.writeHead(200, {\n\
+             'content-type': 'application/json',\n\
+             'content-encoding': 'gzip',\n\
+             'content-length': String(body.length),\n\
+           });\n\
+           res.end(body);\n\
+         });\n\
+         await new Promise((r) => srv.listen(0, '127.0.0.1', r));\n\
+         const port = srv.address().port;\n\
+         \n\
+         const res = await fetch('http://127.0.0.1:' + port + '/');\n\
+         const text = await res.text();\n\
+         console.log('advertised:', advertised);\n\
+         console.log('decoded:', text === payload);\n\
+         console.log('parsed:', JSON.parse(text).hello);\n\
+         srv.close();\n",
+    );
+    // The exact list Node's fetch advertises, modulo the optional whitespace
+    // after the comma. Asserting on the members rather than the whole string
+    // keeps this from failing on that spacing, which is not meaningful to any
+    // RFC 9110 parser -- see divergence 32.
+    assert!(
+        stdout.contains("advertised: gzip") && stdout.contains("deflate"),
+        "fetch must advertise gzip and deflate, or no server will compress: {stdout}"
+    );
+    assert!(
+        stdout.contains("decoded: true"),
+        "a gzip-encoded response must reach JavaScript decoded, not as raw DEFLATE bytes: {stdout}"
+    );
+    assert!(
+        stdout.contains("parsed: compressed world"),
+        "the decoded body must survive JSON.parse: {stdout}"
+    );
+}
+
+/// `fs/promises` rejects on a bad path argument; it does not throw.
+///
+/// Node validates the path INSIDE the promise, so
+/// `fsPromises.unlink(new URL('https://x/y'))` rejects with
+/// ERR_INVALID_URL_SCHEME (measured on v22.22.2). Most of oam's promises
+/// methods are plain arrows that hand back the native's promise, so the
+/// argument check introduced with URL path support escaped SYNCHRONOUSLY
+/// instead -- past the `.catch()` the caller had already attached, and past
+/// `Promise.all`, which is how a supervisor loses a whole batch to one bad
+/// path. The sync and callback forms are deliberately NOT covered here: node
+/// throws synchronously for both, and oam matches that.
+///
+/// `unlink` is the specific shape that broke (a non-async arrow); `readFile`
+/// is async and rejected correctly all along, so it pins the half that was
+/// already right against a fix that over-corrects.
+#[test]
+fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
+    let stdout = run_ok(
+        "fs_promises_reject.mjs",
+        "import fsp from 'node:fs/promises';\n\
+         const bad = new URL('https://example.invalid/x');\n\
+         \n\
+         // A plain-arrow method: the one that threw.\n\
+         try {\n\
+           const p = fsp.unlink(bad);\n\
+           console.log('unlink returned a promise:', p instanceof Promise);\n\
+           await p.then(() => console.log('unlink: RESOLVED?!'),\n\
+                        (e) => console.log('unlink rejected:', e.code));\n\
+         } catch (e) {\n\
+           console.log('unlink THREW SYNCHRONOUSLY:', e.code);\n\
+         }\n\
+         \n\
+         // An async method: correct before the fix, must stay correct.\n\
+         try {\n\
+           await fsp.readFile(bad);\n\
+           console.log('readFile: RESOLVED?!');\n\
+         } catch (e) {\n\
+           console.log('readFile rejected:', e.code);\n\
+         }\n\
+         \n\
+         // The wrapper must not have eaten the class that rides in the same\n\
+         // object, nor the observable function metadata.\n\
+         console.log('Dirent still a class:', /^class/.test(String(fsp.Dirent)));\n\
+         console.log('name:', fsp.unlink.name, 'arity:', fsp.readFile.length);\n",
+    );
+    assert!(
+        stdout.contains("unlink returned a promise: true"),
+        "a promises method must return a promise even for a rejected argument: {stdout}"
+    );
+    assert!(
+        stdout.contains("unlink rejected: ERR_INVALID_URL_SCHEME"),
+        "unlink must REJECT, matching node -- a synchronous throw escapes the caller's .catch(): {stdout}"
+    );
+    assert!(
+        !stdout.contains("THREW SYNCHRONOUSLY"),
+        "no promises method may throw synchronously: {stdout}"
+    );
+    assert!(
+        stdout.contains("readFile rejected: ERR_INVALID_URL_SCHEME"),
+        "the already-async path must keep rejecting: {stdout}"
+    );
+    assert!(
+        stdout.contains("Dirent still a class: true"),
+        "the wrapper must skip the class that shares the object, or `new` and instanceof break: {stdout}"
+    );
+    assert!(
+        stdout.contains("name: unlink arity: 2"),
+        "wrapping must preserve fn.name and fn.length -- node's own tests read them: {stdout}"
+    );
+}
+
+/// The promises wrapper must not re-type what it wraps, and must not reach the
+/// callback layer.
+///
+/// Three regressions the first version of `asAlwaysRejecting` introduced, all
+/// measured against v22.22.2:
+///
+/// 1. `fs/promises.glob` returns an AsyncIterable and validates lazily -- it is
+///    the one member that does not return a promise. Wrapping it was SILENT
+///    data loss rather than an error: `for await` failed loudly, but the
+///    documented `await Array.fromAsync(fsp.glob(...))` saw a Promise, took
+///    Array.fromAsync's array-like branch, read `length === undefined`, and
+///    resolved to `[]`. A build step globbing for files found none and carried
+///    on.
+/// 2. The callback forms are built from the same functions, and node's callback
+///    forms THROW synchronously on a bad path while the promise forms reject.
+///    Wrapping in place made them report through the callback instead.
+/// 3. Ten path-based ops (the chown/utimes/lchmod family) and `openAsBlob` sat
+///    outside the range the original conversion swept and still stringified
+///    their path, so `fs.utimesSync(url)` failed where `fsp.utimes(url)` worked.
+#[test]
+fn fs_promises_wrapper_preserves_glob_callbacks_and_paths() {
+    let stdout = run_ok(
+        "fs_wrapper_shape.mjs",
+        "import fs from 'node:fs';\n\
+         import fsp from 'node:fs/promises';\n\
+         import { pathToFileURL } from 'node:url';\n\
+         import os from 'node:os';\n\
+         import path from 'node:path';\n\
+         \n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-wrap-'));\n\
+         fs.writeFileSync(path.join(dir, 'a.js'), '');\n\
+         fs.writeFileSync(path.join(dir, 'b.js'), '');\n\
+         const pattern = path.join(dir, '*.js');\n\
+         \n\
+         // 1. glob stays an AsyncIterable, through BOTH documented idioms.\n\
+         console.log('fromAsync:', (await Array.fromAsync(fsp.glob(pattern))).length);\n\
+         let n = 0;\n\
+         for await (const _ of fsp.glob(pattern)) n++;\n\
+         console.log('forAwait:', n);\n\
+         \n\
+         // 2. a callback form still throws SYNCHRONOUSLY, as node does.\n\
+         const bad = new URL('https://example.invalid/x');\n\
+         let threw = false;\n\
+         try { fs.unlink(bad, () => {}); } catch { threw = true; }\n\
+         console.log('callbackThrewSync:', threw);\n\
+         \n\
+         // ...while the promise form still REJECTS rather than throwing.\n\
+         let rejected = false;\n\
+         try { await fsp.unlink(bad); } catch (e) { rejected = e.code === 'ERR_INVALID_URL_SCHEME'; }\n\
+         console.log('promiseRejected:', rejected);\n\
+         \n\
+         // 3. the ops outside the original conversion range take a URL too.\n\
+         const file = path.join(dir, 'a.js');\n\
+         const url = pathToFileURL(file);\n\
+         fs.utimesSync(url, new Date(), new Date());\n\
+         console.log('utimesSync:', true);\n\
+         console.log('openAsBlob:', (await fs.openAsBlob(url)).size === 0);\n",
+    );
+    assert!(
+        stdout.contains("fromAsync: 2"),
+        "Array.fromAsync(glob) must yield the files, not [] -- a Promise here is silent data loss: {stdout}"
+    );
+    assert!(
+        stdout.contains("forAwait: 2"),
+        "glob must stay async-iterable: {stdout}"
+    );
+    assert!(
+        stdout.contains("callbackThrewSync: true"),
+        "a callback form must throw synchronously on a bad path, as node does: {stdout}"
+    );
+    assert!(
+        stdout.contains("promiseRejected: true"),
+        "the promise form must still reject rather than throw: {stdout}"
+    );
+    assert!(
+        stdout.contains("utimesSync: true") && stdout.contains("openAsBlob: true"),
+        "the ops outside the original conversion range must accept a URL path: {stdout}"
+    );
+}
