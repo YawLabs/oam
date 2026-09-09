@@ -817,11 +817,313 @@ if [ -z "$NDF_MISSING" ]; then pass; else fail "the napi-off gate no longer cove
 # bash parse error rather than a gate verdict, and nothing else here parses it.
 it "ci-local.sh and the libs it sources parse"
 PARSE_BAD=""
-for s in scripts/ci-local.sh scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
-         scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh; do
+for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/lib/miri-gate.sh \
+         scripts/lib/build-locks.sh scripts/lib/crt-linkage.sh \
+         scripts/lib/iap-helpers.sh; do
   bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
 done
 if [ -z "$PARSE_BAD" ]; then pass; else fail "syntax errors in:$PARSE_BAD"; fi
+
+# =============================================================================
+group "bump-taps.sh -- publishing to the package-manager taps"
+# =============================================================================
+# This script PUSHES to two public repos during a release, and it had no
+# coverage of any kind -- it was not even in the parse list above. Every case
+# below was a live defect found in review; they are here so they cannot come
+# back silently. The failures they encode all shared one shape: the script
+# reported success while a tap stayed on the old release.
+#
+# Real repos, real pushes, real git. Only the two EXTERNAL binaries are stubbed
+# -- gh (which would need a published release) and curl (which would need the
+# network) -- because everything this script gets wrong, it gets wrong in git,
+# and a mocked git would encode the very assumption under test.
+
+TAPS_BIN="$SUITE_TMP/taps-bin"
+mkdir -p "$TAPS_BIN"
+
+# `gh release download` -> a SHA256SUMS carrying the five real asset names in
+# sha256sum's binary-mode form (the leading `*`), which is what the real file
+# uses and what hash_for has to strip. `gh release view` -> the latest tag, so
+# the downgrade guard has something to compare against.
+cat > "$TAPS_BIN/gh" <<'GHSTUB'
+#!/bin/bash
+if [ "$1" = "release" ] && [ "$2" = "download" ]; then
+  d=""; want=0
+  for a in "$@"; do
+    if [ "$want" = "1" ]; then d="$a"; want=0; fi
+    [ "$a" = "--dir" ] && want=1
+  done
+  [ -n "$d" ] || exit 1
+  cat > "$d/SHA256SUMS" <<'SUMS'
+1111111111111111111111111111111111111111111111111111111111111111 *oam-aarch64-apple-darwin
+2222222222222222222222222222222222222222222222222222222222222222 *oam-aarch64-pc-windows-msvc.exe
+3333333333333333333333333333333333333333333333333333333333333333 *oam-x86_64-apple-darwin
+4444444444444444444444444444444444444444444444444444444444444444 *oam-x86_64-pc-windows-msvc.exe
+5555555555555555555555555555555555555555555555555555555555555555 *oam-x86_64-unknown-linux-gnu
+SUMS
+  exit 0
+fi
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then echo "${STUB_LATEST:-v0.14.0}"; exit 0; fi
+exit 0
+GHSTUB
+chmod +x "$TAPS_BIN/gh"
+# The verify step is warn-only and network-bound; failing the fetch exercises
+# its "could not fetch" branch without pretending to know what GitHub serves.
+printf '#!/bin/bash\nexit 1\n' > "$TAPS_BIN/curl"
+chmod +x "$TAPS_BIN/curl"
+
+# taps_fixture -- two bare origins plus working clones, both taps at 0.13.2,
+# with the real manifest shapes: the formula's per-arch url/sha256 pairs
+# (including `using: :nounzip` and the deliberately absent linux-arm64 block)
+# and the manifest's autoupdate block, whose `v$version` must NOT trip the
+# stale-version guard.
+#
+# A FRESH directory per case, never a reset of a shared one. These cases push,
+# rewind refs and dirty the tree; reusing one directory would let a failure in
+# an early case masquerade as a defect in a later one. `taps_dir` names the
+# fixture belonging to the case that just called it.
+TAPS_N=0
+taps_dir=""
+taps_fixture(){
+  TAPS_N=$((TAPS_N + 1))
+  taps_dir="$SUITE_TMP/taps-$TAPS_N"
+  mkdir -p "$taps_dir"
+  ( cd "$taps_dir"
+    git init -q --bare homebrew-yaw.git
+    git init -q --bare scoop-yaw.git
+    git init -q -b main homebrew-yaw
+    mkdir -p homebrew-yaw/Formula homebrew-yaw/Casks
+    cat > homebrew-yaw/Formula/oam.rb <<'RB'
+class Oam < Formula
+  desc "d"
+  version "0.13.2"
+  on_macos do
+    on_arm do
+      url "https://github.com/YawLabs/oam/releases/download/v0.13.2/oam-aarch64-apple-darwin", using: :nounzip
+      sha256 "aaaa111111111111111111111111111111111111111111111111111111111111"
+    end
+    on_intel do
+      url "https://github.com/YawLabs/oam/releases/download/v0.13.2/oam-x86_64-apple-darwin", using: :nounzip
+      sha256 "bbbb222222222222222222222222222222222222222222222222222222222222"
+    end
+  end
+  on_linux do
+    on_intel do
+      url "https://github.com/YawLabs/oam/releases/download/v0.13.2/oam-x86_64-unknown-linux-gnu", using: :nounzip
+      sha256 "cccc333333333333333333333333333333333333333333333333333333333333"
+    end
+  end
+end
+RB
+    # Yaw Terminal's cask lives in this same repo. It is what makes the tap a
+    # SHARED checkout, and it is the passenger the index-sweep case looks for.
+    echo "cask placeholder" > homebrew-yaw/Casks/yaw.rb
+    ( cd homebrew-yaw
+      git add -A
+      git -c user.email=t@t -c user.name=t commit -qm init
+      git remote add origin "$taps_dir/homebrew-yaw.git"
+      git push -q origin main
+      git branch -q --set-upstream-to=origin/main main )
+    git init -q -b main scoop-yaw
+    mkdir -p scoop-yaw/bucket
+    cat > scoop-yaw/bucket/oam.json <<'JS'
+{
+  "version": "0.13.2",
+  "architecture": {
+    "64bit": { "url": "https://github.com/YawLabs/oam/releases/download/v0.13.2/oam-x86_64-pc-windows-msvc.exe", "hash": "dddd444444444444444444444444444444444444444444444444444444444444" },
+    "arm64": { "url": "https://github.com/YawLabs/oam/releases/download/v0.13.2/oam-aarch64-pc-windows-msvc.exe", "hash": "eeee555555555555555555555555555555555555555555555555555555555555" }
+  },
+  "autoupdate": { "architecture": { "64bit": { "url": "https://github.com/YawLabs/oam/releases/download/v$version/oam-x86_64-pc-windows-msvc.exe" } } }
+}
+JS
+    ( cd scoop-yaw
+      git add -A
+      git -c user.email=t@t -c user.name=t commit -qm init
+      git remote add origin "$taps_dir/scoop-yaw.git"
+      git push -q origin main
+      git branch -q --set-upstream-to=origin/main main ) ) >/dev/null 2>&1
+}
+
+# run_taps <args...> -- the real script against the current fixture, with only
+# gh and curl stubbed.
+run_taps(){
+  PATH="$TAPS_BIN:$PATH" \
+  OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
+  STUB_LATEST="${STUB_LATEST:-v0.14.0}" \
+  bash "$REPO_DIR/scripts/bump-taps.sh" "$@" 2>&1
+}
+
+# What origin actually SERVES -- the only question that matters here. Every
+# defect below reported success while this stayed on the old release.
+served(){ git -C "$taps_dir/$1.git" show "refs/heads/main:$2" 2>/dev/null; }
+
+if ! command -v git >/dev/null 2>&1; then
+  it "bump-taps.sh cases"; skip "git not on PATH"
+else
+  it "the happy path publishes both taps, each hash in its own arch block"
+  taps_fixture
+  OUT="$(run_taps v0.14.0)"
+  BREW="$(served homebrew-yaw Formula/oam.rb)"
+  SCOOP="$(served scoop-yaw bucket/oam.json)"
+  # Asset-keyed, not positional: pairing a url with the sha256 that FOLLOWS it
+  # is what keeps the mac hash off the linux binary.
+  if printf '%s' "$BREW" | grep -q 'version "0.14.0"' \
+     && printf '%s' "$BREW" | grep -A1 'oam-aarch64-apple-darwin' | grep -q '1111111111' \
+     && printf '%s' "$BREW" | grep -A1 'oam-x86_64-unknown-linux-gnu' | grep -q '5555555555' \
+     && printf '%s' "$SCOOP" | grep -q '"version": "0.14.0"' \
+     && printf '%s' "$SCOOP" | grep -q '4444444444'; then pass
+  else fail "taps did not serve 0.14.0 with per-asset hashes: $OUT"; fi
+
+  it "a second run is a no-op rather than an empty commit"
+  OUT="$(run_taps v0.14.0)"
+  if printf '%s' "$OUT" | grep -q "already at 0.14.0"; then pass
+  else fail "a second run did not report the taps as already current: $OUT"; fi
+
+  it "the autoupdate block does not trip the stale-version guard"
+  # `v[0-9]` must not match the literal `v$version`, or every scoop bump aborts.
+  if printf '%s' "$(served scoop-yaw bucket/oam.json)" | grep -q 'download/v\$version/'; then pass
+  else fail "the autoupdate template was rewritten, or the guard tripped on it"; fi
+
+  it "a commit that never reached origin is pushed, not called current"
+  # The defect: the idempotence check asked only whether the WORKING TREE
+  # differed. After a failed push the commit is local and the file is clean, so
+  # the documented repair re-run printed "already at ..." and returned PAST the
+  # push -- brew served the old release forever, under a green checkmark.
+  taps_fixture
+  run_taps v0.14.0 >/dev/null
+  git -C "$taps_dir/homebrew-yaw.git" update-ref refs/heads/main \
+    "$(git -C "$taps_dir/homebrew-yaw" rev-parse HEAD~1)"
+  git -C "$taps_dir/homebrew-yaw" fetch -q origin
+  OUT="$(run_taps v0.14.0)"
+  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  else fail "an unpushed commit was not pushed on the repair run: $OUT"; fi
+
+  it "another session's staged file is not swept into our commit"
+  # homebrew-yaw carries Casks/yaw.rb for Yaw Terminal. A bare `git commit`
+  # commits the whole INDEX, so a teammate's mid-edit file was committed and
+  # pushed to the live tap -- invisibly, because the printed diffstat is scoped
+  # to our own file.
+  taps_fixture
+  echo "work in progress" >> "$taps_dir/homebrew-yaw/Casks/yaw.rb"
+  git -C "$taps_dir/homebrew-yaw" add Casks/yaw.rb
+  run_taps v0.14.0 >/dev/null
+  TOUCHED="$(git -C "$taps_dir/homebrew-yaw" show --stat --name-only --format= HEAD | tr -d '\r' | tr '\n' ' ')"
+  case "$TOUCHED" in
+    *Casks/yaw.rb*) fail "the commit swept in a foreign staged file: $TOUCHED" ;;
+    *Formula/oam.rb*) pass ;;
+    *) fail "unexpected commit contents: $TOUCHED" ;;
+  esac
+
+  it "a tap on a local-only branch is refused, and gains no branch"
+  # `rev-list --count HEAD..origin/<branch>` fell back to 0 when the upstream
+  # did not exist, so `push origin HEAD` CREATED that branch on the tap instead
+  # of updating the one people install from -- and reported success.
+  taps_fixture
+  git -C "$taps_dir/homebrew-yaw" checkout -q -b yaw-bump-2.1.4
+  OUT="$(run_taps v0.14.0)"
+  REFS="$(git -C "$taps_dir/homebrew-yaw.git" branch --format='%(refname:short)' | tr '\n' ' ')"
+  if printf '%s' "$OUT" | grep -q "has no origin/yaw-bump-2.1.4"; then
+    case "$REFS" in
+      *yaw-bump*) fail "a junk branch was created on the tap: $REFS" ;;
+      *) pass ;;
+    esac
+  else fail "a local-only branch was not refused: $OUT"; fi
+
+  it "an older tag is refused rather than silently downgrading both taps"
+  # Nothing compared the requested tag against the newest release, and the
+  # verify step confirms whatever it was told -- so a stale tag pasted from an
+  # old release log downgraded every brew and scoop user, reporting success.
+  taps_fixture
+  run_taps v0.14.0 >/dev/null
+  OUT="$(run_taps v0.13.2)"
+  if printf '%s' "$OUT" | grep -q "older than the latest published release" \
+     && printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  else fail "a downgrade was not refused: $OUT"; fi
+
+  it "a downgrade proceeds when it is asked for explicitly"
+  OUT="$(OAM_ALLOW_DOWNGRADE=1 PATH="$TAPS_BIN:$PATH" \
+        OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
+        bash "$REPO_DIR/scripts/bump-taps.sh" v0.13.2 2>&1)"
+  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"'; then pass
+  else fail "an explicitly authorized downgrade did not land: $OUT"; fi
+
+  it "an untracked file does not block a tap that is behind origin"
+  # `git rebase` does not care about untracked files, and the advice the refusal
+  # printed could not work anyway: `git stash` without -u leaves them in place,
+  # so an operator who followed it hit the identical failure.
+  taps_fixture
+  git -C "$taps_dir/homebrew-yaw" commit -q --allow-empty -m "another session's cask bump"
+  git -C "$taps_dir/homebrew-yaw" push -q origin main
+  git -C "$taps_dir/homebrew-yaw" reset -q --hard HEAD~1
+  : > "$taps_dir/homebrew-yaw/oam.rb.bak"
+  OUT="$(run_taps v0.14.0)"
+  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
+  else fail "an untracked file blocked the bump: $OUT"; fi
+
+  it "a behind tap with real uncommitted work is refused, never stashed"
+  # The other half of the same guard: the checkout is shared, so rebasing over
+  # someone's tracked changes -- or stashing them -- is never ours to do.
+  taps_fixture
+  git -C "$taps_dir/homebrew-yaw" commit -q --allow-empty -m "another session's cask bump"
+  git -C "$taps_dir/homebrew-yaw" push -q origin main
+  git -C "$taps_dir/homebrew-yaw" reset -q --hard HEAD~1
+  echo "someone is editing this" >> "$taps_dir/homebrew-yaw/Casks/yaw.rb"
+  OUT="$(run_taps v0.14.0)"
+  if ! printf '%s' "$OUT" | grep -q "Not stashing another session"; then
+    fail "a dirty shared checkout was not refused: $OUT"
+  elif git -C "$taps_dir/homebrew-yaw" diff --quiet -- Casks/yaw.rb; then
+    fail "the foreign edit was discarded"
+  else pass; fi
+
+  it "an abort reverts every un-published rewrite, in both taps"
+  # Both files are rewritten before either is published, so an abort in between
+  # left the OTHER tap rewritten and uncommitted in a shared checkout -- and the
+  # next run then refused to proceed, blaming the operator for the script's own
+  # leftover. Tripped here by a url the JSON rewriter does not touch.
+  taps_fixture
+  node -e 'const fs=require("fs"),p=process.argv[1];const d=JSON.parse(fs.readFileSync(p,"utf8"));d.notes_url="https://github.com/YawLabs/oam/releases/download/v0.9.9/NOTES";fs.writeFileSync(p,JSON.stringify(d,null,2)+"\n");' "$taps_dir/scoop-yaw/bucket/oam.json"
+  ( cd "$taps_dir/scoop-yaw" && git commit -qam "a url the rewriter does not reach" \
+    && git push -q origin main ) >/dev/null 2>&1
+  OUT="$(run_taps v0.14.0)"
+  BREW_DIRTY="$(git -C "$taps_dir/homebrew-yaw" status --porcelain --untracked-files=no | tr -d ' \r\n')"
+  SCOOP_DIRTY="$(git -C "$taps_dir/scoop-yaw" status --porcelain --untracked-files=no | tr -d ' \r\n')"
+  if printf '%s' "$OUT" | grep -q "still references a release other than v0.14.0" \
+     && [ -z "$BREW_DIRTY" ] && [ -z "$SCOOP_DIRTY" ]; then pass
+  else fail "an abort left a rewrite behind (brew=$BREW_DIRTY scoop=$SCOOP_DIRTY): $OUT"; fi
+
+  it "a missing asset hash fails closed rather than publishing a bad manifest"
+  # A wrong published hash is worse than a stale one: it teaches people to
+  # ignore a mismatch.
+  taps_fixture
+  BAD_BIN="$SUITE_TMP/taps-bin-bad"; mkdir -p "$BAD_BIN"
+  grep -v '^4444444444' "$TAPS_BIN/gh" > "$BAD_BIN/gh"
+  chmod +x "$BAD_BIN/gh"; cp "$TAPS_BIN/curl" "$BAD_BIN/curl"
+  OUT="$(PATH="$BAD_BIN:$PATH" OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" \
+        OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
+        bash "$REPO_DIR/scripts/bump-taps.sh" v0.14.0 2>&1)"
+  if printf '%s' "$OUT" | grep -q "no entry for oam-x86_64-pc-windows-msvc.exe" \
+     && printf '%s' "$(served scoop-yaw bucket/oam.json)" | grep -q '"version": "0.13.2"'; then pass
+  else fail "a missing hash did not fail closed: $OUT"; fi
+
+  it "--dry-run publishes nothing"
+  taps_fixture
+  run_taps v0.14.0 --dry-run >/dev/null
+  if printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.13.2"'; then pass
+  else fail "--dry-run published to the tap"; fi
+
+  it "a missing tap checkout exits 3, distinct from a successful bump"
+  # release-local.sh prints "taps are current" for exit 0. Conflating "skipped"
+  # with "done" put that green line directly under the `taps NOT bumped`
+  # warning, and the green one is what an operator skimming a long log keeps.
+  RC=0
+  PATH="$TAPS_BIN:$PATH" OAM_TAPS_OPTIONAL=1 \
+    OAM_HOMEBREW_DIR="$SUITE_TMP/nope-brew" OAM_SCOOP_DIR="$SUITE_TMP/nope-scoop" \
+    bash "$REPO_DIR/scripts/bump-taps.sh" v0.14.0 >/dev/null 2>&1 || RC=$?
+  eq "$RC" "3"
+
+  it "release-local.sh maps that skip code to a warning, not to a success line"
+  ck grep -q '3) warn "taps SKIPPED' "$REPO_DIR/scripts/release-local.sh"
+fi
 
 # =============================================================================
 echo
