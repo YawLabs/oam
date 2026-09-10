@@ -24,12 +24,18 @@
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
 #                                            clippy's job, enforced in step 2)
-#  11. scripts/test-scripts.sh             (GATING; the shell scripts under
+#  11. npm/ launcher packaging            (GATING when node is present --
+#                                            manifest drift against
+#                                            [workspace.package], plus the
+#                                            five node --test files under
+#                                            npm/test. Neither ran in ANY
+#                                            gate before this step existed)
+#  12. scripts/test-scripts.sh             (GATING; the shell scripts under
 #                                            scripts/ -- gc-target.sh selection
 #                                            logic, tunnel-log parsing, sshd
 #                                            detection, disk thresholds, and
 #                                            THIS script's miri-gate verdicts)
-#  12. miri aliasing models               (GATING when nightly+miri present,
+#  13. miri aliasing models               (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
 #                                            disciplines napi.rs relies on)
@@ -40,12 +46,14 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-12)
+#   ./scripts/ci-local.sh              # full gate (steps 1-13)
 #   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (7-9)
-#   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 3's, and 5)
+#   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 3's, and 5).
+#                                        Step 11's node tests are not cargo tests
+#                                        and still run -- they cost about 3s.
 #
-# Neither flag skips steps 10-12; step 12 skips itself when nightly+miri is
-# absent.
+# Neither flag skips steps 10-13; step 13 skips itself when nightly+miri is
+# absent, and step 11 skips itself with no node on PATH.
 #
 # Env:
 #   OAM_SKIP_ATTRIBUTION=1   downgrade step 9 to a warning. Step 9 fails CLOSED,
@@ -172,14 +180,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/12 Format (cargo fmt --check)"
+say "1/13 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
   ok "fmt clean"
 else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/12 Clippy (-D warnings, --all-features)"
+say "2/13 Clippy (-D warnings, --all-features)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 #
@@ -199,7 +207,7 @@ else
   ko "clippy warnings above"
 fi
 
-say "3/12 Feature-off configuration (--no-default-features)"
+say "3/13 Feature-off configuration (--no-default-features)"
 # GATING. `napi` is a DEFAULT feature of both oam_engine and oam_cli, so every
 # other step in this file compiles exactly one of the two configurations the
 # repo ships. The other one -- napi off, which drops the whole of src/napi.rs
@@ -243,7 +251,7 @@ else
   warn "napi-off tests SKIPPED (--no-tests) -- build + clippy still ran"
 fi
 
-say "4/12 Build (cargo build --workspace)"
+say "4/13 Build (cargo build --workspace)"
 clear_debug_holders
 park_link_targets
 # Captured, not streamed straight through. rustc surfaces linker diagnostics --
@@ -274,7 +282,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "5/12 Tests (cargo test --workspace)"
+  say "5/13 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -292,10 +300,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
-  say "5/12 Tests SKIPPED (--no-tests)"
+  say "5/13 Tests SKIPPED (--no-tests)"
 fi
 
-say "6/12 Smoke (oam run)"
+say "6/13 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -345,7 +353,7 @@ if [ -f target/debug/oam.exe ]; then
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "7/12 Conformance (node-differential gate)"
+  say "7/13 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -353,14 +361,14 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "8/12 Node-suite (skip-ratchet + pass-floor gate)"
+  say "8/13 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 
-  say "9/12 Attribution (THIRD_PARTY_LICENSES drift)"
+  say "9/13 Attribution (THIRD_PARTY_LICENSES drift)"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -400,10 +408,10 @@ if [ "$FAST" -eq 0 ]; then
     fi
   fi
 else
-  say "7/12 + 8/12 + 9/12 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "7/13 + 8/13 + 9/13 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "10/12 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "10/13 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -419,27 +427,68 @@ else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
 fi
 
-say "11/12 Scripts (release-orchestration shell tests)"
+say "11/13 npm launcher packaging (manifest drift + node --test)"
+# GATING, and compiles nothing -- seconds, not minutes.
+#
+# npm/ ships the `oamjs` launcher and its five per-platform binary packages, and
+# until this step NO gate touched the tree. The five test files under npm/test
+# ran nowhere; `sync-packages.mjs --check`, which exists precisely to catch a
+# manifest left behind by a version bump, was called by neither this script nor
+# release-local.sh. `npm/package.json` has declared both as `test` and `check`
+# the whole time. So a green run here said nothing at all about the npm channel,
+# and the invariant it protects held only by hand -- the exact shape of
+# gc-target.sh collecting nothing on Linux while reporting success.
+#
+# The optionalDependency pins are why this gates rather than warns: the launcher
+# pins each binary package EXACTLY (never `^`), because a launcher and its
+# binary are one artifact cut from one commit. A launcher published pinning
+# 0.13.2 while the binaries went out as 0.14.0 resolves nothing, and npm reports
+# that as "optional dependency skipped" -- an error that points at the user's
+# install rather than at ours.
+#
+# `node`, not `npm run`: these ARE npm/package.json's `check` and `test`
+# scripts, spelled without the wrapper, because npm's exit cleanup is unreliable
+# on win-arm64 (a clean script can still exit 139) and this is a pre-push gate
+# whose exit status has to mean something.
+#
+# `--no-tests` does NOT skip these: it is documented as skipping the two CARGO
+# test runs, which are minutes of compilation. This is three seconds.
+if ! command -v node >/dev/null 2>&1; then
+  warn "npm packaging gate SKIPPED -- no node on PATH (the conformance step needs it too, so a full run cannot get this far)"
+else
+  ( cd npm && node sync-packages.mjs --check ) \
+    || ko "npm/ manifests do not match Cargo.toml (above) -- regenerate with 'node npm/sync-packages.mjs' and commit the result"
+  ok "npm/ manifests match the workspace version"
+  ( cd npm && node --test "test/*.test.mjs" ) \
+    || ko "npm launcher tests failed (above) -- reproduce with: cd npm && node --test \"test/*.test.mjs\""
+  ok "npm launcher tests passed"
+fi
+
+say "12/13 Scripts (release-orchestration shell tests)"
 # GATING, and compiles nothing -- but NOT the ~2s this comment used to claim.
-# Measured 2026-08-30 on win-arm64: ~7m30s for 59 assertions. The suite is
+# Measured on win-arm64: ~7m30s for 59 assertions (2026-08-30), then ~4m20s for
+# 107 (2026-09-09, after a batch of pure-function cases). The two are not
+# comparable as a rate -- box state differs -- but the shape holds: the suite is
 # spawn-bound (each case forks a shell), so its cost tracks process-creation
 # speed, which on Windows is roughly an order of magnitude worse than on the
-# Linux/mac legs. Keep new cases cheap and prefer pure-function assertions over
-# fixtures that shell out; a case that shells out in a loop dominates the step.
+# Linux/mac legs, and the run that nearly doubled the assertion count while
+# getting FASTER did it by adding cases that spawn nothing. Keep new cases cheap
+# and prefer pure-function assertions over fixtures that shell out; a case that
+# shells out in a loop dominates the step.
 # scripts/ ships the binaries but had no gate of its own until now -- which is
 # how gc-target.sh spent its entire life collecting NOTHING on Linux while
 # reporting success (mawk interval expressions, a dot-requiring family regex,
-# and a `cd ""` no-op, all silent). Runs last because it shares no state with
-# steps 1-9: a failure here invalidates none of the Rust work above, and step 9
-# already establishes that a compile-free gate can sit at the end. Add `-v` for
-# per-case output.
+# and a `cd ""` no-op, all silent). Runs near the end because it shares no
+# state with the compile steps above: a failure here invalidates none of the
+# Rust work, and steps 9 and 11 already establish that a compile-free gate can
+# sit down here. Add `-v` for per-case output.
 if bash scripts/test-scripts.sh; then
   ok "script tests passed"
 else
   ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
 fi
 
-say "12/12 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
+say "13/13 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
 # Every aliasing claim in this repo used to be argued, never machine-checked --
 # and one candidate napi wrapper design reviewed in 2026-08-26 would have ADDED
 # UB while passing every other gate here. oam_aliasing_model closes that.

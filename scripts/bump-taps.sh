@@ -64,6 +64,13 @@ REPO="${OAM_REPO:-YawLabs/oam}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# How the final step decides whether a tap actually serves this release, and
+# why it reads past the CDN to do it. Extracted so scripts/test-scripts.sh can
+# drive the verdicts on every box -- the old inline one-liner had no coverage,
+# which is how it spent its life proving only that a version string was present.
+# shellcheck source=lib/tap-verify.sh
+. "$SCRIPT_DIR/lib/tap-verify.sh"
+
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYA='\033[1;36m'; NC='\033[0m'
 ok()  { echo -e "${GRN}  [ok]${NC} $*" >&2; }
 warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
@@ -406,34 +413,79 @@ publish_tap "$SCOOP_DIR" "$SCOOP_FILE" "Scoop manifest"
 SCOOP_PUBLISHED=1
 
 # --- verify what the taps actually serve ------------------------------------
-# raw.githubusercontent caches a push for up to ~5 minutes, so a mismatch here
-# is usually lag rather than failure. Warn-only: the push already succeeded or
-# this script would have exited.
+# CONTENT, not a version string, and read from ORIGIN rather than an edge copy.
+# Both halves of the reasoning, and the verdicts, are in lib/tap-verify.sh --
+# in short: brew and scoop install by checking the manifest's HASH, so a
+# right-version/wrong-hash manifest fails on every user's machine while a
+# version grep says green; and the documented repair path re-pushes a corrected
+# hash under the SAME version, which a cached body matches.
+#
+# Warn-only, deliberately: the push already succeeded or this script would have
+# exited, and no exit status here can unwind a published tap. What the operator
+# needs is the name of the asset to fix and the reason, not an abort.
 if [ "$DRY_RUN" = "1" ]; then exit 0; fi
-step "Verify the taps serve $VERSION"
-for spec in "homebrew-yaw/main/Formula/oam.rb" "scoop-yaw/main/bucket/oam.json"; do
-  live="$(curl -fsSL --max-time 30 "https://raw.githubusercontent.com/YawLabs/$spec" 2>/dev/null || true)"
-  if [ -z "$live" ]; then
-    warn "could not fetch $spec to verify"
-  elif printf '%s' "$live" | grep -q "\"$VERSION\""; then
-    ok "$spec serves $VERSION"
+step "Verify the taps serve $VERSION with matching hashes"
+
+# Why a served body does not match, in the order that costs least to check. CDN
+# lag was previously reported as the ONLY cause, which sent operators off to
+# wait out a cache that would never change while the real reason -- an unpushed
+# commit, or a push that landed on a non-default branch -- sat one free git
+# command away. Now that the fetch busts the cache, lag is the LAST explanation
+# rather than the first.
+tap_local_state() {
+  local vdir="$1" vbranch vahead
+  vbranch="$(git -C "$vdir" symbolic-ref --quiet --short HEAD || echo '?')"
+  vahead="$(git -C "$vdir" rev-list --count "origin/$vbranch..HEAD" 2>/dev/null || echo '?')"
+  if [ "$vahead" != "0" ] && [ "$vahead" != "?" ]; then
+    printf '%s commit(s) in %s never reached origin/%s -- push them: git -C %s push origin %s' \
+      "$vahead" "$vdir" "$vbranch" "$vdir" "$vbranch"
+  elif [ "$vbranch" != "main" ]; then
+    printf "%s is on '%s', not main -- the push went to the wrong branch" "$vdir" "$vbranch"
   else
-    # CDN lag is ONE cause and was previously reported as the only one, which
-    # sent operators off to wait out a cache that would never change while the
-    # real reason -- an unpushed commit, or a push that landed on a non-default
-    # branch -- sat one free git command away. Check the local facts first.
-    case "$spec" in
-      homebrew-yaw/*) vdir="$HOMEBREW_DIR" ;;
-      *)              vdir="$SCOOP_DIR" ;;
-    esac
-    vbranch="$(git -C "$vdir" symbolic-ref --quiet --short HEAD || echo '?')"
-    vahead="$(git -C "$vdir" rev-list --count "origin/$vbranch..HEAD" 2>/dev/null || echo '?')"
-    if [ "$vahead" != "0" ] && [ "$vahead" != "?" ]; then
-      warn "$spec does not serve $VERSION: $vahead commit(s) in $vdir never reached origin/$vbranch. Push them: git -C $vdir push origin $vbranch"
-    elif [ "$vbranch" != "main" ]; then
-      warn "$spec does not serve $VERSION: $vdir is on '$vbranch', not main -- the push went to the wrong branch."
-    else
-      warn "$spec does not serve $VERSION yet; local state looks correct, so this is most likely raw.githubusercontent's cache (~5 min)."
-    fi
+    printf '%s is on main with nothing unpushed, so the tap repo itself disagrees with SHA256SUMS (the fetch already busts the cache, so lag is unlikely)' \
+      "$vdir"
   fi
+}
+
+# One stamp for the whole step so both fetches are provably from the same
+# instant -- a per-URL `date +%s` would differ across the loop for no reason.
+CACHE_STAMP="$(date +%s)"
+for spec in "homebrew-yaw/main/Formula/oam.rb" "scoop-yaw/main/bucket/oam.json"; do
+  # Each tap serves only its own platforms, so each is verified against its own
+  # asset list. Checking the union would report a mismatch on every clean run.
+  case "$spec" in
+    homebrew-yaw/*) vdir="$HOMEBREW_DIR"; vassets=("${BREW_ASSETS[@]}") ;;
+    *)              vdir="$SCOOP_DIR";    vassets=("${SCOOP_ASSETS[@]}") ;;
+  esac
+  # asset:hash pairs, so a mismatch can name the asset instead of counting.
+  # `|| true` keeps a lookup miss out of `set -e`: an empty hash is already a
+  # miss to tap_verify_verdict, and being told WHICH asset lost its hash beats
+  # aborting the step after everything is published.
+  vpairs=()
+  for a in "${vassets[@]}"; do vpairs+=("$a:$(hash_of "$a" || true)"); done
+
+  live="$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
+    "$(tap_cache_bust "https://raw.githubusercontent.com/YawLabs/$spec" "$CACHE_STAMP")" \
+    2>/dev/null || true)"
+
+  verdict="$(tap_verify_verdict "$live" "$VERSION" "${vpairs[@]}")"
+  case "$verdict" in
+    ok)
+      ok "$spec serves $VERSION with matching hashes" ;;
+    unfetched)
+      warn "could not fetch $spec to verify" ;;
+    no-hashes)
+      # Unreachable while vpairs is built from a non-empty asset list; here so
+      # that a refactor which empties it fails loudly instead of passing on a
+      # version string.
+      warn "$spec: no expected hashes were passed, so only the version string was checked -- this step proved nothing about the content" ;;
+    version-stale)
+      warn "$spec does not serve $VERSION: $(tap_local_state "$vdir")" ;;
+    hash-mismatch*)
+      warn "$spec names $VERSION but serves a DIFFERENT hash for:${verdict#hash-mismatch}"
+      warn "  a wrong published hash is worse than none -- every brew/scoop install of $VERSION will fail its checksum"
+      warn "  $(tap_local_state "$vdir")" ;;
+    *)
+      warn "$spec: unrecognised verdict '$verdict' from tap_verify_verdict -- treat as unverified" ;;
+  esac
 done

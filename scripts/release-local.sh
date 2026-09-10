@@ -343,6 +343,12 @@ else
     || fail "main is not level with origin/main -- the bump commit would not fast-forward; pull/push first"
 
   warn "workspace version $crate_version != $TAG -- bumping Cargo.toml to $tag_version"
+  # Checked BEFORE the rewrite, not at the point of use: the npm manifests below
+  # are DERIVED from the version this block is about to write, and discovering
+  # the tool is missing halfway through would leave a bumped Cargo.toml sitting
+  # in a tree the preflight just certified clean.
+  command -v node >/dev/null 2>&1 \
+    || fail "the version bump derives the npm manifests and needs node on PATH -- or set the version in Cargo.toml, run 'node npm/sync-packages.mjs', commit, and re-run"
   # First `^version = "` line only -- that is [workspace.package], which every
   # member inherits via version.workspace = true. Rewritten through a temp file
   # OUTSIDE the repo, so a failed rewrite cannot leave an untracked file behind
@@ -365,13 +371,61 @@ else
   cargo update --workspace --offline >&2 \
     || fail "could not refresh Cargo.lock ('cargo update --workspace --offline') -- fix and re-run"
 
-  # The tree was clean coming in, so the bump's footprint should be exactly
-  # these two paths. Anything else means something ran that should not have.
-  bump_paths="$(git status --porcelain | awk '{print $2}' | sort | tr '\n' ' ')"
-  [ "$bump_paths" = "Cargo.lock Cargo.toml " ] \
-    || fail "the bump touched unexpected paths ($bump_paths) -- inspect the tree and commit yourself"
+  # The npm manifests are the SAME class of derived artifact as Cargo.lock, and
+  # were the one class this block did not carry: the six package.json versions
+  # and the launcher's five EXACT optionalDependency pins are all generated from
+  # [workspace.package]. Leaving them stale publishes a launcher pinning a
+  # version that was never released, and npm surfaces that as "optional
+  # dependency was skipped" -- an error pointing at the user's install rather
+  # than at ours.
+  #
+  # SYNC, not --check. A check here could only ever FAIL on a real bump, because
+  # the bump is precisely what makes the manifests stale; it would abort the
+  # release over a regeneration the operator then has to do by hand, mid-run, on
+  # top of a Cargo.toml this block has already rewritten. Regenerating and
+  # carrying the result in the SAME commit is what keeps the tag internally
+  # consistent. The --check half still exists -- as ci-local.sh step 11, which
+  # runs further down on the post-bump tree and covers the manual-bump path too.
+  node npm/sync-packages.mjs >&2 \
+    || fail "could not regenerate the npm manifests ('node npm/sync-packages.mjs') -- fix and re-run"
+  # Convergence, proved rather than assumed: a sync that wrote nothing (a moved
+  # targets.js, a partial write) is indistinguishable from an already-current
+  # tree from out here, and the difference is a shipped launcher pinning the
+  # previous release.
+  node npm/sync-packages.mjs --check >&2 \
+    || fail "the npm manifests still drift after a sync -- 'node npm/sync-packages.mjs --check' lists them"
 
-  git add Cargo.toml Cargo.lock || fail "could not stage the version bump"
+  # The tree was clean coming in, so the bump's footprint is Cargo.toml, the
+  # lock, and whatever the sync above derived under npm/. Anything else means
+  # something ran that should not have.
+  #
+  # npm/ is allowed as a PREFIX rather than enumerated because sync-packages.mjs
+  # owns that list -- five platform packages x (package.json + README) plus the
+  # launcher manifest -- and the --check above already proved the tree matches
+  # exactly what it generates. Enumerating it again here would be a second copy
+  # of that list, and two lists that "should" agree are two lists that will not.
+  bump_paths="$(git status --porcelain | awk '{print $2}' | sort | tr '\n' ' ')"
+  bump_unexpected=""
+  while IFS= read -r bump_path; do
+    [ -n "$bump_path" ] || continue
+    case "$bump_path" in
+      Cargo.toml | Cargo.lock | npm/*) ;;
+      *) bump_unexpected="$bump_unexpected $bump_path" ;;
+    esac
+  done <<< "$(git status --porcelain | awk '{print $2}')"
+  [ -z "$bump_unexpected" ] \
+    || fail "the bump touched unexpected paths ($bump_unexpected) -- inspect the tree and commit yourself"
+  # And the converse: an empty footprint would commit nothing while reporting a
+  # bump. The rewrite is already verified above, so this can only fire if
+  # something reverted it in between.
+  case " $bump_paths " in
+    *" Cargo.toml "*) ;;
+    *) fail "the bump left Cargo.toml unmodified -- refusing to commit a release bump that changed nothing" ;;
+  esac
+
+  # `npm` as a pathspec, so a README the sync had to CREATE is staged too; the
+  # binaries npm/stage.mjs drops into npm/oamjs-*/bin are gitignored and stay out.
+  git add Cargo.toml Cargo.lock npm || fail "could not stage the version bump"
   git commit -q -m "chore(release): bump workspace version to $tag_version" \
     || fail "could not commit the version bump"
   # Pushed here, not left local: the tag push below drags the tagged commit

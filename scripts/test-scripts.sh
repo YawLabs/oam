@@ -817,12 +817,154 @@ if [ -z "$NDF_MISSING" ]; then pass; else fail "the napi-off gate no longer cove
 # bash parse error rather than a gate verdict, and nothing else here parses it.
 it "ci-local.sh and the libs it sources parse"
 PARSE_BAD=""
-for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/lib/miri-gate.sh \
-         scripts/lib/build-locks.sh scripts/lib/crt-linkage.sh \
-         scripts/lib/iap-helpers.sh; do
+for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/release-local.sh \
+         scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
+         scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh \
+         scripts/lib/tap-verify.sh; do
   bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
 done
 if [ -z "$PARSE_BAD" ]; then pass; else fail "syntax errors in:$PARSE_BAD"; fi
+
+# --- the npm launcher channel -------------------------------------------------
+# npm/ ships the `oamjs` launcher and its five per-platform binary packages, and
+# NO gate touched the tree: `sync-packages.mjs --check` and the five node --test
+# files were declared in npm/package.json and called by nothing. A green
+# ci-local.sh therefore said nothing at all about that channel -- the same shape
+# as gc-target.sh reporting success while collecting nothing.
+
+it "the local gate runs both of npm/'s own checks"
+NPM_GATE_MISSING=""
+grep -q 'node sync-packages.mjs --check'   scripts/ci-local.sh || NPM_GATE_MISSING="$NPM_GATE_MISSING drift-check"
+grep -q 'node --test "test/\*.test.mjs"'   scripts/ci-local.sh || NPM_GATE_MISSING="$NPM_GATE_MISSING launcher-tests"
+if [ -z "$NPM_GATE_MISSING" ]; then pass; else fail "ci-local.sh no longer gates:$NPM_GATE_MISSING"; fi
+
+it "the checks the gate runs are the ones npm/package.json declares"
+# Two spellings of the same commands, in two files. If package.json's scripts
+# move and the gate keeps the old wording, the gate stops testing the thing the
+# maintainer thinks it tests -- so both have to name the same entry points.
+NPM_PKG_MISSING=""
+grep -q 'sync-packages.mjs --check' npm/package.json || NPM_PKG_MISSING="$NPM_PKG_MISSING check"
+grep -q 'node --test'               npm/package.json || NPM_PKG_MISSING="$NPM_PKG_MISSING test"
+if [ -z "$NPM_PKG_MISSING" ]; then pass; else fail "npm/package.json no longer declares:$NPM_PKG_MISSING"; fi
+
+it "the release bump REGENERATES the npm manifests, it does not merely check them"
+# The manifests are derived from [workspace.package], so the bump is exactly
+# what makes them stale. A bare --check here could only ever fail, aborting the
+# release over a regeneration the operator would then have to do by hand on top
+# of an already-rewritten Cargo.toml. Sync, prove convergence, stage, commit.
+REL_BUMP_MISSING=""
+grep -qE '^ *node npm/sync-packages\.mjs >&2'         scripts/release-local.sh || REL_BUMP_MISSING="$REL_BUMP_MISSING sync"
+grep -qE '^ *node npm/sync-packages\.mjs --check >&2' scripts/release-local.sh || REL_BUMP_MISSING="$REL_BUMP_MISSING convergence-check"
+grep -q  'git add Cargo.toml Cargo.lock npm'          scripts/release-local.sh || REL_BUMP_MISSING="$REL_BUMP_MISSING staging"
+if [ -z "$REL_BUMP_MISSING" ]; then pass; else fail "the release bump no longer:$REL_BUMP_MISSING"; fi
+
+it "the bump's footprint guard still refuses a path that is neither Cargo nor npm/"
+# Widened from an exact two-path string to a prefix rule, so the guard could
+# have been widened into uselessness. It still has to reject anything else.
+grep -q 'bump touched unexpected paths' scripts/release-local.sh \
+  && grep -qE 'Cargo\.toml \| Cargo\.lock \| npm/\*\)' scripts/release-local.sh \
+  && pass || fail "release-local.sh no longer classifies the bump's dirty paths"
+
+it "every ci-local.sh step label agrees on the step count, and none is missing"
+# A step inserted mid-file renumbers every label after it. Getting that wrong is
+# invisible -- the gate still runs, it just lies about where it is -- and the
+# only reader who notices is an operator counting "N/M" in a 15-minute log.
+# No interval expressions in the awk (mawk matches nothing for those).
+STEP_LABELS="$(awk '/^ *say "/ {
+  line = $0
+  while (match(line, /[0-9]+\/[0-9]+/)) {
+    print substr(line, RSTART, RLENGTH)
+    line = substr(line, RSTART + RLENGTH)
+  }
+}' scripts/ci-local.sh)"
+STEP_TOTALS="$(printf '%s\n' "$STEP_LABELS" | sed 's:.*/::' | sort -u | tr '\n' ' ')"
+STEP_NUMS="$(printf '%s\n' "$STEP_LABELS" | sed 's:/.*::' | sort -n -u | tr '\n' ' ')"
+STEP_TOTAL="${STEP_TOTALS% }"
+STEP_WANT=""
+i=1
+while [ "$i" -le "${STEP_TOTAL:-0}" ] 2>/dev/null; do STEP_WANT="$STEP_WANT$i "; i=$((i + 1)); done
+if [ "$STEP_TOTALS" != "$STEP_TOTAL " ]; then
+  fail "ci-local.sh step labels disagree on the total: $STEP_TOTALS"
+elif [ "$STEP_NUMS" != "$STEP_WANT" ]; then
+  fail "ci-local.sh step numbers are '$STEP_NUMS', expected '$STEP_WANT'"
+else pass; fi
+
+it "the usage block's step range matches the labels"
+ck grep -q "full gate (steps 1-$STEP_TOTAL)" scripts/ci-local.sh
+
+# =============================================================================
+group "tap-verify.sh -- what a published tap actually serves"
+# =============================================================================
+# bump-taps.sh's last step decided "did the push land?" from one grep for the
+# VERSION STRING, and had no coverage of any kind. Both of the ways that reports
+# green are asserted here, cheaply, with no spawn: a manifest naming the right
+# version with somebody else's sha256 (which fails on every brew/scoop install),
+# and a refactor that stops passing hashes at all.
+# shellcheck source=lib/tap-verify.sh
+. scripts/lib/tap-verify.sh
+
+LINUX_SHA="5555555555555555555555555555555555555555555555555555555555555555"
+OTHER_SHA="9999999999999999999999999999999999999999999999999999999999999999"
+BREW_BODY='class Oam < Formula
+  version "0.14.0"
+  url "https://github.com/YawLabs/oam/releases/download/v0.14.0/oam-x86_64-unknown-linux-gnu"
+  sha256 "5555555555555555555555555555555555555555555555555555555555555555"
+end'
+
+it "the version plus every expected hash is the only ok verdict"
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0 "oam-x86_64-unknown-linux-gnu:$LINUX_SHA")" "ok"
+
+it "the right version with the wrong hash is caught, and the asset is NAMED"
+# The defect, exactly: brew installs by checking the manifest's hash, so this
+# body is broken for every user while a version grep calls it current. Named
+# rather than counted -- "1 checksum differs" leaves the operator diffing three
+# sha256 lines by hand.
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0 "oam-x86_64-unknown-linux-gnu:$OTHER_SHA")" \
+   "hash-mismatch oam-x86_64-unknown-linux-gnu"
+
+it "every mismatching asset is named, not just the first"
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0 "mac:$OTHER_SHA" "win:$OTHER_SHA")" \
+   "hash-mismatch mac win"
+
+it "a body on another release is version-stale, decided before any hash"
+eq "$(tap_verify_verdict "$BREW_BODY" 0.13.2 "oam-x86_64-unknown-linux-gnu:$LINUX_SHA")" "version-stale"
+
+it "a version PREFIX does not count as serving that version"
+# The quotes are what make this a whole-field match: without them a tap still on
+# 0.14.0 would confirm a 0.14 release, and one on 0.1 would confirm 0.14.0's
+# predecessor by accident.
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14 "oam-x86_64-unknown-linux-gnu:$LINUX_SHA")" "version-stale"
+
+it "an empty body is unfetched -- the network, never a pass"
+eq "$(tap_verify_verdict "" 0.14.0 "oam-x86_64-unknown-linux-gnu:$LINUX_SHA")" "unfetched"
+
+it "passing no hashes at all is its own verdict, not a silent pass"
+# The version-only check that started this. A refactor that drops the pairs must
+# be LOUD; degrading quietly back to a version grep is the whole bug.
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0)" "no-hashes"
+
+it "an empty expected hash is a miss, not a substring match on everything"
+# "" is a substring of every body, so accepting one would make the check
+# unconditionally green -- a worse failure than the one it replaced.
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0 "oam-x86_64-unknown-linux-gnu:")" \
+   "hash-mismatch oam-x86_64-unknown-linux-gnu"
+
+it "a pair that lost its colon is a miss too, not a match on the asset name"
+eq "$(tap_verify_verdict "$BREW_BODY" 0.14.0 "oam-x86_64-unknown-linux-gnu")" \
+   "hash-mismatch oam-x86_64-unknown-linux-gnu"
+
+it "the cache-buster appends a query parameter to a bare url"
+eq "$(tap_cache_bust "https://raw.githubusercontent.com/YawLabs/homebrew-yaw/main/Formula/oam.rb" 1757000000)" \
+   "https://raw.githubusercontent.com/YawLabs/homebrew-yaw/main/Formula/oam.rb?nocache=1757000000"
+
+it "a url that already carries a query gets & rather than a second ?"
+eq "$(tap_cache_bust "https://example.test/x?a=1" 42)" "https://example.test/x?a=1&nocache=42"
+
+it "an omitted stamp still produces a busted url"
+case "$(tap_cache_bust https://example.test/x)" in
+  https://example.test/x\?nocache=[0-9]*) pass ;;
+  *) fail "no timestamp was appended" ;;
+esac
 
 # =============================================================================
 group "bump-taps.sh -- publishing to the package-manager taps"
@@ -1123,6 +1265,80 @@ else
 
   it "release-local.sh maps that skip code to a warning, not to a success line"
   ck grep -q '3) warn "taps SKIPPED' "$REPO_DIR/scripts/release-local.sh"
+
+  # --- what the verify step proves, end to end ------------------------------
+  # Substring assertions via `case`, not `printf ... | grep -q`: this file runs
+  # under `set -o pipefail` and grep -q exits at its FIRST match, so a large
+  # enough body SIGPIPEs the writer and a HIT reads as a miss (the #95 shape
+  # lib/tap-verify.sh's header describes).
+  has_all(){
+    local hay="$1" n; shift
+    for n in "$@"; do
+      case "$hay" in *"$n"*) ;; *) fail "missing '$n' in: $hay"; return 0 ;; esac
+    done
+    pass
+  }
+
+  # One publish, then re-runs whose publish half is a no-op and whose verify
+  # half is the thing under test. The stub serves whatever origin actually holds,
+  # so the happy case cannot pass by agreeing with a fixture nobody published.
+  taps_fixture
+  run_taps v0.14.0 >/dev/null
+  SERVE="$SUITE_TMP/taps-serve"; mkdir -p "$SERVE"
+  served homebrew-yaw Formula/oam.rb > "$SERVE/brew"
+  served scoop-yaw   bucket/oam.json > "$SERVE/scoop"
+  SBIN="$SUITE_TMP/taps-bin-serve"; mkdir -p "$SBIN"; cp "$TAPS_BIN/gh" "$SBIN/gh"
+  cat > "$SBIN/curl" <<'CURLSTUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$TAP_CURL_LOG"
+for a in "$@"; do
+  case "$a" in
+    *homebrew-yaw*) cat "$TAP_SERVE/brew"; exit 0 ;;
+    *scoop-yaw*)    cat "$TAP_SERVE/scoop"; exit 0 ;;
+  esac
+done
+exit 1
+CURLSTUB
+  chmod +x "$SBIN/curl"
+  CURL_LOG="$SUITE_TMP/taps-curl.log"
+  verify_run(){
+    TAP_CURL_LOG="$CURL_LOG" TAP_SERVE="$SERVE" PATH="$SBIN:$PATH" \
+    OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
+    STUB_LATEST=v0.14.0 \
+    bash "$REPO_DIR/scripts/bump-taps.sh" v0.14.0 2>&1
+  }
+
+  it "a tap serving this release with the published hashes verifies clean"
+  : > "$CURL_LOG"
+  OUT="$(verify_run)"
+  has_all "$OUT" \
+    "homebrew-yaw/main/Formula/oam.rb serves 0.14.0 with matching hashes" \
+    "scoop-yaw/main/bucket/oam.json serves 0.14.0 with matching hashes"
+
+  it "the verify fetch reads origin, not whatever the CDN has cached"
+  # The documented repair path re-pushes a CORRECTED HASH UNDER THE SAME
+  # VERSION. Without a cache-buster the ~5 min raw.githubusercontent copy still
+  # carries that version, so the run whose whole job was to prove the fix landed
+  # confirmed the body it was sent to replace.
+  has_all "$(cat "$CURL_LOG")" "nocache=" "Cache-Control: no-cache"
+
+  it "a right-version wrong-hash tap is caught, and the asset is named"
+  # What a version grep called green: brew resolves the url, hashes the binary
+  # and compares it to this field, so every install of 0.14.0 fails while the
+  # release log says the taps are current.
+  node -e 'const fs=require("fs"),p=process.argv[1];fs.writeFileSync(p,fs.readFileSync(p,"utf8").replace(/5555555555/,"9999999999"));' "$SERVE/brew"
+  OUT="$(verify_run)"
+  has_all "$OUT" \
+    "serves a DIFFERENT hash for: oam-x86_64-unknown-linux-gnu" \
+    "worse than none" \
+    "scoop-yaw/main/bucket/oam.json serves 0.14.0 with matching hashes"
+
+  it "an unreachable tap is reported as unfetched, never as verified"
+  OUT="$(TAP_CURL_LOG="$CURL_LOG" TAP_SERVE="$SUITE_TMP/no-such-serve" PATH="$SBIN:$PATH" \
+        OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
+        STUB_LATEST=v0.14.0 \
+        bash "$REPO_DIR/scripts/bump-taps.sh" v0.14.0 2>&1)"
+  has_all "$OUT" "could not fetch homebrew-yaw/main/Formula/oam.rb to verify"
 fi
 
 # =============================================================================

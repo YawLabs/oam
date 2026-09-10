@@ -6672,15 +6672,27 @@ async fn inspector_reconnects_after_client_disconnect() {
         listener.local_addr().unwrap().port()
     };
 
-    // A script with a deliberate pause so we have time to disconnect and
-    // reconnect before the process exits naturally.  3 s is generous; the
-    // whole test is time-boxed to 20 s, well below the CI job limit.
+    // The program has to outlive both sessions, and it waits for the DRIVER to
+    // say so rather than for a fixed sleep.  A fixed sleep is a hard deadline:
+    // "3 s is generous" is a guess about how long a disconnect/reconnect takes,
+    // and a loaded box that needs longer loses the process mid-handshake -- the
+    // second connect then fails with no product bug behind it.  The
+    // 150 x 100 ms ceiling is only the orphan guard for a driver that died
+    // without writing the sentinel, and it sits BELOW the drive timeout so a
+    // genuinely broken run ends at a specific assertion rather than at the
+    // hang guard.
     let file = write_temp(
         "inspector/reconnect.mjs",
-        "console.log('start');\n\
-         await new Promise(r => setTimeout(r, 3000));\n\
+        "import { existsSync } from 'node:fs';\n\
+         console.log('start');\n\
+         const done = process.env.OAM_TEST_DONE;\n\
+         for (let i = 0; i < 150 && !existsSync(done); i++) {\n\
+         await new Promise(r => setTimeout(r, 100));\n\
+         }\n\
          console.log('end');",
     );
+    let done = file.parent().unwrap().join("reconnect.done");
+    let _ = std::fs::remove_file(&done);
     let cache = write_temp("oam-cache-reconn/.keep", "")
         .parent()
         .unwrap()
@@ -6693,12 +6705,18 @@ async fn inspector_reconnects_after_client_disconnect() {
             file.to_str().unwrap(),
         ])
         .env("OAM_CACHE_DIR", cache)
+        .env("OAM_TEST_DONE", &done)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("oam binary spawns");
 
-    let drive = tokio::time::timeout(Duration::from_secs(20), async {
+    // Hang guard only, never the assertion.  It has to EXCEED the sum of the
+    // inner retry budgets (5 s connect + 10 s drain, twice over) or a genuine
+    // failure surfaces here as "did not time out" instead of at the specific
+    // assertion that knows what went wrong.  Still far below ci-local.sh's
+    // 900 s cargo-test ceiling.
+    let drive = tokio::time::timeout(Duration::from_secs(30), async {
         let url = format!("ws://127.0.0.1:{port}/oam");
 
         // --- First client ---
@@ -6734,8 +6752,22 @@ async fn inspector_reconnects_after_client_disconnect() {
                         break 'drain;
                     }
                 }
+                // Peer closed the socket, stream EOF, or a transport error: no
+                // further response can arrive, so stop.
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break 'drain,
                 Ok(Some(Ok(_))) => {} // ping/pong/binary
-                _ => break 'drain,    // timeout, error, or EOF
+                // A per-recv timeout is ONE TICK of this loop's 20 x 500 ms
+                // retry budget, not the end of it.  Folding it into a catch-all
+                // `_ => break` collapsed that budget to a single 500 ms
+                // deadline: the first response slower than 500 ms on a loaded
+                // box left `got_response` false and failed the assertion below
+                // with no product bug behind it.  The 30 s timeout wrapping the
+                // whole drive is the hang guard; this loop is not.
+                //
+                // Deliberately no `_` catch-all: the arms are exhaustive, so a
+                // future variant has to be classified here rather than silently
+                // inheriting `break`.
+                Err(_) => continue,
             }
         }
         assert!(got_response, "first session: no response to Runtime.enable");
@@ -6777,8 +6809,14 @@ async fn inspector_reconnects_after_client_disconnect() {
                         break 'drain2;
                     }
                 }
-                Ok(Some(Ok(_))) => {}
-                _ => break 'drain2,
+                // Peer closed the socket, stream EOF, or a transport error: no
+                // further response can arrive, so stop.
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break 'drain2,
+                Ok(Some(Ok(_))) => {} // ping/pong/binary
+                // Same split as the first drain: a timeout spends one tick of
+                // the retry budget, it does not end the loop.  See there for
+                // why the catch-all had to go.
+                Err(_) => continue,
             }
         }
 
@@ -6786,7 +6824,12 @@ async fn inspector_reconnects_after_client_disconnect() {
         second_session_ok
     });
 
-    let second_session_ok = drive.await.expect("reconnect drive did not time out");
+    let drive_result = drive.await;
+    // Written however the drive ended, and BEFORE the expect: a drive that
+    // failed must not leave the child polling out its whole ceiling, because
+    // the wait_with_output below would block for exactly that long.
+    let _ = std::fs::write(&done, b"");
+    let second_session_ok = drive_result.expect("reconnect drive did not time out");
 
     let output = child.wait_with_output().expect("child exits");
     let stdout = String::from_utf8_lossy(&output.stdout);
