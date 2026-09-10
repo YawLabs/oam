@@ -14,9 +14,10 @@ page says so specifically.
 
 Node is the compatibility baseline, and oam is measured against it rather than
 against a marketing claim: a vendored subset of Node's own test suite runs on
-every release. **429/431 on windows-aarch64, 438/440 on macos-aarch64, 439/441
-on linux-x86_64.** Both remaining failures on every platform are deliberate and
-documented in [node-divergences.md](node-divergences.md).
+every release. **439/442 (99.3%) on windows-aarch64**, the host of the receipt
+committed to this repo; the scorecard is regenerated per host, so a checkout
+built elsewhere reports its own. All three remaining failures are deliberate
+and documented in [node-divergences.md](node-divergences.md).
 
 Where oam differs:
 
@@ -111,7 +112,7 @@ boots and serves its tools.
 
 - **Beta.** Breaking changes before 1.0 are still possible and are called out in
   the changelog. There is no LTS yet.
-- **The conformance number has a denominator.** 99.5% is *pass over tests that
+- **The conformance number has a denominator.** 99.3% is *pass over tests that
   ran*; the corpus is a subset of Node's suite, and
   [node-divergences.md](node-divergences.md) explains what is excluded and why.
 - **Binaries are unsigned**, and checksummed against a published `SHA256SUMS`.

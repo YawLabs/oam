@@ -177,8 +177,34 @@
     // --------------------------------------------------- tool-use loop
     // Runs the call-tool-respond cycle for agentic workloads.
     //
+    // `chat` must return a WHOLE response, not a stream. The presets above are
+    // deliberately NOT drop-ins: openai().chat and anthropic().chat are async
+    // generators, and awaiting a generator hands back the generator itself --
+    // which has no `.content` and no `.choices`, so the loop would find no
+    // tool calls, return { text: '', iterations: 1 }, and never issue a single
+    // request. This example used to pass `anthropic(key).chat` and did exactly
+    // that, silently. The TypeError below now catches it; oam.d.ts has always
+    // said so in prose.
+    //
     //   const result = await runToolLoop({
-    //     chat: anthropic(key).chat,
+    //     chat: async (messages, options) => {
+    //       const res = await fetch('https://api.anthropic.com/v1/messages', {
+    //         method: 'POST',
+    //         headers: {
+    //           'content-type': 'application/json',
+    //           'x-api-key': key,
+    //           'anthropic-version': '2023-06-01',
+    //         },
+    //         // options carries stream:false plus any tools the loop added.
+    //         body: JSON.stringify({
+    //           model: 'claude-sonnet-4-5-20250514',
+    //           max_tokens: 4096,
+    //           messages,
+    //           ...options,
+    //         }),
+    //       });
+    //       return res.json();
+    //     },
     //     tools: [{ name: 'get_weather', ... }],
     //     messages: [{ role: 'user', content: 'What is the weather?' }],
     //     onToolCall: async ({ name, input }) => JSON.stringify({ temp: 72 }),
@@ -199,6 +225,19 @@
         if (tools?.length) options.tools = tools;
 
         const response = await chat(msgs, options);
+
+        // A streaming `chat` is the one mistake this signature invites, and it
+        // fails silently: an async generator is not a thenable, so `await`
+        // returns the generator untouched, every shape test below misses, and
+        // the caller gets an empty result having made no request at all. Say
+        // so instead.
+        if (response && typeof response[Symbol.asyncIterator] === "function") {
+          throw new TypeError(
+            "runToolLoop: `chat` returned an async iterable (a stream). It must return a " +
+              "whole response -- the chat() from openai() / anthropic() streams and is not a " +
+              "drop-in here; pass a non-streaming call of your own.",
+          );
+        }
 
         // For non-streaming responses, chat() returns the raw response.
         // Detect tool_use in Anthropic or tool_calls in OpenAI shape.

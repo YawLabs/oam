@@ -1342,6 +1342,39 @@ CURLSTUB
 fi
 
 # =============================================================================
+# The front-page conformance figures are a RECEIPT, and README.md says two
+# lines above them that receipts are "never hand-edited". They drifted anyway:
+# the docs claimed 429/431 with "both remaining failures" long after the
+# generated scorecard had moved to 439/442 with three. Nothing compared them,
+# so the wrong number read as authoritative precisely because of the sentence
+# promising it could not be.
+#
+# Parsed out of the JSON twin rather than the markdown, because that file is
+# the machine artifact the generator writes first.
+it "the README and why-oam conformance figures match the generated scorecard"
+CONF_JSON="conformance/node-suite-scorecard.json"
+if [ ! -f "$CONF_JSON" ]; then
+  skip "no scorecard at $CONF_JSON"
+else
+  # FIRST match, not the last: `byModule` repeats "pass" per module, and a
+  # greedy sed happily returns the tally of whichever module sorts last --
+  # which is how the first draft of this gate reported 22/442.
+  # No jq dependency: it is not guaranteed on a contributor's box.
+  SC_PASS=$(grep -o '"pass"[[:space:]]*:[[:space:]]*[0-9]*' "$CONF_JSON" | head -1 | grep -o '[0-9]*$')
+  SC_RUNNABLE=$(grep -o '"runnable"[[:space:]]*:[[:space:]]*[0-9]*' "$CONF_JSON" | head -1 | grep -o '[0-9]*$')
+  SC_RATIO="${SC_PASS}/${SC_RUNNABLE}"
+  CONF_STALE=""
+  for doc in README.md docs/why-oam.md; do
+    grep -q "$SC_RATIO" "$doc" || CONF_STALE="$CONF_STALE $doc"
+  done
+  if [ -z "$CONF_STALE" ]; then
+    pass
+  else
+    fail "scorecard says $SC_RATIO; not found in:$CONF_STALE"
+  fi
+fi
+
+# =============================================================================
 echo
 # A skip is carried into the summary rather than swallowed: "all N passed" on a
 # run that quietly skipped the mawk leg is the same overclaim the suite exists

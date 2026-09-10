@@ -20038,3 +20038,110 @@ oam.exit(0);
         "server died on a null body. {ctx}"
     );
 }
+
+/// `runToolLoop` is the one oam:ai export that shipped with no behavioural
+/// test, and its own doc comment showed `chat: anthropic(key).chat` -- which
+/// cannot work. The presets are async generators; awaiting a generator returns
+/// the generator, so every shape test inside the loop missed, the caller got
+/// `{ text: '', iterations: 1 }`, and because generators are lazy NO REQUEST
+/// WAS EVER MADE. Silent, and the example was the thing a reader copies.
+///
+/// Two halves here: the mistake is now loud, and the loop actually works when
+/// handed what it documents.
+#[test]
+fn oam_ai_run_tool_loop_rejects_a_stream_and_completes_a_real_tool_cycle() {
+    let file = write_temp(
+        "ai_tool_loop.mjs",
+        r#"import { runToolLoop, anthropic } from 'oam:ai';
+
+// 1. The old example's shape must now fail loudly rather than no-op.
+let threw = '';
+try {
+  await runToolLoop({
+    chat: anthropic('sk-not-used').chat,
+    tools: [{ name: 'get_weather', description: 'w', input_schema: { type: 'object' } }],
+    messages: [{ role: 'user', content: 'weather?' }],
+    onToolCall: async () => 'unused',
+  });
+} catch (err) {
+  threw = String(err && err.message);
+}
+console.log('STREAM_REJECTED=' + String(threw.includes('async iterable')));
+console.log('NAMES_THE_FIX=' + String(threw.includes('non-streaming')));
+
+// 2. The documented contract, exercised end to end: a whole-response chat,
+//    one tool_use round, then a final text answer. No network -- the point is
+//    the loop's own call/respond bookkeeping.
+const seen = [];
+let turn = 0;
+const result = await runToolLoop({
+  chat: async (messages, options) => {
+    turn += 1;
+    seen.push({ turn, count: messages.length, hasTools: Array.isArray(options.tools), stream: options.stream });
+    if (turn === 1) {
+      return {
+        content: [
+          { type: 'text', text: 'checking. ' },
+          { type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'SF' } },
+        ],
+      };
+    }
+    return { content: [{ type: 'text', text: 'It is 72F.' }] };
+  },
+  tools: [{ name: 'get_weather', description: 'w', input_schema: { type: 'object' } }],
+  messages: [{ role: 'user', content: 'weather in SF?' }],
+  onToolCall: async ({ id, name, input }) => {
+    seen.push({ tool: name, id, city: input.city });
+    return JSON.stringify({ temp: 72 });
+  },
+});
+
+console.log('TEXT=' + result.text);
+console.log('ITERATIONS=' + result.iterations);
+console.log('TOOL_RAN=' + String(seen.some((s) => s.tool === 'get_weather')));
+console.log('TOOL_GOT_INPUT=' + String(seen.some((s) => s.city === 'SF')));
+// The loop must force stream:false, and must grow the transcript with the
+// assistant turn plus the tool_result before asking again.
+console.log('FORCED_NON_STREAM=' + String(seen[0].stream === false));
+console.log('TRANSCRIPT_GREW=' + String(seen[0].count === 1 && seen.find((s) => s.turn === 2).count > 1));
+"#,
+    );
+
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains("STREAM_REJECTED=true"),
+        "a streaming chat was not rejected. {ctx}"
+    );
+    assert!(
+        stdout.contains("NAMES_THE_FIX=true"),
+        "the error does not name the fix. {ctx}"
+    );
+    assert!(
+        stdout.contains("TEXT=It is 72F."),
+        "the loop did not return the final text. {ctx}"
+    );
+    assert!(
+        stdout.contains("ITERATIONS=2"),
+        "the loop did not run two turns. {ctx}"
+    );
+    assert!(
+        stdout.contains("TOOL_RAN=true"),
+        "onToolCall never ran. {ctx}"
+    );
+    assert!(
+        stdout.contains("TOOL_GOT_INPUT=true"),
+        "the tool did not receive its input. {ctx}"
+    );
+    assert!(
+        stdout.contains("FORCED_NON_STREAM=true"),
+        "stream:false was not forced. {ctx}"
+    );
+    assert!(
+        stdout.contains("TRANSCRIPT_GREW=true"),
+        "the tool_result was not fed back. {ctx}"
+    );
+}
