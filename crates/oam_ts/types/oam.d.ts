@@ -136,6 +136,21 @@ declare module "oam:mcp" {
     port?: number;
     /** http only. Defaults to "127.0.0.1". */
     host?: string;
+    /** http only. Browser origins permitted to reach this server, e.g.
+     *  `["http://localhost:5173"]`.
+     *
+     *  EMPTY BY DEFAULT, and that default is the security property. Binding
+     *  127.0.0.1 does not keep a browser out: any page the developer visits
+     *  can POST to a localhost server, and a CORS-simple request needs no
+     *  preflight, so a tool call lands even though the page cannot read the
+     *  reply -- and MCP tools have side effects. A request carrying an
+     *  `Origin` not named here is refused with 403 before routing, which also
+     *  blocks DNS rebinding.
+     *
+     *  A request with NO Origin header is allowed: that is every non-browser
+     *  client. Browsers always send one cross-origin, so its absence is not
+     *  something a page can arrange. */
+    allowedOrigins?: string[];
   }
 
   /** What `serve()` resolves to on the http transport. `server` is the

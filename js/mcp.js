@@ -118,7 +118,11 @@
           return this.#serveStdio();
         }
         if (transport === "http") {
-          return this.#serveHttp(opts.port || parseInt(process.env.PORT, 10) || 3000, opts.host || "127.0.0.1");
+          return this.#serveHttp(
+            opts.port || parseInt(process.env.PORT, 10) || 3000,
+            opts.host || "127.0.0.1",
+            opts.allowedOrigins,
+          );
         }
         throw new Error(`unknown transport: ${transport}`);
       }
@@ -144,6 +148,24 @@
       }
 
       async #handleSingle(message) {
+        // A JSON-RPC message must be an object. `JSON.parse` happily returns
+        // null, a number or a string for a well-formed body, and reading `.id`
+        // off null throws -- which on the HTTP transports lands in an
+        // un-awaited async `createServer` callback and takes the whole runtime
+        // down with OAM-RT0004. On the SSE path the 202 has already been sent,
+        // so the client sees success against a server that is now dead.
+        //
+        // Guarding HERE rather than in each transport fixes stdio, SSE and
+        // streamable-HTTP at once, and answers with the envelope the spec asks
+        // for instead of a dropped connection.
+        if (message === null || typeof message !== "object" || Array.isArray(message)) {
+          return {
+            jsonrpc: JSONRPC,
+            id: null,
+            error: { code: -32600, message: "invalid request: message must be an object" },
+          };
+        }
+
         const id = message.id;
         const method = message.method;
         const params = message.params || {};
@@ -392,31 +414,89 @@
 
       // ---- HTTP + SSE transport ----
 
-      async #serveHttp(port, host) {
+      async #serveHttp(port, host, allowedOrigins) {
         const { createServer } = __oamNode.get("http");
         const sessions = new Map();
-        let nextSessionId = 1;
+        const allowed = normalizeOrigins(allowedOrigins);
 
         const server = createServer(async (req, res) => {
-          const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+          try {
+            // ORIGIN GATE, before any routing.
+            //
+            // This server binds 127.0.0.1 and detectTransport() picks HTTP
+            // whenever stdin is a TTY -- so a plain interactive `oam run
+            // server.js` is listening on localhost by default. "Only local"
+            // is not a boundary against a BROWSER: any page the developer
+            // visits can POST here, and a CORS-simple request does not need
+            // preflight, so the tool call lands even though the attacker
+            // cannot read the reply. Blind is not harmless -- MCP tools have
+            // side effects, which is the point of them. The same check also
+            // blocks DNS rebinding, where the Host header is the attacker's
+            // own name resolved to 127.0.0.1.
+            //
+            // A request with NO Origin header is allowed: that is every
+            // non-browser client (a real MCP client, curl, a test). Browsers
+            // always send Origin on a cross-origin request, so the absence of
+            // one is not something a page can arrange.
+            const origin = req.headers.origin;
+            if (typeof origin === "string" && origin !== "" && !allowed.has(origin.toLowerCase())) {
+              res.writeHead(403, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  jsonrpc: JSONRPC,
+                  id: null,
+                  error: {
+                    code: -32600,
+                    message:
+                      "forbidden origin: pass allowedOrigins to serve() to permit a browser origin",
+                  },
+                }),
+              );
+              return;
+            }
 
-          if (req.method === "GET" && url.pathname === "/sse") {
-            return this.#handleSseConnect(req, res, sessions, nextSessionId++);
-          }
-          if (req.method === "POST" && url.pathname === "/message") {
-            return this.#handleSseMessage(req, res, sessions, url);
-          }
-          if (req.method === "POST" && url.pathname === "/mcp") {
-            return this.#handleStreamableHttp(req, res);
-          }
-          if (req.method === "GET" && url.pathname === "/health") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok", server: this.#name, version: this.#version }));
-            return;
-          }
+            const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-          res.writeHead(404);
-          res.end("not found");
+            if (req.method === "GET" && url.pathname === "/sse") {
+              return this.#handleSseConnect(req, res, sessions, crypto.randomUUID());
+            }
+            if (req.method === "POST" && url.pathname === "/message") {
+              return await this.#handleSseMessage(req, res, sessions, url);
+            }
+            if (req.method === "POST" && url.pathname === "/mcp") {
+              return await this.#handleStreamableHttp(req, res);
+            }
+            if (req.method === "GET" && url.pathname === "/health") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "ok", server: this.#name, version: this.#version }));
+              return;
+            }
+
+            res.writeHead(404);
+            res.end("not found");
+          } catch (err) {
+            // Nothing may escape this callback. It is async and nobody awaits
+            // it, so an unhandled rejection here is a dead runtime rather than
+            // a failed request. The handlers write their own responses, hence
+            // the headersSent check before writing another.
+            try {
+              process.stderr.write(`oam:mcp request failed: ${String((err && err.message) || err)}\n`);
+            } catch {}
+            try {
+              if (!res.headersSent) {
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(
+                  JSON.stringify({
+                    jsonrpc: JSONRPC,
+                    id: null,
+                    error: { code: -32603, message: "internal error" },
+                  }),
+                );
+              } else {
+                res.end();
+              }
+            } catch {}
+          }
         });
 
         return new Promise((resolve, reject) => {
@@ -453,7 +533,11 @@
       }
 
       async #handleSseMessage(req, res, sessions, url) {
-        const sessionId = parseInt(url.searchParams.get("sessionId"), 10);
+        // A string, verbatim. The id used to be an incrementing integer, which
+        // a caller who reached this endpoint could simply guess -- and the
+        // `parseInt` meant `?sessionId=1abc` resolved to session 1. It is a
+        // randomUUID now, so possession of the id is worth something.
+        const sessionId = url.searchParams.get("sessionId") || "";
         const session = sessions.get(sessionId);
         if (!session) {
           res.writeHead(404);
@@ -513,6 +597,21 @@
     }
 
     // ---- helpers ----
+
+    /** Build the allowed-origin set for the HTTP transport.
+     *
+     *  Empty by default: no browser origin is trusted unless the embedder
+     *  names one. Compared lowercased, since Origin is case-insensitive in
+     *  scheme and host. */
+    function normalizeOrigins(list) {
+      const out = new Set();
+      if (!list) return out;
+      const items = Array.isArray(list) ? list : [list];
+      for (const item of items) {
+        if (typeof item === "string" && item !== "") out.add(item.toLowerCase());
+      }
+      return out;
+    }
 
     function detectTransport() {
       try {

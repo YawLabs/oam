@@ -19926,3 +19926,115 @@ fn fs_promises_wrapper_preserves_glob_callbacks_and_paths() {
         "the ops outside the original conversion range must accept a URL path: {stdout}"
     );
 }
+
+/// The HTTP MCP transport binds 127.0.0.1, and `detectTransport()` picks it
+/// whenever stdin is a TTY -- so an ordinary interactive `oam run server.js`
+/// is listening on localhost by default. "Only local" is not a boundary
+/// against a browser: any page the developer visits can POST here, and a
+/// CORS-simple request needs no preflight, so the tool call lands even though
+/// the attacker cannot read the reply. MCP tools have side effects; blind is
+/// not harmless. The same gate blocks DNS rebinding.
+///
+/// Also pinned here: a body of `null` is well-formed JSON, and reading `.id`
+/// off it used to throw INSIDE an un-awaited async createServer callback,
+/// which killed the whole runtime (OAM-RT0004). On the SSE path the 202 had
+/// already been sent, so a client saw success against a dead server.
+///
+/// One script, because the point of the last case is that the SERVER IS STILL
+/// ALIVE afterwards -- which only a later request through the same process can
+/// show.
+#[test]
+fn mcp_http_rejects_foreign_origins_and_survives_a_null_body() {
+    let file = write_temp(
+        "mcp_http_origin.js",
+        r#"
+import { McpServer } from 'oam:mcp';
+
+const server = new McpServer({ name: 'gate', version: '1.0.0' });
+server.tool('ping', { handler: async () => 'pong' });
+
+// Port 0 -> the OS picks a free one, so the test cannot collide with
+// whatever else is listening on this machine.
+const { port } = await server.serve({
+  transport: 'http',
+  port: 0,
+  allowedOrigins: ['http://trusted.example'],
+});
+
+const base = `http://127.0.0.1:${port}`;
+const init = {
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } },
+};
+
+async function post(body, origin) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (origin) headers['Origin'] = origin;
+  const res = await fetch(`${base}/mcp`, { method: 'POST', headers, body: JSON.stringify(body) });
+  return { status: res.status, text: await res.text() };
+}
+
+// 1. A browser origin nobody allowed is refused before routing.
+const evil = await post(init, 'http://evil.example');
+console.log('EVIL_STATUS', evil.status);
+
+// 2. No Origin at all is a non-browser client: allowed.
+const plain = await post(init);
+console.log('PLAIN_STATUS', plain.status);
+console.log('PLAIN_HAS_RESULT', String(plain.text.includes('"result"')));
+
+// 3. An origin the embedder named is allowed.
+const trusted = await post(init, 'http://trusted.example');
+console.log('TRUSTED_STATUS', trusted.status);
+
+// 4. A `null` body: answered, not fatal.
+const nullBody = await post(null);
+console.log('NULL_STATUS', nullBody.status);
+console.log('NULL_HAS_32600', String(nullBody.text.includes('-32600')));
+
+// 5. THE POINT: the server is still serving. Before the guard this request
+//    never got an answer, because step 4 took the runtime down.
+const after = await post(init);
+console.log('ALIVE_AFTER_NULL', String(after.status === 200));
+
+server.close?.();
+oam.exit(0);
+"#,
+    );
+
+    let out = oam(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let ctx = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains("EVIL_STATUS 403"),
+        "foreign origin not refused. {ctx}"
+    );
+    assert!(
+        stdout.contains("PLAIN_STATUS 200"),
+        "no-Origin client refused. {ctx}"
+    );
+    assert!(
+        stdout.contains("PLAIN_HAS_RESULT true"),
+        "no-Origin client got no result. {ctx}"
+    );
+    assert!(
+        stdout.contains("TRUSTED_STATUS 200"),
+        "allowlisted origin refused. {ctx}"
+    );
+    assert!(
+        stdout.contains("NULL_STATUS 200"),
+        "null body not answered. {ctx}"
+    );
+    assert!(
+        stdout.contains("NULL_HAS_32600 true"),
+        "null body got no -32600 envelope. {ctx}"
+    );
+    assert!(
+        stdout.contains("ALIVE_AFTER_NULL true"),
+        "server died on a null body. {ctx}"
+    );
+}
