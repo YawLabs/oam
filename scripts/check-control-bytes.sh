@@ -20,6 +20,14 @@
 # so the change is not merely easy to overlook -- it is unviewable in the tool
 # the reviewer is using.
 #
+# WHY NOT `git grep`: the obvious one-liner is a false-clean trap. `git grep -I`
+# skips files git considers BINARY, and a file containing a NUL is exactly what
+# git calls binary -- so `-I` skips precisely the files this gate is hunting and
+# reports success. Measured on a planted NUL: `-I` finds nothing, `-a` finds it.
+# Using `-a` instead then matches every real image and archive, so the binary
+# question has to be answered deliberately rather than delegated. That is what
+# the node pass below does, and why it does not shell out per file.
+#
 # Usage:
 #   scripts/check-control-bytes.sh              # scan tracked files
 #   scripts/check-control-bytes.sh --staged     # scan staged content only
@@ -37,7 +45,7 @@ case "${1:-}" in
   "") ;;
   --staged) MODE="staged" ;;
   -h | --help)
-    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
@@ -53,68 +61,83 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 
 cd "$(git rev-parse --show-toplevel)"
 
-# The whole scan is one `git grep`, which is why this costs ~0.5s on an
-# 859-file tree rather than the ~10 minutes a per-file `od` loop took.
-#
-# Three flags carry the weight:
-#   -I  skips files git considers binary, so images and archives cost nothing
-#       and need no extension denylist to maintain.
-#   -P  gives PCRE byte ranges. The BRE/ERE fallback cannot express \x00.
-#   -n  gives line numbers, so a finding is actionable rather than "somewhere
-#       in this 4000-line file".
-#
-# The range is every C0 byte EXCEPT tab (09), LF (0a) and CR (0d) -- the three
-# that legitimately appear in text.
-PATTERN='[\x00-\x08\x0b\x0c\x0e-\x1f]'
+command -v node >/dev/null 2>&1 || {
+  # A gate that cannot run must say so rather than report clean.
+  echo "check-control-bytes: node not on PATH; cannot scan" >&2
+  exit 2
+}
 
-if ! git grep -qP '' -- . >/dev/null 2>&1; then
-  # -P needs a git built with PCRE. Degrade honestly: a gate that cannot run
-  # must say so, not report clean.
-  echo "  n/a -- this git has no PCRE support (-P); cannot scan for control bytes" >&2
-  exit 0
-fi
+MODE="$MODE" node --input-type=module -e '
+import { execFileSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import { extname } from "node:path";
 
-if [ "$MODE" = "staged" ]; then
-  # --cached scans the INDEX, which is what a pre-commit gate must check: the
-  # working tree can differ from what is about to be committed.
-  hits=$(git grep -I -n -P --cached "$PATTERN" -- . 2>/dev/null || true)
-else
-  hits=$(git grep -I -n -P "$PATTERN" -- . 2>/dev/null || true)
-fi
+const staged = process.env.MODE === "staged";
 
-[ -z "$hits" ] && exit 0
+// Bytes that legitimately appear in text.
+const OK = new Set([0x09, 0x0a, 0x0d]);
 
-# Drop any file carrying the opt-out marker. Done here rather than in the grep
-# so the marker can sit anywhere in the file.
-found=0
-while IFS= read -r line; do
-  [ -n "$line" ] || continue
-  file="${line%%:*}"
-  if [ "$MODE" = "staged" ]; then
-    marker=$(git show ":$file" 2>/dev/null | grep -cF 'control-byte-ok' || true)
-  else
-    marker=$(grep -cF 'control-byte-ok' "$file" 2>/dev/null || true)
-  fi
-  [ "${marker:-0}" -gt 0 ] && continue
-  if [ "$found" -eq 0 ]; then
-    echo "Raw control bytes in tracked text:"
-    found=1
-  fi
-  # Print file:line only. The matched LINE is deliberately not echoed -- it
-  # contains the control byte, and printing it re-injects the escape into the
-  # reader's terminal, which is the mess this gate exists to stop.
-  echo "  ${line%%:*}:$(printf '%s' "$line" | cut -d: -f2)"
-done <<< "$hits"
+// A DENYLIST of binary extensions rather than an allowlist of text: a text
+// extension nobody listed should still be scanned. The cost of scanning
+// something unexpected is one loud finding a human can waive with the marker;
+// the cost of skipping is silence, which is the failure this gate exists for.
+const BINARY = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp",
+  ".pdf", ".zip", ".gz", ".tgz", ".xz", ".bz2", ".7z", ".tar",
+  ".woff", ".woff2", ".ttf", ".otf", ".eot",
+  ".wasm", ".node", ".exe", ".dll", ".dylib", ".so", ".a", ".rlib", ".pdb",
+  ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg", ".snap",
+]);
 
-[ "$found" -eq 0 ] && exit 0
+const listArgs = staged
+  ? ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"]
+  : ["ls-files", "-z"];
+const files = execFileSync("git", listArgs, { maxBuffer: 64 * 1024 * 1024 })
+  .toString("utf8")
+  .split("\0")
+  .filter(Boolean);
 
-cat >&2 <<'EOF'
+const hits = [];
+for (const f of files) {
+  if (BINARY.has(extname(f).toLowerCase())) continue;
 
-These are invisible in a terminal, make `git diff` report the file as binary
+  let buf;
+  try {
+    // Read the INDEX in staged mode: the working tree can differ from what is
+    // about to be committed, and the commit is what the gate is about.
+    buf = staged
+      ? execFileSync("git", ["show", `:${f}`], { maxBuffer: 64 * 1024 * 1024 })
+      : (existsSync(f) ? readFileSync(f) : null);
+  } catch {
+    continue; // unreadable, a submodule, a broken symlink -- not this gate.
+  }
+  if (!buf) continue;
+
+  let bad = -1;
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if (b < 0x20 && !OK.has(b)) { bad = i; break; }
+  }
+  if (bad < 0) continue;
+  if (buf.includes("control-byte-ok")) continue;
+
+  // Line number, so the finding is actionable. The matched line itself is
+  // deliberately NOT printed -- it carries the control byte, and echoing it
+  // re-injects the escape into the readers terminal.
+  let line = 1;
+  for (let i = 0; i < bad; i++) if (buf[i] === 0x0a) line++;
+  hits.push(`  ${f}:${line}  byte 0x${buf[bad].toString(16).padStart(2, "0")} at offset ${bad}`);
+}
+
+if (hits.length === 0) process.exit(0);
+console.error("Raw control bytes in tracked text:");
+for (const h of hits) console.error(h);
+console.error(`
+These are invisible in a terminal, make \`git diff\` report the file as binary
 (so the change cannot be reviewed), and are valid inside a string literal --
 so fmt, clippy and the tests all pass with them present.
 
 Build such a byte from a numeric code point rather than typing an escape, or
-add the marker control-byte-ok to the file if it is deliberate.
-EOF
-exit 1
+add the marker control-byte-ok to the file if it is deliberate.`);
+process.exit(1);
+'
