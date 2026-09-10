@@ -5,37 +5,42 @@
 # Runs the same checks ci.yml used to run on every push to main / PR, on the
 # local platform (the daily-driver dev box is win-arm64, the one target the
 # hosted runners never covered anyway):
-#   1. cargo fmt --all --check
-#   2. cargo clippy --workspace --all-targets -- -D warnings
-#   3. --no-default-features build + clippy + test  (GATING; the napi-off
+#   1. scripts/check-control-bytes.sh     (GATING; raw C0 bytes in tracked
+#                                            text -- nothing else here can see
+#                                            one, and it runs first because a
+#                                            finding invalidates the build
+#                                            behind it)
+#   2. cargo fmt --all --check
+#   3. cargo clippy --workspace --all-targets -- -D warnings
+#   4. --no-default-features build + clippy + test  (GATING; the napi-off
 #                                            configuration, which nothing else
 #                                            here compiles -- see below)
-#   4. cargo build --workspace
-#   5. cargo test --workspace          (15-min ceiling where `timeout` exists)
-#   6. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
-#   7. cargo run -p xtask -- conformance    (node-differential gate + builtin
+#   5. cargo build --workspace
+#   6. cargo test --workspace          (15-min ceiling where `timeout` exists)
+#   7. smoke: ./target/debug/oam run   (expects "ci smoke 42", byte-identical)
+#   8. cargo run -p xtask -- conformance    (node-differential gate + builtin
 #                                            export-parity ratchet; GATING)
-#   8. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
+#   9. cargo run -p xtask -- node-suite     (skip-ratchet gate; pass-rate is
 #                                            advisory, only a ratchet violation
 #                                            fails -- node-compat.yml parity)
-#   9. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
+#  10. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
 #                                            is installed -- see below)
-#  10. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
+#  11. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
-#                                            clippy's job, enforced in step 2)
-#  11. npm/ launcher packaging            (GATING when node is present --
+#                                            clippy's job, enforced in step 3)
+#  12. npm/ launcher packaging            (GATING when node is present --
 #                                            manifest drift against
 #                                            [workspace.package], plus the
 #                                            five node --test files under
 #                                            npm/test. Neither ran in ANY
 #                                            gate before this step existed)
-#  12. scripts/test-scripts.sh             (GATING; the shell scripts under
+#  13. scripts/test-scripts.sh             (GATING; the shell scripts under
 #                                            scripts/ -- gc-target.sh selection
 #                                            logic, tunnel-log parsing, sshd
 #                                            detection, disk thresholds, and
 #                                            THIS script's miri-gate verdicts)
-#  13. miri aliasing models               (GATING when nightly+miri present,
+#  14. miri aliasing models               (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
 #                                            disciplines napi.rs relies on)
@@ -46,17 +51,17 @@
 # cross-platform sweep outside a release, use scripts/node-compat-measure.sh.
 #
 # Usage:
-#   ./scripts/ci-local.sh              # full gate (steps 1-13)
-#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (7-9)
-#   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 3's, and 5).
-#                                        Step 11's node tests are not cargo tests
+#   ./scripts/ci-local.sh              # full gate (steps 1-14)
+#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (8-10)
+#   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 4's, and 6).
+#                                        Step 12's node tests are not cargo tests
 #                                        and still run -- they cost about 3s.
 #
-# Neither flag skips steps 10-13; step 13 skips itself when nightly+miri is
-# absent, and step 11 skips itself with no node on PATH.
+# Neither flag skips steps 1 or 11-14; step 14 skips itself when nightly+miri
+# is absent, and step 12 skips itself with no node on PATH.
 #
 # Env:
-#   OAM_SKIP_ATTRIBUTION=1   downgrade step 9 to a warning. Step 9 fails CLOSED,
+#   OAM_SKIP_ATTRIBUTION=1   downgrade step 10 to a warning. Step 10 fails CLOSED,
 #                            so an offline box (cargo-about resolves some license
 #                            texts over the network) cannot push without this.
 #
@@ -108,7 +113,7 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # shellcheck source=lib/crt-linkage.sh
 . scripts/lib/crt-linkage.sh
 
-# Step 12's pass/fail decision, extracted so scripts/test-scripts.sh can drive
+# Step 14's pass/fail decision, extracted so scripts/test-scripts.sh can drive
 # it with captured miri output on boxes that have no nightly toolchain (which
 # is most of them). Rationale for every verdict is in the lib's header.
 # shellcheck source=lib/miri-gate.sh
@@ -194,11 +199,22 @@ say "1/14 Control bytes (raw C0 in tracked text)"
 # Relative, because line 76 already cd'd to the repo root. A "$REPO_ROOT/..."
 # spelling would expand to "/scripts/..." here -- this script defines no such
 # variable, and `set -u` does not catch it inside a quoted expansion.
-if bash scripts/check-control-bytes.sh; then
-  ok "no raw control bytes"
-else
-  ko "raw control bytes above -- see the fix line in the report"
-fi
+# Exit code 2 is "the gate could not RUN" (no node on PATH), which is a
+# different fact from "the gate found something" and must not be reported as
+# the latter -- a scanner that cannot run is the false-clean shape this whole
+# step exists to guard, and mislabelling it sends the reader looking for a
+# control byte that does not exist. It is a WARN rather than a hard fail so
+# that a Rust-only box without node can still run the other thirteen steps;
+# node is already a soft dependency here (step 12 skips itself without it).
+set +e
+bash scripts/check-control-bytes.sh
+control_rc=$?
+set -e
+case "$control_rc" in
+  0) ok "no raw control bytes" ;;
+  2) warn "control-byte scan could not run (needs node on PATH) -- NOT a clean result" ;;
+  *) ko "raw control bytes above -- see the fix line in the report" ;;
+esac
 
 say "2/14 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
@@ -211,7 +227,7 @@ say "3/14 Clippy (-D warnings, --all-features)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 #
-# --all-features is load-bearing for step 10. The unsafe-budget scanner is
+# --all-features is load-bearing for step 11. The unsafe-budget scanner is
 # LEXICAL -- it counts every `unsafe` under src/ and tests/ whether or not the
 # current feature set compiles it. Without --all-features the 12 ConPTY unsafe
 # blocks in crates/oam_cli/tests/e2e.rs (cfg(all(windows, feature =
@@ -240,7 +256,7 @@ say "4/14 Feature-off configuration (--no-default-features)"
 #
 # Runs HERE, before the default build, on purpose. `cargo test -p oam_cli`
 # builds the package's bin targets, so this step leaves target/debug/oam.exe
-# holding a napi-LESS binary; step 4's `cargo build --workspace` relinks it with
+# holding a napi-LESS binary; step 5's `cargo build --workspace` relinks it with
 # default features immediately after. Ordering it later would hand the smoke,
 # conformance and node-suite steps the wrong binary, or leave one behind for
 # the developer after a green run.
@@ -346,7 +362,7 @@ else
   ko "smoke output unexpected: '$out'"
 fi
 
-# Still step 6: running is necessary but not sufficient. This box has the VC++
+# Still step 7: running is necessary but not sufficient. This box has the VC++
 # redistributable (every box with Visual Studio does), so a binary that imports
 # the dynamic CRT smokes green here and dies on a clean end-user machine. Only
 # an import check catches that, and only on the Windows leg -- elsewhere there
@@ -438,7 +454,7 @@ say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # above its unsafe_count ceiling -- OR any count strictly BELOW the committed
 # baseline (which must be re-blessed) -- fails here. The old documented_count
 # FLOOR is retired: it conflicted with clippy's unnecessary_safety_comment, and
-# per-site justification is now denied-by-lint on every crate (step 2).
+# per-site justification is now denied-by-lint on every crate (step 3).
 # Baseline: conformance/unsafe-budget.json; regen with
 # `cargo run -p xtask -- unsafe-budget --regen`.
 if cargo run -p xtask -- unsafe-budget; then
@@ -500,7 +516,7 @@ say "13/14 Scripts (release-orchestration shell tests)"
 # reporting success (mawk interval expressions, a dot-requiring family regex,
 # and a `cd ""` no-op, all silent). Runs near the end because it shares no
 # state with the compile steps above: a failure here invalidates none of the
-# Rust work, and steps 9 and 11 already establish that a compile-free gate can
+# Rust work, and steps 10 and 12 already establish that a compile-free gate can
 # sit down here. Add `-v` for per-case output.
 if bash scripts/test-scripts.sh; then
   ok "script tests passed"

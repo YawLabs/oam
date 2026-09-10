@@ -32,11 +32,16 @@
 #   scripts/check-control-bytes.sh              # scan tracked files
 #   scripts/check-control-bytes.sh --staged     # scan staged content only
 #
-# Exit 0 clean, 1 on a finding, 2 on a usage error.
+# Exit 0 clean, 1 on a finding, 2 when the gate could not RUN (bad usage, not a
+# git repo, node absent). The caller must not report a 2 as clean -- a scanner
+# that could not run is the false-clean shape this whole gate exists to guard.
 #
-# Escape hatch: `control-byte-ok` anywhere in the file skips it, for the rare
-# case where the byte is the point. Deliberately in-band rather than a path
-# list, so the justification lives beside the bytes it excuses.
+# Escape hatch: a line reading `control-byte-ok: allow` (in a comment, anywhere
+# in the file) skips that file, for the rare case where the byte is the point.
+# Deliberately in-band rather than a path list, so the justification lives
+# beside the bytes it excuses -- and deliberately a DECLARATION rather than a
+# bare mention, so that a file merely discussing the marker (this script, a
+# rule doc, a commit-message fixture) does not silently become unscannable.
 
 set -uo pipefail
 
@@ -45,7 +50,7 @@ case "${1:-}" in
   "") ;;
   --staged) MODE="staged" ;;
   -h | --help)
-    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
@@ -69,7 +74,7 @@ command -v node >/dev/null 2>&1 || {
 
 MODE="$MODE" node --input-type=module -e '
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { extname } from "node:path";
 
 const staged = process.env.MODE === "staged";
@@ -81,13 +86,24 @@ const OK = new Set([0x09, 0x0a, 0x0d]);
 // extension nobody listed should still be scanned. The cost of scanning
 // something unexpected is one loud finding a human can waive with the marker;
 // the cost of skipping is silence, which is the failure this gate exists for.
+//
+// `.snap` is deliberately NOT here. A snapshot file is text, and in a JS
+// runtime repo it is the format most likely to have captured a raw escape byte
+// from some tool output -- denylisting it would skip exactly the file this
+// gate is for.
 const BINARY = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp",
   ".pdf", ".zip", ".gz", ".tgz", ".xz", ".bz2", ".7z", ".tar",
   ".woff", ".woff2", ".ttf", ".otf", ".eot",
   ".wasm", ".node", ".exe", ".dll", ".dylib", ".so", ".a", ".rlib", ".pdb",
-  ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg", ".snap",
+  ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
 ]);
+
+// A DECLARATION, not a mention. Anchored to its own line and requiring the
+// `: allow` suffix, so a file that merely talks about the marker keeps being
+// scanned. Matched against a latin1 decode so a NUL in the buffer cannot
+// terminate the search early.
+const ALLOW_MARKER = /(^|[\r\n])[^\r\n]{0,80}control-byte-ok:\s*allow/i;
 
 const listArgs = staged
   ? ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"]
@@ -98,20 +114,39 @@ const files = execFileSync("git", listArgs, { maxBuffer: 64 * 1024 * 1024 })
   .filter(Boolean);
 
 const hits = [];
+const unreadable = [];
 for (const f of files) {
   if (BINARY.has(extname(f).toLowerCase())) continue;
 
-  let buf;
-  try {
-    // Read the INDEX in staged mode: the working tree can differ from what is
-    // about to be committed, and the commit is what the gate is about.
-    buf = staged
-      ? execFileSync("git", ["show", `:${f}`], { maxBuffer: 64 * 1024 * 1024 })
-      : (existsSync(f) ? readFileSync(f) : null);
-  } catch {
-    continue; // unreadable, a submodule, a broken symlink -- not this gate.
+  let buf = null;
+  if (staged) {
+    try {
+      // The INDEX, not the working tree: the commit is what the gate is about,
+      // and the two can differ.
+      buf = execFileSync("git", ["show", `:${f}`], { maxBuffer: 64 * 1024 * 1024 });
+    } catch {
+      // An UNMERGED path has no `:<file>` stage-0 entry, so this throws during
+      // a merge resolution. Reported rather than skipped: silently passing
+      // every file in a conflicted commit is the false clean this gate exists
+      // to prevent, and a merge commit is exactly when a stray byte gets
+      // pasted in.
+      unreadable.push(f);
+      continue;
+    }
+  } else if (existsSync(f)) {
+    try {
+      buf = readFileSync(f);
+    } catch {
+      unreadable.push(f);
+      continue;
+    }
+  } else {
+    // Tracked but absent from disk (a sparse checkout, a broken symlink). The
+    // index and HEAD still carry the bytes, so "clean" would be a claim about
+    // a file that was never read.
+    unreadable.push(f);
+    continue;
   }
-  if (!buf) continue;
 
   let bad = -1;
   for (let i = 0; i < buf.length; i++) {
@@ -119,25 +154,35 @@ for (const f of files) {
     if (b < 0x20 && !OK.has(b)) { bad = i; break; }
   }
   if (bad < 0) continue;
-  if (buf.includes("control-byte-ok")) continue;
+  if (ALLOW_MARKER.test(buf.toString("latin1"))) continue;
 
   // Line number, so the finding is actionable. The matched line itself is
   // deliberately NOT printed -- it carries the control byte, and echoing it
-  // re-injects the escape into the readers terminal.
+  // re-injects the escape into the reader terminal.
   let line = 1;
   for (let i = 0; i < bad; i++) if (buf[i] === 0x0a) line++;
   hits.push(`  ${f}:${line}  byte 0x${buf[bad].toString(16).padStart(2, "0")} at offset ${bad}`);
 }
 
-if (hits.length === 0) process.exit(0);
-console.error("Raw control bytes in tracked text:");
-for (const h of hits) console.error(h);
-console.error(`
+if (hits.length === 0 && unreadable.length === 0) process.exit(0);
+
+if (hits.length > 0) {
+  console.error("Raw control bytes in tracked text:");
+  for (const h of hits) console.error(h);
+  console.error(`
 These are invisible in a terminal, make \`git diff\` report the file as binary
 (so the change cannot be reviewed), and are valid inside a string literal --
 so fmt, clippy and the tests all pass with them present.
 
 Build such a byte from a numeric code point rather than typing an escape, or
-add the marker control-byte-ok to the file if it is deliberate.`);
+add a line reading "control-byte-ok: allow" if it is deliberate.`);
+}
+
+if (unreadable.length > 0) {
+  console.error("Could not read, so NOT scanned (refusing to call these clean):");
+  for (const f of unreadable) console.error(`  ${f}`);
+  console.error("An unmerged path during a merge resolution is the usual cause -- finish the merge and re-run.");
+}
+
 process.exit(1);
 '

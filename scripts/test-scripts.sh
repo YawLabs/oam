@@ -1382,6 +1382,82 @@ echo
 # regression -- but they are never invisible.
 SKIP_NOTE=""
 [ "$SKIP" -gt 0 ] && SKIP_NOTE=", ${SKIP} skipped"
+# --- check-control-bytes.sh ---------------------------------------------------
+# The gate ci-local runs FIRST, and the one whose failure mode is a false CLEAN
+# -- so it needs a suite more than most. Its predecessor used `git grep -I`,
+# which skips files git calls binary; a file containing a NUL IS binary to git,
+# so it skipped precisely what it hunted and exited 0.
+#
+# Every control byte below is built from a code point rather than typed as an
+# escape: a typed escape through a shell layer is the exact bug this gate
+# exists to catch, and writing one here is how the fixture would quietly stop
+# testing anything.
+CCB="$REPO_DIR/scripts/check-control-bytes.sh"
+CCB_REPO="$SUITE_TMP/ccb"
+ccb_reset(){
+  rm -rf "$CCB_REPO"
+  mkdir -p "$CCB_REPO"
+  ( cd "$CCB_REPO" && git init -q . && git config user.email t@t && git config user.name t )
+}
+# 0 clean, 1 finding, 2 could-not-run.
+ccb(){ ( cd "$CCB_REPO" && bash "$CCB" "$@" >/dev/null 2>&1; echo $? ); }
+ccb_add(){ ( cd "$CCB_REPO" && git add "$@" >/dev/null 2>&1 ); }
+ccb_node(){ node -e "$1" "$CCB_REPO/$2"; }
+
+if ! command -v node >/dev/null 2>&1; then
+  it "check-control-bytes.sh"
+  skip "node not on PATH -- the scanner cannot run here"
+else
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "fine")' clean.txt
+  ccb_add clean.txt
+  it "reports clean on a tree with no control bytes"
+  eq "$(ccb)" "0"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "let a = " + String.fromCharCode(34,0,34) + ";")' bad.ts
+  ccb_add bad.ts
+  it "finds a planted NUL in tracked mode"
+  eq "$(ccb)" "1"
+
+  it "finds the same NUL in --staged mode"
+  eq "$(ccb --staged)" "1"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "snap = " + String.fromCharCode(34,27,34) + ";")' x.snap
+  ccb_add x.snap
+  it "scans .snap, which is text and the likeliest to carry a stray escape"
+  eq "$(ccb)" "1"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], Buffer.from([0x89,0x50,0x4e,0x47,0x00,0x01]))' logo.png
+  ccb_add logo.png
+  it "skips a real binary extension, which cannot carry the marker"
+  eq "$(ccb)" "0"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "// control-byte-ok: allow" + String.fromCharCode(10) + "let a = " + String.fromCharCode(34,0,34) + ";")' ok.ts
+  ccb_add ok.ts
+  it "honours the control-byte-ok: allow declaration"
+  eq "$(ccb)" "0"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "// this file discusses control-byte-ok in prose" + String.fromCharCode(10) + "let a = " + String.fromCharCode(34,0,34) + ";")' prose.ts
+  ccb_add prose.ts
+  it "a bare MENTION of the marker does not disable the scan"
+  eq "$(ccb)" "1"
+
+  ccb_reset
+  ccb_node 'require("fs").writeFileSync(process.argv[1], "content")' gone.txt
+  ccb_add gone.txt
+  ( cd "$CCB_REPO" && rm -f gone.txt )
+  it "refuses a tracked file absent from disk rather than calling it clean"
+  eq "$(ccb)" "1"
+
+  it "rejects an unknown flag as could-not-run, not as clean"
+  eq "$(ccb --nonsense)" "2"
+fi
+
 if [ "$FAIL" -gt 0 ]; then
   echo -e "${RED}$FAIL failed${NC}, $PASS passed${SKIP_NOTE}"
   exit 1
