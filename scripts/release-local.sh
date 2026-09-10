@@ -504,6 +504,29 @@ if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
   warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; prune with scripts/gc-target.sh"
 fi
 
+# RELIABILITY.md's semver policy: "every release ships a public behavior-change
+# log". That was a written promise with nothing enforcing it, so a release
+# whose [Unreleased] section was still empty shipped silently -- and the
+# omission is invisible afterwards, because the tag makes the CHANGELOG look
+# complete for every version that DOES have entries.
+#
+# Checked here, in preflight, because everything after this point is
+# irreversible or expensive: the tag is already on the remote, and the next
+# steps build three target trees.
+#
+# The check is deliberately shallow -- non-empty, not well-formed. A gate that
+# tried to validate the CONTENT would either be gameable with a placeholder or
+# reject legitimate prose; "the author wrote something" is the part a script
+# can honestly assert, and the policy's own words are "human annotation".
+if [ -f CHANGELOG.md ]; then
+  unreleased_body="$(awk '
+    /^## \[Unreleased\]/ { inside = 1; next }
+    inside && /^## / { exit }
+    inside { print }
+  ' CHANGELOG.md | tr -d '[:space:]')"
+  [ -n "$unreleased_body" ] || fail "CHANGELOG.md [Unreleased] is empty -- RELIABILITY.md requires a public behavior-change log for every release. Add the entries, or say plainly that this release changes nothing observable."
+fi
+
 [ "$SKIP_MAC" = "1" ]   || [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
 ok "preflight ok (tag on remote, HEAD == $TAG, tree clean)"

@@ -180,14 +180,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/13 Format (cargo fmt --check)"
+say "1/14 Control bytes (raw C0 in tracked text)"
+# FIRST because it is the cheapest gate in the file (~1s over 859 tracked
+# files) and because a finding here invalidates everything after it: a raw
+# control byte in a source file is a corrupt payload, not a style question,
+# and there is no point spending ten minutes on cargo build to compile it.
+#
+# Nothing else in this script can see it. A NUL inside a string literal is
+# semantically valid, so fmt, clippy, the build and the tests all pass with it
+# present -- and `git diff` reports the file as "Binary file ... matches" with
+# no hunks, so it is unreviewable rather than merely easy to miss. Five literal
+# NULs reached main in a sibling repo (YawLabs/mcp, b365955) exactly that way.
+# Relative, because line 76 already cd'd to the repo root. A "$REPO_ROOT/..."
+# spelling would expand to "/scripts/..." here -- this script defines no such
+# variable, and `set -u` does not catch it inside a quoted expansion.
+if bash scripts/check-control-bytes.sh; then
+  ok "no raw control bytes"
+else
+  ko "raw control bytes above -- see the fix line in the report"
+fi
+
+say "2/14 Format (cargo fmt --check)"
 if cargo fmt --all --check; then
   ok "fmt clean"
 else
   ko "fmt diffs above -- run 'cargo fmt --all' and re-stage"
 fi
 
-say "2/13 Clippy (-D warnings, --all-features)"
+say "3/14 Clippy (-D warnings, --all-features)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 #
@@ -207,7 +227,7 @@ else
   ko "clippy warnings above"
 fi
 
-say "3/13 Feature-off configuration (--no-default-features)"
+say "4/14 Feature-off configuration (--no-default-features)"
 # GATING. `napi` is a DEFAULT feature of both oam_engine and oam_cli, so every
 # other step in this file compiles exactly one of the two configurations the
 # repo ships. The other one -- napi off, which drops the whole of src/napi.rs
@@ -251,7 +271,7 @@ else
   warn "napi-off tests SKIPPED (--no-tests) -- build + clippy still ran"
 fi
 
-say "4/13 Build (cargo build --workspace)"
+say "5/14 Build (cargo build --workspace)"
 clear_debug_holders
 park_link_targets
 # Captured, not streamed straight through. rustc surfaces linker diagnostics --
@@ -282,7 +302,7 @@ else
 fi
 
 if [ "$SKIP_TESTS" -eq 0 ]; then
-  say "5/13 Tests (cargo test --workspace)"
+  say "6/14 Tests (cargo test --workspace)"
   # ci.yml installed tsgo per matrix leg (continue-on-error); locally just
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
@@ -300,10 +320,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     || ko "tests failed (status $test_status -- 124 means it hit the 15-min hang ceiling)"
   ok "tests passed"
 else
-  say "5/13 Tests SKIPPED (--no-tests)"
+  say "6/14 Tests SKIPPED (--no-tests)"
 fi
 
-say "6/13 Smoke (oam run)"
+say "7/14 Smoke (oam run)"
 SMOKE_DIR="$(mktemp -d)"
 CLEANUP_PATHS+=("$SMOKE_DIR")
 echo "console.log('ci smoke', 6 * 7)" > "$SMOKE_DIR/smoke.js"
@@ -353,7 +373,7 @@ if [ -f target/debug/oam.exe ]; then
 fi
 
 if [ "$FAST" -eq 0 ]; then
-  say "7/13 Conformance (node-differential gate)"
+  say "8/14 Conformance (node-differential gate)"
   command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
   if cargo run -p xtask -- conformance; then
     ok "conformance clean"
@@ -361,14 +381,14 @@ if [ "$FAST" -eq 0 ]; then
     ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
   fi
 
-  say "8/13 Node-suite (skip-ratchet + pass-floor gate)"
+  say "9/14 Node-suite (skip-ratchet + pass-floor gate)"
   if cargo run -p xtask -- node-suite; then
     ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
   else
     ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
   fi
 
-  say "9/13 Attribution (THIRD_PARTY_LICENSES drift)"
+  say "10/14 Attribution (THIRD_PARTY_LICENSES drift)"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -408,10 +428,10 @@ if [ "$FAST" -eq 0 ]; then
     fi
   fi
 else
-  say "7/13 + 8/13 + 9/13 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "8/14 + 9/14 + 10/14 Conformance + node-suite + attribution SKIPPED (--fast)"
 fi
 
-say "10/13 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -427,7 +447,7 @@ else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
 fi
 
-say "11/13 npm launcher packaging (manifest drift + node --test)"
+say "12/14 npm launcher packaging (manifest drift + node --test)"
 # GATING, and compiles nothing -- seconds, not minutes.
 #
 # npm/ ships the `oamjs` launcher and its five per-platform binary packages, and
@@ -464,7 +484,7 @@ else
   ok "npm launcher tests passed"
 fi
 
-say "12/13 Scripts (release-orchestration shell tests)"
+say "13/14 Scripts (release-orchestration shell tests)"
 # GATING, and compiles nothing -- but NOT the ~2s this comment used to claim.
 # Measured on win-arm64: ~7m30s for 59 assertions (2026-08-30), then ~4m20s for
 # 107 (2026-09-09, after a batch of pure-function cases). The two are not
@@ -488,7 +508,7 @@ else
   ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
 fi
 
-say "13/13 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
+say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
 # Every aliasing claim in this repo used to be argued, never machine-checked --
 # and one candidate napi wrapper design reviewed in 2026-08-26 would have ADDED
 # UB while passing every other gate here. oam_aliasing_model closes that.
