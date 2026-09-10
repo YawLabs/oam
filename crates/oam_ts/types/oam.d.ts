@@ -498,12 +498,22 @@ declare module "oam:ai" {
 
 declare module "oam:permissions" {
   export interface PermissionDescriptor {
-    /** The runtime answers "read", "write", "net", "env", "child" and "ffi";
-     *  every other name is reported denied rather than rejected. */
+    /** The runtime answers "read", "write", "net", "env", "child", "ffi" and
+     *  "worker"; every other name is reported denied rather than rejected.
+     *
+     *  "worker" was missing from this list AND from the runtime's own match
+     *  until 2026-09-09, so querying it reported "denied" even on a run where
+     *  it was granted. */
     name: string;
-    /** Matched against the --allow-read / --allow-write path list. */
+    /** Matched against the --allow-read / --allow-write path list, as a
+     *  separator-anchored path prefix over a lexically resolved path: an entry
+     *  grants itself and its subtree, not a sibling that merely shares its
+     *  spelling. */
     path?: string;
-    /** Matched against the --allow-net host list. */
+    /** Matched against the --allow-net host list, EXACTLY. An entry naming a
+     *  port grants only that port; an entry without one grants any port on
+     *  that host. A suffix like `api.github.com.attacker.net` is not granted
+     *  by an `api.github.com` entry. */
     url?: string;
   }
 
