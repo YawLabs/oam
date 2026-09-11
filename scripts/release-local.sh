@@ -58,6 +58,18 @@
 # commit fast-forwards, and refuses if the bump touched anything but
 # Cargo.toml + Cargo.lock. OAM_NO_AUTO_BUMP=1 restores the old hard-fail.
 #
+# THIRD_PARTY_LICENSES.md gets the same treatment, for the same reason: it is
+# a generated artifact the tag must carry current, and the release run should
+# make the tree releasable rather than find out mid-run that it is not. After
+# the bump, preflight regenerates it with cargo-about; if the committed copy
+# drifted (a PR added a dependency and gated with --fast, which used to skip
+# the drift check), the fresh file is committed and landed on main -- BEFORE
+# the tag is created, so we never tag a tree ci-local.sh step 10 would reject.
+# Same guards as the bump (on main, level with origin/main, footprint is
+# exactly the one file); OAM_NO_AUTO_ATTRIBUTION=1 hard-fails instead. This is
+# the one place cargo-about is REQUIRED rather than optional: the release box
+# ships the file, so it must be able to regenerate it.
+#
 # Preflight creates <tag> at HEAD, or RE-POINTS it to HEAD if it already exists
 # somewhere else (a stale tag from an abandoned attempt is the common case), and
 # pushes it. That is safe only while the tag is unpublished, so the
@@ -69,6 +81,9 @@
 # Env knobs:
 #   OAM_NO_AUTO_BUMP=1      never write Cargo.toml; hard-fail on a version
 #                           mismatch the way this script used to
+#   OAM_NO_AUTO_ATTRIBUTION=1
+#                           never write THIRD_PARTY_LICENSES.md; hard-fail on
+#                           drift with the regenerate command instead
 #   OAM_SKIP_LOCAL_GATE=1   skip the local ci-local.sh run
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
@@ -229,6 +244,9 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
 # Asserted by smoke() below, for the Windows assets only.
 # shellcheck source=lib/crt-linkage.sh
 . "$SCRIPT_DIR/lib/crt-linkage.sh"
+# Attribution inputs / comparison / delta, shared with ci-local.sh step 10.
+# shellcheck source=lib/attribution.sh
+. "$SCRIPT_DIR/lib/attribution.sh"
 
 # free_locked_binary <path> -- park it, or die with something actionable.
 free_locked_binary() {
@@ -469,7 +487,92 @@ else
   ok "bumped $crate_version -> $tag_version and landed on main"
 fi
 
-# Re-read HEAD from git rather than reusing anything captured before the bump.
+# --- attribution reconcile --------------------------------------------------
+# THIRD_PARTY_LICENSES.md is the same class of derived artifact as Cargo.lock
+# and the npm manifests: generated from the dependency graph, shipped with every
+# asset, and silently stale the moment a PR changes the graph without
+# regenerating it. ci-local.sh step 10 catches that -- but it runs AFTER the tag
+# is created and pushed below, so the v0.15.0 run discovered the drift with a
+# tag already on origin, and recovering meant a hand-made PR plus a re-run.
+#
+# So reconcile it HERE, after the bump (the lock is final now) and before the
+# tag: regenerate, and if the committed file drifted, commit the fresh one and
+# land it exactly the way the bump lands. The gate downstream still runs; it
+# should now pass by construction, and if it does not, that is a real finding.
+#
+# REQUIRED, not optional, unlike the gate: the gate warns when cargo-about is
+# missing because a dev box without it can still push useful work. A release
+# box without it cannot regenerate the file it is about to ship, so it fails.
+step "Attribution reconcile (THIRD_PARTY_LICENSES.md)"
+command -v cargo-about >/dev/null 2>&1 \
+  || fail "cargo-about not installed -- the release ships THIRD_PARTY_LICENSES.md and must be able to regenerate it (cargo install cargo-about --locked --features cli; the --features flag is load-bearing, without it nothing is installed)"
+# Generated OUTSIDE the repo (the clean-tree preflight above forbids leaving
+# anything behind), then compared CR-insensitively -- see the lib's header.
+attr_tmp="$(mktemp)"
+attr_err="$(mktemp)"
+if ! cargo about generate about.hbs -o "$attr_tmp" 2>"$attr_err" >/dev/null; then
+  # FAIL CLOSED, same as the gate: an unaccepted or unresolvable license exits
+  # 1 too, and that is the compliance violation the whole apparatus exists to
+  # catch. No env escape here -- a release that cannot regenerate its
+  # attribution has no business shipping it.
+  sed 's/^/      /' "$attr_err" >&2
+  rm -f "$attr_tmp" "$attr_err"
+  fail "cargo about generate failed (see above) -- a rejected license fails here too, so do not route around it; fix about.toml or the dependency and re-run"
+fi
+if attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md; then
+  rm -f "$attr_tmp" "$attr_err"
+  ok "THIRD_PARTY_LICENSES.md matches the dependency graph"
+else
+  attr_delta="$(attribution_delta THIRD_PARTY_LICENSES.md "$attr_tmp")" \
+    || { rm -f "$attr_tmp" "$attr_err"; fail "could not diff THIRD_PARTY_LICENSES.md against the fresh generate"; }
+  if [ "${OAM_NO_AUTO_ATTRIBUTION:-0}" = "1" ]; then
+    rm -f "$attr_tmp" "$attr_err"
+    printf '%s\n' "$attr_delta" | sed 's/^/        /' >&2
+    fail "THIRD_PARTY_LICENSES.md is stale (crate delta above; OAM_NO_AUTO_ATTRIBUTION=1 disables the auto-commit) -- regenerate with: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md, then commit, push, and re-run"
+  fi
+  # Same guards as the bump, for the same reason: this becomes a commit on main
+  # that the tag will point at, so it has to fast-forward. Re-read rather than
+  # reused from the bump block -- the bump may have just moved HEAD.
+  attr_branch="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$attr_branch" = "main" ] \
+    || { rm -f "$attr_tmp" "$attr_err"; fail "the attribution reconcile commits to main, but HEAD is on '$attr_branch' -- switch to main (or regenerate THIRD_PARTY_LICENSES.md yourself and re-run)"; }
+  attr_origin_main="$(git rev-parse --verify --quiet origin/main || true)"
+  [ -n "$attr_origin_main" ] || { rm -f "$attr_tmp" "$attr_err"; fail "no origin/main locally -- run 'git fetch origin main' first"; }
+  [ "$(git rev-parse HEAD)" = "$attr_origin_main" ] \
+    || { rm -f "$attr_tmp" "$attr_err"; fail "main is not level with origin/main -- the attribution commit would not fast-forward; pull/push first"; }
+
+  warn "THIRD_PARTY_LICENSES.md is stale -- regenerating and landing on main:"
+  printf '%s\n' "$attr_delta" | sed 's/^/        /' >&2
+  cp "$attr_tmp" THIRD_PARTY_LICENSES.md
+  # Re-read from disk rather than trusting the copy: the file the commit carries
+  # must be the one that was just verified against the graph.
+  attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md \
+    || { rm -f "$attr_tmp" "$attr_err"; fail "THIRD_PARTY_LICENSES.md does not match the fresh generate after the copy -- fix by hand"; }
+  # The tree was clean coming in and the bump (if any) has landed, so the only
+  # legitimate footprint is the one file. Anything else means something ran
+  # that should not have.
+  attr_unexpected=""
+  while IFS= read -r attr_path; do
+    [ -n "$attr_path" ] || continue
+    case "$attr_path" in
+      THIRD_PARTY_LICENSES.md) ;;
+      *) attr_unexpected="$attr_unexpected $attr_path" ;;
+    esac
+  done <<< "$(git status --porcelain | awk '{print $2}')"
+  [ -z "$attr_unexpected" ] \
+    || { rm -f "$attr_tmp" "$attr_err"; fail "the attribution reconcile touched unexpected paths ($attr_unexpected) -- inspect the tree and commit yourself"; }
+  rm -f "$attr_tmp" "$attr_err"
+  git add THIRD_PARTY_LICENSES.md || fail "could not stage THIRD_PARTY_LICENSES.md"
+  git commit -q -m "chore(attribution): regenerate THIRD_PARTY_LICENSES.md for $TAG" \
+    -m "Regenerated by scripts/release-local.sh preflight (cargo about generate about.hbs). Crate delta vs the committed file:" \
+    -m "${attr_delta:-(license text or count changes only -- see the diff)}" \
+    || fail "could not commit the regenerated THIRD_PARTY_LICENSES.md"
+  land_on_main "chore(attribution): regenerate THIRD_PARTY_LICENSES.md for $TAG" "$tag_version"
+  ok "THIRD_PARTY_LICENSES.md regenerated and landed on main"
+fi
+
+# Re-read HEAD from git rather than reusing anything captured before the bump
+# or the attribution reconcile -- either may have moved it.
 head_sha="$(git rev-parse HEAD)"
 
 # HEAD must already be on origin/main. This script creates the tag below, and
