@@ -10,17 +10,26 @@
 //! * Unix — `tokio::signal::unix::signal`. Creating the `Signal` (under the
 //!   runtime enter guard) replaces `SIG_DFL` immediately, so the default
 //!   terminate is suppressed the moment the first JS listener attaches. The
-//!   `SignalHandle` holds the recv task's `AbortHandle`. Removing the last
-//!   listener does NOT drop the handle: tokio leaves its process-global
-//!   handler installed for the process lifetime and offers no way to restore
-//!   `SIG_DFL`, so a dropped stream would leave the signal caught and
-//!   silently discarded — the process becomes unkillable by it. Instead the
-//!   handle goes DORMANT (`set_watched(false)`) and the still-running task
-//!   reproduces the OS default itself: restore `SIG_DFL` and re-raise, so the
-//!   process dies exactly as it would have and the parent sees the right
-//!   terminating signal. Re-adding a listener re-arms the same task.
-//!   (This was previously documented as a benign divergence. It is not:
-//!   `removeAllListeners('SIGINT')` followed by a SIGINT hung forever.)
+//!   `SignalHandle` holds the recv task's `AbortHandle`; removing the last
+//!   listener leaves it DORMANT (`set_watched(false)`) so a later listener
+//!   re-arms the same task. tokio leaves its process-global handler installed
+//!   for the process lifetime and offers no way to restore `SIG_DFL`, so
+//!   something has to reproduce the OS default for every delivery that no JS
+//!   listener is watching -- after `removeAllListeners('SIGINT')`, after the
+//!   run that installed the handler is gone (`oam test` builds a runtime per
+//!   file; a Worker or `oam.fork` isolate has its own), and for the SIGINT
+//!   and SIGTERM raw mode arms with no listener at all. That is
+//!   `serve_default_action`: ONE task per signal, on a runtime that is never
+//!   dropped, which drains the exit hooks and then dies by the signal
+//!   (restore `SIG_DFL`, re-raise), so the parent sees the right terminating
+//!   signal. "No JS listener" is decided per PROCESS, from a count of watched
+//!   handles across every isolate: tokio broadcasts each delivery to every
+//!   receiver, so no one handle can decide alone. (It used to: each handle
+//!   re-raised once its own listeners were gone, which killed the process
+//!   under another isolate's listener, and a dropped run took the default
+//!   with it -- the signal was then caught and discarded, and the process
+//!   unkillable by it. Before that, `removeAllListeners('SIGINT')` followed
+//!   by a SIGINT hung forever.)
 //!
 //! * Windows — `SetConsoleCtrlHandler`. The handler is a zero-capture
 //!   `extern "system"` fn, so state lives in a process-global. It maps
@@ -38,15 +47,18 @@ use std::sync::mpsc::Sender;
 #[cfg(unix)]
 pub struct SignalHandle {
     abort: tokio::task::AbortHandle,
-    /// False once the last JS listener is removed. The recv task stays
-    /// ALIVE while dormant -- see `stop_signal` for why it must.
+    signum: i32,
+    /// False once the last JS listener on this run is removed. The recv task
+    /// stays alive while dormant, so a listener added later re-arms it.
     watched: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(unix)]
 impl SignalHandle {
     pub fn set_watched(&self, on: bool) {
-        self.watched.store(on, std::sync::atomic::Ordering::SeqCst);
+        if self.watched.swap(on, std::sync::atomic::Ordering::SeqCst) != on {
+            count_watcher(self.signum, on);
+        }
     }
 }
 
@@ -54,19 +66,52 @@ impl SignalHandle {
 impl Drop for SignalHandle {
     fn drop(&mut self) {
         self.abort.abort();
+        if self
+            .watched
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            count_watcher(self.signum, false);
+        }
     }
 }
 
-/// Does the OS default action for this signal TERMINATE the process?
+/// Watched handles per signal, across every isolate in the process. A
+/// delivery that finds none gets the OS default from `serve_default_action`.
+#[cfg(unix)]
+static WATCHERS: std::sync::Mutex<std::collections::BTreeMap<i32, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(unix)]
+fn count_watcher(signum: i32, on: bool) {
+    let mut watchers = WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+    let count = watchers.entry(signum).or_insert(0);
+    if on {
+        *count += 1;
+    } else {
+        *count = count.saturating_sub(1);
+    }
+}
+
+#[cfg(unix)]
+fn watched_anywhere(signum: i32) -> bool {
+    WATCHERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&signum)
+        .is_some_and(|count| *count > 0)
+}
+
+/// Does the OS default action for this signal TERMINATE or STOP the process?
 /// Only those need the restore-and-re-raise dance when no listener is
 /// attached; for an ignore-by-default signal (SIGWINCH) simply dropping the
 /// delivery already reproduces the default exactly.
 ///
 /// SIGTSTP is in this set: its default action stops the process, and after
-/// SIG_DFL is restored the re-raise reproduces exactly that. SIGCONT is NOT:
-/// its default is "continue", so re-raising after restore would be a no-op
-/// anyway, and treating it as terminating could kill a process whose stop
-/// default had been dropped -- a dormant SIGCONT must stay a no-op.
+/// SIG_DFL is restored the re-raise reproduces exactly that (see `die_by` for
+/// what a stop does differently from a death). SIGCONT is NOT: its default
+/// is "continue", so re-raising after restore would be a no-op anyway, and
+/// treating it as terminating could kill a process whose stop default had
+/// been dropped -- a dormant SIGCONT must stay a no-op.
 #[cfg(unix)]
 fn default_terminates(signum: i32) -> bool {
     matches!(
@@ -111,6 +156,13 @@ pub fn start_signal(
     name: &str,
 ) -> Option<SignalHandle> {
     let kind = signal_kind(name)?;
+    let signum = kind.as_raw_value();
+    // The default action for a delivery nobody watches is served process-wide
+    // (see serve_default_action), and has to be in place before this handle
+    // exists: it outlives the handle, the run and the listener.
+    if default_terminates(signum) {
+        serve_default_action(signum);
+    }
     // Enter the runtime so `signal()` registers with the runtime's signal
     // driver synchronously (SIG_DFL is replaced before this returns), closing
     // the startup race where a signal could hit the default handler between
@@ -121,44 +173,17 @@ pub fn start_signal(
     };
     let tx = tx.clone();
     let nm = name.to_string();
-    let signum = kind.as_raw_value();
     let watched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let task_watched = watched.clone();
+    count_watcher(signum, true);
     let join = runtime.spawn(async move {
         while sig.recv().await.is_some() {
-            if !task_watched.load(std::sync::atomic::Ordering::SeqCst) {
-                // No JS listener left. tokio's handler CANNOT be uninstalled
-                // (its registration is a one-time global), so without this
-                // the signal would be caught and silently discarded and the
-                // process would be unkillable by it -- e.g. SIGINT after
-                // removeAllListeners('SIGINT'). Restore the default and
-                // re-raise so the process dies exactly as it would have,
-                // and the parent observes the right terminating signal.
-                if default_terminates(signum) {
-                    // The process is about to die by signal, and a signal
-                    // death emits no JS 'exit' -- so the listeners that would
-                    // normally put the terminal back into cooked mode never
-                    // run. Drain the hooks first: a shell left raw by a
-                    // Ctrl-C'd TUI does not recover on its own. Hooks only,
-                    // not the artifact sweep -- what a terminating signal
-                    // should do about on-disk artifacts is a separate policy
-                    // question this does not answer.
-                    crate::run_exit_hooks();
-                    // SAFETY: `libc::signal`/`libc::raise` take only the integer
-                    // signal number and the well-known SIG_DFL constant -- no
-                    // pointers into our memory. This runs only when the signal's
-                    // default action terminates and no JS listener remains, so
-                    // restoring SIG_DFL and re-raising reproduces exactly that
-                    // default action.
-                    unsafe {
-                        libc::signal(signum, libc::SIG_DFL);
-                        libc::raise(signum);
-                    }
-                }
-                // Ignore-by-default signals need nothing: dropping the
-                // delivery already IS the default action.
-                continue;
-            }
+            // Forwarded whether or not this run still has a listener: a
+            // `process.emit` with none is a no-op, and whether the delivery
+            // instead takes the OS default is decided for the whole process
+            // by serve_default_action's task, from the watcher count alone.
+            // Gating on this run's flag as well opened a window, between the
+            // flag and the count on the last removeListener, in which neither
+            // task acted and the signal was lost.
             let sent = tx.send(OpCompletion {
                 id: SIGNAL_OP_ID,
                 outcome: OpOutcome::Signal(nm.clone()),
@@ -171,15 +196,114 @@ pub fn start_signal(
     });
     Some(SignalHandle {
         abort: join.abort_handle(),
+        signum,
         watched,
     })
 }
 
+/// Serve `signum`'s OS default for the rest of the process: a delivery that no
+/// JS listener anywhere in the process is watching drains the exit hooks and
+/// then dies by the signal. Idempotent, and it returns only once tokio has
+/// replaced `SIG_DFL`, so a caller that arms it can rely on the next delivery
+/// being served.
+///
+/// One task per signal, on a runtime of its own that is never dropped. A task
+/// on a run's runtime died with that run -- `oam test` builds one per file, a
+/// Worker or `oam.fork` isolate one each -- while tokio's handler stayed
+/// installed with nobody receiving, so every later delivery was caught and
+/// discarded. Raw mode arms SIGINT and SIGTERM here with no listener at all,
+/// which is node's `SignalExit`: a terminal left raw is restored by the exit
+/// hooks on the way down.
+#[cfg(unix)]
+pub fn serve_default_action(signum: i32) {
+    static SERVED: std::sync::Mutex<std::collections::BTreeSet<i32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    let mut served = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+    if served.contains(&signum) {
+        return;
+    }
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("oam-signal-default")
+            .enable_all()
+            .build()
+            .ok()
+    });
+    let Some(runtime) = runtime.as_ref() else {
+        return;
+    };
+    let mut sig = {
+        let _guard = runtime.enter();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(signum)) {
+            Ok(sig) => sig,
+            Err(_) => return,
+        }
+    };
+    served.insert(signum);
+    runtime.spawn(async move {
+        while sig.recv().await.is_some() {
+            // Ignore-by-default signals need nothing: dropping the delivery
+            // already IS the default action.
+            if default_terminates(signum) && !watched_anywhere(signum) {
+                die_by(signum);
+            }
+        }
+    });
+}
+
+/// The OS default for a signal whose default terminates or stops the process.
+///
+/// A death first runs the process-state hooks: a signal death emits no JS
+/// 'exit', so the listeners that would normally put the terminal back into
+/// cooked mode never run, and a shell left raw by a killed TUI does not
+/// recover on its own. Those hooks only -- not the report-shaped exit hooks,
+/// which print, and not the artifact sweep: what a terminating signal should
+/// do about on-disk artifacts is a separate policy question this does not
+/// answer.
+///
+/// A STOP (SIGTSTP) is not a death, and gets neither: the process comes back
+/// on SIGCONT with its raw mode intact, as node's does (`SignalExit` covers
+/// SIGINT and SIGTERM only, and the shell's job control restores the tty per
+/// job). Draining the one-shot restore on a stop left the program running
+/// cooked with `isRaw` still true, and its next signal death with no restore
+/// left to run. And once `raise` returns -- the process was continued -- the
+/// handler tokio installed goes back in: tokio registers each signal's
+/// sigaction once for the process, so leaving SIG_DFL behind would make every
+/// later SIGTSTP listener dead on arrival.
+#[cfg(unix)]
+fn die_by(signum: i32) {
+    let stops = signum == libc::SIGTSTP;
+    if !stops {
+        crate::run_process_state_hooks();
+    }
+    // SAFETY: `sigaction` with a null new action only reads the current
+    // disposition into `installed`, a live zeroed stack struct; `signal` and
+    // `raise` take only the integer signal number and the well-known SIG_DFL
+    // constant; the final `sigaction` writes back the struct just read, with
+    // a null old-action pointer, which it permits. This runs only when the
+    // signal's default action terminates or stops and no JS listener is
+    // watching it, so restoring SIG_DFL and re-raising reproduces exactly that
+    // default action; after a stop, the read-back disposition is reinstalled
+    // unchanged.
+    unsafe {
+        let mut installed: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signum, std::ptr::null(), &mut installed);
+        libc::signal(signum, libc::SIG_DFL);
+        libc::raise(signum);
+        if stops {
+            libc::sigaction(signum, &installed, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Stop delivering `name` to JS.
 ///
-/// Unix keeps the handle DORMANT rather than dropping it: the recv task owns
-/// the only path back to the OS default action (see `start_signal`), so
-/// aborting it would leave the signal permanently swallowed.
+/// Unix keeps the handle DORMANT rather than dropping it, so a listener added
+/// later re-arms the same task. The OS default for a delivery that nobody is
+/// watching is `serve_default_action`'s job, not this handle's.
 #[cfg(unix)]
 pub fn stop_signal(map: &mut std::collections::HashMap<String, SignalHandle>, name: &str) {
     if let Some(handle) = map.get(name) {

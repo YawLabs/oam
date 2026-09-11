@@ -921,9 +921,9 @@ impl CoreRuntime {
     pub fn start_signal(&mut self, name: &str) {
         if let Some(existing) = self.signals.get(name) {
             // A DORMANT unix handle (every listener removed, task still
-            // alive to serve the OS default) is re-armed, not recreated:
-            // tokio's signal registration is a one-time global, so the task
-            // owning the stream has to outlive the JS listeners.
+            // alive) is re-armed, not recreated: tokio's signal registration
+            // is a one-time global, so the task owning the stream has to
+            // outlive the JS listeners.
             existing.set_watched(true);
             return;
         }
@@ -935,9 +935,9 @@ impl CoreRuntime {
 
     /// Stop delivering OS signal `name`, restoring the OS default action.
     /// Backend-specific (see `signal::stop_signal`): Windows drops the handle
-    /// so its ctrl handler falls through; unix keeps it dormant, because
-    /// tokio's handler cannot be uninstalled and the task is what reproduces
-    /// the default.
+    /// so its ctrl handler falls through; unix keeps it dormant for a later
+    /// listener to re-arm, and `signal::serve_default_action` reproduces the
+    /// default for a delivery no listener in the process is watching.
     pub fn stop_signal(&mut self, name: &str) {
         signal::stop_signal(&mut self.signals, name);
     }
@@ -982,23 +982,32 @@ pub fn register_exit_cleanup(path: std::path::PathBuf) {
 static EXIT_HOOKS: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Callbacks that put PROCESS state back -- the terminal's cooked mode -- on
+/// every way out, a signal death included. Kept apart from `EXIT_HOOKS`: a
+/// death by signal restores the terminal and nothing else, as node's
+/// `SignalExit` does, where the report-shaped hooks (a diagnostics drain to
+/// stderr) belong to the exits that print anyway.
+static PROCESS_STATE_HOOKS: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Register a callback to run on a hard exit, before the artifact drain.
 pub fn register_exit_hook(hook: impl FnOnce() + Send + 'static) {
     let mut guard = EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
     guard.push(Box::new(hook));
 }
 
-/// Run every registered hook, leaving the artifact list alone.
-///
-/// Split out of `run_exit_cleanup` for the exit paths that must restore
-/// PROCESS state -- the terminal's cooked mode, above all -- while a caller
-/// further up is still holding paths it may want on disk. `main`'s fatal
-/// sub-code returns render their diagnostics around this call, and the signal
-/// re-raise runs it with the process about to die by signal. Idempotent: the
-/// list is taken, so a later `run_exit_cleanup` does no double work.
-pub fn run_exit_hooks() {
+/// Register a callback that restores process state; it runs first on every
+/// hard exit and alone on a signal death (`run_process_state_hooks`).
+pub fn register_process_state_hook(hook: impl FnOnce() + Send + 'static) {
+    let mut guard = PROCESS_STATE_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.push(Box::new(hook));
+}
+
+fn drain(list: &std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>) {
     let hooks = {
-        let mut guard = EXIT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = list.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
     };
     for hook in hooks {
@@ -1006,6 +1015,24 @@ pub fn run_exit_hooks() {
         // it and keep going -- the process is exiting either way.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
     }
+}
+
+/// Run the process-state hooks only: what a death by signal owes the
+/// terminal, and nothing that prints. Idempotent -- the list is taken.
+pub fn run_process_state_hooks() {
+    drain(&PROCESS_STATE_HOOKS);
+}
+
+/// Run every registered hook, leaving the artifact list alone.
+///
+/// Split out of `run_exit_cleanup` for the exit paths that must restore
+/// PROCESS state -- the terminal's cooked mode, above all -- while a caller
+/// further up is still holding paths it may want on disk. `main`'s fatal
+/// sub-code returns render their diagnostics around this call. Idempotent:
+/// both lists are taken, so a later `run_exit_cleanup` does no double work.
+pub fn run_exit_hooks() {
+    run_process_state_hooks();
+    drain(&EXIT_HOOKS);
 }
 
 /// Run every registered hook, then remove every registered artifact.

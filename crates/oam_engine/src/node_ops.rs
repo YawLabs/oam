@@ -882,10 +882,11 @@ static TTY_RESTORE_HOOKED: std::sync::atomic::AtomicBool =
 /// `process.on('exit')` in node_compat covers the graceful path, but oam has
 /// in-process exits that never emit it: the stdout/stderr EPIPE bails
 /// (`op_stdout_write` / `op_stderr_write`), the near-heap-limit OOM banner,
-/// `main`'s fatal sub-code returns, and the SIG_DFL re-raise for a signal
-/// whose JS listener was removed. Every one of those drains oam_core's exit
-/// hooks, so a single registration covers the lot -- and a terminal left raw
-/// is the one failure mode a shell never recovers from by itself.
+/// `main`'s fatal sub-code returns, and the OS default for a signal that no
+/// JS listener is watching (`oam_core::signal::serve_default_action`). Every
+/// one of those drains oam_core's exit hooks, so a single registration covers
+/// the lot -- and a terminal left raw is the one failure mode a shell never
+/// recovers from by itself.
 ///
 /// Registered AT MOST ONCE. Hooks are drained, never deduplicated, so arming
 /// per enable would grow the list without bound under a TUI that toggles raw
@@ -895,11 +896,12 @@ fn arm_tty_restore_hook(fd: i32) {
     if TTY_RESTORE_HOOKED.swap(true, Ordering::SeqCst) {
         return;
     }
-    oam_core::register_exit_hook(move || {
+    oam_core::register_process_state_hook(move || {
         // A no-op when the program already restored: a successful disable
         // clears the saved mode, and both impls treat "nothing saved" as
-        // "already cooked".
-        let _ = tty_set_raw_mode(fd, false);
+        // "already cooked". The exit-path reset, not the switch: see
+        // tty_reset_mode.
+        tty_reset_mode(fd);
     });
 }
 
@@ -1410,8 +1412,36 @@ fn raw_mode_bits(cooked: TtyModeBits) -> TtyModeBits {
     }
 }
 
+/// The exit-path restore on Windows: the ordinary switch back, which cannot
+/// block the way a unix drain can.
+#[cfg(windows)]
+fn tty_reset_mode(fd: i32) {
+    let _ = tty_set_raw_mode(fd, false);
+}
+
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
+    tty_switch(fd, enable, false)
+}
+
+/// The exit-path restore: libuv's `uv_tty_reset_mode` and node's
+/// `ResetStdio`, not `uv_tty_set_mode`. TCSANOW, where the switch drains with
+/// TCSADRAIN -- a drain waits for the terminal to consume queued output, and
+/// on an exit path, a signal death above all, a stalled reader (a hung
+/// terminal, an ssh session with a full socket buffer) must not be able to
+/// keep the process alive. SIGTTOU is blocked around it, as node does, so a
+/// job moved to the background after going raw is not stopped by its own
+/// restore on the way out. And it never waits for a switch in progress on
+/// another thread: like `uv_tty_reset_mode`'s `UV_EBUSY`, a busy lock means
+/// no restore, because that switch may be the stalled drain this exists to
+/// get past.
+#[cfg(unix)]
+fn tty_reset_mode(fd: i32) {
+    let _ = tty_switch(fd, false, true);
+}
+
+#[cfg(unix)]
+fn tty_switch(fd: i32, enable: bool, at_exit: bool) -> i32 {
     // No pending-read cancel here, unlike the Windows impl above. A stdin
     // read blocked in canonical mode picks up the termios change on its own,
     // on both kernels, and the input already pending comes with it:
@@ -1458,16 +1488,29 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
     // `term` is read. `&mut term` / `&raw_term` / `&o` point at live stack
     // storage for the duration of each tc*attr call. `fd` is the
     // caller-supplied descriptor; a bad fd makes the syscalls fail cleanly
-    // (non-zero return), never UB.
+    // (non-zero return), never UB. The two `sigset_t`s on the exit path are
+    // plain data, zeroed and then initialised by sigemptyset/sigaddset before
+    // pthread_sigmask reads them through pointers to that live stack storage;
+    // its old-set pointer on the restoring call is null, which it permits.
     unsafe {
         // Held across the whole switch, so the mode check and the mode change
         // cannot interleave. Poisoning is recovered rather than swallowed: a
         // dropped `PoisonError` here used to skip the SAVE while still
         // applying raw mode, after which every restore took the "nothing
         // saved" arm and reported success with the terminal still raw.
-        let mut saved = UNIX_STDIN_ORIG_TERMIOS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut saved = if at_exit {
+            match UNIX_STDIN_ORIG_TERMIOS.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                // A switch is in progress on another thread; see
+                // tty_reset_mode.
+                Err(std::sync::TryLockError::WouldBlock) => return -16, // EBUSY
+            }
+        } else {
+            UNIX_STDIN_ORIG_TERMIOS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
         if enable {
             if saved.is_some() {
                 return 0; // already raw
@@ -1494,7 +1537,27 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             let Some(orig) = *saved else {
                 return 0; // never enabled, or already restored
             };
-            if libc::tcsetattr(fd, libc::TCSADRAIN, &orig) != 0 {
+            let rc = if at_exit {
+                // See tty_reset_mode: no drain, and SIGTTOU held off.
+                let mut block: libc::sigset_t = std::mem::zeroed();
+                let mut prior: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut block);
+                libc::sigaddset(&mut block, libc::SIGTTOU);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut prior);
+                let rc = loop {
+                    let rc = libc::tcsetattr(fd, libc::TCSANOW, &orig);
+                    if rc == 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break rc;
+                    }
+                };
+                libc::pthread_sigmask(libc::SIG_SETMASK, &prior, std::ptr::null_mut());
+                rc
+            } else {
+                libc::tcsetattr(fd, libc::TCSADRAIN, &orig)
+            };
+            if rc != 0 {
                 // Keep the snapshot: the tty is still raw, so a later attempt
                 // -- the exit hook, say -- must still be able to put it back.
                 return last_os_tty_errno();
@@ -1632,7 +1695,24 @@ fn op_tty_set_raw_mode(
     // 0 on success, else the negative libuv errno -- `uv_tty_set_mode`'s own
     // contract, so the JS side can emit node's ErrnoException shape rather
     // than swallowing a bare `false`.
-    rv.set_int32(tty_set_raw_mode(fd, enable));
+    let rc = tty_set_raw_mode(fd, enable);
+    // node puts the terminal back from its own SIGINT/SIGTERM handler
+    // (SignalExit -> ResetStdio, src/node.cc), installed at startup whether or
+    // not JS listens. oam installed a native handler only for a JS listener,
+    // so a raw program killed without one died at SIG_DFL with the terminal
+    // still raw. On a successful enable, have both served for the rest of the
+    // process: a delivery that no JS listener anywhere is watching drains the
+    // exit hooks -- the termios restore among them -- and then dies by the
+    // signal. Process-wide rather than on this run's CoreRuntime, so it
+    // outlives the run, and a listener in another isolate still wins.
+    // Windows is untouched: SIGTERM is never delivered there, and console
+    // control events take the separate ctrl-handler path.
+    #[cfg(unix)]
+    if enable && rc == 0 {
+        oam_core::signal::serve_default_action(libc::SIGINT);
+        oam_core::signal::serve_default_action(libc::SIGTERM);
+    }
+    rv.set_int32(rc);
 }
 
 fn op_tty_get_win_size(
