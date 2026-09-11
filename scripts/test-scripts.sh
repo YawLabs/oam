@@ -820,7 +820,7 @@ PARSE_BAD=""
 for s in scripts/ci-local.sh scripts/bump-taps.sh scripts/release-local.sh \
          scripts/lib/miri-gate.sh scripts/lib/build-locks.sh \
          scripts/lib/crt-linkage.sh scripts/lib/iap-helpers.sh \
-         scripts/lib/tap-verify.sh; do
+         scripts/lib/tap-verify.sh scripts/lib/attribution.sh; do
   bash -n "$s" 2>/dev/null || PARSE_BAD="$PARSE_BAD $s"
 done
 if [ -z "$PARSE_BAD" ]; then pass; else fail "syntax errors in:$PARSE_BAD"; fi
@@ -891,6 +891,154 @@ else pass; fi
 
 it "the usage block's step range matches the labels"
 ck grep -q "full gate (steps 1-$STEP_TOTAL)" scripts/ci-local.sh
+
+# =============================================================================
+group "attribution -- drift decision, comparison and delta"
+# =============================================================================
+# THIRD_PARTY_LICENSES.md is generated, shipped with every asset, and was gated
+# ONLY by the full ci-local.sh run: --fast skipped step 10 outright, so a PR that
+# changed Cargo.lock and gated with --fast landed stale attribution and the
+# v0.15.0 RELEASE was the first thing to notice. The fix has two halves -- a
+# --fast skip rule that keys on the inputs, and a preflight reconcile in
+# release-local.sh -- and the logic both share lives in lib/attribution.sh so
+# it can be driven here with fixtures, on boxes with or without cargo-about.
+# shellcheck source=lib/attribution.sh
+. scripts/lib/attribution.sh
+
+ATTR_FIX="$SUITE_TMP/attr"
+mkdir -p "$ATTR_FIX"
+# A committed file and a fresh generate that differ by exactly the v0.15.0
+# drift: one summary count and three crates under one license's "Used by:".
+printf -- '- Apache License 2.0 -- 254 crate(s)\nUsed by:\n- aho-corasick 1.1.3\n- bytes 1.10.1\n- tower-http 0.6.11\n' > "$ATTR_FIX/committed.md"
+printf -- '- Apache License 2.0 -- 257 crate(s)\nUsed by:\n- aho-corasick 1.1.3\n- async-compression 0.4.43\n- bytes 1.10.1\n- compression-codecs 0.4.38\n- compression-core 0.4.32\n- tower-http 0.6.11\n' > "$ATTR_FIX/fresh.md"
+# The same bytes as committed.md but CRLF -- what an old clone or a stray
+# core.autocrlf produces.
+sed 's/$/\r/' "$ATTR_FIX/committed.md" > "$ATTR_FIX/committed-crlf.md"
+# A crate REMOVED (tower-http gone) and nothing added.
+printf -- '- Apache License 2.0 -- 253 crate(s)\nUsed by:\n- aho-corasick 1.1.3\n- bytes 1.10.1\n' > "$ATTR_FIX/removed.md"
+
+it "attribution_matches: identical files match"
+ck attribution_matches "$ATTR_FIX/committed.md" "$ATTR_FIX/committed.md"
+
+it "attribution_matches: CR bytes carry no meaning (CRLF copy still matches)"
+ck attribution_matches "$ATTR_FIX/committed.md" "$ATTR_FIX/committed-crlf.md"
+
+it "attribution_matches: a real drift does not match"
+if attribution_matches "$ATTR_FIX/fresh.md" "$ATTR_FIX/committed.md"; then
+  fail "fresh.md and committed.md differ by three crates but matched"
+else pass; fi
+
+# The delta is what the release commit body says and what the operator reads in
+# the log, so its shape is asserted exactly: crate lines only, +/- prefixed, in
+# file order, and NOT the summary-count line.
+it "attribution_delta: reports each crate that entered, and only those"
+ATTR_DELTA="$(attribution_delta "$ATTR_FIX/committed.md" "$ATTR_FIX/fresh.md")"
+ATTR_WANT="$(printf '+ async-compression 0.4.43\n+ compression-codecs 0.4.38\n+ compression-core 0.4.32')"
+if [ "$ATTR_DELTA" = "$ATTR_WANT" ]; then pass
+else fail "got:$(printf '\n%s' "$ATTR_DELTA")$(printf '\nwant:\n%s' "$ATTR_WANT")"; fi
+
+it "attribution_delta: reports a crate that left"
+ATTR_DELTA="$(attribution_delta "$ATTR_FIX/committed.md" "$ATTR_FIX/removed.md")"
+if [ "$ATTR_DELTA" = "- tower-http 0.6.11" ]; then pass
+else fail "got '$ATTR_DELTA', want '- tower-http 0.6.11'"; fi
+
+# diff exits 1 whenever the files differ, which is every real call. Both
+# callers run under `set -e -o pipefail`; a bare `diff | awk` there would abort
+# the release on the exact input the function exists for. So: differing files
+# must return 0 with output, identical files must return 0 with NO output, and
+# an unreadable side must NOT be reported as an empty (clean) delta.
+it "attribution_delta: returns 0 on a drift and 0-with-nothing on identical files"
+ATTR_RC=0
+ATTR_OUT="$(attribution_delta "$ATTR_FIX/committed.md" "$ATTR_FIX/fresh.md")" || ATTR_RC=$?
+ATTR_RC2=0
+ATTR_OUT2="$(attribution_delta "$ATTR_FIX/committed.md" "$ATTR_FIX/committed.md")" || ATTR_RC2=$?
+if [ "$ATTR_RC" = 0 ] && [ -n "$ATTR_OUT" ] && [ "$ATTR_RC2" = 0 ] && [ -z "$ATTR_OUT2" ]; then pass
+else fail "drift: rc=$ATTR_RC out='$ATTR_OUT'; identical: rc=$ATTR_RC2 out='$ATTR_OUT2'"; fi
+
+it "attribution_delta: an unreadable side is an error, not an empty delta"
+ATTR_RC=0
+ATTR_OUT="$(attribution_delta "$ATTR_FIX/committed.md" "$ATTR_FIX/does-not-exist.md" 2>/dev/null)" || ATTR_RC=$?
+if [ "$ATTR_RC" != 0 ]; then pass; else fail "missing file returned 0 with '$ATTR_OUT'"; fi
+
+# The --fast rule, as the pure function ci-local.sh calls. It must fail toward
+# RUNNING: no base and any changed input both mean run; only a provably
+# unchanged input set may skip. The prefix is the contract ci-local.sh
+# dispatches on, so it is asserted literally.
+it "attribution_fast_decision: no base to compare against -> run"
+case "$(attribution_fast_decision "" "")" in run:*) pass ;; *) fail "expected run:<why>" ;; esac
+
+it "attribution_fast_decision: a changed input -> run, naming the path"
+ATTR_DEC="$(attribution_fast_decision deadbeef "Cargo.lock")"
+case "$ATTR_DEC" in run:*Cargo.lock*) pass ;; *) fail "got '$ATTR_DEC'" ;; esac
+
+it "attribution_fast_decision: several changed inputs are all named on one line"
+ATTR_DEC="$(attribution_fast_decision deadbeef "$(printf 'Cargo.lock\nabout.toml')")"
+case "$ATTR_DEC" in
+  run:*Cargo.lock*about.toml*) [ "$(printf '%s\n' "$ATTR_DEC" | wc -l)" -eq 1 ] && pass || fail "multi-line: '$ATTR_DEC'" ;;
+  *) fail "got '$ATTR_DEC'" ;;
+esac
+
+it "attribution_fast_decision: base present and nothing changed -> skip"
+case "$(attribution_fast_decision deadbeef "")" in skip:*) pass ;; *) fail "expected skip:<why>" ;; esac
+
+# The input list is the whole basis for the skip. Every path that can move the
+# generated file must be on it: the lock, the workspace and member manifests
+# (publish=false is what about.toml's private filter keys on; features and
+# target deps start in a Cargo.toml), the generator's config and template, and
+# the output itself (a hand edit must be re-verified). Measured against the
+# real index, which is what ci-local.sh does.
+it "attribution_inputs covers the lock, every workspace manifest, about.*, and the output"
+ATTR_INPUTS="$(attribution_inputs)"
+ATTR_MISSING=""
+for want in Cargo.lock Cargo.toml about.toml about.hbs THIRD_PARTY_LICENSES.md \
+            $(git ls-files -- 'crates/*/Cargo.toml' xtask/Cargo.toml); do
+  case $'\n'"$ATTR_INPUTS"$'\n' in *$'\n'"$want"$'\n'*) ;; *) ATTR_MISSING="$ATTR_MISSING $want" ;; esac
+done
+if [ -z "$ATTR_MISSING" ]; then pass; else fail "attribution_inputs is missing:$ATTR_MISSING"; fi
+
+# --- wiring: the gate and the release must decide through the lib ------------
+# An inline re-implementation of either half would be untested again.
+it "ci-local.sh --fast dispatches step 10 through attribution_fast_decision"
+ATTR_WIRE=""
+for want in 'attribution_fast_decision "$attr_base" "$attr_changed"' 'attribution_changed_paths "$attr_base"' \
+            'run:\*)  attribution_step' 'skip:\*) say "10/14 Attribution SKIPPED' \
+            'attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md' '\. scripts/lib/attribution.sh'; do
+  grep -q -- "$want" scripts/ci-local.sh || ATTR_WIRE="$ATTR_WIRE [$want]"
+done
+if [ -z "$ATTR_WIRE" ]; then pass; else fail "ci-local.sh no longer references:$ATTR_WIRE"; fi
+
+it "ci-local.sh --fast no longer skips step 10 unconditionally"
+if grep -q '8/14 + 9/14 + 10/14' scripts/ci-local.sh; then
+  fail "the combined '8/14 + 9/14 + 10/14 ... SKIPPED (--fast)' label is back -- attribution is being skipped with conformance again"
+else pass; fi
+
+it "release-local.sh reconciles attribution through the lib and lands it via land_on_main"
+ATTR_WIRE=""
+for want in 'step "Attribution reconcile' 'attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md' \
+            'attribution_delta THIRD_PARTY_LICENSES.md "$attr_tmp"' \
+            'land_on_main "chore(attribution): regenerate THIRD_PARTY_LICENSES.md for $TAG"' \
+            'OAM_NO_AUTO_ATTRIBUTION' 'the attribution reconcile touched unexpected paths' \
+            '\. "$SCRIPT_DIR/lib/attribution.sh"'; do
+  grep -q -- "$want" scripts/release-local.sh || ATTR_WIRE="$ATTR_WIRE [$want]"
+done
+if [ -z "$ATTR_WIRE" ]; then pass; else fail "release-local.sh no longer carries:$ATTR_WIRE"; fi
+
+# The whole point: reconcile BEFORE the tag exists, so a drift never leaves a
+# tag on origin pointing at a tree the gate rejects (the v0.15.0 shape, and the
+# changelog gate's before it). Asserted by line order, since that is the
+# property -- a correct block moved below the tag push is the bug again.
+it "release-local.sh reconciles attribution BEFORE creating or pushing the tag"
+ATTR_LINE="$(grep -n 'step "Attribution reconcile' scripts/release-local.sh | head -1 | cut -d: -f1)"
+TAG_LINE="$(grep -n 'git tag -a "$TAG" -m "$TAG"' scripts/release-local.sh | head -1 | cut -d: -f1)"
+BUMP_LINE="$(grep -n 'land_on_main "chore(release): bump workspace version' scripts/release-local.sh | head -1 | cut -d: -f1)"
+if [ -n "$ATTR_LINE" ] && [ -n "$TAG_LINE" ] && [ -n "$BUMP_LINE" ] \
+   && [ "$BUMP_LINE" -lt "$ATTR_LINE" ] && [ "$ATTR_LINE" -lt "$TAG_LINE" ]; then pass
+else fail "order is bump@$BUMP_LINE attribution@$ATTR_LINE tag@$TAG_LINE -- want bump < attribution < tag"; fi
+
+it "release-local.sh requires cargo-about (fails closed) rather than warning like the gate"
+if grep -q 'fail "cargo-about not installed' scripts/release-local.sh \
+   && ! grep -q 'warn "cargo-about not installed' scripts/release-local.sh; then pass
+else fail "the release must hard-fail without cargo-about; only ci-local.sh may warn"; fi
 
 # =============================================================================
 group "tap-verify.sh -- what a published tap actually serves"

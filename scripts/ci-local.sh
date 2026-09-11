@@ -24,7 +24,10 @@
 #                                            advisory, only a ratchet violation
 #                                            fails -- node-compat.yml parity)
 #  10. THIRD_PARTY_LICENSES.md drift        (cargo-about; GATING when the tool
-#                                            is installed -- see below)
+#                                            is installed -- see below. Runs
+#                                            under --fast too whenever an
+#                                            attribution input changed vs
+#                                            origin/main: scripts/lib/attribution.sh)
 #  11. unsafe budget bidirectional ratchet  (GATING; AI-POLICY.md gate 5 --
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
@@ -52,7 +55,10 @@
 #
 # Usage:
 #   ./scripts/ci-local.sh              # full gate (steps 1-14)
-#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite + attribution (8-10)
+#   ./scripts/ci-local.sh --fast       # skip conformance + node-suite (8-9); attribution
+#                                        (10) is skipped ONLY when Cargo.lock, the
+#                                        manifests, about.toml/about.hbs and the
+#                                        generated file are unchanged vs origin/main
 #   ./scripts/ci-local.sh --no-tests   # skip both cargo test runs (step 4's, and 6).
 #                                        Step 12's node tests are not cargo tests
 #                                        and still run -- they cost about 3s.
@@ -118,6 +124,11 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # is most of them). Rationale for every verdict is in the lib's header.
 # shellcheck source=lib/miri-gate.sh
 . scripts/lib/miri-gate.sh
+
+# Step 10's inputs, comparison and --fast skip rule, shared with
+# release-local.sh's preflight reconcile and driven by scripts/test-scripts.sh.
+# shellcheck source=lib/attribution.sh
+. scripts/lib/attribution.sh
 
 # Leftovers under target/debug are, by definition, orphans of an earlier run:
 # nothing a human uses long-term runs out of the debug tree. Clearing them
@@ -388,23 +399,13 @@ if [ -f target/debug/oam.exe ]; then
   fi
 fi
 
-if [ "$FAST" -eq 0 ]; then
-  say "8/14 Conformance (node-differential gate)"
-  command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
-  if cargo run -p xtask -- conformance; then
-    ok "conformance clean"
-  else
-    ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
-  fi
-
-  say "9/14 Node-suite (skip-ratchet + pass-floor gate)"
-  if cargo run -p xtask -- node-suite; then
-    ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
-  else
-    ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
-  fi
-
+# attribution_step [why-under-fast] -- step 10, as a function because BOTH
+# branches below call it: the full gate unconditionally, --fast whenever
+# scripts/lib/attribution.sh says an input changed. The optional argument is
+# the --fast reason, echoed so the log explains a step the flag used to skip.
+attribution_step() {
   say "10/14 Attribution (THIRD_PARTY_LICENSES drift)"
+  [ -z "$1" ] || echo "  running under --fast: $1"
   # Every released binary statically links ~380 crates, so their notices have to
   # travel with it. Cargo.lock changes silently invalidate the checked-in file;
   # this catches that.
@@ -427,7 +428,7 @@ if [ "$FAST" -eq 0 ]; then
       # stored bytes match a fresh generate, but that only holds for checkouts
       # made after that rule landed -- an older clone, or a stray core.autocrlf,
       # would otherwise fail the gate over line endings that carry no meaning.
-      if diff -q <(tr -d '\r' <"$attr_tmp") <(tr -d '\r' <THIRD_PARTY_LICENSES.md) >/dev/null 2>&1; then
+      if attribution_matches "$attr_tmp" THIRD_PARTY_LICENSES.md; then
         ok "THIRD_PARTY_LICENSES.md matches the dependency graph"
       else
         ko "THIRD_PARTY_LICENSES.md is stale -- regenerate with: cargo about generate about.hbs -o THIRD_PARTY_LICENSES.md"
@@ -443,8 +444,46 @@ if [ "$FAST" -eq 0 ]; then
       ko "cargo about generate failed (see above) -- a rejected license fails here too; if this is only network, re-run or set OAM_SKIP_ATTRIBUTION=1"
     fi
   fi
+}
+
+if [ "$FAST" -eq 0 ]; then
+  say "8/14 Conformance (node-differential gate)"
+  command -v node >/dev/null 2>&1 || ko "conformance needs node on PATH"
+  if cargo run -p xtask -- conformance; then
+    ok "conformance clean"
+  else
+    ko "conformance diverged from Node -- see output above / conformance/scorecard.json"
+  fi
+
+  say "9/14 Node-suite (skip-ratchet + pass-floor gate)"
+  if cargo run -p xtask -- node-suite; then
+    ok "node-suite gate ok (pass-rate in CONFORMANCE-NODE.md)"
+  else
+    ko "node-suite gate failed (skip-ratchet or pass-floor violation -- see output above)"
+  fi
+
+  attribution_step ""
 else
-  say "8/14 + 9/14 + 10/14 Conformance + node-suite + attribution SKIPPED (--fast)"
+  say "8/14 + 9/14 Conformance + node-suite SKIPPED (--fast)"
+  # --fast used to skip step 10 with these two, and that is how stale attribution
+  # reached main: a PR that changed Cargo.lock, gated with --fast, and the first
+  # gate to notice was the v0.15.0 RELEASE run. Step 10 costs ~50s, all of it
+  # cargo-about, and its inputs are a short, known list -- so skip it only when
+  # that list is provably unchanged against origin/main (merge-base, so a branch
+  # is measured against where it forked, not against everything main gained
+  # since). No base at all means run: "cannot prove unchanged" is not
+  # "unchanged". The decision is a pure function, tested in test-scripts.sh.
+  attr_base="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+  attr_changed=""
+  if [ -n "$attr_base" ]; then
+    attr_changed="$(attribution_changed_paths "$attr_base")"
+  fi
+  attr_decision="$(attribution_fast_decision "$attr_base" "$attr_changed")"
+  case "$attr_decision" in
+    run:*)  attribution_step "${attr_decision#run:}" ;;
+    skip:*) say "10/14 Attribution SKIPPED (--fast; ${attr_decision#skip:})" ;;
+    *)      ko "attribution_fast_decision returned '$attr_decision' -- expected run:<why> or skip:<why>" ;;
+  esac
 fi
 
 say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
