@@ -895,8 +895,9 @@ fn arm_tty_restore_hook(fd: i32) {
 
 /// The last OS error in the shape node reports for a failed tty switch: the
 /// negative libuv number, which is what `uv_tty_set_mode` returns and what
-/// `ERR_SYSTEM_ERROR` formats. Call it IMMEDIATELY after the failing syscall,
-/// before anything else can move `errno` / `GetLastError`.
+/// node's `ErrnoException(err, 'setRawMode')` names. Call it IMMEDIATELY
+/// after the failing syscall, before anything else can move `errno` /
+/// `GetLastError`.
 fn last_os_tty_errno() -> i32 {
     let err = std::io::Error::last_os_error();
     let code = oam_core::node_error_code(&err);
@@ -951,10 +952,11 @@ enum ConsoleSwitch {
 /// the mode the console is in now, the direction, and `saved` -- the mode
 /// the first setRawMode(true) stashed, None when raw was never enabled.
 ///
-/// Two early returns mirror libuv's `uv_tty_set_mode` (src/win/tty.c):
-/// `if (!!mode == !!(tty->flags & UV_HANDLE_TTY_RAW)) return 0;` -- asking
+/// Two early returns mirror libuv's `uv_tty_set_mode` (src/win/tty.c,
+/// v1.51.0): `if ((int)mode == tty->tty.rd.mode.mode) return 0;` -- asking
 /// for the mode the tty is already in is a no-op, and NORMAL when raw was
-/// never enabled is that no-op too. libuv keys it off its own flag; here the
+/// never enabled is that no-op too, because `uv_tty_init` starts the mode at
+/// 0, UV_TTY_MODE_NORMAL. libuv keys it off the mode it last set; here the
 /// console's current mode and the saved-original slot carry the same
 /// information. Synthesising a cooked mode from the current one instead
 /// (what this used to do) is not harmless: on a console that starts with
@@ -1282,22 +1284,33 @@ fn raw_mode_bits(cooked: TtyModeBits) -> TtyModeBits {
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
     // No pending-read cancel here, unlike the Windows impl above. A stdin
-    // read blocked in canonical mode picks up the termios change on its own:
-    // Linux's n_tty_set_termios wakes tty->read_wait, and n_tty_read
-    // re-evaluates icanon on every wakeup, so the blocked read returns the
-    // very next byte typed after tcsetattr (verified on a 6.6 kernel: a read
-    // blocked under ICANON returned a single 'h', no Enter, once the caller
-    // cleared ICANON). BSD/XNU's ttread does NOT wake on TIOCSETA; the next
-    // byte to arrive is what re-checks ICANON, so that byte is delivered raw.
+    // read blocked in canonical mode picks up the termios change on its own,
+    // on both kernels, and the input already pending comes with it:
     //
-    // That BSD sentence is read off the source, not measured the way the
-    // Linux one was, and it understates the case: bytes typed BEFORE the
-    // switch are sitting in the canonical queue too, so they are not
-    // delivered until a further byte arrives either. No test here can tell
-    // the two behaviours apart -- the pty case
-    // (`raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing`)
-    // sends its keystroke right after the switch, which satisfies both
-    // "woken at tcsetattr" and "woken by the next byte". Treat it as sourced.
+    // - Linux: n_tty_set_termios, on an ICANON change, makes everything
+    //   pending readable (commit_head moves to the read head) and wakes
+    //   tty->read_wait, and n_tty_read re-evaluates icanon on every wakeup --
+    //   so the blocked read returns what was pending, or else the very next
+    //   byte typed (the second half verified on a 6.6 kernel: a read blocked
+    //   under ICANON returned a single 'h', typed after the switch, with no
+    //   Enter).
+    // - XNU: ttioctl_locked (bsd/kern/tty.c), on an ICANON-off transition
+    //   made by anything but TIOCSETAF, appends the raw queue to the
+    //   canonical one and swaps the two, so all pending input sits in the
+    //   queue a non-canonical read takes from, then calls ttwakeup -- which
+    //   wakes TSA_HUP_OR_INPUT, the channel ttread sleeps on, and ttread's
+    //   `goto loop` re-reads the lflag. TCSADRAIN, which this uses as libuv
+    //   does, is TIOCSETAW, so the branch runs.
+    //
+    // On both kernels the wake at tcsetattr and the hand-over of pending
+    // input are read off the source, not measured. Both measurements -- the
+    // 6.6 probe and the pty case
+    // (`raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing`),
+    // which runs on Linux and macOS -- send their keystroke after the switch,
+    // which a reader woken at tcsetattr and one woken by the next byte both
+    // satisfy. An earlier version of this comment read the XNU source as "does
+    // not wake" and called the pre-switch bytes stranded; the transition branch
+    // above says otherwise.
     //
     // Either way it is all libuv does on unix -- uv_tty_set_mode is a bare
     // tcsetattr -- so node and oam agree.
@@ -1368,9 +1381,10 @@ mod raw_mode_tests {
     use super::{TtyModeBits, raw_mode_bits, tty_set_raw_mode};
 
     /// The op's contract is `uv_tty_set_mode`'s: 0, or the negative libuv
-    /// errno the JS side turns into node's `ERR_SYSTEM_ERROR`. It used to be a
-    /// bare bool, and the JS side dropped the failure on the floor -- the
-    /// program went on believing it had a raw terminal.
+    /// errno the JS side turns into node's `ErrnoException` shape (code the
+    /// errno name, syscall 'setRawMode'). It used to be a bare bool, and the JS
+    /// side dropped the failure on the floor -- the program went on believing
+    /// it had a raw terminal.
     ///
     /// A descriptor that was never opened makes `tcgetattr` fail `EBADF`,
     /// which libuv numbers `-EBADF` on POSIX. Nothing else in this binary
@@ -1487,7 +1501,7 @@ fn op_tty_set_raw_mode(
     let fd = args.get(0).int32_value(scope).unwrap_or(0);
     let enable = args.get(1).boolean_value(scope);
     // 0 on success, else the negative libuv errno -- `uv_tty_set_mode`'s own
-    // contract, so the JS side can raise node's ERR_SYSTEM_ERROR shape rather
+    // contract, so the JS side can emit node's ErrnoException shape rather
     // than swallowing a bare `false`.
     rv.set_int32(tty_set_raw_mode(fd, enable));
 }

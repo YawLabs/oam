@@ -33,11 +33,13 @@
 //! adjustment) only when the cancelled read was cooked and echoing.
 //!
 //! Unix needs none of this: a read blocked in canonical mode picks up a
-//! termios change on its own (Linux wakes the reader from `tcsetattr`; BSD
-//! does not wake, and re-checks `ICANON` when the next byte arrives), which
-//! is also all libuv does there. The Linux half is measured, the BSD half is
-//! read off the source -- see the unix `tty_set_raw_mode` in oam_engine's
-//! node_ops, which carries the full caveat.
+//! termios change on its own -- Linux and XNU both wake the reader from the
+//! `tcsetattr` that clears `ICANON`, and hand it the input already pending (a
+//! `TCSAFLUSH` discards that input first) -- which is also all libuv does
+//! there. Both wakes are read off the kernel source; what is measured, on
+//! Linux 6.6 and by a pty test that also runs on macOS, is only that a key
+//! typed after the switch reaches the waiting read without Enter. The unix
+//! `tty_set_raw_mode` in oam_engine's node_ops carries the detail.
 //!
 //! One reader is assumed: the JS Readable never has two `_read`s in flight,
 //! and nothing else in the runtime reads stdin while a program runs.

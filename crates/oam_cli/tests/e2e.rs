@@ -8482,7 +8482,9 @@ mod unix_pty {
     /// ISSET(tp->t_lflag, ICANON)`, not on the incoming value -- and then ends
     /// with `tp->t_lflag = t->c_lflag | ISSET(tp->t_lflag, PENDIN)`
     /// (bsd/kern/tty.c; FreeBSD's tty.c is the same lineage). That trailing OR
-    /// is also why no later `tcsetattr` can scrub the bit back off.
+    /// is also why no later `tcsetattr` that leaves `ICANON` on can scrub the
+    /// bit back off -- only a flush, turning `ICANON` off again, or the tty's
+    /// next read, poll or incoming byte clears it.
     ///
     /// So every raw-mode restore reads it back. One call would dodge it -- the
     /// kernel skips the branch for `TIOCSETAF`, i.e. `TCSAFLUSH` -- and
@@ -8965,9 +8967,11 @@ process.exit(0);
 /// HANDLE_FLAG_INHERIT on the harness's std handles does not change it).
 /// Routing through `cmd /c ... <CONIN$ >CONOUT$` puts the stdio back on the
 /// console, but `<CONIN$` opens console input READ-ONLY and SetConsoleMode
-/// needs write access -- so `setRawMode(true)` silently fails (the child
-/// reports isRaw=false) and both raw-mode assertions become vacuous. They are
-/// `#[ignore]`d rather than left to pass for the wrong reason.
+/// needs write access -- so `setRawMode(true)` fails with access denied
+/// (ERROR_ACCESS_DENIED, measured on Windows 11 26200; since the switch
+/// reports its errno, the child's stdin emits 'error' instead of going raw)
+/// and both raw-mode assertions become vacuous. They are `#[ignore]`d rather
+/// than left to pass for the wrong reason.
 ///
 /// The fix is to hand the child a console input handle opened
 /// GENERIC_READ | GENERIC_WRITE -- a small helper launched inside the pty that
@@ -9341,7 +9345,7 @@ mod conpty {
     /// must arrive without Enter, and the line the cancel discarded must not
     /// be delivered as data.
     #[test]
-    #[ignore = "blocked: the child gets a read-only console input handle, so setRawMode is a no-op -- see the module docs and YawLabs/oam#109"]
+    #[ignore = "blocked: the child gets a read-only console input handle, so setRawMode fails with access denied -- see the module docs and YawLabs/oam#109"]
     fn raw_mode_after_a_prompt_delivers_a_keystroke_without_enter() {
         let script = write_temp(
             "conpty_raw.mjs",
@@ -9395,7 +9399,7 @@ process.stdin.on('data', (d) => {
     /// ConPTY reflects a real SetConsoleCursorPosition into the output as a
     /// cursor escape, which is what this looks for.
     #[test]
-    #[ignore = "vacuous until raw mode engages: setRawMode is a no-op on the read-only console input handle -- see the module docs and YawLabs/oam#109"]
+    #[ignore = "vacuous until raw mode engages: setRawMode fails with access denied on the read-only console input handle -- see the module docs and YawLabs/oam#109"]
     fn leaving_raw_mode_does_not_move_the_cursor() {
         let script = write_temp(
             "conpty_raw_off.mjs",
