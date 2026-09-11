@@ -592,6 +592,33 @@ contradict the test's own next assertion: it reads `.buffer` and requires the an
 `true`. If a later V8 brings on-heap typed arrays back, the test starts passing by itself
 and this entry goes away.
 
+### 33. On Windows, `setRawMode` edits the console mode it finds instead of writing a fixed one
+
+libuv's `uv_tty_set_mode` (`src/win/tty.c`, v1.51.0, the libuv Node v22.22.2 vendors)
+writes a fixed console input mode in each direction: `ENABLE_WINDOW_INPUT` plus
+`ENABLE_VIRTUAL_TERMINAL_INPUT` for the `UV_TTY_MODE_RAW_VT` that `setRawMode(true)` asks
+for, and `ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT` for
+`setRawMode(false)`. So mouse input is cleared in both directions, window input is forced
+on in raw and off in cooked, and VT input a shell had turned on does not survive the first
+`setRawMode(false)` after a `setRawMode(true)` (one before any raw switch hits the early
+return and writes nothing). QuickEdit and Insert survive, because libuv never passes
+`ENABLE_EXTENDED_FLAGS`. Only a normal exit puts the console back: Node's
+`atexit(ResetStdio)` calls `uv_tty_reset_mode`, which restores the mode libuv recorded at
+startup once a raw switch has armed it.
+
+oam clears `ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT` from the mode
+the console is in and adds `ENABLE_VIRTUAL_TERMINAL_INPUT`; `setRawMode(false)` restores
+the mode that enable saved (`plan_console_switch`, `crates/oam_engine/src/node_ops.rs`).
+Going by the source, what the program reads comes out the same on both — keystrokes as VT
+sequences, unechoed, Ctrl-C as `0x03`. At a normal exit each puts back a mode it recorded:
+libuv the one from startup, oam the one its last enable found. The difference is the
+console mode between a round trip and exit, and it shows to anything that queries or reads
+the console in that window: the program itself, or a child that inherits the console and
+reads it without setting its own mode.
+
+_(source)_ Read out of both implementations, not measured side by side. Unix is unaffected:
+there oam applies libuv's `UV_TTY_MODE_RAW` recipe exactly (`raw_mode_bits`, same file).
+
 ---
 
 ## Module loading and the CLI
