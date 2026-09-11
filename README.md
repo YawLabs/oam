@@ -1,5 +1,7 @@
 # oam
 
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+
 **The reliable TypeScript runtime for the AI era.**
 
 > Fast is table stakes. Reliable is the product.
