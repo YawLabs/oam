@@ -859,6 +859,16 @@ fn op_is_tty(
 static WIN_STDIN_ORIG_MODE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// Serialises the Windows switch, as UNIX_STDIN_ORIG_TERMIOS's lock does on
+/// unix. A second setRawMode -- a Worker's, or the exit hook's -- must not
+/// read the console mode or the saved slot in the middle of another switch,
+/// least of all in the cancel's settle wait between the two: it would save a
+/// raw mode as the "original", or flip before the first switch's Enter has
+/// landed. The stdin reader's settle path never takes it, so holding it
+/// across that wait cannot deadlock.
+#[cfg(windows)]
+static WIN_CONSOLE_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(unix)]
 static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
     std::sync::Mutex::new(None);
@@ -943,9 +953,12 @@ enum ConsoleSwitch {
     /// Nothing: no SetConsoleMode and -- what matters -- no cancel of a
     /// read in flight, which would drop its type-ahead for nothing.
     Keep,
-    /// Set `target`; `from_cooked_echo` says whether the read blocked under
-    /// the OLD mode was a cooked, echoing one (its Enter echoes a newline).
-    Set { target: u32, from_cooked_echo: bool },
+    /// Set `target`; `echo` is what the synthetic Enter writes when it lands
+    /// on the read blocked under the OLD mode.
+    Set {
+        target: u32,
+        echo: oam_core::stdin::EnterEcho,
+    },
 }
 
 /// The decision behind the Windows `tty_set_raw_mode`, as a pure function of
@@ -980,10 +993,79 @@ fn plan_console_switch(mode: u32, enable: bool, saved: Option<u32>) -> ConsoleSw
     if target == mode {
         return ConsoleSwitch::Keep;
     }
-    ConsoleSwitch::Set {
-        target,
-        from_cooked_echo: mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
-            == (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT),
+    // What the Enter writes is the read's own, pre-flip mode's call: on
+    // conhost's rewritten cooked read, a line read writes a newline whether
+    // or not it echoes the typed characters -- CRLF with PROCESSED_INPUT, a
+    // bare CR without -- and a raw read writes nothing (readDataCooked.cpp;
+    // measured on conhost 10.0.26100.1). The pre-rewrite code wrote nothing
+    // for a line read without ECHO; see EnterEcho.
+    let echo = if (mode & ENABLE_LINE_INPUT) == 0 {
+        oam_core::stdin::EnterEcho::Nothing
+    } else if (mode & ENABLE_PROCESSED_INPUT) != 0 {
+        oam_core::stdin::EnterEcho::Newline
+    } else {
+        oam_core::stdin::EnterEcho::CarriageReturn
+    };
+    ConsoleSwitch::Set { target, echo }
+}
+
+/// A console-mode switch in libuv's order: hold the stdin reader, cancel the
+/// read in flight while the mode it was issued under is still in force, flip,
+/// release. Generic over the steps so the order is unit-tested: it is what the
+/// cursor restore depends on, and without a console nothing else could see it
+/// change. The hold is released on the error path too.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn switch_in_libuv_order<G, E>(
+    hold: impl FnOnce() -> G,
+    cancel: impl FnOnce(),
+    flip: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let held = hold();
+    cancel();
+    let flipped = flip();
+    drop(held);
+    flipped
+}
+
+#[cfg(test)]
+mod switch_order_tests {
+    use super::switch_in_libuv_order;
+    use std::cell::RefCell;
+
+    struct Released<'a>(&'a RefCell<Vec<&'static str>>);
+
+    impl Drop for Released<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("release");
+        }
+    }
+
+    fn run(log: &RefCell<Vec<&'static str>>, flip: Result<(), i32>) -> Result<(), i32> {
+        switch_in_libuv_order(
+            || {
+                log.borrow_mut().push("hold");
+                Released(log)
+            },
+            || log.borrow_mut().push("cancel"),
+            || {
+                log.borrow_mut().push("flip");
+                flip
+            },
+        )
+    }
+
+    #[test]
+    fn the_read_is_cancelled_before_the_flip_and_released_after_it() {
+        let log = RefCell::new(Vec::new());
+        assert_eq!(run(&log, Ok(())), Ok(()));
+        assert_eq!(*log.borrow(), ["hold", "cancel", "flip", "release"]);
+    }
+
+    #[test]
+    fn a_failed_flip_still_releases_the_hold_and_reports_the_error() {
+        let log = RefCell::new(Vec::new());
+        assert_eq!(run(&log, Err(-4071)), Err(-4071));
+        assert_eq!(*log.borrow(), ["hold", "cancel", "flip", "release"]);
     }
 }
 
@@ -1003,12 +1085,13 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
         // libuv's Windows EBADF: no console handle behind this descriptor.
         return -4083;
     }
+    let _switch = WIN_CONSOLE_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     let mut mode: u32 = 0;
-    let from_cooked_echo;
     // SAFETY: `h` is a console handle from win_std_handle, already rejected
     // above if 0/-1. `mode` is a live stack u32 passed by `&mut`, valid for
     // GetConsoleMode's out-write, and is only read after the return is checked
-    // non-zero. SetConsoleMode takes the handle plus a by-value DWORD.
+    // non-zero. SetConsoleMode takes the handle plus a by-value DWORD. The
+    // hold and cancel between the two calls are safe code.
     unsafe {
         if GetConsoleMode(h, &mut mode) == 0 {
             return last_os_tty_errno();
@@ -1026,42 +1109,69 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
             (orig != u32::MAX).then_some(orig)
         };
-        let target = match plan_console_switch(mode, enable, saved) {
+        let (target, echo) = match plan_console_switch(mode, enable, saved) {
             ConsoleSwitch::Keep => return 0,
-            ConsoleSwitch::Set {
-                target,
-                from_cooked_echo: echo,
-            } => {
-                from_cooked_echo = echo;
-                target
-            }
+            ConsoleSwitch::Set { target, echo } => (target, echo),
         };
-        if SetConsoleMode(h, target) == 0 {
-            return last_os_tty_errno();
+        // Cancel the stdin read in flight BEFORE the flip, in libuv's order
+        // (see below); the hold keeps the read it re-issues waiting for the
+        // new mode.
+        let flipped = switch_in_libuv_order(
+            || (fd == 0).then(oam_core::stdin::hold_console_reads),
+            || {
+                if fd == 0 {
+                    oam_core::stdin::cancel_pending_console_read(echo);
+                }
+            },
+            || {
+                if SetConsoleMode(h, target) == 0 {
+                    Err(last_os_tty_errno())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if let Err(errno) = flipped {
+            // A failed restore keeps the saved mode, so a later attempt -- the
+            // exit hook, say -- can still put the console back. It used to be
+            // taken out of the slot first and lost with the error.
+            if let Some(orig) = saved {
+                WIN_STDIN_ORIG_MODE.store(orig, Ordering::SeqCst);
+            }
+            return errno;
         }
     }
-    // The mode is flipped, but a stdin read that was ALREADY blocked keeps the
-    // semantics it was issued with: a cooked (ENABLE_LINE_INPUT) ReadConsoleW
-    // returns only on Enter no matter what SetConsoleMode did after it. And
-    // one is nearly always blocked, because node's Readable refills the moment
-    // a chunk is pushed -- so right after a readline answer the next cooked
-    // read is pending, and a TUI that now goes raw saw nothing the user typed
-    // until they pressed Enter. libuv cancels the pending read from
-    // uv_tty_set_mode (uv__cancel_read_console: a synthetic VK_RETURN, the
-    // returned line discarded, a fresh read queued under the new mode);
-    // oam_core::stdin does the same. After the flip, on purpose: the re-issued
-    // read must start under the NEW mode.
+    // Why the cancel above exists: a stdin read that is ALREADY blocked keeps
+    // the line buffering it was issued with -- a cooked (ENABLE_LINE_INPUT)
+    // ReadConsoleW returns only on Enter no matter what SetConsoleMode does
+    // after it. And one is nearly always blocked, because node's Readable
+    // refills the moment a chunk is pushed -- so right after a readline answer
+    // the next cooked read is pending, and a TUI that then goes raw saw
+    // nothing the user typed until they pressed Enter. libuv cancels the
+    // pending read from uv_tty_set_mode (uv__cancel_read_console: a synthetic
+    // VK_RETURN, the returned line discarded, a fresh read queued under the
+    // new mode); oam_core::stdin does the same.
+    //
+    // In libuv's order: cancel, THEN flip. libuv stops the read before its
+    // SetConsoleMode and waits on its output lock for the cancelled read to
+    // finish; the hold does that job here, parking the reader's next read
+    // until the flip has landed so that it starts under the NEW mode. The
+    // order is what the cursor restore depends on. Injected after the flip,
+    // the Enter was handled under the new mode, and conhost 10.0.26100.1
+    // answers a raw mode's Enter with a bare carriage return, not the echoed
+    // newline libuv's last-row adjustment assumes -- so a prompt on the
+    // buffer's last row came back with the cursor one row too high. Before
+    // the flip, a read already blocked in ReadConsoleW handles the Enter under
+    // its own mode.
     //
     // Both directions: a read issued RAW keeps raw semantics across the
     // switch back too, and would hand the next cooked prompt its first
-    // keystroke immediately and un-echoed. What differs is the echo: only a
-    // read issued under LINE_INPUT + ECHO_INPUT has its Enter echoed as a
-    // newline, so only then is there a cursor to put back -- a raw read
-    // returns the injected `\r` as one silent byte. The PRE-flip `mode` is
-    // what the pending read was issued under.
-    if fd == 0 {
-        oam_core::stdin::cancel_pending_console_read(from_cooked_echo);
-    }
+    // keystroke immediately and un-echoed. What differs is what the Enter
+    // writes, and the read's own mode -- the PRE-flip one, still in force
+    // when the Enter lands -- decides it (EnterEcho): a line read writes a
+    // newline, CRLF with PROCESSED_INPUT (which scrolls from the last row)
+    // and a bare CR without; a raw read returns the injected `\r` as one
+    // silent byte and leaves no cursor to put back.
     // Last, with the switch fully landed: the console is raw from here, so
     // this is the point past which an exit that never reaches JS would strand
     // it that way.
@@ -1077,6 +1187,7 @@ mod console_switch_tests {
         ConsoleSwitch, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
         ENABLE_VIRTUAL_TERMINAL_INPUT, plan_console_switch,
     };
+    use oam_core::stdin::EnterEcho;
 
     const ENABLE_WINDOW_INPUT: u32 = 0x0008;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
@@ -1095,7 +1206,7 @@ mod console_switch_tests {
             plan_console_switch(COOKED, true, None),
             ConsoleSwitch::Set {
                 target: RAW,
-                from_cooked_echo: true
+                echo: EnterEcho::Newline
             }
         );
     }
@@ -1127,7 +1238,7 @@ mod console_switch_tests {
             plan_console_switch(RAW, false, Some(COOKED)),
             ConsoleSwitch::Set {
                 target: COOKED,
-                from_cooked_echo: false
+                echo: EnterEcho::Nothing
             }
         );
     }
@@ -1141,13 +1252,31 @@ mod console_switch_tests {
     }
 
     #[test]
-    fn a_line_read_without_echo_has_no_newline_to_undo() {
+    fn a_line_read_writes_its_newline_whether_or_not_it_echoes() {
+        // ECHO governs the typed characters only; conhost's rewritten cooked
+        // read writes the Enter's newline for any LINE_INPUT read
+        // (readDataCooked.cpp, and measured on 10.0.26100.1: mode 0x1f3
+        // returned "x\r\n" and scrolled the last row).
         let silent_cooked = COOKED & !ENABLE_ECHO_INPUT;
         assert_eq!(
             plan_console_switch(silent_cooked, true, None),
             ConsoleSwitch::Set {
                 target: RAW,
-                from_cooked_echo: false
+                echo: EnterEcho::Newline
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_read_without_processed_input_writes_a_bare_carriage_return() {
+        // Measured: mode 0x1f6 returned "x\r" and scrolled nothing, so there
+        // is a cursor to put back but no row to step up.
+        let unprocessed = COOKED & !ENABLE_PROCESSED_INPUT;
+        assert_eq!(
+            plan_console_switch(unprocessed, true, None),
+            ConsoleSwitch::Set {
+                target: RAW,
+                echo: EnterEcho::CarriageReturn
             }
         );
     }
