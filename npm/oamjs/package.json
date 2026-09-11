@@ -1,6 +1,6 @@
 {
   "name": "oamjs",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "oam -- a Rust + V8 runtime that runs TypeScript directly and hosts MCP servers",
   "license": "Apache-2.0",
   "homepage": "https://oamjs.org",
@@ -33,10 +33,10 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "oamjs-win32-x64": "0.14.0",
-    "oamjs-win32-arm64": "0.14.0",
-    "oamjs-darwin-x64": "0.14.0",
-    "oamjs-darwin-arm64": "0.14.0",
-    "oamjs-linux-x64": "0.14.0"
+    "oamjs-win32-x64": "0.15.0",
+    "oamjs-win32-arm64": "0.15.0",
+    "oamjs-darwin-x64": "0.15.0",
+    "oamjs-darwin-arm64": "0.15.0",
+    "oamjs-linux-x64": "0.15.0"
   }
 }
