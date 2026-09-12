@@ -1330,6 +1330,20 @@ else
      && printf '%s' "$(served homebrew-yaw Formula/oam.rb)" | grep -q 'version "0.14.0"'; then pass
   else fail "a downgrade was not refused: $OUT"; fi
 
+  it "an early abort does not crash inside the EXIT trap"
+  # The trap is armed at bump-taps.sh:163, but BREW_FILE and SCOOP_FILE are
+  # assigned only at :331 and :371 -- so under `set -u` every failure in that
+  # window (no published SHA256SUMS, this downgrade guard, a missing asset
+  # hash) died with "BREW_FILE: unbound variable" INSIDE cleanup, replacing the
+  # diagnosis the operator needs with a bash error about the script's own
+  # bookkeeping. The case above cannot catch it: `fail` prints its message
+  # BEFORE the trap runs, so grepping for that message passes either way.
+  OUT="$(run_taps v0.13.2 2>&1)"
+  if printf '%s' "$OUT" | grep -q "unbound variable"; then
+    fail "the EXIT trap crashed on an early abort: $OUT"
+  elif printf '%s' "$OUT" | grep -q "older than the latest published release"; then pass
+  else fail "the early abort did not report its real reason: $OUT"; fi
+
   it "a downgrade proceeds when it is asked for explicitly"
   OUT="$(OAM_ALLOW_DOWNGRADE=1 PATH="$TAPS_BIN:$PATH" \
         OAM_HOMEBREW_DIR="$taps_dir/homebrew-yaw" OAM_SCOOP_DIR="$taps_dir/scoop-yaw" \
