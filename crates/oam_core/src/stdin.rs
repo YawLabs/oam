@@ -15,29 +15,55 @@
 //! libuv has the same problem and solves it in `uv_tty_set_mode`: a pending
 //! line read is cancelled by writing a synthetic VK_RETURN key event
 //! (`uv__cancel_read_console`), the line that read returns is discarded, and a
-//! fresh read is queued under the new mode. This module is that mechanism.
-//! [`ReadGate`] tracks whether a read is blocked; the Windows raw-mode op
-//! calls [`cancel_pending_console_read`] after flipping the mode, which marks
-//! the read for discard and injects the Enter; the read loop drops the
-//! discarded result and reads again. As in libuv, any type-ahead sitting in
-//! the cooked line buffer is lost with the cancelled read, and the newline the
-//! console echoed for the synthetic Enter is undone by restoring the cursor.
+//! fresh read is queued under the new mode. This module is that mechanism, in
+//! libuv's order. [`ReadGate`] tracks whether a read is blocked. The Windows
+//! raw-mode op takes a `ReadGate::hold`, so the reader cannot issue its next
+//! read; calls [`cancel_pending_console_read`] BEFORE it flips the mode, which
+//! marks the read for discard and injects the Enter while the mode the read
+//! was issued under is still in force; flips the mode; and releases the hold,
+//! so the re-issued read starts under the new mode. As in libuv, any
+//! type-ahead sitting in the cooked line buffer is lost with the cancelled
+//! read, and whatever the console wrote for the synthetic Enter is undone by
+//! restoring the cursor.
+//!
+//! The order is load-bearing. Injected AFTER the flip, the Enter is handled
+//! under the new mode, and conhost 10.0.26100.1 (measured) answers a raw
+//! mode's Enter with a bare carriage return rather than an echoed newline --
+//! so the last-row adjustment in `SavedCursor::restore_target`, which assumes
+//! a newline scrolled the buffer, put the cursor a row too high whenever the
+//! prompt sat on the buffer's last row. Before the flip, a read already
+//! blocked in ReadConsoleW handles the Enter under its own mode. (A read
+//! marked PENDING but not yet inside ReadConsoleW when the settle wait runs
+//! out would take the queued Enter after the flip; the wait is 250 ms against
+//! a console's sub-millisecond latency.)
 //!
 //! The cancel runs in BOTH directions, because a read issued raw keeps raw
 //! semantics across the switch back just the same, and would deliver the
-//! first keystroke of the next cooked prompt immediately and un-echoed. But
-//! only a cooked, echoing read has an Enter the console echoes: a raw read
-//! returns the injected `\r` as one silent byte and nothing on screen moves.
-//! So the raw-mode op passes the PRE-flip mode along, and the cursor is
-//! saved and put back (with libuv's "the echo scrolled the last row" row
-//! adjustment) only when the cancelled read was cooked and echoing.
+//! first keystroke of the next cooked prompt immediately and un-echoed. What
+//! the synthetic Enter writes is decided by the mode that read runs under
+//! ([`EnterEcho`]): on conhost's rewritten cooked read, a line read writes a
+//! newline whether or not it echoes -- CRLF with ENABLE_PROCESSED_INPUT, which
+//! scrolls the buffer from its last row, and a bare CR without -- while a raw
+//! read writes nothing. The raw-mode op passes that along: the cursor is saved
+//! and put back for a line read, and stepped up a row only when a newline
+//! scrolled it. (libuv steps up unconditionally, which holds only because its
+//! own NORMAL mode always carries PROCESSED_INPUT.)
+//!
+//! The mapping is the rewritten cooked read's, the code conhost 10.0.26100
+//! runs. The code before the rewrite (the terminal repo's release-1.18)
+//! wrote nothing at all for a line read without ENABLE_ECHO_INPUT, so on a
+//! host still running it, a console handed to oam with echo off can have its
+//! cursor put back one row too high from the buffer's last row. That is read
+//! off the source, not measured: only 10.0.26100.1 was at hand.
 //!
 //! Unix needs none of this: a read blocked in canonical mode picks up a
-//! termios change on its own (Linux wakes the reader from `tcsetattr`; BSD
-//! does not wake, and re-checks `ICANON` when the next byte arrives), which
-//! is also all libuv does there. The Linux half is measured, the BSD half is
-//! read off the source -- see the unix `tty_set_raw_mode` in oam_engine's
-//! node_ops, which carries the full caveat.
+//! termios change on its own -- Linux and XNU both wake the reader from the
+//! `tcsetattr` that clears `ICANON`, and hand it the input already pending (a
+//! `TCSAFLUSH` discards that input first) -- which is also all libuv does
+//! there. Both wakes are read off the kernel source; what is measured, on
+//! Linux 6.6 and by a pty test that also runs on macOS, is only that a key
+//! typed after the switch reaches the waiting read without Enter. The unix
+//! `tty_set_raw_mode` in oam_engine's node_ops carries the detail.
 //!
 //! One reader is assumed: the JS Readable never has two `_read`s in flight,
 //! and nothing else in the runtime reads stdin while a program runs.
@@ -66,29 +92,51 @@ const DISCARD: u8 = 2;
 #[cfg_attr(not(windows), allow(dead_code))]
 const SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// What the synthetic Enter writes to the screen when it lands on the read in
+/// flight -- decided by the mode that read runs under, the PRE-flip one. From
+/// conhost's rewritten cooked read (readDataCooked.cpp), and measured on
+/// conhost 10.0.26100.1: a line (ENABLE_LINE_INPUT) read writes a newline
+/// whether or not it echoes the typed characters, CRLF with
+/// ENABLE_PROCESSED_INPUT and a bare CR without; a raw read returns the Enter
+/// as one silent byte. (The pre-rewrite code wrote nothing for a line read
+/// without ENABLE_ECHO_INPUT -- see the module docs.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnterEcho {
+    /// A raw read: nothing on screen moves.
+    Nothing,
+    /// A line read without ENABLE_PROCESSED_INPUT: a bare CR.
+    CarriageReturn,
+    /// A line read with ENABLE_PROCESSED_INPUT: CRLF, which scrolls the buffer
+    /// when the cursor sits on its last row.
+    Newline,
+}
+
 /// Where the cursor was when the cancel was injected. Restored once the
-/// discarded read returns, undoing the newline the console echoed for the
-/// synthetic Enter (libuv does the same from its read thread). Only
-/// constructed by the Windows console half (and the tests); the state
-/// machine around it is shared so the decisions are testable everywhere.
+/// discarded read returns, undoing what the console wrote for the synthetic
+/// Enter (libuv does the same from its read thread). Only constructed by the
+/// Windows console half (and the tests); the state machine around it is
+/// shared so the decisions are testable everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SavedCursor {
     x: i16,
     y: i16,
-    /// Screen-buffer height. A cursor on the last row scrolled the buffer up
-    /// when the Enter was echoed, so it goes back one row higher.
+    /// Screen-buffer height.
     rows: i16,
+    /// Whether the Enter writes a newline, which scrolls the buffer when the
+    /// cursor sits on its last row -- rather than a bare CR, which does not.
+    scrolls: bool,
 }
 
 impl SavedCursor {
     /// Where the cursor goes back to: one row higher when it sat on the
-    /// buffer's last row, because the echoed Enter scrolled the buffer up
-    /// (libuv's adjustment in uv_tty_line_read_thread). Never above row 0.
+    /// buffer's last row AND the Enter's newline scrolled the buffer up
+    /// (libuv's adjustment in uv_tty_line_read_thread). A bare CR scrolls
+    /// nothing, so the row stays. Never above row 0.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn restore_target(self) -> (i16, i16) {
         let mut y = self.y;
-        if self.y == self.rows - 1 && y > 0 {
+        if self.scrolls && self.y == self.rows - 1 && y > 0 {
             y -= 1;
         }
         (self.x, y)
@@ -96,13 +144,16 @@ impl SavedCursor {
 }
 
 struct Settle {
-    /// Set by `arm_cancel` for a cooked, echoing read; None for a raw one,
-    /// whose injected Enter echoes nothing.
+    /// Set by `arm_cancel` for a line read, whose injected Enter writes to the
+    /// screen; None for a raw one, which writes nothing.
     saved_cursor: Option<SavedCursor>,
     /// Bumped each time a discarded read settles. The cancelling thread waits
     /// for the bump so that output its caller writes right after the mode
     /// switch lands AFTER the cursor restore, never under it.
     generation: u64,
+    /// Outstanding `ReadGate::hold`s. While non-zero the reader parks in
+    /// `begin` instead of issuing its next read.
+    held: u32,
 }
 
 /// The pending-read state machine. One instance per stdin ([`STDIN_GATE`]);
@@ -111,6 +162,8 @@ pub struct ReadGate {
     state: AtomicU8,
     settle: Mutex<Settle>,
     settled: Condvar,
+    /// Signalled when the last hold is released.
+    released: Condvar,
 }
 
 impl Default for ReadGate {
@@ -126,14 +179,35 @@ impl ReadGate {
             settle: Mutex::new(Settle {
                 saved_cursor: None,
                 generation: 0,
+                held: 0,
             }),
             settled: Condvar::new(),
+            released: Condvar::new(),
         }
     }
 
-    /// A read is about to block.
+    /// A read is about to block. Parks first while a hold is out, and marks
+    /// the read PENDING under the same lock `hold` takes -- so once `hold`
+    /// returns, every read is either already PENDING (and a cancel will find
+    /// it) or waiting here for the release.
     fn begin(&self) {
+        let settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
+        let _settle = self
+            .released
+            .wait_while(settle, |s| s.held > 0)
+            .unwrap_or_else(|e| e.into_inner());
         self.state.store(PENDING, Ordering::SeqCst);
+    }
+
+    /// Keep the reader from issuing its next read until the returned guard
+    /// drops. A read already blocked is unaffected -- cancel it separately --
+    /// and one about to begin waits in `begin`. This is what lets a console
+    /// mode switch cancel the pending read under the OLD mode and still have
+    /// the re-issued read start under the NEW one; libuv gets the same by
+    /// stopping the read before its SetConsoleMode and restarting it after.
+    pub fn hold(&self) -> ReadHold<'_> {
+        self.settle.lock().unwrap_or_else(|e| e.into_inner()).held += 1;
+        ReadHold { gate: self }
     }
 
     /// The blocking read returned `bytes_read` bytes (0 for EOF or an error).
@@ -173,9 +247,9 @@ impl ReadGate {
     }
 
     /// Arm a cancel: mark the read in flight for discard and remember where
-    /// the cursor is, so the newline the console echoes for the synthetic
-    /// Enter can be undone. `cursor` is consulted only once a read is
-    /// actually marked, and returns None for a raw read (nothing echoes).
+    /// the cursor is, so whatever the console writes for the synthetic Enter
+    /// can be undone. `cursor` is consulted only once a read is
+    /// actually marked, and returns None for a raw read (nothing is written).
     /// Returns the settle generation to wait on, or None when nothing was
     /// pending.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -206,11 +280,11 @@ impl ReadGate {
 
     /// A marked read returned `bytes_read` bytes. Puts the cursor back when
     /// there is one to put back, bumps the settle generation, and wakes the
-    /// cancelling thread. Returns the cursor that was restored: only a
-    /// cooked, echoing read (the one `arm_cancel` saved a cursor for) that
-    /// actually returned its Enter echoed a newline; a raw read's injected
-    /// `\r` and a cancelled read that failed moved nothing. The decision is
-    /// platform-independent; the SetConsoleCursorPosition behind it is not.
+    /// cancelling thread. Returns the cursor that was restored: only a line
+    /// read (the one `arm_cancel` saved a cursor for) that actually returned
+    /// its Enter wrote anything; a raw read's injected `\r` and a cancelled
+    /// read that failed moved nothing. The decision is platform-independent;
+    /// the SetConsoleCursorPosition behind it is not.
     fn settle_discard(&self, bytes_read: usize) -> Option<SavedCursor> {
         let mut settle = self.settle.lock().unwrap_or_else(|e| e.into_inner());
         let restored = settle.saved_cursor.take().filter(|_| bytes_read > 0);
@@ -245,21 +319,37 @@ impl ReadGate {
     }
 }
 
+/// A [`ReadGate::hold`]. The reader resumes when the last one drops.
+#[must_use = "the hold is released when the guard drops"]
+pub struct ReadHold<'a> {
+    gate: &'a ReadGate,
+}
+
+impl Drop for ReadHold<'_> {
+    fn drop(&mut self) {
+        let mut settle = self.gate.settle.lock().unwrap_or_else(|e| e.into_inner());
+        settle.held -= 1;
+        if settle.held == 0 {
+            self.gate.released.notify_all();
+        }
+    }
+}
+
 #[cfg(windows)]
 impl ReadGate {
     /// libuv's `uv__cancel_read_console`: if a read is blocked, mark it for
     /// discard, inject a synthetic Enter so it returns, and wait for it to
-    /// settle. Returns whether a read was cancelled. Call AFTER the console
-    /// mode has been switched, so the read the loop re-issues runs under the
-    /// new mode. `from_cooked_echo` says what the read was issued under:
-    /// only then does its Enter echo a newline worth undoing.
-    pub fn cancel_console_read(&self, from_cooked_echo: bool) -> bool {
-        let cursor = || {
-            if from_cooked_echo {
-                console::cursor_position()
-            } else {
-                None
-            }
+    /// settle. Returns whether a read was cancelled. Call BEFORE the console
+    /// mode is switched, with a hold out: the Enter has to land while the
+    /// read's own mode is still in force, and the hold keeps the re-issued
+    /// read from starting until the new mode is. `echo` is what that Enter
+    /// writes (see `EnterEcho`): nothing for a raw read, which leaves no
+    /// cursor to restore.
+    pub fn cancel_console_read(&self, echo: EnterEcho) -> bool {
+        let cursor = || match echo {
+            EnterEcho::Nothing => None,
+            EnterEcho::CarriageReturn => console::cursor_position(false),
+            EnterEcho::Newline => console::cursor_position(true),
         };
         let Some(generation) = self.arm_cancel(cursor) else {
             return false;
@@ -276,13 +366,21 @@ impl ReadGate {
 /// The gate for the process's stdin.
 pub static STDIN_GATE: ReadGate = ReadGate::new();
 
-/// Cancel the stdin read in flight, if any, after a console-mode switch. See
-/// the module docs. `from_cooked_echo`: the mode the read was issued under
-/// had ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT set, so its Enter echoes a
-/// newline that must be undone. Returns whether a read was cancelled.
+/// Cancel the stdin read in flight, if any, ahead of a console-mode switch,
+/// while holding [`hold_console_reads`]. See the module docs. `echo`: what the
+/// synthetic Enter writes under the mode the read was issued with, which
+/// decides whether there is a cursor to put back and whether a scroll moved
+/// it. Returns whether a read was cancelled.
 #[cfg(windows)]
-pub fn cancel_pending_console_read(from_cooked_echo: bool) -> bool {
-    STDIN_GATE.cancel_console_read(from_cooked_echo)
+pub fn cancel_pending_console_read(echo: EnterEcho) -> bool {
+    STDIN_GATE.cancel_console_read(echo)
+}
+
+/// Hold the stdin reader across a console-mode switch: its next read waits
+/// until the guard drops. See `ReadGate::hold`.
+#[cfg(windows)]
+pub fn hold_console_reads() -> ReadHold<'static> {
+    STDIN_GATE.hold()
 }
 
 /// Read into `buf` through the gate. A result marked for discard while the
@@ -389,7 +487,7 @@ mod console {
 
     /// The active screen buffer's cursor position, or None when there is no
     /// console to ask.
-    pub(super) fn cursor_position() -> Option<SavedCursor> {
+    pub(super) fn cursor_position(scrolls: bool) -> Option<SavedCursor> {
         let name = conout_name();
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the
@@ -416,12 +514,14 @@ mod console {
                 x: info.dwCursorPosition.X,
                 y: info.dwCursorPosition.Y,
                 rows: info.dwSize.Y,
+                scrolls,
             })
         }
     }
 
     /// Put the cursor back where `cursor_position` found it, one row higher
-    /// when the echoed Enter scrolled the buffer (libuv's adjustment).
+    /// when the Enter's newline scrolled the buffer (see
+    /// `SavedCursor::restore_target`).
     pub(super) fn restore_cursor(cursor: SavedCursor) {
         let name = conout_name();
         let (x, y) = cursor.restore_target();
@@ -571,6 +671,7 @@ mod tests {
         x: 7,
         y: 3,
         rows: 40,
+        scrolls: true,
     };
 
     #[test]
@@ -663,12 +764,23 @@ mod tests {
             x: 7,
             y: 39,
             rows: 40,
+            scrolls: true,
         };
         assert_eq!(last_row.restore_target(), (7, 38), "the echo scrolled");
+        let bare_cr = SavedCursor {
+            scrolls: false,
+            ..last_row
+        };
+        assert_eq!(
+            bare_cr.restore_target(),
+            (7, 39),
+            "a bare CR scrolls nothing, so the row stays"
+        );
         let one_row = SavedCursor {
             x: 0,
             y: 0,
             rows: 1,
+            scrolls: true,
         };
         assert_eq!(one_row.restore_target(), (0, 0), "never above row 0");
     }
@@ -689,5 +801,118 @@ mod tests {
             assert!(gate.wait_settled(generation, Duration::from_secs(5)));
         });
         assert_eq!(gate.generation(), generation + 1);
+    }
+
+    /// A reader that announces each read the loop issues, then returns what
+    /// the test hands it -- so a test can see whether, and when, a read was
+    /// issued. `cancel` stands in for a mode switch's synthetic Enter landing
+    /// while the read is blocked.
+    struct Announcing<'a> {
+        gate: &'a ReadGate,
+        issued: std::sync::mpsc::Sender<()>,
+        results: std::sync::mpsc::Receiver<(bool, &'static [u8])>,
+    }
+
+    impl Read for Announcing<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(self.gate.is_pending(), "read issued outside the gate");
+            self.issued.send(()).unwrap();
+            // Bounded, so a regression FAILS rather than hangs: a reader
+            // blocked here forever would hold up thread::scope after the
+            // assertion that caught the regression had already panicked. (A
+            // reader parked in `begin` by a hold that is never released is not
+            // covered -- that wait is untimed, so a broken release still hangs.)
+            let (cancel, bytes) = self
+                .results
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the test never answered this read");
+            if cancel {
+                assert!(
+                    self.gate.mark_discard(),
+                    "cancel must find the read pending"
+                );
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn a_hold_parks_a_read_that_has_not_begun_until_it_is_released() {
+        let gate = ReadGate::new();
+        let g = &gate;
+        let (issued_tx, issued) = std::sync::mpsc::channel();
+        let (results_tx, results) = std::sync::mpsc::channel();
+        let hold = g.hold();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                let mut r = Announcing {
+                    gate: g,
+                    issued: issued_tx,
+                    results,
+                };
+                let mut buf = [0u8; 8];
+                let n = read_through_gate(g, &mut r, &mut buf).unwrap();
+                buf[..n].to_vec()
+            });
+            assert!(
+                issued.recv_timeout(Duration::from_millis(100)).is_err(),
+                "no read may be issued while the gate is held"
+            );
+            drop(hold);
+            issued
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the release lets the read begin");
+            results_tx.send((false, b"k")).unwrap();
+            assert_eq!(reader.join().unwrap(), b"k");
+        });
+    }
+
+    #[test]
+    fn a_read_discarded_under_a_hold_is_reissued_only_after_the_release() {
+        // The mode switch's order: hold, cancel the read in flight, switch,
+        // release. The discarded read must not be re-issued in between: that
+        // re-issue is the read that has to start under the NEW mode.
+        let gate = ReadGate::new();
+        let g = &gate;
+        let (issued_tx, issued) = std::sync::mpsc::channel();
+        let (results_tx, results) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                let mut r = Announcing {
+                    gate: g,
+                    issued: issued_tx,
+                    results,
+                };
+                let mut buf = [0u8; 8];
+                let n = read_through_gate(g, &mut r, &mut buf).unwrap();
+                buf[..n].to_vec()
+            });
+            issued
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the first read begins");
+            let hold = g.hold();
+            // The cancel lands while that read is blocked: it returns the
+            // synthetic Enter and is discarded.
+            results_tx.send((true, b"\r\n")).unwrap();
+            assert!(
+                g.wait_settled(0, Duration::from_secs(5)),
+                "the discard settles under the hold"
+            );
+            assert!(
+                issued.recv_timeout(Duration::from_millis(100)).is_err(),
+                "the discarded read must not be re-issued while held"
+            );
+            drop(hold);
+            issued
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the release re-issues the read");
+            results_tx.send((false, b"h")).unwrap();
+            assert_eq!(
+                reader.join().unwrap(),
+                b"h",
+                "the discarded line never surfaces"
+            );
+        });
     }
 }

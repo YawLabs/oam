@@ -11616,28 +11616,21 @@
         // stdin 'data' byte and Ctrl-C is delivered as 0x03 (no SIGINT) -- the
         // signals-in item's console-ctrl handler naturally won't fire.
         // 0 or the negative libuv errno, matching uv_tty_set_mode. Node's
-        // tty.ReadStream#setRawMode emits on failure and leaves isRaw alone
-        // (lib/tty.js); swallowing it left the program believing it was raw.
-        //
-        // Deliberate divergence in the ERROR OBJECT only: node builds it as
-        // `new ERR_SYSTEM_ERROR(err)` with `err` the bare integer, so its
-        // SystemError constructor destructures a number and every field comes
-        // out undefined ("A system error occurred: undefined returned
-        // undefined (undefined)"). The `code` is what programs branch on and
-        // it matches; the rest is populated here from the same libuv table
-        // getSystemErrorName reads, because a garbage message helps nobody.
+        // tty.ReadStream#setRawMode emits a failure as an 'error' event and
+        // leaves isRaw alone (lib/tty.js, v22.22.2), and the error is
+        // `new ErrnoException(err, 'setRawMode')`: code is
+        // util.getSystemErrorName(err), message is `setRawMode <code>`, and
+        // errno, code, syscall are set in that order. Swallowing it left the
+        // program believing it was raw.
         const rawErrno = natives.ttySetRawMode(fd, enable);
         if (rawErrno !== 0) {
+          // getSystemErrorName's lookup and its unmapped-errno fallback.
           const entry = uvErrnoTable(natives).get(rawErrno);
-          const name = entry === undefined ? "UNKNOWN" : entry[0];
-          const text = entry === undefined ? "unknown error" : entry[1];
-          const err = new Error(
-            `A system error occurred: uv_tty_set_mode returned ${name} (${text})`,
-          );
-          err.code = "ERR_SYSTEM_ERROR";
+          const code = entry === undefined ? "Unknown system error " + rawErrno : entry[0];
+          const err = new Error(`setRawMode ${code}`);
           err.errno = rawErrno;
-          err.syscall = "uv_tty_set_mode";
-          err.info = { errno: rawErrno, code: name, message: text, syscall: "uv_tty_set_mode" };
+          err.code = code;
+          err.syscall = "setRawMode";
           stream.emit("error", err);
           return stream;
         }

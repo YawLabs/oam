@@ -859,6 +859,16 @@ fn op_is_tty(
 static WIN_STDIN_ORIG_MODE: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// Serialises the Windows switch, as UNIX_STDIN_ORIG_TERMIOS's lock does on
+/// unix. A second setRawMode -- a Worker's, or the exit hook's -- must not
+/// read the console mode or the saved slot in the middle of another switch,
+/// least of all in the cancel's settle wait between the two: it would save a
+/// raw mode as the "original", or flip before the first switch's Enter has
+/// landed. The stdin reader's settle path never takes it, so holding it
+/// across that wait cannot deadlock.
+#[cfg(windows)]
+static WIN_CONSOLE_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(unix)]
 static UNIX_STDIN_ORIG_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
     std::sync::Mutex::new(None);
@@ -872,10 +882,11 @@ static TTY_RESTORE_HOOKED: std::sync::atomic::AtomicBool =
 /// `process.on('exit')` in node_compat covers the graceful path, but oam has
 /// in-process exits that never emit it: the stdout/stderr EPIPE bails
 /// (`op_stdout_write` / `op_stderr_write`), the near-heap-limit OOM banner,
-/// `main`'s fatal sub-code returns, and the SIG_DFL re-raise for a signal
-/// whose JS listener was removed. Every one of those drains oam_core's exit
-/// hooks, so a single registration covers the lot -- and a terminal left raw
-/// is the one failure mode a shell never recovers from by itself.
+/// `main`'s fatal sub-code returns, and the OS default for a signal that no
+/// JS listener is watching (`oam_core::signal::serve_default_action`). Every
+/// one of those drains oam_core's exit hooks, so a single registration covers
+/// the lot -- and a terminal left raw is the one failure mode a shell never
+/// recovers from by itself.
 ///
 /// Registered AT MOST ONCE. Hooks are drained, never deduplicated, so arming
 /// per enable would grow the list without bound under a TUI that toggles raw
@@ -885,18 +896,20 @@ fn arm_tty_restore_hook(fd: i32) {
     if TTY_RESTORE_HOOKED.swap(true, Ordering::SeqCst) {
         return;
     }
-    oam_core::register_exit_hook(move || {
+    oam_core::register_process_state_hook(move || {
         // A no-op when the program already restored: a successful disable
         // clears the saved mode, and both impls treat "nothing saved" as
-        // "already cooked".
-        let _ = tty_set_raw_mode(fd, false);
+        // "already cooked". The exit-path reset, not the switch: see
+        // tty_reset_mode.
+        tty_reset_mode(fd);
     });
 }
 
 /// The last OS error in the shape node reports for a failed tty switch: the
 /// negative libuv number, which is what `uv_tty_set_mode` returns and what
-/// `ERR_SYSTEM_ERROR` formats. Call it IMMEDIATELY after the failing syscall,
-/// before anything else can move `errno` / `GetLastError`.
+/// node's `ErrnoException(err, 'setRawMode')` names. Call it IMMEDIATELY
+/// after the failing syscall, before anything else can move `errno` /
+/// `GetLastError`.
 fn last_os_tty_errno() -> i32 {
     let err = std::io::Error::last_os_error();
     let code = oam_core::node_error_code(&err);
@@ -942,19 +955,23 @@ enum ConsoleSwitch {
     /// Nothing: no SetConsoleMode and -- what matters -- no cancel of a
     /// read in flight, which would drop its type-ahead for nothing.
     Keep,
-    /// Set `target`; `from_cooked_echo` says whether the read blocked under
-    /// the OLD mode was a cooked, echoing one (its Enter echoes a newline).
-    Set { target: u32, from_cooked_echo: bool },
+    /// Set `target`; `echo` is what the synthetic Enter writes when it lands
+    /// on the read blocked under the OLD mode.
+    Set {
+        target: u32,
+        echo: oam_core::stdin::EnterEcho,
+    },
 }
 
 /// The decision behind the Windows `tty_set_raw_mode`, as a pure function of
 /// the mode the console is in now, the direction, and `saved` -- the mode
 /// the first setRawMode(true) stashed, None when raw was never enabled.
 ///
-/// Two early returns mirror libuv's `uv_tty_set_mode` (src/win/tty.c):
-/// `if (!!mode == !!(tty->flags & UV_HANDLE_TTY_RAW)) return 0;` -- asking
+/// Two early returns mirror libuv's `uv_tty_set_mode` (src/win/tty.c,
+/// v1.51.0): `if ((int)mode == tty->tty.rd.mode.mode) return 0;` -- asking
 /// for the mode the tty is already in is a no-op, and NORMAL when raw was
-/// never enabled is that no-op too. libuv keys it off its own flag; here the
+/// never enabled is that no-op too, because `uv_tty_init` starts the mode at
+/// 0, UV_TTY_MODE_NORMAL. libuv keys it off the mode it last set; here the
 /// console's current mode and the saved-original slot carry the same
 /// information. Synthesising a cooked mode from the current one instead
 /// (what this used to do) is not harmless: on a console that starts with
@@ -978,10 +995,79 @@ fn plan_console_switch(mode: u32, enable: bool, saved: Option<u32>) -> ConsoleSw
     if target == mode {
         return ConsoleSwitch::Keep;
     }
-    ConsoleSwitch::Set {
-        target,
-        from_cooked_echo: mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
-            == (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT),
+    // What the Enter writes is the read's own, pre-flip mode's call: on
+    // conhost's rewritten cooked read, a line read writes a newline whether
+    // or not it echoes the typed characters -- CRLF with PROCESSED_INPUT, a
+    // bare CR without -- and a raw read writes nothing (readDataCooked.cpp;
+    // measured on conhost 10.0.26100.1). The pre-rewrite code wrote nothing
+    // for a line read without ECHO; see EnterEcho.
+    let echo = if (mode & ENABLE_LINE_INPUT) == 0 {
+        oam_core::stdin::EnterEcho::Nothing
+    } else if (mode & ENABLE_PROCESSED_INPUT) != 0 {
+        oam_core::stdin::EnterEcho::Newline
+    } else {
+        oam_core::stdin::EnterEcho::CarriageReturn
+    };
+    ConsoleSwitch::Set { target, echo }
+}
+
+/// A console-mode switch in libuv's order: hold the stdin reader, cancel the
+/// read in flight while the mode it was issued under is still in force, flip,
+/// release. Generic over the steps so the order is unit-tested: it is what the
+/// cursor restore depends on, and without a console nothing else could see it
+/// change. The hold is released on the error path too.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn switch_in_libuv_order<G, E>(
+    hold: impl FnOnce() -> G,
+    cancel: impl FnOnce(),
+    flip: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let held = hold();
+    cancel();
+    let flipped = flip();
+    drop(held);
+    flipped
+}
+
+#[cfg(test)]
+mod switch_order_tests {
+    use super::switch_in_libuv_order;
+    use std::cell::RefCell;
+
+    struct Released<'a>(&'a RefCell<Vec<&'static str>>);
+
+    impl Drop for Released<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("release");
+        }
+    }
+
+    fn run(log: &RefCell<Vec<&'static str>>, flip: Result<(), i32>) -> Result<(), i32> {
+        switch_in_libuv_order(
+            || {
+                log.borrow_mut().push("hold");
+                Released(log)
+            },
+            || log.borrow_mut().push("cancel"),
+            || {
+                log.borrow_mut().push("flip");
+                flip
+            },
+        )
+    }
+
+    #[test]
+    fn the_read_is_cancelled_before_the_flip_and_released_after_it() {
+        let log = RefCell::new(Vec::new());
+        assert_eq!(run(&log, Ok(())), Ok(()));
+        assert_eq!(*log.borrow(), ["hold", "cancel", "flip", "release"]);
+    }
+
+    #[test]
+    fn a_failed_flip_still_releases_the_hold_and_reports_the_error() {
+        let log = RefCell::new(Vec::new());
+        assert_eq!(run(&log, Err(-4071)), Err(-4071));
+        assert_eq!(*log.borrow(), ["hold", "cancel", "flip", "release"]);
     }
 }
 
@@ -1001,12 +1087,13 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
         // libuv's Windows EBADF: no console handle behind this descriptor.
         return -4083;
     }
+    let _switch = WIN_CONSOLE_SWITCH.lock().unwrap_or_else(|e| e.into_inner());
     let mut mode: u32 = 0;
-    let from_cooked_echo;
     // SAFETY: `h` is a console handle from win_std_handle, already rejected
     // above if 0/-1. `mode` is a live stack u32 passed by `&mut`, valid for
     // GetConsoleMode's out-write, and is only read after the return is checked
-    // non-zero. SetConsoleMode takes the handle plus a by-value DWORD.
+    // non-zero. SetConsoleMode takes the handle plus a by-value DWORD. The
+    // hold and cancel between the two calls are safe code.
     unsafe {
         if GetConsoleMode(h, &mut mode) == 0 {
             return last_os_tty_errno();
@@ -1024,42 +1111,69 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             let orig = WIN_STDIN_ORIG_MODE.swap(u32::MAX, Ordering::SeqCst);
             (orig != u32::MAX).then_some(orig)
         };
-        let target = match plan_console_switch(mode, enable, saved) {
+        let (target, echo) = match plan_console_switch(mode, enable, saved) {
             ConsoleSwitch::Keep => return 0,
-            ConsoleSwitch::Set {
-                target,
-                from_cooked_echo: echo,
-            } => {
-                from_cooked_echo = echo;
-                target
-            }
+            ConsoleSwitch::Set { target, echo } => (target, echo),
         };
-        if SetConsoleMode(h, target) == 0 {
-            return last_os_tty_errno();
+        // Cancel the stdin read in flight BEFORE the flip, in libuv's order
+        // (see below); the hold keeps the read it re-issues waiting for the
+        // new mode.
+        let flipped = switch_in_libuv_order(
+            || (fd == 0).then(oam_core::stdin::hold_console_reads),
+            || {
+                if fd == 0 {
+                    oam_core::stdin::cancel_pending_console_read(echo);
+                }
+            },
+            || {
+                if SetConsoleMode(h, target) == 0 {
+                    Err(last_os_tty_errno())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if let Err(errno) = flipped {
+            // A failed restore keeps the saved mode, so a later attempt -- the
+            // exit hook, say -- can still put the console back. It used to be
+            // taken out of the slot first and lost with the error.
+            if let Some(orig) = saved {
+                WIN_STDIN_ORIG_MODE.store(orig, Ordering::SeqCst);
+            }
+            return errno;
         }
     }
-    // The mode is flipped, but a stdin read that was ALREADY blocked keeps the
-    // semantics it was issued with: a cooked (ENABLE_LINE_INPUT) ReadConsoleW
-    // returns only on Enter no matter what SetConsoleMode did after it. And
-    // one is nearly always blocked, because node's Readable refills the moment
-    // a chunk is pushed -- so right after a readline answer the next cooked
-    // read is pending, and a TUI that now goes raw saw nothing the user typed
-    // until they pressed Enter. libuv cancels the pending read from
-    // uv_tty_set_mode (uv__cancel_read_console: a synthetic VK_RETURN, the
-    // returned line discarded, a fresh read queued under the new mode);
-    // oam_core::stdin does the same. After the flip, on purpose: the re-issued
-    // read must start under the NEW mode.
+    // Why the cancel above exists: a stdin read that is ALREADY blocked keeps
+    // the line buffering it was issued with -- a cooked (ENABLE_LINE_INPUT)
+    // ReadConsoleW returns only on Enter no matter what SetConsoleMode does
+    // after it. And one is nearly always blocked, because node's Readable
+    // refills the moment a chunk is pushed -- so right after a readline answer
+    // the next cooked read is pending, and a TUI that then goes raw saw
+    // nothing the user typed until they pressed Enter. libuv cancels the
+    // pending read from uv_tty_set_mode (uv__cancel_read_console: a synthetic
+    // VK_RETURN, the returned line discarded, a fresh read queued under the
+    // new mode); oam_core::stdin does the same.
+    //
+    // In libuv's order: cancel, THEN flip. libuv stops the read before its
+    // SetConsoleMode and waits on its output lock for the cancelled read to
+    // finish; the hold does that job here, parking the reader's next read
+    // until the flip has landed so that it starts under the NEW mode. The
+    // order is what the cursor restore depends on. Injected after the flip,
+    // the Enter was handled under the new mode, and conhost 10.0.26100.1
+    // answers a raw mode's Enter with a bare carriage return, not the echoed
+    // newline libuv's last-row adjustment assumes -- so a prompt on the
+    // buffer's last row came back with the cursor one row too high. Before
+    // the flip, a read already blocked in ReadConsoleW handles the Enter under
+    // its own mode.
     //
     // Both directions: a read issued RAW keeps raw semantics across the
     // switch back too, and would hand the next cooked prompt its first
-    // keystroke immediately and un-echoed. What differs is the echo: only a
-    // read issued under LINE_INPUT + ECHO_INPUT has its Enter echoed as a
-    // newline, so only then is there a cursor to put back -- a raw read
-    // returns the injected `\r` as one silent byte. The PRE-flip `mode` is
-    // what the pending read was issued under.
-    if fd == 0 {
-        oam_core::stdin::cancel_pending_console_read(from_cooked_echo);
-    }
+    // keystroke immediately and un-echoed. What differs is what the Enter
+    // writes, and the read's own mode -- the PRE-flip one, still in force
+    // when the Enter lands -- decides it (EnterEcho): a line read writes a
+    // newline, CRLF with PROCESSED_INPUT (which scrolls from the last row)
+    // and a bare CR without; a raw read returns the injected `\r` as one
+    // silent byte and leaves no cursor to put back.
     // Last, with the switch fully landed: the console is raw from here, so
     // this is the point past which an exit that never reaches JS would strand
     // it that way.
@@ -1075,6 +1189,7 @@ mod console_switch_tests {
         ConsoleSwitch, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
         ENABLE_VIRTUAL_TERMINAL_INPUT, plan_console_switch,
     };
+    use oam_core::stdin::EnterEcho;
 
     const ENABLE_WINDOW_INPUT: u32 = 0x0008;
     const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
@@ -1093,7 +1208,7 @@ mod console_switch_tests {
             plan_console_switch(COOKED, true, None),
             ConsoleSwitch::Set {
                 target: RAW,
-                from_cooked_echo: true
+                echo: EnterEcho::Newline
             }
         );
     }
@@ -1125,7 +1240,7 @@ mod console_switch_tests {
             plan_console_switch(RAW, false, Some(COOKED)),
             ConsoleSwitch::Set {
                 target: COOKED,
-                from_cooked_echo: false
+                echo: EnterEcho::Nothing
             }
         );
     }
@@ -1139,13 +1254,31 @@ mod console_switch_tests {
     }
 
     #[test]
-    fn a_line_read_without_echo_has_no_newline_to_undo() {
+    fn a_line_read_writes_its_newline_whether_or_not_it_echoes() {
+        // ECHO governs the typed characters only; conhost's rewritten cooked
+        // read writes the Enter's newline for any LINE_INPUT read
+        // (readDataCooked.cpp, and measured on 10.0.26100.1: mode 0x1f3
+        // returned "x\r\n" and scrolled the last row).
         let silent_cooked = COOKED & !ENABLE_ECHO_INPUT;
         assert_eq!(
             plan_console_switch(silent_cooked, true, None),
             ConsoleSwitch::Set {
                 target: RAW,
-                from_cooked_echo: false
+                echo: EnterEcho::Newline
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_read_without_processed_input_writes_a_bare_carriage_return() {
+        // Measured: mode 0x1f6 returned "x\r" and scrolled nothing, so there
+        // is a cursor to put back but no row to step up.
+        let unprocessed = COOKED & !ENABLE_PROCESSED_INPUT;
+        assert_eq!(
+            plan_console_switch(unprocessed, true, None),
+            ConsoleSwitch::Set {
+                target: RAW,
+                echo: EnterEcho::CarriageReturn
             }
         );
     }
@@ -1279,25 +1412,64 @@ fn raw_mode_bits(cooked: TtyModeBits) -> TtyModeBits {
     }
 }
 
+/// The exit-path restore on Windows: the ordinary switch back, which cannot
+/// block the way a unix drain can.
+#[cfg(windows)]
+fn tty_reset_mode(fd: i32) {
+    let _ = tty_set_raw_mode(fd, false);
+}
+
 #[cfg(unix)]
 fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
+    tty_switch(fd, enable, false)
+}
+
+/// The exit-path restore: libuv's `uv_tty_reset_mode` and node's
+/// `ResetStdio`, not `uv_tty_set_mode`. TCSANOW, where the switch drains with
+/// TCSADRAIN -- a drain waits for the terminal to consume queued output, and
+/// on an exit path, a signal death above all, a stalled reader (a hung
+/// terminal, an ssh session with a full socket buffer) must not be able to
+/// keep the process alive. SIGTTOU is blocked around it, as node does, so a
+/// job moved to the background after going raw is not stopped by its own
+/// restore on the way out. And it never waits for a switch in progress on
+/// another thread: like `uv_tty_reset_mode`'s `UV_EBUSY`, a busy lock means
+/// no restore, because that switch may be the stalled drain this exists to
+/// get past.
+#[cfg(unix)]
+fn tty_reset_mode(fd: i32) {
+    let _ = tty_switch(fd, false, true);
+}
+
+#[cfg(unix)]
+fn tty_switch(fd: i32, enable: bool, at_exit: bool) -> i32 {
     // No pending-read cancel here, unlike the Windows impl above. A stdin
-    // read blocked in canonical mode picks up the termios change on its own:
-    // Linux's n_tty_set_termios wakes tty->read_wait, and n_tty_read
-    // re-evaluates icanon on every wakeup, so the blocked read returns the
-    // very next byte typed after tcsetattr (verified on a 6.6 kernel: a read
-    // blocked under ICANON returned a single 'h', no Enter, once the caller
-    // cleared ICANON). BSD/XNU's ttread does NOT wake on TIOCSETA; the next
-    // byte to arrive is what re-checks ICANON, so that byte is delivered raw.
+    // read blocked in canonical mode picks up the termios change on its own,
+    // on both kernels, and the input already pending comes with it:
     //
-    // That BSD sentence is read off the source, not measured the way the
-    // Linux one was, and it understates the case: bytes typed BEFORE the
-    // switch are sitting in the canonical queue too, so they are not
-    // delivered until a further byte arrives either. No test here can tell
-    // the two behaviours apart -- the pty case
-    // (`raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing`)
-    // sends its keystroke right after the switch, which satisfies both
-    // "woken at tcsetattr" and "woken by the next byte". Treat it as sourced.
+    // - Linux: n_tty_set_termios, on an ICANON change, makes everything
+    //   pending readable (commit_head moves to the read head) and wakes
+    //   tty->read_wait, and n_tty_read re-evaluates icanon on every wakeup --
+    //   so the blocked read returns what was pending, or else the very next
+    //   byte typed (the second half verified on a 6.6 kernel: a read blocked
+    //   under ICANON returned a single 'h', typed after the switch, with no
+    //   Enter).
+    // - XNU: ttioctl_locked (bsd/kern/tty.c), on an ICANON-off transition
+    //   made by anything but TIOCSETAF, appends the raw queue to the
+    //   canonical one and swaps the two, so all pending input sits in the
+    //   queue a non-canonical read takes from, then calls ttwakeup -- which
+    //   wakes TSA_HUP_OR_INPUT, the channel ttread sleeps on, and ttread's
+    //   `goto loop` re-reads the lflag. TCSADRAIN, which this uses as libuv
+    //   does, is TIOCSETAW, so the branch runs.
+    //
+    // On both kernels the wake at tcsetattr and the hand-over of pending
+    // input are read off the source, not measured. Both measurements -- the
+    // 6.6 probe and the pty case
+    // (`raw_mode_delivers_a_keystroke_unechoed_and_keeps_output_processing`),
+    // which runs on Linux and macOS -- send their keystroke after the switch,
+    // which a reader woken at tcsetattr and one woken by the next byte both
+    // satisfy. An earlier version of this comment read the XNU source as "does
+    // not wake" and called the pre-switch bytes stranded; the transition branch
+    // above says otherwise.
     //
     // Either way it is all libuv does on unix -- uv_tty_set_mode is a bare
     // tcsetattr -- so node and oam agree.
@@ -1316,16 +1488,29 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
     // `term` is read. `&mut term` / `&raw_term` / `&o` point at live stack
     // storage for the duration of each tc*attr call. `fd` is the
     // caller-supplied descriptor; a bad fd makes the syscalls fail cleanly
-    // (non-zero return), never UB.
+    // (non-zero return), never UB. The two `sigset_t`s on the exit path are
+    // plain data, zeroed and then initialised by sigemptyset/sigaddset before
+    // pthread_sigmask reads them through pointers to that live stack storage;
+    // its old-set pointer on the restoring call is null, which it permits.
     unsafe {
         // Held across the whole switch, so the mode check and the mode change
         // cannot interleave. Poisoning is recovered rather than swallowed: a
         // dropped `PoisonError` here used to skip the SAVE while still
         // applying raw mode, after which every restore took the "nothing
         // saved" arm and reported success with the terminal still raw.
-        let mut saved = UNIX_STDIN_ORIG_TERMIOS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut saved = if at_exit {
+            match UNIX_STDIN_ORIG_TERMIOS.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                // A switch is in progress on another thread; see
+                // tty_reset_mode.
+                Err(std::sync::TryLockError::WouldBlock) => return -16, // EBUSY
+            }
+        } else {
+            UNIX_STDIN_ORIG_TERMIOS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
         if enable {
             if saved.is_some() {
                 return 0; // already raw
@@ -1352,7 +1537,27 @@ fn tty_set_raw_mode(fd: i32, enable: bool) -> i32 {
             let Some(orig) = *saved else {
                 return 0; // never enabled, or already restored
             };
-            if libc::tcsetattr(fd, libc::TCSADRAIN, &orig) != 0 {
+            let rc = if at_exit {
+                // See tty_reset_mode: no drain, and SIGTTOU held off.
+                let mut block: libc::sigset_t = std::mem::zeroed();
+                let mut prior: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut block);
+                libc::sigaddset(&mut block, libc::SIGTTOU);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut prior);
+                let rc = loop {
+                    let rc = libc::tcsetattr(fd, libc::TCSANOW, &orig);
+                    if rc == 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break rc;
+                    }
+                };
+                libc::pthread_sigmask(libc::SIG_SETMASK, &prior, std::ptr::null_mut());
+                rc
+            } else {
+                libc::tcsetattr(fd, libc::TCSADRAIN, &orig)
+            };
+            if rc != 0 {
                 // Keep the snapshot: the tty is still raw, so a later attempt
                 // -- the exit hook, say -- must still be able to put it back.
                 return last_os_tty_errno();
@@ -1368,9 +1573,10 @@ mod raw_mode_tests {
     use super::{TtyModeBits, raw_mode_bits, tty_set_raw_mode};
 
     /// The op's contract is `uv_tty_set_mode`'s: 0, or the negative libuv
-    /// errno the JS side turns into node's `ERR_SYSTEM_ERROR`. It used to be a
-    /// bare bool, and the JS side dropped the failure on the floor -- the
-    /// program went on believing it had a raw terminal.
+    /// errno the JS side turns into node's `ErrnoException` shape (code the
+    /// errno name, syscall 'setRawMode'). It used to be a bare bool, and the JS
+    /// side dropped the failure on the floor -- the program went on believing
+    /// it had a raw terminal.
     ///
     /// A descriptor that was never opened makes `tcgetattr` fail `EBADF`,
     /// which libuv numbers `-EBADF` on POSIX. Nothing else in this binary
@@ -1487,9 +1693,26 @@ fn op_tty_set_raw_mode(
     let fd = args.get(0).int32_value(scope).unwrap_or(0);
     let enable = args.get(1).boolean_value(scope);
     // 0 on success, else the negative libuv errno -- `uv_tty_set_mode`'s own
-    // contract, so the JS side can raise node's ERR_SYSTEM_ERROR shape rather
+    // contract, so the JS side can emit node's ErrnoException shape rather
     // than swallowing a bare `false`.
-    rv.set_int32(tty_set_raw_mode(fd, enable));
+    let rc = tty_set_raw_mode(fd, enable);
+    // node puts the terminal back from its own SIGINT/SIGTERM handler
+    // (SignalExit -> ResetStdio, src/node.cc), installed at startup whether or
+    // not JS listens. oam installed a native handler only for a JS listener,
+    // so a raw program killed without one died at SIG_DFL with the terminal
+    // still raw. On a successful enable, have both served for the rest of the
+    // process: a delivery that no JS listener anywhere is watching drains the
+    // exit hooks -- the termios restore among them -- and then dies by the
+    // signal. Process-wide rather than on this run's CoreRuntime, so it
+    // outlives the run, and a listener in another isolate still wins.
+    // Windows is untouched: SIGTERM is never delivered there, and console
+    // control events take the separate ctrl-handler path.
+    #[cfg(unix)]
+    if enable && rc == 0 {
+        oam_core::signal::serve_default_action(libc::SIGINT);
+        oam_core::signal::serve_default_action(libc::SIGTERM);
+    }
+    rv.set_int32(rc);
 }
 
 fn op_tty_get_win_size(

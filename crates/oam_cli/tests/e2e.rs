@@ -8482,7 +8482,9 @@ mod unix_pty {
     /// ISSET(tp->t_lflag, ICANON)`, not on the incoming value -- and then ends
     /// with `tp->t_lflag = t->c_lflag | ISSET(tp->t_lflag, PENDIN)`
     /// (bsd/kern/tty.c; FreeBSD's tty.c is the same lineage). That trailing OR
-    /// is also why no later `tcsetattr` can scrub the bit back off.
+    /// is also why no later `tcsetattr` that leaves `ICANON` on can scrub the
+    /// bit back off -- only a flush, turning `ICANON` off again, or the tty's
+    /// next read, poll or incoming byte clears it.
     ///
     /// So every raw-mode restore reads it back. One call would dodge it -- the
     /// kernel skips the branch for `TIOCSETAF`, i.e. `TCSAFLUSH` -- and
@@ -8604,13 +8606,18 @@ mod unix_pty {
     /// `oam run <script>` with the pty slave as all three stdio, and a pump
     /// draining the master side into `seen`.
     fn spawn_on_pty(pty: &Pty, script: &Path) -> Session {
+        spawn_args_on_pty(pty, &["run", script.to_str().unwrap(), "--no-check"])
+    }
+
+    /// `oam <args>` on the pty, as `spawn_on_pty` runs `oam run`.
+    fn spawn_args_on_pty(pty: &Pty, args: &[&str]) -> Session {
         let cache = write_temp("oam-cache-pty/.keep", "")
             .parent()
             .unwrap()
             .to_path_buf();
         let stdio = || Stdio::from(pty.slave.try_clone().expect("dup slave"));
         let child = Command::new(env!("CARGO_BIN_EXE_oam"))
-            .args(["run", script.to_str().unwrap(), "--no-check"])
+            .args(args)
             .env("OAM_CACHE_DIR", &cache)
             .env("OAM_DAEMON_IDLE_MS", "45000")
             .stdin(stdio())
@@ -8618,6 +8625,11 @@ mod unix_pty {
             .stderr(stdio())
             .spawn()
             .expect("spawn oam on the pty");
+        session_from(pty, child)
+    }
+
+    /// Wrap an already-spawned child on `pty`, with the output pump.
+    fn session_from(pty: &Pty, child: Child) -> Session {
         let master = std::fs::File::from(pty.master.try_clone().expect("dup master"));
         let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
         let pump_stopped = Arc::new(Mutex::new(None::<String>));
@@ -8909,6 +8921,277 @@ setTimeout(() => { throw new Error('fatal'); }, 10);
         );
     }
 
+    /// A raw program killed by a signal it never listened for still puts the
+    /// terminal back -- and still dies by that signal.
+    ///
+    /// node restores the tty from its own SIGINT/SIGTERM handler (SignalExit
+    /// -> ResetStdio, src/node.cc), installed at startup whether or not JS
+    /// listens. oam installed a native handler only for a JS listener, so this
+    /// program died at SIG_DFL with the terminal still raw. The child takes no
+    /// listener on purpose, and the parent sends the signal: raw mode clears
+    /// ISIG, so a typed Ctrl-C would arrive as a byte, not a SIGINT. `kill(1)`
+    /// rather than `libc::kill` keeps this test out of the unsafe budget.
+    fn killed_raw_without_a_listener(signal: libc::c_int, kill_arg: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        let pty = open_pty();
+        let original = termios_of(&pty.slave);
+        let script = write_temp(
+            &format!("pty_no_listener_{}.mjs", &kill_arg[1..]),
+            r#"
+process.stdin.setRawMode(true);
+process.stdout.write('[raw]');
+process.stdin.resume();
+"#,
+        );
+        let s = spawn_on_pty(&pty, &script);
+        s.wait_for("[raw]");
+        assert_eq!(
+            termios_of(&pty.slave).c_lflag & libc::ICANON,
+            0,
+            "raw while it runs"
+        );
+        let sent = Command::new("kill")
+            .args([kill_arg, &s.child.id().to_string()])
+            .status()
+            .expect("run kill(1)");
+        assert!(sent.success(), "kill {kill_arg} failed: {sent}");
+        let (status, out) = s.finish_status();
+        assert_eq!(
+            status.signal(),
+            Some(signal),
+            "want death by the signal itself, as with no handler at all: {status} {out:?}"
+        );
+        assert_termios_restored(
+            &termios_of(&pty.slave),
+            &original,
+            &format!("{kill_arg} with no listener restores the termios"),
+        );
+    }
+
+    #[test]
+    fn a_sigterm_with_no_listener_restores_the_termios_and_still_kills() {
+        killed_raw_without_a_listener(libc::SIGTERM, "-TERM");
+    }
+
+    #[test]
+    fn a_sigint_with_no_listener_restores_the_termios_and_still_kills() {
+        killed_raw_without_a_listener(libc::SIGINT, "-INT");
+    }
+
+    /// A dropped run must not take the signal's default action with it. `oam
+    /// test` builds a fresh runtime per file: the first file goes raw -- which
+    /// arms SIGINT -- and back, and the second is still running when SIGINT
+    /// arrives with no listener anywhere, so it must kill the runner. When the
+    /// default was served from the first file's runtime, it died with that
+    /// runtime while tokio's handler stayed installed, and the SIGINT was
+    /// caught and discarded: the runner was unkillable by it.
+    #[test]
+    fn a_signal_after_the_run_that_armed_it_is_gone_still_takes_the_default() {
+        use std::os::unix::process::ExitStatusExt;
+        let pty = open_pty();
+        let first = write_temp(
+            "pty_dropped_run/a.test.mjs",
+            "process.stdin.setRawMode(true);\nprocess.stdin.setRawMode(false);\n",
+        );
+        let second = write_temp(
+            "pty_dropped_run/b.test.mjs",
+            "process.stdout.write('[b]');\nsetInterval(() => {}, 1000);\n",
+        );
+        let s = spawn_args_on_pty(
+            &pty,
+            &["test", first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        s.wait_for("[b]");
+        let sent = Command::new("kill")
+            .args(["-INT", &s.child.id().to_string()])
+            .status()
+            .expect("run kill(1)");
+        assert!(sent.success(), "kill -INT failed: {sent}");
+        let (status, out) = s.finish_status();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGINT),
+            "want death by SIGINT, not a swallowed signal: {status} {out:?}"
+        );
+    }
+
+    /// A listener in one isolate keeps the signal from another isolate's raw
+    /// mode. A Worker goes raw -- arming SIGTERM for the process -- and stays
+    /// alive, while the main thread listens for SIGTERM: the delivery must
+    /// reach that listener, and the process must not die by the signal. tokio
+    /// broadcasts each delivery to every receiver in the process, so a default
+    /// decided per isolate killed the process under the main thread's
+    /// listener. The worker's interval is load-bearing: one that exits right
+    /// after going raw takes its isolate -- and, under a per-isolate default,
+    /// the default with it -- away before the signal lands, and the listener
+    /// wins for the wrong reason.
+    #[test]
+    fn a_listener_in_another_isolate_keeps_the_signal_from_raw_mode() {
+        let pty = open_pty();
+        let worker = write_temp(
+            "pty_worker_raw_listener/worker.cjs",
+            r#"
+process.stdin.setRawMode(true);
+require('node:worker_threads').parentPort.postMessage('raw');
+setInterval(() => {}, 1000);
+"#,
+        );
+        let worker_path = worker.to_string_lossy().replace('\\', "/");
+        let script = write_temp(
+            "pty_worker_raw_listener/main.mjs",
+            &format!(
+                r#"
+import {{ Worker }} from 'node:worker_threads';
+process.on('SIGTERM', () => {{
+  process.stdout.write('[got SIGTERM]');
+  process.exit(7);
+}});
+const w = new Worker('{worker_path}');
+w.on('message', () => process.stdout.write('[raw]'));
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        );
+        let s = spawn_on_pty(&pty, &script);
+        s.wait_for("[raw]");
+        let sent = Command::new("kill")
+            .args(["-TERM", &s.child.id().to_string()])
+            .status()
+            .expect("run kill(1)");
+        assert!(sent.success(), "kill -TERM failed: {sent}");
+        let (status, out) = s.finish_status();
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the listener must win, not the default: {status} {out:?}"
+        );
+        assert!(out.contains("[got SIGTERM]"), "{out:?}");
+    }
+
+    /// A stop is not a death: SIGTSTP with no listener stops the process and
+    /// leaves its raw mode alone, and after SIGCONT the program is still raw
+    /// and a SIGTSTP listener added afterwards still fires. Draining the
+    /// one-shot terminal restore on the stop left the program running cooked
+    /// while `isRaw` said otherwise, and leaving SIG_DFL installed after the
+    /// stop made every later SIGTSTP listener dead on arrival.
+    ///
+    /// The program adds a SIGTSTP listener and removes it again before the
+    /// first stop, on purpose: that installs the native handler and leaves it
+    /// dormant, so the stop goes through oam's own default-action path rather
+    /// than straight to the kernel -- with no handler ever installed, the
+    /// kernel stops the process itself and the first half of this test would
+    /// pass whatever oam did.
+    ///
+    /// The child is put in its own process group inside this test's session,
+    /// so the kernel honours the stop; an orphaned process group's SIGTSTP is
+    /// discarded, and this test would then pass for no reason.
+    #[test]
+    fn a_stop_leaves_raw_mode_alone_and_a_later_sigtstp_listener_still_fires() {
+        use std::os::unix::process::CommandExt;
+        let pty = open_pty();
+        let script = write_temp(
+            "pty_stop_keeps_raw.mjs",
+            r#"
+const dormant = () => {};
+process.on('SIGTSTP', dormant);
+process.removeListener('SIGTSTP', dormant);
+process.stdin.setRawMode(true);
+process.stdout.write('[raw]');
+process.stdin.resume();
+process.stdin.on('data', (d) => {
+  if (d[0] === 0x6c) {
+    process.on('SIGTSTP', () => { process.stdout.write('[js got TSTP]'); process.exit(9); });
+    process.stdout.write('[listening]');
+  }
+});
+"#,
+        );
+        let cache = write_temp("oam-cache-pty/.keep", "")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let stdio = || Stdio::from(pty.slave.try_clone().expect("dup slave"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oam"));
+        cmd.args(["run", script.to_str().unwrap(), "--no-check"])
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .stdin(stdio())
+            .stdout(stdio())
+            .stderr(stdio());
+        // Its own process group, in THIS session -- not its own session. The
+        // kernel discards a stop signal sent to an orphaned process group (one
+        // with no member whose parent is in another group of the same
+        // session), and a setsid child is exactly that: measured, SIGTSTP left
+        // it in state S. A setpgid child has this test as the parent in
+        // another group of the same session, so the stop lands (state T).
+        //
+        // SAFETY: the pre_exec closure runs in the forked child before exec
+        // and calls only async-signal-safe libc: setpgid with two integers --
+        // no allocation, no locks.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut s = session_from(&pty, cmd.spawn().expect("spawn oam on the pty"));
+        s.wait_for("[raw]");
+        assert_eq!(
+            termios_of(&pty.slave).c_lflag & libc::ICANON,
+            0,
+            "raw while it runs"
+        );
+        let pid = s.child.id().to_string();
+        let signal = |sig: &str| {
+            let sent = Command::new("kill")
+                .args([sig, &pid])
+                .status()
+                .expect("run kill(1)");
+            assert!(sent.success(), "kill {sig} failed: {sent}");
+        };
+        signal("-TSTP");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{}/stat", s.child.id()))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit(')')
+                        .next()?
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_string)
+                });
+            match state.as_deref() {
+                Some("T") | Some("t") => break,
+                // No procfs (macOS): give the stop a moment and go on; the
+                // termios assertion below is the one that matters.
+                None if Instant::now() >= deadline => break,
+                None => {}
+                Some(_) if Instant::now() >= deadline => panic!("never stopped: {:?}", state),
+                Some(_) => {}
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            termios_of(&pty.slave).c_lflag & libc::ICANON,
+            0,
+            "a stop must leave raw mode alone"
+        );
+        signal("-CONT");
+        s.send(b"l");
+        s.wait_for("[listening]");
+        signal("-TSTP");
+        let (status, out) = s.finish_status();
+        assert_eq!(
+            status.code(),
+            Some(9),
+            "the SIGTSTP listener added after the stop must fire: {status} {out:?}"
+        );
+        assert!(out.contains("[js got TSTP]"), "{out:?}");
+    }
+
     #[test]
     fn disabling_raw_mode_that_was_never_enabled_touches_nothing() {
         let pty = open_pty();
@@ -8965,9 +9248,11 @@ process.exit(0);
 /// HANDLE_FLAG_INHERIT on the harness's std handles does not change it).
 /// Routing through `cmd /c ... <CONIN$ >CONOUT$` puts the stdio back on the
 /// console, but `<CONIN$` opens console input READ-ONLY and SetConsoleMode
-/// needs write access -- so `setRawMode(true)` silently fails (the child
-/// reports isRaw=false) and both raw-mode assertions become vacuous. They are
-/// `#[ignore]`d rather than left to pass for the wrong reason.
+/// needs write access -- so `setRawMode(true)` fails with access denied
+/// (ERROR_ACCESS_DENIED, measured on Windows 11 26200; since the switch
+/// reports its errno, the child's stdin emits 'error' instead of going raw)
+/// and both raw-mode assertions become vacuous. They are `#[ignore]`d rather
+/// than left to pass for the wrong reason.
 ///
 /// The fix is to hand the child a console input handle opened
 /// GENERIC_READ | GENERIC_WRITE -- a small helper launched inside the pty that
@@ -9341,7 +9626,7 @@ mod conpty {
     /// must arrive without Enter, and the line the cancel discarded must not
     /// be delivered as data.
     #[test]
-    #[ignore = "blocked: the child gets a read-only console input handle, so setRawMode is a no-op -- see the module docs and YawLabs/oam#109"]
+    #[ignore = "blocked: the child gets a read-only console input handle, so setRawMode fails with access denied -- see the module docs and YawLabs/oam#109"]
     fn raw_mode_after_a_prompt_delivers_a_keystroke_without_enter() {
         let script = write_temp(
             "conpty_raw.mjs",
@@ -9395,7 +9680,7 @@ process.stdin.on('data', (d) => {
     /// ConPTY reflects a real SetConsoleCursorPosition into the output as a
     /// cursor escape, which is what this looks for.
     #[test]
-    #[ignore = "vacuous until raw mode engages: setRawMode is a no-op on the read-only console input handle -- see the module docs and YawLabs/oam#109"]
+    #[ignore = "vacuous until raw mode engages: setRawMode fails with access denied on the read-only console input handle -- see the module docs and YawLabs/oam#109"]
     fn leaving_raw_mode_does_not_move_the_cursor() {
         let script = write_temp(
             "conpty_raw_off.mjs",
