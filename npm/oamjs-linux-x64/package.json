@@ -1,6 +1,6 @@
 {
   "name": "oamjs-linux-x64",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "The oam binary for linux x64 (x86_64-unknown-linux-gnu). Installed as an optional dependency of oamjs; not useful on its own.",
   "license": "Apache-2.0",
   "homepage": "https://oamjs.org",
