@@ -140,8 +140,8 @@ cleanup() {
   # A clean exit leaves the tree as the run intended -- including --dry-run,
   # which deliberately keeps the rewrite and prints how to discard it.
   if [ "$rc" -eq 0 ]; then return; fi
-  revert_unpublished "${HOMEBREW_DIR:-}" "$BREW_FILE" "$BREW_REWRITTEN" "$BREW_PUBLISHED"
-  revert_unpublished "${SCOOP_DIR:-}" "$SCOOP_FILE" "$SCOOP_REWRITTEN" "$SCOOP_PUBLISHED"
+  revert_unpublished "${HOMEBREW_DIR:-}" "${BREW_FILE:-}" "$BREW_REWRITTEN" "$BREW_PUBLISHED"
+  revert_unpublished "${SCOOP_DIR:-}" "${SCOOP_FILE:-}" "$SCOOP_REWRITTEN" "$SCOOP_PUBLISHED"
 }
 
 # Undo one un-published rewrite, and say so only if there was something to undo.
