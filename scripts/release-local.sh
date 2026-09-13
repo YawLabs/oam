@@ -775,16 +775,19 @@ step "MCP sidecar regression matrix"
 if ! command -v node >/dev/null 2>&1; then
   warn "node not on PATH -- sidecar matrix skipped (it hosts the harness, not the test)"
 else
+  # The machine-readable report goes beside the stamps, never into RELEASE_DIR:
+  # `gh release create "$RELEASE_DIR"/*` would publish it as a release asset.
+  matrix_report="$STAMP_STASH/mcp-sidecar-matrix.json"
   set +e
   # The freshly built NATIVE asset -- the matrix must exercise the binary this
   # release actually ships, not whatever oam happens to be on PATH.
-  OAM_BIN="$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe" node "$REPO_DIR/scripts/mcp-sidecar-matrix.mjs"
+  OAM_BIN="$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe" node "$REPO_DIR/scripts/mcp-sidecar-matrix.mjs" --json="$matrix_report"
   matrix_status=$?
   set -e
   case "$matrix_status" in
-    0) ok "every oam-hosted sidecar served its tools" ;;
-    1) fail "a sidecar failed on this build -- see above; nothing has been published" ;;
-    *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean" ;;
+    0) ok "every oam-hosted sidecar answered a tool call on this build (report: $matrix_report)" ;;
+    1) fail "a sidecar failed on this build -- see above; nothing has been published (report: $matrix_report)" ;;
+    *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean; the unanswered sidecars are named above" ;;
   esac
 fi
 
