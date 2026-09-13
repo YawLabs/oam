@@ -45,6 +45,8 @@
 #   - gate+test+conformance on the Mac (inside mac-release) -- conformance
 #     carries the builtin export-parity ratchet, and darwin has native code
 #     (fs statfs) that no other leg executes
+#   - the Windows console raw-mode e2e (crates/oam_cli/tests/conpty.rs) run
+#     against BOTH Windows release assets, win-x64 under emulation included
 #
 # Usage -- the tag AND the version are managed for you:
 #   ./scripts/release-local.sh v0.8.0
@@ -711,6 +713,34 @@ else
   cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"   # runs under the OS's x64 emulation
 fi
+
+step "Windows console raw-mode e2e against the release assets"
+# The raw-mode switch cancels a pending console read (oam_core::stdin) -- code
+# that only runs against a REAL console, so the pipe-driven e2e and
+# conformance never reach it. crates/oam_cli/tests/conpty.rs drives it through
+# a pseudoconsole, and ci-local.sh runs that against the DEBUG build. Run it
+# again here against what actually ships: OAM_CONPTY_BIN points the (native)
+# harness at each asset in turn. For win-x64 this is the only place its console
+# half runs at all, and under emulation, where everything is slow -- the
+# conditions a timing bug in that code shows up under (it has: a settle wait
+# bounded at 250 ms failed 2 cold runs in 5 before it was fixed). It also runs
+# BEFORE the remote legs, so a regression costs minutes, not the full release.
+#
+# `cargo test` here links the debug oam next to the test binary even though
+# no test runs it, so free that path first, as ci-local.sh does before its own
+# test steps. Only debug-tree processes are killed; nothing live runs from it.
+conpty_assets=("$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe")
+[ "$SKIP_WIN_X64" = "1" ] || conpty_assets+=("$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe")
+oam_kill_under "$PWD/target/debug"
+oam_reap_parked target/debug
+oam_reap_parked target/debug/deps
+for asset in "${conpty_assets[@]}"; do
+  # A native Windows path: the harness checks the value with a Rust is_file(),
+  # which knows nothing of MSYS's /tmp.
+  OAM_CONPTY_BIN="$(cygpath -w "$asset")" cargo test -p oam_cli --test conpty \
+    || fail "console raw-mode e2e failed against $(basename "$asset") -- see above; nothing has been published"
+  ok "console raw-mode e2e passed against $(basename "$asset")"
+done
 
 # --- remote legs (FAIL-CLOSED: capture, check exit, then consume) ---------------
 if [ "$SKIP_MAC" = "1" ]; then
