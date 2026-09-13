@@ -49,6 +49,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    # Declarations only: the WSA* error constants node_error_code's libuv
+    # table matches on.
+    "Win32_Networking_WinSock",
 ] }
 
 # Unix extra-fd stdio (child_unix.rs): the signal-number table, the pollfd for

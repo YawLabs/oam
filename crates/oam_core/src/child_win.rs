@@ -226,6 +226,12 @@ pub fn spawn_extra(
     stdio: &[StdioFd],
     detached: bool,
 ) -> Result<RawChild, String> {
+    // Same program search rule as the std-backed spawns (see child.rs).
+    if super::child::program_names_directory(command, cwd) {
+        return Err(super::child::spawn_failure_json(
+            &super::child::directory_program_error(),
+        ));
+    }
     // SAFETY: one large block wraps the whole spawn sequence; each Win32 call
     // inside establishes its preconditions locally. `sa`/`si`/`pi` are
     // zero-initialized POD then filled; every HANDLE handed to the child is

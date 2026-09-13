@@ -176,6 +176,11 @@ pub fn spawn_child(
         (command, args)
     };
 
+    #[cfg(windows)]
+    if !shell && program_names_directory(&prog, cwd.as_deref()) {
+        return Err(spawn_failure_json(&directory_program_error()));
+    }
+
     let mut cmd = tokio::process::Command::new(&prog);
     #[cfg(windows)]
     {
@@ -218,19 +223,7 @@ pub fn spawn_child(
     #[cfg(not(windows))]
     let _ = detached;
 
-    let child = cmd.spawn().map_err(|e| {
-        let code = super::node_error_code(&e);
-        // errno rides along: node emits it as the `code` argument of the
-        // 'close' event for a child that never started, so the JS layer cannot
-        // reproduce node's failure shape without it.
-        let errno = super::node_errno(code, &e)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "null".to_string());
-        format!(
-            "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"{}\"}}",
-            e.to_string().replace('"', "\\\"")
-        )
-    })?;
+    let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;
     // Right after spawn, not suspended: tokio's Command cannot resume a
     // suspended child. job_win.rs explains why that window is libuv's own.
     #[cfg(windows)]
@@ -246,6 +239,112 @@ pub fn spawn_child(
 /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` -- no console of the parent's
 /// and no share of its Ctrl+C. CREATE_NO_WINDOW is left off there because the
 /// CreateProcessW contract ignores it alongside DETACHED_PROCESS.
+/// The JSON body a failed async spawn hands the JS layer: the node code, the
+/// errno, and the OS message.
+///
+/// errno rides along: node emits it as the `code` argument of the 'close'
+/// event for a child that never started, so the JS layer cannot reproduce
+/// node's failure shape without it.
+pub(crate) fn spawn_failure_json(e: &std::io::Error) -> String {
+    let code = super::node_error_code(e);
+    let errno = super::node_errno(code, e)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"{}\"}}",
+        e.to_string().replace('"', "\\\"")
+    )
+}
+
+/// Whether `prog` names a DIRECTORY that libuv's program search would reject.
+///
+/// node resolves the program itself before CreateProcessW (`search_path` in
+/// libuv's src/win/process.c), and that search never returns a directory: it
+/// tries the name, then the name with `.com` and `.exe` appended, skipping
+/// anything that is not a file, and fails as ERROR_FILE_NOT_FOUND -- ENOENT --
+/// when nothing is left. std hands a directory straight to CreateProcessW,
+/// which fails with ERROR_ACCESS_DENIED, so `spawn('C:\\some\\dir')` came
+/// back as a permission error where node reports the program as not found.
+///
+/// Only a name with a path in it is checked. A bare name goes through std's
+/// PATH search, which does not look in the working directory at all -- the
+/// same answer for a directory as libuv's, if for a different reason.
+#[cfg(windows)]
+pub(crate) fn program_names_directory(prog: &str, cwd: Option<&str>) -> bool {
+    let has_path = prog.contains(['/', '\\']) || prog == "." || prog == "..";
+    if !has_path {
+        return false;
+    }
+    let path = std::path::Path::new(prog);
+    let full = match cwd {
+        Some(cwd) if path.is_relative() => std::path::Path::new(cwd).join(path),
+        _ => path.to_path_buf(),
+    };
+    let with = |ext: &str| {
+        let mut name = full.clone().into_os_string();
+        name.push(ext);
+        std::path::PathBuf::from(name).is_file()
+    };
+    full.is_dir() && !with(".com") && !with(".exe")
+}
+
+#[cfg(all(test, windows))]
+mod program_search_tests {
+    use super::program_names_directory;
+
+    #[test]
+    fn a_directory_is_not_a_program_unless_an_exe_or_com_sits_beside_it() {
+        let root = std::env::temp_dir().join(format!("oam-program-dir-{}", std::process::id()));
+        let dir = root.join("tool");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_str().unwrap();
+
+        assert!(program_names_directory(dir_s, None));
+        assert!(!program_names_directory(
+            "tool",
+            Some(root.to_str().unwrap())
+        ));
+        assert!(program_names_directory(
+            ".\\tool",
+            Some(root.to_str().unwrap())
+        ));
+        assert!(program_names_directory(".", None));
+        // A bare name is left to the PATH search.
+        assert!(!program_names_directory("cmd", None));
+
+        // libuv tries `tool.com` and `tool.exe` before giving up on `tool`.
+        std::fs::write(root.join("tool.exe"), b"MZ").unwrap();
+        assert!(!program_names_directory(dir_s, None));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// The error a directory program fails with: the ERROR_FILE_NOT_FOUND libuv's
+/// search reports (see `program_names_directory`).
+#[cfg(windows)]
+pub(crate) fn directory_program_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32)
+}
+
+/// The errno for a spawnSync failure oam detects itself (a timeout, an
+/// overflowing buffer), which has no OS error to take it from.
+fn synthetic_spawn_errno(code: &str) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        // The windows table is keyed on the code alone.
+        super::node_errno(code, &std::io::Error::other(code))
+    }
+    #[cfg(unix)]
+    {
+        match code {
+            "ETIMEDOUT" => Some(-libc::ETIMEDOUT),
+            "ENOBUFS" => Some(-libc::ENOBUFS),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn windows_creation_flags(detached: bool) -> u32 {
     use windows_sys::Win32::System::Threading::{
@@ -366,7 +465,15 @@ pub fn spawn_sync(
         }
     }
 
-    let mut child = match cmd.spawn() {
+    #[cfg(windows)]
+    let spawned = if !shell && program_names_directory(&prog, cwd) {
+        Err(directory_program_error())
+    } else {
+        cmd.spawn()
+    };
+    #[cfg(not(windows))]
+    let spawned = cmd.spawn();
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             let code = super::node_error_code(&e);
@@ -378,6 +485,7 @@ pub fn spawn_sync(
                 pid: 0,
                 error: Some(SpawnSyncError {
                     code: code.to_string(),
+                    errno: super::node_errno(code, &e),
                     message: e.to_string(),
                 }),
             };
@@ -471,6 +579,7 @@ pub fn spawn_sync(
                 pid,
                 error: Some(SpawnSyncError {
                     code: "ETIMEDOUT".to_string(),
+                    errno: synthetic_spawn_errno("ETIMEDOUT"),
                     message: format!("spawnSync timed out after {timeout_ms}ms"),
                 }),
             };
@@ -512,6 +621,7 @@ pub fn spawn_sync(
                     pid,
                     error: Some(SpawnSyncError {
                         code: "ENOBUFS".to_string(),
+                        errno: synthetic_spawn_errno("ENOBUFS"),
                         message: format!("spawnSync {command} ENOBUFS"),
                     }),
                 };
@@ -534,6 +644,7 @@ pub fn spawn_sync(
             pid,
             error: Some(SpawnSyncError {
                 code: super::node_error_code(&e).to_string(),
+                errno: super::node_errno(super::node_error_code(&e), &e),
                 message: e.to_string(),
             }),
         },
@@ -551,6 +662,8 @@ pub struct SpawnSyncResult {
 
 pub struct SpawnSyncError {
     pub code: String,
+    /// The libuv errno node puts on `result.error.errno`.
+    pub errno: Option<i32>,
     pub message: String,
 }
 

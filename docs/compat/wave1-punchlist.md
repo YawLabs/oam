@@ -56,8 +56,9 @@ fix opportunistically or when a real package trips one.
   'UNC\server\...'); realpath on network shares is wrong.
 - Pending exceptions from a throwing toString are replaced by the natives'
   own TypeError; missing args coerce to the string 'undefined'.
-- node_error_code cannot produce EXDEV — cross-device rename surfaces as
-  EIO, defeating the standard copy+unlink fallback.
+- node_error_code cannot produce EXDEV on Linux/macOS — cross-device rename
+  surfaces as EIO, defeating the standard copy+unlink fallback. (Windows maps
+  ERROR_NOT_SAME_DEVICE to EXDEV through libuv's table.)
 - process.env / process.argv natives abort on non-Unicode environment
   entries (std::env::vars panics) — switch to vars_os with lossy decode.
 - A panicking op future hangs the event loop: inflight never decrements

@@ -528,6 +528,28 @@ fn throw_node_error(
     throw_system_error(scope, code, &message, syscall, Some(path), error);
 }
 
+/// `throw_node_error` for an operation with call-site error rules: the
+/// syscall a failure names and whether it carries the path can depend on the
+/// operation (see `oam_core::fs_error_at`).
+fn throw_fs_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    site: oam_core::FsSite<'_>,
+    syscall: &'static str,
+    path: &str,
+    error: &std::io::Error,
+) {
+    let failure = oam_core::fs_error_at(site, syscall, path, error);
+    let message = oam_core::fs_error_message(failure, path, error);
+    throw_system_error(
+        scope,
+        failure.code,
+        &message,
+        failure.syscall,
+        failure.has_path.then_some(path),
+        error,
+    );
+}
+
 /// Throw node's system-error shape for an operation on an ALREADY-OPEN
 /// descriptor: no `path` property, no path segment in the message, and a
 /// wrong-mode denial reported as EBADF rather than EACCES (see
@@ -3605,7 +3627,7 @@ fn op_fs_read_file_sync(
                 rv.set(value);
             }
         }
-        Err(e) => throw_node_error(scope, "open", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
     }
 }
 
@@ -3627,7 +3649,7 @@ fn op_fs_read_file_utf8_sync(
                 rv.set(s.into());
             }
         }
-        Err(e) => throw_node_error(scope, "open", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
     }
 }
 
@@ -3659,7 +3681,12 @@ fn op_fs_write_file_sync(
         std::fs::write(&path, &bytes)
     };
     if let Err(e) = result {
-        throw_node_error(scope, "open", &path, &e);
+        let site = if append {
+            oam_core::FsSite::AppendFile
+        } else {
+            oam_core::FsSite::WriteFile
+        };
+        throw_fs_error(scope, site, "open", &path, &e);
     }
 }
 
@@ -3752,7 +3779,7 @@ fn op_fs_mkdir_sync(
         std::fs::create_dir(&path)
     };
     if let Err(e) = result {
-        throw_node_error(scope, "mkdir", &path, &e);
+        throw_fs_error(scope, oam_core::FsSite::Mkdir, "mkdir", &path, &e);
     }
 }
 
@@ -4717,7 +4744,7 @@ fn op_fs_readlink_sync(
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error(scope, "readlink", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::Readlink, "readlink", &path, &e),
     }
 }
 
@@ -4987,7 +5014,7 @@ fn op_fs_open_sync(
             let val = v8::Number::new(scope, id as f64);
             rv.set(val.into());
         }
-        Err(e) => throw_node_error(scope, "open", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::Open(&flags), "open", &path, &e),
     }
 }
 
@@ -5743,6 +5770,11 @@ fn op_spawn_sync(
         let k = v8::String::new(scope, "code").unwrap();
         let v = v8::String::new(scope, &error.code).unwrap();
         err_obj.set(scope, k.into(), v.into());
+        if let Some(errno) = error.errno {
+            let k = v8::String::new(scope, "errno").unwrap();
+            let v = v8::Integer::new(scope, errno);
+            err_obj.set(scope, k.into(), v.into());
+        }
         let k = v8::String::new(scope, "message").unwrap();
         let v = v8::String::new(scope, &error.message).unwrap();
         err_obj.set(scope, k.into(), v.into());

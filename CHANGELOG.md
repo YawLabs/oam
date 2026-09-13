@@ -18,6 +18,43 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows, OS errors carried a different code than node reports.** oam
+  named an OS error by std's `io::ErrorKind` instead of the raw Win32 code, and
+  the kind is a lossy view of the number. A write to a read-only file, an
+  `unlink` of a directory, a `setRawMode` on a read-only console and an ACL
+  denial all came back `EACCES` / -4092 where node says `EPERM` / -4048; a
+  sharing violation came back `EIO` where node says `EBUSY`; a text file spawned
+  as a program came back `EIO` where node says `EFTYPE`; and the OS's own
+  sentence ("Access is denied. (os error 5)") leaked into the message.
+  `node_error_code` now translates a raw code through libuv's own table
+  (`uv_translate_sys_error`, src/win/error.c, v1.51.0), and messages use libuv's
+  wording, checked entry for entry against `util.getSystemErrorMessage`'s table.
+  An error with no OS code -- rustls's, say -- keeps its own text.
+  On top of the table, oam now applies the per-operation rules libuv adds:
+  - `open(dir, 'w')` and `writeFile(dir)` are `EISDIR` (and `'wx'` is `EEXIST`).
+  - `readFile(dir)` is `EISDIR` on `read`, and `appendFile(dir)` is `EISDIR` on
+    `write`, neither with a path.
+  - `mkdir` of an invalid name is `EINVAL`, and so is `readlink` of a file that
+    is not a link.
+  - Spawning a directory is `ENOENT`, as node's program search reports it,
+    where oam used to report a permission error.
+  - `spawn()` THROWS a failure node does not emit as an event: every code
+    except `EACCES`, `EAGAIN`, `EMFILE`, `ENFILE` and `ENOENT`, e.g. `EPERM` or
+    `EFTYPE`, with node's `spawn <CODE>` shape. It used to emit an `'error'`.
+    `fork()` and an `'ipc'` stdio slot still emit, because they spawn only
+    after the channel binds.
+  - `spawnSync`'s `result.error` now carries `errno`, `syscall`, `path` and
+    `spawnargs`, with node's `spawnSync <file> <CODE>` message where it used to
+    carry only the OS text.
+
+  On Linux and macOS a raw `EPERM` is now `EPERM` too; std folded it into
+  `EACCES` while the errno already said -1. Still divergent on Windows, and
+  known: `fs.open(dir)` for reading succeeds in node, which takes directory
+  descriptors oam does not have; `stat` of a locked system file such as
+  `pagefile.sys` is `EBUSY` where node falls back to `EPERM`; spawn's own PATH
+  and extension search still differs from libuv's. **This is a behaviour
+  change** for any code that compared a Windows error code against `EACCES` or
+  `EIO`.
 - **On Windows, going raw right after a prompt could overwrite the answer line.**
   `setRawMode` flipped the console mode first and cancelled the stdin read in
   flight afterwards, so the synthetic Enter that cancels the read was handled
