@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "049bbda+wip",
-  "oamVersion": "oam 0.14.0",
+  "commit": "cdfe6dc",
+  "oamVersion": "oam 0.15.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 99,
-      "total": 99,
+      "pass": 101,
+      "total": 101,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -416,6 +416,14 @@
         },
         {
           "case": "97-stdin-ref-and-destroy.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "98-stdin-close-on-eof.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "99-windows-os-error-codes.mjs",
           "status": "pass"
         }
       ]
