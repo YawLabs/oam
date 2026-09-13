@@ -95,18 +95,20 @@ peak throughput, and it is why the numbers above are the ones that matter.
 protocol. Yaw MCP runs its sidecars on oam by default, and every oam release is
 gated on a matrix that boots each one and requires it to serve a non-empty tool
 list (`scripts/mcp-sidecar-matrix.mjs`). Booting is not enough — a sidecar that
-starts and advertises nothing is still broken — and neither is advertising: a
-sidecar with a tool that needs no credential, no network and no external
-service gets that tool CALLED, and the result asserted. Every such call is made
-on node too, so a sidecar that broke upstream is reported as broken upstream
-rather than failing an oam release.
+starts and advertises nothing is still broken — and neither is advertising:
+every sidecar gets a real tool CALLED, and the result asserted. Every call is
+made on node too, so a sidecar that broke upstream is reported as broken
+upstream rather than failing an oam release.
 
-Three of the nine sidecars qualify today (memory, fetch, ctxlint). The other six
-are boot-only and the gate names them, with the reason, on every run: four
-advertise nothing but calls into a credentialed API or a live database, and two
-drive a real browser that installs out of band. So a tool call is verified for a
-third of the set, and for the rest the gate still says only that the sidecar
-boots and serves its tools.
+All nine sidecars get a call, none of them with a credential or the internet.
+The harness supplies what each call would otherwise reach: a loopback HTTP
+server (fetch, and Lemon Squeezy's webhook sink), a Redis wire-protocol fake,
+the local PostgreSQL, and the Chromium-family browser already installed for
+puppeteer and playwright. Tailscale's one network-free tool reports its own
+tool registry. When a dependency is genuinely missing, the row is reported
+DEMOTED with the reason and the run is marked incomplete, not clean. One call
+per sidecar is still a floor on behaviour, not coverage of it, and the gate
+prints how many of the advertised tools that is.
 
 ## Honesty notes
 

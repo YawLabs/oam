@@ -77,9 +77,44 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   pre-existing downgrade case could not catch it, because `fail` prints its
   message BEFORE the trap runs, so grepping for that message passed either way.
   (#127)
+- **The sidecar release gate's "verified against node" rows were oam against oam.**
+  Every @yawlabs sidecar's `bin` is a runtime launcher that prefers oam, so the
+  control arm's `node <bin>` re-spawned oam -- measured with a process-tree walk --
+  and fetch and ctxlint passed a comparison that compared oam with itself. The control
+  arm now sets the launcher's own `*_RUNTIME` switch to `node`, read from its source
+  rather than listed, and a launcher that names no switch is refused instead of
+  trusted.
+- **Every sidecar in the release gate now answers a real tool call; six were
+  boot-only.** None needs a credential or the internet: tailscale's network-free
+  `tailscale_tool_groups`, Lemon Squeezy's webhook sink pointed at the loopback
+  server, redis against a Redis wire-protocol fake with fixed replies, postgres
+  against the local server with a SELECT that crosses bytea, and puppeteer and
+  playwright driving the Chromium-family browser already installed, headless, in a
+  profile the harness owns. A dependency that is genuinely missing DEMOTES the row
+  with the reason and makes the run incomplete (exit 3) -- before, a loopback bind
+  that failed quietly turned fetch into "boot only" and exited 0. Inherited
+  credentials and configuration are scrubbed from each sidecar's environment, so
+  "needs no credential" holds on a box that has one.
+- **The release gate now fails a sidecar that leaves a process behind.** Each probe
+  shuts the sidecar down the way a host does (stdin closed, then killed) and checks
+  its direct children against the node control. On Windows, node's libuv places
+  children in a kill-on-close job object and oam does not, so on oam 0.15.1 both
+  browser sidecars leave their browser running where node leaves none -- and the gate
+  now says so rather than passing them.
+- **puppeteer no longer SKIPs the gate on an interrupted browser download.** Its
+  postinstall fetches a Chrome the gate never used, and a half-extracted copy in the
+  user cache failed the whole batch install. `PUPPETEER_SKIP_DOWNLOAD=1` is set for
+  the install, and a failed install now reports its error or its timeout rather than
+  the first deprecation warning npm printed.
 
 ### Changed
 
+- **The sidecar release gate reports what it tested.** Each row carries the resolved
+  sidecar version, the summary states how many of the advertised tools were actually
+  called, `--json=<path>` writes a machine-readable report (release-local.sh keeps it
+  beside the conformance stamps, outside the published assets), and progress text is
+  only rewritten in place on a terminal, so a captured log no longer runs lines
+  together.
 - **A failed `setRawMode` emits Node's error shape.** oam built an error with
   `code` `'ERR_SYSTEM_ERROR'` and `syscall` `'uv_tty_set_mode'`; Node v22.22.2's
   `lib/tty.js` emits `new ErrnoException(err, 'setRawMode')`, whose `code` is
