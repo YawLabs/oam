@@ -89,6 +89,13 @@ await later("promises.open(dir, w)", async () => (await fs.promises.open(dir, "w
 // --- per-operation EINVAL ------------------------------------------------------
 sync("mkdirSync(invalid name)", () => fs.mkdirSync(path.join(root, 'a"b')));
 await later("promises.mkdir(invalid name)", () => fs.promises.mkdir(path.join(root, "a*b")));
+// ...but not recursively: node's mkdirp re-stats and reports ENOENT.
+sync("mkdirSync(invalid name, recursive)", () =>
+  fs.mkdirSync(path.join(root, 'c"d'), { recursive: true }),
+);
+await later("promises.mkdir(invalid name, recursive)", () =>
+  fs.promises.mkdir(path.join(root, "c*d"), { recursive: true }),
+);
 sync("readlinkSync(regular file)", () => fs.readlinkSync(readOnly));
 await later("promises.readlink(regular file)", () => fs.promises.readlink(readOnly));
 
@@ -120,6 +127,67 @@ try {
 } catch (err) {
   console.log("spawn(text file) threw", shape(err));
 }
+// ...including on the extra-descriptor path, with a backslash path in play.
+try {
+  const child = spawn(text, [], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  child.once("error", (err) => console.log("spawn(text file, 4 stdio) emitted", shape(err)));
+  console.log("spawn(text file, 4 stdio) returned");
+} catch (err) {
+  console.log("spawn(text file, 4 stdio) threw", shape(err));
+}
+
+// An extensionless file named by path -- a node_modules/.bin shell shim beside
+// its .cmd -- is not a program to libuv: it tries only `.com` and `.exe`, and
+// the failure is an EMITTED ENOENT, not a thrown EFTYPE.
+const shim = path.join(root, "tool");
+fs.writeFileSync(shim, "#!/bin/sh\n");
+fs.writeFileSync(`${shim}.cmd`, "@exit 0\r\n");
+console.log("spawnSync(extensionless file)", shape(spawnSync(shim).error));
+await new Promise((resolve) => {
+  try {
+    const child = spawn(shim);
+    child.once("error", (err) => {
+      console.log("spawn(extensionless file) emitted", shape(err));
+      resolve();
+    });
+    child.once("spawn", () => {
+      console.log("spawn(extensionless file) spawned");
+      resolve();
+    });
+  } catch (err) {
+    console.log("spawn(extensionless file) threw", shape(err));
+    resolve();
+  }
+});
+
+// A working directory that is missing, or is a file: CreateProcessW's
+// ERROR_DIRECTORY, which node reports as an emitted ENOENT -- not ENOTDIR, and
+// never thrown.
+const missingDir = path.join(root, "no-such-dir");
+console.log("spawnSync(missing cwd)", shape(spawnSync("cmd.exe", ["/d", "/c", "exit"], { cwd: missingDir }).error));
+console.log("spawnSync(file as cwd)", shape(spawnSync("cmd.exe", ["/d", "/c", "exit"], { cwd: readOnly }).error));
+await new Promise((resolve) => {
+  try {
+    const child = spawn("cmd.exe", ["/d", "/c", "exit"], { cwd: missingDir });
+    child.once("error", (err) => console.log("spawn(missing cwd) emitted", shape(err)));
+    child.once("close", (code) => {
+      console.log("spawn(missing cwd) close", code);
+      resolve();
+    });
+  } catch (err) {
+    console.log("spawn(missing cwd) threw", shape(err));
+    resolve();
+  }
+});
+sync("process.chdir(regular file)", () => process.chdir(readOnly));
+sync("readdirSync(regular file)", () => fs.readdirSync(readOnly));
+await later("promises.readdir(regular file)", () => fs.promises.readdir(readOnly));
+
+// A shell spawn's error names the shell, with the shell's own argv.
+console.log(
+  "spawnSync(shell, timed out)",
+  shape(spawnSync("ping -n 3 127.0.0.1", { shell: true, timeout: 50 }).error),
+);
 
 fs.chmodSync(readOnly, 0o666);
 fs.rmSync(root, { recursive: true, force: true });

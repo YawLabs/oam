@@ -3756,7 +3756,7 @@ fn op_fs_readdir_sync(
     }
     match oam_core::ops::readdir_to_json(&path) {
         Ok(json) => return_json(scope, &mut rv, &json),
-        Err(e) => throw_node_error(scope, "scandir", &path, &e),
+        Err(e) => throw_fs_error(scope, oam_core::FsSite::Scandir, "scandir", &path, &e),
     }
 }
 
@@ -3779,7 +3779,13 @@ fn op_fs_mkdir_sync(
         std::fs::create_dir(&path)
     };
     if let Err(e) = result {
-        throw_fs_error(scope, oam_core::FsSite::Mkdir, "mkdir", &path, &e);
+        throw_fs_error(
+            scope,
+            oam_core::FsSite::Mkdir { recursive },
+            "mkdir",
+            &path,
+            &e,
+        );
     }
 }
 

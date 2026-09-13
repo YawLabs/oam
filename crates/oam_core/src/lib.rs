@@ -1262,12 +1262,13 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
     if let Some(raw) = error.raw_os_error() {
         return windows_error_code(raw);
     }
-    // std maps EPERM and EACCES to the same kind; node keeps them apart, and
-    // node_errno already reports the raw -1 for EPERM, so the code has to
-    // agree with it.
+    // std's kinds fold several errnos together (EPERM into PermissionDenied
+    // with EACCES) or have none for them (EMFILE, EXDEV, ENOSPC, ...), while
+    // node_errno reports the real -errno, so the code has to come from the same
+    // number.
     #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::EPERM) {
-        return "EPERM";
+    if let Some(code) = error.raw_os_error().and_then(unix_errno_code) {
+        return code;
     }
     match error.kind() {
         ErrorKind::NotFound => "ENOENT",
@@ -1296,23 +1297,97 @@ pub fn node_error_code(error: &std::io::Error) -> &'static str {
     }
 }
 
+/// The node code for a raw unix errno: the name libuv gives it. Only codes
+/// libuv names are listed, and only one spelling of an alias (EAGAIN, not
+/// EWOULDBLOCK; ENOTSUP, not EOPNOTSUPP, which is the same number on Linux).
+#[cfg(unix)]
+fn unix_errno_code(raw: i32) -> Option<&'static str> {
+    Some(match raw {
+        libc::E2BIG => "E2BIG",
+        libc::EACCES => "EACCES",
+        libc::EADDRINUSE => "EADDRINUSE",
+        libc::EADDRNOTAVAIL => "EADDRNOTAVAIL",
+        libc::EAFNOSUPPORT => "EAFNOSUPPORT",
+        libc::EAGAIN => "EAGAIN",
+        libc::EALREADY => "EALREADY",
+        libc::EBADF => "EBADF",
+        libc::EBUSY => "EBUSY",
+        libc::ECANCELED => "ECANCELED",
+        libc::ECONNABORTED => "ECONNABORTED",
+        libc::ECONNREFUSED => "ECONNREFUSED",
+        libc::ECONNRESET => "ECONNRESET",
+        libc::EDESTADDRREQ => "EDESTADDRREQ",
+        libc::EEXIST => "EEXIST",
+        libc::EFAULT => "EFAULT",
+        libc::EFBIG => "EFBIG",
+        libc::EHOSTDOWN => "EHOSTDOWN",
+        libc::EHOSTUNREACH => "EHOSTUNREACH",
+        libc::EILSEQ => "EILSEQ",
+        libc::EINTR => "EINTR",
+        libc::EINVAL => "EINVAL",
+        libc::EIO => "EIO",
+        libc::EISCONN => "EISCONN",
+        libc::EISDIR => "EISDIR",
+        libc::ELOOP => "ELOOP",
+        libc::EMFILE => "EMFILE",
+        libc::EMLINK => "EMLINK",
+        libc::EMSGSIZE => "EMSGSIZE",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::ENETDOWN => "ENETDOWN",
+        libc::ENETUNREACH => "ENETUNREACH",
+        libc::ENFILE => "ENFILE",
+        libc::ENOBUFS => "ENOBUFS",
+        libc::ENODEV => "ENODEV",
+        libc::ENOENT => "ENOENT",
+        libc::ENOEXEC => "ENOEXEC",
+        libc::ENOMEM => "ENOMEM",
+        libc::ENOPROTOOPT => "ENOPROTOOPT",
+        libc::ENOSPC => "ENOSPC",
+        libc::ENOSYS => "ENOSYS",
+        libc::ENOTCONN => "ENOTCONN",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::ENOTEMPTY => "ENOTEMPTY",
+        libc::ENOTSOCK => "ENOTSOCK",
+        libc::ENOTSUP => "ENOTSUP",
+        libc::ENOTTY => "ENOTTY",
+        libc::ENXIO => "ENXIO",
+        libc::EOVERFLOW => "EOVERFLOW",
+        libc::EPERM => "EPERM",
+        libc::EPIPE => "EPIPE",
+        libc::EPROTO => "EPROTO",
+        libc::EPROTONOSUPPORT => "EPROTONOSUPPORT",
+        libc::EPROTOTYPE => "EPROTOTYPE",
+        libc::ERANGE => "ERANGE",
+        libc::EROFS => "EROFS",
+        libc::ESHUTDOWN => "ESHUTDOWN",
+        libc::ESPIPE => "ESPIPE",
+        libc::ESRCH => "ESRCH",
+        libc::ETIMEDOUT => "ETIMEDOUT",
+        libc::ETXTBSY => "ETXTBSY",
+        libc::EXDEV => "EXDEV",
+        _ => return None,
+    })
+}
+
 /// libuv's `uv_translate_sys_error` (src/win/error.c, v1.51.0) for a raw Win32
 /// or Winsock error code: what node reports for that code, entry for entry,
 /// with `UNKNOWN` for a code libuv does not list.
 ///
-/// Three rows depart from libuv's GENERIC table, each because every oam site
-/// that can surface the code is one where libuv itself departs from it too:
+/// Two groups of rows depart from libuv's GENERIC table:
 ///
 /// - WSAHOST_NOT_FOUND / WSANO_DATA / WSATRY_AGAIN come from getaddrinfo, and
 ///   node's dns layer names them `ENOTFOUND` / `EAI_AGAIN`; the generic table
 ///   would say `ENOENT` / `UNKNOWN`.
 /// - ERROR_BROKEN_PIPE and ERROR_NO_DATA are `EPIPE`, from libuv's WRITE table
 ///   (`uv_translate_write_sys_error`); the generic table says `EOF` /
-///   `EAGAIN`. Only a write can report them here -- std turns ERROR_BROKEN_PIPE
-///   on a read into `Ok(0)`.
-/// - ERROR_DIRECTORY is `ENOTDIR`, what libuv's scandir and opendir report for
-///   a file; the generic table says `ENOENT`. mkdir has its own override (see
-///   `fs_error_at`).
+///   `EAGAIN`. oam reports a broken pipe on a read as end-of-stream before it
+///   gets here -- std's handle read returns `Ok(0)` for ERROR_BROKEN_PIPE --
+///   so what reaches this table is a write's.
+///
+/// Where libuv changes the answer for one operation only -- readdir's
+/// `ENOTDIR`, mkdir's `EINVAL` -- that is `fs_error_at`'s job, not this
+/// table's: the same code means something else at another call site
+/// (ERROR_DIRECTORY from CreateProcessW is a bad working directory, `ENOENT`).
 #[cfg(windows)]
 fn windows_error_code(raw: i32) -> &'static str {
     use windows_sys::Win32::Foundation::*;
@@ -1351,7 +1426,6 @@ fn windows_error_code(raw: i32) -> &'static str {
     };
     match raw {
         ERROR_BROKEN_PIPE | ERROR_NO_DATA => "EPIPE",
-        ERROR_DIRECTORY => "ENOTDIR",
         ERROR_NOACCESS => "EFAULT",
         ERROR_ELEVATION_REQUIRED | ERROR_CANT_ACCESS_FILE => "EACCES",
         ERROR_ADDRESS_ALREADY_ASSOCIATED => "EADDRINUSE",
@@ -1389,6 +1463,7 @@ fn windows_error_code(raw: i32) -> &'static str {
         ERROR_BUFFER_OVERFLOW | ERROR_FILENAME_EXCED_RANGE => "ENAMETOOLONG",
         ERROR_NETWORK_UNREACHABLE => "ENETUNREACH",
         ERROR_BAD_PATHNAME
+        | ERROR_DIRECTORY
         | ERROR_ENVVAR_NOT_FOUND
         | ERROR_FILE_NOT_FOUND
         | ERROR_INVALID_NAME
@@ -1431,7 +1506,13 @@ fn node_error_reason(code: &str, error: &std::io::Error) -> String {
         code,
         "ENOENT" | "EACCES" | "EEXIST" | "ENOTEMPTY" | "ENOTDIR" | "EISDIR" | "EINVAL" | "EBADF"
     );
-    if (always || error.raw_os_error().is_some())
+    // A unix errno with no name of its own is coded EIO as a fallback; there
+    // the OS's text is the only account of what went wrong.
+    #[cfg(unix)]
+    let translated = code != "EIO" || error.raw_os_error() == Some(libc::EIO);
+    #[cfg(not(unix))]
+    let translated = true;
+    if (always || (translated && error.raw_os_error().is_some()))
         && let Some(text) = uv_strerror(code)
     {
         return text.to_string();
@@ -1439,99 +1520,104 @@ fn node_error_reason(code: &str, error: &std::io::Error) -> String {
     error.to_string()
 }
 
-/// libuv's `uv_strerror` text for a code (include/uv.h, v1.51.0), the Rust
-/// copy of `UV_ERROR_MESSAGES` in js/node_compat.js. The two are compared
-/// entry for entry by a test, so they cannot drift apart.
+/// libuv's `uv_strerror` text for a code (include/uv.h, v1.51.0).
 pub fn uv_strerror(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "E2BIG" => "argument list too long",
-        "EACCES" => "permission denied",
-        "EADDRINUSE" => "address already in use",
-        "EADDRNOTAVAIL" => "address not available",
-        "EAFNOSUPPORT" => "address family not supported",
-        "EAGAIN" => "resource temporarily unavailable",
-        "EAI_ADDRFAMILY" => "address family not supported",
-        "EAI_AGAIN" => "temporary failure",
-        "EAI_BADFLAGS" => "bad ai_flags value",
-        "EAI_BADHINTS" => "invalid value for hints",
-        "EAI_CANCELED" => "request canceled",
-        "EAI_FAIL" => "permanent failure",
-        "EAI_FAMILY" => "ai_family not supported",
-        "EAI_MEMORY" => "out of memory",
-        "EAI_NODATA" => "no address",
-        "EAI_NONAME" => "unknown node or service",
-        "EAI_OVERFLOW" => "argument buffer overflow",
-        "EAI_PROTOCOL" => "resolved protocol is unknown",
-        "EAI_SERVICE" => "service not available for socket type",
-        "EAI_SOCKTYPE" => "socket type not supported",
-        "EALREADY" => "connection already in progress",
-        "EBADF" => "bad file descriptor",
-        "EBUSY" => "resource busy or locked",
-        "ECANCELED" => "operation canceled",
-        "ECHARSET" => "invalid Unicode character",
-        "ECONNABORTED" => "software caused connection abort",
-        "ECONNREFUSED" => "connection refused",
-        "ECONNRESET" => "connection reset by peer",
-        "EDESTADDRREQ" => "destination address required",
-        "EEXIST" => "file already exists",
-        "EFAULT" => "bad address in system call argument",
-        "EFBIG" => "file too large",
-        "EHOSTUNREACH" => "host is unreachable",
-        "EILSEQ" => "illegal byte sequence",
-        "EINTR" => "interrupted system call",
-        "EINVAL" => "invalid argument",
-        "EIO" => "i/o error",
-        "EISCONN" => "socket is already connected",
-        "EISDIR" => "illegal operation on a directory",
-        "ELOOP" => "too many symbolic links encountered",
-        "EMFILE" => "too many open files",
-        "EMLINK" => "too many links",
-        "EMSGSIZE" => "message too long",
-        "ENAMETOOLONG" => "name too long",
-        "ENETDOWN" => "network is down",
-        "ENETUNREACH" => "network is unreachable",
-        "ENFILE" => "file table overflow",
-        "ENOBUFS" => "no buffer space available",
-        "ENODATA" => "no data available",
-        "ENODEV" => "no such device",
-        "ENOENT" => "no such file or directory",
-        "ENOEXEC" => "exec format error",
-        "ENOMEM" => "not enough memory",
-        "ENOPROTOOPT" => "protocol not available",
-        "ENOSPC" => "no space left on device",
-        "ENOSYS" => "function not implemented",
-        "ENOTCONN" => "socket is not connected",
-        "ENOTDIR" => "not a directory",
-        "ENOTEMPTY" => "directory not empty",
-        "ENOTSOCK" => "socket operation on non-socket",
-        "ENOTSUP" => "operation not supported on socket",
-        "ENOTTY" => "inappropriate ioctl for device",
-        "ENXIO" => "no such device or address",
-        "EOF" => "end of file",
-        "EOVERFLOW" => "value too large for defined data type",
-        "EPERM" => "operation not permitted",
-        "EPIPE" => "broken pipe",
-        "EPROTO" => "protocol error",
-        "EPROTONOSUPPORT" => "protocol not supported",
-        "EPROTOTYPE" => "protocol wrong type for socket",
-        "ERANGE" => "result too large",
-        "EROFS" => "read-only file system",
-        "ESPIPE" => "invalid seek",
-        "ESRCH" => "no such process",
-        "ETIMEDOUT" => "connection timed out",
-        "ETXTBSY" => "text file is busy",
-        "EXDEV" => "cross-device link not permitted",
-        "UNKNOWN" => "unknown error",
-        "EFTYPE" => "inappropriate file type or format",
-        "EHOSTDOWN" => "host is down",
-        "ENONET" => "machine is not on the network",
-        "EREMOTEIO" => "remote I/O error",
-        "ESHUTDOWN" => "cannot send after transport endpoint shutdown",
-        "ESOCKTNOSUPPORT" => "socket type not supported",
-        "EUNATCH" => "protocol driver not attached",
-        _ => return None,
-    })
+    UV_ERROR_MESSAGES
+        .iter()
+        .find(|(name, _)| *name == code)
+        .map(|(_, text)| *text)
 }
+
+/// The Rust copy of `UV_ERROR_MESSAGES` in js/node_compat.js. A test compares
+/// the two in both directions -- every entry here present there with the same
+/// text, and the same number of entries -- so neither can drift.
+const UV_ERROR_MESSAGES: &[(&str, &str)] = &[
+    ("E2BIG", "argument list too long"),
+    ("EACCES", "permission denied"),
+    ("EADDRINUSE", "address already in use"),
+    ("EADDRNOTAVAIL", "address not available"),
+    ("EAFNOSUPPORT", "address family not supported"),
+    ("EAGAIN", "resource temporarily unavailable"),
+    ("EAI_ADDRFAMILY", "address family not supported"),
+    ("EAI_AGAIN", "temporary failure"),
+    ("EAI_BADFLAGS", "bad ai_flags value"),
+    ("EAI_BADHINTS", "invalid value for hints"),
+    ("EAI_CANCELED", "request canceled"),
+    ("EAI_FAIL", "permanent failure"),
+    ("EAI_FAMILY", "ai_family not supported"),
+    ("EAI_MEMORY", "out of memory"),
+    ("EAI_NODATA", "no address"),
+    ("EAI_NONAME", "unknown node or service"),
+    ("EAI_OVERFLOW", "argument buffer overflow"),
+    ("EAI_PROTOCOL", "resolved protocol is unknown"),
+    ("EAI_SERVICE", "service not available for socket type"),
+    ("EAI_SOCKTYPE", "socket type not supported"),
+    ("EALREADY", "connection already in progress"),
+    ("EBADF", "bad file descriptor"),
+    ("EBUSY", "resource busy or locked"),
+    ("ECANCELED", "operation canceled"),
+    ("ECHARSET", "invalid Unicode character"),
+    ("ECONNABORTED", "software caused connection abort"),
+    ("ECONNREFUSED", "connection refused"),
+    ("ECONNRESET", "connection reset by peer"),
+    ("EDESTADDRREQ", "destination address required"),
+    ("EEXIST", "file already exists"),
+    ("EFAULT", "bad address in system call argument"),
+    ("EFBIG", "file too large"),
+    ("EHOSTUNREACH", "host is unreachable"),
+    ("EILSEQ", "illegal byte sequence"),
+    ("EINTR", "interrupted system call"),
+    ("EINVAL", "invalid argument"),
+    ("EIO", "i/o error"),
+    ("EISCONN", "socket is already connected"),
+    ("EISDIR", "illegal operation on a directory"),
+    ("ELOOP", "too many symbolic links encountered"),
+    ("EMFILE", "too many open files"),
+    ("EMLINK", "too many links"),
+    ("EMSGSIZE", "message too long"),
+    ("ENAMETOOLONG", "name too long"),
+    ("ENETDOWN", "network is down"),
+    ("ENETUNREACH", "network is unreachable"),
+    ("ENFILE", "file table overflow"),
+    ("ENOBUFS", "no buffer space available"),
+    ("ENODATA", "no data available"),
+    ("ENODEV", "no such device"),
+    ("ENOENT", "no such file or directory"),
+    ("ENOEXEC", "exec format error"),
+    ("ENOMEM", "not enough memory"),
+    ("ENOPROTOOPT", "protocol not available"),
+    ("ENOSPC", "no space left on device"),
+    ("ENOSYS", "function not implemented"),
+    ("ENOTCONN", "socket is not connected"),
+    ("ENOTDIR", "not a directory"),
+    ("ENOTEMPTY", "directory not empty"),
+    ("ENOTSOCK", "socket operation on non-socket"),
+    ("ENOTSUP", "operation not supported on socket"),
+    ("ENOTTY", "inappropriate ioctl for device"),
+    ("ENXIO", "no such device or address"),
+    ("EOF", "end of file"),
+    ("EOVERFLOW", "value too large for defined data type"),
+    ("EPERM", "operation not permitted"),
+    ("EPIPE", "broken pipe"),
+    ("EPROTO", "protocol error"),
+    ("EPROTONOSUPPORT", "protocol not supported"),
+    ("EPROTOTYPE", "protocol wrong type for socket"),
+    ("ERANGE", "result too large"),
+    ("EROFS", "read-only file system"),
+    ("ESPIPE", "invalid seek"),
+    ("ESRCH", "no such process"),
+    ("ETIMEDOUT", "connection timed out"),
+    ("ETXTBSY", "text file is busy"),
+    ("EXDEV", "cross-device link not permitted"),
+    ("UNKNOWN", "unknown error"),
+    ("EFTYPE", "inappropriate file type or format"),
+    ("EHOSTDOWN", "host is down"),
+    ("ENONET", "machine is not on the network"),
+    ("EREMOTEIO", "remote I/O error"),
+    ("ESHUTDOWN", "cannot send after transport endpoint shutdown"),
+    ("ESOCKTNOSUPPORT", "socket type not supported"),
+    ("EUNATCH", "protocol driver not attached"),
+];
 
 /// Which filesystem operation failed, for `fs_error_at`: the few places where
 /// node's answer for an OS error depends on the operation, not just the code.
@@ -1545,8 +1631,13 @@ pub enum FsSite<'a> {
     WriteFile,
     /// `fs.appendFile`: open with `a`, then write.
     AppendFile,
-    Mkdir,
+    /// `fs.mkdir`; `recursive` is the `{ recursive: true }` form.
+    Mkdir {
+        recursive: bool,
+    },
     Readlink,
+    /// `fs.readdir`.
+    Scandir,
 }
 
 /// What node reports for a failed filesystem operation: the code, the syscall
@@ -1572,8 +1663,12 @@ pub struct FsError {
 ///   `appendFile` on the write. std opens without that flag, so every one of
 ///   these arrives here as ERROR_ACCESS_DENIED instead -- which the table
 ///   reads as `EPERM`.
-/// - fs__mkdir reports ERROR_INVALID_NAME and ERROR_DIRECTORY as `EINVAL`.
+/// - fs__mkdir reports ERROR_INVALID_NAME and ERROR_DIRECTORY as `EINVAL`. Not
+///   for a recursive mkdir: node's MKDirp re-stats the path after the failure
+///   and reports `ENOENT`.
 /// - fs__readlink reports ERROR_NOT_A_REPARSE_POINT as `EINVAL`.
+/// - fs__scandir reports a file as `ENOTDIR`; libuv's table says `ENOENT` for
+///   the ERROR_DIRECTORY std gets.
 ///
 /// Not reproduced: `fs.open(dir)` with `r`, `r+`, `a` or `a+` SUCCEEDS in
 /// node, which would take directory descriptors oam does not have. oam fails
@@ -1601,8 +1696,13 @@ pub fn fs_error_at(
             has_path,
         };
         match site {
-            FsSite::Mkdir if matches!(raw, Some(ERROR_INVALID_NAME | ERROR_DIRECTORY)) => {
+            FsSite::Mkdir { recursive: false }
+                if matches!(raw, Some(ERROR_INVALID_NAME | ERROR_DIRECTORY)) =>
+            {
                 return at("EINVAL", syscall, true);
+            }
+            FsSite::Scandir if raw == Some(ERROR_DIRECTORY) => {
+                return at("ENOTDIR", syscall, true);
             }
             FsSite::Readlink if raw == Some(ERROR_NOT_A_REPARSE_POINT) => {
                 return at("EINVAL", syscall, true);
@@ -2900,7 +3000,7 @@ pub mod ops {
         .unwrap_or_else(|e| Err(std::io::Error::other(e)))
         {
             Ok(json) => OpOutcome::Json(json),
-            Err(e) => node_fail(e, "scandir", &path),
+            Err(e) => node_fail_at(super::FsSite::Scandir, e, "scandir", &path),
         }
     }
 
@@ -2912,7 +3012,7 @@ pub mod ops {
         };
         match result {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail_at(super::FsSite::Mkdir, e, "mkdir", &path),
+            Err(e) => node_fail_at(super::FsSite::Mkdir { recursive }, e, "mkdir", &path),
         }
     }
 
@@ -4268,7 +4368,7 @@ mod os_error_code_tests {
 
     /// Every message oam writes must be libuv's, which js/node_compat.js keeps
     /// a second copy of (`UV_ERROR_MESSAGES`) for util.getSystemErrorMessage.
-    /// Compared entry for entry, both ways, so neither copy can drift.
+    /// Compared entry for entry, and counted, so neither copy can drift.
     #[test]
     fn uv_strerror_matches_the_js_table() {
         let js = include_str!("../../../js/node_compat.js");
@@ -4302,6 +4402,13 @@ mod os_error_code_tests {
             seen > 80,
             "parsed only {seen} entries from UV_ERROR_MESSAGES"
         );
+        // Every JS entry matched a Rust one; equal counts leave no Rust-only
+        // entry either.
+        assert_eq!(
+            super::UV_ERROR_MESSAGES.len(),
+            seen,
+            "the Rust table has entries the JS table lacks"
+        );
         assert_eq!(uv_strerror("ENOTACODE"), None);
     }
 
@@ -4318,6 +4425,31 @@ mod os_error_code_tests {
         assert_eq!(
             node_error_message("ENOENT", "open", "p", &missing),
             "ENOENT: no such file or directory, open 'p'"
+        );
+    }
+
+    /// A raw errno std has no kind for still gets its own name, and an EIO
+    /// that is only a fallback keeps the OS's words.
+    #[cfg(unix)]
+    #[test]
+    fn unix_errnos_are_named_by_number() {
+        for (errno, code) in [
+            (libc::EPERM, "EPERM"),
+            (libc::EMFILE, "EMFILE"),
+            (libc::ENFILE, "ENFILE"),
+            (libc::EXDEV, "EXDEV"),
+            (libc::ENOSPC, "ENOSPC"),
+            (libc::EACCES, "EACCES"),
+        ] {
+            assert_eq!(
+                node_error_code(&std::io::Error::from_raw_os_error(errno)),
+                code
+            );
+        }
+        let exdev = std::io::Error::from_raw_os_error(libc::EXDEV);
+        assert_eq!(
+            node_error_message("EXDEV", "rename", "p", &exdev),
+            "EXDEV: cross-device link not permitted, rename 'p'"
         );
     }
 
@@ -4354,10 +4486,13 @@ mod os_error_code_tests {
             (ERROR_INVALID_HANDLE, "EBADF"),
             (ERROR_OPERATION_ABORTED, "ECANCELED"),
             (ERROR_INVALID_FUNCTION, "EISDIR"),
-            // oam's three deliberate departures from the generic table.
+            // Generic here; readdir's ENOTDIR is a per-operation rule. From
+            // CreateProcessW it is a bad working directory, which node reports
+            // as ENOENT.
+            (ERROR_DIRECTORY, "ENOENT"),
+            // oam's deliberate departures from the generic table.
             (ERROR_BROKEN_PIPE, "EPIPE"),
             (ERROR_NO_DATA, "EPIPE"),
-            (ERROR_DIRECTORY, "ENOTDIR"),
         ];
         for &(code, expected) in cases {
             assert_eq!(node_error_code(&raw(code)), expected, "Win32 error {code}");
@@ -4457,10 +4592,29 @@ mod os_error_code_tests {
         for code in [ERROR_INVALID_NAME, ERROR_DIRECTORY] {
             let e = raw(code);
             assert_eq!(
-                fs_error_at(FsSite::Mkdir, "mkdir", "a*b", &e),
+                fs_error_at(FsSite::Mkdir { recursive: false }, "mkdir", "a*b", &e),
                 expect("EINVAL", "mkdir", true)
             );
         }
+        // node's recursive mkdir re-stats and reports ENOENT instead.
+        assert_eq!(
+            fs_error_at(
+                FsSite::Mkdir { recursive: true },
+                "mkdir",
+                "a*b",
+                &raw(ERROR_INVALID_NAME)
+            ),
+            expect("ENOENT", "mkdir", true)
+        );
+        // readdir of a file is ENOTDIR; the same code elsewhere is ENOENT.
+        assert_eq!(
+            fs_error_at(FsSite::Scandir, "scandir", file_s, &raw(ERROR_DIRECTORY)),
+            expect("ENOTDIR", "scandir", true)
+        );
+        assert_eq!(
+            fs_error_at(FsSite::Open("r"), "open", file_s, &raw(ERROR_DIRECTORY)),
+            expect("ENOENT", "open", true)
+        );
         // ...but only mkdir: every other operation keeps the table's answer.
         assert_eq!(
             fs_error_at(FsSite::Open("r"), "open", "a*b", &raw(ERROR_INVALID_NAME)),
