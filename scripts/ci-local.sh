@@ -238,16 +238,16 @@ say "3/14 Clippy (-D warnings, --all-features)"
 # -D warnings via clippy args, NOT RUSTFLAGS: a global RUSTFLAGS would
 # fingerprint-poison the cargo cache against the plain build/test steps.
 #
-# --all-features is load-bearing for step 11. The unsafe-budget scanner is
-# LEXICAL -- it counts every `unsafe` under src/ and tests/ whether or not the
-# current feature set compiles it. Without --all-features the 12 ConPTY unsafe
-# blocks in crates/oam_cli/tests/e2e.rs (cfg(all(windows, feature =
-# "conpty-e2e"))) count toward the oam_cli ceiling while never being seen by
-# undocumented_unsafe_blocks = deny -- i.e. the ratchet gates code the safety
-# lint never checked. The workspace has exactly two features (napi, already
-# default, and conpty-e2e), and the ConPTY module plus its windows-sys
-# dev-dependency are both cfg(windows)-gated, so this is a clean superset on
-# every leg.
+# --all-features is kept for step 11. The unsafe-budget scanner is LEXICAL --
+# it counts every `unsafe` under src/ and tests/ whether or not the current
+# feature set compiles it -- so a feature-gated unsafe block would count toward
+# a crate's ceiling while never being seen by undocumented_unsafe_blocks =
+# deny, i.e. the ratchet would gate code the safety lint never checked. The
+# workspace has exactly one feature today (napi, already default), so this is
+# currently a no-op; it stays so the next feature does not reopen that gap.
+# (The ConPTY e2e used to be the live case, behind a conpty-e2e feature. Since
+# YawLabs/oam#109 it is crates/oam_cli/tests/conpty.rs, cfg(windows) and
+# always on, so a Windows run lints it like any other test.)
 if cargo clippy --workspace --all-targets --all-features -- -D warnings; then
   ok "clippy clean (all features)"
 else
