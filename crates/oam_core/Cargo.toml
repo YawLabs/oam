@@ -48,6 +48,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
 ] }
 
 # Unix extra-fd stdio (child_unix.rs): the signal-number table, the pollfd for

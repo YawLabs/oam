@@ -21202,6 +21202,10 @@
         env: opts.env || globalThis.process.env,
         shell: !!opts.shell,
         clearEnv: false,
+        // node's spawnSync honors `detached` too (spawn_sync.cc sets
+        // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
+        // Windows kill-on-close job like an async one.
+        detached: !!opts.detached,
         timeout: opts.timeout || 0,
         maxBuffer: opts.maxBuffer || 50 * 1024 * 1024,
         input: opts.input != null
@@ -21440,6 +21444,7 @@
         // children; oam's proxy mutates a JS-side cache, so pass that.
         env: opts.env || globalThis.process.env,
         clearEnv: false,
+        detached: !!opts.detached,
       };
 
       cp.stdio = new Array(stdioArr.length).fill(null);
@@ -21804,6 +21809,9 @@
         env: opts.env || globalThis.process.env,
         shell: !!opts.shell,
         clearEnv: false,
+        // Windows: a non-detached child joins the kill-on-close job and dies
+        // with this process, as under node; a detached one is left out.
+        detached: !!opts.detached,
       };
 
       const readStdout = async (handle) => {
@@ -21949,8 +21957,11 @@
       // `exec(cmd, {stdio:'inherit'})` hand back null streams where node hands
       // back real ones. (execSync/spawnSync DO honor stdio; only async exec
       // does not -- `execSync(cmd, {stdio:'inherit'})` is a normal idiom.)
+      // `detached` is off the whitelist as well, so an exec'd child stays in
+      // the Windows kill-on-close job whatever the caller passed.
       const spawnOpts = Object.assign({}, opts);
       delete spawnOpts.stdio;
+      delete spawnOpts.detached;
       return collectExec(spawn(command, [], spawnOpts), command, opts, callback);
     }
 
@@ -22102,7 +22113,9 @@
       // happen to appear inside an argument. `shell` stays honored if the
       // caller explicitly asks for one, which node also supports.
       const spawnOpts = Object.assign({}, opts, { shell: !!opts.shell });
+      // Same whitelist as exec(): neither stdio nor detached reaches spawn.
       delete spawnOpts.stdio;
+      delete spawnOpts.detached;
       const display = norm.args.length
         ? `${norm.command} ${norm.args.join(" ")}`
         : norm.command;
@@ -22221,6 +22234,8 @@
           env: childEnv,
           shell: false,
           clearEnv: false,
+          // node's fork() forwards its options to spawn(), detached included.
+          detached: !!opts.detached,
         };
 
         ipcServer.on("connection", (socket) => {

@@ -57,6 +57,11 @@ pub mod child_win;
 pub use child_unix as child_extra;
 #[cfg(windows)]
 pub use child_win as child_extra;
+/// The kill-on-close job object that ties a non-detached Windows child's
+/// lifetime to this process (libuv parity). Every Windows spawn path that
+/// backs `child_process` or `cluster` goes through it.
+#[cfg(windows)]
+mod job_win;
 
 pub type OpId = u64;
 

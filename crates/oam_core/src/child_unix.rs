@@ -163,6 +163,10 @@ pub(crate) fn signal_name(num: i32) -> String {
 /// Spawn a child with an arbitrary stdio fd layout. Pipes are created per the
 /// `stdio` spec; the child inherits the appropriate ends as numbered fds, and
 /// the parent keeps the other ends for I/O.
+///
+/// `_detached` keeps the signature shared with child_win.rs, where it decides
+/// kill-on-close job membership. It is not yet honored here (node would
+/// `setsid()` the child); a POSIX child outlives its parent either way.
 pub fn spawn_extra(
     command: &str,
     args: &[String],
@@ -170,6 +174,7 @@ pub fn spawn_extra(
     env: Option<&[(String, String)]>,
     clear_env: bool,
     stdio: &[StdioFd],
+    _detached: bool,
 ) -> Result<RawChild, String> {
     // Relocate child ends above every target index so the pre_exec dup2 cannot
     // alias a source onto another target.

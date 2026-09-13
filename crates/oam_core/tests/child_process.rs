@@ -48,7 +48,17 @@ fn spawn_echoer(marker: &str) -> (tokio::process::Child, u32) {
             format!("cat >/dev/null; printf '%s' '{marker}'"),
         ],
     );
-    spawn_child(command, args, None, None, false, false, stdio_pipe_all()).expect("spawn echoer")
+    spawn_child(
+        command,
+        args,
+        None,
+        None,
+        false,
+        false,
+        stdio_pipe_all(),
+        false,
+    )
+    .expect("spawn echoer")
 }
 
 /// Insert a spawned child into a fresh registry and return (registry, handle).
@@ -200,6 +210,7 @@ async fn deliver_kill_does_not_signal_exited_child() {
         false,
         false,
         stdio_pipe_all(),
+        false,
     )
     .expect("spawn immediate-exit child");
     let (reg, handle) = register(child, pid);
@@ -243,6 +254,7 @@ async fn raw_kill_after_exit_reports_real_exit() {
         None,
         false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
     )
     .expect("spawn_extra immediate-exit child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -287,6 +299,7 @@ async fn raw_kill_during_wait_delivers_signal() {
         None,
         false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
     )
     .expect("spawn_extra sleeper child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -333,6 +346,7 @@ async fn raw_kill_during_wait_delivers_signal_win() {
         None,
         false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
     )
     .expect("spawn_extra ping sleeper");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -375,6 +389,7 @@ async fn raw_kill_before_wait_delivers_signal() {
         None,
         false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
     )
     .expect("spawn_extra sleeper child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -421,6 +436,7 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         None,
         false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
+        false,
     )
     .expect("spawn_extra trapping child");
     let reg: RawChildRegistry = Arc::new(Mutex::new(HashMap::new()));

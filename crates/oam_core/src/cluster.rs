@@ -37,6 +37,11 @@ pub async fn cluster_fork(
 
     match cmd.spawn() {
         Ok(child) => {
+            // kill_on_drop covers the runtime dropping; the job covers the
+            // primary being KILLED, which never runs a drop. node's cluster
+            // forks through uv_spawn, so its workers die that way too.
+            #[cfg(windows)]
+            super::job_win::adopt_tokio_child(&child);
             let pid = child.id().unwrap_or(0);
             let handle = ids.fetch_add(1, Ordering::Relaxed);
             let mut guard = children.lock().unwrap_or_else(|e| e.into_inner());

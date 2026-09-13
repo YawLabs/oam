@@ -106,6 +106,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   user cache failed the whole batch install. `PUPPETEER_SKIP_DOWNLOAD=1` is set for
   the install, and a failed install now reports its error or its timeout rather than
   the first deprecation warning npm printed.
+- **On Windows, a child outlived the oam process that spawned it when that process
+  was killed.** node's libuv puts every non-detached child in a process-global job
+  object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the kernel closes the job's
+  only handle however the parent ends -- a clean exit, a crash, `TerminateProcess` --
+  which takes the children down with it. oam had no job, so a sidecar killed by its
+  host left its browser running, and a script that spawned
+  `node -e "setInterval(()=>{},1e9)"` with stdio ignored still had it running 1.5s
+  after the script was killed, where under node it is gone. oam now keeps the same
+  job, flag for flag (`KILL_ON_JOB_CLOSE`, `BREAKAWAY_OK`, `SILENT_BREAKAWAY_OK`,
+  `DIE_ON_UNHANDLED_EXCEPTION` -- so a grandchild a child starts on its own is not a
+  member, exactly as under node), on every path behind `child_process` and
+  `cluster`: `spawn`, the extra-fd `CreateProcessW` spawn, `execFile` and the shell
+  `exec` starts, `fork`, `cluster.fork`, and `spawnSync`, whose child now dies too if
+  oam is killed while blocked on it. The extra-fd path creates the child suspended
+  and resumes it only once it is in the job; tokio's and std's `Command` cannot
+  resume a suspended child, so those paths join it right after the spawn, which is
+  where libuv joins every child. `detached: true` children stay out of the job --
+  and now also get libuv's `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, where oam
+  used to ignore the option on Windows -- as does the `oam_ts` checker daemon. A job
+  that cannot be created or joined (oam itself inside a job that forbids nesting)
+  degrades to the old behaviour rather than failing the spawn. POSIX is untouched: a
+  child there outlives its parent under node as well. A new e2e test kills a real
+  `oam run` with `TerminateProcess` and checks a child from each of those seven paths
+  is gone and a `detached` one is not; it fails on 0.15.1, where all eight survive.
 
 ### Changed
 

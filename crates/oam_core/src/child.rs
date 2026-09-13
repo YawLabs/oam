@@ -123,6 +123,12 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// call -- but it MUST run inside a tokio runtime context, because on Unix it
 /// registers the child with the signal-driver reactor. Callers on the V8
 /// thread must hold a `Handle::enter()` guard; see `CoreRuntime::enter`.
+///
+/// `detached` is node's option: on Windows it adds libuv's
+/// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and keeps the child OUT of
+/// the kill-on-close job (job_win.rs) every other child is placed in. It is
+/// not yet honored on POSIX, where node would also `setsid()` the child.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_child(
     command: String,
     args: Vec<String>,
@@ -131,6 +137,7 @@ pub fn spawn_child(
     shell: bool,
     clear_env: bool,
     stdio: StdioSpec,
+    detached: bool,
 ) -> Result<(tokio::process::Child, u32), String> {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -206,8 +213,10 @@ pub fn spawn_child(
 
     #[cfg(windows)]
     {
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.creation_flags(windows_creation_flags(detached));
     }
+    #[cfg(not(windows))]
+    let _ = detached;
 
     let child = cmd.spawn().map_err(|e| {
         let code = super::node_error_code(&e);
@@ -222,8 +231,31 @@ pub fn spawn_child(
             e.to_string().replace('"', "\\\"")
         )
     })?;
+    // Right after spawn, not suspended: tokio's Command cannot resume a
+    // suspended child. job_win.rs explains why that window is libuv's own.
+    #[cfg(windows)]
+    if !detached {
+        super::job_win::adopt_tokio_child(&child);
+    }
     let pid = child.id().unwrap_or(0);
     Ok((child, pid))
+}
+
+/// Windows creation flags for a `child_process` spawn. `CREATE_NO_WINDOW` is
+/// oam's standing default; a `detached: true` child instead gets libuv's
+/// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` -- no console of the parent's
+/// and no share of its Ctrl+C. CREATE_NO_WINDOW is left off there because the
+/// CreateProcessW contract ignores it alongside DETACHED_PROCESS.
+#[cfg(windows)]
+pub(crate) fn windows_creation_flags(detached: bool) -> u32 {
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    };
+    if detached {
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    } else {
+        CREATE_NO_WINDOW
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,6 +270,7 @@ pub fn spawn_sync(
     timeout_ms: u64,
     max_buffer: usize,
     stdio: StdioSpec,
+    detached: bool,
 ) -> SpawnSyncResult {
     let (prog, final_args) = if shell {
         #[cfg(windows)]
@@ -316,8 +349,10 @@ pub fn spawn_sync(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        cmd.creation_flags(windows_creation_flags(detached));
     }
+    #[cfg(not(windows))]
+    let _ = detached;
 
     if clear_env {
         cmd.env_clear();
@@ -348,6 +383,15 @@ pub fn spawn_sync(
             };
         }
     };
+
+    // Node's spawnSync goes through uv_spawn too, so a child it is blocked on
+    // still dies if this process is killed mid-wait. std's Command cannot
+    // resume a suspended child either; same post-spawn assignment as above.
+    #[cfg(windows)]
+    if !detached {
+        use std::os::windows::io::AsHandle;
+        super::job_win::adopt(child.as_handle());
+    }
 
     let pid = child.id();
 

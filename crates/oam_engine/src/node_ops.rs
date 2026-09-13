@@ -5564,6 +5564,17 @@ fn op_worker_get_data(
 
 // -------------------------------------------------------- child_process ops
 
+/// node's `detached` spawn option, read as the JS layer normalized it (`!!`).
+/// On Windows it keeps the child out of the kill-on-close job, so it survives
+/// this process being killed; see oam_core's job_win.rs.
+fn opt_detached(scope: &mut v8::PinScope<'_, '_>, opts: Option<v8::Local<'_, v8::Object>>) -> bool {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "detached")?;
+        o.get(scope, key.into())
+    })
+    .is_some_and(|v| v.is_true())
+}
+
 fn op_spawn_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5626,6 +5637,7 @@ fn op_spawn_sync(
             val.number_value(scope)
         })
         .unwrap_or(0.0) as u64;
+    let detached = opt_detached(scope, opts);
     let max_buffer = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "maxBuffer")?;
@@ -5687,6 +5699,7 @@ fn op_spawn_sync(
         timeout_ms,
         max_buffer,
         stdio,
+        detached,
     );
 
     let obj = v8::Object::new(scope);
@@ -5819,6 +5832,7 @@ fn op_spawn_async(
     });
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
+    let detached = opt_detached(scope, opts);
 
     let children = core_runtime!(scope).children();
     let ids = core_runtime!(scope).body_ids();
@@ -5831,7 +5845,9 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, clear_env, stdio)
+        oam_core::child::spawn_child(
+            command, child_args, cwd, env_pairs, shell, clear_env, stdio, detached,
+        )
     };
     match spawned {
         Ok((child, pid)) => {
@@ -6184,6 +6200,7 @@ fn op_spawn_extra(
         return;
     }
 
+    let detached = opt_detached(scope, opts);
     let reg = core_runtime!(scope).raw_children();
     let ids = core_runtime!(scope).body_ids();
     match oam_core::child_extra::spawn_extra(
@@ -6193,6 +6210,7 @@ fn op_spawn_extra(
         env_pairs.as_deref(),
         clear_env,
         &stdio,
+        detached,
     ) {
         Ok(child) => {
             let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

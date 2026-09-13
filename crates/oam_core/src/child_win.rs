@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::BorrowedHandle;
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
@@ -35,11 +36,11 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::OpOutcome;
@@ -199,6 +200,11 @@ fn open_nul() -> HANDLE {
 /// Spawn a child with an arbitrary stdio fd layout. Pipes are created per the
 /// `stdio` spec; the child inherits the appropriate ends as numbered fds via
 /// the CRT fd-table, and the parent keeps the other ends for I/O.
+///
+/// A non-`detached` child is created SUSPENDED, placed in the kill-on-close
+/// job (job_win.rs), and only then resumed, so it never runs an instruction
+/// outside the job. A `detached` child skips the job and gets libuv's
+/// DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_extra(
     command: &str,
@@ -207,6 +213,7 @@ pub fn spawn_extra(
     env: Option<&[(String, String)]>,
     clear_env: bool,
     stdio: &[StdioFd],
+    detached: bool,
 ) -> Result<RawChild, String> {
     // SAFETY: one large block wraps the whole spawn sequence; each Win32 call
     // inside establishes its preconditions locally. `sa`/`si`/`pi` are
@@ -215,7 +222,10 @@ pub fn spawn_extra(
     // `attr_buf`, `cmd_w`, and the env block all outlive the CreateProcessW that
     // borrows their pointers; and every out-param is a live local. Each early
     // return first runs `cleanup_fail`, which closes every handle allocated so
-    // far, so no handle leaks on an error path.
+    // far, so no handle leaks on an error path. `pi.hProcess` and `pi.hThread`
+    // are the fresh handles CreateProcessW returned: the process handle is only
+    // BORROWED for the job assignment, while it is still open, and the thread
+    // handle is resumed before either is closed or handed to RawChild.
     unsafe {
         let mut sa: SECURITY_ATTRIBUTES = std::mem::zeroed();
         sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
@@ -416,23 +426,24 @@ pub fn spawn_extra(
         let mut cmd_w = to_wide(&cmdline);
 
         // Environment block (optional).
+        let base_flags = super::child::windows_creation_flags(detached);
         let mut env_block;
         let (env_ptr, creation_flags) = match env {
             Some(env) => {
                 env_block = build_env_block(env, clear_env);
                 (
                     env_block.as_mut_ptr() as *const std::ffi::c_void,
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    base_flags | CREATE_UNICODE_ENVIRONMENT,
                 )
             }
             None if clear_env => {
                 env_block = build_env_block(&[], true);
                 (
                     env_block.as_mut_ptr() as *const std::ffi::c_void,
-                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    base_flags | CREATE_UNICODE_ENVIRONMENT,
                 )
             }
-            None => (std::ptr::null(), CREATE_NO_WINDOW),
+            None => (std::ptr::null(), base_flags),
         };
 
         let cwd_w = cwd.map(to_wide);
@@ -445,7 +456,10 @@ pub fn spawn_extra(
             std::ptr::null(),
             std::ptr::null(),
             1, // bInheritHandles (scoped by the handle list in si.lpAttributeList)
-            creation_flags | EXTENDED_STARTUPINFO_PRESENT,
+            // SUSPENDED for every child: a non-detached one must be in the job
+            // before its first instruction (see below). libuv suspends only
+            // detached children and assigns the rest while they already run.
+            creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             env_ptr,
             cwd_ptr,
             &si.StartupInfo,
@@ -468,6 +482,30 @@ pub fn spawn_extra(
                 .unwrap_or_else(|| "null".to_string());
             return Err(format!(
                 "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"CreateProcessW failed (GetLastError={err}) for {}\"}}",
+                command.replace('"', "\\\"")
+            ));
+        }
+
+        // Job membership while the child is still suspended, so nothing it
+        // does -- including exiting or spawning -- happens outside the job.
+        if !detached {
+            super::job_win::adopt(BorrowedHandle::borrow_raw(pi.hProcess));
+        }
+        if ResumeThread(pi.hThread) == u32::MAX {
+            let err = GetLastError();
+            // A child that can never run must not be left parked: libuv
+            // terminates it and fails the spawn, and so does this.
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            cleanup_fail(&child_close, &nul_handles, &parent_fds);
+            let ioe = std::io::Error::from_raw_os_error(err as i32);
+            let code = super::node_error_code(&ioe);
+            let errno = super::node_errno(code, &ioe)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            return Err(format!(
+                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"ResumeThread failed (GetLastError={err}) for {}\"}}",
                 command.replace('"', "\\\"")
             ));
         }
@@ -823,6 +861,7 @@ mod tests {
                 None,
                 false,
                 &[StdioFd::ChildRead, StdioFd::Ignore, StdioFd::Ignore],
+                false,
             )
             .expect("spawn_extra");
 
