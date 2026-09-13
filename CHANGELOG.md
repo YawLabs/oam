@@ -18,6 +18,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **On Windows, a raw-mode switch on a cold start could echo a stray newline or
+  put the cursor back after the next write.** `setRawMode` cancels the stdin read
+  in flight and must not flip the console mode until that read has settled.
+  libuv waits for it with no timeout; oam gave up after 250 ms, which the first
+  run of a freshly written binary -- pages still being faulted in and scanned --
+  ran past. The cancelled Enter was then handled under the new mode: going back
+  to cooked mode echoed it as a newline, and going raw from a prompt on the last
+  row moved the cursor after the program had already written. Measured 2
+  failing runs in 5 on a freshly copied binary. The wait now returns when the
+  read settles, as before, but its bound is a 5 s backstop against a read that
+  can never settle rather than a latency guess. The console e2e now also runs
+  against both Windows release assets, win-x64 under emulation included, before
+  a release publishes. (#109)
 - **On Windows, going raw right after a prompt could overwrite the answer line.**
   `setRawMode` flipped the console mode first and cancelled the stdin read in
   flight afterwards, so the synthetic Enter that cancels the read was handled

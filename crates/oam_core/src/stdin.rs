@@ -32,10 +32,24 @@
 //! so the last-row adjustment in `SavedCursor::restore_target`, which assumes
 //! a newline scrolled the buffer, put the cursor a row too high whenever the
 //! prompt sat on the buffer's last row. Before the flip, a read already
-//! blocked in ReadConsoleW handles the Enter under its own mode. (A read
-//! marked PENDING but not yet inside ReadConsoleW when the settle wait runs
-//! out would take the queued Enter after the flip; the wait is 250 ms against
-//! a console's sub-millisecond latency.)
+//! blocked in ReadConsoleW handles the Enter under its own mode.
+//!
+//! So the switch must not flip until the cancelled read has settled, and
+//! libuv never does: `uv__cancel_read_console` takes `uv_tty_output_lock`, the
+//! read thread releases it only after its cursor restore, and
+//! `uv_tty_set_mode` waits on that lock with no timeout before
+//! `SetConsoleMode`. oam used to cap the same wait at 250 ms on the theory
+//! that a console answers in well under a millisecond. The console does; the
+//! reading thread is another matter. On a cold start -- the first run of a
+//! freshly written binary, its pages still being faulted in and scanned -- the
+//! cap ran out, and both halves of this design broke in the way the order
+//! exists to prevent: a raw read cancelled on the way back to cooked mode had
+//! its Enter echoed as a newline after the flip, and a cooked read cancelled
+//! on the way to raw had its cursor restore land after the program's next
+//! write. Measured on the ConPTY e2e (crates/oam_cli/tests/conpty.rs) against
+//! a freshly copied binary, 2 failing runs in 5, and reproduced on demand by
+//! delaying the reader's settle by 400 ms. The wait is now bounded only as a
+//! backstop ([`SETTLE_TIMEOUT`]).
 //!
 //! The cancel runs in BOTH directions, because a read issued raw keeps raw
 //! semantics across the switch back just the same, and would deliver the
@@ -83,14 +97,22 @@ const PENDING: u8 = 1;
 /// discard; a synthetic Enter is on its way to make it return.
 const DISCARD: u8 = 2;
 
-/// How long a cancel waits for the discarded read to settle (consume the
-/// injected Enter and restore the cursor). Console latency is well under a
-/// millisecond; the bound only keeps a wedged console from wedging the
-/// isolate thread. (The cancel side -- this, `arm_cancel`, `wait_settled`,
+/// The longest a cancel waits for the discarded read to settle (consume the
+/// injected Enter and restore the cursor) before the switch goes ahead anyway.
+///
+/// This is a backstop, not an estimate of how long a settle takes. The wait
+/// returns the moment the read settles -- well under a millisecond normally --
+/// and the switch must not proceed before that (see the module docs: libuv's
+/// equivalent wait has no timeout at all). What the bound guards against is a
+/// read that can never settle, because something other than this process
+/// consumed the injected Enter: another program sharing the console, say. Past
+/// it, the switch degrades to flipping with the read still pending rather than
+/// hanging the isolate thread. It used to be 250 ms, which a cold start ran
+/// past. (The cancel side -- this, `arm_cancel`, `wait_settled`,
 /// `disarm_cancel` -- is driven by the Windows console half; on unix nothing
 /// cancels, so those are dead there while the tests still cover them.)
 #[cfg_attr(not(windows), allow(dead_code))]
-const SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the synthetic Enter writes to the screen when it lands on the read in
 /// flight -- decided by the mode that read runs under, the PRE-flip one. From
@@ -884,6 +906,27 @@ mod tests {
             assert!(gate.wait_settled(generation, Duration::from_secs(5)));
         });
         assert_eq!(gate.generation(), generation + 1);
+    }
+
+    /// The real bound outlasts a slow reader. A settle that arrives 600 ms
+    /// after the cancel -- a reading thread descheduled, or faulting in cold
+    /// pages -- must still be waited for, because the switch that follows
+    /// depends on the read having settled first. The old 250 ms bound gave up
+    /// here, and the ConPTY e2e caught what that does to the screen.
+    #[test]
+    fn the_settle_bound_outlasts_a_slow_reader() {
+        let gate = ReadGate::new();
+        let generation = gate.generation();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(600));
+                gate.settle_discard(2);
+            });
+            assert!(
+                gate.wait_settled(generation, SETTLE_TIMEOUT),
+                "a 600 ms settle must not outrun SETTLE_TIMEOUT"
+            );
+        });
     }
 
     /// A reader that announces each read the loop issues, then returns what
