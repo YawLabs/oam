@@ -36,8 +36,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
     `write`, neither with a path.
   - `mkdir` of an invalid name is `EINVAL`, and so is `readlink` of a file that
     is not a link.
-  - Spawning a directory is `ENOENT`, as node's program search reports it,
-    where oam used to report a permission error.
+  - A program named by path is resolved the way libuv's search does: the name
+    as given only when it has an extension, then `.com`, then `.exe`, never a
+    directory, relative to `cwd`. Spawning a directory or an extensionless
+    shell shim is now `ENOENT`, as in node, where oam reported a permission
+    error or ran the file.
   - `spawn()` THROWS a failure node does not emit as an event: every code
     except `EACCES`, `EAGAIN`, `EMFILE`, `ENFILE` and `ENOENT`, e.g. `EPERM` or
     `EFTYPE`, with node's `spawn <CODE>` shape. It used to emit an `'error'`.
@@ -47,12 +50,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
     `spawnargs`, with node's `spawnSync <file> <CODE>` message where it used to
     carry only the OS text.
 
-  On Linux and macOS a raw `EPERM` is now `EPERM` too; std folded it into
-  `EACCES` while the errno already said -1. Still divergent on Windows, and
+  On Linux and macOS a raw errno is now named by its number too: `EPERM`, which
+  std folded into `EACCES` while the errno already said -1, and `EMFILE`,
+  `ENFILE`, `EXDEV`, `ENOSPC` and the rest std has no kind for, which were `EIO`
+  -- so a spawn that runs out of descriptors emits `EMFILE` like node. Still divergent on Windows, and
   known: `fs.open(dir)` for reading succeeds in node, which takes directory
   descriptors oam does not have; `stat` of a locked system file such as
-  `pagefile.sys` is `EBUSY` where node falls back to `EPERM`; spawn's own PATH
-  and extension search still differs from libuv's. **This is a behaviour
+  `pagefile.sys` is `EBUSY` where node falls back to `EPERM`; operations on the
+  `NUL` device report `EISDIR` where node treats it as a character device; and
+  for a BARE program name, spawn's PATH search still differs from libuv's. **This is a behaviour
   change** for any code that compared a Windows error code against `EACCES` or
   `EIO`.
 - **On Windows, going raw right after a prompt could overwrite the answer line.**
