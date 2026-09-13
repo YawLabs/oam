@@ -55,6 +55,16 @@
 //! fails with ERROR_ACCESS_DENIED (measured on Windows 11 26200) and the child
 //! never goes raw. YawLabs/oam#109.
 //!
+//! ## Which oam is under test
+//!
+//! The binary cargo built alongside these tests, unless `OAM_CONPTY_BIN`
+//! names another. scripts/release-local.sh sets it to each Windows release
+//! asset in turn -- including the x64 one, which only ever runs under the OS's
+//! x64 emulation on the release box -- so the assets that ship are the ones
+//! that pass, not a debug build made from the same commit. A name that does
+//! not exist fails every console test instead of quietly testing the cargo
+//! build in its place.
+//!
 //! ## A test target of its own
 //!
 //! Rather than a module of e2e.rs: windows-sys links `CreatePseudoConsole` as a
@@ -103,9 +113,31 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
     path
 }
 
+/// The oam binary the console tests run: `OAM_CONPTY_BIN` when it is set (see
+/// the docs at the top of this file), otherwise the one cargo built for this
+/// test target.
+fn oam_under_test() -> PathBuf {
+    match std::env::var_os("OAM_CONPTY_BIN").filter(|value| !value.is_empty()) {
+        Some(bin) => {
+            let bin = PathBuf::from(bin);
+            assert!(
+                bin.is_file(),
+                "OAM_CONPTY_BIN={} is not a file. Refusing to fall back to the \
+                 cargo-built oam, which would pass for a binary nobody asked about.",
+                bin.display()
+            );
+            bin
+        }
+        None => PathBuf::from(env!("CARGO_BIN_EXE_oam")),
+    }
+}
+
 /// A pseudoconsole with a child attached: writes to `input` are keystrokes,
 /// everything the child paints lands in `seen`.
 struct ConPty {
+    /// The command line the child was started with, for failure messages --
+    /// with `OAM_CONPTY_BIN` in play, which binary failed is the first question.
+    command_line: String,
     hpc: isize,
     input: std::fs::File,
     process: OwnedHandle,
@@ -155,7 +187,7 @@ impl ConPty {
     fn spawn(script: &Path) -> Self {
         Self::spawn_command(&format!(
             "\"{}\" run \"{}\" --no-check",
-            env!("CARGO_BIN_EXE_oam"),
+            oam_under_test().display(),
             script.display()
         ))
     }
@@ -241,7 +273,11 @@ impl ConPty {
         // this binary.
         let environment = environment_block(&[
             ("OAM_CACHE_DIR", cache.display().to_string()),
-            ("OAM_DAEMON_IDLE_MS", "45000".to_string()),
+            // Nothing here type-checks, so no daemon should start; if one
+            // does, it must not idle for long holding the binary under test
+            // (a release asset, under OAM_CONPTY_BIN). Same cap as the
+            // release script's smoke run.
+            ("OAM_DAEMON_IDLE_MS", "1500".to_string()),
         ]);
         let mut info = PROCESS_INFORMATION::default();
         // SAFETY: `command` is a live NUL-terminated UTF-16 buffer (the
@@ -296,6 +332,7 @@ impl ConPty {
             });
         }
         Self {
+            command_line: command_line.to_string(),
             hpc,
             input,
             process,
@@ -392,8 +429,9 @@ impl ConPty {
             let drained = exited_at.is_some_and(|at| at.elapsed() > Duration::from_secs(5));
             assert!(
                 Instant::now() < deadline && !drained,
-                "never saw {what} on the console; child {}; raw {:?}; text {text:?}",
+                "never saw {what} on the console; child {} ({}); raw {:?}; text {text:?}",
                 self.exit_state(),
+                self.command_line,
                 self.raw_output()
             );
             std::thread::sleep(Duration::from_millis(25));
