@@ -176,6 +176,17 @@ pub fn spawn_child(
         (command, args)
     };
 
+    #[cfg(windows)]
+    let prog = if shell {
+        prog
+    } else {
+        match resolve_windows_program(&prog, cwd.as_deref()) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => prog,
+            Err(e) => return Err(spawn_failure_json(&e)),
+        }
+    };
+
     let mut cmd = tokio::process::Command::new(&prog);
     #[cfg(windows)]
     {
@@ -218,19 +229,7 @@ pub fn spawn_child(
     #[cfg(not(windows))]
     let _ = detached;
 
-    let child = cmd.spawn().map_err(|e| {
-        let code = super::node_error_code(&e);
-        // errno rides along: node emits it as the `code` argument of the
-        // 'close' event for a child that never started, so the JS layer cannot
-        // reproduce node's failure shape without it.
-        let errno = super::node_errno(code, &e)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "null".to_string());
-        format!(
-            "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"{}\"}}",
-            e.to_string().replace('"', "\\\"")
-        )
-    })?;
+    let child = cmd.spawn().map_err(|e| spawn_failure_json(&e))?;
     // Right after spawn, not suspended: tokio's Command cannot resume a
     // suspended child. job_win.rs explains why that window is libuv's own.
     #[cfg(windows)]
@@ -239,6 +238,168 @@ pub fn spawn_child(
     }
     let pid = child.id().unwrap_or(0);
     Ok((child, pid))
+}
+
+/// The JSON body a failed async spawn hands the JS layer: the node code, the
+/// errno (null when there is none), and the OS message.
+///
+/// errno rides along: node emits it as the `code` argument of the 'close'
+/// event for a child that never started, so the JS layer cannot reproduce
+/// node's failure shape without it.
+pub(crate) fn spawn_failure_json(e: &std::io::Error) -> String {
+    spawn_failure_json_with(e, &e.to_string())
+}
+
+/// `spawn_failure_json` with a message of the caller's own.
+pub(crate) fn spawn_failure_json_with(e: &std::io::Error, message: &str) -> String {
+    let code = super::node_error_code(e);
+    serde_json::json!({
+        "code": code,
+        "errno": super::node_errno(code, e),
+        "message": message,
+    })
+    .to_string()
+}
+
+/// What spawning `prog` must run on Windows: libuv's program search
+/// (`search_path` / `path_search_walk_ext` in src/win/process.c) for a name
+/// with a path in it.
+///
+/// node resolves the program itself, before CreateProcessW, and libuv's search
+/// is narrower than std's: it tries the name as given only when its last
+/// component has an extension, then the name with `.com` appended, then with
+/// `.exe` -- skipping anything whose attributes mark a directory, without
+/// following a link -- and fails as ERROR_FILE_NOT_FOUND when nothing is
+/// left. A relative name is taken from `cwd` when one is given. std instead
+/// hands CreateProcessW whatever it was given, so a directory came back as
+/// ERROR_ACCESS_DENIED (EPERM, which spawn() throws) where node reports ENOENT,
+/// and an extensionless shell shim or a missing UNC share came back as EFTYPE
+/// or UNKNOWN.
+///
+/// - `Ok(None)`: run `prog` as given; std reaches the same file.
+/// - `Ok(Some(path))`: run `path`; std would reach a different file or none.
+/// - `Err`: nothing libuv would run.
+///
+/// A bare name is left to std's PATH search: libuv also searches the working
+/// directory and the CHILD's PATH first, a separate difference this does not
+/// take on.
+#[cfg(windows)]
+pub(crate) fn resolve_windows_program(
+    prog: &str,
+    cwd: Option<&str>,
+) -> std::io::Result<Option<String>> {
+    use std::os::windows::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    if !(prog.contains(['/', '\\']) || prog == "." || prog == "..") {
+        return Ok(None);
+    }
+    let path = Path::new(prog);
+    let from_cwd = cwd.is_some() && path.is_relative();
+    let full = match cwd {
+        Some(cwd) if path.is_relative() => Path::new(cwd).join(path),
+        _ => path.to_path_buf(),
+    };
+    let last = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+    let has_ext = last.rfind('.').is_some_and(|dot| dot + 1 < last.len());
+    let runnable = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0)
+    };
+    let with = |ext: &str| {
+        let mut name = full.clone().into_os_string();
+        name.push(ext);
+        PathBuf::from(name)
+    };
+    let as_given = |p: PathBuf, std_reaches_it: bool| {
+        if std_reaches_it && !from_cwd {
+            Ok(None)
+        } else {
+            Ok(Some(p.to_string_lossy().into_owned()))
+        }
+    };
+    if has_ext && runnable(&full) {
+        return as_given(full, true);
+    }
+    let com = with(".com");
+    if runnable(&com) {
+        return as_given(com, false);
+    }
+    let exe = with(".exe");
+    if runnable(&exe) {
+        // std appends `.exe` to a name without an extension on its own.
+        return as_given(exe, !has_ext);
+    }
+    Err(std::io::Error::from_raw_os_error(
+        windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32,
+    ))
+}
+
+#[cfg(all(test, windows))]
+mod program_search_tests {
+    use super::resolve_windows_program as resolve;
+
+    #[test]
+    fn a_program_path_follows_libuvs_search() {
+        let root = std::env::temp_dir().join(format!("oam-program-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("tool")).unwrap();
+        std::fs::create_dir_all(root.join("dir.exe")).unwrap();
+        std::fs::write(root.join("shim"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("shim.cmd"), b"@exit 0\r\n").unwrap();
+        std::fs::write(root.join("real.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("script.txt"), b"hi").unwrap();
+        let r = |name: &str| root.join(name).to_str().unwrap().to_string();
+        let not_found =
+            |result: std::io::Result<Option<String>>| result.unwrap_err().raw_os_error() == Some(2);
+
+        // A directory, with or without an extension, is never the program.
+        assert!(not_found(resolve(&r("tool"), None)));
+        assert!(not_found(resolve(&r("dir.exe"), None)));
+        assert!(not_found(resolve(".", None)));
+        // No extension: the name itself is not tried, only .com and .exe.
+        assert!(not_found(resolve(&r("shim"), None)));
+        assert!(not_found(resolve(&r("missing"), None)));
+        // With an extension the name is tried as given, whatever it holds.
+        assert_eq!(resolve(&r("script.txt"), None).unwrap(), None);
+        assert_eq!(resolve(&r("real.exe"), None).unwrap(), None);
+        // std appends .exe itself, so `real` needs no rewrite...
+        assert_eq!(resolve(&r("real"), None).unwrap(), None);
+        // ...but a relative name is resolved from `cwd`, where std would not.
+        let root_s = root.to_str().unwrap();
+        assert_eq!(
+            resolve(".\\real.exe", Some(root_s)).unwrap(),
+            Some(root.join(".\\real.exe").to_string_lossy().into_owned())
+        );
+        // A bare name is left to the PATH search.
+        assert_eq!(resolve("cmd", None).unwrap(), None);
+        // libuv tries .com before .exe, and std never tries .com.
+        std::fs::write(root.join("tool.com"), b"MZ").unwrap();
+        assert_eq!(
+            resolve(&r("tool"), None).unwrap(),
+            Some(format!("{}.com", r("tool")))
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// The errno for a spawnSync failure oam detects itself (a timeout, an
+/// overflowing buffer), which has no OS error to take it from.
+fn synthetic_spawn_errno(code: &str) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        // The windows table is keyed on the code alone.
+        super::node_errno(code, &std::io::Error::other(code))
+    }
+    #[cfg(unix)]
+    {
+        match code {
+            "ETIMEDOUT" => Some(-libc::ETIMEDOUT),
+            "ENOBUFS" => Some(-libc::ENOBUFS),
+            _ => None,
+        }
+    }
 }
 
 /// Windows creation flags for a `child_process` spawn. `CREATE_NO_WINDOW` is
@@ -304,6 +465,16 @@ pub fn spawn_sync(
         (command.to_string(), args.to_vec())
     };
 
+    #[cfg(windows)]
+    let (prog, unresolved) = if shell {
+        (prog, None)
+    } else {
+        match resolve_windows_program(&prog, cwd) {
+            Ok(Some(resolved)) => (resolved, None),
+            Ok(None) => (prog, None),
+            Err(e) => (prog, Some(e)),
+        }
+    };
     let mut cmd = std::process::Command::new(&prog);
     #[cfg(windows)]
     {
@@ -366,7 +537,14 @@ pub fn spawn_sync(
         }
     }
 
-    let mut child = match cmd.spawn() {
+    #[cfg(windows)]
+    let spawned = match unresolved {
+        Some(e) => Err(e),
+        None => cmd.spawn(),
+    };
+    #[cfg(not(windows))]
+    let spawned = cmd.spawn();
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             let code = super::node_error_code(&e);
@@ -378,6 +556,7 @@ pub fn spawn_sync(
                 pid: 0,
                 error: Some(SpawnSyncError {
                     code: code.to_string(),
+                    errno: super::node_errno(code, &e),
                     message: e.to_string(),
                 }),
             };
@@ -471,6 +650,7 @@ pub fn spawn_sync(
                 pid,
                 error: Some(SpawnSyncError {
                     code: "ETIMEDOUT".to_string(),
+                    errno: synthetic_spawn_errno("ETIMEDOUT"),
                     message: format!("spawnSync timed out after {timeout_ms}ms"),
                 }),
             };
@@ -512,6 +692,7 @@ pub fn spawn_sync(
                     pid,
                     error: Some(SpawnSyncError {
                         code: "ENOBUFS".to_string(),
+                        errno: synthetic_spawn_errno("ENOBUFS"),
                         message: format!("spawnSync {command} ENOBUFS"),
                     }),
                 };
@@ -534,6 +715,7 @@ pub fn spawn_sync(
             pid,
             error: Some(SpawnSyncError {
                 code: super::node_error_code(&e).to_string(),
+                errno: super::node_errno(super::node_error_code(&e), &e),
                 message: e.to_string(),
             }),
         },
@@ -551,6 +733,8 @@ pub struct SpawnSyncResult {
 
 pub struct SpawnSyncError {
     pub code: String,
+    /// The libuv errno node puts on `result.error.errno`.
+    pub errno: Option<i32>,
     pub message: String,
 }
 

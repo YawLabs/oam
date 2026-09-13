@@ -226,6 +226,12 @@ pub fn spawn_extra(
     stdio: &[StdioFd],
     detached: bool,
 ) -> Result<RawChild, String> {
+    // Same program search as the std-backed spawns (see child.rs).
+    let resolved = match super::child::resolve_windows_program(command, cwd) {
+        Ok(resolved) => resolved,
+        Err(e) => return Err(super::child::spawn_failure_json(&e)),
+    };
+    let command = resolved.as_deref().unwrap_or(command);
     // SAFETY: one large block wraps the whole spawn sequence; each Win32 call
     // inside establishes its preconditions locally. `sa`/`si`/`pi` are
     // zero-initialized POD then filled; every HANDLE handed to the child is
@@ -486,14 +492,13 @@ pub fn spawn_extra(
             // (3) and friends land on the same code node reports, and errno
             // rides along: node emits it as the `code` argument of the 'close'
             // event for a child that never started (same contract as child.rs).
+            // Built as JSON, not formatted: a Windows path is full of
+            // backslashes, and an unescaped one made the whole body unparsable,
+            // so the JS side lost the code.
             let ioe = std::io::Error::from_raw_os_error(err as i32);
-            let code = super::node_error_code(&ioe);
-            let errno = super::node_errno(code, &ioe)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "null".to_string());
-            return Err(format!(
-                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"CreateProcessW failed (GetLastError={err}) for {}\"}}",
-                command.replace('"', "\\\"")
+            return Err(super::child::spawn_failure_json_with(
+                &ioe,
+                &format!("CreateProcessW failed (GetLastError={err}) for {command}"),
             ));
         }
 
@@ -511,13 +516,9 @@ pub fn spawn_extra(
             CloseHandle(pi.hProcess);
             cleanup_fail(&child_close, &nul_handles, &parent_fds);
             let ioe = std::io::Error::from_raw_os_error(err as i32);
-            let code = super::node_error_code(&ioe);
-            let errno = super::node_errno(code, &ioe)
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "null".to_string());
-            return Err(format!(
-                "{{\"code\":\"{code}\",\"errno\":{errno},\"message\":\"ResumeThread failed (GetLastError={err}) for {}\"}}",
-                command.replace('"', "\\\"")
+            return Err(super::child::spawn_failure_json_with(
+                &ioe,
+                &format!("ResumeThread failed (GetLastError={err}) for {command}"),
             ));
         }
 

@@ -21058,6 +21058,9 @@
       }
       let cmd = String(command);
       let argv = (args || []).map(String);
+      // The caller's own arguments, before the self-spawn rewrite below: what
+      // node's errors report as `spawnargs`.
+      const userArgs = argv.slice();
       const opts = options || {};
       // Self-spawn parity: Node runs `node <script> [args]`, but oam's CLI needs
       // the `run` subcommand. When the command resolves to oam's own execPath
@@ -21086,8 +21089,28 @@
       return {
         command: cmd,
         args: argv,
+        userArgs,
         options: opts,
       };
+    }
+
+    /** The program and argv node's error for a failed spawn names -- its
+     *  `options.file` and `options.args` (normalizeSpawnArguments): the SHELL
+     *  and the shell's own argv when `shell` is set, otherwise the caller's
+     *  command and arguments, never oam's self-spawn rewrite. */
+    function spawnErrorTarget(norm) {
+      const opts = norm.options;
+      if (!opts.shell) return { file: norm.command, args: norm.userArgs.slice() };
+      const command = [norm.command, ...norm.userArgs].join(" ");
+      if (globalThis.process.platform === "win32") {
+        const file =
+          typeof opts.shell === "string" ? opts.shell : globalThis.process.env.comspec || "cmd.exe";
+        if (/^(?:.*\\)?cmd(?:\.exe)?$/i.test(file)) {
+          return { file, args: ["/d", "/s", "/c", `"${command}"`] };
+        }
+        return { file, args: ["-c", command] };
+      }
+      return { file: typeof opts.shell === "string" ? opts.shell : "/bin/sh", args: ["-c", command] };
     }
 
     function decodeOutput(buf, encoding) {
@@ -21120,6 +21143,32 @@
       shaped.path = command;
       shaped.spawnargs = args ? args.slice() : [];
       return shaped;
+    }
+
+    // The spawn failures node reports as an 'error' event. Every other code is
+    // THROWN from spawn() itself (lib/internal/child_process.js,
+    // ChildProcess.prototype.spawn): `spawn(file)` on an executable the caller
+    // may not run throws EPERM, a text file EFTYPE, a non-PE ".exe" UNKNOWN.
+    const SPAWN_EMITTED_CODES = new Set(["EACCES", "EAGAIN", "EMFILE", "ENFILE", "ENOENT"]);
+
+    /** The error spawn() must throw for a native spawn failure, or null when
+     *  node would emit it instead. node's shape: ErrnoException(err, 'spawn')
+     *  -- message `spawn <CODE>`, own errno/code/syscall in that order, and no
+     *  path or spawnargs. */
+    function spawnThrownError(err) {
+      const raw = typeof err === "string" ? err : (err && err.message) || "";
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+      if (!parsed || !parsed.code || SPAWN_EMITTED_CODES.has(parsed.code)) return null;
+      const thrown = new Error(`spawn ${parsed.code}`);
+      if (typeof parsed.errno === "number") thrown.errno = parsed.errno;
+      thrown.code = parsed.code;
+      thrown.syscall = "spawn";
+      return thrown;
     }
 
     // Native per-fd stdio direction codes, shared with spawnExtra's stdioCode.
@@ -21237,6 +21286,19 @@
       // so `spawnSync(..., {stdio: 'inherit'}).stdout === null`.
       const slot = (buf, fd) =>
         modes[fd] === STDIO_PIPE ? decodeOutput(buf, encoding) : null;
+      let error;
+      if (result.error) {
+        // node's shape (lib/internal/child_process.js spawnSync):
+        // ErrnoException(err, 'spawnSync ' + file) with path and spawnargs
+        // added -- message `spawnSync <file> <CODE>`, never the OS's own text.
+        const target = spawnErrorTarget(norm);
+        error = new Error(`spawnSync ${target.file} ${result.error.code}`);
+        if (typeof result.error.errno === "number") error.errno = result.error.errno;
+        error.code = result.error.code;
+        error.syscall = `spawnSync ${target.file}`;
+        error.path = target.file;
+        error.spawnargs = target.args;
+      }
       return {
         pid: result.pid,
         output: [null, slot(result.stdout, 1), slot(result.stderr, 2)],
@@ -21244,9 +21306,7 @@
         stderr: slot(result.stderr, 2),
         status: result.status,
         signal: result.signal,
-        error: result.error
-          ? Object.assign(new Error(result.error.message), { code: result.error.code })
-          : undefined,
+        error,
       };
     }
 
@@ -21482,7 +21542,13 @@
       try {
         info = JSON.parse(natives.spawnExtra(norm.command, norm.args, nativeOpts, codes));
       } catch (err) {
-        const e = spawnFailureError(err, norm.command, norm.args);
+        // Thrown, not emitted, for the codes node throws -- but only when this
+        // runs inside spawn() itself. With an ipc slot it runs after the
+        // channel binds, where a throw would escape into an event callback.
+        const thrown = wantsIpc ? null : spawnThrownError(err);
+        if (thrown) throw thrown;
+        const target = spawnErrorTarget(norm);
+        const e = spawnFailureError(err, target.file, target.args);
         // An ipc channel bound for this child would otherwise keep listening
         // forever: 'exit' never fires for a child that never started.
         if (cp._ipcTeardown) cp._ipcTeardown();
@@ -21874,6 +21940,11 @@
       try {
         info = JSON.parse(natives.spawnAsync(norm.command, norm.args, nativeOpts));
       } catch (err) {
+        // Thrown, not emitted, for the codes node throws -- but only when this
+        // runs inside spawn() itself (see spawnExtra). fork() has the same
+        // limit for good: its spawn always waits for the channel to bind.
+        const thrown = wantsIpc ? null : spawnThrownError(err);
+        if (thrown) throw thrown;
         info = null;
         queueMicrotask(() => handleSpawnFailure(err));
       }
@@ -21915,7 +21986,8 @@
         launch(null);
       }
       function handleSpawnFailure(err) {
-        const e = spawnFailureError(err, norm.command, norm.args);
+        const target = spawnErrorTarget(norm);
+        const e = spawnFailureError(err, target.file, target.args);
         // The stdin side gets a STREAM-shaped error, not the child's ENOENT:
         // node settles the write that was already in flight with EPIPE, then
         // destroys the stream so anything written later fails with
