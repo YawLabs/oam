@@ -464,9 +464,9 @@ impl Drop for ConPty {
 ///
 /// Anything outside that set PANICS rather than being guessed at, so a cursor
 /// assertion made on this screen is never quietly wrong about a sequence it
-/// did not understand. Private-mode CSIs (`ESC[?25l`, `ESC[?9001h`) and forms
-/// with intermediate bytes are the exception: they set modes, cursor styles and
-/// reports, and none of them paints or moves anything.
+/// did not understand. The exceptions set a mode or ask a question without
+/// touching the grid: an allowlist of DEC private modes (see `private_mode`),
+/// keyboard-protocol and device-attribute forms, and the cursor-shape DECSCUSR.
 struct Screen {
     cells: Vec<Vec<char>>,
     row: usize,
@@ -639,6 +639,24 @@ impl Screen {
         }
     }
 
+    /// A DEC private sequence, `ESC[?` already taken off. Only modes that
+    /// neither move the cursor nor change what is on screen or where text
+    /// lands get through. The rest panic -- the alternate screen (?47, ?1047,
+    /// ?1049), column mode (?3), origin mode (?6), autowrap (?7), margins
+    /// (?69) and anything unlisted -- because honouring them is work this
+    /// model does not do.
+    fn private_mode(modes: &str, final_byte: char) {
+        // Cursor keys, cursor blink, cursor visibility, focus reporting,
+        // bracketed paste, synchronized output, win32-input-mode.
+        const INERT: [&str; 7] = ["1", "12", "25", "1004", "2004", "2026", "9001"];
+        match final_byte {
+            'h' | 'l' if modes.split(';').all(|mode| INERT.contains(&mode)) => {}
+            // Status and keyboard-protocol queries: they ask, and paint nothing.
+            'n' | 'u' => {}
+            _ => panic!("Screen does not model CSI \"?{modes}\"{final_byte}"),
+        }
+    }
+
     fn blank(&mut self, row: usize, columns: std::ops::Range<usize>) {
         for col in columns {
             self.cells[row][col] = ' ';
@@ -646,9 +664,22 @@ impl Screen {
     }
 
     fn csi(&mut self, body: &str, final_byte: char) {
-        if body.starts_with(['?', '>', '=', '<'])
-            || body.contains(|c: char| (' '..='/').contains(&c))
-        {
+        if let Some(modes) = body.strip_prefix('?') {
+            Self::private_mode(modes, final_byte);
+            return;
+        }
+        // Keyboard-protocol settings and device-attribute queries: they
+        // configure or ask, and put nothing on the grid.
+        if body.starts_with(['>', '=', '<']) {
+            return;
+        }
+        if body.contains(|c: char| (' '..='/').contains(&c)) {
+            // DECSCUSR (`ESC[2 q`), the cursor's shape, is the one
+            // intermediate-byte form with a reason to be here.
+            assert!(
+                body.ends_with(' ') && final_byte == 'q',
+                "Screen does not model CSI {body:?}{final_byte}"
+            );
             return;
         }
         let params: Vec<usize> = body.split(';').map(|p| p.parse().unwrap_or(0)).collect();
@@ -794,6 +825,20 @@ fn screen_defers_the_wrap_from_the_last_column() {
         "the wrap is pending, not taken"
     );
     assert_eq!(screen.line(1), "");
+
+    // What tells a deferred wrap from an eager one: a CR while the wrap is
+    // pending returns to the START of the full row, and the next character
+    // overwrites its first cell. An eager wrap would have put it on row 2.
+    let screen = Screen::replay(&format!("{full}\rY"));
+    assert!(screen.line(0).starts_with("Yx"), "{:?}", screen.line(0));
+    assert_eq!(screen.next_write(), (0, 1));
+}
+
+#[test]
+#[should_panic(expected = "does not model CSI")]
+fn screen_refuses_a_private_mode_that_changes_the_screen() {
+    // The alternate screen: honouring it would mean a second grid.
+    Screen::replay("\u{1b}[?25l\u{1b}[?1049h");
 }
 
 #[test]
