@@ -437,6 +437,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // stdin
         ("stdinRead", op_stdin_read),
         ("stdinSetRef", op_stdin_set_ref),
+        ("stdinHandleType", op_stdin_handle_type),
         // os extended
         ("osRelease", op_os_release),
         ("osTotalMem", op_os_total_mem),
@@ -6559,6 +6560,20 @@ fn op_stdin_set_ref(
 ) {
     let referenced = args.get(0).boolean_value(scope);
     core_runtime_mut!(scope).set_stdin_ref(referenced);
+}
+
+/// `__oam.node.stdinHandleType()`: what fd 0 is -- "TTY", "FILE", "PIPE" or
+/// "UNKNOWN", libuv's `uv_guess_handle` names. node builds `process.stdin`'s
+/// class from it, and the class decides whether EOF is followed by 'close'
+/// (see `oam_core::stdin::HandleType`).
+fn op_stdin_handle_type(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let name = oam_core::stdin::stdin_handle_type().as_str();
+    let val = v8::String::new(scope, name).unwrap();
+    rv.set(val.into());
 }
 
 // ============================================================== os extended

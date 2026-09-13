@@ -130,6 +130,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   child there outlives its parent under node as well. A new e2e test kills a real
   `oam run` with `TerminateProcess` and checks a child from each of those seven paths
   is gone and a `detached` one is not; it fails on 0.15.1, where all eight survive.
+- **`process.stdin` emitted 'end' but never 'close' when a parent closed the pipe.**
+  node builds stdin's class from what fd 0 is: a pipe or socket is a `net.Socket`
+  and a terminal a `tty.ReadStream`, both of which destroy themselves after 'end',
+  while a file -- a `< input.txt` redirect, or the null device `stdio: 'ignore'`
+  attaches -- is an `fs.ReadStream` opened with `autoClose: false` that emits 'end'
+  alone. oam made every stdin the file shape, so an MCP server that shuts down on
+  stdin 'close' (`process.stdin.on("close", () => server.close())` in
+  `@modelcontextprotocol/server-puppeteer`) never did when its host disconnected,
+  and leaked the browser it owned -- which the sidecar release gate reported as a
+  FAIL. stdin now classifies fd 0 as libuv's `uv_guess_handle` does (TTY, FILE,
+  PIPE, UNKNOWN) and destroys itself after 'end' for everything but a FILE.
+  Conformance case 98 checks pipe, file and ignored stdin -- data, `readable` plus
+  `read()`, a handler that shuts down on 'close', `destroy()` before and after EOF,
+  and `for await ... break` -- against node, and differs from node on 0.15.1.
 
 ### Changed
 

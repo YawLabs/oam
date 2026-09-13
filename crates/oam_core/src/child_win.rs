@@ -29,7 +29,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
+    FILE_TYPE, FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -97,10 +97,21 @@ pub struct RawChild {
 
 pub type RawChildRegistry = Arc<Mutex<HashMap<u64, RawChild>>>;
 
+/// `GetFileType`: what kind of object a handle names -- a pipe (or socket), a
+/// character device (a console, `NUL`), a disk file, or FILE_TYPE_UNKNOWN.
+/// Shared by the CRT fd-table flags below and stdin's handle classification
+/// (stdin.rs), which is libuv's `uv_guess_handle`.
+pub(crate) fn file_type(h: HANDLE) -> FILE_TYPE {
+    // SAFETY: GetFileType takes the handle by value and only asks the kernel
+    // for the type of the object it names; it dereferences none of our
+    // memory. So any value is sound to pass -- a live handle, a closed or
+    // recycled one, null, INVALID_HANDLE_VALUE -- and one that names nothing
+    // comes back FILE_TYPE_UNKNOWN rather than faulting.
+    unsafe { GetFileType(h) }
+}
+
 fn crt_flag(h: HANDLE) -> u8 {
-    // SAFETY: `h` is a live handle owned by the caller; GetFileType only reads
-    // the kernel object's type and dereferences none of our memory.
-    match unsafe { GetFileType(h) } {
+    match file_type(h) {
         FILE_TYPE_PIPE => FOPEN | FPIPE,
         FILE_TYPE_CHAR => FOPEN | FDEV,
         _ => FOPEN,

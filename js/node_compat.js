@@ -12724,8 +12724,25 @@
       });
       lazyStdio("stdin", () => {
         const { Readable } = registry.get("stream");
+        // What EOF does depends on what fd 0 is, because node builds stdin's
+        // class from it (getStdin, lib/internal/bootstrap/switches/
+        // is_main_thread.js). A pipe or socket is a net.Socket and a terminal
+        // a tty.ReadStream -- both autoDestroy, so 'end' is followed by
+        // 'close' and the stream reads destroyed -- and so is the empty
+        // Readable node substitutes when there is no usable stdin. A FILE --
+        // `< input.txt`, and NUL or /dev/null, which is what `stdio: 'ignore'`
+        // attaches -- is an fs.ReadStream opened with autoClose: false: 'end'
+        // and nothing after it, never destroyed. (The pipe and FILE shapes
+        // are probe-verified against v22.22.2 by conformance case 98; the
+        // terminal and no-stdin ones are read off that source.) autoDestroy
+        // was false for every stdin, which kept FILE right and got the pipe
+        // wrong: a parent closing the pipe produced 'end' with no 'close', so
+        // an MCP server that shuts down on stdin 'close' (server-puppeteer)
+        // never did. EOF on an autoDestroy stdin runs the destroy() below
+        // after 'end'; the read has settled by then, so its
+        // stdinSetRef(false) has no read left to retire.
         const stdin = new Readable({
-          autoDestroy: false,
+          autoDestroy: natives.stdinHandleType() !== "FILE",
           read() {
             natives.stdinRead().then(
               (chunk) => {

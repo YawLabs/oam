@@ -426,6 +426,89 @@ pub async fn stdin_read() -> OpOutcome {
     }
 }
 
+/// What fd 0 is, in the four kinds libuv's `uv_guess_handle` sorts a handle
+/// into. node's `getStdin` (lib/internal/bootstrap/switches/is_main_thread.js)
+/// picks `process.stdin`'s class by it, and the class decides what EOF does:
+/// a `net.Socket` or `tty.ReadStream` destroys itself after 'end', so 'close'
+/// follows, while a file is an `fs.ReadStream` opened with `autoClose: false`
+/// and emits 'end' alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleType {
+    /// A terminal (node: `tty.ReadStream`).
+    Tty,
+    /// A regular file, or a character device that is not a terminal --
+    /// `< input.txt`, `/dev/null`, Windows' `NUL` (node: `fs.ReadStream`).
+    File,
+    /// A pipe or a socket (node: `net.Socket`).
+    Pipe,
+    /// Anything else, including no stdin at all (node: an empty Readable,
+    /// already ended).
+    Unknown,
+}
+
+impl HandleType {
+    /// libuv's spelling, as node's `guessHandleType` returns it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HandleType::Tty => "TTY",
+            HandleType::File => "FILE",
+            HandleType::Pipe => "PIPE",
+            HandleType::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// [`HandleType`] of this process's stdin.
+pub fn stdin_handle_type() -> HandleType {
+    guess_handle(&std::io::stdin())
+}
+
+/// `uv_guess_handle` (src/win/handle.c): a character device is a TTY when it
+/// is a console and a FILE otherwise, a pipe is a PIPE, a disk file a FILE,
+/// and anything GetFileType cannot name is UNKNOWN. The terminal test is
+/// `IsTerminal`, the one `process.stdin.isTTY` already reports, so the two
+/// can never disagree.
+#[cfg(windows)]
+fn guess_handle<H>(handle: &H) -> HandleType
+where
+    H: std::os::windows::io::AsRawHandle + std::io::IsTerminal,
+{
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE};
+    if handle.is_terminal() {
+        return HandleType::Tty;
+    }
+    match crate::child_win::file_type(handle.as_raw_handle()) {
+        FILE_TYPE_DISK | FILE_TYPE_CHAR => HandleType::File,
+        FILE_TYPE_PIPE => HandleType::Pipe,
+        _ => HandleType::Unknown,
+    }
+}
+
+/// `uv_guess_handle` (src/unix/core.c): a terminal is a TTY, a regular file
+/// or character device a FILE, a FIFO a PIPE. libuv tells a socket's family
+/// apart (TCP, UDP, a unix-domain PIPE); node gives TCP and PIPE the same
+/// `net.Socket`, and a datagram socket as stdin is not a shape anything
+/// spawns, so every socket is a PIPE here. An fd `fstat` fails on (closed)
+/// is UNKNOWN, as are directories and block devices.
+#[cfg(unix)]
+fn guess_handle<H>(handle: &H) -> HandleType
+where
+    H: std::os::fd::AsFd + std::io::IsTerminal,
+{
+    use rustix::fs::FileType;
+    if handle.is_terminal() {
+        return HandleType::Tty;
+    }
+    match rustix::fs::fstat(handle.as_fd()) {
+        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile | FileType::CharacterDevice => HandleType::File,
+            FileType::Fifo | FileType::Socket => HandleType::Pipe,
+            _ => HandleType::Unknown,
+        },
+        Err(_) => HandleType::Unknown,
+    }
+}
+
 /// The Win32 console half: the synthetic Enter that wakes a blocked
 /// `ReadConsoleW`, and the cursor save/restore that undoes its echo. Goes
 /// through `CONOUT$` rather than the stdout handle so the restore reaches the
@@ -914,5 +997,55 @@ mod tests {
                 "the discarded line never surfaces"
             );
         });
+    }
+
+    /// The classification node's stdin class hangs on, checked against real
+    /// objects of each kind rather than the process's own stdin (which is
+    /// whatever the test runner attached).
+    #[test]
+    fn guess_handle_sorts_files_devices_and_pipes() {
+        let path = std::env::temp_dir().join(format!(
+            "oam-guess-handle-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(guess_handle(&file), HandleType::File, "a disk file");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+
+        // What `stdio: 'ignore'` hands a child: NUL / /dev/null, a character
+        // device that is not a terminal, which libuv calls a FILE too.
+        let null = std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap();
+        assert_eq!(guess_handle(&null), HandleType::File, "the null device");
+
+        let (reader, _writer) = std::io::pipe().unwrap();
+        #[cfg(windows)]
+        let reader = std::os::windows::io::OwnedHandle::from(reader);
+        #[cfg(unix)]
+        let reader = std::os::fd::OwnedFd::from(reader);
+        assert_eq!(guess_handle(&reader), HandleType::Pipe, "a pipe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guess_handle_calls_a_directory_unknown() {
+        let dir = std::fs::File::open(std::env::temp_dir()).unwrap();
+        assert_eq!(guess_handle(&dir), HandleType::Unknown);
+    }
+
+    #[test]
+    fn handle_type_spells_libuv_names() {
+        assert_eq!(
+            [
+                HandleType::Tty,
+                HandleType::File,
+                HandleType::Pipe,
+                HandleType::Unknown
+            ]
+            .map(HandleType::as_str),
+            ["TTY", "FILE", "PIPE", "UNKNOWN"]
+        );
     }
 }
