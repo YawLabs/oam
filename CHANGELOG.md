@@ -18,6 +18,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A refused TCP connect took about 2 s to fail on Windows** (#137). The
+  stack retransmits the SYN of a connect to a closed loopback port before it
+  reports `ECONNREFUSED`; libuv tells it not to (`SIO_TCP_INITIAL_RTO`, for
+  loopback targets only), so node reports the refusal in milliseconds while
+  every `net.connect` and `tls.connect` under oam waited about 2 s, and
+  `tls.connect(port)` paid it on every call: its default host, `localhost`,
+  resolves to `::1` first on Windows, and an IPv4-only listener refuses that
+  before the `127.0.0.1` attempt. oam's connect now does what libuv does, for
+  `net` and `tls` alike; the resolved-address loop and the error shape are
+  tokio's, byte for byte. `http` and `fetch` go through reqwest's own
+  connector, which cannot be told this, and keep the 2 s on Windows (recorded
+  in `docs/node-divergences.md`).
+
 - **A TLS socket lacked the `net.Socket` API, and ioredis crashed over
   `rediss://`** (#132). In Node `tls.TLSSocket` extends `net.Socket`; oam's
   extended `stream.Duplex` and shared no base with its `net.Socket`, so a

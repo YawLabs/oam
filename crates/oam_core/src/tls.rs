@@ -138,7 +138,7 @@ pub async fn tls_connect(
     client_key_pem: Option<String>,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
-    let tcp = match tokio::net::TcpStream::connect(&addr).await {
+    let tcp = match crate::tcp::connect_tcp(&host, port).await {
         Ok(s) => s,
         Err(e) => return tls_fail(e, "connect", &addr),
     };

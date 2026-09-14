@@ -989,6 +989,25 @@ _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; c
 described; the bare-`connect()` and `socket`-option shapes as described; `unref()` liveness
 measured against a Node-hosted TLS server.
 
+### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and report `ECONNRESET`
+
+Windows retransmits the SYN of a connect to a closed loopback port for about 2 s before it
+reports the refusal; libuv turns that off per socket (`SIO_TCP_INITIAL_RTO`, loopback targets
+only), so node's `net`, `tls`, `http` and `fetch` all see `ECONNREFUSED` within milliseconds.
+oam's `net.connect` and `tls.connect` do the same since #137 (pinned by
+`conformance/cases/101-net-refused-loopback-connect-fast.mjs`). `http.request` and `fetch`
+go through reqwest's connector, which has no way to set that option, so on Windows they still
+wait about 2 s. Independently of the platform, the failure then surfaces as `socket hang up` /
+`ECONNRESET` from `http.request` (reqwest's error text stops at "error sending request", and
+the refusal sits deeper in its source chain, which oam's mapping does not walk) and as a
+`fetch failed` `TypeError` whose `cause` carries no `code`, where node reports
+`connect ECONNREFUSED 127.0.0.1:<port>` in both places. Retry logic that keys on
+`err.code === 'ECONNREFUSED'` does not fire under oam.
+
+_(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms with
+`cause.code` `ECONNREFUSED` / 2033 ms with no code; `http.get` `ECONNREFUSED` at 4 ms /
+`ECONNRESET` at 2024 ms.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is
