@@ -23939,6 +23939,10 @@
         // key-exchange group behind getEphemeralKeyInfo(). _isServer marks
         // the accept loop's sockets, where Node reports no key info.
         this._peerCertificates = null;
+        // Parsed form of _peerCertificates, filled lazily and per index by
+        // _parsedPeerCert so getPeerCertificate does not re-decode the same
+        // DER on every call; dropped whenever the chain is (re)set.
+        this._peerParsed = null;
         this._ephemeralKeyInfo = null;
         this._isServer = false;
         // Node: a TLSSocket built without a transport is `connecting` from
@@ -24111,6 +24115,22 @@
         if (this._ephemeralKeyInfo === null || this._protocol === "TLSv1.3") return {};
         return Object.assign({}, this._ephemeralKeyInfo);
       }
+      // Parse peer certificate `i` (leaf is 0) once and cache it. The DER
+      // parse -- base64 -> DER -> ASN.1 plus the three fingerprint digests --
+      // is identical on every getPeerCertificate call, so it is done at most
+      // once per certificate and reused; a fresh legacy object is still built
+      // per call from the cached parse, as Node builds a fresh object from
+      // its already-parsed session certificate. Non-detailed calls only ever
+      // touch index 0. Mirrors X509Certificate's own `_parsed` cache.
+      _parsedPeerCert(i) {
+        if (this._peerParsed === null) this._peerParsed = new Array(this._peerCertificates.length);
+        var parsed = this._peerParsed[i];
+        if (parsed === undefined) {
+          parsed = natives.cryptoX509Parse(new Uint8Array(globalThis.Buffer.from(this._peerCertificates[i], "base64")));
+          this._peerParsed[i] = parsed;
+        }
+        return parsed;
+      }
       // Node's legacy object for the peer's leaf, a fresh one per call; {}
       // when the peer sent no certificate (before the handshake; a server
       // whose client sent none). `detailed` links each certificate to the
@@ -24124,7 +24144,7 @@
         if (chain === null || chain.length === 0) return {};
         var parsed = [];
         for (var i = 0; i < chain.length; i++) {
-          parsed.push(natives.cryptoX509Parse(new Uint8Array(globalThis.Buffer.from(chain[i], "base64"))));
+          parsed.push(this._parsedPeerCert(i));
           if (!detailed) break;
         }
         var objects = parsed.map(x509LegacyObject);
@@ -24329,6 +24349,7 @@
           socket._cipher = info.cipher;
           socket._cipherStandardName = info.cipherStandardName || null;
           socket._peerCertificates = info.peerCertificates || null;
+          socket._peerParsed = null;
           socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
           if (info.remoteAddr) {
@@ -24473,6 +24494,7 @@
               socket._cipher = info.cipher;
               socket._cipherStandardName = info.cipherStandardName || null;
               socket._peerCertificates = info.peerCertificates || null;
+              socket._peerParsed = null;
               socket._isServer = true;
               socket.alpnProtocol = info.alpnProtocol || false;
               socket.encrypted = true;
