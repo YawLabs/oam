@@ -30,9 +30,18 @@ Every check -- `oam check`, and the concurrent one behind `oam run` and
 `oam test` -- also sees oam's own declarations for the `oam:` modules
 (`oam:mcp`, `oam:test`, `oam:ai`, `oam:permissions`) and the `oam` global.
 Nothing to install and no `tsconfig.json` edit: for a project they arrive
-through a generated config in oam's cache that `extends` yours, so your
-`compilerOptions`, `include` and `paths` still decide what is checked and
-how. Node's own globals are a separate question -- `process`, `Buffer` and
+through a generated config that `extends` yours, so your `compilerOptions`,
+`include`, `paths`, `types` and `references` still decide what is checked
+and how. That config is written under `node_modules/.oam/ts-decls/` at
+your project's nearest `node_modules` (the directory oam's `--precompile`
+output already lives in, gitignored there), because TypeScript resolves a
+`types` entry from the root config's directory and that has to be where
+your own `@types` are. It goes under oam's own cache dir only when there
+is no `node_modules` at or above the project, or that directory cannot be
+written; a project that names a package in `types` is then checked against
+its own tsconfig alone, with TS2307 on `oam:` imports, and `OAM_DEBUG=1`
+says so. A tsconfig chain that uses `${configDir}` is checked that way
+too. Node's own globals are a separate question -- `process`, `Buffer` and
 friends still want `@types/node` in the project, because those are Node's
 types to publish, not oam's. A project that carries its own ambient
 `declare const oam` (hand-written, or copied from oam's demo before 0.14)

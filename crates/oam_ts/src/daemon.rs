@@ -65,10 +65,15 @@ const REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// After a spawn that never came up, don't try again for this long.
 const SPAWN_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
-/// A daemon Check is bounded by two tsgo runs (the file listing and the
-/// check itself) plus slack; the client waits that long, never longer.
+/// A daemon Check is bounded by four tsgo runs plus slack: the file listing
+/// and the check, each of which runs a second time against the user's own
+/// tsconfig when the wrapper config's run fails on a config-level problem
+/// (`list_files`, `check_cancellable`). The two extra runs are the fast
+/// shapes -- a listing never type-checks, and an options failure exits
+/// before the semantic pass -- but the bound is the bound; the client waits
+/// this long, never longer, and then runs one-shot.
 fn check_timeout() -> Duration {
-    crate::tsgo_timeout() * 2 + Duration::from_secs(30)
+    crate::tsgo_timeout() * 4 + Duration::from_secs(30)
 }
 
 /// 30 minutes, overridable (tests use a short value so any spawn/lifecycle
@@ -444,6 +449,20 @@ fn fingerprint(root: &Path, tsconfig: &Path, listed: &[PathBuf]) -> Option<u64> 
                 entries.insert(path, stamp(Ok(meta)));
             }
         }
+        // Whether a `node_modules` exists at this level, stamped present or
+        // absent. The walk skips its contents by design and the listed
+        // files under it are stamped one by one -- but a node_modules that
+        // was ABSENT at the last fill listed nothing, so a reinstall that
+        // leaves the lockfile alone (pnpm, yarn, bun, a plain `mv` back)
+        // would be served the verdict cached against the missing directory
+        // (#130 made that verdict a cacheable TS2688 where it used to be an
+        // uncacheable internal error). A directory's mtime moves when a
+        // direct child appears or vanishes, which is what an install does.
+        let node_modules = ancestor.join("node_modules");
+        entries.insert(
+            node_modules.clone(),
+            stamp(std::fs::metadata(&node_modules)),
+        );
     }
     if entries.len() > CAP {
         return None;
@@ -1342,6 +1361,35 @@ mod tests {
         // Irrelevant files don't participate.
         std::fs::write(dir.join("notes.txt"), "hi").unwrap();
         assert_eq!(after, fingerprint(&dir, &tsconfig, &[]).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_tracks_node_modules_presence_on_every_ancestor() {
+        // A verdict cached with no node_modules (a TS2688 for its missing
+        // @types) must not survive the directory coming back; nothing else
+        // in the fingerprint sees a reinstall that leaves the lockfile alone.
+        let dir = scratch("fp-nm");
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, "{}").unwrap();
+        let absent = fingerprint(&dir, &tsconfig, &[]).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        let present = fingerprint(&dir, &tsconfig, &[]).unwrap();
+        assert_ne!(absent, present, "a node_modules appearing must invalidate");
+        std::fs::remove_dir(dir.join("node_modules")).unwrap();
+        assert_eq!(
+            absent,
+            fingerprint(&dir, &tsconfig, &[]).unwrap(),
+            "and its removal restores the earlier fingerprint"
+        );
+        // The stamp is per ancestor: a hoisted install above the project
+        // counts the same way.
+        let package = dir.join("packages").join("foo");
+        std::fs::create_dir_all(&package).unwrap();
+        let nested = package.join("tsconfig.json");
+        std::fs::write(&nested, "{}").unwrap();
+        let before = fingerprint(&package, &nested, &[]).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        assert_ne!(before, fingerprint(&package, &nested, &[]).unwrap());
     }
 
     #[test]

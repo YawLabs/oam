@@ -6377,6 +6377,468 @@ fn check_keeps_a_projects_own_include_when_adding_declarations() {
     );
 }
 
+/// Sorted entry names of `dir`; empty when it does not exist.
+fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Issue #130: TypeScript resolves a `types` entry from the ROOT config's
+/// directory, and the root config of a project check is oam's generated
+/// wrapper. Under oam's cache dir the wrapper could not find the project's
+/// `@types/node` (TS2688), the span-less error surfaced as an internal
+/// OAM-TS0004, and the clean retry against the user's own tsconfig was
+/// thrown away. The wrapper now lives under the project's
+/// `node_modules/.oam/ts-decls/`, from which a bare `@types` name, a
+/// self-typed package and a relative path all resolve -- one-shot and
+/// through the daemon, whose fingerprint then covers the `@types` files the
+/// check read.
+#[test]
+fn check_resolves_types_entries_from_the_projects_node_modules() {
+    let cache = write_temp("types-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "typesproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true, \
+         \"types\": [\"node\", \"selftyped\", \"./typings/local\"]}, \"include\": [\"src\"]}",
+    );
+    // A stub of @types/node: what `types: ["node"]` has to find.
+    write_temp(
+        "typesproj/node_modules/@types/node/package.json",
+        "{\"name\": \"@types/node\", \"types\": \"index.d.ts\"}",
+    );
+    let stub = write_temp(
+        "typesproj/node_modules/@types/node/index.d.ts",
+        "declare module \"node:fs\" { export function readFileSync(path: string, encoding: string): string; }\n",
+    );
+    // A package that ships its own types (the shape of vitest/globals or
+    // bun-types): found through the node_modules fallback, which an explicit
+    // `typeRoots` would switch off.
+    write_temp(
+        "typesproj/node_modules/selftyped/package.json",
+        "{\"name\": \"selftyped\", \"types\": \"index.d.ts\"}",
+    );
+    write_temp(
+        "typesproj/node_modules/selftyped/index.d.ts",
+        "declare const SELF_TYPED_GLOBAL: number;\n",
+    );
+    // A relative entry: resolved against the root config, so the wrapper has
+    // to restate it absolute.
+    write_temp(
+        "typesproj/typings/local/index.d.ts",
+        "declare const LOCAL_TYPING_GLOBAL: string;\n",
+    );
+    // The `oam:` import is what makes the assertion below load-bearing: a
+    // wrapper that still failed and a clean retry against the bare tsconfig
+    // would also exit 0 -- but without oam's declarations, so this import
+    // would report TS2307.
+    let proj = write_temp(
+        "typesproj/src/index.ts",
+        "import { readFileSync } from \"node:fs\";\n\
+         import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const size: number = readFileSync(\"tsconfig.json\", \"utf8\").length;\n\
+         export const g: number = SELF_TYPED_GLOBAL;\n\
+         export const l: string = LOCAL_TYPING_GLOBAL;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let run = |args: &[&str]| -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .output()
+            .expect("oam runs")
+    };
+
+    let root_before = dir_entries(&proj);
+    let one_shot = run(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&one_shot) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&one_shot.stderr);
+    assert!(
+        one_shot.status.success(),
+        "every types entry must resolve through the wrapper: {stderr}"
+    );
+    assert!(
+        !stderr.contains("OAM-TS"),
+        "clean means no diagnostic: {stderr}"
+    );
+
+    // The wrapper landed under node_modules/.oam/ts-decls -- nowhere else in
+    // the tree, gitignored there, and not under oam's cache.
+    assert_eq!(
+        dir_entries(&proj),
+        root_before,
+        "nothing new at the project root"
+    );
+    let oam_dir = proj.join("node_modules").join(".oam");
+    let wrappers = dir_entries(&oam_dir.join("ts-decls"));
+    assert!(
+        wrappers
+            .iter()
+            .any(|name| name.starts_with("project-") && name.ends_with(".json")),
+        "wrapper expected under node_modules/.oam/ts-decls, found {wrappers:?}"
+    );
+    assert!(
+        oam_dir.join(".gitignore").is_file(),
+        "node_modules/.oam is gitignored"
+    );
+    assert!(
+        dir_entries(&cache.join("ts-decls").join("projects")).is_empty(),
+        "no fallback wrapper under oam's cache"
+    );
+
+    // Daemon path: the same answer, and a cache that an edit to the @types
+    // package invalidates.
+    let via_daemon = run(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        via_daemon.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&via_daemon.stderr)
+    );
+    // As in check_daemon_lifecycle_and_cache: the first check may lose the
+    // spawn race and run one-shot, so let the daemon serve one before the
+    // edit -- the invalidation below has to be the daemon's to get right.
+    let status = || -> serde_json::Value {
+        serde_json::from_str(
+            String::from_utf8_lossy(&run(&["daemon", "status", proj.to_str().unwrap()]).stdout)
+                .trim(),
+        )
+        .unwrap()
+    };
+    if status()["checks_served"].as_u64().unwrap_or(0) == 0 {
+        assert!(
+            run(&["check", proj.to_str().unwrap(), "--json"])
+                .status
+                .success()
+        );
+    }
+    assert!(
+        status()["checks_served"].as_u64().unwrap_or(0) >= 1,
+        "the daemon served no check across two attempts: {}",
+        status()
+    );
+    // A CACHED verdict is what the edit below has to invalidate: an
+    // unchanged re-check must be a hit first, or a daemon that never caches
+    // this shape (a fill whose listing failed) would pass the edit
+    // assertion trivially.
+    assert!(
+        run(&["check", proj.to_str().unwrap(), "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        status()["cache_hits"].as_u64().unwrap_or(0) >= 1,
+        "the unchanged re-check must be served from the cache: {}",
+        status()
+    );
+    std::fs::write(
+        &stub,
+        "declare module \"node:fs\" { export function readFileSync(path: string, encoding: string): number; }\n",
+    )
+    .unwrap();
+    let after_edit = run(&["check", proj.to_str().unwrap(), "--json"]);
+    let stderr = String::from_utf8_lossy(&after_edit.stderr);
+    assert!(
+        !after_edit.status.success(),
+        "an edit under @types must not be served a stale clean: {stderr}"
+    );
+    // `.length` on a number now.
+    assert!(stderr.contains("OAM-TS2339"), "stderr: {stderr}");
+    let _ = run(&["daemon", "stop", proj.to_str().unwrap()]);
+}
+
+fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// A JS string literal for `path` (JSON escaping is a subset of JS's).
+fn js_string(path: &std::path::Path) -> String {
+    serde_json::to_string(path.to_str().unwrap()).unwrap()
+}
+
+/// Issue #130's second defect, pinned with a scripted tsgo because a real
+/// one no longer fails through the wrapper: when the wrapper run reports
+/// only a config-level problem and the retry against the user's own
+/// tsconfig is CLEAN, clean is the answer (it used to be discarded for being
+/// empty, and OAM-TS0004 came back). And the daemon fingerprints what the
+/// bare program read, not only what the wrapper's could, so an edit to a
+/// file only the bare program saw still invalidates its cache.
+#[test]
+fn check_takes_a_clean_retry_and_the_daemon_fingerprints_what_it_read() {
+    if !node_available() {
+        eprintln!("skipping: node not installed (the scripted tsgo needs it)");
+        return;
+    }
+    let cache = write_temp("retry-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "retryproj/tsconfig.json",
+        "{\"compilerOptions\": {\"types\": [\"node\"]}}",
+    );
+    let stub = write_temp("retryproj/node_modules/@types/node/index.d.ts", "// fine\n");
+    let src = write_temp("retryproj/src/index.ts", "export const n = 1;\n");
+    let proj = src.parent().unwrap().parent().unwrap().to_path_buf();
+    let log = write_temp("retry-tsgo-log/calls.txt", "");
+    // A tsgo that resolves `types` through the user's own tsconfig and
+    // through nothing else -- the pre-fix wrapper's failure, made permanent.
+    // Listing through the wrapper prints a partial list and exits 1, the way
+    // a real tsgo does on a config error; checking through it fails the same
+    // way; the bare config is clean until the stub says BROKEN.
+    write_temp(
+        "fake-retry-tsgo/fake-tsgo.js",
+        &format!(
+            r#"const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync({log}, args.join(" ") + "\n");
+if (args[0] === "--version") {{ console.log("Version 7.0.0-fake"); process.exit(0); }}
+const config = args[args.indexOf("-p") + 1] || "";
+const wrapper = !/tsconfig\.json$/.test(config);
+const cannotResolve = "error TS2688: Cannot find type definition file for 'node'.\n  The file is in the program because:\n    Entry point of type library 'node' specified in compilerOptions";
+if (args.includes("--listFilesOnly")) {{
+  console.log({src});
+  if (wrapper) {{ console.log(cannotResolve); process.exit(1); }}
+  console.log({stub});
+  process.exit(0);
+}}
+if (wrapper) {{ console.log(cannotResolve); process.exit(1); }}
+if (fs.readFileSync({stub}, "utf8").includes("BROKEN")) {{
+  console.log("src/index.ts(1,1): error TS2322: the stub says BROKEN.");
+  process.exit(1);
+}}
+process.exit(0);
+"#,
+            log = js_string(&log),
+            src = js_string(&src),
+            stub = js_string(&stub),
+        ),
+    );
+    let fake = write_fake_tsgo(
+        "fake-retry-tsgo",
+        "@echo off\r\nnode \"%~dp0fake-tsgo.js\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+        "#!/bin/sh\nexec node \"$(dirname \"$0\")/fake-tsgo.js\" \"$@\"\n",
+    );
+    let run = |args: &[&str]| -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .env("OAM_TSGO", &fake)
+            .output()
+            .expect("oam runs")
+    };
+
+    // One-shot: the wrapper run fails on a config-level problem, the bare
+    // retry is clean, and clean is what comes back.
+    let one_shot = run(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    let stderr = String::from_utf8_lossy(&one_shot.stderr);
+    assert!(
+        one_shot.status.success(),
+        "a clean retry is the answer, not OAM-TS0004: {stderr}"
+    );
+    assert!(!stderr.contains("OAM-TS"), "stderr: {stderr}");
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let checks: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.contains("-p ") && !line.contains("--listFilesOnly"))
+        .collect();
+    assert_eq!(checks.len(), 2, "wrapper run, then the bare retry: {calls}");
+    assert!(
+        checks[0].contains("project-") && checks[1].ends_with("tsconfig.json"),
+        "{calls}"
+    );
+
+    // Daemon: its fill lists through the wrapper (partial, exit 1), so it
+    // must also list through the bare config, or the stub is missing from
+    // the fingerprint and an edit to it is served the stale clean.
+    let via_daemon = run(&["check", proj.to_str().unwrap(), "--json"]);
+    assert!(
+        via_daemon.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&via_daemon.stderr)
+    );
+    let status = || -> serde_json::Value {
+        serde_json::from_str(
+            String::from_utf8_lossy(&run(&["daemon", "status", proj.to_str().unwrap()]).stdout)
+                .trim(),
+        )
+        .unwrap()
+    };
+    if status()["checks_served"].as_u64().unwrap_or(0) == 0 {
+        assert!(
+            run(&["check", proj.to_str().unwrap(), "--json"])
+                .status
+                .success()
+        );
+    }
+    assert!(
+        status()["checks_served"].as_u64().unwrap_or(0) >= 1,
+        "the daemon served no check across two attempts: {}",
+        status()
+    );
+    // The union has to produce a fingerprint the daemon CACHES against --
+    // a fill whose listing errs caches nothing and would pass the edit
+    // assertion below by re-running tsgo every time.
+    assert!(
+        run(&["check", proj.to_str().unwrap(), "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        status()["cache_hits"].as_u64().unwrap_or(0) >= 1,
+        "the unchanged re-check must be served from the cache: {}",
+        status()
+    );
+    std::fs::write(&stub, "// BROKEN\n").unwrap();
+    let after_edit = run(&["check", proj.to_str().unwrap(), "--json"]);
+    let stderr = String::from_utf8_lossy(&after_edit.stderr);
+    assert!(
+        !after_edit.status.success() && stderr.contains("OAM-TS2322"),
+        "the edit to a file only the bare program read must miss the cache: {stderr}"
+    );
+    let _ = run(&["daemon", "stop", proj.to_str().unwrap()]);
+}
+
+/// The shape issue #130 reported, verbatim: `"types": ["node"]` and nothing
+/// the wrapper has to restate. It resolves through inheritance alone from
+/// where the wrapper now sits -- the wrapper carries no `compilerOptions` --
+/// and oam's declarations come along.
+#[test]
+fn check_inherits_a_list_of_type_packages_untouched() {
+    write_temp(
+        "baretypes/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"types\": [\"node\"]}, \"include\": [\"src\"]}",
+    );
+    write_temp(
+        "baretypes/node_modules/@types/node/package.json",
+        "{\"name\": \"@types/node\", \"types\": \"index.d.ts\"}",
+    );
+    write_temp(
+        "baretypes/node_modules/@types/node/index.d.ts",
+        "declare module \"node:fs\" { export function readFileSync(path: string, encoding: string): string; }\n",
+    );
+    let proj = write_temp(
+        "baretypes/src/index.ts",
+        "import { readFileSync } from \"node:fs\";\n\
+         import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const size: number = readFileSync(\"tsconfig.json\", \"utf8\").length;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("OAM-TS"), "stderr: {stderr}");
+    let dir = proj.join("node_modules").join(".oam").join("ts-decls");
+    let wrapper = dir_entries(&dir)
+        .into_iter()
+        .find(|name| name.starts_with("project-") && name.ends_with(".json"))
+        .expect("wrapper written in-tree");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(wrapper)).unwrap()).unwrap();
+    assert!(
+        json.get("compilerOptions").is_none(),
+        "nothing restated for a list of package names: {json}"
+    );
+}
+
+/// `composite` defaults `rootDir` to the ROOT config's directory -- the
+/// wrapper's -- so every source was "not under rootDir" (TS6059), the retry
+/// ran without oam's declarations, and an `oam:` import reported TS2307.
+/// The wrapper restates TypeScript's own default for the user's config.
+#[test]
+fn check_keeps_a_composite_projects_root_dir_through_the_wrapper() {
+    write_temp(
+        "compositeproj/tsconfig.json",
+        "{\"compilerOptions\": {\"composite\": true, \"outDir\": \"dist\", \"strict\": true}, \"include\": [\"src\"]}",
+    );
+    let proj = write_temp(
+        "compositeproj/src/index.ts",
+        "import { McpServer } from \"oam:mcp\";\nexport const server = new McpServer({ name: \"demo\" });\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stderr.contains("OAM-TS"),
+        "a composite project must keep oam's declarations: {stderr}"
+    );
+}
+
+/// `references` is the one top-level key `extends` never carries, so the
+/// wrapper's program had none, and an import into an unbuilt referenced
+/// project checked its SOURCES -- clean, where `tsc -p` reports TS6305. The
+/// wrapper restates the user's own list.
+#[test]
+fn check_honours_project_references_like_tsc() {
+    write_temp(
+        "refsproj/lib/tsconfig.json",
+        "{\"compilerOptions\": {\"composite\": true, \"outDir\": \"dist\", \"strict\": true}, \"include\": [\"src\"]}",
+    );
+    write_temp("refsproj/lib/src/x.ts", "export const x: number = 1;\n");
+    write_temp(
+        "refsproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true}, \"include\": [\"src\"], \"references\": [{\"path\": \"./lib\"}]}",
+    );
+    let proj = write_temp(
+        "refsproj/src/index.ts",
+        "import { x } from \"../lib/src/x\";\nexport const y: number = x;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("OAM-TS6305"),
+        "an unbuilt reference is TS6305 under `tsc -p`, and must be here too: {stderr}"
+    );
+}
+
 #[test]
 fn mcp_serves_the_agent_loop_over_stdio() {
     use std::io::{BufRead, BufReader, Write};
