@@ -18,6 +18,25 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`oam check` lost oam's declarations on any tsconfig chain that uses
+  `${configDir}`**, and on any project with an `outDir` but no `rootDir`. The
+  template names the root config's directory, and through the generated
+  wrapper the root was the wrapper, so #135 fell back to a bare check
+  (TS2307 on `oam:` imports) whenever the template appeared. The wrapper now
+  restates every key whose effective value names the template (`files`,
+  `include`, `exclude`, `outDir`, `declarationDir`, `rootDir`, `rootDirs`,
+  `outFile`, `tsBuildInfoFile`, `baseUrl`, `generateTrace`, `typeRoots` and
+  `paths` values) with the project's directory substituted, exactly as
+  `tsgo -p tsconfig.json` resolves them, measured against tsgo including its
+  start-of-value and case quirks; `types`, `references` and the source-map
+  roots are not substituted by tsgo and stay inherited. Separately,
+  TypeScript 7 defaults `rootDir` to the config directory and checks it
+  eagerly whenever `outDir`, `declarationDir`, `sourceRoot` or `mapRoot` is
+  set, so such a project without an explicit `rootDir` failed the wrapper
+  run with TS6059 and was silently checked without oam's declarations; the
+  wrapper now restates that default too. `OAM_DEBUG=1` names the keys
+  restated.
+
 - **A refused TCP connect took about 2 s to fail on Windows** (#137). The
   stack retransmits the SYN of a connect to a closed loopback port before it
   reports `ECONNREFUSED`; libuv tells it not to (`SIO_TCP_INITIAL_RTO`, for

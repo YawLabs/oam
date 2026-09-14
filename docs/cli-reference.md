@@ -40,8 +40,11 @@ your own `@types` are. It goes under oam's own cache dir only when there
 is no `node_modules` at or above the project, or that directory cannot be
 written; a project that names a package in `types` is then checked against
 its own tsconfig alone, with TS2307 on `oam:` imports, and `OAM_DEBUG=1`
-says so. A tsconfig chain that uses `${configDir}` is checked that way
-too. Node's own globals are a separate question -- `process`, `Buffer` and
+says so. `${configDir}` in any config of the `extends` chain is honoured:
+the generated config restates each key it affects with your project's own
+directory substituted, so the program checked is the one
+`tsgo -p tsconfig.json` builds; `OAM_DEBUG=1` lists the keys restated.
+Node's own globals are a separate question -- `process`, `Buffer` and
 friends still want `@types/node` in the project, because those are Node's
 types to publish, not oam's. A project that carries its own ambient
 `declare const oam` (hand-written, or copied from oam's demo before 0.14)
