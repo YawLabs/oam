@@ -409,7 +409,10 @@ pub async fn tcp_listen(
 
 /// Accept one connection from a TCP listener. Remove-await-reinsert on the
 /// LISTENER. Splits and stores the accepted stream's read/write halves.
-/// Returns Json {handle, remoteAddr} or Done if listener was closed.
+/// Returns Json {handle, remoteAddr, localAddr?} or Done if listener was
+/// closed -- the accepted socket's own address too, so `socket.address()`,
+/// `localAddress` and `localPort` on a server-side net.Socket answer as
+/// node's do.
 pub async fn tcp_accept(
     registry: TcpRegistry,
     server_id: u64,
@@ -417,16 +420,19 @@ pub async fn tcp_accept(
 ) -> OpOutcome {
     let (listener, notify) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        let listener = guard.listeners.remove(&server_id);
+        // Closed, or another accept already holds the listener. Checked
+        // BEFORE the cancel Notify is created: an accept that lands after
+        // `tcp_server_close` removed the server's Notify would otherwise
+        // insert a fresh one that nothing ever removes (#139).
+        let Some(listener) = guard.listeners.remove(&server_id) else {
+            return OpOutcome::Done;
+        };
         let notify = guard
             .cancel
             .entry(server_id)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
             .clone();
         (listener, notify)
-    };
-    let Some(listener) = listener else {
-        return OpOutcome::Done;
     };
 
     tokio::select! {
@@ -435,6 +441,7 @@ pub async fn tcp_accept(
                 Ok((stream, peer_addr)) => {
                     reinsert_listener(&registry, server_id, listener);
 
+                    let local_addr = stream.local_addr().ok();
                     let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
                     let (reader, writer) = stream.into_split();
                     {
@@ -443,13 +450,14 @@ pub async fn tcp_accept(
                         guard.writers.insert(handle, writer);
                     }
 
-                    OpOutcome::Json(
-                        serde_json::json!({
-                            "handle": handle,
-                            "remoteAddr": addr_to_json(peer_addr),
-                        })
-                        .to_string(),
-                    )
+                    let mut payload = serde_json::json!({
+                        "handle": handle,
+                        "remoteAddr": addr_to_json(peer_addr),
+                    });
+                    if let Some(la) = local_addr {
+                        payload["localAddr"] = addr_to_json(la);
+                    }
+                    OpOutcome::Json(payload.to_string())
                 }
                 Err(e) => {
                     reinsert_listener(&registry, server_id, listener);
@@ -458,19 +466,35 @@ pub async fn tcp_accept(
             }
         }
         _ = notify.notified() => {
+            // The close that woke this accept set the marker for the two
+            // accept-completed branches, which reinsert the listener; this
+            // one drops it itself, so the marker has nothing left to guard.
             drop(listener);
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closed
+                .remove(&server_id);
             OpOutcome::Done
         }
     }
 }
 
-/// Close a TCP server. Remove the listener AND add to closed set so any
-/// in-flight accept does not resurrect it. Notifies any blocked accept.
+/// Close a TCP server. Remove the listener; if an accept is parked on it, mark
+/// it closed so the accept does not resurrect it, and wake the accept. The
+/// marker lives only while an accept is in flight: `reinsert_listener`
+/// removes it when that accept observes it, and a server closed with no
+/// accept parked leaves nothing behind (#139).
 pub fn tcp_server_close(registry: &TcpRegistry, server_id: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-    guard.listeners.remove(&server_id);
-    guard.closed.insert(server_id);
+    let had_listener = guard.listeners.remove(&server_id).is_some();
     if let Some(notify) = guard.cancel.remove(&server_id) {
+        // An accept holds the listener while it is parked, so "no listener
+        // in the map but a cancel Notify registered" is exactly "an accept is
+        // in flight": the marker is what stops it re-inserting the listener.
+        if !had_listener {
+            guard.closed.insert(server_id);
+        }
         notify.notify_one();
     }
 }
@@ -556,6 +580,75 @@ mod tests {
                     ));
                 }
             }
+        }
+
+        let bookkeeping = registry.lock().unwrap().bookkeeping();
+        assert_eq!(
+            bookkeeping,
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// The server-side twin of the test above (#139): a listener closed with
+    /// no accept parked, closed while one is parked, or closed after accepts
+    /// completed leaves nothing behind, and an accept issued after the close
+    /// creates no cancel Notify. Also pins the accepted socket's own address
+    /// in the accept payload.
+    #[tokio::test]
+    async fn closed_servers_leave_no_bookkeeping_behind() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+
+        for shape in 0..3 {
+            let OpOutcome::Json(payload) =
+                tcp_listen(registry.clone(), ids.clone(), "127.0.0.1".into(), 0).await
+            else {
+                panic!("listen failed");
+            };
+            let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            let server_id = info["serverId"].as_u64().unwrap();
+            let port = u16::try_from(info["port"].as_u64().unwrap()).unwrap();
+            match shape {
+                0 => {
+                    // Closed with nothing parked: no marker may be left.
+                    tcp_server_close(&registry, server_id);
+                }
+                1 => {
+                    // Closed while an accept is parked: the marker's one use.
+                    let parked = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tcp_server_close(&registry, server_id);
+                    assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+                }
+                _ => {
+                    // An accept completes (its Notify stays registered), the
+                    // stream is closed, then the server.
+                    let client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                        .await
+                        .unwrap();
+                    let OpOutcome::Json(accepted) =
+                        tcp_accept(registry.clone(), server_id, ids.clone()).await
+                    else {
+                        panic!("accept failed");
+                    };
+                    let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+                    assert_eq!(
+                        accepted["localAddr"]["port"].as_u64(),
+                        Some(u64::from(port)),
+                        "the accept payload carries the accepted socket's own address"
+                    );
+                    tcp_close(&registry, accepted["handle"].as_u64().unwrap());
+                    drop(client);
+                    tcp_server_close(&registry, server_id);
+                }
+            }
+            // An accept after the close must neither resurrect the server
+            // nor register a cancel Notify for it.
+            assert!(matches!(
+                tcp_accept(registry.clone(), server_id, ids.clone()).await,
+                OpOutcome::Done
+            ));
         }
 
         let bookkeeping = registry.lock().unwrap().bookkeeping();

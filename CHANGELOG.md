@@ -38,7 +38,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   object); `socket.pending` is `!handle || connecting`, true on a fresh socket
   (it read `connecting` alone); and `net.connect(options)` honours
   `allowHalfOpen` and `timeout`, so a half-open client ended by its peer reads
-  `writeOnly`, not `closed`. Every value measured on Node.
+  `writeOnly`, not `closed`. A server-side (accepted) socket also reports its
+  own local address, so `socket.address()`, `localAddress`, `localPort` and
+  `localFamily` are populated on a `'connection'` socket where they were `{}`
+  and `undefined`. Every value measured on Node.
 
 - **`getProtocol()`, `getCipher()` and `getPeerCertificate()` on a TLS socket
   were rustls's Debug names and `{}`** (#138). `getProtocol()` returned

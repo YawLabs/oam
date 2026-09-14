@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "43bf4ff",
+  "commit": "d0b22b4+wip",
   "oamVersion": "oam 0.15.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 104,
-      "total": 104,
+      "pass": 110,
+      "total": 110,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -72,6 +72,30 @@
         },
         {
           "case": "102-fetch-http-refused-error-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "103-tls-cipher-and-peer-cert.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "104-net-socket-unref-releases-loop.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "105-tls-socket-unref-releases-loop.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "106-net-socket-unref-then-ref.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "107-tls-certificate-verdicts.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "108-accepted-socket-local-address.mjs",
           "status": "pass"
         },
         {

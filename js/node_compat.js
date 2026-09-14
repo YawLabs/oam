@@ -18589,6 +18589,11 @@
             this.remotePort = options._remoteAddr.port;
             this.remoteFamily = options._remoteAddr.family;
           }
+          if (options._localAddr) {
+            this.localAddress = options._localAddr.address;
+            this.localPort = options._localAddr.port;
+            this.localFamily = options._localAddr.family;
+          }
         }
       }
 
@@ -19051,6 +19056,7 @@
           const socket = new Socket({
             _handle: accepted.handle,
             _remoteAddr: accepted.remoteAddr,
+            _localAddr: accepted.localAddr,
           });
           socket._readLoop();
           this.emit("connection", socket);
