@@ -15750,6 +15750,383 @@ server.close();
     assert!(stdout.contains("closed=true"), "{stdout}");
 }
 
+// ─── net / tls: ref() / unref() and loop-liveness (#140) ─────────────
+
+/// Run oam with a wall-clock bound. A `None` status means the child was
+/// still running at the deadline and has been killed: the failure mode of
+/// a liveness test is a hang, and a hang must fail one named test in
+/// seconds rather than wedge the suite.
+fn oam_bounded(
+    args: &[&str],
+    deadline: std::time::Duration,
+) -> (Option<std::process::ExitStatus>, String, String) {
+    use std::io::Read;
+    use std::process::Stdio;
+    let cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(args)
+        .env("OAM_ENABLE_NATIVE_ADDONS", "1")
+        .env("OAM_CACHE_DIR", cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .env("OAM_CHECK_WAIT_MS", "60000")
+        .env_remove("FORCE_COLOR")
+        .env_remove("NO_COLOR")
+        .env_remove("NODE_DISABLE_COLORS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oam binary runs");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let end = std::time::Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= end => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    (status, out.join().unwrap(), err.join().unwrap())
+}
+
+/// The `exit=0 after=<ms>` line a liveness script prints from 'exit': how
+/// long the process lived past the moment it unref'd its handles. Measured
+/// by the script itself so a loaded box's slow startup cannot fake a hold.
+fn exit_after_ms(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("exit=0 after="))
+        .unwrap_or_else(|| panic!("no `exit=0 after=` line in: {stdout}"))
+        .trim()
+        .parse()
+        .expect("elapsed ms")
+}
+
+// #140: a connected, reading, unref'd socket let node exit at once while
+// oam stayed alive -- the parked read counted toward loop-liveness whatever
+// the JS flag said. Every handle is unref'd here, the accepted server-side
+// socket included: node keeps that one ref'd until told otherwise, and it
+// alone holds the process (probed on v22.22.2).
+#[test]
+fn net_socket_unref_releases_the_event_loop() {
+    let file = write_temp(
+        "net_unref_releases.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', (d) => {
+    console.log('data=' + d);
+    client.unref();
+    server.unref();
+    t0 = Date.now();
+    console.log('active=' + JSON.stringify(process.getActiveResourcesInfo()));
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd socket held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("data=hello"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("active=[]"),
+        "unref'd handles leave the view: {stdout}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    // The runtime drops with three reads and an accept still parked: no
+    // panic, no complaint on the way out.
+    assert!(
+        stderr.trim().is_empty(),
+        "shutdown with reads parked must be silent: {stderr}"
+    );
+}
+
+// The inverse: with nothing unref'd the same program is still running at
+// 1.5s, and it is the test that kills it.
+#[test]
+fn net_socket_left_referenced_keeps_the_event_loop() {
+    let file = write_temp(
+        "net_ref_keeps.mjs",
+        r#"
+import net from 'node:net';
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hello'); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', () => {});
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_millis(1500),
+    );
+    assert!(
+        status.is_none(),
+        "exited {status:?} with every socket still referenced\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+// ref() after unref() pins the loop again. An UNREF'D timer fires only
+// while something else keeps the process alive -- here the re-ref'd client
+// -- so 'alive-at-1500' is printed only if ref() took. Had it been a no-op
+// on the loop, the process would have exited straight after the data line.
+#[test]
+fn net_socket_ref_after_unref_keeps_the_event_loop() {
+    let file = write_temp(
+        "net_ref_after_unref.mjs",
+        r#"
+import net from 'node:net';
+process.on('exit', (code) => console.log('exit=' + code));
+let accepted;
+const server = net.createServer((conn) => { accepted = conn; conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', () => {
+    client.unref();
+    server.unref();
+    console.log('chained=' + (client.ref() === client));
+    setTimeout(() => {
+      console.log('alive-at-1500');
+      client.destroy();
+      accepted.destroy();
+      server.close();
+    }, 1500).unref();
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status =
+        status.unwrap_or_else(|| panic!("still alive at 20s\nstdout: {stdout}\nstderr: {stderr}"));
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in ["chained=true", "alive-at-1500", "exit=0"] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+// server.unref() lets the process exit with the server still listening
+// (node), whether called before listen() -- remembered and applied once
+// bound -- or after.
+#[test]
+fn net_server_unref_releases_the_event_loop() {
+    let file = write_temp(
+        "net_server_unref.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const early = net.createServer(() => {});
+early.unref();
+early.listen(0, '127.0.0.1', () => {
+  const late = net.createServer(() => {});
+  late.listen(0, '127.0.0.1', () => {
+    t0 = Date.now();
+    console.log('chained=' + (late.unref() === late) + ' listening=' + (early.listening && late.listening));
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd listener held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("chained=true listening=true"),
+        "stdout: {stdout}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    assert!(stderr.trim().is_empty(), "stderr: {stderr}");
+}
+
+// The tls shape of #140: a TLSSocket unref'd BEFORE it connected (node
+// defers that to 'connect'), a tls.Server unref'd once listening, the
+// accepted TLSSocket unref'd on 'secureConnection'.
+#[test]
+fn tls_socket_unref_releases_the_event_loop() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = tls.createServer({ cert, key }, (conn) => { conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = tls.connect({ host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false });
+  console.log('chained=' + (client.unref() === client));
+  client.on('data', (d) => {
+    console.log('data=' + d);
+    server.unref();
+    t0 = Date.now();
+    console.log('active=' + JSON.stringify(process.getActiveResourcesInfo()));
+  });
+});
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let file = write_temp("tls_unref_releases.mjs", &src);
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd TLS socket held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in ["chained=true", "data=hello", "active=[]"] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "shutdown with TLS reads parked must be silent: {stderr}"
+    );
+}
+
+// net.Socket state follows the handle, as node's does (every line below
+// is node v22.22.2's output for the same script): address() is `{}` before
+// connect and again after close, `pending` is `!handle || connecting` --
+// true on a FRESH socket, not only while connecting -- readyState walks
+// open (fresh) -> opening -> open -> readOnly -> closed, writeOnly once the
+// peer ended a half-open socket, and 'close' carries hadError.
+#[test]
+fn net_socket_address_pending_and_ready_state_follow_the_handle() {
+    let file = write_temp(
+        "net_socket_state.mjs",
+        r#"
+import net from 'node:net';
+const j = JSON.stringify;
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+
+const fresh = new net.Socket();
+console.log('fresh=' + j({ address: fresh.address(), pending: fresh.pending, readyState: fresh.readyState }));
+const server = net.createServer({ allowHalfOpen: true }, (s) => { s.on('data', () => {}); s.on('end', () => s.end()); });
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  const c = net.connect(port, '127.0.0.1');
+  console.log('connecting=' + j({ address: c.address(), pending: c.pending, readyState: c.readyState }));
+  await once(c, 'connect');
+  const a = c.address();
+  console.log('connected=' + j({ keys: Object.keys(a), address: a.address, family: a.family, portOk: typeof a.port === 'number' && a.port !== port, pending: c.pending, readyState: c.readyState }));
+  c.on('data', () => {});
+  c.end();
+  console.log('ended=' + j({ pending: c.pending, readyState: c.readyState, keys: Object.keys(c.address()) }));
+  const hadError = await once(c, 'close');
+  console.log('closed=' + j({ address: c.address(), pending: c.pending, readyState: c.readyState, hadError }));
+  // destroy(err): 'close' carries hadError=true, and the handle is gone.
+  const d = net.connect(port, '127.0.0.1');
+  await once(d, 'connect');
+  d.on('error', () => {});
+  const dClose = once(d, 'close');
+  d.destroy(new Error('boom'));
+  console.log('destroyErr=' + j({ hadError: await dClose, address: d.address(), pending: d.pending }));
+  // The peer ends first on a half-open socket: writeOnly, not pending.
+  const half = net.createServer({ allowHalfOpen: true }, (s) => s.end('bye'));
+  await new Promise((r) => half.listen(0, '127.0.0.1', r));
+  const w = net.connect({ port: half.address().port, host: '127.0.0.1', allowHalfOpen: true });
+  w.on('data', () => {});
+  await once(w, 'end');
+  console.log('peerEnded=' + j({ readyState: w.readyState, pending: w.pending }));
+  w.end();
+  await once(w, 'close');
+  half.close();
+  server.close();
+});
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"fresh={"address":{},"pending":true,"readyState":"open"}"#,
+        r#"connecting={"address":{},"pending":true,"readyState":"opening"}"#,
+        r#"connected={"keys":["address","family","port"],"address":"127.0.0.1","family":"IPv4","portOk":true,"pending":false,"readyState":"open"}"#,
+        r#"ended={"pending":false,"readyState":"readOnly","keys":["address","family","port"]}"#,
+        r#"closed={"address":{},"pending":true,"readyState":"closed","hadError":false}"#,
+        r#"destroyErr={"hadError":true,"address":{},"pending":true}"#,
+        r#"peerEnded={"readyState":"writeOnly","pending":false}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
 // ======================================= dns.resolve + dns.reverse
 
 #[test]
