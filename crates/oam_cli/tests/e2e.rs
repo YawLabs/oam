@@ -14001,6 +14001,134 @@ C7rRXUYQtUTmtwTetACx3EEz7k2ixAxxdDCUPJIxGcVIPVKt6sTovr3yGLMuc4f7\n\
 I5PYIZ3kyY8EsQqX4JpTtbY=\n\
 -----END PRIVATE KEY-----";
 
+/// A throwaway private CA (CA:TRUE, valid to 2126) and the localhost leaf it
+/// signed (SAN DNS:localhost, IP:127.0.0.1), for the trust-store tests: the
+/// server presents the leaf alone, and only a client that trusts the CA --
+/// through `ca` or NODE_EXTRA_CA_CERTS -- connects. Generated once with
+/// openssl and embedded; no test shells out to regenerate them.
+const TLS_TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDHzCCAgegAwIBAgIUX5ir308lg8m4hQdNnUz0UdN33DwwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwIBcNMjYwOTE0MTExMTI0WhgPMjEy\n\
+NjA4MjExMTExMjRaMBYxFDASBgNVBAMMC29hbSB0ZXN0IENBMIIBIjANBgkqhkiG\n\
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5oXf7XNg5MHjC511VA64HF8kdBHebuI207US\n\
+fCQg9EYTe3hzOBACwsn78SNXFfmDw5E7hlF2xTuZmD3OJx9a0Ax54EoF67Z4Bigw\n\
+My6GF1oKNsmeCGn9nv62+7jm9UspForbmWE8/rC3bM37BbvS87FoogEdXQS5uNQz\n\
+4AuGbduhr27IXlScHsub4paSIrW6etllby5Ja+81NpVmwuZ32QNk+s0bwcLq8YIq\n\
+5zpemaKeTGDBbG3mIt3vYsfjg8zUTdCdkjOs8q0+BSB8OkhGpe888d5JyUxd1WiK\n\
+qiTpfG3+2Pbr0eK7pzIzeT+HDfzUInFfr7lu6lBtfjQRWSZWGwIDAQABo2MwYTAd\n\
+BgNVHQ4EFgQUKmakijzWE71HQeyNAwaTnq9/xyMwHwYDVR0jBBgwFoAUKmakijzW\n\
+E71HQeyNAwaTnq9/xyMwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw\n\
+DQYJKoZIhvcNAQELBQADggEBACX/zgcVyya26/+5t6Be9duAAJs1X0VSKSzXP/Au\n\
+A+ngqWqFBPDhIzorx84d+siuRKVLOZUjObba245P4oiaJwNSz3Ihix5V3FHGZTVM\n\
+vHpVP8V7tzKpoEz89vfhueFOB0u2TVJe/099DAHrjaaza0zWa1zfxucrBAFQiQIA\n\
+2GK95UN3sSv9/rl3QlxQx8ld5QlpIjjhQL7N1JWWKcuBqDHgbfN1qwB2CWSB+v3g\n\
+YyTiYg/yyeFi173xPPS3CoiyyVyO+6ySfhwvopDJVkTdZafDpV5/d1o+AssKYX3R\n\
+Jd1U3J1YgXh3HzZEI9Yeo2jZzDogNzNObNoYdXRUoDVPMXo=\n\
+-----END CERTIFICATE-----";
+
+const TLS_TEST_LEAF_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDRzCCAi+gAwIBAgIUXMdiPT0RoKd1ynyNQq5kRcwrF9UwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwIBcNMjYwOTE0MTExMTI1WhgPMjEy\n\
+NjA4MjExMTExMjVaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcN\n\
+AQEBBQADggEPADCCAQoCggEBALtUgW8legRgDaIObCQ75gb63jPvvGLkgrmfvL+z\n\
+zuIpFr6McD3Em6aX0fje4x8SjVF10F1HTa8pLDy4G6T/UiBuATovjMsEIqk1MLW2\n\
+F6/KfQLO35pVC6PeUCYW8UkqymVifxsPQuzdV+Hbp9VDaamHtCFhJN0sl0TAbc37\n\
+xp4WZwI1HTSQ4q+ReLSslNQiK+bwJQeKdiL7u6jzXqkb0uTxOJ2bSS2BhpPbPiNR\n\
+fZObJiFr6wtURUvy0AY9AmbNJwuWkuM0aJlOibaVIPPgVGDtZJCd8gQEdV4pKIMZ\n\
+avTN3AbNeIMmn3nZehk5jvEHxL+tjTXG8no5f5X2KFlMwi0CAwEAAaOBjDCBiTAa\n\
+BgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADALBgNVHQ8EBAMC\n\
+BaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFJpXOwzKMtLLnbaIViTA\n\
+QsTBV5+8MB8GA1UdIwQYMBaAFCpmpIo81hO9R0HsjQMGk56vf8cjMA0GCSqGSIb3\n\
+DQEBCwUAA4IBAQCsP5gsrw1RHvEN9oBR1Pf+CXylfpH7It7ZMWDFW73rdhuC3Zxr\n\
+22zgG04mRt2Gd4Ufq4FCjqELVoecWx5U/hv2v/4KmVqegJkcTnMOmQ3Bs391XXa9\n\
+C+07yxnaDXE19agNm4ZACwmdf30LPaSqeVp3Y3aw8lH+5KeWrrVBpi7m8NMyHThC\n\
+Yn0a/DcxRET01zHZb6AEve5eJT6Lm0YF/DF6r4+YfGehLX892VDoWgrNCz7DpDuC\n\
+1ALfON7I9FSAJGh3iBvTbX9R7xVuKd8Za2f8Xwr/t7jK/zYxLAT9oyTH1FXIFAnP\n\
+H5shelNOFfKjeO2TTJ9u7hMSzF9fWd4EOB7u\n\
+-----END CERTIFICATE-----";
+
+const TLS_TEST_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC7VIFvJXoEYA2i\n\
+DmwkO+YG+t4z77xi5IK5n7y/s87iKRa+jHA9xJuml9H43uMfEo1RddBdR02vKSw8\n\
+uBuk/1IgbgE6L4zLBCKpNTC1thevyn0Czt+aVQuj3lAmFvFJKsplYn8bD0Ls3Vfh\n\
+26fVQ2mph7QhYSTdLJdEwG3N+8aeFmcCNR00kOKvkXi0rJTUIivm8CUHinYi+7uo\n\
+816pG9Lk8Tidm0ktgYaT2z4jUX2TmyYha+sLVEVL8tAGPQJmzScLlpLjNGiZTom2\n\
+lSDz4FRg7WSQnfIEBHVeKSiDGWr0zdwGzXiDJp952XoZOY7xB8S/rY01xvJ6OX+V\n\
+9ihZTMItAgMBAAECggEADSEodpMjMNilRqJ0JJCo1/xlQ9vy/DYVONAKo/UE9Fz6\n\
+Nx4TZSuOgpKe04Prr0CBnx/+xqA6FaNxHPWvxP9le4MPmvW84c3HECJQ6QDQ5YVF\n\
+AG63b/2zSdJJvncFL6JMJTxODvt22VskzwkHg68B4jFHXWo4Rzgvh1C6tsvavoxS\n\
+DA/J/Pl+saC6iccDtLp4lbJaMzCGGRDPjb13hqBcHoPEjF5JtN9I1bCVUZn/QFbY\n\
+7PHRptS2SDuAcoPiC8SlqZff7PSMakZzBT7Ng7kSdW3mFapJkN2NM5IsmIlTyG83\n\
+1GfTXCH1o00HXpoJ8N5YundxoG5FWlCIgcrEO1jNEQKBgQDbCJapOXVz6ULoTevi\n\
+SzdQH38UH1Ckd1rp0QYxm/MWXXyupWnBBt2iBekbFygT2bRwhtIA33CEusYmh4sN\n\
+nal6ERh5wbYYzngPaO0sHX4QVzBYleu344/pkgZxCEpG8G5oxjggj/ds15TsgLVS\n\
+KEsvXnodKmVsvDqfDFWD+ZnEzwKBgQDa8ijtlbO2ro9HgvqAr88kS/8nVlnZdXE5\n\
+9YT/DEYVsLQzduIze9G4uzI/dgSn8UtUatCvgREFB2CkQUvSeUEF4LIH6zhiI2eu\n\
+yJzhAR3tU6hXWsJSLSMildlv6ooWngdNmQg9pXTNbUjJ4dtfn1Rip5A/FKzsLxDG\n\
+/mjx6R3AQwKBgHTfA0zuXM5pY4sCsN+BVNVKyQranrPy/66NGqnz1WRUo8eoeWJG\n\
+oJHoZ3ZOB9N3sYDtXzaaAra/1iUO49JzEtAQOSgWhWx9FrDaQtrsLazYaPKLpEft\n\
+g4eUpB1B2Cg7+B2tzpsJVnNcIJmFH7rjxyJSXgQb8Bxx3zGoaiTOVQ8fAoGAST2G\n\
+iWtxkaO1FEPxTkkBbu/pK5yMM91AghXqZnMRosHYlfqn0ncSAczFE0uEZTWncFbG\n\
+9l6jdd4w6uFY3tBm+vNeOp3p35JeZa6AJBh+jVxVzNr0dA7bWP9tnC2GAejdIo0V\n\
+n6GQgAOVvMrL2qHu1Y2eCCv/aIaaAycprfrAVAcCgYBF6Hs47CZ4RPMzUnlMV8F+\n\
+F7McNeFuVRqpneXVSNB7UDuID2ttb7RTchZaG2hc84LWRV0/yjElLrG6yPxyGFIq\n\
+hnNgLVJt6pGXwWKx6CgqUvijJFPNwDhZRYtLfyCWXHDQ4E9T3C5DO7T+8lafH6NO\n\
+lAvLJ1NDDacIcdciXw6fZg==\n\
+-----END PRIVATE KEY-----";
+
+/// The leaf's key under a certificate the CA signed for 2020-01-01 to
+/// 2021-01-01: expired, and otherwise identical to TLS_TEST_LEAF_CERT.
+const TLS_TEST_EXPIRED_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDRTCCAi2gAwIBAgIUXMdiPT0RoKd1ynyNQq5kRcwrF9YwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwHhcNMjAwMTAxMDAwMDAwWhcNMjEw\n\
+MTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQC7VIFvJXoEYA2iDmwkO+YG+t4z77xi5IK5n7y/s87i\n\
+KRa+jHA9xJuml9H43uMfEo1RddBdR02vKSw8uBuk/1IgbgE6L4zLBCKpNTC1thev\n\
+yn0Czt+aVQuj3lAmFvFJKsplYn8bD0Ls3Vfh26fVQ2mph7QhYSTdLJdEwG3N+8ae\n\
+FmcCNR00kOKvkXi0rJTUIivm8CUHinYi+7uo816pG9Lk8Tidm0ktgYaT2z4jUX2T\n\
+myYha+sLVEVL8tAGPQJmzScLlpLjNGiZTom2lSDz4FRg7WSQnfIEBHVeKSiDGWr0\n\
+zdwGzXiDJp952XoZOY7xB8S/rY01xvJ6OX+V9ihZTMItAgMBAAGjgYwwgYkwGgYD\n\
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWg\n\
+MBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBSaVzsMyjLSy522iFYkwELE\n\
+wVefvDAfBgNVHSMEGDAWgBQqZqSKPNYTvUdB7I0DBpOer3/HIzANBgkqhkiG9w0B\n\
+AQsFAAOCAQEAPWFcRQF+fBqgAxRdsItGEcWK+wuodRNmnZ0qLd1bRTaqUASUW5ek\n\
+lNI65QaHbmCbFNgSqzkHfKT8sGs2NzHy1jvrEb2IcQrrrHzX8e19MrMCx0P0qqpr\n\
+1b19Yz9MMojQqKbIsJkh9aeQeD0ogelP571Bu0FmXHVuPb0RXyXF23z3dpjUtkAQ\n\
+QamNnNaq5R45wdYHJlNQsj9CLn7M7drDQFIsC2iakqMGHwounusQGWtzlgfmd8b+\n\
+gscDe/porMSzoYIdHpwkyK3hxLY96eO63Yhr7TzUWNCmn4P2QTiWl0Sn3OF9yTNA\n\
+z8RNjndsbTHaEcGslUIMehEVlS40ozOotw==\n\
+-----END CERTIFICATE-----";
+
+/// The client half every trust-store e2e shares: connect with `opts` over
+/// the base options and report the verdict -- `secureConnect` with the
+/// socket's `authorized` / `authorizationError`, or the error's code,
+/// message and own keys plus the socket's verdict fields. Every await is
+/// bounded.
+const TLS_VERDICT_HELPER: &str = r#"
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const verdict = (port, opts) => within(8000, 'verdict', new Promise((resolve) => {
+  const s = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', ...opts });
+  s.on('secureConnect', () => {
+    resolve({ ok: true, authorized: s.authorized, authorizationError: s.authorizationError });
+    s.end();
+  });
+  s.on('error', (e) => {
+    const out = { ok: false, code: e.code, message: e.message, keys: Object.keys(e), hasSyscall: 'syscall' in e, hasErrno: 'errno' in e };
+    if ('reason' in e) out.reason = e.reason;
+    if ('host' in e) out.host = e.host;
+    out.authorized = s.authorized;
+    out.authorizationError = s.authorizationError;
+    resolve(out);
+  });
+}));
+"#;
+
 #[test]
 fn https_create_server_serves_tls() {
     let src = format!(
@@ -14339,9 +14467,10 @@ fn tls_connect_server_auth_does_not_require_client_cert() {
     // (Some("undefined") instead of None), so the optional clientCert/clientKey
     // arrived as present-but-bogus and failed with
     // `no private key found in client key PEM` (tls.rs) before any handshake.
-    // Here the self-signed test cert is also passed as `ca`, so validation still
-    // fails (CaUsedAsEndEntity) -- but that proves build_client_config succeeded
-    // with no client auth; the bug error string must be absent.
+    // The self-signed CA:TRUE test cert is passed as `ca`: Node trusts a leaf
+    // that is itself in the store and connects (#136), so the verdict must be
+    // a clean connection -- rustls alone refused it as CaUsedAsEndEntity, and
+    // this test used to settle for "reached validation at all".
     let src = format!(
         r#"
 import tls from 'node:tls';
@@ -14357,7 +14486,7 @@ let outcome;
 try {{
   const sock = tls.connect({{ host: '127.0.0.1', port, ca: cert, servername: 'localhost', rejectUnauthorized: true }});
   await new Promise((res, rej) => {{ sock.on('secureConnect', () => res()); sock.on('error', rej); }});
-  outcome = 'connected';
+  outcome = 'connected authorized=' + sock.authorized + ' authorizationError=' + sock.authorizationError;
   sock.end();
 }} catch (e) {{
   outcome = 'err:' + e.message;
@@ -14380,11 +14509,309 @@ server.close();
         !combined.contains("no private key found in client key PEM"),
         "server-auth tls.connect wrongly entered the client-auth path (arg_string bug regressed): {combined}"
     );
-    // It reached cert validation rather than the config error.
     assert!(
-        combined.contains("outcome="),
-        "probe did not run: {combined}"
+        combined.contains("outcome=connected authorized=true authorizationError=null"),
+        "a self-signed certificate passed as `ca` is the server's own certificate and must connect: {combined}"
     );
+}
+
+/// #136: `NODE_EXTRA_CA_CERTS` adds a private CA to the default trust store,
+/// so a server whose certificate chains to it connects without a `ca`
+/// option. A `ca` option REPLACES the extras (Node reads the variable into
+/// its default store only), yet the chain is still completed through the
+/// extra CA before it is refused -- so the refusal is
+/// SELF_SIGNED_CERT_IN_CHAIN, not UNABLE_TO_VERIFY_LEAF_SIGNATURE (both
+/// probed on v22.22.2).
+#[test]
+fn tls_node_extra_ca_certs_trusts_a_private_ca() {
+    let bundle = write_temp("extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const selfSigned = `{self_signed}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+console.log('env=' + JSON.stringify(await verdict(port, {{}})));
+console.log('ca=' + JSON.stringify(await verdict(port, {{ ca: selfSigned }})));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        self_signed = TLS_TEST_CERT,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_extra_ca.mjs", &src);
+    let output = oam_with_env(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(r#"env={"ok":true,"authorized":true,"authorizationError":null}"#),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            r#"ca={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"SELF_SIGNED_CERT_IN_CHAIN"}"#
+        ),
+        "stdout: {stdout}"
+    );
+    assert!(!stderr.contains("Warning:"), "stderr: {stderr}");
+}
+
+/// #136, the other half: without the variable the same server is refused
+/// with Node's code and message -- `code` alone on the error, no syscall or
+/// errno (it used to be `EIO: invalid peer certificate: UnknownIssuer`) --
+/// and the socket carries the verdict; `ca` trusts it; rejectUnauthorized:
+/// false connects but still reports the verdict (all probed on v22.22.2).
+#[test]
+fn tls_private_ca_is_refused_with_node_s_code_unless_trusted() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const ca = `{ca}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+console.log('none=' + JSON.stringify(await verdict(port, {{}})));
+console.log('ca=' + JSON.stringify(await verdict(port, {{ ca }})));
+console.log('array=' + JSON.stringify(await verdict(port, {{ ca: [cert, ca] }})));
+console.log('advisory=' + JSON.stringify(await verdict(port, {{ rejectUnauthorized: false }})));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_private_ca.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+        r#"ca={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"array={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"advisory={"ok":true,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+/// #136: a bundle that will not load is a warning, never an error. Node
+/// prints it at startup -- a bare `Warning: ...` line on stderr, with no
+/// `(node:PID)` prefix, even for a script that never touches TLS -- and the
+/// process runs on with the default store. A bundle that fails part-way
+/// keeps every certificate before the bad section; one with no certificate
+/// in it is silently empty (all probed on v22.22.2).
+#[test]
+fn tls_node_extra_ca_certs_load_failures_warn_and_still_run() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const v = await verdict(port, {{}});
+console.log('verdict=' + (v.ok ? 'connected' : v.code));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_extra_ca_warn.mjs", &src);
+    let bad_section = "-----BEGIN CERTIFICATE-----\nnot base64 !!!\n-----END CERTIFICATE-----\n";
+    let missing = write_temp("extra-ca/present.pem", "")
+        .parent()
+        .unwrap()
+        .join("does-not-exist.pem");
+    let good_then_bad = write_temp(
+        "extra-ca/good-then-bad.pem",
+        &format!("{TLS_TEST_CA_CERT}\n{bad_section}"),
+    );
+    let bad_then_good = write_temp(
+        "extra-ca/bad-then-good.pem",
+        &format!("{bad_section}{TLS_TEST_CA_CERT}\n"),
+    );
+    let no_certs = write_temp("extra-ca/no-certs.pem", "just some text, no certificates\n");
+
+    let run = |bundle: &std::path::Path, script: &std::path::Path| {
+        let output = oam_with_env(
+            &["run", script.to_str().unwrap(), "--no-check"],
+            &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+        );
+        assert!(
+            output.status.success(),
+            "bundle {}: exit {:?}\nstdout: {}\nstderr: {}",
+            bundle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (stdout, stderr) = run(&missing, &file);
+    let expected = format!(
+        "Warning: Ignoring extra certs from `{}`, load failed: error:80000002:system library::No such file or directory",
+        missing.display()
+    );
+    assert_eq!(
+        stderr.matches("Warning: Ignoring extra certs").count(),
+        1,
+        "exactly one warning, once per process: {stderr}"
+    );
+    assert!(stderr.contains(&expected), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("(node:"),
+        "not a process warning: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "the connection is still attempted against the default store: {stdout}"
+    );
+
+    // Boot-time, not first-TLS-use: a script with no TLS in it warns too.
+    let no_tls = write_temp("tls_extra_ca_no_tls.mjs", "console.log('no tls');\n");
+    let (stdout, stderr) = run(&missing, &no_tls);
+    assert!(stderr.contains(&expected), "stderr: {stderr}");
+    assert!(stdout.contains("no tls"), "stdout: {stdout}");
+
+    let (stdout, stderr) = run(&good_then_bad, &file);
+    assert!(
+        stderr.contains("load failed: error:04800064:PEM routines::bad base64 decode"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=connected"),
+        "the certificate before the bad section is trusted: {stdout}"
+    );
+
+    let (stdout, stderr) = run(&bad_then_good, &file);
+    assert!(stderr.contains("bad base64 decode"), "stderr: {stderr}");
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "nothing after the bad section loads: {stdout}"
+    );
+
+    let (stdout, stderr) = run(&no_certs, &file);
+    assert!(
+        !stderr.contains("Warning:"),
+        "no certificate is not an error: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "stdout: {stdout}"
+    );
+}
+
+/// #136: a refused certificate is reported with the code and message Node
+/// gives it, decided the way OpenSSL decides (self-signed leaf, self-signed
+/// chain top, validity period before everything else, hostname only on a
+/// trusted chain), and ERR_TLS_CERT_ALTNAME_INVALID carries Node's
+/// `reason` / `host` / `cert` in Node's key order. Every value probed on
+/// v22.22.2.
+#[test]
+fn tls_refused_certificates_carry_node_s_codes() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const leaf = `{leaf}`;
+const leafKey = `{key}`;
+const ca = `{ca}`;
+const expired = `{expired}`;
+const selfSigned = `{self_signed}`;
+const selfSignedKey = `{self_signed_key}`;
+{helper}
+const serve = async (opts) => {{
+  const server = tls.createServer(opts, (s) => s.end('hi'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return server;
+}};
+const selfServer = await serve({{ cert: selfSigned, key: selfSignedKey }});
+console.log('selfsigned=' + JSON.stringify(await verdict(selfServer.address().port, {{}})));
+console.log('selfsigned-ip=' + JSON.stringify(await verdict(selfServer.address().port, {{ servername: undefined, ca: selfSigned }})));
+selfServer.close();
+const leafServer = await serve({{ cert: leaf, key: leafKey }});
+console.log('hostname=' + JSON.stringify(await verdict(leafServer.address().port, {{ ca, servername: 'example.com' }})));
+console.log('hostname-advisory=' + JSON.stringify(await verdict(leafServer.address().port, {{ ca, servername: 'example.com', rejectUnauthorized: false }})));
+console.log('untrusted-wrong-host=' + JSON.stringify(await verdict(leafServer.address().port, {{ servername: 'example.com' }})));
+leafServer.close();
+const chainServer = await serve({{ cert: leaf + '\n' + ca, key: leafKey }});
+console.log('chain=' + JSON.stringify(await verdict(chainServer.address().port, {{}})));
+console.log('chain-ca=' + JSON.stringify(await verdict(chainServer.address().port, {{ ca }})));
+chainServer.close();
+const expiredServer = await serve({{ cert: expired, key: leafKey }});
+console.log('expired=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca }})));
+console.log('expired-wrong-host=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca, servername: 'example.com' }})));
+console.log('expired-advisory=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca, rejectUnauthorized: false }})));
+expiredServer.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+        expired = TLS_TEST_EXPIRED_CERT,
+        self_signed = TLS_TEST_CERT,
+        self_signed_key = TLS_TEST_KEY,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_verdicts.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
+        // The e2e cert has no subjectAltName at all (CN=localhost only), so
+        // the IP the host resolved to is checked against an empty list --
+        // Node's exact wording.
+        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        // An untrusted chain is refused before the name is looked at.
+        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,
+        r#"chain={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"]"#,
+        r#"chain-ca={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"expired={"ok":false,"code":"CERT_HAS_EXPIRED","message":"certificate has expired","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
+        // The validity period is checked last by OpenSSL and so wins over
+        // every other failure, the hostname included.
+        r#"expired-wrong-host={"ok":false,"code":"CERT_HAS_EXPIRED""#,
+        r#"expired-advisory={"ok":true,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }
 
 #[test]

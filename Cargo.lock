@@ -1930,6 +1930,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha1 0.10.6",
@@ -1939,6 +1940,7 @@ dependencies = [
  "tokio-uring",
  "webpki-roots 0.26.11",
  "windows-sys 0.61.2",
+ "x509-parser",
 ]
 
 [[package]]
