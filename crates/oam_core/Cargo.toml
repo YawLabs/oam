@@ -34,6 +34,18 @@ base64 = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pemfile = { workspace = true }
+# Node's certificate verdicts (tls.rs): x509-parser reads validity,
+# issuer/subject and subjectAltName off the peer chain to name a refusal the
+# way OpenSSL does and to run Node's own hostname check; rustls-webpki is
+# named only to recognise its `CaUsedAsEndEntity` behind rustls's
+# `CertificateError::Other`.
+#
+# NOT new supply chain: both already compile in the graph -- x509-parser via
+# oam_engine (node:crypto's X509Certificate), rustls-webpki 0.103 via rustls
+# itself, on the same version and the same features (ring, std) rustls
+# enables. These are new dependency EDGES onto crates already being built.
+x509-parser = { workspace = true }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

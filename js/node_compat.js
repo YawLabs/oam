@@ -24263,7 +24263,9 @@
       var host = options.host || options.hostname || "localhost";
       var port = options.port || 443;
       var serverName = options.servername || host;
-      var ca = options.ca != null ? String(options.ca) : undefined;
+      // Node takes `ca` as one PEM (string or Buffer) or an array of them.
+      var ca = options.ca == null ? undefined
+        : Array.isArray(options.ca) ? options.ca.map(String).join("\n") : String(options.ca);
       var cert = options.cert != null ? String(options.cert) : undefined;
       var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
@@ -24312,7 +24314,11 @@
           }
           socket._handle = info.handle;
           socket.connecting = false;
+          // Node: `authorized` is the verifier's verdict even with
+          // rejectUnauthorized:false, and `authorizationError` its code
+          // (null on an accepted certificate).
           socket.authorized = info.authorized;
+          socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
           socket._protocol = info.protocol;
           socket._cipher = info.cipher;
           socket._cipherStandardName = info.cipherStandardName || null;
@@ -24341,10 +24347,26 @@
         (err) => {
           socket._connectPending = false;
           socket.connecting = false;
-          socket.destroy(typeof err === "string" ? new Error(err) : err);
+          if (typeof err === "string") err = new Error(err);
+          if (err && typeof err.code === "string" && err.syscall === undefined) {
+            // The verifier refused the certificate (a connect-syscall error
+            // carries `syscall`; this one carries only Node's code): Node
+            // records the verdict on the socket before destroying it, and
+            // its ERR_TLS_CERT_ALTNAME_INVALID carries the reason, the name
+            // it checked and the peer certificate.
+            socket.authorized = false;
+            socket.authorizationError = err.code;
+            if (err.code === "ERR_TLS_CERT_ALTNAME_INVALID") {
+              err.reason = err.message.slice(ALTNAME_MISMATCH_PREFIX.length);
+              err.host = serverName.replace(/[.]$/, "");
+              err.cert = socket.getPeerCertificate();
+            }
+          }
+          socket.destroy(err);
         },
       );
     }
+    var ALTNAME_MISMATCH_PREFIX = "Hostname/IP does not match certificate's altnames: ";
 
     function connect(...args) {
       var parsed = normalizeConnectArgs(args);

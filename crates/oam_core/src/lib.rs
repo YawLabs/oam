@@ -632,13 +632,17 @@ impl CoreRuntime {
         TLS_PROVIDER.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
+        // NODE_EXTRA_CA_CERTS: read once, here at boot, with Node's warning
+        // on stderr if the file will not load -- before any script runs and
+        // whether or not a TLS connection ever follows, as Node does.
+        let extra_ca = tls::extra_ca_certs();
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("oam-io")
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
             // Stated rather than inherited from the cargo features: reqwest
             // turns these on by default once the feature is compiled in, so an
@@ -661,9 +665,15 @@ impl CoreRuntime {
                     std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
                     std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
                 ],
-            )
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
+            );
+        // Node's undici and https share the one root store, so the extra CAs
+        // apply to fetch() and https.request() as they do to tls.connect().
+        for cert in &extra_ca.certs {
+            if let Ok(cert) = reqwest::Certificate::from_der(cert.as_ref()) {
+                http = http.add_root_certificate(cert);
+            }
+        }
+        let http = http.build().map_err(|e| format!("http client: {e}"))?;
         let (tx, rx) = mpsc::channel();
         Ok(Self {
             tokio: Some(tokio),
