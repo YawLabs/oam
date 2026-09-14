@@ -18,6 +18,34 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`getProtocol()`, `getCipher()` and `getPeerCertificate()` on a TLS socket
+  were rustls's Debug names and `{}`** (#138). `getProtocol()` returned
+  `TLSv1_3` and `getCipher().name` `TLS13_AES_256_GCM_SHA384`, so code that
+  switches on `getProtocol() === 'TLSv1.3'` or logs a cipher name diverged,
+  and `getPeerCertificate()` gave a connected socket nothing to inspect. Both
+  a `tls.connect()` socket and an accepted one now report OpenSSL's names
+  (`TLSv1.3`; `{ name: 'TLS_AES_256_GCM_SHA384', standardName, version }`,
+  with the OpenSSL name next to the IANA `standardName` for the TLS 1.2
+  suites); `getPeerCertificate([detailed])` returns Node's legacy object
+  (`subject` and `issuer` as null-prototype objects, `modulus`/`bits`/
+  `exponent`/`pubkey` or `bits`/`pubkey`/`asn1Curve`/`nistCurve`,
+  `valid_from`/`valid_to` in OpenSSL's spelling, the three fingerprints,
+  `subjectaltname`, `infoAccess`, `ext_key_usage`, `serialNumber`, `raw`, and
+  with `detailed` an `issuerCertificate` link through the chain, a self-issued
+  last certificate pointing at itself); `getPeerX509Certificate()` and
+  `getEphemeralKeyInfo()` (`{}` after TLS 1.3, `{ type, name, size }` after
+  TLS 1.2, `null` on a server-side or destroyed socket) are added, and every
+  getter is `{}` or `undefined` before the handshake and `null` once the
+  socket is destroyed, as measured on Node. `crypto.X509Certificate` gains
+  `fingerprint512`, `infoAccess` and a complete `toLegacyObject()`, and four
+  of its fields now carry Node's values where they did not: `validFrom`/
+  `validTo` print as OpenSSL does (`Jun 15 12:30:07 2026 GMT`), `serialNumber`
+  keeps a leading zero nibble, `keyUsage` is the extended-key-usage OID list
+  and `subjectAltName` is `undefined` without the extension, and `ca` follows
+  `X509_check_ca` (a KeyUsage without keyCertSign is not a CA). Not covered:
+  `minVersion`/`maxVersion` are still not honoured, so a TLS 1.2 handshake
+  cannot be pinned from JS; the names of its six suites are unit-tested.
+
 - **`oam check` lost oam's declarations on any tsconfig chain that uses
   `${configDir}`**, and on any project with an `outDir` but no `rootDir`. The
   template names the root config's directory, and through the generated

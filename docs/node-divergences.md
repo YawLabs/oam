@@ -977,9 +977,10 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   and `tls.TLSSocket`: an unref'd open socket still keeps an oam process alive where Node
   exits. oam's loop is driven by native ops in flight, and an unref'd handle's parked read
   is not yet excluded from that count (#140).
-- **`getProtocol()` / `getCipher()` return rustls's names** (`TLSv1_3`,
-  `TLS13_AES_256_GCM_SHA384`) where Node returns `TLSv1.3` and
-  `TLS_AES_256_GCM_SHA384`. Pre-existing; #138.
+- **`minVersion` / `maxVersion` / `secureProtocol` are not honoured**, so a TLS 1.2
+  handshake cannot be pinned from JS (every handshake here is TLS 1.3 when the peer allows
+  it). `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
+  peer sent; Node also consults the client's trust store for the issuer of the last one.
 
 The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting
 `TLSSocket` under it; that is a rewrite of the class every socket-heavy module leans on, and
