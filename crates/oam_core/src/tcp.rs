@@ -658,4 +658,83 @@ mod tests {
             "(closed, cancel, in_flight, readers, writers)"
         );
     }
+
+    /// #139, the duplex case the single-half tests miss: a handle closed
+    /// while BOTH a read and a write are in flight (in_flight == 2) keeps
+    /// its closed marker until the SECOND half returns, not the first. This
+    /// is a net.Socket writing a request body while reading the response,
+    /// destroyed mid-flight: the read is woken by the close and returns
+    /// first, the write drains later. If the marker cleared on the first
+    /// half back, the second would see no marker, reinsert its half after
+    /// close, and resurrect the handle -- the surviving half (and the TCP
+    /// connection, and the event loop) leaking at exit, the exact #139 hang.
+    /// Driven through the real take/close/reinsert/release primitives the
+    /// ops use (each op holds a half out of the maps behind an `InFlight`
+    /// guard); the awaits between are irrelevant to the bookkeeping.
+    #[tokio::test]
+    async fn a_close_with_both_halves_in_flight_clears_only_on_the_last() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(echo_server(listener, 1));
+
+        let OpOutcome::Json(payload) =
+            tcp_connect(registry.clone(), ids.clone(), "127.0.0.1".into(), port).await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let handle = info["handle"].as_u64().unwrap();
+
+        // A read op and a write op each check out their half (in_flight ==
+        // 2), each behind an `InFlight` guard, exactly as tcp_read/tcp_write.
+        let reader = registry.lock().unwrap().take_reader(handle).unwrap();
+        let g_read = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        let writer = registry.lock().unwrap().take_writer(handle).unwrap();
+        let g_write = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        assert_eq!(
+            registry.lock().unwrap().in_flight.get(&handle).copied(),
+            Some(2),
+            "both halves in flight for this handle"
+        );
+
+        // Close: the marker is set because a half is still out.
+        tcp_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping().0,
+            1,
+            "marker set while a half is in flight"
+        );
+
+        // The read op returns first (its select woken by the close): the
+        // reinsert drops the half because the handle is closed, and the
+        // guard's drop releases -> in_flight 2->1, marker MUST stay.
+        assert!(
+            !reinsert_reader(&registry, handle, reader),
+            "read half dropped, not reinserted"
+        );
+        drop(g_read);
+        let bk = registry.lock().unwrap().bookkeeping();
+        assert_eq!(bk.0, 1, "marker must survive the first half back");
+        assert_eq!(bk.2, 1, "one half still in flight");
+
+        // The write op returns: the last half back clears the marker.
+        assert!(
+            !reinsert_writer(&registry, handle, writer),
+            "write half dropped, not reinserted"
+        );
+        drop(g_write);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
 }

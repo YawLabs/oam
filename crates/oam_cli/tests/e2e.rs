@@ -16327,6 +16327,93 @@ server.listen(0, '127.0.0.1', () => {
     );
 }
 
+// #140, the pre-connect ordering the post-connect test misses: unref() called
+// on a net.Socket BEFORE it connects has no handle to act on yet, so node
+// defers it (`once('connect', this.unref)`) and oam records the flag and
+// applies `tcpSetRef(handle, false)` once the handle appears. A fire-and-
+// forget background connection written as `net.connect(...); c.unref()` must
+// still let the process exit; if the deferred application regressed, the
+// parked read would pin the loop and the process would hang at exit.
+#[test]
+fn net_socket_unref_before_connect_releases_the_event_loop() {
+    let file = write_temp(
+        "net_unref_before_connect.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hi'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  // unref() BEFORE 'connect' fires -- deferred to once('connect', unref).
+  client.unref();
+  server.unref();
+  client.on('data', () => {});
+  t0 = Date.now();
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: unref() before 'connect' did not release the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after a pre-connect unref(): the deferred unref did not take\nstdout: {stdout}"
+    );
+}
+
+// #140 parity: net.connect({ timeout }) must arm the idle timer at
+// construction (createConnection wires options.timeout to setTimeout), where
+// the existing coverage only drives the setTimeout() method. A connection
+// pool that sets an inactivity timeout this way relies on the 'timeout' event
+// firing; without the wiring it never would. The socket stays open on
+// timeout, as in node (the event does not destroy it).
+#[test]
+fn net_connect_options_timeout_arms_an_idle_timer() {
+    let file = write_temp(
+        "net_connect_timeout_option.mjs",
+        r#"
+import net from 'node:net';
+// A server that accepts and then sends nothing: the client's idle timer,
+// armed by net.connect's `timeout` option, is the only thing that fires.
+const server = net.createServer(() => {});
+server.listen(0, '127.0.0.1', () => {
+  const c = net.connect({ port: server.address().port, host: '127.0.0.1', timeout: 60 });
+  c.on('timeout', () => {
+    console.log('timeout readyState=' + c.readyState + ' destroyed=' + c.destroyed);
+    c.destroy();
+    server.close();
+  });
+  c.on('error', () => {});
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(10),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 10s: net.connect({{ timeout }}) never armed an idle timer\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("timeout readyState=open destroyed=false"),
+        "the option's idle timer must fire with the socket still open: {stdout}"
+    );
+}
+
 // ref() after unref() pins the loop again. An UNREF'D timer fires only
 // while something else keeps the process alive -- here the re-ref'd client
 // -- so 'alive-at-1500' is printed only if ref() took. Had it been a no-op

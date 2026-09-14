@@ -165,6 +165,163 @@ C7rRXUYQtUTmtwTetACx3EEz7k2ixAxxdDCUPJIxGcVIPVKt6sTovr3yGLMuc4f7
 I5PYIZ3kyY8EsQqX4JpTtbY=
 -----END PRIVATE KEY-----`;
 
+// A leaf chained through a non-self-signed intermediate to a root the client
+// is not given, and a leaf whose validity period has not started -- for the
+// incomplete-chain and not-yet-valid verdicts. Minted with openssl, embedded.
+const CHAIN_ROOT = `-----BEGIN CERTIFICATE-----
+MIIDIzCCAgugAwIBAgIUaPSZpqSb/Y/gC+okpLcSTLrO6MMwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNb2FtIHRlc3Qgcm9vdDAgFw0yNjA5MTQyMjEyMDFaGA8y
+MTI2MDgyMTIyMTIwMVowGDEWMBQGA1UEAwwNb2FtIHRlc3Qgcm9vdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAMmr+h+3f4TYbkQ+RlaxK4FnjkAzx7Ji
+Qut16fnLV+GGdmYQswwTObN2366VrjD8zD0VoBJgU5Vfd6HNrJRfEr5Xn2C6dY5q
+JGaou+6k3xUIdwq5IRDX+LAHr9CbssRjwlxkfXhQKpMWr0TK1/7UFr9BENmv1WY+
+sy7vqbxcHq0ne4Pxcigmxobhs09Jw0FsbRlIn6TuxBIoxF6Fti+S5IroCbWKjphd
+sy+wcwIAT8rT86jtpdZ/F1KrSCvFPfRtk0Y9CzDKxQNjDaCXr+MgqhYfUXMHBCsc
+/4we9A0gfygDdYf17yB4C/7Qz6aW9Zb7E+BDsWxwTPF1+dNb5BQhNYECAwEAAaNj
+MGEwHQYDVR0OBBYEFG6HviMKwbfJAAvAJMWqqPR1iFGvMB8GA1UdIwQYMBaAFG6H
+viMKwbfJAAvAJMWqqPR1iFGvMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQD
+AgEGMA0GCSqGSIb3DQEBCwUAA4IBAQCdZTV8e6W3D5D2yA2/dEvt5/VjmjTWR+Qu
+DYLRdhPYSgWHBwfU0tVctscGMT8kaKo0nqwcFR1WaDBYucJxHzIDqoPdpyvAz4kl
+kUE9gQEFpAaOKSwgWY3X1RaCOsrMJsfH5G2XmSoD2iUllAZehmri3m2dIPsy2bCC
+0dZhETxuJVfozhkjjOrd18lmrJvauPElSKJodaH76FZ6NNoeu3zR6/KAvhf23lj+
+Pkdn0P9TUDOjGIXPBtOE1ZcwZloDvc3HZ5FXF0d10VOI58KmVILYzwLOAOPGi8MG
+WB3rTJQHuG+glT3zSYXRBQgo6S+HW+ktZ/RbLArS+SkDGiyIcXui
+-----END CERTIFICATE-----`;
+const CHAIN_INTER = `-----BEGIN CERTIFICATE-----
+MIIDLjCCAhagAwIBAgIUMudqfWkqCviMATDYT0hPrrNis8MwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNb2FtIHRlc3Qgcm9vdDAgFw0yNjA5MTQyMjEyMDJaGA8y
+MTI2MDgyMTIyMTIwMlowIDEeMBwGA1UEAwwVb2FtIHRlc3QgaW50ZXJtZWRpYXRl
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlMLt2Tc83khhnKz2EPrE
+IUq/yhs/5+UCRLjfVOpbg99VcgNMM9MqiDPk99MsJgZP/s7zZdU6bZPddNMHVnGK
+wTcf57CH0qp2gDLlIzZDbaspfuDPcQzFDJUSDN79vBLlT2nQOYDAstz8BHesYUCp
+qWplXcSfFFz1+g7nxnKGElETMWo4RamroVr65rQjlvY9CudxJ6ufhds2cmCMflkj
+fNWaa8ZpFFscGZLk4vcJp53bIi5utBHS40vQyBq8jbRH1aFuRUHlBewI+koYHLNA
+F25y+KJp4Ukuj2YelyhErlTW3FjvRUEOrG6ZpVTRBWU4VtRHLeDaUyscoQd484U6
+XQIDAQABo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAd
+BgNVHQ4EFgQUOl0ZkvpfMS20ACPsrp1AKLgUEO0wHwYDVR0jBBgwFoAUboe+IwrB
+t8kAC8Akxaqo9HWIUa8wDQYJKoZIhvcNAQELBQADggEBAE1qkuY1u8RYdUQzBELl
+GtVDxGg2aXp45L7w7UykqBvfd3laCqHgXa9WfT9HeN1jc+KuimoZAaV8/qACTLv9
+zCg2nxx9KEmnaf2aRs4vajGVcHEav4IzR6bcSaCWVjSQSPTPWTuqRf98Jbfuq4gc
+ZDerNmPGfzORoO3CVg6zILpvINyuHjtAvknoN1SvUPa7zz2mzwdSB0RnAYB/vsJi
+GLUjfYAbCs/WwXoIClHOABnocrqueeAVg6KXqoea9eIGsuIElMJWl6jO/KHX7FNi
+s6GZPLS0HhJnhLbegH+50+M7vbgfLE2zv6fA5z/8NwEnxdAy8fANsmYeEhclUpJI
+4Zo=
+-----END CERTIFICATE-----`;
+const CHAIN_LEAF = `-----BEGIN CERTIFICATE-----
+MIIDVDCCAjygAwIBAgIUQJdLLzB4vxRaQPgG+DsCcRC7RMIwDQYJKoZIhvcNAQEL
+BQAwIDEeMBwGA1UEAwwVb2FtIHRlc3QgaW50ZXJtZWRpYXRlMCAXDTI2MDkxNDIy
+MTIwMloYDzIxMjYwODIxMjIxMjAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCiPXvsvJiqbU3lA0yWN4ahcYXQ
+oM5+x97if51zX5HliN7xXyjzVy/UKJT4KP6WHs19EfLmR3lrTJ8fipsHgt5GjqSt
+j8DAvdw7SAkKdUx+No5q0K5RYOuzoN4ises3DkJoK7ni2GZ+ceWG7ZPVn2K02DtS
+s/gwQBzB1kZd4KsSCynA/cmGZlP5tOyi11ra70MDDKG4woEtlV7Bq5yxzj9b0uni
+3yRg9yPb/fqlvRhkZL+Wd3gwxA6Q/GL3resfTza0mP1Jd2ytysy5BTQXOo9R9FE/
+dojFEaXsQAqtbJ1RvtZL7/4jiOYDSQykNqnztdt2azRWWG1+T2n5tM7WSLBTAgMB
+AAGjgY8wgYwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAkGA1UdEwQCMAAw
+DgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBQo
+jysFd/48mW67dfkyDpbg4rxt1DAfBgNVHSMEGDAWgBQ6XRmS+l8xLbQAI+yunUAo
+uBQQ7TANBgkqhkiG9w0BAQsFAAOCAQEAXBiTqB8Asib8SGyOVGl/epQbyPdAE8Ob
+54AZ7zz0GFrpKffuMzu8L4dTuY6FMHTKCBr39F+odmLSy8kIyU0qr1gqRM8JAiew
+Pp0rcgKmVyDhhWb19rUjqCKdEQ/gR3hv9CKVWIYhdvYa4/0KMVUUIBm19yCzXpH4
+YCxB9nQiN5kheQY8dsa7zSc7/atg/SSPH+Ejelf1Gh0YndIl2DHdjQRzbxDaBBeP
+F2qh+Mt+cKQXjASX857y5Vspov+VM76l2rz+HHjohVsy85g8BqRZiH93t/HyxHGq
+R5zB/NPIde1UZ/542dcyIbJjUOoy7zOqLJEiwEljZjn+MLpzjy1o4A==
+-----END CERTIFICATE-----`;
+const CHAIN_LEAF_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCiPXvsvJiqbU3l
+A0yWN4ahcYXQoM5+x97if51zX5HliN7xXyjzVy/UKJT4KP6WHs19EfLmR3lrTJ8f
+ipsHgt5GjqStj8DAvdw7SAkKdUx+No5q0K5RYOuzoN4ises3DkJoK7ni2GZ+ceWG
+7ZPVn2K02DtSs/gwQBzB1kZd4KsSCynA/cmGZlP5tOyi11ra70MDDKG4woEtlV7B
+q5yxzj9b0uni3yRg9yPb/fqlvRhkZL+Wd3gwxA6Q/GL3resfTza0mP1Jd2ytysy5
+BTQXOo9R9FE/dojFEaXsQAqtbJ1RvtZL7/4jiOYDSQykNqnztdt2azRWWG1+T2n5
+tM7WSLBTAgMBAAECggEAKDEaH7IzEdllOCxCj14vFJSmhWIo9cB3B15894WAA8CO
+FnawEuSQ/TqWeQnS1AbKekb1iTXAryO6sdopAMnbXdhdlH+tzTHburXkQ3p+mi/S
+xURwQsnDamsaTLcN4cQ/EEZw1PEuJvn5Vh1KB9xl3A5LV/gsrmtblGuMYBpV1vCX
+CQ+XgMYtz1ByEuVsy8um2f52p/XQQHix+Xf1PCsqD+miMeCBI8fGJ/MZ9I+Lo9T/
+4DqNC9emTVmVZgeKruPC/KmcDCtxcTtXCVPLm9lUCbonQFKRIODGmTmjAbYEg7+b
+rDks9bqe43F5YoAl4jwnLi/Qc29iIN68jRYOZA6uWQKBgQDPCWVhXWr01jL4wcOb
+p9oo7c0l7pSCl8Hw8uIPnTo+mUqmoMfCI/VIxmIJWPKQXL+btfLHkC1Teva36iKr
+Ljyem4Z+niK4wjpV1dJZSwnGotu/NYtNbYvQRVTRJhj1ldo/EKTWBD0rxOzCAZhZ
+ok7lnB2Sn64mNIISOuU2v1kV+wKBgQDIm/nP6kMdRLHvqe3KXBh5UaRbPvkdCVes
+4HjbBu6+YjX76oNgwGsdkv3W1LnwuxLpwL0+wMqrBL4H1mF+M8+rTfDHmW82/PvA
+we5WEaQu5gtNVpvneSQ5Qggx0gzwwEA2IqyjlCKCIejTaBJV/QcJns+cwiujMAYR
+rvRfhTk3iQKBgFdghMvpzDkWqZ540GBCH/2EFz+6CC1xdOWG7EdguPMwaOQYGRZj
+bKLRLxD43C53JlrGGHeG7so7rCKEiyspsWXTB5kqjkbhmhMd0c/jrnWJyCpTo74C
+zK4ShLBcXs5O9zQEhzzXvyVYz/81AyJZMOkQ0R5PjAUNxhOBjblkWmm/AoGBAK1k
+C07G901j47v3jx057rlldH6ddmm/enVk63C8lDwf3PMpZnaIucytERPPeAt3VkiO
+G8QSlNmuVqWliUywcY1p53RNzQ+lJ+AafusLgnI6yYgGFOjEDygiR7zwBdlNAfMI
+k1krn4wEzR10tWx3L88D4gRm25rH1mcQZg3ts1+pAoGASPeXeeZv3l6B84l/2Wgt
+/TAPeIIeu2CapL+jzLl+N4fbVjgspV/pljm+cKtccSjDliKuxOTN3QQxZFD0Evrs
+pa07vc3DKVo4AoemY0hWKgtFqGhSWqX8fMTe8ANWZOSK/3iXDI87tBHSQK/eOFZ4
+7gF9ZQtXQ3prqz2YjsDVz1Y=
+-----END PRIVATE KEY-----`;
+const FUTURE_CA = `-----BEGIN CERTIFICATE-----
+MIIDITCCAgmgAwIBAgIUNM/2tdc+Ywb9ZWvRRx4NNgFR/rkwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNb2FtIGZ1dHVyZSBjYTAeFw0yNjA5MTQyMjEyMDJaFw0z
+NjA5MTEyMjEyMDJaMBgxFjAUBgNVBAMMDW9hbSBmdXR1cmUgY2EwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC5qlBckZJoweBQQCgg1IYwxD8sQJBQH1hs
+N6Ais9sTI56voKTPt8i1UDx7B7H4WPPQ6U4BDm4rO5zqmHkhgryneGr7elnUhSKz
+FCXjl2ZAtVqnFmupe6V2DYdoDACcC+A/pYloJw9ygnin4ZLgKMlNZ7araj6lG6GE
+kdREZyN/g12M/hm8Dj7q70h0NLsxXD6Cy2hNIrkLFtZGmbur+nK+brm4QB9EXNMF
+TlqAO/drfqDWVgmbZXezYQyW2Eb6Ut3dxOBJTz6mVexjIiJnN9vasL2o7MfJG0BC
+fCjXiCXX1f+lOaIz3PhBfxOQU0UDIugE4GK2GP/fyOA8O2n/8+tZAgMBAAGjYzBh
+MB0GA1UdDgQWBBRB9w3DcL7yYXl7tjKj2Yi+489uITAfBgNVHSMEGDAWgBRB9w3D
+cL7yYXl7tjKj2Yi+489uITAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIB
+BjANBgkqhkiG9w0BAQsFAAOCAQEAnRJH2lYCkbXfE6TCzlN0qyrPAzJ70AfAjAmA
+gyUpV+lHa0GSEtOcaDCzfeswbt9rVX0sL2ts10NEI90Qg/J24519/DSeMZamrUDB
+FkYT7BI40Qled7vkiHYaycmtjmKmCVshLvFj7tjdau8Dv9an628CEBoPcBBIpgjU
+zIpLqpB/O9LBakfhjvIZ8GXJpBKS1EfFTbuaPO0xwBNfO6kKphzoe1GOpMOiUk1i
+K3DID3twiccEZDZgBd9nFwaVhFLBGwzxOQFwO2zmYLbssiWczwKTcY8huj/dN6UP
+wkiHB3xfT8msH3STYqcVk4gsZtS+Zh0SS18nw21wgZMJvtkSBA==
+-----END CERTIFICATE-----`;
+const FUTURE_LEAF = `-----BEGIN CERTIFICATE-----
+MIIDBjCCAe6gAwIBAgIUYOYyslJDB9dovuLEJH+WSi4a31UwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNb2FtIGZ1dHVyZSBjYTAiGA8yMTAwMDEwMTAwMDAwMFoY
+DzIxMTAwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQC5qlBckZJoweBQQCgg1IYwxD8sQJBQH1hs
+N6Ais9sTI56voKTPt8i1UDx7B7H4WPPQ6U4BDm4rO5zqmHkhgryneGr7elnUhSKz
+FCXjl2ZAtVqnFmupe6V2DYdoDACcC+A/pYloJw9ygnin4ZLgKMlNZ7araj6lG6GE
+kdREZyN/g12M/hm8Dj7q70h0NLsxXD6Cy2hNIrkLFtZGmbur+nK+brm4QB9EXNMF
+TlqAO/drfqDWVgmbZXezYQyW2Eb6Ut3dxOBJTz6mVexjIiJnN9vasL2o7MfJG0BC
+fCjXiCXX1f+lOaIz3PhBfxOQU0UDIugE4GK2GP/fyOA8O2n/8+tZAgMBAAGjSDBG
+MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRMEAjAAMB0GA1UdDgQW
+BBRB9w3DcL7yYXl7tjKj2Yi+489uITANBgkqhkiG9w0BAQsFAAOCAQEAFOaoN/SL
+i5wxBJnonptA/ixotKyiVgOsjaun3xakAcYM2gDQ0WidZPDivShP9MtRq0BSDpdQ
+4EJ4DPQPSIZOeKxHunUrFwh8bFRZ0JM4HzWG+Xe59iKLcxlNsHJHVEJHCwFU2LaG
+nV/igyxEVhpS72T8iKrnpZ4Yghcc5s6hvYvz66x/XBiSuoIDd7drKTw3Ki8FEKQk
+70GV5MN3LMYeZjeb1CxvRrwpGWoO0+YEl8WjXDocVe1ICpxClnS1mrm9/ooCoExl
+cVB2J26Xa2zTEgpcUBZtK82Fhk+t2AfJmeUL6Fr5tgrd+tmb/WCwB0l0KvsclmkX
+2BOclqJ8JejPOA==
+-----END CERTIFICATE-----`;
+const FUTURE_LEAF_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC5qlBckZJoweBQ
+QCgg1IYwxD8sQJBQH1hsN6Ais9sTI56voKTPt8i1UDx7B7H4WPPQ6U4BDm4rO5zq
+mHkhgryneGr7elnUhSKzFCXjl2ZAtVqnFmupe6V2DYdoDACcC+A/pYloJw9ygnin
+4ZLgKMlNZ7araj6lG6GEkdREZyN/g12M/hm8Dj7q70h0NLsxXD6Cy2hNIrkLFtZG
+mbur+nK+brm4QB9EXNMFTlqAO/drfqDWVgmbZXezYQyW2Eb6Ut3dxOBJTz6mVexj
+IiJnN9vasL2o7MfJG0BCfCjXiCXX1f+lOaIz3PhBfxOQU0UDIugE4GK2GP/fyOA8
+O2n/8+tZAgMBAAECggEARdIADYeq5N0/4z31OT9ixVUPoq8W9iKLiIq0nEhBsuVa
+yBYj1H97KYAmdmfS7B9bdS0/adNI59YvsOMs7kaxdlMo/DArNunoPiruArQNPnlU
+wXADhcVbWFVHHgAhfI1Uw+qXDUVfIENjZ1LDfqun5AWEIts9+q4049tJVX3p0gnr
+L5KwN5/F5Lq8It3hBw0x2RWWky16TS7e4thRppp6q69sWlKvOcU1s2xDOzgWzVOz
+ioHKt7p+nerjwNPE6HoT7IF8hNKXv4/j3GGdl5YzFg9kRZy2c2n16ugsXpcGkT5U
+zIV+EEE5wKjiRZdPJpU6LZ2QAtzhtiuRZI8hDZXkBwKBgQDfUT6yLZRXNk7+ZJWq
+9GgIHdy6FMVvkFxLGHTVtf4cVP+pnr5IWnbOXTWixI7oCnkeUYIRIJOD8v2fzw7p
+bUTlUBpjwkDNhpwk22SDAl8SFKkl1jMRgSJDOMH2N3Smi4qxxG9GL5JKRP5FblDy
+bkqQ/pvtJwINu8aqcIfaDgkVOwKBgQDU1mfGORu71bao5Afp8jG+He5AxY7tmNGi
+R4NRnZanS8WeqvhuQx2Z07/g+Il6amwHUXbvPCAblR67Y6HQOWFAhqvKL1hPdQT+
+nc22e5eLNqDNWqCy42yvD92C/TGyWUjWN8/qbzHZRs1Rlugk44uwfJYovZGVKITd
+tHhSiHioewKBgQCu5ZNjupzGHOuLAz3QkO/1A2Y+ekwSzw3pZnMCeTFWAR/mOUQv
+qGIJxyhdnPGLO8CWBSIHxeqiWalXArRcDs75hV3VqWpVTMp3dzfl/vJ0V6gN0Q9X
+8znhSc9mxRHf6cOq6/x2DIXXEufNetN8uvI9UprOBlHubZTvIYjUN0/XxwKBgQCG
+oq54rQ2HL7Thd4YuDmA7BJH/dTlpwV7zCcvfKBHx+DOloD+Q+HHUKifZ9z54KrP1
+mSnkQiOJbzZGkcr9fh6wA8DOIE77zGmBa2+C/QGrNb5YyPiY0NaikyWrw+DZEjPK
+Fvo2MWrWKDyfXReypiJqXRVb5jcepMgPuybWBrBU2wKBgQC2OZ6PmRYNEmtP8uWW
+itFSl02i5ksjZ6ierj/fO6ON0dg4DjR/uGCcRKv595Il0ZoCf4OYGMUX1i0gxDaA
+/uE3VnejLAASanSt1dJuBe2bEUioMdNJZAYz1FaYfjHuhN114Aly0NTuIa8Zgijv
+vnmsjWZJwSDu/vIHNLARSmgUmw==
+-----END PRIVATE KEY-----`;
+
 // The error as a client sees it: own keys in order, no syscall/errno, the
 // altname error's reason and host. `cert` is not printed -- node fills it
 // with the parsed peer certificate, which oam's getPeerCertificate() does
@@ -249,3 +406,25 @@ await report("expired, no ca", expiredServer, {});
 await report("expired, ca, wrong host", expiredServer, { ca: CA, servername: "example.com" });
 await report("expired, rejectUnauthorized:false", expiredServer, { ca: CA, rejectUnauthorized: false });
 expiredServer.close();
+
+// --- a leaf chained through a non-self-signed intermediate -------------------
+// The intermediate is signed by a root the client is not given, so no complete
+// chain can be built: leaf+intermediate is "unable to get local issuer", the
+// leaf alone with the intermediate as `ca` is "unable to get issuer", and only
+// the root as `ca` verifies it.
+const chainServer2 = await serve({ cert: CHAIN_LEAF + "\n" + CHAIN_INTER, key: CHAIN_LEAF_KEY });
+await report("chain to untrusted root, no ca", chainServer2, {});
+await report("chain to untrusted root, ca=root", chainServer2, { ca: CHAIN_ROOT });
+chainServer2.close();
+
+const leafOnlyServer = await serve({ cert: CHAIN_LEAF, key: CHAIN_LEAF_KEY });
+await report("leaf only, ca=intermediate", leafOnlyServer, { ca: CHAIN_INTER });
+leafOnlyServer.close();
+
+// --- not yet valid: the validity period beats every other complaint ----------
+const futureServer = await serve({ cert: FUTURE_LEAF, key: FUTURE_LEAF_KEY });
+await report("not yet valid, ca", futureServer, { ca: FUTURE_CA });
+await report("not yet valid, no ca", futureServer, {});
+await report("not yet valid, ca, wrong host", futureServer, { ca: FUTURE_CA, servername: "example.com" });
+await report("not yet valid, rejectUnauthorized:false", futureServer, { ca: FUTURE_CA, rejectUnauthorized: false });
+futureServer.close();

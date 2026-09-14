@@ -1845,6 +1845,93 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
     }
 
+    /// #139, the duplex case: a TLS handle closed while BOTH a read and a
+    /// write are in flight (in_flight == 2) keeps its closed marker until
+    /// the SECOND half returns. This is an HTTPS request streaming a body
+    /// while reading the response, destroyed mid-flight: the read is woken
+    /// by the close and returns first, the write drains later. If the marker
+    /// cleared on the first half back, the second would reinsert its half
+    /// after close and resurrect the handle -- the surviving TlsReader/
+    /// TlsWriter (and the BiLock, so the socket never closes and the process
+    /// hangs at exit) leaking, which is precisely what #139 documents for
+    /// tls. Driven through the real take/close/reinsert/release primitives
+    /// the ops use; the awaits between are irrelevant to the bookkeeping.
+    #[tokio::test]
+    async fn a_close_with_both_halves_in_flight_clears_only_on_the_last() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(echo_server(listener, 1));
+
+        let OpOutcome::Json(payload) = tls_connect(
+            registry.clone(),
+            ids.clone(),
+            "127.0.0.1".into(),
+            port,
+            Some("localhost".into()),
+            Some(CERT.into()),
+            true,
+            None,
+            None,
+        )
+        .await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let handle = info["handle"].as_u64().unwrap();
+
+        // A read op and a write op each check out their half (in_flight ==
+        // 2), each behind an `InFlight` guard, exactly as tls_read/tls_write.
+        let reader = registry.lock().unwrap().take_reader(handle).unwrap();
+        let g_read = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        let writer = registry.lock().unwrap().take_writer(handle).unwrap();
+        let g_write = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        assert_eq!(
+            registry.lock().unwrap().in_flight.get(&handle).copied(),
+            Some(2),
+            "both halves in flight for this handle"
+        );
+
+        // Close: the marker is set because a half is still out.
+        tls_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping().0,
+            1,
+            "marker set while a half is in flight"
+        );
+
+        // The read op returns first (woken by the close): reinsert drops the
+        // half (closed), the guard releases -> in_flight 2->1, marker STAYS.
+        assert!(
+            !reinsert_reader(&registry, handle, reader),
+            "read half dropped, not reinserted"
+        );
+        drop(g_read);
+        let bk = registry.lock().unwrap().bookkeeping();
+        assert_eq!(bk.0, 1, "marker must survive the first half back");
+        assert_eq!(bk.2, 1, "one half still in flight");
+
+        // The write op returns: the last half back clears the marker.
+        assert!(
+            !reinsert_writer(&registry, handle, writer),
+            "write half dropped, not reinserted"
+        );
+        drop(g_write);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
     /// The verifier's verdict drives `authorized` / `authorizationError`
     /// in advisory mode and rejects the handshake otherwise.
     #[tokio::test]
