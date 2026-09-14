@@ -533,6 +533,40 @@ pub enum ZlibStream {
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
 
+/// A handle whose in-flight ops JS can `ref()` / `unref()` as a unit -- the
+/// key [`CoreRuntime::spawn_handle_op`] files an op under. Tagged by kind
+/// even though every id below comes from the one `body_ids` counter: the tag
+/// costs nothing and keeps a stdin read from ever sharing a key with a
+/// socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HandleKey {
+    /// `process.stdin` (one read at a time; see [`crate::stdin::stdin_read`]).
+    Stdin,
+    /// A `net.Socket` stream: its parked read.
+    Tcp(u64),
+    /// A `net.Server` / `tls.Server` listener: its parked accept.
+    TcpServer(u64),
+    /// A `tls.TLSSocket`: its parked read.
+    Tls(u64),
+}
+
+/// What [`CoreRuntime`] remembers per [`HandleKey`].
+struct HandleRef {
+    /// Counts toward `inflight` -- true until JS calls `unref()`.
+    referenced: bool,
+    /// The ops in flight under this key.
+    ops: HashSet<OpId>,
+}
+
+impl HandleRef {
+    fn new() -> Self {
+        Self {
+            referenced: true,
+            ops: HashSet::new(),
+        }
+    }
+}
+
 pub struct CoreRuntime {
     /// Option so Drop can take it for shutdown_background (see below).
     tokio: Option<tokio::runtime::Runtime>,
@@ -548,15 +582,19 @@ pub struct CoreRuntime {
     /// happen; counting it in `inflight` pins the process forever. Same
     /// rationale as SIGNAL_OP_ID, but per-op rather than a fixed id.
     unref_ops: HashSet<OpId>,
-    /// The `process.stdin` read in flight, if any, and whether it counts
-    /// toward `inflight`. Tracked apart from every other op because stdin is
-    /// the one op JS can RETIRE while it is still blocked in the OS: node's
-    /// `stdin.unref()` and destroying the stream both release the loop while
-    /// the read itself cannot be cancelled. Knowing the live id is what makes
-    /// [`Self::set_stdin_ref`] safe -- flipping the ref-ness of an op that has
-    /// already settled would corrupt `inflight`.
-    stdin_op: Option<OpId>,
-    stdin_referenced: bool,
+    /// Per-handle ref accounting: the ops in flight under each handle JS can
+    /// `ref()` / `unref()` (a socket's parked read, a server's parked accept,
+    /// the stdin read) and whether they count toward `inflight`. Node lets
+    /// an unref'd handle go on working without keeping the process alive;
+    /// here the op cannot be cancelled while it is blocked in the OS, so it
+    /// keeps running and merely stops counting. Knowing the live ids is what
+    /// makes [`Self::set_handle_ref`] safe -- flipping the ref-ness of an op
+    /// that has already settled would corrupt `inflight`. Self-pruning: an
+    /// entry in its default state (referenced, nothing in flight) is dropped,
+    /// so the map only ever holds live or unref'd handles.
+    handles: HashMap<HandleKey, HandleRef>,
+    /// Reverse index so [`Self::note_settled`] finds an op's handle in O(1).
+    op_handles: HashMap<OpId, HandleKey>,
     /// Installed OS-signal watchers keyed by Node signal name (SIGTERM, ...).
     /// Each value keeps a native handler alive; dropping it uninstalls (Unix
     /// aborts the tokio recv task, Windows removes the name from the active
@@ -635,8 +673,8 @@ impl CoreRuntime {
             next_id: 1,
             inflight: 0,
             unref_ops: HashSet::new(),
-            stdin_op: None,
-            stdin_referenced: true,
+            handles: HashMap::new(),
+            op_handles: HashMap::new(),
             signals: HashMap::new(),
             bodies: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_bodies: std::sync::Arc::new(std::sync::Mutex::new(
@@ -824,48 +862,100 @@ impl CoreRuntime {
         id
     }
 
-    /// Spawn the `process.stdin` read, remembering its id so JS can retire it
-    /// later, and honouring the ref-ness set by [`Self::set_stdin_ref`] -- a
-    /// read issued while stdin is unref'd must not pin the loop either.
-    ///
-    /// One op spans the whole of [`crate::stdin::stdin_read`], the retries the
-    /// pending-read gate drives included: when a console-mode switch cancels
-    /// the blocked read, the discarded result is dropped and the read
-    /// re-issued INSIDE this same op. So the id stays valid across a cancel,
-    /// the gate and this bookkeeping never race over it, a read retired here
-    /// stays retired across those retries, and a cancel never resurrects one.
-    pub fn spawn_stdin_op<F>(&mut self, op: F) -> OpId
+    /// Spawn an op that belongs to a handle JS can `ref()` / `unref()`
+    /// (`socket.unref()`, `server.unref()`, `process.stdin.unref()`): counted
+    /// toward `inflight` only while `key` is referenced -- an op issued while
+    /// the handle is unref'd must not pin the loop either -- and remembered
+    /// under the key so [`Self::set_handle_ref`] can flip it while it is
+    /// still blocked in the OS. Several ops may be in flight per key.
+    pub fn spawn_handle_op<F>(&mut self, key: HandleKey, op: F) -> OpId
     where
         F: Future<Output = OpOutcome> + Send + 'static,
     {
-        let id = if self.stdin_referenced {
+        let referenced = match self.handles.get(&key) {
+            Some(handle) => handle.referenced,
+            None => true,
+        };
+        let id = if referenced {
             self.spawn_op(op)
         } else {
             self.spawn_op_unref(op)
         };
-        self.stdin_op = Some(id);
+        self.handles
+            .entry(key)
+            .or_insert_with(HandleRef::new)
+            .ops
+            .insert(id);
+        self.op_handles.insert(id, key);
         id
     }
 
-    /// node's `stdin.ref()` / `stdin.unref()`, and what destroying the stream
-    /// does: stop (or resume) the stdin read holding the loop open. Applies to
-    /// the read in flight AND to the ones issued after it. The blocking read
-    /// is not cancelled -- as in node, where the fd stays readable -- it just
-    /// no longer counts.
-    pub fn set_stdin_ref(&mut self, referenced: bool) {
-        self.stdin_referenced = referenced;
-        let Some(id) = self.stdin_op else {
-            return;
-        };
-        if referenced {
-            // Only re-count it if it is genuinely still in flight: a settled
-            // op has already been removed from `unref_ops`.
-            if self.unref_ops.remove(&id) {
-                self.inflight += 1;
+    /// node's `handle.ref()` / `handle.unref()`: stop (or resume) the
+    /// handle's ops holding the loop open. Applies to every op in flight
+    /// under `key` AND to the ones issued after it. Nothing is cancelled --
+    /// as in node, where an unref'd socket still reads and a stdin fd stays
+    /// readable -- it just no longer counts. Idempotent, and safe after the
+    /// ops settled: a settled op has already left the key's set in
+    /// [`Self::note_settled`], so it is never re-counted.
+    pub fn set_handle_ref(&mut self, key: HandleKey, referenced: bool) {
+        let handle = self.handles.entry(key).or_insert_with(HandleRef::new);
+        handle.referenced = referenced;
+        for id in &handle.ops {
+            if referenced {
+                if self.unref_ops.remove(id) {
+                    self.inflight += 1;
+                }
+            } else if self.unref_ops.insert(*id) {
+                self.inflight -= 1;
             }
-        } else if self.unref_ops.insert(id) {
-            self.inflight -= 1;
         }
+        self.prune_handle(key);
+    }
+
+    /// The handle is closed: drop its bookkeeping so the maps never grow with
+    /// sockets that came and went. An op still in flight under it keeps the
+    /// ref-ness it has until it settles (a closed socket's parked read comes
+    /// back with EOF or an error, or is woken by the close itself).
+    pub fn forget_handle(&mut self, key: HandleKey) {
+        if let Some(handle) = self.handles.remove(&key) {
+            for id in handle.ops {
+                self.op_handles.remove(&id);
+            }
+        }
+    }
+
+    /// Drop a key whose entry says nothing (referenced, nothing in flight).
+    /// An UNREF'D key with nothing in flight is kept on purpose: the state
+    /// has to survive the gap between one parked read and the next.
+    fn prune_handle(&mut self, key: HandleKey) {
+        if self
+            .handles
+            .get(&key)
+            .is_some_and(|handle| handle.referenced && handle.ops.is_empty())
+        {
+            self.handles.remove(&key);
+        }
+    }
+
+    /// The `process.stdin` read: [`Self::spawn_handle_op`] under
+    /// [`HandleKey::Stdin`]. One op spans the whole of
+    /// [`crate::stdin::stdin_read`], the retries the pending-read gate drives
+    /// included: when a console-mode switch cancels the blocked read, the
+    /// discarded result is dropped and the read re-issued INSIDE this same
+    /// op. So the id stays valid across a cancel, the gate and this
+    /// bookkeeping never race over it, a read retired here stays retired
+    /// across those retries, and a cancel never resurrects one.
+    pub fn spawn_stdin_op<F>(&mut self, op: F) -> OpId
+    where
+        F: Future<Output = OpOutcome> + Send + 'static,
+    {
+        self.spawn_handle_op(HandleKey::Stdin, op)
+    }
+
+    /// node's `stdin.ref()` / `stdin.unref()`, and what destroying the stream
+    /// does: [`Self::set_handle_ref`] on [`HandleKey::Stdin`].
+    pub fn set_stdin_ref(&mut self, referenced: bool) {
+        self.set_handle_ref(HandleKey::Stdin, referenced);
     }
 
     pub fn has_inflight(&self) -> bool {
@@ -873,16 +963,19 @@ impl CoreRuntime {
     }
 
     /// Bookkeeping shared by `try_recv` and `recv_deadline`: a settled op
-    /// stops counting, and a settled STDIN op stops being retirable (its id
-    /// must never be handed to `set_stdin_ref` again).
+    /// stops counting, and leaves its handle's in-flight set (its id must
+    /// never be re-counted by `set_handle_ref` again).
     fn note_settled(&mut self, completion: &OpCompletion) {
         if completion.id == SIGNAL_OP_ID {
             // Never counted in `inflight` (a bare listener must not pin the
             // loop), so it must not decrement -- that would underflow at 0.
             return;
         }
-        if self.stdin_op == Some(completion.id) {
-            self.stdin_op = None;
+        if let Some(key) = self.op_handles.remove(&completion.id) {
+            if let Some(handle) = self.handles.get_mut(&key) {
+                handle.ops.remove(&completion.id);
+            }
+            self.prune_handle(key);
         }
         if !self.unref_ops.remove(&completion.id) {
             self.inflight -= 1;
@@ -4712,6 +4805,107 @@ mod tests {
         assert_eq!(settled.id, other);
         assert_ne!(settled.id, completion.id);
         assert!(!core.has_inflight());
+    }
+
+    #[test]
+    fn handle_ops_follow_their_key_and_keys_stay_apart() {
+        let mut core = CoreRuntime::new().unwrap();
+        let sock = HandleKey::Tcp(7);
+        let read = core.spawn_handle_op(sock, ops::sleep(60_000));
+        let write = core.spawn_handle_op(sock, ops::sleep(60_000));
+        assert!(
+            core.has_inflight(),
+            "a socket's ops pin the loop by default"
+        );
+
+        // socket.unref(): every op in flight under the key stops counting.
+        core.set_handle_ref(sock, false);
+        assert!(!core.has_inflight());
+        core.set_handle_ref(sock, false);
+        assert!(!core.has_inflight(), "idempotent");
+        // The next op inherits the ref-ness in force when it is issued.
+        let next = core.spawn_handle_op(sock, ops::sleep(60_000));
+        assert!(next != read && next != write);
+        assert!(
+            !core.has_inflight(),
+            "issued while unref'd, so it does not count"
+        );
+
+        // Another handle -- same id, different kind -- is its own key.
+        let other = HandleKey::Tls(7);
+        core.spawn_handle_op(other, ops::sleep(60_000));
+        assert!(
+            core.has_inflight(),
+            "unref'ing Tcp(7) said nothing about Tls(7)"
+        );
+        core.set_handle_ref(other, false);
+        assert!(!core.has_inflight());
+        core.set_handle_ref(HandleKey::TcpServer(7), false);
+        assert!(
+            !core.has_inflight(),
+            "a key with nothing in flight is inert"
+        );
+
+        // socket.ref() puts all three of the socket's ops back.
+        core.set_handle_ref(sock, true);
+        assert!(core.has_inflight());
+        core.set_handle_ref(other, true);
+        core.set_handle_ref(sock, false);
+        assert!(core.has_inflight(), "Tls(7) alone still pins the loop");
+        core.set_handle_ref(other, false);
+        assert!(!core.has_inflight());
+    }
+
+    #[test]
+    fn forgetting_a_handle_drops_its_bookkeeping_but_not_its_ops() {
+        let mut core = CoreRuntime::new().unwrap();
+        let sock = HandleKey::Tcp(3);
+        core.spawn_handle_op(sock, ops::sleep(60_000));
+        core.forget_handle(sock);
+        assert!(core.has_inflight(), "a still-running op keeps its ref-ness");
+        assert!(core.handles.is_empty() && core.op_handles.is_empty());
+        // A stale unref() after close reaches nothing that was forgotten,
+        // and leaves no residue once set back.
+        core.set_handle_ref(sock, false);
+        assert!(core.has_inflight());
+        core.set_handle_ref(sock, true);
+        assert!(core.handles.is_empty());
+    }
+
+    #[test]
+    fn a_settled_handle_op_leaves_no_residue() {
+        let mut core = CoreRuntime::new().unwrap();
+        let sock = HandleKey::Tcp(5);
+        core.spawn_handle_op(sock, ops::sleep(5));
+        assert_eq!(core.handles.len(), 1);
+        core.recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("the op settles");
+        assert!(!core.has_inflight());
+        // A referenced key with nothing in flight is the default state: gone.
+        assert!(core.handles.is_empty() && core.op_handles.is_empty());
+        // Flipping it after the fact must not touch `inflight`.
+        core.set_handle_ref(sock, false);
+        core.set_handle_ref(sock, true);
+        assert!(!core.has_inflight());
+        assert!(core.handles.is_empty());
+
+        // Unref'd, the key outlives its ops -- the state must survive the gap
+        // between one parked read and the next -- and is dropped by
+        // forget_handle (the close path).
+        core.set_handle_ref(sock, false);
+        core.spawn_handle_op(sock, ops::sleep(5));
+        assert!(!core.has_inflight());
+        core.recv_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("the op settles");
+        assert_eq!(core.handles.len(), 1, "an unref'd key is remembered");
+        core.spawn_handle_op(sock, ops::sleep(60_000));
+        assert!(!core.has_inflight(), "still unref'd across the gap");
+        core.forget_handle(sock);
+        assert!(core.handles.is_empty() && core.op_handles.is_empty());
+        assert!(
+            !core.has_inflight(),
+            "forgotten while retired: the op stays retired"
+        );
     }
 
     #[test]

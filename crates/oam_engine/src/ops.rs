@@ -8,7 +8,7 @@
 //! resolver on the isolate thread (Done -> undefined, Text -> string,
 //! Failed -> reject with Error).
 
-use oam_core::{CoreRuntime, OpCompletion, OpId, OpOutcome};
+use oam_core::{CoreRuntime, HandleKey, OpCompletion, OpId, OpOutcome};
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -157,12 +157,13 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     global.set(scope, internal_key.into(), internal.into());
 }
 
-/// Spawn `op` and return its promise via `rv`. The shared shape of every
-/// async binding (node_ops fs natives ride it too).
-pub(crate) fn spawn_op(
+/// The shared shape of every async binding (node_ops fs natives ride it
+/// too): create the promise, hand the op to the runtime through `spawn`,
+/// park the resolver under the op id it returns, return the promise via `rv`.
+fn spawn_with(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    op: impl Future<Output = OpOutcome> + Send + 'static,
+    spawn: impl FnOnce(&mut CoreRuntime) -> OpId,
 ) {
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         let message = v8::String::new(scope, "failed to create promise").unwrap();
@@ -173,33 +174,33 @@ pub(crate) fn spawn_op(
     let promise = resolver.get_promise(scope);
     let resolver = v8::Global::new(scope, resolver);
 
-    let id = core_runtime_mut!(scope).spawn_op(op);
+    let id = spawn(core_runtime_mut!(scope));
     pending_ops_mut!(scope).park(id, resolver);
 
     rv.set(promise.into());
 }
 
-/// Like `spawn_op`, but for the `process.stdin` read: the runtime remembers
-/// the op's id so `stdin.unref()` / destroying the stream can retire it while
-/// it is still blocked in the OS (see `CoreRuntime::set_stdin_ref`).
-pub(crate) fn spawn_stdin_op(
+/// Spawn `op` and return its promise via `rv`.
+pub(crate) fn spawn_op(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     op: impl Future<Output = OpOutcome> + Send + 'static,
 ) {
-    let Some(resolver) = v8::PromiseResolver::new(scope) else {
-        let message = v8::String::new(scope, "failed to create promise").unwrap();
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-        return;
-    };
-    let promise = resolver.get_promise(scope);
-    let resolver = v8::Global::new(scope, resolver);
+    spawn_with(scope, rv, |core| core.spawn_op(op));
+}
 
-    let id = core_runtime_mut!(scope).spawn_stdin_op(op);
-    pending_ops_mut!(scope).park(id, resolver);
-
-    rv.set(promise.into());
+/// Like `spawn_op`, but the op belongs to a handle JS can `ref()` /
+/// `unref()` -- a socket's read, a server's accept, the stdin read: it keeps
+/// the event loop alive only while the handle is referenced, and the runtime
+/// remembers it under `key` so a later flip reaches it while it is still
+/// blocked in the OS (see `CoreRuntime::spawn_handle_op`).
+pub(crate) fn spawn_handle_op(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    key: HandleKey,
+    op: impl Future<Output = OpOutcome> + Send + 'static,
+) {
+    spawn_with(scope, rv, |core| core.spawn_handle_op(key, op));
 }
 
 /// Like `spawn_op`, but the op does NOT keep the event loop alive. For
@@ -209,19 +210,7 @@ pub(crate) fn spawn_op_unref(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     op: impl Future<Output = OpOutcome> + Send + 'static,
 ) {
-    let Some(resolver) = v8::PromiseResolver::new(scope) else {
-        let message = v8::String::new(scope, "failed to create promise").unwrap();
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-        return;
-    };
-    let promise = resolver.get_promise(scope);
-    let resolver = v8::Global::new(scope, resolver);
-
-    let id = core_runtime_mut!(scope).spawn_op_unref(op);
-    pending_ops_mut!(scope).park(id, resolver);
-
-    rv.set(promise.into());
+    spawn_with(scope, rv, |core| core.spawn_op_unref(op));
 }
 
 /// `__oam.mapPosition(file, line, column) -> [line, column] | null`:

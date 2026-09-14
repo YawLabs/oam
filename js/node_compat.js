@@ -18447,6 +18447,7 @@
         this.remoteFamily = undefined;
         this.localAddress = undefined;
         this.localPort = undefined;
+        this.localFamily = undefined;
         this.bytesRead = 0;
         this.bytesWritten = 0;
         this.bufferSize = 0;
@@ -18543,7 +18544,13 @@
             if (result.localAddr) {
               this.localAddress = result.localAddr.address;
               this.localPort = result.localAddr.port;
+              this.localFamily = result.localAddr.family;
             }
+            // unref() before the handle existed: node defers it to 'connect'
+            // (Socket.prototype.unref is `this.once('connect', this.unref)`
+            // without a handle); the remembered flag is applied here, before
+            // 'connect' fires and before the first read parks.
+            if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
             this.emit("connect");
             this.emit("ready");
             this._readLoop();
@@ -18811,13 +18818,37 @@
       setKeepAlive() { return this; }
       // Node excludes UNREF'd handles from _getActiveHandles() and
       // getActiveResourcesInfo() (probe-verified: server.unref() removes it
-      // from both). The flag is read by those views; it does not yet affect
-      // oam's loop-liveness, which is native-op driven.
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
-      address() {
-        return { address: this.localAddress, port: this.localPort, family: this.remoteFamily || "IPv4" };
+      // from both); the flag is what those views read. The native call is
+      // what releases the event loop (#140): the socket's parked read stops
+      // counting toward loop-liveness while the socket goes on reading --
+      // data still arrives while something else keeps the process alive,
+      // and ref() puts it back (both probed on v22.22.2). Without a handle
+      // yet, the flag alone is kept and applied the moment the handle
+      // appears -- node's `once('connect', this.unref)` deferral.
+      ref() {
+        this._handleRefed = true;
+        if (this._handle !== null) natives.tcpSetRef(this._handle, true);
+        return this;
       }
+      unref() {
+        this._handleRefed = false;
+        if (this._handle !== null) natives.tcpSetRef(this._handle, false);
+        return this;
+      }
+      // `{}` without a handle -- before connect and again after close --
+      // else the local endpoint in node's key order (probed on v22.22.2).
+      address() {
+        if (this._handle === null) return {};
+        return {
+          address: this.localAddress,
+          family: this.localFamily || this.remoteFamily || "IPv4",
+          port: this.localPort,
+        };
+      }
+      // Node's shape, probed: "open" on a FRESH socket too (readable and
+      // writable, not connecting), "opening" while connecting, "readOnly"
+      // after end(), "writeOnly" once the peer ended a half-open socket,
+      // "closed" after destroy.
       get readyState() {
         if (this.connecting) return "opening";
         if (this.readable && this.writable) return "open";
@@ -18825,7 +18856,9 @@
         if (this.writable) return "writeOnly";
         return "closed";
       }
-      get pending() { return this.connecting; }
+      // Node: `!this._handle || this.connecting` -- true on a fresh socket
+      // and again once the handle is gone, not only while connecting.
+      get pending() { return this._handle === null || this.connecting; }
       pipe(dest) {
         this._pipeHandler = (chunk) => dest.write(chunk);
         this.on("data", this._pipeHandler);
@@ -18892,6 +18925,10 @@
             this._port = bound.port;
             this._host = bound.hostname || hostname;
             this.listening = true;
+            // unref() before listen(): node remembers it (`this._unref`) and
+            // applies it once the handle is bound -- here before the accept
+            // loop parks its first accept.
+            if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
             this._acceptLoop();
           },
@@ -18950,9 +18987,20 @@
       }
 
       getConnections(cb) { if (cb) cb(null, 0); return this; }
-      // Same unref semantics as Socket (see the note there).
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // Same unref semantics as Socket (see the note there): the flag feeds
+      // the active-handle views, the native releases the loop -- node exits
+      // with an unref'd server still listening (probed). Only while bound:
+      // after close() the listener is gone and the runtime has forgotten it.
+      ref() {
+        this._handleRefed = true;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, false);
+        return this;
+      }
     }
 
     function createConnection(options, cb) {
@@ -18961,7 +19009,13 @@
         cb = typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : undefined;
         options = { port: options, host: host };
       }
-      const socket = new Socket();
+      // Node builds the socket FROM the options (`new Socket(options)`), so
+      // `net.connect({ allowHalfOpen: true })` yields a half-open socket and
+      // `timeout` arms the idle timer. A bare `new Socket()` here dropped
+      // both: the peer's FIN then closed the socket where node leaves it
+      // writeOnly.
+      const socket = new Socket(options);
+      if (options.timeout) socket.setTimeout(options.timeout);
       socket.connect(options, cb);
       return socket;
     }
@@ -23956,10 +24010,20 @@
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
       // Node excludes UNREF'd handles from _getActiveHandles() and
-      // getActiveResourcesInfo(); the flag is what those views read (as for
-      // net.Socket, it does not yet affect oam's loop-liveness).
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // getActiveResourcesInfo(); the flag is what those views read. The
+      // native releases the loop, as for net.Socket (#140): the parked read
+      // stops counting, the socket keeps reading. Without a handle the flag
+      // is applied when the connect lands (node's deferral to 'connect').
+      ref() {
+        this._handleRefed = true;
+        if (this._handle !== null) natives.tlsSetRef(this._handle, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this._handle !== null) natives.tlsSetRef(this._handle, false);
+        return this;
+      }
       // `{}` until connected, then Node's key order (probed on v22.22.2).
       address() {
         if (this.localAddress === undefined) return {};
@@ -24095,6 +24159,9 @@
             socket.localFamily = info.localAddr.family;
           }
           if (socket._timeoutMs > 0) socket._resetTimeout();
+          // unref() before the handle existed is applied now, before
+          // 'connect' and before the first read parks (see TLSSocket.unref).
+          if (socket._handleRefed === false) natives.tlsSetRef(info.handle, false);
           socket.emit("connect");
           socket.emit("ready");
           socket.emit("secureConnect");
@@ -24164,6 +24231,8 @@
             this._port = bound.port;
             this._host = bound.hostname || hostname;
             this.listening = true;
+            // unref() before listen(), applied once bound (as net.Server).
+            if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
             this._acceptLoop(bound.serverId, certPem, keyPem);
           },
@@ -24242,9 +24311,18 @@
         return this;
       }
       // Same unref semantics as net.Server: the flag is what the
-      // active-handle views read.
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // active-handle views read, the native (on the listener the accept
+      // loop parks on) releases the loop.
+      ref() {
+        this._handleRefed = true;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, false);
+        return this;
+      }
       getTicketKeys() { return Buffer.alloc(48); }
       setTicketKeys() {}
     }
