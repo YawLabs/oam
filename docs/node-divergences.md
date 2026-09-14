@@ -989,7 +989,7 @@ _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; c
 described; the bare-`connect()` and `socket`-option shapes as described; `unref()` liveness
 measured against a Node-hosted TLS server.
 
-### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and report `ECONNRESET`
+### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written
 
 Windows retransmits the SYN of a connect to a closed loopback port for about 2 s before it
 reports the refusal; libuv turns that off per socket (`SIO_TCP_INITIAL_RTO`, loopback targets
@@ -997,16 +997,20 @@ only), so node's `net`, `tls`, `http` and `fetch` all see `ECONNREFUSED` within 
 oam's `net.connect` and `tls.connect` do the same since #137 (pinned by
 `conformance/cases/101-net-refused-loopback-connect-fast.mjs`). `http.request` and `fetch`
 go through reqwest's connector, which has no way to set that option, so on Windows they still
-wait about 2 s. Independently of the platform, the failure then surfaces as `socket hang up` /
-`ECONNRESET` from `http.request` (reqwest's error text stops at "error sending request", and
-the refusal sits deeper in its source chain, which oam's mapping does not walk) and as a
-`fetch failed` `TypeError` whose `cause` carries no `code`, where node reports
-`connect ECONNREFUSED 127.0.0.1:<port>` in both places. Retry logic that keys on
-`err.code === 'ECONNREFUSED'` does not fire under oam.
+wait about 2 s before reporting the refusal.
 
-_(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms with
-`cause.code` `ECONNREFUSED` / 2033 ms with no code; `http.get` `ECONNREFUSED` at 4 ms /
-`ECONNRESET` at 2024 ms.
+The error itself has node's shape on every platform (`fetch failed` with the transport error
+as `cause`; `errno`, `code`, `syscall`, `address`, `port`; pinned by
+`conformance/cases/102-fetch-http-refused-error-shape.mjs`), with one difference: the
+`address` on it, and in the `connect ECONNREFUSED <address>:<port>` message, is the URL's host
+as written. reqwest does not say which resolved address was refused, so
+`fetch('http://localhost:8080/')` fails with `address: 'localhost'` where node names the IP it
+tried and, for a name with several addresses, reports one error per address inside an
+`AggregateError` (`code` on the aggregate, message empty). An IP literal matches node exactly.
+
+_(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms / 2033 ms,
+`http.get` at 4 ms / 2024 ms; `localhost` gave node an `AggregateError` over `::1` and
+`127.0.0.1`, oam a single `Error` naming `localhost`.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

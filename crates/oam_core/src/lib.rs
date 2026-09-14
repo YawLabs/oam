@@ -3636,6 +3636,83 @@ pub mod ops {
             .map_err(|e| format!("pinned http client: {e}"))
     }
 
+    /// A transport failure from `Client::send`, shaped the way node reports
+    /// it. reqwest's Display stops at "error sending request for url (...)"
+    /// and the refusal, timeout or resolver failure sits deeper in its source
+    /// chain, as the `io::Error` hyper-util's connector wrapped under a "tcp
+    /// connect error" or "dns error" label. Walking to it gives node's `code`
+    /// / `errno` / `syscall` and the message node builds from them: `connect
+    /// ECONNREFUSED 127.0.0.1:8080` or `getaddrinfo ENOTFOUND host`. The host
+    /// is the URL's, as written: the connector does not say which resolved
+    /// address refused, where node names the IP and reports one error per
+    /// address (an AggregateError) for a name with several. Retry logic keys
+    /// on `code`, and used to see `ECONNRESET` (the http client's guess from
+    /// reqwest's text) or nothing at all (fetch). Every other failure keeps
+    /// reqwest's text, uncoded, as before.
+    fn fetch_send_failed(error: reqwest::Error, url: &str) -> OpOutcome {
+        use std::error::Error as _;
+        let mut stage = None;
+        let mut io = None;
+        let mut cur = error.source();
+        while let Some(e) = cur {
+            if let Some(e) = e.downcast_ref::<std::io::Error>() {
+                io = Some(e);
+                break;
+            }
+            let text = e.to_string();
+            if text == "tcp connect error" || text == "dns error" {
+                stage = Some(text);
+            }
+            cur = e.source();
+        }
+        let (Some(stage), Some(io)) = (stage, io) else {
+            return OpOutcome::Failed(format!("{error}"));
+        };
+        let parsed = reqwest::Url::parse(url).ok();
+        // `host_str` keeps the brackets of an IPv6 literal; node's address
+        // and message do not ("connect ECONNREFUSED ::1:8080").
+        let host = parsed
+            .as_ref()
+            .and_then(|u| u.host_str())
+            .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_string())
+            .unwrap_or_default();
+        if stage == "dns error" {
+            // Windows carries WSAHOST_NOT_FOUND / WSATRY_AGAIN on the error;
+            // std builds the unix resolver failure with no OS code at all,
+            // only gai_strerror's text, so "try again" is told apart from
+            // "no such name" by that text.
+            let code = match super::node_error_code(io) {
+                "EAI_AGAIN" => "EAI_AGAIN",
+                _ if io.to_string().contains("Temporary failure") => "EAI_AGAIN",
+                _ => "ENOTFOUND",
+            };
+            let errno = if code == "EAI_AGAIN" { -3001 } else { -3008 };
+            return OpOutcome::node_failed_at(
+                code,
+                format!("getaddrinfo {code} {host}"),
+                "getaddrinfo",
+                None,
+                Some(errno),
+            );
+        }
+        let code = super::node_error_code(io);
+        if code == "EIO" {
+            // Not a network failure the table knows; do not invent a code.
+            return OpOutcome::Failed(format!("{error}"));
+        }
+        let port = parsed
+            .as_ref()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(0);
+        OpOutcome::node_failed_at(
+            code,
+            format!("connect {code} {host}:{port}"),
+            "connect",
+            None,
+            super::node_errno(code, io),
+        )
+    }
+
     /// Streaming fetch: resolves at HEADERS time with the response shape
     /// plus a body handle. The body streams through fetch_body_read one
     /// chunk per op — `for await (const chunk of response.body)` sees
@@ -3698,7 +3775,7 @@ pub mod ops {
         }
         let response = match builder.send().await {
             Ok(r) => r,
-            Err(e) => return OpOutcome::Failed(format!("fetch failed: {e}")),
+            Err(e) => return fetch_send_failed(e, &req.url),
         };
         let status = response.status().as_u16();
         let status_text = response

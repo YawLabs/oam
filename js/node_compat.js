@@ -17986,13 +17986,22 @@
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and reqwest's strings carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
+          // fetch() rejects with the bare "fetch failed" and the transport
+          // error as `cause`: a connect or resolver failure arrives there
+          // already in node's shape (errno, code, syscall, address/port or
+          // hostname) and is emitted as-is; anything else is matched on the
+          // cause's text, which is where reqwest's detail now lives.
+          var cause = err && err.cause;
+          var detail = cause && cause.message ? cause.message : msg;
           var mapped;
-          if (/connection refused|ECONNREFUSED/i.test(msg)) {
+          if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+            mapped = cause;
+          } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
               syscall: "connect",
             });
-          } else if (/error sending request|connection reset|connection closed|IncompleteMessage/i.test(msg)) {
+          } else if (/error sending request|connection reset|connection closed|IncompleteMessage/i.test(detail)) {
             mapped = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
           } else {
             mapped = err instanceof Error ? err : new Error(msg);

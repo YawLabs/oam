@@ -28,8 +28,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   before the `127.0.0.1` attempt. oam's connect now does what libuv does, for
   `net` and `tls` alike; the resolved-address loop and the error shape are
   tokio's, byte for byte. `http` and `fetch` go through reqwest's own
-  connector, which cannot be told this, and keep the 2 s on Windows (recorded
-  in `docs/node-divergences.md`).
+  connector, which cannot be told this, and keep the 2 s on Windows
+  (`docs/node-divergences.md` #35).
+- **`fetch` and `http.request` reported a refused connection as
+  `ECONNRESET`, or with no code at all.** reqwest's error text stops at
+  "error sending request" and the refusal sits deeper in its source chain,
+  so the http client guessed `socket hang up` / `ECONNRESET` from the text
+  and `fetch` rejected with that text as its message and no `cause`; retry
+  logic keyed on `err.code === 'ECONNREFUSED'` never fired, and a hostname
+  that did not resolve looked the same as a dead server. The native op now
+  walks to the connector's `io::Error` and reports node's shape: `fetch`
+  rejects with the bare `TypeError: fetch failed` and the transport error as
+  `cause`, `http.request` emits that error, and both carry `errno`, `code`
+  (`ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, ...), `syscall`
+  and the peer (`address` and `port` for `connect`, `hostname` for
+  `getaddrinfo`), with node's `connect ECONNREFUSED 127.0.0.1:8080` and
+  `getaddrinfo ENOTFOUND host` messages. Pinned by
+  `conformance/cases/102-fetch-http-refused-error-shape.mjs`, byte-identical
+  with node for an IPv4 and an IPv6 refusal and an unresolvable name.
 
 - **A TLS socket lacked the `net.Socket` API, and ioredis crashed over
   `rediss://`** (#132). In Node `tls.TLSSocket` extends `net.Socket`; oam's
