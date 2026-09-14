@@ -42,10 +42,15 @@
 //!   restates the whole list with each relative entry made absolute against
 //!   the user's tsconfig dir.
 //!
-//! * `rootDir` under `composite`. Its default is then the root config's
-//!   directory, so every source is "not under rootDir" (TS6059, probed);
-//!   the wrapper restates TypeScript's own default -- the user's tsconfig
-//!   dir -- when the chain sets `composite` and declares no `rootDir`.
+//! * `rootDir`'s default. TypeScript 7 defaults it to the root config's
+//!   directory (measured: with `outDir` and no `rootDir`, emit lands at
+//!   `dist/src/a.js`), and checks it eagerly whenever an option makes emit
+//!   paths matter -- `outDir`, `declarationDir`, `sourceRoot`, `mapRoot`
+//!   (each measured to report TS6059 through a wrapper in another
+//!   directory, `--noEmit` notwithstanding), and `composite` -- so every
+//!   source was "not under rootDir". The wrapper restates TypeScript's own
+//!   default -- the user's tsconfig dir -- when the chain declares any of
+//!   those and no `rootDir`.
 //!
 //! * `references`, the one top-level key TypeScript excludes from
 //!   inheritance. The wrapper restates the user's own list with absolute
@@ -53,17 +58,31 @@
 //!   oam as it does through `tsc -p` (probed: it checked the reference's
 //!   sources and passed before).
 //!
-//! * `${configDir}` (TypeScript 5.5+), substituted with the root config's
-//!   directory wherever it appears. A base config with
-//!   `"include": ["${configDir}/src"]` matched nothing through the wrapper,
-//!   and the check came back clean with a type error present (probed). The
-//!   template can sit in any path-typed key, so rather than restate them
-//!   all, a chain that uses it gets no wrapper: the check runs against the
-//!   user's tsconfig, with TS2307 on `oam:` imports, which is honest.
+//! * `${configDir}` (TypeScript 5.5+): "the directory of the ROOT config",
+//!   substituted wherever a path-typed value STARTS with it -- and through
+//!   the wrapper that is the wrapper's directory, so a base config's
+//!   `"include": ["${configDir}/src"]` matched nothing and the check came
+//!   back clean with a type error present (probed). The wrapper restates
+//!   every key whose effective value names the template, substituted with
+//!   the user's tsconfig dir, and any other relative entry of that key made
+//!   absolute against the config that declared it. Which keys, measured on
+//!   tsgo (`--showConfig` through a wrapper in another directory shows what
+//!   moved): `files`, `include`, `exclude`, and of compilerOptions `outDir`,
+//!   `declarationDir`, `rootDir`, `rootDirs`, `outFile`, `tsBuildInfoFile`,
+//!   `baseUrl`, `generateTrace`, `typeRoots` and the values of `paths`. NOT
+//!   substituted, so nothing to restate: `types` (a template entry is looked
+//!   up as a package name, and fails as one), `references[].path` (the
+//!   literal directory, TS6053), `mapRoot` and `sourceRoot` (emitted
+//!   verbatim). Two quirks the wrapper mirrors: the template is recognized
+//!   without regard to case but replaced only in its exact spelling, so
+//!   `${CONFIGDIR}/x` keeps its text and is resolved against the root dir
+//!   instead of the declaring config's; and it counts only at the START of
+//!   a value -- `sub/${configDir}/x` is a literal directory name, resolved
+//!   against the declaring config like any other relative entry.
 //!
 //! Those are the only places this file reimplements tsc's config semantics,
-//! and they are why `read_chain` reports which keys the chain declares
-//! rather than what they contain.
+//! and they are why `read_chain` reports which keys the chain declares, and
+//! resolves only the entries the wrapper may have to restate.
 //!
 //! WHERE the wrapper lives matters for the same reason (issue #130). A bare
 //! `types` entry -- `"node"` -- is looked up from the root config's
@@ -94,9 +113,31 @@
 //! plumbing. `OAM_DEBUG=1` says when, and why, a check ran without the
 //! wrapper.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::daemon::{cache_root, fnv1a64, project_key, resolve_extends, strip_jsonc};
+
+/// TypeScript 5.5's template for the ROOT config's directory (module docs).
+const CONFIG_DIR_TEMPLATE: &str = "${configDir}";
+
+/// The string-valued path-typed compilerOptions tsgo substitutes the template
+/// in (module docs, measured). `baseUrl` and `outFile` stay on the list
+/// although TypeScript 7 rejects them outright (TS5102): the substitution
+/// still runs before the rejection, and restating them keeps the report the
+/// user's own tsconfig gets.
+const PATH_OPTIONS: [&str; 7] = [
+    "outDir",
+    "declarationDir",
+    "rootDir",
+    "outFile",
+    "tsBuildInfoFile",
+    "baseUrl",
+    "generateTrace",
+];
+
+/// The list-valued ones.
+const PATH_LIST_OPTIONS: [&str; 2] = ["rootDirs", "typeRoots"];
 
 /// The declarations, compiled in. Not read from disk at runtime: an
 /// installed oam is a single binary with no data directory beside it.
@@ -255,6 +296,33 @@ fn prune_older_declarations(keep: &Path) {
     }
 }
 
+/// One path-typed value, resolved the way tsc resolves it when the user's
+/// tsconfig is the root of the compilation (`resolve_entry`).
+#[derive(Debug, PartialEq)]
+struct PathValue {
+    path: PathBuf,
+    /// The value named `${configDir}`. Inherited through the wrapper it
+    /// would resolve against the wrapper's directory, so it is restated.
+    config_dir: bool,
+}
+
+/// A path-typed list, resolved the same way.
+#[derive(Default, Debug, PartialEq)]
+struct PathList {
+    entries: Vec<PathBuf>,
+    /// Some entry named `${configDir}`: the whole list is restated, since a
+    /// key is inherited or replaced as a unit.
+    config_dir: bool,
+}
+
+/// `compilerOptions.paths` with its values resolved (`paths_map`), in the
+/// shape the wrapper writes.
+#[derive(Default, Debug, PartialEq)]
+struct PathsMap {
+    map: serde_json::Map<String, serde_json::Value>,
+    config_dir: bool,
+}
+
 /// What the wrapper needs to know about the user's `extends` chain.
 #[derive(Default)]
 struct ChainFacts {
@@ -262,12 +330,26 @@ struct ChainFacts {
     /// `Some(vec![])` for a solution-style `"files": []` -- declaring the
     /// key is what suppresses the default glob, not the entries in it.
     files: Option<Vec<PathBuf>>,
-    declares_include: bool,
-    declares_exclude: bool,
-    /// `outDir` / `declarationDir`, absolute. Part of tsc's default exclude,
-    /// so the restated default has to name them or a project that emits into
-    /// its own tree would type-check its own output.
-    out_dirs: Vec<PathBuf>,
+    /// `include` / `exclude` of the nearest config that declares each.
+    /// Declared means inherited untouched -- unless an entry names
+    /// `${configDir}`, when the list is restated (module docs).
+    include: Option<PathList>,
+    exclude: Option<PathList>,
+    /// The string-valued path-typed compilerOptions (`PATH_OPTIONS`), the
+    /// nearest declaration per key. `outDir` / `declarationDir` are part of
+    /// tsc's default exclude, so the restated default has to name them or a
+    /// project that emits into its own tree would type-check its own
+    /// output; a declared `rootDir` is inherited, resolved against the
+    /// config that declared it, so no default to restate
+    /// (`needs_root_dir_default`); and any of them naming `${configDir}`
+    /// is restated.
+    path_options: BTreeMap<&'static str, PathValue>,
+    /// The list-valued ones (`PATH_LIST_OPTIONS`), restated when an entry
+    /// names `${configDir}`.
+    path_lists: BTreeMap<&'static str, PathList>,
+    /// `compilerOptions.paths` of the nearest config that declares it,
+    /// restated when a value names `${configDir}`.
+    paths: Option<PathsMap>,
     /// The `compilerOptions.types` list of the nearest config that declares
     /// one, verbatim. A relative entry resolves against the ROOT config
     /// (module docs), so the wrapper restates it absolute against the user's
@@ -276,14 +358,132 @@ struct ChainFacts {
     types: Option<Vec<String>>,
     /// `compilerOptions.composite` of the nearest config that declares it.
     composite: Option<bool>,
-    /// Some config in the chain declares `rootDir`: inherited, and resolved
-    /// against the config that declared it, so nothing to restate.
-    declares_root_dir: bool,
+    /// Some config in the chain declares `sourceRoot` or `mapRoot`: neither
+    /// is a path to resolve (module docs), but either makes tsc check
+    /// `rootDir` eagerly.
+    declares_emit_roots: bool,
     /// The user's tsconfig's own `references`, absolute. Only the root
     /// config's apply (module docs), so only the leaf's are read.
     references: Vec<PathBuf>,
-    /// A config in the chain uses `${configDir}` (module docs): no wrapper.
-    uses_config_dir: bool,
+}
+
+impl ChainFacts {
+    /// The chain leaves `rootDir` to its default -- the ROOT config's
+    /// directory in TypeScript 7 -- and declares something that makes tsc
+    /// check it (module docs): the wrapper has to restate the default for
+    /// the user's config, or every source is "not under rootDir" (TS6059).
+    fn needs_root_dir_default(&self) -> bool {
+        !self.path_options.contains_key("rootDir")
+            && (self.composite == Some(true)
+                || self.declares_emit_roots
+                || ["outDir", "declarationDir"]
+                    .iter()
+                    .any(|key| self.path_options.contains_key(key)))
+    }
+
+    /// The keys whose effective value names `${configDir}` -- what the
+    /// wrapper restates on that account.
+    fn config_dir_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.include.as_ref().is_some_and(|list| list.config_dir) {
+            keys.push("include");
+        }
+        if self.exclude.as_ref().is_some_and(|list| list.config_dir) {
+            keys.push("exclude");
+        }
+        keys.extend(
+            self.path_options
+                .iter()
+                .filter(|(_, value)| value.config_dir)
+                .map(|(key, _)| *key),
+        );
+        keys.extend(
+            self.path_lists
+                .iter()
+                .filter(|(_, list)| list.config_dir)
+                .map(|(key, _)| *key),
+        );
+        if self.paths.as_ref().is_some_and(|paths| paths.config_dir) {
+            keys.push("paths");
+        }
+        keys
+    }
+}
+
+/// TypeScript's own test for the template (`startsWithConfigDirTemplate`):
+/// at the start of the value, compared without regard to case.
+fn names_config_dir(entry: &str) -> bool {
+    entry
+        .get(..CONFIG_DIR_TEMPLATE.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(CONFIG_DIR_TEMPLATE))
+}
+
+/// One entry of a path-typed key, resolved as tsc resolves it when the
+/// user's tsconfig is the root of the compilation: `${configDir}` at the
+/// start means `root`; anything else is relative to `dir`, the config that
+/// declared it (and a rooted path is itself). Only the exact spelling is
+/// replaced -- any other capitalisation passes tsc's test but not its
+/// replacement, so the text is kept and just the base moves to `root`
+/// (measured: `${CONFIGDIR}/upper` resolves to `<root>/${CONFIGDIR}/upper`).
+fn resolve_entry(entry: &str, dir: &Path, root: &Path) -> PathValue {
+    if names_config_dir(entry) {
+        let rest = entry
+            .strip_prefix(CONFIG_DIR_TEMPLATE)
+            .map_or(entry, |rest| rest.trim_start_matches(['/', '\\']));
+        PathValue {
+            path: crate::normalize_path(&root.join(rest)),
+            config_dir: true,
+        }
+    } else {
+        PathValue {
+            path: crate::normalize_path(&dir.join(entry)),
+            config_dir: false,
+        }
+    }
+}
+
+fn path_list(list: &[serde_json::Value], dir: &Path, root: &Path) -> PathList {
+    let mut out = PathList::default();
+    for entry in list.iter().filter_map(serde_json::Value::as_str) {
+        let value = resolve_entry(entry, dir, root);
+        out.config_dir |= value.config_dir;
+        out.entries.push(value.path);
+    }
+    out
+}
+
+/// `paths` values, each resolved like any other path-typed entry -- against
+/// the config that declared the map, `baseUrl` (the other base) being gone
+/// in TypeScript 7 -- except one that is neither relative nor rooted
+/// (`lib/*`): tsgo reports TS5090 for it whatever it resolves to, and only
+/// the verbatim text keeps that report. Anything that is not a string passes
+/// through for tsgo to reject as it would.
+fn paths_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    dir: &Path,
+    root: &Path,
+) -> PathsMap {
+    let mut out = PathsMap::default();
+    for (pattern, targets) in map {
+        let restated = match targets {
+            serde_json::Value::Array(targets) => serde_json::Value::Array(
+                targets
+                    .iter()
+                    .map(|target| match target.as_str() {
+                        Some(text) if names_config_dir(text) || is_relative_path(text) => {
+                            let value = resolve_entry(text, dir, root);
+                            out.config_dir |= value.config_dir;
+                            serde_json::Value::String(json_path(&value.path))
+                        }
+                        _ => target.clone(),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        };
+        out.map.insert(pattern.clone(), restated);
+    }
+    out
 }
 
 /// Read `tsconfig` and everything it extends, in TypeScript's precedence
@@ -296,13 +496,21 @@ struct ChainFacts {
 /// runs the check with no declarations rather than guessing at a file set,
 /// because guessing wrong drops the user's own sources out of the program.
 fn read_chain(tsconfig: &Path) -> Option<ChainFacts> {
+    // The root of the compilation `tsc -p tsconfig.json` would run, which is
+    // what `${configDir}` means whichever config in the chain says it.
+    let root = tsconfig.parent()?;
     let mut facts = ChainFacts::default();
     let mut seen: Vec<PathBuf> = Vec::new();
-    visit(tsconfig, &mut facts, &mut seen)?;
+    visit(tsconfig, root, &mut facts, &mut seen)?;
     Some(facts)
 }
 
-fn visit(config: &Path, facts: &mut ChainFacts, seen: &mut Vec<PathBuf>) -> Option<()> {
+fn visit(
+    config: &Path,
+    root: &Path,
+    facts: &mut ChainFacts,
+    seen: &mut Vec<PathBuf>,
+) -> Option<()> {
     let leaf = seen.is_empty();
     // Cycle guard and depth cap, matching daemon::tsconfig_chain: a config
     // that extends itself is a user error tsgo reports, not a reason for the
@@ -313,41 +521,52 @@ fn visit(config: &Path, facts: &mut ChainFacts, seen: &mut Vec<PathBuf>) -> Opti
     seen.push(config.to_path_buf());
     let dir = config.parent()?;
     let raw = std::fs::read_to_string(config).ok()?;
-    // The raw text, not the parsed value: the template can sit in any
-    // path-typed key, and one inside a comment costs only a wrapper-less
-    // check, which is the safe side.
-    facts.uses_config_dir |= raw.contains("${configDir}");
     let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&raw)).ok()?;
 
     if facts.files.is_none()
         && let Some(files) = json.get("files").and_then(serde_json::Value::as_array)
     {
-        facts.files = Some(
-            files
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(|entry| crate::normalize_path(&dir.join(entry)))
-                .collect(),
-        );
+        facts.files = Some(path_list(files, dir, root).entries);
     }
-    facts.declares_include |= json.get("include").is_some();
-    facts.declares_exclude |= json.get("exclude").is_some();
-    for key in ["outDir", "declarationDir"] {
-        if let Some(value) = json
-            .pointer("/compilerOptions")
-            .and_then(|options| options.get(key))
-            .and_then(serde_json::Value::as_str)
-        {
-            facts.out_dirs.push(crate::normalize_path(&dir.join(value)));
-        }
+    if facts.include.is_none()
+        && let Some(include) = json.get("include").and_then(serde_json::Value::as_array)
+    {
+        facts.include = Some(path_list(include, dir, root));
+    }
+    if facts.exclude.is_none()
+        && let Some(exclude) = json.get("exclude").and_then(serde_json::Value::as_array)
+    {
+        facts.exclude = Some(path_list(exclude, dir, root));
     }
     // Nearest declaration wins, like `files`: compilerOptions merge per key,
-    // so a leaf's `types` replaces a base's outright (probed for an
-    // `extends` array too: the later entry's list replaces the earlier's).
+    // so a leaf's `types` (or `paths`, or `outDir`) replaces a base's
+    // outright (probed for an `extends` array too: the later entry's list
+    // replaces the earlier's).
+    let options = json.get("compilerOptions");
+    let option = |key: &str| options.and_then(|options| options.get(key));
+    for key in PATH_OPTIONS {
+        if !facts.path_options.contains_key(key)
+            && let Some(value) = option(key).and_then(serde_json::Value::as_str)
+        {
+            facts
+                .path_options
+                .insert(key, resolve_entry(value, dir, root));
+        }
+    }
+    for key in PATH_LIST_OPTIONS {
+        if !facts.path_lists.contains_key(key)
+            && let Some(list) = option(key).and_then(serde_json::Value::as_array)
+        {
+            facts.path_lists.insert(key, path_list(list, dir, root));
+        }
+    }
+    if facts.paths.is_none()
+        && let Some(map) = option("paths").and_then(serde_json::Value::as_object)
+    {
+        facts.paths = Some(paths_map(map, dir, root));
+    }
     if facts.types.is_none()
-        && let Some(types) = json
-            .pointer("/compilerOptions/types")
-            .and_then(serde_json::Value::as_array)
+        && let Some(types) = option("types").and_then(serde_json::Value::as_array)
     {
         facts.types = Some(
             types
@@ -358,13 +577,11 @@ fn visit(config: &Path, facts: &mut ChainFacts, seen: &mut Vec<PathBuf>) -> Opti
         );
     }
     if facts.composite.is_none()
-        && let Some(composite) = json
-            .pointer("/compilerOptions/composite")
-            .and_then(serde_json::Value::as_bool)
+        && let Some(composite) = option("composite").and_then(serde_json::Value::as_bool)
     {
         facts.composite = Some(composite);
     }
-    facts.declares_root_dir |= json.pointer("/compilerOptions/rootDir").is_some();
+    facts.declares_emit_roots |= option("sourceRoot").is_some() || option("mapRoot").is_some();
     if leaf && let Some(references) = json.get("references").and_then(serde_json::Value::as_array) {
         facts.references = references
             .iter()
@@ -388,7 +605,7 @@ fn visit(config: &Path, facts: &mut ChainFacts, seen: &mut Vec<PathBuf>) -> Opti
         // report; skipping it here only means the wrapper learns nothing
         // from it, which is the same as it declaring no keys.
         if let Some(path) = resolve_extends(dir, spec) {
-            visit(&path, facts, seen)?;
+            visit(&path, root, facts, seen)?;
         }
     }
     Some(())
@@ -407,11 +624,12 @@ fn json_path(path: &Path) -> String {
     }
 }
 
-/// TypeScript's own test for a `types` entry that names a RELATIVE path
-/// (`pathIsRelative`): `.` or `..` alone, or either followed by a separator.
-/// A rooted path needs no restating, and a package name like `node` is
-/// looked up, not joined.
-fn is_relative_types_entry(entry: &str) -> bool {
+/// TypeScript's own `pathIsRelative`: `.` or `..` alone, or either followed
+/// by a separator. What a `types` entry has to look like to name a FILE
+/// rather than a package (a rooted path needs no restating, and a package
+/// name like `node` is looked up, not joined), and what a `paths` value has
+/// to look like for TypeScript 7 not to report TS5090.
+fn is_relative_path(entry: &str) -> bool {
     match entry.strip_prefix("..").or_else(|| entry.strip_prefix('.')) {
         Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'),
         None => false,
@@ -424,7 +642,7 @@ fn is_relative_types_entry(entry: &str) -> bool {
 /// relative or rooted entry names a file and resolves the same from
 /// anywhere once restated.
 fn is_package_types_entry(entry: &str) -> bool {
-    !is_relative_types_entry(entry) && !Path::new(entry).has_root()
+    !is_relative_path(entry) && !Path::new(entry).has_root()
 }
 
 /// The wrapper config's text: `extends` the user's, plus the declarations as
@@ -452,12 +670,12 @@ fn wrapper_json(tsconfig: &Path, declarations: &Path, facts: &ChainFacts) -> Str
     // config was the root, whichever config in the chain declared it. A
     // list of package names alone is left to inheritance untouched.
     if let Some(types) = &facts.types
-        && types.iter().any(|entry| is_relative_types_entry(entry))
+        && types.iter().any(|entry| is_relative_path(entry))
     {
         let restated: Vec<String> = types
             .iter()
             .map(|entry| {
-                if is_relative_types_entry(entry) {
+                if is_relative_path(entry) {
                     json_path(&crate::normalize_path(&project.join(entry)))
                 } else {
                     entry.clone()
@@ -466,9 +684,30 @@ fn wrapper_json(tsconfig: &Path, declarations: &Path, facts: &ChainFacts) -> Str
             .collect();
         options.insert("types".into(), serde_json::json!(restated));
     }
-    // `composite` defaults `rootDir` to the root config's directory, which
-    // would be ours: restate TypeScript's own default for the user's config.
-    if facts.composite == Some(true) && !facts.declares_root_dir {
+    // A path-typed option naming `${configDir}` would be substituted with
+    // THIS file's directory (module docs): restate it resolved, the user's
+    // tsconfig dir standing in for the template. One that does not is
+    // inherited untouched, resolved against the config that declared it.
+    for (key, value) in &facts.path_options {
+        if value.config_dir {
+            options.insert((*key).into(), serde_json::json!(json_path(&value.path)));
+        }
+    }
+    for (key, list) in &facts.path_lists {
+        if list.config_dir {
+            let entries: Vec<String> = list.entries.iter().map(|path| json_path(path)).collect();
+            options.insert((*key).into(), serde_json::json!(entries));
+        }
+    }
+    if let Some(paths) = &facts.paths
+        && paths.config_dir
+    {
+        options.insert("paths".into(), serde_json::Value::Object(paths.map.clone()));
+    }
+    // `rootDir` defaults to the root config's directory, which would be
+    // ours: restate TypeScript's own default for the user's config wherever
+    // tsc would check it (module docs).
+    if facts.needs_root_dir_default() {
         options.insert("rootDir".into(), serde_json::json!(json_path(project)));
     }
     if !options.is_empty() {
@@ -484,21 +723,43 @@ fn wrapper_json(tsconfig: &Path, declarations: &Path, facts: &ChainFacts) -> Str
                 .collect(),
         );
     }
-    // The chain declares neither key, so its program is tsc's default glob
-    // -- which our `files` would otherwise suppress. Restate it.
-    if facts.files.is_none() && !facts.declares_include {
-        wrapper["include"] = serde_json::json!([format!("{}/**/*", json_path(project))]);
-        // Only when the chain declares no exclude of its own: an exclude
+    let restated = |list: &PathList| -> serde_json::Value {
+        let entries: Vec<String> = list.entries.iter().map(|path| json_path(path)).collect();
+        serde_json::json!(entries)
+    };
+    match &facts.include {
+        // An include naming `${configDir}` would match under THIS file's
+        // directory (module docs): restate it resolved.
+        Some(include) if include.config_dir => wrapper["include"] = restated(include),
+        // Declared without it: inherited, resolved against its own config.
+        Some(_) => {}
+        // The chain declares neither key, so its program is tsc's default
+        // glob -- which our `files` would otherwise suppress. Restate it.
+        None if facts.files.is_none() => {
+            wrapper["include"] = serde_json::json!([format!("{}/**/*", json_path(project))]);
+        }
+        None => {}
+    }
+    match &facts.exclude {
+        Some(exclude) if exclude.config_dir => wrapper["exclude"] = restated(exclude),
+        Some(_) => {}
+        // With the default glob restated above, and only then: an exclude
         // here would override theirs, and tsc's defaults do not apply once a
         // config declares one.
-        if !facts.declares_exclude {
+        None if facts.files.is_none() && facts.include.is_none() => {
             let mut exclude: Vec<String> = ["node_modules", "bower_components", "jspm_packages"]
                 .iter()
                 .map(|dir| json_path(&project.join(dir)))
                 .collect();
-            exclude.extend(facts.out_dirs.iter().map(|path| json_path(path)));
+            exclude.extend(
+                ["outDir", "declarationDir"]
+                    .iter()
+                    .filter_map(|key| facts.path_options.get(key))
+                    .map(|value| json_path(&value.path)),
+            );
             wrapper["exclude"] = serde_json::json!(exclude);
         }
+        None => {}
     }
     serde_json::to_string_pretty(&wrapper).unwrap_or_default()
 }
@@ -515,12 +776,13 @@ fn wrapper_json(tsconfig: &Path, declarations: &Path, facts: &ChainFacts) -> Str
 /// without them.
 pub(crate) fn project_config(tsconfig: &Path) -> Option<PathBuf> {
     let facts = read_chain(tsconfig)?;
-    if facts.uses_config_dir {
+    let config_dir_keys = facts.config_dir_keys();
+    if !config_dir_keys.is_empty() {
         crate::debug(format_args!(
-            "{} uses ${{configDir}}, which a wrapper config cannot preserve; checking without oam's declarations",
-            tsconfig.display()
+            "{} names ${{configDir}} in {}; the wrapper restates each against the project dir",
+            tsconfig.display(),
+            config_dir_keys.join(", ")
         ));
-        return None;
     }
     let declarations = declarations_file()?;
     let name = format!("project-{}.json", project_key(tsconfig));
@@ -606,7 +868,7 @@ mod tests {
         let tsconfig = dir.join("tsconfig.json");
         let dts = dir.join("oam.d.ts");
         let facts = ChainFacts {
-            declares_include: true,
+            include: Some(PathList::default()),
             ..Default::default()
         };
         let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
@@ -626,7 +888,7 @@ mod tests {
         let tsconfig = dir.join("tsconfig.json");
         let dts = dir.join("oam.d.ts");
         let packages = ChainFacts {
-            declares_include: true,
+            include: Some(PathList::default()),
             types: Some(vec!["node".into(), "vitest/globals".into()]),
             ..Default::default()
         };
@@ -659,17 +921,17 @@ mod tests {
     }
 
     #[test]
-    fn relative_types_entries_are_typescripts_definition_not_a_substring_test() {
+    fn relative_entries_are_typescripts_definition_not_a_substring_test() {
         for entry in [".", "..", "./x", "../x", ".\\x", "..\\x"] {
-            assert!(is_relative_types_entry(entry), "{entry}");
+            assert!(is_relative_path(entry), "{entry}");
             assert!(!is_package_types_entry(entry), "{entry}");
         }
         for entry in ["node", ".hidden", "...", "@types/node", "vitest/globals"] {
-            assert!(!is_relative_types_entry(entry), "{entry}");
+            assert!(!is_relative_path(entry), "{entry}");
             assert!(is_package_types_entry(entry), "{entry}");
         }
         for entry in ["/abs", if cfg!(windows) { "C:/abs" } else { "/abs/x" }] {
-            assert!(!is_relative_types_entry(entry), "{entry}");
+            assert!(!is_relative_path(entry), "{entry}");
             assert!(!is_package_types_entry(entry), "{entry} is rooted");
         }
     }
@@ -680,7 +942,7 @@ mod tests {
         let tsconfig = dir.join("tsconfig.json");
         let dts = dir.join("oam.d.ts");
         let composite = ChainFacts {
-            declares_include: true,
+            include: Some(PathList::default()),
             composite: Some(true),
             references: vec![dir.join("lib"), dir.join("..").join("shared")],
             ..Default::default()
@@ -699,20 +961,76 @@ mod tests {
             ]),
             "{wrapper}"
         );
-        // A declared rootDir is inherited (resolved against its own config)
-        // and composite: false has no default to restate.
+        // The same default whenever tsc checks rootDir eagerly (module
+        // docs): an out dir or a declaration dir, or sourceRoot / mapRoot.
+        let plain = |key: &'static str| {
+            BTreeMap::from([(
+                key,
+                PathValue {
+                    path: dir.join("dist"),
+                    config_dir: false,
+                },
+            )])
+        };
         for facts in [
             ChainFacts {
-                declares_root_dir: true,
+                include: Some(PathList::default()),
+                path_options: plain("outDir"),
+                ..Default::default()
+            },
+            ChainFacts {
+                include: Some(PathList::default()),
+                path_options: plain("declarationDir"),
+                ..Default::default()
+            },
+            ChainFacts {
+                include: Some(PathList::default()),
+                declares_emit_roots: true,
+                ..Default::default()
+            },
+        ] {
+            let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
+            assert_eq!(
+                wrapper["compilerOptions"]["rootDir"],
+                json_path(&dir),
+                "{wrapper}"
+            );
+        }
+        // A declared rootDir is inherited (resolved against its own config);
+        // composite: false has no default to restate; and a chain that
+        // declares none of the triggers gets no rootDir either -- the
+        // default is never checked, and the wrapper stays what it was.
+        for facts in [
+            ChainFacts {
+                path_options: BTreeMap::from([
+                    (
+                        "rootDir",
+                        PathValue {
+                            path: dir.join("src"),
+                            config_dir: false,
+                        },
+                    ),
+                    (
+                        "outDir",
+                        PathValue {
+                            path: dir.join("dist"),
+                            config_dir: false,
+                        },
+                    ),
+                ]),
                 ..ChainFacts {
-                    declares_include: true,
+                    include: Some(PathList::default()),
                     composite: Some(true),
                     ..Default::default()
                 }
             },
             ChainFacts {
-                declares_include: true,
+                include: Some(PathList::default()),
                 composite: Some(false),
+                ..Default::default()
+            },
+            ChainFacts {
+                include: Some(PathList::default()),
                 ..Default::default()
             },
         ] {
@@ -727,7 +1045,13 @@ mod tests {
         let tsconfig = dir.join("tsconfig.json");
         let dts = dir.join("oam.d.ts");
         let facts = ChainFacts {
-            out_dirs: vec![dir.join("dist")],
+            path_options: BTreeMap::from([(
+                "outDir",
+                PathValue {
+                    path: dir.join("dist"),
+                    config_dir: false,
+                },
+            )]),
             ..Default::default()
         };
         let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
@@ -751,7 +1075,7 @@ mod tests {
         let dts = dir.join("oam.d.ts");
         let facts = ChainFacts {
             files: Some(vec![dir.join("main.ts")]),
-            declares_exclude: true,
+            exclude: Some(PathList::default()),
             ..Default::default()
         };
         let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
@@ -794,11 +1118,21 @@ mod tests {
             Some(vec![crate::normalize_path(&dir.join("leaf.ts"))]),
             "the leaf's files wins over the base's"
         );
-        assert!(facts.declares_exclude, "the base's exclude still counts");
-        assert!(!facts.declares_include);
         assert_eq!(
-            facts.out_dirs,
-            vec![crate::normalize_path(&dir.join("cfg").join("out"))],
+            facts.exclude,
+            Some(PathList {
+                entries: vec![crate::normalize_path(&dir.join("cfg").join("x"))],
+                config_dir: false,
+            }),
+            "the base's exclude still counts, resolved against the config that declared it"
+        );
+        assert!(facts.include.is_none());
+        assert_eq!(
+            facts.path_options.get("outDir"),
+            Some(&PathValue {
+                path: crate::normalize_path(&dir.join("cfg").join("out")),
+                config_dir: false,
+            }),
             "outDir resolves against the config that declared it"
         );
         assert_eq!(
@@ -807,7 +1141,7 @@ mod tests {
             "types is recorded verbatim; a relative entry is root-relative, not base-relative"
         );
         assert_eq!(facts.composite, Some(true), "inherited from the base");
-        assert!(!facts.declares_root_dir);
+        assert!(!facts.path_options.contains_key("rootDir"));
         assert_eq!(
             facts.references,
             vec![
@@ -816,7 +1150,7 @@ mod tests {
             ],
             "only the LEAF's references count, and only entries with a path"
         );
-        assert!(!facts.uses_config_dir);
+        assert!(facts.config_dir_keys().is_empty());
 
         // A leaf `types` replaces the base's outright, even when empty; a
         // leaf `composite: false` beats the base's true; a rootDir anywhere
@@ -830,29 +1164,392 @@ mod tests {
         let facts = read_chain(&tsconfig).expect("parses");
         assert_eq!(facts.types, Some(Vec::new()));
         assert_eq!(facts.composite, Some(false));
-        assert!(facts.declares_root_dir);
+        assert_eq!(
+            facts.path_options.get("rootDir"),
+            Some(&PathValue {
+                path: crate::normalize_path(&dir),
+                config_dir: false,
+            })
+        );
         assert!(facts.references.is_empty(), "the base's are never read");
     }
 
     #[test]
-    fn chain_using_config_dir_gets_no_wrapper() {
-        // `${configDir}` would substitute the wrapper's directory; a chain
-        // that uses it is checked bare rather than through a wrong program.
-        let dir = scratch("decls-configdir");
-        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+    fn entries_resolve_the_template_the_way_typescript_does() {
+        let root = scratch("decls-resolve");
+        let declaring = root.join("node_modules").join("@acme").join("tsconfig");
+        let resolved = |entry: &str| resolve_entry(entry, &declaring, &root);
+        let at = |base: &Path, rest: &str| crate::normalize_path(&base.join(rest));
+        // The exact spelling at the start: the root config's directory,
+        // whichever config declared it -- and only that spelling.
+        for (entry, path) in [
+            ("${configDir}/src", at(&root, "src")),
+            ("${configDir}", crate::normalize_path(&root)),
+            ("${configDir}/", crate::normalize_path(&root)),
+            ("${configDir}src", at(&root, "src")),
+            ("${configDir}/../sibling", at(&root, "../sibling")),
+        ] {
+            assert_eq!(
+                resolved(entry),
+                PathValue {
+                    path,
+                    config_dir: true
+                },
+                "{entry}"
+            );
+        }
+        // Any other capitalisation passes TypeScript's test but not its
+        // replacement (measured): the text stays, the base moves to root.
+        for entry in ["${CONFIGDIR}/upper", "${ConfigDir}/c"] {
+            assert_eq!(
+                resolved(entry),
+                PathValue {
+                    path: at(&root, entry),
+                    config_dir: true
+                },
+                "{entry}"
+            );
+        }
+        // Not at the start: a literal directory name, relative to the
+        // config that declared it like any other entry.
+        for entry in ["sub/${configDir}/x", "./${configDir}", "plain/dir", "."] {
+            assert_eq!(
+                resolved(entry),
+                PathValue {
+                    path: at(&declaring, entry),
+                    config_dir: false
+                },
+                "{entry}"
+            );
+        }
+        // A rooted entry is itself.
+        let rooted = if cfg!(windows) {
+            "C:/elsewhere"
+        } else {
+            "/elsewhere"
+        };
+        assert_eq!(resolved(rooted).path, PathBuf::from(rooted));
+        assert!(names_config_dir("${configdir}x"));
+        assert!(!names_config_dir("${configDi"));
+        assert!(!names_config_dir(""));
+    }
+
+    #[test]
+    fn chain_records_the_template_per_key_with_the_nearest_declaration_winning() {
+        // A shared base under node_modules names the template everywhere it
+        // can; a middle config names it in one key; the leaf overrides one
+        // of the base's. Every key is read leaf-first, and only the keys
+        // whose EFFECTIVE value names the template are flagged.
+        let dir = scratch("decls-template");
+        let base_dir = dir.join("node_modules").join("@acme").join("tsconfig");
+        std::fs::create_dir_all(&base_dir).unwrap();
         std::fs::write(
-            dir.join("base.json"),
-            r#"{ "include": ["${configDir}/src"] }"#,
+            base_dir.join("base.json"),
+            r#"{
+                "compilerOptions": {
+                    "outDir": "${configDir}/dist",
+                    "declarationDir": "types-out",
+                    "rootDir": "${configDir}",
+                    "tsBuildInfoFile": "${configDir}/.cache/tsbuildinfo",
+                    "rootDirs": ["${configDir}/src", "gen"],
+                    "typeRoots": ["${configDir}/typings", "more"],
+                    "paths": { "@lib/*": ["${configDir}/lib/*"], "@rel/*": ["./rel/*"], "@bare/*": ["bare/*"], "@root/*": ["/rooted/*"], "@odd": 1 },
+                    "types": ["${configDir}/typings/mine"]
+                },
+                "files": ["${configDir}/src/main.ts", "extra.ts"],
+                "include": ["${configDir}/src"],
+                "exclude": ["${configDir}/src/skipped", "tmp"]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tsconfig.middle.json"),
+            r#"{ "extends": "@acme/tsconfig/base.json",
+                "compilerOptions": { "outDir": "build", "typeRoots": ["mine"] } }"#,
         )
         .unwrap();
         let tsconfig = dir.join("tsconfig.json");
-        std::fs::write(&tsconfig, r#"{ "extends": "./base.json" }"#).unwrap();
-        assert!(read_chain(&tsconfig).unwrap().uses_config_dir);
-        assert!(project_config(&tsconfig).is_none());
-        assert!(
-            !dir.join("node_modules").join(".oam").exists(),
-            "nothing written for a chain that gets no wrapper"
+        std::fs::write(
+            &tsconfig,
+            r#"{ "extends": "./tsconfig.middle.json", "include": ["app"] }"#,
+        )
+        .unwrap();
+        let facts = read_chain(&tsconfig).expect("parses");
+        let at = |base: &Path, rest: &str| crate::normalize_path(&base.join(rest));
+
+        assert_eq!(
+            facts.files,
+            Some(vec![at(&dir, "src/main.ts"), at(&base_dir, "extra.ts")]),
+            "the template means the project dir; a plain entry means its own config's"
         );
+        assert_eq!(
+            facts.include,
+            Some(PathList {
+                entries: vec![at(&dir, "app")],
+                config_dir: false
+            }),
+            "the leaf's include wins, and it does not name the template"
+        );
+        assert_eq!(
+            facts.exclude,
+            Some(PathList {
+                entries: vec![at(&dir, "src/skipped"), at(&base_dir, "tmp")],
+                config_dir: true
+            })
+        );
+        let option = |key: &str| facts.path_options.get(key).expect(key);
+        assert_eq!(
+            option("outDir"),
+            &PathValue {
+                path: at(&dir, "build"),
+                config_dir: false
+            },
+            "the middle config's outDir replaces the base's template one"
+        );
+        assert_eq!(
+            option("declarationDir"),
+            &PathValue {
+                path: at(&base_dir, "types-out"),
+                config_dir: false
+            }
+        );
+        assert_eq!(
+            option("rootDir"),
+            &PathValue {
+                path: crate::normalize_path(&dir),
+                config_dir: true
+            }
+        );
+        assert_eq!(
+            option("tsBuildInfoFile"),
+            &PathValue {
+                path: at(&dir, ".cache/tsbuildinfo"),
+                config_dir: true
+            }
+        );
+        assert!(!facts.path_options.contains_key("outFile"));
+        assert_eq!(
+            facts.path_lists.get("rootDirs"),
+            Some(&PathList {
+                entries: vec![at(&dir, "src"), at(&base_dir, "gen")],
+                config_dir: true
+            })
+        );
+        assert_eq!(
+            facts.path_lists.get("typeRoots"),
+            Some(&PathList {
+                entries: vec![at(&dir, "mine")],
+                config_dir: false
+            }),
+            "the middle config's list replaces the base's as a unit"
+        );
+        let paths = facts.paths.as_ref().expect("paths");
+        assert!(paths.config_dir);
+        assert_eq!(
+            paths.map,
+            serde_json::json!({
+                "@lib/*": [json_path(&at(&dir, "lib/*"))],
+                "@rel/*": [json_path(&at(&base_dir, "rel/*"))],
+                "@bare/*": ["bare/*"],
+                "@root/*": ["/rooted/*"],
+                "@odd": 1,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            "a relative value resolves against its own config; a bare one (TS5090) and a rooted one pass through"
+        );
+        assert_eq!(
+            facts.types,
+            Some(vec!["${configDir}/typings/mine".to_string()]),
+            "types is never substituted (measured): kept verbatim, looked up as a package name"
+        );
+        assert_eq!(
+            facts.config_dir_keys(),
+            vec!["exclude", "rootDir", "tsBuildInfoFile", "rootDirs", "paths"]
+        );
+    }
+
+    #[test]
+    fn wrapper_restates_exactly_the_keys_that_name_the_template() {
+        let dir = scratch("decls-restate");
+        let tsconfig = dir.join("tsconfig.json");
+        let dts = dir.join("oam.d.ts");
+        let value = |rest: &str, config_dir: bool| PathValue {
+            path: dir.join(rest),
+            config_dir,
+        };
+        let list = |rest: &[&str], config_dir: bool| PathList {
+            entries: rest.iter().map(|rest| dir.join(rest)).collect(),
+            config_dir,
+        };
+        let facts = ChainFacts {
+            include: Some(list(&["src"], true)),
+            // Declared without the template: inherited, not restated.
+            exclude: Some(list(&["src/skipped"], false)),
+            path_options: BTreeMap::from([
+                ("outDir", value("dist", true)),
+                ("rootDir", value("src", false)),
+                ("tsBuildInfoFile", value(".cache/tsbuildinfo", true)),
+            ]),
+            path_lists: BTreeMap::from([
+                ("typeRoots", list(&["typings"], true)),
+                ("rootDirs", list(&["src", "gen"], false)),
+            ]),
+            paths: Some(PathsMap {
+                map: serde_json::json!({ "@lib/*": [json_path(&dir.join("lib").join("*"))], "@bare/*": ["bare/*"] })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                config_dir: true,
+            }),
+            composite: Some(true),
+            ..Default::default()
+        };
+        let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
+        assert_eq!(
+            wrapper["include"],
+            serde_json::json!([json_path(&dir.join("src"))])
+        );
+        assert!(
+            wrapper.get("exclude").is_none(),
+            "declared without the template, so inherited: {wrapper}"
+        );
+        assert_eq!(
+            wrapper["compilerOptions"],
+            serde_json::json!({
+                "outDir": json_path(&dir.join("dist")),
+                "tsBuildInfoFile": json_path(&dir.join(".cache").join("tsbuildinfo")),
+                "typeRoots": [json_path(&dir.join("typings"))],
+                "paths": { "@lib/*": [json_path(&dir.join("lib").join("*"))], "@bare/*": ["bare/*"] },
+            }),
+            "rootDir and rootDirs are declared without the template (inherited), \
+             and a declared rootDir means no composite default to restate: {wrapper}"
+        );
+        assert_eq!(wrapper["files"], serde_json::json!([json_path(&dts)]));
+        // Every restated path is absolute, and under the project.
+        let project = json_path(&dir);
+        let mut restated: Vec<String> = Vec::new();
+        restated.extend(
+            wrapper["include"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string()),
+        );
+        for key in ["outDir", "tsBuildInfoFile"] {
+            restated.push(
+                wrapper["compilerOptions"][key]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        restated.push(
+            wrapper["compilerOptions"]["typeRoots"][0]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        restated.push(
+            wrapper["compilerOptions"]["paths"]["@lib/*"][0]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+        for path in restated {
+            assert!(
+                path.starts_with(&project) && Path::new(&path).is_absolute(),
+                "{path} should be absolute under {project}"
+            );
+        }
+
+        // The default glob's exclude names the SUBSTITUTED out dirs.
+        let facts = ChainFacts {
+            path_options: BTreeMap::from([
+                ("outDir", value("dist", true)),
+                ("declarationDir", value("types-out", true)),
+            ]),
+            ..Default::default()
+        };
+        let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
+        let exclude = wrapper["exclude"].as_array().expect("exclude").clone();
+        for name in ["dist", "types-out"] {
+            assert!(
+                exclude.contains(&serde_json::json!(json_path(&dir.join(name)))),
+                "{name} missing from {exclude:?}"
+            );
+        }
+        assert_eq!(
+            wrapper["compilerOptions"],
+            serde_json::json!({
+                "outDir": json_path(&dir.join("dist")),
+                "declarationDir": json_path(&dir.join("types-out")),
+                // An out dir makes tsc check rootDir: its default, restated.
+                "rootDir": json_path(&dir),
+            })
+        );
+        // An exclude naming the template is restated even when the include
+        // is the default glob; an include naming it is restated instead of
+        // the default.
+        let facts = ChainFacts {
+            exclude: Some(list(&["skip"], true)),
+            ..Default::default()
+        };
+        let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
+        assert_eq!(
+            wrapper["include"],
+            serde_json::json!([format!("{}/**/*", json_path(&dir))])
+        );
+        assert_eq!(
+            wrapper["exclude"],
+            serde_json::json!([json_path(&dir.join("skip"))])
+        );
+        let facts = ChainFacts {
+            include: Some(list(&["${CONFIGDIR}/src"], true)),
+            ..Default::default()
+        };
+        let wrapper = parsed(&wrapper_json(&tsconfig, &dts, &facts));
+        assert_eq!(
+            wrapper["include"],
+            serde_json::json!([json_path(&dir.join("${CONFIGDIR}/src"))]),
+            "the literal text of a case variant, under the project dir"
+        );
+        assert!(wrapper.get("exclude").is_none(), "{wrapper}");
+    }
+
+    #[test]
+    fn chain_using_config_dir_gets_a_wrapper_rooted_at_the_project() {
+        // A shared base config's `${configDir}` would substitute the
+        // wrapper's directory: the wrapper restates it, resolved against the
+        // user's tsconfig dir, and lands in-tree like any other.
+        let dir = scratch("decls-configdir");
+        let base_dir = dir.join("node_modules").join("@acme").join("tsconfig");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("base.json"),
+            r#"{ "compilerOptions": { "typeRoots": ["${configDir}/typings"] },
+                "include": ["${configDir}/src"] }"#,
+        )
+        .unwrap();
+        let tsconfig = dir.join("tsconfig.json");
+        std::fs::write(&tsconfig, r#"{ "extends": "@acme/tsconfig/base.json" }"#).unwrap();
+        let wrapper = project_config(&tsconfig).expect("wrapper written");
+        assert!(
+            wrapper.starts_with(dir.join("node_modules").join(".oam")),
+            "{}",
+            wrapper.display()
+        );
+        let json = parsed(&std::fs::read_to_string(&wrapper).unwrap());
+        assert_eq!(
+            json["include"],
+            serde_json::json!([json_path(&crate::normalize_path(&dir.join("src")))])
+        );
+        assert_eq!(
+            json["compilerOptions"]["typeRoots"],
+            serde_json::json!([json_path(&crate::normalize_path(&dir.join("typings")))])
+        );
+        assert!(json.get("exclude").is_none(), "{json}");
     }
 
     #[test]
