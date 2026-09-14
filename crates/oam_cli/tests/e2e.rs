@@ -6848,6 +6848,491 @@ fn check_honours_project_references_like_tsc() {
     );
 }
 
+/// The last path segment, whichever separator tsgo or oam printed.
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// `path` with forward slashes: how oam's wrapper config spells every path
+/// it restates (TypeScript accepts them on Windows, and a backslash in JSON
+/// is an escape).
+fn slashed(path: &std::path::Path) -> String {
+    path.to_str().unwrap().replace('\\', "/")
+}
+
+/// Diagnostics of a direct `tsgo -p tsconfig.json` run in `project` -- the
+/// oracle a check through oam's wrapper has to match -- as (code, file
+/// basename, line); a span-less one carries an empty name and line 0.
+/// Resolved the way oam resolves it when nothing overrides: `OAM_TSGO`, else
+/// the PATH name (the npm shim is `tsgo.cmd` on Windows).
+fn direct_tsgo_diagnostics(project: &std::path::Path) -> Vec<(String, String, u64)> {
+    let program = std::env::var("OAM_TSGO")
+        .unwrap_or_else(|_| if cfg!(windows) { "tsgo.cmd" } else { "tsgo" }.to_string());
+    let out = std::process::Command::new(program)
+        .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
+        .current_dir(project)
+        .output()
+        .expect("tsgo spawns directly: oam just ran it");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut diagnostics = Vec::new();
+    for line in stdout.lines() {
+        // `src/a.ts(3,5): error TS2322: ...` or a span-less `error TS5102: ...`;
+        // an indented elaboration line is neither.
+        let Some((head, rest)) = line
+            .split_once(": error TS")
+            .or_else(|| line.strip_prefix("error TS").map(|rest| ("", rest)))
+        else {
+            continue;
+        };
+        let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let (file, line_no) = match head.rsplit_once('(') {
+            Some((file, position)) => (
+                basename(file),
+                position
+                    .split(',')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+            ),
+            None => (String::new(), 0),
+        };
+        diagnostics.push((format!("TS{code}"), file, line_no));
+    }
+    diagnostics.sort();
+    diagnostics
+}
+
+/// oam's ODIF JSONL, in the same shape.
+fn oam_diagnostics(stderr: &str) -> Vec<(String, String, u64)> {
+    let mut diagnostics: Vec<(String, String, u64)> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|d| {
+            (
+                d["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_start_matches("OAM-")
+                    .to_string(),
+                d["spans"][0]["file"]
+                    .as_str()
+                    .map(basename)
+                    .unwrap_or_default(),
+                d["spans"][0]["start"]["line"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    diagnostics.sort();
+    diagnostics
+}
+
+/// The wrapper's program is the user's: oam reports exactly what a direct
+/// tsgo run of the user's tsconfig reports, minus the one TS2307 that run
+/// has for the `oam:` import at `oam_import` (file basename, line) -- the
+/// declarations being the wrapper's whole point. None when the direct run
+/// never reaches the semantic pass (a config error suppresses it).
+fn assert_matches_direct_tsgo(
+    project: &std::path::Path,
+    stderr: &str,
+    oam_import: Option<(&str, u64)>,
+) {
+    let mut direct = direct_tsgo_diagnostics(project);
+    if let Some((file, line)) = oam_import {
+        let missing = ("TS2307".to_string(), file.to_string(), line);
+        let at = direct
+            .iter()
+            .position(|d| *d == missing)
+            .unwrap_or_else(|| {
+                panic!("direct tsgo reports {missing:?} without oam's declarations: {direct:?}")
+            });
+        direct.remove(at);
+    }
+    assert_eq!(
+        oam_diagnostics(stderr),
+        direct,
+        "through the wrapper (left) vs the user's own tsconfig (right): {stderr}"
+    );
+}
+
+/// The wrapper oam wrote for `project`, in-tree.
+fn in_tree_wrapper(project: &std::path::Path) -> serde_json::Value {
+    let dir = project.join("node_modules").join(".oam").join("ts-decls");
+    let name = dir_entries(&dir)
+        .into_iter()
+        .find(|name| name.starts_with("project-") && name.ends_with(".json"))
+        .expect("wrapper written in-tree");
+    serde_json::from_str(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap()
+}
+
+/// `${configDir}` in a shared base config means the ROOT config's directory,
+/// which through the wrapper was the wrapper's own: a base config's
+/// `"include": ["${configDir}/src"]` matched nothing, and the chain was
+/// checked without oam's declarations to stay honest. The wrapper now
+/// restates every key naming the template against the user's tsconfig dir,
+/// so include, exclude, rootDir, typeRoots and paths all mean what they mean
+/// under `tsgo -p tsconfig.json` -- and `oam:` imports still resolve.
+#[test]
+fn check_substitutes_config_dir_from_a_shared_base_config() {
+    write_temp(
+        "cfgdir-base/node_modules/@acme/tsconfig/base.json",
+        r#"{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "rootDir": "${configDir}",
+    "paths": { "@lib/*": ["${configDir}/lib/*"] },
+    "typeRoots": ["${configDir}/typings"],
+    "types": ["mine"]
+  },
+  "include": ["${configDir}/src"],
+  "exclude": ["${configDir}/src/skipped"]
+}"#,
+    );
+    write_temp(
+        "cfgdir-base/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    // The alias, the typeRoots package and the `oam:` import all have to
+    // resolve for this file to be clean.
+    write_temp(
+        "cfgdir-base/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         import { lib } from \"@lib/thing\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const l: number = lib;\n\
+         export const m: number = MINE_GLOBAL;\n",
+    );
+    // Inside the include: reported. Inside the exclude, and outside the
+    // include: not.
+    write_temp(
+        "cfgdir-base/src/planted.ts",
+        "export const n: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/src/skipped/bad.ts",
+        "export const bad: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/scratch/outside.ts",
+        "export const outside: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/lib/thing.ts",
+        "export const lib: number = 1;\n",
+    );
+    let proj = write_temp(
+        "cfgdir-base/typings/mine/index.d.ts",
+        "declare const MINE_GLOBAL: number;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "planted.ts".to_string(), 1)],
+        "the include picks up src/, the exclude holds, the alias and the typeRoots package resolve, rootDir is the project: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/src")])
+    );
+    assert_eq!(
+        wrapper["exclude"],
+        serde_json::json!([format!("{root}/src/skipped")])
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({
+            "rootDir": root,
+            "typeRoots": [format!("{root}/typings")],
+            "paths": { "@lib/*": [format!("{root}/lib/*")] },
+        }),
+        "every template key restated absolute under the project; `types` names a package and inherits: {wrapper}"
+    );
+    assert!(
+        std::path::Path::new(&root).is_absolute() && !root.contains('\\'),
+        "{root}"
+    );
+}
+
+/// The template in the MIDDLE of a three-level chain -- a project base that
+/// extends a shared package config -- is the root's directory all the same,
+/// and the leaf's own keys still win over it.
+#[test]
+fn check_substitutes_config_dir_named_in_the_middle_of_a_chain() {
+    write_temp(
+        "cfgdir-middle/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true }, "include": ["never"] }"#,
+    );
+    write_temp(
+        "cfgdir-middle/tsconfig.middle.json",
+        r#"{ "extends": "@acme/tsconfig/base.json",
+  "compilerOptions": { "paths": { "@lib/*": ["${configDir}/lib/*"] } },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-middle/tsconfig.json",
+        r#"{ "extends": "./tsconfig.middle.json" }"#,
+    );
+    write_temp(
+        "cfgdir-middle/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         import { lib } from \"@lib/thing\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const l: number = lib;\n",
+    );
+    write_temp(
+        "cfgdir-middle/src/planted.ts",
+        "export const n: number = \"no\";\n",
+    );
+    let proj = write_temp(
+        "cfgdir-middle/lib/thing.ts",
+        "export const lib: number = 1;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "planted.ts".to_string(), 1)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/src")])
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({ "paths": { "@lib/*": [format!("{root}/lib/*")] } }),
+        "{wrapper}"
+    );
+}
+
+/// A leaf that overrides a base's template key gets its own, plain value:
+/// inherited as-is, restated by nothing. The base's other template key
+/// still is.
+#[test]
+fn check_keeps_a_leafs_override_of_a_base_configs_template_key() {
+    write_temp(
+        "cfgdir-override/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "${configDir}/dist" },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-override/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json", "include": ["app"] }"#,
+    );
+    write_temp(
+        "cfgdir-override/app/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    );
+    // Under the base's include, which the leaf replaced: not checked.
+    let proj = write_temp(
+        "cfgdir-override/src/notchecked.ts",
+        "export const bad: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    assert!(
+        wrapper.get("include").is_none() && wrapper.get("exclude").is_none(),
+        "the leaf's plain include inherits untouched: {wrapper}"
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({
+            "outDir": format!("{}/dist", slashed(&proj)),
+            "rootDir": slashed(&proj),
+        }),
+        "the template outDir restated, and with it the rootDir default an out dir makes tsc check: {wrapper}"
+    );
+}
+
+/// A template `outDir` with no exclude anywhere in the chain: tsc's default
+/// exclude names it, so a project emitting into its own tree does not
+/// type-check its own output. The restated default has to name the
+/// SUBSTITUTED directory.
+#[test]
+fn check_excludes_a_template_out_dir_by_default() {
+    write_temp(
+        "cfgdir-outdir/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "${configDir}/dist" } }"#,
+    );
+    write_temp(
+        "cfgdir-outdir/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    write_temp(
+        "cfgdir-outdir/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    );
+    let proj = write_temp(
+        "cfgdir-outdir/dist/stale.ts",
+        "export const stale: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "dist/ is the out dir, excluded by default: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/**/*")])
+    );
+    assert!(
+        wrapper["exclude"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("{root}/dist"))),
+        "{wrapper}"
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({ "outDir": format!("{root}/dist"), "rootDir": root }),
+        "{wrapper}"
+    );
+}
+
+/// TypeScript 7 defaults `rootDir` to the ROOT config's directory and checks
+/// it eagerly once `outDir` is set -- so through the wrapper every source
+/// was "not under rootDir" (TS6059), the retry ran without oam's
+/// declarations, and an `oam:` import reported TS2307 in any project that
+/// set an out dir without a root dir. No template anywhere here: the
+/// wrapper restates TypeScript's own default for the user's config.
+#[test]
+fn check_keeps_a_projects_root_dir_through_the_wrapper_when_an_out_dir_is_set() {
+    write_temp(
+        "outdirproj/tsconfig.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "dist" }, "include": ["src"] }"#,
+    );
+    let proj = write_temp(
+        "outdirproj/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "oam's declarations must survive an out dir: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+}
+
+/// TypeScript 7 has removed `baseUrl` (TS5102), and tsgo still substitutes
+/// the template in it before rejecting it (measured). Restated or not, the
+/// report is the one the user's own tsconfig gets -- and only that one: a
+/// config error suppresses the semantic pass on both sides.
+#[test]
+fn check_reports_a_removed_base_url_like_tsgo() {
+    write_temp(
+        "cfgdir-baseurl/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "baseUrl": "${configDir}" },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-baseurl/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    let proj = write_temp(
+        "cfgdir-baseurl/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS5102".to_string(), String::new(), 0)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, None);
+    assert_eq!(
+        in_tree_wrapper(&proj)["compilerOptions"]["baseUrl"],
+        serde_json::json!(slashed(&proj))
+    );
+}
+
 #[test]
 fn mcp_serves_the_agent_loop_over_stdio() {
     use std::io::{BufRead, BufReader, Write};
