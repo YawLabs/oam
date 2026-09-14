@@ -1608,7 +1608,9 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             (
                 "b.example.test",
                 identity(
-                    Some("DNS:a.example.test, email:x@y, URI:http://z, DNS:b.example.test"),
+                    Some(
+                        "DNS:a.example.test, email:x@y, URI:http://example.com, DNS:b.example.test",
+                    ),
                     &[],
                 ),
                 None,
