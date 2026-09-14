@@ -43,6 +43,18 @@ fn ts_error(code: &str, message: String) -> Diagnostic {
     Diagnostic::new(code, Severity::Error, Origin::Typecheck, message)
 }
 
+/// `OAM_DEBUG` is set (and not `0`): the switch oam_cli reads to print why a
+/// check fell back from the daemon. Here it explains why a check ran without
+/// oam's declarations, or from a different config than the one it wanted --
+/// the never-fail-a-check stance (decls.rs) degrades silently by design, and
+/// this is the one place the degradation is spelled out. Stderr only, and
+/// only under the switch, so the `--json` JSONL contract is untouched.
+pub(crate) fn debug(message: std::fmt::Arguments<'_>) {
+    if std::env::var_os("OAM_DEBUG").is_some_and(|v| !v.is_empty() && v != "0") {
+        eprintln!("oam check: {message}");
+    }
+}
+
 fn missing_tsgo(detail: &str) -> Diagnostic {
     ts_error(
         TSGO_MISSING,
@@ -712,20 +724,27 @@ pub fn check_cancellable(
     diagnostics.extend(parse_tsc_output(&stderr, &base));
     annotate_declaration_collisions(&mut diagnostics);
 
-    // A CONFIG error is reported against the file that EXTENDS the one
-    // declaring the option, and our wrapper is that file -- so tsgo emits it
-    // with no `file(line,col)` prefix, parse_tsc_line rejects it, and a real,
-    // fixable problem in the user's own tsconfig (TS5102 `baseUrl` has been
-    // removed, TS5090 non-relative `paths`, both common in existing projects)
-    // came back as an internal-looking OAM-TS0004 whose embedded suggestion was
-    // rewritten relative to oam's CACHE directory. Re-run once against the
-    // user's own tsconfig, without the declarations: the same principle
-    // decls.rs already applies everywhere else -- when the wrapper cannot work,
-    // degrade to checking without it rather than degrading the diagnostic.
-    if let Some(tsconfig) = tsconfig.as_deref()
-        && diagnostics.is_empty()
+    // Some config-level problems lose their position when the option is
+    // inherited through `extends`: tsgo reports them against the ROOT config
+    // -- our wrapper -- with no `file(line,col)` prefix, or with a span
+    // inside the wrapper itself (measured: TS5102 `baseUrl` has been
+    // removed is spanned on the bare run and span-less through the wrapper;
+    // TS2688 missing `types`, TS6053 missing `files` entry and TS6059
+    // rootDir are span-less either way; TS5023 unknown option keeps the
+    // declaring config's span through both, so it is never attributed to
+    // us). Some of those are the user's to fix; some the wrapper CAUSED and
+    // the user's own tsconfig is fine (#130: a `types` entry the wrapper
+    // could not resolve from where it sat). The output alone cannot tell
+    // them apart, so when every diagnostic is attributable to the wrapper,
+    // re-run once against the user's own tsconfig, without the declarations
+    // -- the same principle decls.rs applies everywhere else: when the
+    // wrapper cannot work, degrade to checking without it rather than
+    // degrading the diagnostic.
+    if let (Some(tsconfig), Some(wrapper)) = (tsconfig.as_deref(), wrapper.as_deref())
         && !output.status.success()
-        && wrapper.is_some()
+        && diagnostics
+            .iter()
+            .all(|d| attributable_to_wrapper(d, wrapper))
     {
         let mut bare = common.to_vec();
         bare.push("-p".as_ref());
@@ -736,7 +755,22 @@ pub fn check_cancellable(
                 &String::from_utf8_lossy(&retry.stderr),
                 &base,
             ));
-            if !retried.is_empty() {
+            // The retry is the answer whenever it IS one: diagnostics the
+            // user can act on, or a clean exit. A clean retry used to be
+            // discarded because it was empty (#130), so a project that
+            // type-checks was reported as an internal error. Only a retry
+            // that also failed without saying why falls through to the
+            // wrapper's own output.
+            if retry.status.success() || !retried.is_empty() {
+                debug(format_args!(
+                    "the wrapper config's run reported {}; the answer is from {} alone, without oam's declarations",
+                    diagnostics
+                        .iter()
+                        .map(|d| d.code.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    tsconfig.display()
+                ));
                 return Ok(retried);
             }
         }
@@ -744,6 +778,8 @@ pub fn check_cancellable(
 
     // Non-zero exit with zero parsed diagnostics = tsgo itself failed
     // (bad flags, crashed): surface raw output rather than claiming clean.
+    // A config-level problem no longer lands here -- parse_tsc_line keeps
+    // the span-less `error TSnnnn:` form as a diagnostic of its own.
     if diagnostics.is_empty() && !output.status.success() {
         return Err(ts_error(
             "OAM-TS0004",
@@ -761,6 +797,18 @@ pub fn check_cancellable(
     Ok(diagnostics)
 }
 
+/// A diagnostic the wrapper config, rather than the user's project, may have
+/// caused: one with no span at all (a config-level problem is reported
+/// against the root config, and that is the wrapper), or one whose every
+/// span sits inside the wrapper file itself. A diagnostic in the user's own
+/// source is the user's whatever config produced it.
+fn attributable_to_wrapper(d: &Diagnostic, wrapper: &Path) -> bool {
+    let wrapper = normalize_path(wrapper);
+    d.spans
+        .iter()
+        .all(|span| normalize_path(Path::new(&span.file)) == wrapper)
+}
+
 /// The exact file set tsgo's program for `tsconfig` reads (`--listFilesOnly`:
 /// sources, `allowJs` .js, `resolveJsonModule` .json, `@types`, the lib
 /// .d.ts files that ship with tsgo, `extends`/`include` targets outside the
@@ -770,20 +818,46 @@ pub(crate) fn list_files(tsconfig: &Path, handle: &TsgoHandle) -> Result<Vec<Pat
     let base = tsconfig
         .parent()
         .ok_or_else(|| ts_error("OAM-TS0002", "tsconfig has no parent".to_string()))?;
-    // --noEmit matters: without it a checkJs project fails TS5055 ("would
-    // overwrite input file") before listing anything (probed).
-    //
     // Listed through the SAME wrapper the check runs (decls.rs), so oam's own
     // declaration file is one of the listed paths and its stamp joins the
     // fingerprint: upgrading oam changes the declarations' content-hashed
     // name, which invalidates the daemon's cache instead of serving the
     // previous release's diagnostics.
     let wrapper = decls::project_config(tsconfig);
+    let (mut files, status) = list_via(wrapper.as_deref().unwrap_or(tsconfig), base, handle)?;
+    // `--listFilesOnly` never runs the semantic check, so a non-zero exit
+    // here is a config- or options-level problem -- exactly the class where
+    // check_cancellable may fall back to the user's own tsconfig, whose
+    // program can read files the wrapper's could not (#130: the `@types`
+    // package a `types` entry named). Fingerprint the union, so the cached
+    // verdict is invalidated by everything EITHER program read; a superset
+    // only ever costs an extra tsgo run, never a stale answer.
+    if wrapper.is_some()
+        && !status.success()
+        && let Ok((bare, _)) = list_via(tsconfig, base, handle)
+    {
+        files.extend(bare);
+        files.sort_unstable();
+        files.dedup();
+    }
+    Ok(files)
+}
+
+/// One `--listFilesOnly` run against `config`: the absolute paths it printed
+/// (a config error still prints the files it could resolve, so the exit
+/// status comes back alongside), Err when it printed none.
+fn list_via(
+    config: &Path,
+    base: &Path,
+    handle: &TsgoHandle,
+) -> Result<(Vec<PathBuf>, std::process::ExitStatus), Diagnostic> {
+    // --noEmit matters: without it a checkJs project fails TS5055 ("would
+    // overwrite input file") before listing anything (probed).
     let args: [&OsStr; 4] = [
         "--listFilesOnly".as_ref(),
         "--noEmit".as_ref(),
         "-p".as_ref(),
-        wrapper.as_deref().unwrap_or(tsconfig).as_os_str(),
+        config.as_os_str(),
     ];
     let output = run_tsgo(&args, base, base, handle)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -808,7 +882,7 @@ pub(crate) fn list_files(tsconfig: &Path, handle: &TsgoHandle) -> Result<Vec<Pat
             ),
         ));
     }
-    Ok(files)
+    Ok((files, output.status))
 }
 
 /// Fold `.`/`..` and re-join with the platform separator. tsgo prints
@@ -885,47 +959,81 @@ fn parse_tsc_output(output: &str, base: &Path) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// `path(line,col): severity TSnnnn: message`
+/// `path(line,col): severity TSnnnn: message`, or -- for a problem tsgo has
+/// no position for: a removed option inherited through `extends` (TS5102),
+/// a `types` entry it cannot find (TS2688), a `files` entry that does not
+/// exist (TS6053) -- just `severity TSnnnn: message`, which is a diagnostic
+/// with no span rather than noise (it used to be dropped, and the check
+/// then failed as an internal OAM-TS0004).
+///
+/// tsgo indents every elaboration line under a diagnostic, and an indented
+/// line cannot parse as the span-less form -- the indent lands in the
+/// severity word -- so those append to the previous message in
+/// `parse_tsc_output` whatever they say.
 ///
 /// Spans are zero-width (end == start): the plain format carries only the
 /// start position, and inventing a length would mislead agents that apply
 /// edits by span. A tsgo JSON output mode (or `--pretty` parsing) is the
 /// way to recover lengths later.
 fn parse_tsc_line(line: &str, base: &Path) -> Option<Diagnostic> {
-    let (location, rest) = line.split_once("): ")?;
-    let (file, position) = location.rsplit_once('(')?;
-    let (line_str, col_str) = position.split_once(',')?;
-    let line_no: u32 = line_str.trim().parse().ok()?;
-    let col_no: u32 = col_str.trim().parse().ok()?;
+    if let Some((location, rest)) = line.split_once("): ")
+        && let Some((file, position)) = location.rsplit_once('(')
+        && let Some((line_str, col_str)) = position.split_once(',')
+        && let Ok(line_no) = line_str.trim().parse::<u32>()
+        && let Ok(col_no) = col_str.trim().parse::<u32>()
+    {
+        let (severity_word, code_number, message) = split_severity_code_message(rest)?;
+        // Any word tsgo puts here is at worst informational; this arm has
+        // always read it that way.
+        let severity = severity_of(severity_word).unwrap_or(Severity::Info);
+        let file = normalize_path(&base.join(file));
+        let position = Position {
+            line: line_no,
+            col: col_no,
+        };
+        return Some(
+            Diagnostic::new(
+                format!("OAM-TS{code_number}"),
+                severity,
+                Origin::Typecheck,
+                message,
+            )
+            .with_span(Span {
+                file: file.to_string_lossy().into_owned(),
+                start: position.clone(),
+                end: position,
+            }),
+        );
+    }
+    let (severity_word, code_number, message) = split_severity_code_message(line)?;
+    // Strict here: with no position in front, only tsc's own category words
+    // mark a diagnostic, or a stray `Compiling TS1234: ...` would become one.
+    let severity = severity_of(severity_word)?;
+    Some(Diagnostic::new(
+        format!("OAM-TS{code_number}"),
+        severity,
+        Origin::Typecheck,
+        message,
+    ))
+}
 
-    let (severity_word, rest) = rest.split_once(' ')?;
-    let severity = match severity_word {
-        "error" => Severity::Error,
-        "warning" => Severity::Warning,
-        _ => Severity::Info,
-    };
+/// `severity TSnnnn: message` -> (severity word, digits, message).
+fn split_severity_code_message(text: &str) -> Option<(&str, &str, &str)> {
+    let (severity_word, rest) = text.split_once(' ')?;
     let (ts_code, message) = rest.split_once(": ")?;
     let code_number = ts_code.strip_prefix("TS")?;
     code_number.parse::<u32>().ok()?;
+    Some((severity_word, code_number, message))
+}
 
-    let file = normalize_path(&base.join(file));
-    let position = Position {
-        line: line_no,
-        col: col_no,
-    };
-    Some(
-        Diagnostic::new(
-            format!("OAM-TS{code_number}"),
-            severity,
-            Origin::Typecheck,
-            message,
-        )
-        .with_span(Span {
-            file: file.to_string_lossy().into_owned(),
-            start: position.clone(),
-            end: position,
-        }),
-    )
+/// tsc's `DiagnosticCategory` names as `--pretty false` prints them.
+fn severity_of(word: &str) -> Option<Severity> {
+    match word {
+        "error" => Some(Severity::Error),
+        "warning" => Some(Severity::Warning),
+        "message" | "suggestion" => Some(Severity::Info),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -964,9 +1072,63 @@ mod tests {
 
     #[test]
     fn garbage_lines_without_prior_diagnostic_are_dropped() {
-        let out = "Compiling project...\nnot a diagnostic\n";
+        let out = "Compiling project...\nnot a diagnostic\nCompiling TS1234: not a category word\n";
         let diags = parse_tsc_output(out, Path::new("/p"));
-        assert!(diags.is_empty());
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn span_less_config_errors_are_diagnostics_with_their_elaboration() {
+        // Measured against tsgo 7.0.0-dev: a `types` entry it cannot find.
+        let out = "error TS2688: Cannot find type definition file for 'node'.\n  \
+                   The file is in the program because:\n    \
+                   Entry point of type library 'node' specified in compilerOptions\n";
+        let diags = parse_tsc_output(out, Path::new("/p"));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "OAM-TS2688");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert!(diags[0].spans.is_empty(), "no position to invent");
+        assert!(
+            diags[0]
+                .message
+                .contains("Entry point of type library 'node'"),
+            "elaboration lines belong to it: {}",
+            diags[0].message
+        );
+        // An indented line cannot be a diagnostic of its own, whatever it
+        // says: the indent is where the severity word would be. So an
+        // elaboration line that happens to read like a diagnostic appends.
+        let out = "error TS5023: Unknown compiler option 'x'.\n  error TS9999: quoted inside the elaboration\n";
+        let diags = parse_tsc_output(out, Path::new("/p"));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "OAM-TS5023");
+    }
+
+    #[test]
+    fn attributable_to_wrapper_means_span_less_or_inside_the_wrapper() {
+        let wrapper = Path::new("/nm/.oam/ts-decls/project-x.json");
+        let span = |file: &str| Span {
+            file: file.to_string(),
+            start: Position { line: 1, col: 1 },
+            end: Position { line: 1, col: 1 },
+        };
+        let span_less = ts_error("OAM-TS2688", "no position".into());
+        assert!(attributable_to_wrapper(&span_less, wrapper));
+        let in_wrapper = ts_error("OAM-TS6053", "x".into())
+            .with_span(span("/nm/.oam/ts-decls/./project-x.json"));
+        assert!(
+            attributable_to_wrapper(&in_wrapper, wrapper),
+            "spelling folded"
+        );
+        let in_source = ts_error("OAM-TS2322", "x".into()).with_span(span("/proj/src/a.ts"));
+        assert!(!attributable_to_wrapper(&in_source, wrapper));
+        let mixed = ts_error("OAM-TS2322", "x".into())
+            .with_span(span("/nm/.oam/ts-decls/project-x.json"))
+            .with_span(span("/proj/src/a.ts"));
+        assert!(
+            !attributable_to_wrapper(&mixed, wrapper),
+            "one user span is enough"
+        );
     }
 
     #[test]

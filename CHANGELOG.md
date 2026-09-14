@@ -18,6 +18,61 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`oam check` failed every project with `"types": ["node"]` in its
+  tsconfig** (#130), reporting an internal `OAM-TS0004` carrying
+  `TS2688: Cannot find type definition file for 'node'` where `tsc` and `tsgo`
+  both pass. oam checks a project through a generated config that `extends`
+  the user's and adds oam's own declarations, and TypeScript resolves a
+  `compilerOptions.types` entry from the ROOT config's directory -- the default
+  typeRoots walk and the `node_modules` fallback both start there, never at the
+  config that declared the entry. With the wrapper under oam's cache dir, the
+  lookup for `@types/node` walked up from beside oam's cache and found nothing.
+  Two things went wrong on top of that: `TS2688` has no `file(line,col)`
+  prefix, so it was dropped rather than reported, and the check's retry against
+  the user's own tsconfig -- which exited clean -- was discarded for producing
+  no diagnostics, so a project that type-checks came back as an internal error.
+  Now:
+  - The wrapper is written under `node_modules/.oam/ts-decls/` at the
+    project's nearest `node_modules` (the hoisted one of a monorepo root when
+    the package has none) -- the directory oam already keeps `--precompile`
+    output in, gitignored the same way -- so every lookup walks the same
+    directories the user's tsconfig would. A bare `@types` name, a self-typed
+    package such as `vitest/globals` and a hoisted install all resolve;
+    `--incremental` is unaffected. Nothing is written anywhere else in the
+    project. oam's cache dir is the fallback when no `node_modules` exists at
+    or above the project or it cannot be written; a project that names a
+    package in `types` is then checked without oam's declarations rather than
+    through a wrapper that cannot resolve it (from the cache dir a stray
+    `~/node_modules/@types` could even resolve where the project's own config
+    fails). `OAM_DEBUG=1` reports every such fallback.
+  - A relative `types` entry (`"./typings/local"`), which TypeScript resolves
+    against the root config whichever config in the chain declared it, is
+    restated absolute against the user's tsconfig dir.
+  - A `composite` project's default `rootDir` -- also the root config's
+    directory -- is restated as the user's tsconfig dir, so every source no
+    longer lands "not under rootDir" (TS6059) through the wrapper.
+  - `references` is restated too: it is the one top-level key `extends` never
+    carries, so the wrapper's program used to check a referenced project's
+    sources directly. An import into an unbuilt reference now reports TS6305
+    through `oam check` exactly as it does through `tsc -p`.
+  - A chain that uses `${configDir}` gets no wrapper. TypeScript substitutes
+    the root config's directory, so a base config's
+    `"include": ["${configDir}/src"]` matched nothing through the wrapper and
+    the check came back clean with a type error present. Such a project is
+    checked against its own tsconfig, with TS2307 on `oam:` imports.
+  - A span-less `error TSnnnn:` line is a diagnostic in its own right, with its
+    elaboration lines attached, instead of an `OAM-TS0004`.
+  - A clean retry is a clean check. The retry now runs whenever every
+    diagnostic of the wrapper run is attributable to the wrapper (no span, or a
+    span inside the wrapper file), and its result is used whenever it exits
+    clean or says something -- only a retry that also failed without saying why
+    falls through to the wrapper's own output.
+  - The daemon's fingerprint covers the files the user's own tsconfig reads
+    when the wrapper's `--listFilesOnly` fails, so a cached verdict reached
+    through the retry is still invalidated by an `@types` upgrade. It also
+    stamps whether a `node_modules` exists at each level above the project:
+    a verdict cached while it was missing (a TS2688 for the missing types) is
+    no longer served after a reinstall that leaves the lockfile alone.
 - **On Windows, OS errors carried a different code than node reports.** oam
   named an OS error by std's `io::ErrorKind` instead of the raw Win32 code, and
   the kind is a lossy view of the number. A write to a read-only file, an
