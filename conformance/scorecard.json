@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "98a604f+wip",
+  "commit": "43bf4ff",
   "oamVersion": "oam 0.15.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 102,
-      "total": 102,
+      "pass": 104,
+      "total": 104,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -64,6 +64,14 @@
         },
         {
           "case": "100-tls-socket-net-api.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "101-net-refused-loopback-connect-fast.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "102-fetch-http-refused-error-shape.mjs",
           "status": "pass"
         },
         {
