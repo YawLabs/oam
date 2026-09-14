@@ -18287,6 +18287,41 @@
 
   // ------------------------------------------------------------- node:net
   // TCP sockets and servers backed by __oam.node tcp* ops.
+  // net.Socket#setTimeout and tls.TLSSocket#setTimeout, as Node's
+  // setStreamTimeout (lib/internal/stream_base_commons.js, v22.22.2): a
+  // no-op on a destroyed socket; `socket.timeout` mirrors the value;
+  // `msecs` validated as a non-negative finite number and `callback` as a
+  // function; msecs 0 clears the timer and REMOVES the callback (a caller
+  // that armed with one and disarms with the same one must not have it fire
+  // on the next re-arm); otherwise the timer is (re)armed and the callback
+  // rides on 'timeout' once. Every message and code probed on Node. The
+  // socket's own reads and writes re-arm the timer through _resetTimeout.
+  function socketSetTimeout(socket, msecs, callback) {
+    if (socket.destroyed) return socket;
+    socket.timeout = msecs;
+    if (typeof msecs !== "number") {
+      throw new codes.ERR_INVALID_ARG_TYPE("msecs", "number", msecs);
+    }
+    if (msecs < 0 || !Number.isFinite(msecs)) {
+      throw new codes.ERR_OUT_OF_RANGE("msecs", "a non-negative finite number", msecs);
+    }
+    if (callback !== undefined && typeof callback !== "function") {
+      throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+    }
+    if (socket._timeoutId !== null) {
+      globalThis.clearTimeout(socket._timeoutId);
+      socket._timeoutId = null;
+    }
+    socket._timeoutMs = msecs;
+    if (msecs === 0) {
+      if (callback) socket.removeListener("timeout", callback);
+    } else {
+      socket._resetTimeout();
+      if (callback) socket.once("timeout", callback);
+    }
+    return socket;
+  }
+
   registry.factories.net = (natives) => {
     const EventEmitter = registry.get("events");
 
@@ -18383,7 +18418,21 @@
       return e;
     }
 
+    // In Node, tls.TLSSocket EXTENDS net.Socket, so `x instanceof net.Socket`
+    // is how library code decides it holds a socket. Here the two classes
+    // cannot share a base -- this Socket is a hand-rolled EventEmitter over
+    // the tcp natives, TLSSocket a real stream.Duplex over the tls natives --
+    // so net.Socket answers the question for its kin by brand instead
+    // (#132). The brand is only consulted for `net.Socket` itself; a user
+    // subclass gets the ordinary prototype walk and nothing else.
+    const kNetSocketLike = Symbol.for("oam.netSocketLike");
+
     class Socket extends EventEmitter {
+      static [Symbol.hasInstance](instance) {
+        if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
+        return this === Socket && instance !== null && typeof instance === "object" &&
+          instance[kNetSocketLike] === true;
+      }
       constructor(options) {
         super();
         this._handle = null;
@@ -18748,16 +18797,7 @@
       }
 
       setEncoding(encoding) { this._encoding = encoding; return this; }
-      setTimeout(ms, cb) {
-        if (this._timeoutId !== null) {
-          globalThis.clearTimeout(this._timeoutId);
-          this._timeoutId = null;
-        }
-        if (cb) this.once("timeout", cb);
-        this._timeoutMs = ms || 0;
-        if (this._timeoutMs > 0) this._resetTimeout();
-        return this;
-      }
+      setTimeout(msecs, callback) { return socketSetTimeout(this, msecs, callback); }
       _resetTimeout() {
         if (this._timeoutId !== null) globalThis.clearTimeout(this._timeoutId);
         if (this._timeoutMs > 0 && !this.destroyed) {
@@ -23664,46 +23704,126 @@
     const EventEmitter = registry.get("events");
     const { Duplex } = registry.get("stream");
 
+    // net.Socket's brand (see its Symbol.hasInstance): what makes
+    // `tlsSocket instanceof net.Socket` true here, as it is in Node.
+    const kNetSocketLike = Symbol.for("oam.netSocketLike");
+
+    function socketClosedBeforeConnectionError() {
+      var e = new Error("Socket closed before the connection was established");
+      e.code = "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
+      return e;
+    }
+    function socketClosedError() {
+      var e = new Error("Socket is closed");
+      e.code = "ERR_SOCKET_CLOSED";
+      return e;
+    }
+    // A connect-syscall error in Node's shape (`connect EISCONN host:port -
+    // Local (addr:port)`, code / errno / syscall / address / port), for the
+    // one code the TLS path raises itself.
+    function connectSyscallError(code, host, port, socket) {
+      var local = socket.localAddress !== undefined
+        ? " - Local (" + socket.localAddress + ":" + socket.localPort + ")" : "";
+      var e = new Error("connect " + code + " " + host + ":" + port + local);
+      e.code = code;
+      e.syscall = "connect";
+      e.address = host;
+      e.port = port;
+      var errno = { EISCONN: process.platform === "win32" ? -4069 : process.platform === "darwin" ? -56 : -106 }[code];
+      if (errno !== undefined) e.errno = errno;
+      return e;
+    }
+
+    // A TLS socket. In Node this class extends net.Socket and inherits the
+    // whole socket API; here it is a stream.Duplex over the tls natives, so
+    // that API is carried explicitly (#132), each member with Node's
+    // semantics (probed on v22.22.2) -- and where oam's own net.Socket above
+    // still differs from Node (address() before connect, `pending` on a
+    // fresh socket), this class follows Node. The transport feeds the
+    // address fields once it connects.
+    //
+    // The `socket` constructor argument and the `socket` option are accepted
+    // for signature parity only. oam has no native op to wrap an existing
+    // plain socket in a CLIENT-side TLS session (tls_accept_wrap does the
+    // server side), so a TLSSocket opens its own connection through
+    // connect() and refuses a socket it was asked to wrap (connect()
+    // destroys it with an error, rather than quietly connecting somewhere
+    // else). And unlike Node, where a bare `new TLSSocket().connect()` only
+    // opens the transport and only tls.connect() starts the handshake,
+    // oam's connect() runs the handshake too: 'secureConnect' fires from
+    // both paths.
     class TLSSocket extends Duplex {
       constructor(socket, options) {
-        super({ autoDestroy: false });
+        // autoDestroy ON: once both 'end' and 'finish' have fired, the Duplex
+        // destroys itself, which is what net.Socket does with its handle and
+        // what Node's TLSSocket does -- 'close' follows a clean bilateral
+        // end (probed: connect, ready, secureConnect, finish, end, close),
+        // the native handle is released, and the socket leaves
+        // getActiveResourcesInfo(). This class used to opt out, a rationale
+        // borrowed from the fs streams, which at the time emitted their own
+        // 'close' (they run autoDestroy now too); here it meant no 'close'
+        // ever, a handle held until exit, and a dead socket listed as
+        // active -- and ioredis reconnects on 'close'.
+        //
+        // emitClose OFF: 'close' is emitted by _destroy itself, carrying
+        // Node's `hadError` boolean and one loop turn after the handle is
+        // released, the way Node's handle-close callback does.
+        super({ autoDestroy: true, emitClose: false });
+        this[kNetSocketLike] = true;
         this.encrypted = true;
         this.authorized = false;
         this.authorizationError = null;
         this.alpnProtocol = false;
-        // Match net.Socket / Node semantics: when the peer half-closes (our
-        // readable hits EOF), auto-end our write side unless allowHalfOpen.
-        // Without this the peer's parked read never sees a FIN, so the event
-        // loop (which exits on inflight==0) never drains and the process hangs
-        // at exit. oam's Duplex does NOT do this automatically (net.Socket
-        // does it by hand in _readLoop), so TLSSocket must too.
+        // Node's default: when the peer half-closes (our readable hits EOF),
+        // the write side is ended too, after 'end' -- the vendored Readable
+        // does it (endReadableNT -> endWritableNT) off this flag, so an 'end'
+        // listener still sees the socket writable, as in Node.
         this.allowHalfOpen = (options && options.allowHalfOpen) || false;
         this._handle = null;
         this._reading = false;
         this._protocol = null;
         this._cipher = null;
+        // Node: a TLSSocket built without a transport is `connecting` from
+        // construction until 'connect' (pending, readyState "opening"); the
+        // accept loop clears it on a socket born connected. _connectPending
+        // is the narrower fact -- a native connect is in flight -- that a
+        // second connect() is judged by.
+        this.connecting = true;
+        this._connectPending = false;
+        this.remoteAddress = undefined;
+        this.remotePort = undefined;
+        this.remoteFamily = undefined;
+        this.localAddress = undefined;
+        this.localPort = undefined;
+        this.localFamily = undefined;
+        this.bytesRead = 0;
+        this._bytesDispatched = 0;
+        this.timeout = undefined;
+        this._timeoutMs = 0;
+        this._timeoutId = null;
+        // The TLS options (ca, cert, key, servername, rejectUnauthorized) a
+        // later connect() reuses.
+        this._tlsOptions = options || {};
+        this._wrappedSocket = socket || (options && options.socket) || null;
       }
-      // On readable EOF, half-close our write side (sends FIN) so the peer's
-      // read drains -- mirrors net.Socket._readLoop's allowHalfOpen branch.
+      // Readable EOF. `read(0)` after the null push is what Node's
+      // onStreamRead does: with nothing buffered it emits 'end' whether or
+      // not anyone is consuming, and 'end' is what auto-ends the write side
+      // (allowHalfOpen false) and, once both sides are done, destroys the
+      // socket. A socket nobody read from used to sit open forever here.
       _onReadEof() {
         this.push(null);
-        if (!this.allowHalfOpen) {
-          try {
-            this.end();
-          } catch (_) {
-            /* already ending/ended */
-          }
-        }
+        this.read(0);
       }
-      _kickRead() {
-        // If a consumer attached 'data' (or otherwise started flowing) BEFORE
-        // the handle was ready, the initial _read no-op'd. Now that the handle
-        // exists, re-pull so data actually flows. No-ops if already reading.
-        if (this._handle !== null && !this._reading &&
-            (this.readableFlowing === true ||
-             (typeof this.listenerCount === "function" && this.listenerCount("data") > 0))) {
-          this._read(65536);
-        }
+      // Start reading now, consumer or not (Node's afterConnect does it with
+      // read(0)): the transport is watched from the moment it is connected,
+      // so a peer's EOF is seen and an open socket keeps the process alive,
+      // as a net.Socket does. Called directly rather than through read(0)
+      // because a consumer that attached 'data' before the handle existed
+      // left the Readable believing a read is in flight (its _read no-op'd
+      // on the null handle), and read(0) defers to that belief.
+      _startReading() {
+        if (this._handle !== null && !this._reading) this._read(65536);
       }
       _read(size) {
         if (this._handle === null || this._reading) return;
@@ -23714,6 +23834,8 @@
             if (data === undefined) {
               this._onReadEof();
             } else {
+              this.bytesRead += data.length;
+              if (this._timeoutMs > 0) this._resetTimeout();
               this.push(globalThis.Buffer.from(data.buffer, data.byteOffset, data.length));
             }
           },
@@ -23736,18 +23858,48 @@
         );
       }
       _write(chunk, encoding, callback) {
-        if (this._handle === null) {
-          callback(new Error("TLSSocket: not connected"));
-          return;
-        }
         var data = typeof chunk === "string"
           ? globalThis.Buffer.from(chunk, encoding) : chunk;
+        // Counted when handed to this layer, as Node counts a write it has
+        // queued behind a pending connect (see bytesWritten).
+        this._bytesDispatched += data.length;
+        this._writeData(data, callback);
+      }
+      // Node queues writes -- and the FIN -- issued while the socket is still
+      // connecting and sends them on 'connect'; a socket that dies first
+      // fails them with ERR_SOCKET_CLOSED_BEFORE_CONNECTION. Failing them
+      // here at once would, with autoDestroy on, destroy the socket before
+      // it ever connected -- the `const s = tls.connect(o); s.write(req)`
+      // shape every hand-rolled client and ioredis's connector use.
+      _writeData(data, callback) {
+        if (this._handle === null) {
+          if (this.connecting && !this.destroyed) {
+            this._afterConnect(() => this._writeData(data, callback), callback);
+            return;
+          }
+          callback(socketClosedError());
+          return;
+        }
+        if (this._timeoutMs > 0) this._resetTimeout();
         natives.tlsWrite(this._handle, data).then(
           () => callback(),
           (err) => callback(typeof err === "string" ? new Error(err) : err),
         );
       }
+      // Run `fn` once the socket connects, or `onClose(err)` if it closes
+      // first -- whichever comes first, exactly once.
+      _afterConnect(fn, onClose) {
+        var connected, closed;
+        connected = () => { this.removeListener("close", closed); fn(); };
+        closed = () => { this.removeListener("connect", connected); onClose(socketClosedBeforeConnectionError()); };
+        this.once("connect", connected);
+        this.once("close", closed);
+      }
       _final(callback) {
+        if (this._handle === null && this.connecting && !this.destroyed) {
+          this._afterConnect(() => this._final(callback), () => callback());
+          return;
+        }
         if (this._handle !== null) {
           natives.tlsShutdown(this._handle).then(() => callback(), () => callback());
         } else {
@@ -23755,11 +23907,25 @@
         }
       }
       _destroy(err, callback) {
+        registry._activeHandles.delete(this);
+        if (this._timeoutId !== null) {
+          globalThis.clearTimeout(this._timeoutId);
+          this._timeoutId = null;
+        }
+        this.connecting = false;
+        this._connectPending = false;
+        // The handle is gone, and with it the local endpoint: address() is
+        // `{}` again. The remote fields stay, as they do in Node once read.
+        this.localAddress = this.localPort = this.localFamily = undefined;
         if (this._handle !== null) {
           natives.tlsClose(this._handle);
           this._handle = null;
         }
         callback(err);
+        // Node emits 'close' from the handle-close callback: a loop turn
+        // after 'end' / 'error', with `hadError`, so a listener attached
+        // after awaiting 'end' still sees it.
+        globalThis.setImmediate(() => this.emit("close", !!err));
       }
       getPeerCertificate() { return {}; }
       getProtocol() { return this._protocol || null; }
@@ -23768,19 +23934,100 @@
       }
       setMaxSendFragment() { return true; }
       enableTrace() {}
-      get remoteAddress() { return this._remoteAddress || undefined; }
-      get remotePort() { return this._remotePort || undefined; }
+
+      // ---- the net.Socket surface (#132), Node's semantics ----
+      setTimeout(msecs, callback) { return socketSetTimeout(this, msecs, callback); }
+      // Idle timer: re-armed by every read and write, fires 'timeout' with
+      // the socket still open (probed on Node: readyState stays "open" and
+      // destroyed stays false; closing it is the listener's decision).
+      _resetTimeout() {
+        if (this._timeoutId !== null) globalThis.clearTimeout(this._timeoutId);
+        if (this._timeoutMs > 0 && !this.destroyed) {
+          this._timeoutId = globalThis.setTimeout(() => {
+            this._timeoutId = null;
+            this.emit("timeout");
+          }, this._timeoutMs);
+        }
+      }
+      // Chainable no-ops, as on net.Socket: ioredis calls both on every
+      // connection (Redis.js: setNoDelay(true), then setKeepAlive(true, 0)
+      // because keepAlive defaults to the number 0) and crashed over
+      // rediss:// when the first was missing.
+      setNoDelay() { return this; }
+      setKeepAlive() { return this; }
+      // Node excludes UNREF'd handles from _getActiveHandles() and
+      // getActiveResourcesInfo(); the flag is what those views read (as for
+      // net.Socket, it does not yet affect oam's loop-liveness).
+      ref() { this._handleRefed = true; return this; }
+      unref() { this._handleRefed = false; return this; }
+      // `{}` until connected, then Node's key order (probed on v22.22.2).
+      address() {
+        if (this.localAddress === undefined) return {};
+        return { address: this.localAddress, family: this.localFamily || "IPv4", port: this.localPort };
+      }
+      // Node's TLSSocket has a handle from construction, so bufferSize is a
+      // number from the start: what is queued in the writable.
+      get bufferSize() { return this.writableLength; }
+      // Bytes handed to this layer plus bytes still queued behind an
+      // in-flight write -- Node's formula, so back-to-back writes count at
+      // once rather than as the queue drains.
+      get bytesWritten() {
+        var queued = 0;
+        var buffered = this.writableBuffer;
+        if (buffered) {
+          for (var i = 0; i < buffered.length; i++) queued += buffered[i].chunk.length;
+        }
+        return this._bytesDispatched + queued;
+      }
+      get pending() { return this._handle === null || this.connecting; }
+      get readyState() {
+        if (this.destroyed) return "closed";
+        if (this.connecting || this._handle === null) return "opening";
+        var r = this.readable, w = this.writable;
+        if (r && w) return "open";
+        if (r) return "readOnly";
+        if (w) return "writeOnly";
+        return "closed";
+      }
+      // socket.connect(options[, cb]) / socket.connect(port[, host][, options][, cb]),
+      // Node's argument shapes: the endpoint from here, the TLS options from
+      // the constructor. Like net.Socket.connect, the callback rides on
+      // 'connect'.
+      connect(...args) {
+        var parsed = normalizeConnectArgs(args);
+        _connectTls(this, Object.assign({}, this._tlsOptions, parsed[0]), parsed[1], "connect");
+        return this;
+      }
     }
 
-    function connect(optionsOrPort, hostOrCb, cb) {
-      var options, callback;
-      if (typeof optionsOrPort === "number") {
-        options = { port: optionsOrPort, host: typeof hostOrCb === "string" ? hostOrCb : "localhost" };
-        callback = typeof hostOrCb === "function" ? hostOrCb : cb;
+    // Node's argument shapes for tls.connect and socket.connect
+    // (net._normalizeArgs plus tls's normalizeConnectArgs): (options[, cb])
+    // or (port[, host][, options][, cb]) -- an options object right after
+    // the port, or after the host, merges over them. Probed: the old
+    // (port, host|cb, cb) parse threw on (port, host, options) with the
+    // options object as the listener, and dropped the options on (port,
+    // options, cb) -- rejectUnauthorized, servername, ca, host all lost.
+    function normalizeConnectArgs(args) {
+      var options = {};
+      var arg0 = args[0];
+      if (typeof arg0 === "object" && arg0 !== null) {
+        options = Object.assign({}, arg0);
       } else {
-        options = optionsOrPort || {};
-        callback = typeof hostOrCb === "function" ? hostOrCb : undefined;
+        options.port = arg0;
+        if (typeof args[1] === "string") options.host = args[1];
       }
+      if (typeof args[1] === "object" && args[1] !== null) Object.assign(options, args[1]);
+      else if (typeof args[2] === "object" && args[2] !== null) Object.assign(options, args[2]);
+      var last = args[args.length - 1];
+      return [options, typeof last === "function" ? last : undefined];
+    }
+
+    // The connect flow tls.connect() and TLSSocket.prototype.connect() share.
+    // One native op does the TCP connect and the handshake, so 'connect',
+    // 'ready' and 'secureConnect' fire back to back -- Node's order, probed
+    // -- and the transport's addresses land as they would on a net.Socket:
+    // remoteAddress is the resolved IP, never the host name.
+    function _connectTls(socket, options, callback, event) {
       var host = options.host || options.hostname || "localhost";
       var port = options.port || 443;
       var serverName = options.servername || host;
@@ -23789,26 +24036,86 @@
       var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
 
-      var socket = new TLSSocket(null, options);
-      socket._remoteAddress = host;
-      socket._remotePort = port;
-      if (callback) socket.once("secureConnect", callback);
+      if (socket._connectPending || socket._handle !== null) {
+        // Node: a connect() on a socket that is connecting or connected
+        // fails with EISCONN and destroys the socket, and the callback
+        // never runs. Ignoring the call would drop the callback silently.
+        process.nextTick(() => socket.destroy(connectSyscallError("EISCONN", host, port, socket)));
+        return;
+      }
+      if (socket._wrappedSocket) {
+        // Not openable here (class comment): fail on the next tick, the way
+        // a refused connect would, rather than connect somewhere else.
+        var unsupported = new Error(
+          "The feature tls over an existing socket (the `socket` option) is " +
+          "unavailable on the current platform, which is being used to run oam",
+        );
+        unsupported.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+        process.nextTick(() => socket.destroy(unsupported));
+        return;
+      }
+      if (socket.destroyed) {
+        // Node reconnects a destroyed socket (its documented reconnect
+        // shape): reset the stream state and go again.
+        socket._undestroy();
+        socket._reading = false;
+      }
+      if (callback) socket.once(event, callback);
+      socket.connecting = true;
+      socket._connectPending = true;
+      // Node registers the handle synchronously inside connect(), before the
+      // connection exists, and a TLS socket reports as a TCPSocketWrap
+      // before and after the handshake (probed: the TLS wrap sits on the TCP
+      // handle).
+      registry._activeHandles.set(socket, "TCPSocketWrap");
 
       natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key).then(
         (info) => {
+          socket._connectPending = false;
+          if (socket.destroyed) {
+            // destroy() raced the connect: close the fresh native handle
+            // rather than revive a dead socket (net.Socket does the same).
+            try { natives.tlsClose(info.handle); } catch (_) { /* noop */ }
+            return;
+          }
           socket._handle = info.handle;
+          socket.connecting = false;
           socket.authorized = info.authorized;
           socket._protocol = info.protocol;
           socket._cipher = info.cipher;
           socket.alpnProtocol = info.alpnProtocol || false;
+          if (info.remoteAddr) {
+            socket.remoteAddress = info.remoteAddr.address;
+            socket.remotePort = info.remoteAddr.port;
+            socket.remoteFamily = info.remoteAddr.family;
+          }
+          if (info.localAddr) {
+            socket.localAddress = info.localAddr.address;
+            socket.localPort = info.localAddr.port;
+            socket.localFamily = info.localAddr.family;
+          }
+          if (socket._timeoutMs > 0) socket._resetTimeout();
+          socket.emit("connect");
+          socket.emit("ready");
           socket.emit("secureConnect");
-          socket._kickRead();
+          socket._startReading();
         },
         (err) => {
+          socket._connectPending = false;
+          socket.connecting = false;
           socket.destroy(typeof err === "string" ? new Error(err) : err);
         },
       );
+    }
 
+    function connect(...args) {
+      var parsed = normalizeConnectArgs(args);
+      var options = parsed[0];
+      var socket = new TLSSocket(null, options);
+      // Node arms the idle timer from the option when it opens the transport
+      // itself (never for a wrapped socket, which is refused here anyway).
+      if (options.timeout && !options.socket) socket.setTimeout(options.timeout);
+      _connectTls(socket, options, parsed[1], "secureConnect");
       return socket;
     }
 
@@ -23848,6 +24155,9 @@
         var keyPem = this._options.key instanceof Uint8Array
           ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
 
+        // Registered synchronously inside listen(), as net.Server is: Node
+        // lists a listening tls.Server as a TCPServerWrap.
+        registry._activeHandles.set(this, "TCPServerWrap");
         natives.tcpListen(hostname, port || 0).then(
           (bound) => {
             this._serverId = bound.serverId;
@@ -23857,7 +24167,10 @@
             this.emit("listening");
             this._acceptLoop(bound.serverId, certPem, keyPem);
           },
-          (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
+          (err) => {
+            registry._activeHandles.delete(this);
+            this.emit("error", typeof err === "string" ? new Error(err) : err);
+          },
         );
         return this;
       }
@@ -23882,17 +24195,30 @@
               var info = await natives.tlsAcceptWrap(tcpHandle, certPem, keyPem);
               var socket = new TLSSocket(null, {});
               socket._handle = info.handle;
-              socket.authorized = true;
+              socket.connecting = false;
+              // Node: false unless requestCert produced a verified peer
+              // certificate, and this server never requests one. Its
+              // `timeout` is the server's, which is 0.
+              socket.authorized = false;
+              socket.timeout = 0;
               socket._protocol = info.protocol;
               socket._cipher = info.cipher;
               socket.alpnProtocol = info.alpnProtocol || false;
               socket.encrypted = true;
-              if (accepted.remoteAddr) {
-                socket._remoteAddress = accepted.remoteAddr.address;
-                socket._remotePort = accepted.remoteAddr.port;
+              var remote = info.remoteAddr || accepted.remoteAddr;
+              if (remote) {
+                socket.remoteAddress = remote.address;
+                socket.remotePort = remote.port;
+                socket.remoteFamily = remote.family;
               }
+              if (info.localAddr) {
+                socket.localAddress = info.localAddr.address;
+                socket.localPort = info.localAddr.port;
+                socket.localFamily = info.localAddr.family;
+              }
+              registry._activeHandles.set(socket, "TCPSocketWrap");
               this.emit("secureConnection", socket);
-              socket._kickRead();
+              socket._startReading();
             } catch (e) {
               this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
             }
@@ -23902,11 +24228,12 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { port: this._port, address: this._host, family: this._host.includes(":") ? "IPv6" : "IPv4" }
           : null;
       }
       close(callback) {
         this._closed = true;
+        registry._activeHandles.delete(this);
         if (this._serverId !== null) {
           natives.tcpServerClose(this._serverId);
           this.listening = false;
@@ -23914,6 +24241,10 @@
         if (callback) this.once("close", callback);
         return this;
       }
+      // Same unref semantics as net.Server: the flag is what the
+      // active-handle views read.
+      ref() { this._handleRefed = true; return this; }
+      unref() { this._handleRefed = false; return this; }
       getTicketKeys() { return Buffer.alloc(48); }
       setTicketKeys() {}
     }

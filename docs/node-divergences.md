@@ -944,6 +944,51 @@ entries below were executed on both runtimes unless marked.
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
 | `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` builds an ordinary stream — there is no byte controller and no `byobRequest` — and `getReader({ mode: 'byob' })` ignores the mode, returning a default reader rather than a `ReadableStreamBYOBReader`. The one place in the runtime that node builds a byte stream, `fsPromises.FileHandle.readableWebStream()`, is affected: it delivers node's exact chunks (plain `Uint8Array`, node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor) so default-reader and `for await` consumption match byte for byte, and only a BYOB reader diverges. | Real byte streams, `byobRequest`, and BYOB readers. |
 
+### 34. `tls.TLSSocket` is a `net.Socket` by brand, not by prototype
+
+In Node `tls.TLSSocket extends net.Socket`. In oam the two cannot share a base: `net.Socket`
+is a hand-rolled `EventEmitter` over the TCP natives, `tls.TLSSocket` a real `stream.Duplex`
+over the TLS natives. A TLS socket carries the `net.Socket` surface (every public member of
+oam's own `net.Socket`, prototype and instance fields, checked mechanically by
+`conformance/cases/100-tls-socket-net-api.mjs` against a `tls.connect()` socket, byte-identical
+with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` answers
+`instanceof` for its kin through a `Symbol.hasInstance` that recognises a brand symbol a
+`TLSSocket` carries. What differs from Node:
+
+- **The chain itself.** `Object.getPrototypeOf` walks from a `TLSSocket` reach `Duplex`, never
+  `net.Socket.prototype`, and `net.Socket.prototype.method.call(tlsSocket)` is not a
+  supported way to reach a socket method. The other direction holds too: a `net.Socket` is not
+  a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
+  true.
+- **Node members absent from both classes**, which the mechanical walk cannot see by
+  construction: `destroySoon`, `resetAndDestroy`, and `net.Socket.prototype.read` (a
+  `TLSSocket`, being a Duplex, has `read`). A `tls.connect()` socket also still lacks them.
+- **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
+  the TLS handshake inside oam's native connect and fires `'connect'`, `'ready'` and
+  `'secureConnect'`; in Node that `connect()` only opens the transport, and only
+  `tls.connect()` starts the handshake. oam is a superset here.
+- **No wrapping of an existing socket.** oam has no native op that starts a client-side TLS
+  session over an already-connected plain socket, so `tls.connect({ socket })` and
+  `new tls.TLSSocket(existingSocket)` are refused: the socket is destroyed on the next tick
+  with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
+  is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
+  exists, open the TLS connection with `tls.connect({ host, port })` instead.
+- **`ref()` / `unref()` affect the resource views, not loop liveness**, on both `net.Socket`
+  and `tls.TLSSocket`: an unref'd open socket still keeps an oam process alive where Node
+  exits. oam's loop is driven by native ops in flight, and an unref'd handle's parked read
+  is not yet excluded from that count (#140).
+- **`getProtocol()` / `getCipher()` return rustls's names** (`TLSv1_3`,
+  `TLS13_AES_256_GCM_SHA384`) where Node returns `TLSv1.3` and
+  `TLS_AES_256_GCM_SHA384`. Pre-existing; #138.
+
+The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting
+`TLSSocket` under it; that is a rewrite of the class every socket-heavy module leans on, and
+it waits for the `net` tranche of the vendored Node suite to gate it.
+
+_(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
+described; the bare-`connect()` and `socket`-option shapes as described; `unref()` liveness
+measured against a Node-hosted TLS server.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is

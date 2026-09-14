@@ -121,7 +121,10 @@ fn build_client_config(
 }
 
 /// tls.connect: TCP connect + TLS handshake.
-/// Returns Json {handle, protocol, cipher, authorized, alpnProtocol}.
+/// Returns Json {handle, protocol, cipher, authorized, alpnProtocol,
+/// localAddr?, remoteAddr?} -- the address pair in the same shape as
+/// tcp_connect's, so a TLSSocket can report `address()`, `localPort` and the
+/// resolved `remoteAddress` the way a net.Socket does.
 #[allow(clippy::too_many_arguments)]
 pub async fn tls_connect(
     registry: TlsRegistry,
@@ -185,6 +188,10 @@ pub async fn tls_connect(
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
 
+    let (tcp, _) = tls_stream.get_ref();
+    let local_addr = tcp.local_addr().ok();
+    let remote_addr = tcp.peer_addr().ok();
+
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = tokio::io::split(tls_stream);
     {
@@ -193,16 +200,20 @@ pub async fn tls_connect(
         guard.writers.insert(handle, TlsWriter::Client(writer));
     }
 
-    OpOutcome::Json(
-        serde_json::json!({
-            "handle": handle,
-            "protocol": protocol,
-            "cipher": cipher,
-            "authorized": reject_unauthorized,
-            "alpnProtocol": alpn,
-        })
-        .to_string(),
-    )
+    let mut payload = serde_json::json!({
+        "handle": handle,
+        "protocol": protocol,
+        "cipher": cipher,
+        "authorized": reject_unauthorized,
+        "alpnProtocol": alpn,
+    });
+    if let Some(la) = local_addr {
+        payload["localAddr"] = crate::tcp::addr_to_json(la);
+    }
+    if let Some(ra) = remote_addr {
+        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
+    }
+    OpOutcome::Json(payload.to_string())
 }
 
 pub async fn tls_read(registry: TlsRegistry, handle: u64, len: usize) -> OpOutcome {
@@ -376,6 +387,10 @@ pub async fn tls_accept_wrap(
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
 
+    let (tcp, _) = tls_stream.get_ref();
+    let local_addr = tcp.local_addr().ok();
+    let remote_addr = tcp.peer_addr().ok();
+
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = tokio::io::split(tls_stream);
     {
@@ -384,15 +399,19 @@ pub async fn tls_accept_wrap(
         guard.writers.insert(handle, TlsWriter::Server(writer));
     }
 
-    OpOutcome::Json(
-        serde_json::json!({
-            "handle": handle,
-            "protocol": protocol,
-            "cipher": cipher,
-            "alpnProtocol": alpn,
-        })
-        .to_string(),
-    )
+    let mut payload = serde_json::json!({
+        "handle": handle,
+        "protocol": protocol,
+        "cipher": cipher,
+        "alpnProtocol": alpn,
+    });
+    if let Some(la) = local_addr {
+        payload["localAddr"] = crate::tcp::addr_to_json(la);
+    }
+    if let Some(ra) = remote_addr {
+        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
+    }
+    OpOutcome::Json(payload.to_string())
 }
 
 /// Build a TLS server config from PEM-encoded cert chain + private key.

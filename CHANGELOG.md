@@ -18,6 +18,84 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A TLS socket lacked the `net.Socket` API, and ioredis crashed over
+  `rediss://`** (#132). In Node `tls.TLSSocket` extends `net.Socket`; oam's
+  extended `stream.Duplex` and shared no base with its `net.Socket`, so a
+  `tls.connect()` socket had no `setNoDelay`, `setKeepAlive`, `setTimeout`,
+  `ref`, `unref`, `address`, `connect`, `readyState` or `pending`, and
+  `instanceof net.Socket` was false. ioredis calls `setNoDelay(true)` then
+  `setKeepAlive(true, 0)` on every connection, so a `rediss://` client threw
+  `TypeError: stream.setNoDelay is not a function` from the connect callback
+  and the process died; a database driver's idle `setTimeout`, a background
+  connection's `unref()` and an `address()` for logging broke the same way.
+  A TLS socket now carries the `net.Socket` surface with Node's semantics,
+  every value probed against Node v22.22.2:
+  - `setNoDelay` / `setKeepAlive` are chainable no-ops, as on `net.Socket`.
+  - `setTimeout(msecs[, callback])` is an idle timer re-armed by every read
+    and write, firing `'timeout'` with the socket still open. It has Node's
+    contract on both `net.Socket` and `tls.TLSSocket`: `msecs` must be a
+    non-negative finite number (`ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`),
+    `socket.timeout` mirrors the value, `setTimeout(0, cb)` removes `cb`
+    rather than adding it a second time, and a destroyed socket ignores the
+    call. `tls.connect({ timeout })` arms it, as in Node.
+  - `ref()` / `unref()` drive `process.getActiveResourcesInfo()` and
+    `process._getActiveHandles()`, where a TLS socket now appears as a
+    `TCPSocketWrap` from the moment `tls.connect()` returns, as in Node.
+  - `address()` is `{}` until connected and again after close, then
+    `{ address, family, port }` for the local endpoint; `localAddress`,
+    `localPort`, `localFamily`, `remoteFamily`, `bufferSize`, `bytesRead` and
+    `bytesWritten` are populated (`bytesWritten` counts a queued write at
+    once, Node's formula), and `remoteAddress` is the resolved IP rather than
+    the host name given (Node reports `127.0.0.1` for `localhost`). Both
+    native TLS ops now return the transport's local and peer addresses in
+    `tcp_connect`'s shape.
+  - `readyState` / `pending` / `connecting` follow Node: `"opening"` / `true`
+    / `true` from construction until the transport connects (which on oam is
+    the same instant the handshake completes), `"closed"` / `true` after
+    destroy.
+  - A write or `end()` issued before the connection exists is queued and
+    sent on `'connect'`, as Node queues them; a socket that dies first fails
+    the write with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`.
+  - `tls.connect(port[, host][, options][, callback])` takes every shape Node
+    documents. It used to accept only `(port, host, cb)`: with `(port, host,
+    options)` the options object was taken for the listener and the call
+    threw, and with `(port, options, cb)` the options were dropped, so
+    `rejectUnauthorized`, `servername`, `ca` and `host` were lost.
+  - `connect(options[, cb])` and `connect(port[, host][, options][, cb])` work
+    on a `new tls.TLSSocket(null, tlsOptions)`, reusing the constructor's TLS
+    options, with the callback on `'connect'` as for `net.Socket`. A second
+    `connect()` on a connecting or connected socket destroys it with
+    `EISCONN`, and `connect()` on a destroyed socket reconnects it, both as
+    Node does; the two used to be silent no-ops that dropped the callback.
+  - The `socket` option (and constructor argument) is refused with
+    `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` on the next tick: oam cannot wrap an
+    existing plain socket in a client-side TLS session, and the call used to
+    open a new connection to the default host and port instead, hanging in
+    `"opening"`.
+  - `'connect'` and `'ready'` fire before `'secureConnect'`, in Node's order.
+  - `tlsSocket instanceof net.Socket` is true. The two classes still cannot
+    share a base, so `net.Socket` answers by a brand its kin carry rather
+    than by prototype; `Object.getPrototypeOf` walks differ from Node
+    (divergence 34).
+  - A TLS socket is read from the moment it connects, consumer or not, as
+    Node reads it: a peer's EOF is seen, `'end'` fires even with nothing
+    consuming, the write side is ended after `'end'` (so an `'end'` listener
+    still sees the socket writable, as in Node), and once both sides are done
+    the socket emits `'close'` with Node's `hadError` boolean, a loop turn
+    later, releases its native handle, and leaves
+    `getActiveResourcesInfo()`. It used to read only once a consumer
+    attached, and ran with stream `autoDestroy` off, so a socket nobody read
+    from sat open forever and `'close'` never followed `'end'` + `'finish'`;
+    ioredis reconnects on `'close'`.
+  - On the server side an accepted socket reports `authorized: false`
+    (Node's value without `requestCert`), `timeout: 0`, and the same fields;
+    a listening `tls.Server` is a `TCPServerWrap` in the resource views, has
+    `ref()` / `unref()`, and `address().family` says `IPv6` for a `::1`
+    listener.
+  A conformance case walks every public member of the runtime's own
+  `net.Socket` (prototype and instance fields) against a `tls.connect()`
+  socket, byte-identical with Node, so the next missing member fails the gate
+  instead of a library.
 - **`oam check` failed every project with `"types": ["node"]` in its
   tsconfig** (#130), reporting an internal `OAM-TS0004` carrying
   `TS2688: Cannot find type definition file for 'node'` where `tsc` and `tsgo`
