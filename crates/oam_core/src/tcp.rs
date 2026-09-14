@@ -75,8 +75,9 @@ fn reinsert_listener(
     }
 }
 
-/// Format a SocketAddr as a Node-style structured address object.
-fn addr_to_json(addr: std::net::SocketAddr) -> serde_json::Value {
+/// Format a SocketAddr as a Node-style structured address object. Shared
+/// with the TLS ops, whose sockets carry the same `localAddr`/`remoteAddr`.
+pub(crate) fn addr_to_json(addr: std::net::SocketAddr) -> serde_json::Value {
     serde_json::json!({
         "address": addr.ip().to_string(),
         "port": addr.port(),

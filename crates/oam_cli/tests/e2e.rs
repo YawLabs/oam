@@ -40,6 +40,15 @@ fn oam(args: &[&str]) -> Output {
         // tsgo regularly missed 10s, which used to force skips (8d7b515)
         // that hid real assertions; 60s keeps them live on loaded boxes.
         .env("OAM_CHECK_WAIT_MS", "60000")
+        // Colour policy is the test's to set, never the terminal's: oam
+        // honours these exactly as Node does (FORCE_COLOR wins over a piped
+        // stdout), so a terminal that exports FORCE_COLOR=3 -- this dev box's
+        // does -- turned structured_clone_and_util_style_text's "piped
+        // output carries no escapes" assertion red for no reason of oam's.
+        // A test that wants one sets it in its own script or Command.
+        .env_remove("FORCE_COLOR")
+        .env_remove("NO_COLOR")
+        .env_remove("NODE_DISABLE_COLORS")
         .output()
         .expect("oam binary runs")
 }
@@ -14139,6 +14148,186 @@ server.close();
         stdout.contains("has_createSecureContext=true"),
         "stdout: {stdout}"
     );
+}
+
+/// Issue #132: Node's tls.TLSSocket extends net.Socket, so a TLS socket
+/// carries the whole socket API; oam's did not (no shared base), and ioredis
+/// crashed over rediss:// on its first `stream.setNoDelay(true)`. Every
+/// value asserted here was probed on Node v22.22.2 against the same shape,
+/// except the last block, where oam is a documented superset (a bare
+/// `connect()` handshakes; Node's only opens the transport).
+#[test]
+fn tls_socket_carries_the_net_socket_api() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import net from 'node:net';
+
+const cert = `{cert}`;
+const key = `{key}`;
+const tcpWraps = () => process.getActiveResourcesInfo().filter((t) => t === 'TCPSocketWrap').length;
+// Every await is bounded: a regression that never fires the event must
+// fail in seconds, not hang the suite's test thread.
+const within = (ms, label, p) => {{
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => {{ t = setTimeout(r, ms); }}).then(() => {{ console.log(label + '=NEVER'); process.exit(3); }}),
+  ]).finally(() => clearTimeout(t));
+}};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+
+// Echo, except 'delay': answered with an unprompted 'push' 30ms later, so
+// the client can see READ activity with no write of its own.
+const server = tls.createServer({{ cert, key }}, (s) => {{
+  s.on('data', (d) => {{ if (String(d) === 'delay') setTimeout(() => s.write('push'), 30); else s.write(d); }});
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+
+const events = [];
+// rejectUnauthorized:false as in the sibling tests: rustls refuses the
+// self-signed test cert as its own CA (CaUsedAsEndEntity); nothing here
+// depends on verification. 'localhost' so remoteAddress proves resolved
+// (it costs ~2s on Windows, where oam's tcp connect tries ::1 first).
+const s = tls.connect({{ host: 'localhost', port, rejectUnauthorized: false, servername: 'localhost' }});
+for (const ev of ['connect', 'ready', 'secureConnect', 'timeout', 'end', 'close']) s.on(ev, () => events.push(ev));
+let hadError;
+s.once('close', (h) => {{ hadError = h; }});
+console.log('before=' + JSON.stringify({{ pending: s.pending, readyState: s.readyState, address: s.address(), instanceofNet: s instanceof net.Socket, tcpWraps: tcpWraps() }}));
+await once(s, 'secureConnect');
+
+// The ioredis shape (Redis.js:151-163): both calls, chained, on connect.
+console.log('chain=' + (s.setNoDelay(true) === s && s.setKeepAlive(true, 0) === s));
+const a = s.address();
+console.log('after=' + JSON.stringify({{
+  pending: s.pending, readyState: s.readyState,
+  addressOk: a.address === '127.0.0.1' && a.family === 'IPv4' && typeof a.port === 'number' && a.port !== port,
+  keys: Object.keys(a), localPort: typeof s.localPort,
+  remote: [s.remoteAddress, s.remotePort === port, s.remoteFamily],
+}}));
+const refed = tcpWraps();
+s.unref();
+console.log('unref=' + (refed - tcpWraps()));
+s.ref();
+console.log('ref=' + (tcpWraps() - refed));
+
+// setTimeout(0, cb) REMOVES cb (Node): a callback armed then disarmed must
+// not fire on the next arm. `timeout` mirrors the last value set.
+const stale = () => events.push('stale');
+s.setTimeout(20, stale);
+s.setTimeout(0, stale);
+s.setTimeout(60);
+const t0 = Date.now();
+await once(s, 'timeout');
+console.log('timeout=' + JSON.stringify({{ late: Date.now() - t0 >= 50, readyState: s.readyState, destroyed: s.destroyed, timeoutProp: s.timeout }}));
+
+// A read re-arms the idle timer: armed at 300ms, the server's push ~30ms in
+// must move the firing to ~300ms after the push arrives, not ~270ms after.
+// The margins are wide on purpose: a loaded CI box can starve this process
+// for tens of milliseconds between the push and its 'data'.
+s.setTimeout(300);
+const fired = once(s, 'timeout').then(() => Date.now());
+s.write('delay');
+await once(s, 'data');
+const pushed = Date.now();
+console.log('rearmed=' + ((await fired) - pushed >= 290));
+s.setTimeout(0);
+
+s.write('ping');
+await once(s, 'data');
+console.log('bytes=' + JSON.stringify([s.bytesRead, s.bytesWritten]));
+s.end();
+await once(s, 'close', 3000);
+console.log('events=' + JSON.stringify(events));
+// By identity: the server-side socket of this same process may still be
+// winding down, so a count of TCPSocketWraps is not the question.
+console.log('closed=' + JSON.stringify({{ readyState: s.readyState, pending: s.pending, listed: process._getActiveHandles().includes(s), hadError, address: s.address() }}));
+
+// A write issued before the connection exists is queued and sent on
+// 'connect', and counts in bytesWritten at once (Node's shape). It used to
+// fail, and with autoDestroy the failure destroyed the socket before it
+// ever connected. The (port, host, options) argument form is Node's too;
+// it used to throw with the options object taken for the listener.
+const w = tls.connect(port, '127.0.0.1', {{ rejectUnauthorized: false, servername: 'localhost' }});
+w.on('error', () => {{}});
+w.write('early');
+console.log('queued=' + JSON.stringify({{ bytesWritten: w.bytesWritten, pending: w.pending }}));
+console.log('early=' + String(await within(5000, 'early', new Promise((r) => w.once('data', (d) => r(String(d)))))));
+const wClose = once(w, 'close', 3000);
+w.destroy(new Error('boom'));
+console.log('wHadError=' + String(await wClose));
+
+// end() with nothing read and no consumer: the peer's answering EOF must
+// still be seen (the transport is read from connect, as Node reads it), so
+// 'end' fires, the write side is already done, and the socket closes. It
+// used to sit open forever, since reading only began once a consumer
+// attached.
+const z = tls.connect({{ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost' }});
+z.on('error', () => {{}});
+z.end();
+await once(z, 'close', 4000);
+console.log('bareEnd=' + z.readyState);
+
+// new TLSSocket() + connect(). On oam the connect() runs the handshake too,
+// so 'secureConnect' has fired and the cipher is known by the time the
+// connect callback runs; Node's bare connect() stops at the transport and
+// leaves the handshake to tls.connect() -- a documented superset.
+const t = new tls.TLSSocket(null, {{ rejectUnauthorized: false, servername: 'localhost' }});
+const tEvents = [];
+for (const ev of ['connect', 'secureConnect']) t.on(ev, () => tEvents.push(ev));
+console.log('fresh=' + JSON.stringify({{ pending: t.pending, readyState: t.readyState, instanceofNet: t instanceof net.Socket, connecting: t.connecting, bufferSize: t.bufferSize }}));
+await within(5000, 'connect', new Promise((r) => t.connect({{ host: '127.0.0.1', port }}, r)));
+console.log('connected=' + JSON.stringify({{ readyState: t.readyState, encrypted: t.encrypted, cipher: typeof t.getCipher().name, seen: tEvents }}));
+// A second connect() on a connected socket is EISCONN and destroys it
+// (Node); it used to be a silent no-op that dropped the callback.
+t.on('error', (e) => tEvents.push('error:' + e.code));
+t.on('close', (h) => tEvents.push('close:' + h));
+t.connect({{ host: '127.0.0.1', port }}, () => tEvents.push('cb'));
+await once(t, 'close', 3000);
+console.log('eisconn=' + JSON.stringify(tEvents.slice(2)));
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_socket_api.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        // Registered synchronously, pending, `{}` from address() -- Node's shape.
+        r#"before={"pending":true,"readyState":"opening","address":{},"instanceofNet":true,"tcpWraps":1}"#,
+        "chain=true",
+        r#""pending":false,"readyState":"open","addressOk":true,"keys":["address","family","port"],"localPort":"number","remote":["127.0.0.1",true,"IPv4"]"#,
+        "unref=1",
+        "ref=0",
+        r#"timeout={"late":true,"readyState":"open","destroyed":false,"timeoutProp":60}"#,
+        "rearmed=true",
+        // 'push' + the 'ping' echo read; 'delay' + 'ping' written.
+        "bytes=[8,9]",
+        // No 'stale': the disarmed callback never fired.
+        r#"events=["connect","ready","secureConnect","timeout","timeout","end","close"]"#,
+        // hadError false on a clean end; the local endpoint gone with the handle.
+        r#"closed={"readyState":"closed","pending":true,"listed":false,"hadError":false,"address":{}}"#,
+        r#"queued={"bytesWritten":5,"pending":true}"#,
+        "early=early",
+        "wHadError=true",
+        "bareEnd=closed",
+        r#"fresh={"pending":true,"readyState":"opening","instanceofNet":true,"connecting":true,"bufferSize":0}"#,
+        r#"connected={"readyState":"open","encrypted":true,"cipher":"string","seen":["connect","secureConnect"]}"#,
+        r#"eisconn=["error:EISCONN","close:true"]"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }
 
 #[test]

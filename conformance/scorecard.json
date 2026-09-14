@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "cdfe6dc",
+  "commit": "98a604f+wip",
   "oamVersion": "oam 0.15.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 101,
-      "total": 101,
+      "pass": 102,
+      "total": 102,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -60,6 +60,10 @@
         },
         {
           "case": "10-timers-als-process.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "100-tls-socket-net-api.mjs",
           "status": "pass"
         },
         {
