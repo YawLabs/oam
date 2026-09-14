@@ -973,10 +973,6 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
   is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
   exists, open the TLS connection with `tls.connect({ host, port })` instead.
-- **`ref()` / `unref()` affect the resource views, not loop liveness**, on both `net.Socket`
-  and `tls.TLSSocket`: an unref'd open socket still keeps an oam process alive where Node
-  exits. oam's loop is driven by native ops in flight, and an unref'd handle's parked read
-  is not yet excluded from that count (#140).
 - **`minVersion` / `maxVersion` / `secureProtocol` are not honoured**, so a TLS 1.2
   handshake cannot be pinned from JS (every handshake here is TLS 1.3 when the peer allows
   it). `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
@@ -987,8 +983,7 @@ The complete fix for the chain is making `net.Socket` a real `Duplex` and re-par
 it waits for the `net` tranche of the vendored Node suite to gate it.
 
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
-described; the bare-`connect()` and `socket`-option shapes as described; `unref()` liveness
-measured against a Node-hosted TLS server.
+described; the bare-`connect()` and `socket`-option shapes as described.
 
 ### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written
 
@@ -1012,6 +1007,19 @@ tried and, for a name with several addresses, reports one error per address insi
 _(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms / 2033 ms,
 `http.get` at 4 ms / 2024 ms; `localhost` gave node an `AggregateError` over `::1` and
 `127.0.0.1`, oam a single `Error` naming `localhost`.
+
+### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
+
+Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
+host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
+'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0` and
+`connect(port)` defaults to `127.0.0.1`: same program, same data, `IPv4` in every observable.
+`tls.connect(port)` defaults to `localhost` on both runtimes and, since #137, reaches an
+IPv4-only listener as fast as Node does. Switching the connect default alone would not close
+the gap; it needs a dual-stack listen default first.
+
+_(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
+program.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

@@ -18,6 +18,28 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`socket.unref()` and `server.unref()` did not release the event loop**
+  (#140). They removed the handle from `process.getActiveResourcesInfo()` as
+  Node's do, but a connected, reading, unref'd `net.Socket` or `tls.TLSSocket`,
+  and an unref'd listening `net.Server` or `tls.Server`, still kept an oam
+  process alive where Node exits at once, so a client library that opens a
+  keep-alive connection and `unref()`s it (redis clients, loggers, telemetry
+  exporters) hung the process. The engine's stdin-only ref accounting is now
+  per-handle accounting: a parked read or accept on an unref'd handle stops
+  counting toward liveness, `ref()` re-pins it, an unref'd socket still
+  receives data while something else keeps the process alive, writes and
+  shutdowns keep pinning the loop as libuv's requests do, and `unref()` before
+  the handle exists is applied once it does, as Node defers it to
+  `'connect'`. Pinned by three conformance cases (a net and a tls client with
+  every socket unref'd, and an `unref()` then `ref()` kept alive by an
+  unref'd timer) and wall-clock e2e tests.
+- **`net.Socket` state before connect and after close.** `socket.address()`
+  is `{}` before connect and after close (it always returned an endpoint
+  object); `socket.pending` is `!handle || connecting`, true on a fresh socket
+  (it read `connecting` alone); and `net.connect(options)` honours
+  `allowHalfOpen` and `timeout`, so a half-open client ended by its peer reads
+  `writeOnly`, not `closed`. Every value measured on Node.
+
 - **`getProtocol()`, `getCipher()` and `getPeerCertificate()` on a TLS socket
   were rustls's Debug names and `{}`** (#138). `getProtocol()` returned
   `TLSv1_3` and `getCipher().name` `TLS13_AES_256_GCM_SHA384`, so code that
