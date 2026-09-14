@@ -973,21 +973,53 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
   is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
   exists, open the TLS connection with `tls.connect({ host, port })` instead.
-- **`ref()` / `unref()` affect the resource views, not loop liveness**, on both `net.Socket`
-  and `tls.TLSSocket`: an unref'd open socket still keeps an oam process alive where Node
-  exits. oam's loop is driven by native ops in flight, and an unref'd handle's parked read
-  is not yet excluded from that count (#140).
-- **`getProtocol()` / `getCipher()` return rustls's names** (`TLSv1_3`,
-  `TLS13_AES_256_GCM_SHA384`) where Node returns `TLSv1.3` and
-  `TLS_AES_256_GCM_SHA384`. Pre-existing; #138.
+- **`minVersion` / `maxVersion` / `secureProtocol` are not honoured**, so a TLS 1.2
+  handshake cannot be pinned from JS (every handshake here is TLS 1.3 when the peer allows
+  it). `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
+  peer sent; Node also consults the client's trust store for the issuer of the last one.
 
 The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting
 `TLSSocket` under it; that is a rewrite of the class every socket-heavy module leans on, and
 it waits for the `net` tranche of the vendored Node suite to gate it.
 
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
-described; the bare-`connect()` and `socket`-option shapes as described; `unref()` liveness
-measured against a Node-hosted TLS server.
+described; the bare-`connect()` and `socket`-option shapes as described.
+
+### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written
+
+Windows retransmits the SYN of a connect to a closed loopback port for about 2 s before it
+reports the refusal; libuv turns that off per socket (`SIO_TCP_INITIAL_RTO`, loopback targets
+only), so node's `net`, `tls`, `http` and `fetch` all see `ECONNREFUSED` within milliseconds.
+oam's `net.connect` and `tls.connect` do the same since #137 (pinned by
+`conformance/cases/101-net-refused-loopback-connect-fast.mjs`). `http.request` and `fetch`
+go through reqwest's connector, which has no way to set that option, so on Windows they still
+wait about 2 s before reporting the refusal.
+
+The error itself has node's shape on every platform (`fetch failed` with the transport error
+as `cause`; `errno`, `code`, `syscall`, `address`, `port`; pinned by
+`conformance/cases/102-fetch-http-refused-error-shape.mjs`), with one difference: the
+`address` on it, and in the `connect ECONNREFUSED <address>:<port>` message, is the URL's host
+as written. reqwest does not say which resolved address was refused, so
+`fetch('http://localhost:8080/')` fails with `address: 'localhost'` where node names the IP it
+tried and, for a name with several addresses, reports one error per address inside an
+`AggregateError` (`code` on the aggregate, message empty). An IP literal matches node exactly.
+
+_(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms / 2033 ms,
+`http.get` at 4 ms / 2024 ms; `localhost` gave node an `AggregateError` over `::1` and
+`127.0.0.1`, oam a single `Error` naming `localhost`.
+
+### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
+
+Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
+host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
+'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0` and
+`connect(port)` defaults to `127.0.0.1`: same program, same data, `IPv4` in every observable.
+`tls.connect(port)` defaults to `localhost` on both runtimes and, since #137, reaches an
+IPv4-only listener as fast as Node does. Switching the connect default alone would not close
+the gap; it needs a dual-stack listen default first.
+
+_(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
+program.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

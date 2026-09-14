@@ -895,6 +895,26 @@
     return String(value).toWellFormed();
   }
 
+  function shapeFetchCause(e, url) {
+    if (!(e instanceof Error)) return new Error(String(e));
+    if (e.syscall !== "connect" && e.syscall !== "getaddrinfo") return e;
+    let parsed = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return e;
+    }
+    // URL keeps the brackets of an IPv6 literal; node's address does not.
+    const host = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+    if (e.syscall === "getaddrinfo") {
+      e.hostname = host;
+    } else {
+      e.address = host;
+      e.port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
+    }
+    return e;
+  }
+
   globalThis.fetch = async function fetch(input, init) {
     init = init || {};
     const signal = init.signal;
@@ -977,8 +997,15 @@
     const op = globalThis.__oam
       .fetch(JSON.stringify(request))
       .then(makeResponse, (e) => {
-        // WHATWG: fetch() rejects with a TypeError on network failure.
-        throw new TypeError(e && e.message ? e.message : String(e));
+        // WHATWG: fetch() rejects with a TypeError on network failure, and
+        // node's message is the bare "fetch failed" with the transport error
+        // underneath as `cause` -- that is where `code` (ECONNREFUSED,
+        // ENOTFOUND, ...) lives and what retry logic reads. The native op
+        // rejects with node's errno / code / syscall for a connect or
+        // resolver failure; node also names the peer on it, which the
+        // request URL supplies here: address + port for connect, hostname
+        // for getaddrinfo.
+        throw new TypeError("fetch failed", { cause: shapeFetchCause(e, request.url) });
       });
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op

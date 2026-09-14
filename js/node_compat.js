@@ -14785,6 +14785,85 @@
     };
   };
 
+  // Node's legacy certificate object (crypto_x509.cc X509ToObject, then
+  // tls's translatePeerCertificate): what socket.getPeerCertificate() and
+  // X509Certificate#toLegacyObject() return, built from cryptoX509Parse's
+  // fields in Node's key order (probed on v22.22.2): subject, issuer,
+  // [subjectaltname], [infoAccess], ca, the key fields (RSA: modulus, bits,
+  // exponent, pubkey = the SubjectPublicKeyInfo DER; EC: bits, pubkey = the
+  // raw point, asn1Curve, [nistCurve]; other key types: none), valid_from,
+  // valid_to, fingerprint, fingerprint256, fingerprint512, [ext_key_usage],
+  // serialNumber, raw. subject and issuer are null-prototype objects keyed
+  // by the attribute short names, a repeated key becoming an array; infoAccess
+  // is a null-prototype object of arrays keyed "METHOD - LOCATION". Shared
+  // by the crypto and tls factories.
+  function x509NameObject(entries) {
+    var out = Object.create(null);
+    for (var i = 0; i < entries.length; i++) {
+      var key = entries[i][0], value = entries[i][1];
+      if (key in out) {
+        if (Array.isArray(out[key])) out[key].push(value);
+        else out[key] = [out[key], value];
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+  function x509InfoAccessObject(text) {
+    var out = Object.create(null);
+    var lines = text.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var colon = lines[i].indexOf(":");
+      if (colon < 0) continue;
+      var key = lines[i].slice(0, colon), value = lines[i].slice(colon + 1);
+      if (key in out) out[key].push(value);
+      else out[key] = [value];
+    }
+    return out;
+  }
+  function x509LegacyObject(parsed) {
+    var Buffer = globalThis.Buffer;
+    var out = {};
+    out.subject = x509NameObject(parsed.subjectEntries);
+    out.issuer = x509NameObject(parsed.issuerEntries);
+    if (parsed.subjectAltName !== undefined) out.subjectaltname = parsed.subjectAltName;
+    if (parsed.infoAccess !== undefined) out.infoAccess = x509InfoAccessObject(parsed.infoAccess);
+    out.ca = parsed.ca;
+    if (parsed.keyType === "rsa") {
+      out.modulus = parsed.modulus;
+      out.bits = parsed.bits;
+      out.exponent = parsed.exponent;
+      out.pubkey = Buffer.from(parsed.pubkey);
+    } else if (parsed.keyType === "ec") {
+      out.bits = parsed.bits;
+      out.pubkey = Buffer.from(parsed.pubkey);
+      out.asn1Curve = parsed.asn1Curve;
+      if (parsed.nistCurve !== undefined) out.nistCurve = parsed.nistCurve;
+    }
+    out.valid_from = parsed.validFrom;
+    out.valid_to = parsed.validTo;
+    out.fingerprint = parsed.fingerprint;
+    out.fingerprint256 = parsed.fingerprint256;
+    out.fingerprint512 = parsed.fingerprint512;
+    if (parsed.extKeyUsage !== undefined) out.ext_key_usage = parsed.extKeyUsage.slice();
+    out.serialNumber = parsed.serialNumber;
+    out.raw = Buffer.from(parsed.raw);
+    return out;
+  }
+  // The parts of OpenSSL's X509_check_issued that decide the legacy object's
+  // issuerCertificate links (probed: a self-signed certificate whose KeyUsage
+  // lacks keyCertSign does NOT point at itself): the names match, the
+  // subject's authority key id matches the issuer's subject key id when both
+  // are present, and an issuer carrying a KeyUsage extension has keyCertSign.
+  // The signature-algorithm and serial checks are not mirrored.
+  function x509IssuedBy(issuer, subject) {
+    if (issuer.subject !== subject.issuer) return false;
+    if (subject.authorityKeyId !== undefined && issuer.subjectKeyId !== undefined &&
+        subject.authorityKeyId !== issuer.subjectKeyId) return false;
+    return issuer.keyCertSign !== false;
+  }
+
   // ---------------------------------------------------------- node:crypto
   // Wave-1 surface: streaming hashes + HMAC (md5/sha1/sha224-512, the
   // workhorses of etags, cache keys, and HS256 JWTs), OS randomness, and
@@ -16130,6 +16209,7 @@
         if (typeof buf === "string") buf = BufferCtor.from(buf);
         else if (!BufferCtor.isBuffer(buf)) buf = BufferCtor.from(buf);
         var parsed = natives.cryptoX509Parse(new Uint8Array(buf));
+        this._parsed = parsed;
         this._subject = parsed.subject;
         this._issuer = parsed.issuer;
         this._serialNumber = parsed.serialNumber;
@@ -16137,9 +16217,17 @@
         this._validTo = parsed.validTo;
         this._fingerprint = parsed.fingerprint;
         this._fingerprint256 = parsed.fingerprint256;
+        this._fingerprint512 = parsed.fingerprint512;
         this._ca = parsed.ca;
-        this._subjectAltName = parsed.subjectAltName || "";
-        this._keyUsage = parsed.keyUsage || [];
+        // undefined without the extension, as in Node (probed on v22.22.2:
+        // a certificate with no SAN reports undefined, not "").
+        this._subjectAltName = parsed.subjectAltName;
+        this._infoAccess = parsed.infoAccess;
+        // Node's keyUsage is the EXTENDED key usage -- the EKU OIDs, undefined
+        // without that extension (probed: a certificate carrying only a
+        // KeyUsage extension reports undefined). The KeyUsage bits have no
+        // getter in Node.
+        this._keyUsage = parsed.extKeyUsage;
         this._raw = BufferCtor.from(parsed.raw);
       }
       get subject() { return this._subject; }
@@ -16149,8 +16237,10 @@
       get validTo() { return this._validTo; }
       get fingerprint() { return this._fingerprint; }
       get fingerprint256() { return this._fingerprint256; }
+      get fingerprint512() { return this._fingerprint512; }
       get ca() { return this._ca; }
       get subjectAltName() { return this._subjectAltName; }
+      get infoAccess() { return this._infoAccess; }
       get keyUsage() { return this._keyUsage; }
       get raw() { return this._raw; }
       toString() {
@@ -16160,17 +16250,8 @@
         return "-----BEGIN CERTIFICATE-----\n" + out.join("\n") + "\n-----END CERTIFICATE-----\n";
       }
       toJSON() { return this.toString(); }
-      toLegacyObject() {
-        return {
-          subject: this._subject,
-          issuer: this._issuer,
-          serialNumber: this._serialNumber,
-          valid_from: this._validFrom,
-          valid_to: this._validTo,
-          fingerprint: this._fingerprint,
-          fingerprint256: this._fingerprint256,
-        };
-      }
+      // A fresh legacy object each call, in Node's shape (x509LegacyObject).
+      toLegacyObject() { return x509LegacyObject(this._parsed); }
     }
 
     const webcrypto = { subtle, getRandomValues, randomUUID };
@@ -17986,13 +18067,22 @@
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and reqwest's strings carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
+          // fetch() rejects with the bare "fetch failed" and the transport
+          // error as `cause`: a connect or resolver failure arrives there
+          // already in node's shape (errno, code, syscall, address/port or
+          // hostname) and is emitted as-is; anything else is matched on the
+          // cause's text, which is where reqwest's detail now lives.
+          var cause = err && err.cause;
+          var detail = cause && cause.message ? cause.message : msg;
           var mapped;
-          if (/connection refused|ECONNREFUSED/i.test(msg)) {
+          if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+            mapped = cause;
+          } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
               syscall: "connect",
             });
-          } else if (/error sending request|connection reset|connection closed|IncompleteMessage/i.test(msg)) {
+          } else if (/error sending request|connection reset|connection closed|IncompleteMessage/i.test(detail)) {
             mapped = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
@@ -18447,6 +18537,7 @@
         this.remoteFamily = undefined;
         this.localAddress = undefined;
         this.localPort = undefined;
+        this.localFamily = undefined;
         this.bytesRead = 0;
         this.bytesWritten = 0;
         this.bufferSize = 0;
@@ -18498,6 +18589,11 @@
             this.remotePort = options._remoteAddr.port;
             this.remoteFamily = options._remoteAddr.family;
           }
+          if (options._localAddr) {
+            this.localAddress = options._localAddr.address;
+            this.localPort = options._localAddr.port;
+            this.localFamily = options._localAddr.family;
+          }
         }
       }
 
@@ -18543,7 +18639,13 @@
             if (result.localAddr) {
               this.localAddress = result.localAddr.address;
               this.localPort = result.localAddr.port;
+              this.localFamily = result.localAddr.family;
             }
+            // unref() before the handle existed: node defers it to 'connect'
+            // (Socket.prototype.unref is `this.once('connect', this.unref)`
+            // without a handle); the remembered flag is applied here, before
+            // 'connect' fires and before the first read parks.
+            if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
             this.emit("connect");
             this.emit("ready");
             this._readLoop();
@@ -18811,13 +18913,37 @@
       setKeepAlive() { return this; }
       // Node excludes UNREF'd handles from _getActiveHandles() and
       // getActiveResourcesInfo() (probe-verified: server.unref() removes it
-      // from both). The flag is read by those views; it does not yet affect
-      // oam's loop-liveness, which is native-op driven.
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
-      address() {
-        return { address: this.localAddress, port: this.localPort, family: this.remoteFamily || "IPv4" };
+      // from both); the flag is what those views read. The native call is
+      // what releases the event loop (#140): the socket's parked read stops
+      // counting toward loop-liveness while the socket goes on reading --
+      // data still arrives while something else keeps the process alive,
+      // and ref() puts it back (both probed on v22.22.2). Without a handle
+      // yet, the flag alone is kept and applied the moment the handle
+      // appears -- node's `once('connect', this.unref)` deferral.
+      ref() {
+        this._handleRefed = true;
+        if (this._handle !== null) natives.tcpSetRef(this._handle, true);
+        return this;
       }
+      unref() {
+        this._handleRefed = false;
+        if (this._handle !== null) natives.tcpSetRef(this._handle, false);
+        return this;
+      }
+      // `{}` without a handle -- before connect and again after close --
+      // else the local endpoint in node's key order (probed on v22.22.2).
+      address() {
+        if (this._handle === null) return {};
+        return {
+          address: this.localAddress,
+          family: this.localFamily || this.remoteFamily || "IPv4",
+          port: this.localPort,
+        };
+      }
+      // Node's shape, probed: "open" on a FRESH socket too (readable and
+      // writable, not connecting), "opening" while connecting, "readOnly"
+      // after end(), "writeOnly" once the peer ended a half-open socket,
+      // "closed" after destroy.
       get readyState() {
         if (this.connecting) return "opening";
         if (this.readable && this.writable) return "open";
@@ -18825,7 +18951,9 @@
         if (this.writable) return "writeOnly";
         return "closed";
       }
-      get pending() { return this.connecting; }
+      // Node: `!this._handle || this.connecting` -- true on a fresh socket
+      // and again once the handle is gone, not only while connecting.
+      get pending() { return this._handle === null || this.connecting; }
       pipe(dest) {
         this._pipeHandler = (chunk) => dest.write(chunk);
         this.on("data", this._pipeHandler);
@@ -18892,6 +19020,10 @@
             this._port = bound.port;
             this._host = bound.hostname || hostname;
             this.listening = true;
+            // unref() before listen(): node remembers it (`this._unref`) and
+            // applies it once the handle is bound -- here before the accept
+            // loop parks its first accept.
+            if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
             this._acceptLoop();
           },
@@ -18924,6 +19056,7 @@
           const socket = new Socket({
             _handle: accepted.handle,
             _remoteAddr: accepted.remoteAddr,
+            _localAddr: accepted.localAddr,
           });
           socket._readLoop();
           this.emit("connection", socket);
@@ -18950,9 +19083,20 @@
       }
 
       getConnections(cb) { if (cb) cb(null, 0); return this; }
-      // Same unref semantics as Socket (see the note there).
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // Same unref semantics as Socket (see the note there): the flag feeds
+      // the active-handle views, the native releases the loop -- node exits
+      // with an unref'd server still listening (probed). Only while bound:
+      // after close() the listener is gone and the runtime has forgotten it.
+      ref() {
+        this._handleRefed = true;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, false);
+        return this;
+      }
     }
 
     function createConnection(options, cb) {
@@ -18961,7 +19105,13 @@
         cb = typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : undefined;
         options = { port: options, host: host };
       }
-      const socket = new Socket();
+      // Node builds the socket FROM the options (`new Socket(options)`), so
+      // `net.connect({ allowHalfOpen: true })` yields a half-open socket and
+      // `timeout` arms the idle timer. A bare `new Socket()` here dropped
+      // both: the peer's FIN then closed the socket where node leaves it
+      // writeOnly.
+      const socket = new Socket(options);
+      if (options.timeout) socket.setTimeout(options.timeout);
       socket.connect(options, cb);
       return socket;
     }
@@ -23783,6 +23933,18 @@
         this._reading = false;
         this._protocol = null;
         this._cipher = null;
+        this._cipherStandardName = null;
+        // From the handshake: the peer's chain (base64 DER, leaf first) that
+        // getPeerCertificate() builds Node's legacy object from, and the
+        // key-exchange group behind getEphemeralKeyInfo(). _isServer marks
+        // the accept loop's sockets, where Node reports no key info.
+        this._peerCertificates = null;
+        // Parsed form of _peerCertificates, filled lazily and per index by
+        // _parsedPeerCert so getPeerCertificate does not re-decode the same
+        // DER on every call; dropped whenever the chain is (re)set.
+        this._peerParsed = null;
+        this._ephemeralKeyInfo = null;
+        this._isServer = false;
         // Node: a TLSSocket built without a transport is `connecting` from
         // construction until 'connect' (pending, readyState "opening"); the
         // accept loop clears it on a socket born connected. _connectPending
@@ -23927,10 +24089,96 @@
         // after awaiting 'end' still sees it.
         globalThis.setImmediate(() => this.emit("close", !!err));
       }
-      getPeerCertificate() { return {}; }
-      getProtocol() { return this._protocol || null; }
+      // The handshake getters read Node's TLSWrap handle, which exists from
+      // construction and is gone once the socket is destroyed: null then
+      // (probed on v22.22.2, after 'close': getProtocol, getCipher,
+      // getEphemeralKeyInfo and getPeerCertificate all null,
+      // getPeerX509Certificate undefined). Before the handshake the handle
+      // answers with what it has: the configured maximum "TLSv1.3" for the
+      // protocol, undefined for the cipher, {} for the key info and the
+      // peer certificate. The names are OpenSSL's, mapped in tls.rs (#138).
+      getProtocol() {
+        if (this.destroyed) return null;
+        return this._protocol || "TLSv1.3";
+      }
       getCipher() {
-        return this._cipher ? { name: this._cipher, standardName: this._cipher, version: this._protocol } : null;
+        if (this.destroyed) return null;
+        if (!this._cipher) return undefined;
+        return { name: this._cipher, standardName: this._cipherStandardName || this._cipher, version: this._protocol };
+      }
+      // Node: null on a server-side socket; {} when the exchange is not
+      // reported as ephemeral -- which, probed, is every TLS 1.3 handshake
+      // (OpenSSL keeps no peer temporary key once a 1.3 handshake is done);
+      // the { type, name, size } object appears after a TLS 1.2 handshake.
+      getEphemeralKeyInfo() {
+        if (this.destroyed || this._isServer) return null;
+        if (this._ephemeralKeyInfo === null || this._protocol === "TLSv1.3") return {};
+        return Object.assign({}, this._ephemeralKeyInfo);
+      }
+      // Parse peer certificate `i` (leaf is 0) once and cache it. The DER
+      // parse -- base64 -> DER -> ASN.1 plus the three fingerprint digests --
+      // is identical on every getPeerCertificate call, so it is done at most
+      // once per certificate and reused; a fresh legacy object is still built
+      // per call from the cached parse, as Node builds a fresh object from
+      // its already-parsed session certificate. Non-detailed calls only ever
+      // touch index 0. Mirrors X509Certificate's own `_parsed` cache.
+      _parsedPeerCert(i) {
+        if (this._peerParsed === null) this._peerParsed = new Array(this._peerCertificates.length);
+        var parsed = this._peerParsed[i];
+        if (parsed === undefined) {
+          parsed = natives.cryptoX509Parse(new Uint8Array(globalThis.Buffer.from(this._peerCertificates[i], "base64")));
+          this._peerParsed[i] = parsed;
+        }
+        return parsed;
+      }
+      // Node's legacy object for the peer's leaf, a fresh one per call; {}
+      // when the peer sent no certificate (before the handshake; a server
+      // whose client sent none). `detailed` links each certificate to the
+      // next in the chain through issuerCertificate, and the last one to
+      // itself when it is self-issued. Node would otherwise look the last
+      // issuer up in the trust store; oam has no store to consult, so a
+      // chain ending in a certificate the peer did not send stops there.
+      getPeerCertificate(detailed) {
+        if (this.destroyed) return null;
+        var chain = this._peerCertificates;
+        if (chain === null || chain.length === 0) return {};
+        var parsed = [];
+        for (var i = 0; i < chain.length; i++) {
+          parsed.push(this._parsedPeerCert(i));
+          if (!detailed) break;
+        }
+        var objects = parsed.map(x509LegacyObject);
+        if (detailed) {
+          // Node's AddIssuerChainToObject: from the leaf, find its issuer
+          // among the remaining certificates (X509_check_issued), link, and
+          // go on from that one; the last links to itself when it issued
+          // itself.
+          var rest = [];
+          for (var j = 1; j < parsed.length; j++) rest.push(j);
+          var current = 0;
+          for (;;) {
+            var found = -1;
+            for (var r = 0; r < rest.length; r++) {
+              if (x509IssuedBy(parsed[rest[r]], parsed[current])) { found = r; break; }
+            }
+            if (found < 0) break;
+            objects[current].issuerCertificate = objects[rest[found]];
+            current = rest[found];
+            rest.splice(found, 1);
+          }
+          if (x509IssuedBy(parsed[current], parsed[current])) objects[current].issuerCertificate = objects[current];
+        }
+        return objects[0];
+      }
+      // A fresh X509Certificate of the peer's leaf each call (Node builds
+      // one per call); undefined without a peer certificate or once
+      // destroyed.
+      getPeerX509Certificate() {
+        if (this.destroyed) return undefined;
+        var chain = this._peerCertificates;
+        if (chain === null || chain.length === 0) return undefined;
+        var X509Certificate = registry.get("crypto").X509Certificate;
+        return new X509Certificate(globalThis.Buffer.from(chain[0], "base64"));
       }
       setMaxSendFragment() { return true; }
       enableTrace() {}
@@ -23956,10 +24204,20 @@
       setNoDelay() { return this; }
       setKeepAlive() { return this; }
       // Node excludes UNREF'd handles from _getActiveHandles() and
-      // getActiveResourcesInfo(); the flag is what those views read (as for
-      // net.Socket, it does not yet affect oam's loop-liveness).
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // getActiveResourcesInfo(); the flag is what those views read. The
+      // native releases the loop, as for net.Socket (#140): the parked read
+      // stops counting, the socket keeps reading. Without a handle the flag
+      // is applied when the connect lands (node's deferral to 'connect').
+      ref() {
+        this._handleRefed = true;
+        if (this._handle !== null) natives.tlsSetRef(this._handle, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this._handle !== null) natives.tlsSetRef(this._handle, false);
+        return this;
+      }
       // `{}` until connected, then Node's key order (probed on v22.22.2).
       address() {
         if (this.localAddress === undefined) return {};
@@ -24031,7 +24289,9 @@
       var host = options.host || options.hostname || "localhost";
       var port = options.port || 443;
       var serverName = options.servername || host;
-      var ca = options.ca != null ? String(options.ca) : undefined;
+      // Node takes `ca` as one PEM (string or Buffer) or an array of them.
+      var ca = options.ca == null ? undefined
+        : Array.isArray(options.ca) ? options.ca.map(String).join("\n") : String(options.ca);
       var cert = options.cert != null ? String(options.cert) : undefined;
       var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
@@ -24080,9 +24340,17 @@
           }
           socket._handle = info.handle;
           socket.connecting = false;
+          // Node: `authorized` is the verifier's verdict even with
+          // rejectUnauthorized:false, and `authorizationError` its code
+          // (null on an accepted certificate).
           socket.authorized = info.authorized;
+          socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
           socket._protocol = info.protocol;
           socket._cipher = info.cipher;
+          socket._cipherStandardName = info.cipherStandardName || null;
+          socket._peerCertificates = info.peerCertificates || null;
+          socket._peerParsed = null;
+          socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
           if (info.remoteAddr) {
             socket.remoteAddress = info.remoteAddr.address;
@@ -24095,6 +24363,9 @@
             socket.localFamily = info.localAddr.family;
           }
           if (socket._timeoutMs > 0) socket._resetTimeout();
+          // unref() before the handle existed is applied now, before
+          // 'connect' and before the first read parks (see TLSSocket.unref).
+          if (socket._handleRefed === false) natives.tlsSetRef(info.handle, false);
           socket.emit("connect");
           socket.emit("ready");
           socket.emit("secureConnect");
@@ -24103,10 +24374,26 @@
         (err) => {
           socket._connectPending = false;
           socket.connecting = false;
-          socket.destroy(typeof err === "string" ? new Error(err) : err);
+          if (typeof err === "string") err = new Error(err);
+          if (err && typeof err.code === "string" && err.syscall === undefined) {
+            // The verifier refused the certificate (a connect-syscall error
+            // carries `syscall`; this one carries only Node's code): Node
+            // records the verdict on the socket before destroying it, and
+            // its ERR_TLS_CERT_ALTNAME_INVALID carries the reason, the name
+            // it checked and the peer certificate.
+            socket.authorized = false;
+            socket.authorizationError = err.code;
+            if (err.code === "ERR_TLS_CERT_ALTNAME_INVALID") {
+              err.reason = err.message.slice(ALTNAME_MISMATCH_PREFIX.length);
+              err.host = serverName.replace(/[.]$/, "");
+              err.cert = socket.getPeerCertificate();
+            }
+          }
+          socket.destroy(err);
         },
       );
     }
+    var ALTNAME_MISMATCH_PREFIX = "Hostname/IP does not match certificate's altnames: ";
 
     function connect(...args) {
       var parsed = normalizeConnectArgs(args);
@@ -24164,6 +24451,8 @@
             this._port = bound.port;
             this._host = bound.hostname || hostname;
             this.listening = true;
+            // unref() before listen(), applied once bound (as net.Server).
+            if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
             this._acceptLoop(bound.serverId, certPem, keyPem);
           },
@@ -24203,6 +24492,10 @@
               socket.timeout = 0;
               socket._protocol = info.protocol;
               socket._cipher = info.cipher;
+              socket._cipherStandardName = info.cipherStandardName || null;
+              socket._peerCertificates = info.peerCertificates || null;
+              socket._peerParsed = null;
+              socket._isServer = true;
               socket.alpnProtocol = info.alpnProtocol || false;
               socket.encrypted = true;
               var remote = info.remoteAddr || accepted.remoteAddr;
@@ -24242,9 +24535,18 @@
         return this;
       }
       // Same unref semantics as net.Server: the flag is what the
-      // active-handle views read.
-      ref() { this._handleRefed = true; return this; }
-      unref() { this._handleRefed = false; return this; }
+      // active-handle views read, the native (on the listener the accept
+      // loop parks on) releases the loop.
+      ref() {
+        this._handleRefed = true;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, true);
+        return this;
+      }
+      unref() {
+        this._handleRefed = false;
+        if (this.listening) natives.tcpServerSetRef(this._serverId, false);
+        return this;
+      }
       getTicketKeys() { return Buffer.alloc(48); }
       setTicketKeys() {}
     }

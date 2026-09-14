@@ -2371,26 +2371,274 @@ fn format_colon_hex(bytes: &[u8]) -> String {
         .join(":")
 }
 
-fn format_x509_name(name: &x509_parser::x509::X509Name<'_>) -> String {
-    let mut parts = Vec::new();
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// OpenSSL's short name for an X.500 attribute type -- the keys of Node's
+/// `subject` / `issuer`, in the newline-joined string and the legacy object
+/// alike. An unknown type prints as its dotted OID, as OBJ_obj2txt does.
+fn x509_attr_short_name(oid: &str) -> Option<&'static str> {
+    Some(match oid {
+        "2.5.4.3" => "CN",
+        "2.5.4.4" => "SN",
+        "2.5.4.5" => "serialNumber",
+        "2.5.4.6" => "C",
+        "2.5.4.7" => "L",
+        "2.5.4.8" => "ST",
+        "2.5.4.9" => "street",
+        "2.5.4.10" => "O",
+        "2.5.4.11" => "OU",
+        "2.5.4.12" => "title",
+        "2.5.4.13" => "description",
+        "2.5.4.15" => "businessCategory",
+        "2.5.4.17" => "postalCode",
+        "2.5.4.41" => "name",
+        "2.5.4.42" => "GN",
+        "2.5.4.43" => "initials",
+        "2.5.4.44" => "generationQualifier",
+        "2.5.4.46" => "dnQualifier",
+        "2.5.4.65" => "pseudonym",
+        "2.5.4.97" => "organizationIdentifier",
+        "0.9.2342.19200300.100.1.1" => "UID",
+        "0.9.2342.19200300.100.1.25" => "DC",
+        "1.2.840.113549.1.9.1" => "emailAddress",
+        "1.3.6.1.4.1.311.60.2.1.1" => "jurisdictionL",
+        "1.3.6.1.4.1.311.60.2.1.2" => "jurisdictionST",
+        "1.3.6.1.4.1.311.60.2.1.3" => "jurisdictionC",
+        _ => return None,
+    })
+}
+
+/// A name's (type, value) pairs in certificate order.
+fn x509_name_entries(name: &x509_parser::x509::X509Name<'_>) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
     for rdn in name.iter() {
         for attr in rdn.iter() {
             let oid = attr.attr_type().to_id_string();
-            let label = match oid.as_str() {
-                "2.5.4.3" => "CN",
-                "2.5.4.6" => "C",
-                "2.5.4.7" => "L",
-                "2.5.4.8" => "ST",
-                "2.5.4.10" => "O",
-                "2.5.4.11" => "OU",
-                "1.2.840.113549.1.9.1" => "emailAddress",
-                _ => &oid,
-            };
-            let value = attr.as_str().unwrap_or("(invalid)");
-            parts.push(format!("{label}={value}"));
+            let label = x509_attr_short_name(&oid).map_or(oid, str::to_string);
+            let value = attr.as_str().unwrap_or("(invalid)").to_string();
+            entries.push((label, value));
         }
     }
-    parts.join("\n")
+    entries
+}
+
+/// Node's `X509Certificate#subject` string: one `type=value` per line.
+fn format_x509_name(entries: &[(String, String)]) -> String {
+    entries
+        .iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// BN_bn2hex: uppercase hex with the leading zero BYTES dropped -- a leading
+/// zero nibble stays, so a serial of 0x0abc prints "0ABC", as Node prints it
+/// (probed on v22.22.2) -- and "0" for zero.
+fn bn_hex(bytes: &[u8]) -> String {
+    match bytes.iter().position(|b| *b != 0) {
+        None => "0".to_string(),
+        Some(i) => bytes[i..].iter().map(|b| format!("{b:02X}")).collect(),
+    }
+}
+
+/// BN_print, which Node's `exponent` goes through (unlike the serial and the
+/// modulus, which go through BN_bn2hex): leading zero NIBBLES dropped too, so
+/// 65537 prints "10001" (probed: exponent "0x10001").
+fn bn_print_hex(bytes: &[u8]) -> String {
+    let hex = bn_hex(bytes);
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// A DER OBJECT IDENTIFIER's content octets as the dotted string OBJ_obj2txt
+/// prints: the first sub-identifier folds the first two arcs.
+fn oid_to_string(content: &[u8]) -> String {
+    let mut arcs: Vec<u128> = Vec::new();
+    let mut acc: u128 = 0;
+    let mut first = true;
+    for b in content {
+        acc = (acc << 7) | u128::from(b & 0x7f);
+        if b & 0x80 != 0 {
+            continue;
+        }
+        if first {
+            first = false;
+            if acc < 80 {
+                arcs.push(acc / 40);
+                arcs.push(acc % 40);
+            } else {
+                arcs.push(2);
+                arcs.push(acc - 80);
+            }
+        } else {
+            arcs.push(acc);
+        }
+        acc = 0;
+    }
+    arcs.iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// OpenSSL's ASN1_TIME_print of a UTC instant -- "Jun 15 12:30:07 2026 GMT",
+/// the day space-padded ("Sep  5") -- which is Node's `validFrom` /
+/// `valid_from` (probed on v22.22.2).
+fn asn1_time_openssl(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days over the proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{} {day:>2} {hour:02}:{minute:02}:{second:02} {year} GMT",
+        MONTHS[(month - 1) as usize]
+    )
+}
+
+/// Node's spelling of a GeneralName in subjectAltName and infoAccess
+/// (probed): "DNS:", "IP Address:" -- a dotted quad, or IPv6 as uppercase
+/// hex groups with no zero compression ("0:0:0:0:0:0:0:1") -- "email:",
+/// "URI:". "Registered ID:" and "othername:<unsupported>" follow Node's
+/// printer unprobed; the rest keep the parser's Debug form.
+fn general_name_string(gn: &x509_parser::extensions::GeneralName<'_>) -> String {
+    use x509_parser::extensions::GeneralName;
+    match gn {
+        GeneralName::DNSName(s) => format!("DNS:{s}"),
+        GeneralName::IPAddress(b) if b.len() == 4 => {
+            format!("IP Address:{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        }
+        GeneralName::IPAddress(b) if b.len() == 16 => {
+            let groups: Vec<String> = b
+                .chunks(2)
+                .map(|pair| format!("{:X}", u16::from_be_bytes([pair[0], pair[1]])))
+                .collect();
+            format!("IP Address:{}", groups.join(":"))
+        }
+        GeneralName::RFC822Name(s) => format!("email:{s}"),
+        GeneralName::URI(s) => format!("URI:{s}"),
+        GeneralName::RegisteredID(oid) => format!("Registered ID:{}", oid.to_id_string()),
+        GeneralName::OtherName(..) => "othername:<unsupported>".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The extended-key-usage OIDs in certificate order -- Node's `keyUsage` and
+/// the legacy `ext_key_usage`. x509-parser's parsed form keeps flags, not
+/// order, so the SEQUENCE OF OBJECT IDENTIFIER is read by hand.
+fn ext_key_usage_oids(value: &[u8]) -> Vec<String> {
+    fn tlv(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let tag = *bytes.first()?;
+        let first_len = *bytes.get(1)?;
+        let (len, header) = if first_len & 0x80 == 0 {
+            (usize::from(first_len), 2)
+        } else {
+            let n = usize::from(first_len & 0x7f);
+            if n == 0 || n > 4 || bytes.len() < 2 + n {
+                return None;
+            }
+            let len = bytes[2..2 + n]
+                .iter()
+                .fold(0usize, |len, b| (len << 8) | usize::from(*b));
+            (len, 2 + n)
+        };
+        let end = header.checked_add(len)?;
+        if bytes.len() < end {
+            return None;
+        }
+        Some((tag, &bytes[header..end], &bytes[end..]))
+    }
+    let mut oids = Vec::new();
+    let Some((0x30, mut body, _)) = tlv(value) else {
+        return oids;
+    };
+    while let Some((tag, content, rest)) = tlv(body) {
+        if tag == 0x06 {
+            oids.push(oid_to_string(content));
+        }
+        body = rest;
+    }
+    oids
+}
+
+/// Node's legacy key fields (X509ToObject): RSA gets modulus/bits/exponent
+/// and pubkey (the SubjectPublicKeyInfo DER); EC gets bits, pubkey (the raw
+/// point), asn1Curve and nistCurve (absent for a curve NIST did not name);
+/// other key types get none.
+enum X509KeyFields {
+    Rsa {
+        modulus: String,
+        exponent: String,
+        bits: u32,
+        spki: Vec<u8>,
+    },
+    Ec {
+        bits: u32,
+        point: Vec<u8>,
+        asn1_curve: &'static str,
+        nist_curve: Option<&'static str>,
+    },
+    None,
+}
+
+fn x509_key_fields(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> X509KeyFields {
+    use x509_parser::public_key::PublicKey;
+    match spki.parsed() {
+        Ok(PublicKey::RSA(rsa)) => {
+            let skip = rsa
+                .modulus
+                .iter()
+                .position(|b| *b != 0)
+                .unwrap_or(rsa.modulus.len());
+            let significant = &rsa.modulus[skip..];
+            let bits =
+                significant.len() as u32 * 8 - significant.first().map_or(0, |b| b.leading_zeros());
+            X509KeyFields::Rsa {
+                modulus: bn_hex(rsa.modulus),
+                exponent: format!("0x{}", bn_print_hex(rsa.exponent)),
+                bits,
+                spki: spki.raw.to_vec(),
+            }
+        }
+        Ok(PublicKey::EC(point)) => {
+            let curve = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .map(|p| oid_to_string(p.data));
+            let (asn1_curve, nist_curve, bits) = match curve.as_deref() {
+                Some("1.2.840.10045.3.1.7") => ("prime256v1", Some("P-256"), 256),
+                Some("1.3.132.0.34") => ("secp384r1", Some("P-384"), 384),
+                Some("1.3.132.0.35") => ("secp521r1", Some("P-521"), 521),
+                Some("1.3.132.0.10") => ("secp256k1", None, 256),
+                _ => return X509KeyFields::None,
+            };
+            X509KeyFields::Ec {
+                bits,
+                point: point.data().to_vec(),
+                asn1_curve,
+                nist_curve,
+            }
+        }
+        _ => X509KeyFields::None,
+    }
 }
 
 pub(crate) fn op_crypto_x509_parse(
@@ -2435,25 +2683,66 @@ pub(crate) fn op_crypto_x509_parse(
         }};
     }
 
-    set_str!("subject", &format_x509_name(cert.subject()));
-    set_str!("issuer", &format_x509_name(cert.issuer()));
+    macro_rules! set_bool {
+        ($name:expr, $val:expr) => {{
+            let k = v8::String::new(scope, $name).unwrap();
+            obj.set(scope, k.into(), v8::Boolean::new(scope, $val).into());
+        }};
+    }
+    macro_rules! set_str_array {
+        ($name:expr, $items:expr) => {{
+            let items = $items;
+            let arr = v8::Array::new(scope, items.len() as i32);
+            for (i, s) in items.iter().enumerate() {
+                let val = v8::String::new(scope, s).unwrap();
+                arr.set_index(scope, i as u32, val.into());
+            }
+            let k = v8::String::new(scope, $name).unwrap();
+            obj.set(scope, k.into(), arr.into());
+        }};
+    }
+    macro_rules! set_bytes {
+        ($name:expr, $bytes:expr) => {{
+            if let Some(val) = crate::node_ops::bytes_to_uint8array(scope, $bytes) {
+                let k = v8::String::new(scope, $name).unwrap();
+                obj.set(scope, k.into(), val);
+            }
+        }};
+    }
 
-    let serial_hex = cert
-        .tbs_certificate
-        .raw_serial()
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<String>();
-    let serial_hex = serial_hex.trim_start_matches('0');
-    let serial_hex = if serial_hex.is_empty() {
-        "0"
-    } else {
-        serial_hex
-    };
-    set_str!("serialNumber", serial_hex);
+    let subject_entries = x509_name_entries(cert.subject());
+    let issuer_entries = x509_name_entries(cert.issuer());
+    set_str!("subject", &format_x509_name(&subject_entries));
+    set_str!("issuer", &format_x509_name(&issuer_entries));
+    // The (type, value) pairs the legacy object's null-prototype subject and
+    // issuer are built from on the JS side (a repeated type becomes an array).
+    for (name, entries) in [
+        ("subjectEntries", &subject_entries),
+        ("issuerEntries", &issuer_entries),
+    ] {
+        let arr = v8::Array::new(scope, entries.len() as i32);
+        for (i, (label, value)) in entries.iter().enumerate() {
+            let pair = v8::Array::new(scope, 2);
+            let l = v8::String::new(scope, label).unwrap();
+            let v = v8::String::new(scope, value).unwrap();
+            pair.set_index(scope, 0, l.into());
+            pair.set_index(scope, 1, v.into());
+            arr.set_index(scope, i as u32, pair.into());
+        }
+        let k = v8::String::new(scope, name).unwrap();
+        obj.set(scope, k.into(), arr.into());
+    }
 
-    set_str!("validFrom", &cert.validity().not_before.to_string());
-    set_str!("validTo", &cert.validity().not_after.to_string());
+    set_str!("serialNumber", &bn_hex(cert.tbs_certificate.raw_serial()));
+
+    set_str!(
+        "validFrom",
+        &asn1_time_openssl(cert.validity().not_before.timestamp())
+    );
+    set_str!(
+        "validTo",
+        &asn1_time_openssl(cert.validity().not_after.timestamp())
+    );
 
     {
         let hash = <sha1::Sha1 as Digest>::digest(&der_bytes);
@@ -2463,36 +2752,36 @@ pub(crate) fn op_crypto_x509_parse(
         let hash = <sha2::Sha256 as Digest>::digest(&der_bytes);
         set_str!("fingerprint256", &format_colon_hex(&hash));
     }
+    {
+        let hash = <sha2::Sha512 as Digest>::digest(&der_bytes);
+        set_str!("fingerprint512", &format_colon_hex(&hash));
+    }
 
-    let mut ca = false;
+    let mut basic_constraints: Option<bool> = None;
     let mut san_formatted: Option<String> = None;
     let mut ku_list: Vec<&str> = Vec::new();
+    // The pieces of OpenSSL's X509_check_issued that decide whether one
+    // certificate issued another (the legacy object's issuerCertificate
+    // links): the names, the key identifiers, and keyCertSign when a
+    // KeyUsage extension is present at all.
+    let mut key_cert_sign: Option<bool> = None;
+    let mut ext_key_usage: Option<Vec<String>> = None;
+    let mut info_access: Option<String> = None;
+    let mut subject_key_id: Option<String> = None;
+    let mut authority_key_id: Option<String> = None;
 
     for ext in cert.extensions() {
+        use x509_parser::extensions::ParsedExtension;
         match ext.parsed_extension() {
-            x509_parser::extensions::ParsedExtension::BasicConstraints(bc) => {
-                ca = bc.ca;
+            ParsedExtension::BasicConstraints(bc) => {
+                basic_constraints = Some(bc.ca);
             }
-            x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
-                let names: Vec<String> = san
-                    .general_names
-                    .iter()
-                    .map(|gn| {
-                        use x509_parser::extensions::GeneralName;
-                        match gn {
-                            GeneralName::DNSName(s) => format!("DNS:{s}"),
-                            GeneralName::IPAddress(b) if b.len() == 4 => {
-                                format!("IP Address:{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-                            }
-                            GeneralName::RFC822Name(s) => format!("email:{s}"),
-                            GeneralName::URI(s) => format!("URI:{s}"),
-                            other => format!("{other:?}"),
-                        }
-                    })
-                    .collect();
+            ParsedExtension::SubjectAlternativeName(san) => {
+                let names: Vec<String> =
+                    san.general_names.iter().map(general_name_string).collect();
                 san_formatted = Some(names.join(", "));
             }
-            x509_parser::extensions::ParsedExtension::KeyUsage(ku) => {
+            ParsedExtension::KeyUsage(ku) => {
                 if ku.digital_signature() {
                     ku_list.push("digitalSignature");
                 }
@@ -2514,32 +2803,120 @@ pub(crate) fn op_crypto_x509_parse(
                 if ku.crl_sign() {
                     ku_list.push("cRLSign");
                 }
+                key_cert_sign = Some(ku.key_cert_sign());
+            }
+            ParsedExtension::ExtendedKeyUsage(_) => {
+                ext_key_usage = Some(ext_key_usage_oids(ext.value));
+            }
+            ParsedExtension::AuthorityInfoAccess(aia) => {
+                // Node's X509Certificate#infoAccess: "METHOD - LOCATION" per
+                // line, OpenSSL's long names for the two well-known methods.
+                let lines: Vec<String> = aia
+                    .accessdescs
+                    .iter()
+                    .map(|ad| {
+                        let method = match ad.access_method.to_id_string().as_str() {
+                            "1.3.6.1.5.5.7.48.1" => "OCSP".to_string(),
+                            "1.3.6.1.5.5.7.48.2" => "CA Issuers".to_string(),
+                            other => other.to_string(),
+                        };
+                        format!("{method} - {}", general_name_string(&ad.access_location))
+                    })
+                    .collect();
+                info_access = Some(lines.join("\n"));
+            }
+            ParsedExtension::SubjectKeyIdentifier(id) => {
+                subject_key_id = Some(hex_lower(id.0));
+            }
+            ParsedExtension::AuthorityKeyIdentifier(akid) => {
+                if let Some(id) = &akid.key_identifier {
+                    authority_key_id = Some(hex_lower(id.0));
+                }
             }
             _ => {}
         }
     }
 
-    {
-        let k = v8::String::new(scope, "ca").unwrap();
-        obj.set(scope, k.into(), v8::Boolean::new(scope, ca).into());
-    }
+    // OpenSSL's X509_check_ca, which Node's `ca` reports: a KeyUsage without
+    // keyCertSign says no (probed on v22.22.2: a CA:TRUE self-signed
+    // certificate issued with keyUsage=digitalSignature reads ca:false);
+    // otherwise BasicConstraints decides; without one, a v1 self-issued root
+    // or a KeyUsage that allows certificate signing still counts (those two
+    // follow check_ca's source, unprobed).
+    let self_issued = subject_entries == issuer_entries;
+    let is_v1 = cert.tbs_certificate.version == x509_parser::x509::X509Version::V1;
+    let ca = match (key_cert_sign, basic_constraints) {
+        (Some(false), _) => false,
+        (_, Some(constrained)) => constrained,
+        (Some(true), None) => true,
+        (None, None) => is_v1 && self_issued,
+    };
+    set_bool!("ca", ca);
     if let Some(ref san) = san_formatted {
         set_str!("subjectAltName", san);
     }
     if !ku_list.is_empty() {
-        let arr = v8::Array::new(scope, ku_list.len() as i32);
-        for (i, s) in ku_list.iter().enumerate() {
-            let val = v8::String::new(scope, s).unwrap();
-            arr.set_index(scope, i as u32, val.into());
-        }
-        let k = v8::String::new(scope, "keyUsage").unwrap();
-        obj.set(scope, k.into(), arr.into());
+        set_str_array!("keyUsage", &ku_list);
+    }
+    if let Some(ref oids) = ext_key_usage {
+        set_str_array!("extKeyUsage", oids);
+    }
+    if let Some(ref text) = info_access {
+        set_str!("infoAccess", text);
+    }
+    if let Some(flag) = key_cert_sign {
+        set_bool!("keyCertSign", flag);
+    }
+    if let Some(ref id) = subject_key_id {
+        set_str!("subjectKeyId", id);
+    }
+    if let Some(ref id) = authority_key_id {
+        set_str!("authorityKeyId", id);
     }
 
-    if let Some(raw) = crate::node_ops::bytes_to_uint8array(scope, der_for_raw) {
-        let k = v8::String::new(scope, "raw").unwrap();
-        obj.set(scope, k.into(), raw);
+    match x509_key_fields(cert.public_key()) {
+        X509KeyFields::Rsa {
+            modulus,
+            exponent,
+            bits,
+            spki,
+        } => {
+            set_str!("keyType", "rsa");
+            set_str!("modulus", &modulus);
+            set_str!("exponent", &exponent);
+            let k = v8::String::new(scope, "bits").unwrap();
+            obj.set(
+                scope,
+                k.into(),
+                v8::Number::new(scope, f64::from(bits)).into(),
+            );
+            set_bytes!("pubkey", spki);
+        }
+        X509KeyFields::Ec {
+            bits,
+            point,
+            asn1_curve,
+            nist_curve,
+        } => {
+            set_str!("keyType", "ec");
+            let k = v8::String::new(scope, "bits").unwrap();
+            obj.set(
+                scope,
+                k.into(),
+                v8::Number::new(scope, f64::from(bits)).into(),
+            );
+            set_bytes!("pubkey", point);
+            set_str!("asn1Curve", asn1_curve);
+            if let Some(nist) = nist_curve {
+                set_str!("nistCurve", nist);
+            }
+        }
+        X509KeyFields::None => {
+            set_str!("keyType", "");
+        }
     }
+
+    set_bytes!("raw", der_for_raw);
 
     rv.set(obj.into());
 }
@@ -2577,4 +2954,99 @@ pub(crate) fn op_crypto_check_prime(
     let n = BigUint::from_bytes_be(&data);
     let is_prime = probably_prime(&n, 25);
     rv.set(v8::Boolean::new(scope, is_prime).into());
+}
+
+#[cfg(test)]
+mod x509_legacy_fields {
+    use super::*;
+
+    // BN_bn2hex drops leading zero BYTES only (probed on v22.22.2: a serial
+    // of 0x0abc reads "0ABC" from both X509Certificate#serialNumber and
+    // getPeerCertificate().serialNumber).
+    #[test]
+    fn bn_hex_keeps_a_leading_zero_nibble() {
+        assert_eq!(bn_hex(&[0x00, 0x0a, 0xbc]), "0ABC");
+        assert_eq!(bn_hex(&[0x26, 0xc7, 0x11]), "26C711");
+        assert_eq!(bn_hex(&[0x00, 0x00]), "0");
+        assert_eq!(bn_hex(&[]), "0");
+        // No leading zero byte: the top nibble stays, unlike BN_print below.
+        assert_eq!(bn_hex(&[0x01, 0x00, 0x01]), "010001");
+    }
+
+    // BN_print (the exponent's printer) drops the zero nibble bn2hex keeps.
+    #[test]
+    fn bn_print_hex_drops_a_leading_zero_nibble() {
+        assert_eq!(bn_print_hex(&[0x01, 0x00, 0x01]), "10001");
+        assert_eq!(bn_print_hex(&[0x00, 0x0a, 0xbc]), "ABC");
+        assert_eq!(bn_print_hex(&[0x00]), "0");
+        assert_eq!(bn_print_hex(&[0x03]), "3");
+    }
+
+    // OpenSSL's ASN1_TIME_print, as Node's validFrom reads: a space-padded
+    // day, a four-digit year, "GMT".
+    #[test]
+    fn asn1_time_prints_like_openssl() {
+        assert_eq!(asn1_time_openssl(1_781_526_607), "Jun 15 12:30:07 2026 GMT");
+        assert_eq!(asn1_time_openssl(1_788_570_123), "Sep  5 01:02:03 2026 GMT");
+        assert_eq!(asn1_time_openssl(2_104_743_976), "Sep 11 11:06:16 2036 GMT");
+        assert_eq!(asn1_time_openssl(946_684_799), "Dec 31 23:59:59 1999 GMT");
+        assert_eq!(asn1_time_openssl(0), "Jan  1 00:00:00 1970 GMT");
+        assert_eq!(asn1_time_openssl(951_782_400), "Feb 29 00:00:00 2000 GMT");
+    }
+
+    #[test]
+    fn oid_content_prints_dotted() {
+        assert_eq!(
+            oid_to_string(&[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01]),
+            "1.3.6.1.5.5.7.3.1"
+        );
+        assert_eq!(oid_to_string(&[0x55, 0x1d, 0x25, 0x00]), "2.5.29.37.0");
+        assert_eq!(
+            oid_to_string(&[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]),
+            "1.2.840.113549.1.1.1"
+        );
+        assert_eq!(
+            oid_to_string(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]),
+            "1.2.840.10045.3.1.7"
+        );
+    }
+
+    // The EKU OIDs come back in certificate order, which the parsed
+    // extension does not keep.
+    #[test]
+    fn ext_key_usage_oids_keep_certificate_order() {
+        let client_then_server = [
+            0x30, 0x14, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02, 0x06, 0x08,
+            0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+        ];
+        assert_eq!(
+            ext_key_usage_oids(&client_then_server),
+            vec![
+                "1.3.6.1.5.5.7.3.2".to_string(),
+                "1.3.6.1.5.5.7.3.1".to_string()
+            ]
+        );
+        assert!(ext_key_usage_oids(&[0x04, 0x00]).is_empty());
+        assert!(ext_key_usage_oids(&[0x30, 0x05, 0x06]).is_empty());
+    }
+
+    // Node's subjectAltName spellings (probed): IPv6 as uppercase groups with
+    // no zero compression.
+    #[test]
+    fn general_names_print_like_node() {
+        use x509_parser::extensions::GeneralName;
+        let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(
+            general_name_string(&GeneralName::IPAddress(&v6)),
+            "IP Address:2001:DB8:0:0:0:0:0:1"
+        );
+        assert_eq!(
+            general_name_string(&GeneralName::IPAddress(&[127, 0, 0, 1])),
+            "IP Address:127.0.0.1"
+        );
+        assert_eq!(
+            general_name_string(&GeneralName::DNSName("localhost")),
+            "DNS:localhost"
+        );
+    }
 }

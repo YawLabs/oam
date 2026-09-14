@@ -335,6 +335,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
         ("tcpServerClose", op_tcp_server_close),
+        ("tcpSetRef", op_tcp_set_ref),
+        ("tcpServerSetRef", op_tcp_server_set_ref),
         // UDP sockets (node:dgram)
         ("udpBind", op_udp_bind),
         ("udpSend", op_udp_send),
@@ -394,6 +396,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsWrite", op_tls_write),
         ("tlsClose", op_tls_close),
         ("tlsShutdown", op_tls_shutdown),
+        ("tlsSetRef", op_tls_set_ref),
         ("tlsAcceptWrap", op_tls_accept_wrap),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
@@ -2819,7 +2822,17 @@ fn op_tcp_read(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_read(tcp, handle, len));
+    // Keyed by the socket: a parked read on an unref'd socket must not keep
+    // the process alive (node: reading is the handle's own activity, and an
+    // unref'd handle does not count). Writes and shutdowns stay plain ops --
+    // in node those are REQUESTS, and a pending request pins the loop
+    // whatever the handle's ref-ness.
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::Tcp(handle),
+        oam_core::tcp::tcp_read(tcp, handle, len),
+    );
 }
 
 fn op_tcp_write(
@@ -2844,6 +2857,22 @@ fn op_tcp_close(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
+}
+
+/// `__oam.node.tcpSetRef(handle, referenced)`: node's `socket.ref()` /
+/// `socket.unref()` once the socket has a handle. The parked read is not
+/// cancelled -- an unref'd socket still receives data while something else
+/// keeps the process alive -- it just stops (or resumes) counting toward
+/// loop-liveness, as does every read issued after it.
+fn op_tcp_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let referenced = args.get(1).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Tcp(handle), referenced);
 }
 
 fn op_tcp_shutdown(
@@ -2889,9 +2918,13 @@ fn op_tcp_accept(
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
-    crate::ops::spawn_op(
+    // Keyed by the listener: `server.unref()` lets the process exit with the
+    // server still listening (node), so the parked accept must not count
+    // once the server is unref'd. tls.Server accepts through here too.
+    crate::ops::spawn_handle_op(
         scope,
         &mut rv,
+        oam_core::HandleKey::TcpServer(server_id),
         oam_core::tcp::tcp_accept(tcp, server_id, ids),
     );
 }
@@ -2904,6 +2937,20 @@ fn op_tcp_server_close(
     let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_server_close(&tcp, server_id);
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::TcpServer(server_id));
+}
+
+/// `__oam.node.tcpServerSetRef(serverId, referenced)`: node's `server.ref()`
+/// / `server.unref()` (net and tls) once the server is bound. The listener
+/// keeps accepting; its parked accept just stops (or resumes) counting.
+fn op_tcp_server_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let referenced = args.get(1).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::TcpServer(server_id), referenced);
 }
 
 // ------------------------------------------------------------------- UDP
@@ -3028,7 +3075,14 @@ fn op_tls_read(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     let tls = core_runtime!(scope).tls();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_read(tls, handle, len));
+    // Keyed by the socket, as op_tcp_read is: an unref'd TLSSocket's parked
+    // read must not keep the process alive.
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::Tls(handle),
+        oam_core::tls::tls_read(tls, handle, len),
+    );
 }
 
 fn op_tls_write(
@@ -3053,6 +3107,19 @@ fn op_tls_close(
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tls = core_runtime!(scope).tls();
     oam_core::tls::tls_close(&tls, handle);
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tls(handle));
+}
+
+/// `__oam.node.tlsSetRef(handle, referenced)`: `socket.ref()` / `unref()`
+/// on a TLSSocket with a handle; see op_tcp_set_ref.
+fn op_tls_set_ref(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let referenced = args.get(1).boolean_value(scope);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Tls(handle), referenced);
 }
 
 fn op_tls_shutdown(
@@ -6584,7 +6651,15 @@ fn op_stdin_read(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    crate::ops::spawn_stdin_op(scope, &mut rv, oam_core::stdin_read());
+    // The same per-handle ref accounting a socket's read uses, under the
+    // stdin key: see `CoreRuntime::spawn_stdin_op` for why one op spans the
+    // read's console-mode retries.
+    crate::ops::spawn_handle_op(
+        scope,
+        &mut rv,
+        oam_core::HandleKey::Stdin,
+        oam_core::stdin_read(),
+    );
 }
 
 /// `__oam.node.stdinSetRef(referenced)`: node's `process.stdin.ref()` /
@@ -6597,7 +6672,7 @@ fn op_stdin_set_ref(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let referenced = args.get(0).boolean_value(scope);
-    core_runtime_mut!(scope).set_stdin_ref(referenced);
+    core_runtime_mut!(scope).set_handle_ref(oam_core::HandleKey::Stdin, referenced);
 }
 
 /// `__oam.node.stdinHandleType()`: what fd 0 is -- "TTY", "FILE", "PIPE" or

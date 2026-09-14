@@ -6848,6 +6848,491 @@ fn check_honours_project_references_like_tsc() {
     );
 }
 
+/// The last path segment, whichever separator tsgo or oam printed.
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// `path` with forward slashes: how oam's wrapper config spells every path
+/// it restates (TypeScript accepts them on Windows, and a backslash in JSON
+/// is an escape).
+fn slashed(path: &std::path::Path) -> String {
+    path.to_str().unwrap().replace('\\', "/")
+}
+
+/// Diagnostics of a direct `tsgo -p tsconfig.json` run in `project` -- the
+/// oracle a check through oam's wrapper has to match -- as (code, file
+/// basename, line); a span-less one carries an empty name and line 0.
+/// Resolved the way oam resolves it when nothing overrides: `OAM_TSGO`, else
+/// the PATH name (the npm shim is `tsgo.cmd` on Windows).
+fn direct_tsgo_diagnostics(project: &std::path::Path) -> Vec<(String, String, u64)> {
+    let program = std::env::var("OAM_TSGO")
+        .unwrap_or_else(|_| if cfg!(windows) { "tsgo.cmd" } else { "tsgo" }.to_string());
+    let out = std::process::Command::new(program)
+        .args(["-p", "tsconfig.json", "--pretty", "false", "--noEmit"])
+        .current_dir(project)
+        .output()
+        .expect("tsgo spawns directly: oam just ran it");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut diagnostics = Vec::new();
+    for line in stdout.lines() {
+        // `src/a.ts(3,5): error TS2322: ...` or a span-less `error TS5102: ...`;
+        // an indented elaboration line is neither.
+        let Some((head, rest)) = line
+            .split_once(": error TS")
+            .or_else(|| line.strip_prefix("error TS").map(|rest| ("", rest)))
+        else {
+            continue;
+        };
+        let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let (file, line_no) = match head.rsplit_once('(') {
+            Some((file, position)) => (
+                basename(file),
+                position
+                    .split(',')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+            ),
+            None => (String::new(), 0),
+        };
+        diagnostics.push((format!("TS{code}"), file, line_no));
+    }
+    diagnostics.sort();
+    diagnostics
+}
+
+/// oam's ODIF JSONL, in the same shape.
+fn oam_diagnostics(stderr: &str) -> Vec<(String, String, u64)> {
+    let mut diagnostics: Vec<(String, String, u64)> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|d| {
+            (
+                d["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_start_matches("OAM-")
+                    .to_string(),
+                d["spans"][0]["file"]
+                    .as_str()
+                    .map(basename)
+                    .unwrap_or_default(),
+                d["spans"][0]["start"]["line"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    diagnostics.sort();
+    diagnostics
+}
+
+/// The wrapper's program is the user's: oam reports exactly what a direct
+/// tsgo run of the user's tsconfig reports, minus the one TS2307 that run
+/// has for the `oam:` import at `oam_import` (file basename, line) -- the
+/// declarations being the wrapper's whole point. None when the direct run
+/// never reaches the semantic pass (a config error suppresses it).
+fn assert_matches_direct_tsgo(
+    project: &std::path::Path,
+    stderr: &str,
+    oam_import: Option<(&str, u64)>,
+) {
+    let mut direct = direct_tsgo_diagnostics(project);
+    if let Some((file, line)) = oam_import {
+        let missing = ("TS2307".to_string(), file.to_string(), line);
+        let at = direct
+            .iter()
+            .position(|d| *d == missing)
+            .unwrap_or_else(|| {
+                panic!("direct tsgo reports {missing:?} without oam's declarations: {direct:?}")
+            });
+        direct.remove(at);
+    }
+    assert_eq!(
+        oam_diagnostics(stderr),
+        direct,
+        "through the wrapper (left) vs the user's own tsconfig (right): {stderr}"
+    );
+}
+
+/// The wrapper oam wrote for `project`, in-tree.
+fn in_tree_wrapper(project: &std::path::Path) -> serde_json::Value {
+    let dir = project.join("node_modules").join(".oam").join("ts-decls");
+    let name = dir_entries(&dir)
+        .into_iter()
+        .find(|name| name.starts_with("project-") && name.ends_with(".json"))
+        .expect("wrapper written in-tree");
+    serde_json::from_str(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap()
+}
+
+/// `${configDir}` in a shared base config means the ROOT config's directory,
+/// which through the wrapper was the wrapper's own: a base config's
+/// `"include": ["${configDir}/src"]` matched nothing, and the chain was
+/// checked without oam's declarations to stay honest. The wrapper now
+/// restates every key naming the template against the user's tsconfig dir,
+/// so include, exclude, rootDir, typeRoots and paths all mean what they mean
+/// under `tsgo -p tsconfig.json` -- and `oam:` imports still resolve.
+#[test]
+fn check_substitutes_config_dir_from_a_shared_base_config() {
+    write_temp(
+        "cfgdir-base/node_modules/@acme/tsconfig/base.json",
+        r#"{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "rootDir": "${configDir}",
+    "paths": { "@lib/*": ["${configDir}/lib/*"] },
+    "typeRoots": ["${configDir}/typings"],
+    "types": ["mine"]
+  },
+  "include": ["${configDir}/src"],
+  "exclude": ["${configDir}/src/skipped"]
+}"#,
+    );
+    write_temp(
+        "cfgdir-base/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    // The alias, the typeRoots package and the `oam:` import all have to
+    // resolve for this file to be clean.
+    write_temp(
+        "cfgdir-base/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         import { lib } from \"@lib/thing\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const l: number = lib;\n\
+         export const m: number = MINE_GLOBAL;\n",
+    );
+    // Inside the include: reported. Inside the exclude, and outside the
+    // include: not.
+    write_temp(
+        "cfgdir-base/src/planted.ts",
+        "export const n: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/src/skipped/bad.ts",
+        "export const bad: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/scratch/outside.ts",
+        "export const outside: number = \"no\";\n",
+    );
+    write_temp(
+        "cfgdir-base/lib/thing.ts",
+        "export const lib: number = 1;\n",
+    );
+    let proj = write_temp(
+        "cfgdir-base/typings/mine/index.d.ts",
+        "declare const MINE_GLOBAL: number;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "planted.ts".to_string(), 1)],
+        "the include picks up src/, the exclude holds, the alias and the typeRoots package resolve, rootDir is the project: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/src")])
+    );
+    assert_eq!(
+        wrapper["exclude"],
+        serde_json::json!([format!("{root}/src/skipped")])
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({
+            "rootDir": root,
+            "typeRoots": [format!("{root}/typings")],
+            "paths": { "@lib/*": [format!("{root}/lib/*")] },
+        }),
+        "every template key restated absolute under the project; `types` names a package and inherits: {wrapper}"
+    );
+    assert!(
+        std::path::Path::new(&root).is_absolute() && !root.contains('\\'),
+        "{root}"
+    );
+}
+
+/// The template in the MIDDLE of a three-level chain -- a project base that
+/// extends a shared package config -- is the root's directory all the same,
+/// and the leaf's own keys still win over it.
+#[test]
+fn check_substitutes_config_dir_named_in_the_middle_of_a_chain() {
+    write_temp(
+        "cfgdir-middle/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true }, "include": ["never"] }"#,
+    );
+    write_temp(
+        "cfgdir-middle/tsconfig.middle.json",
+        r#"{ "extends": "@acme/tsconfig/base.json",
+  "compilerOptions": { "paths": { "@lib/*": ["${configDir}/lib/*"] } },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-middle/tsconfig.json",
+        r#"{ "extends": "./tsconfig.middle.json" }"#,
+    );
+    write_temp(
+        "cfgdir-middle/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         import { lib } from \"@lib/thing\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const l: number = lib;\n",
+    );
+    write_temp(
+        "cfgdir-middle/src/planted.ts",
+        "export const n: number = \"no\";\n",
+    );
+    let proj = write_temp(
+        "cfgdir-middle/lib/thing.ts",
+        "export const lib: number = 1;\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "planted.ts".to_string(), 1)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/src")])
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({ "paths": { "@lib/*": [format!("{root}/lib/*")] } }),
+        "{wrapper}"
+    );
+}
+
+/// A leaf that overrides a base's template key gets its own, plain value:
+/// inherited as-is, restated by nothing. The base's other template key
+/// still is.
+#[test]
+fn check_keeps_a_leafs_override_of_a_base_configs_template_key() {
+    write_temp(
+        "cfgdir-override/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "${configDir}/dist" },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-override/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json", "include": ["app"] }"#,
+    );
+    write_temp(
+        "cfgdir-override/app/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    );
+    // Under the base's include, which the leaf replaced: not checked.
+    let proj = write_temp(
+        "cfgdir-override/src/notchecked.ts",
+        "export const bad: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    assert!(
+        wrapper.get("include").is_none() && wrapper.get("exclude").is_none(),
+        "the leaf's plain include inherits untouched: {wrapper}"
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({
+            "outDir": format!("{}/dist", slashed(&proj)),
+            "rootDir": slashed(&proj),
+        }),
+        "the template outDir restated, and with it the rootDir default an out dir makes tsc check: {wrapper}"
+    );
+}
+
+/// A template `outDir` with no exclude anywhere in the chain: tsc's default
+/// exclude names it, so a project emitting into its own tree does not
+/// type-check its own output. The restated default has to name the
+/// SUBSTITUTED directory.
+#[test]
+fn check_excludes_a_template_out_dir_by_default() {
+    write_temp(
+        "cfgdir-outdir/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "${configDir}/dist" } }"#,
+    );
+    write_temp(
+        "cfgdir-outdir/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    write_temp(
+        "cfgdir-outdir/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    );
+    let proj = write_temp(
+        "cfgdir-outdir/dist/stale.ts",
+        "export const stale: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "dist/ is the out dir, excluded by default: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+    let wrapper = in_tree_wrapper(&proj);
+    let root = slashed(&proj);
+    assert_eq!(
+        wrapper["include"],
+        serde_json::json!([format!("{root}/**/*")])
+    );
+    assert!(
+        wrapper["exclude"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(format!("{root}/dist"))),
+        "{wrapper}"
+    );
+    assert_eq!(
+        wrapper["compilerOptions"],
+        serde_json::json!({ "outDir": format!("{root}/dist"), "rootDir": root }),
+        "{wrapper}"
+    );
+}
+
+/// TypeScript 7 defaults `rootDir` to the ROOT config's directory and checks
+/// it eagerly once `outDir` is set -- so through the wrapper every source
+/// was "not under rootDir" (TS6059), the retry ran without oam's
+/// declarations, and an `oam:` import reported TS2307 in any project that
+/// set an out dir without a root dir. No template anywhere here: the
+/// wrapper restates TypeScript's own default for the user's config.
+#[test]
+fn check_keeps_a_projects_root_dir_through_the_wrapper_when_an_out_dir_is_set() {
+    write_temp(
+        "outdirproj/tsconfig.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "outDir": "dist" }, "include": ["src"] }"#,
+    );
+    let proj = write_temp(
+        "outdirproj/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS2322".to_string(), "main.ts".to_string(), 3)],
+        "oam's declarations must survive an out dir: {stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, Some(("main.ts", 1)));
+}
+
+/// TypeScript 7 has removed `baseUrl` (TS5102), and tsgo still substitutes
+/// the template in it before rejecting it (measured). Restated or not, the
+/// report is the one the user's own tsconfig gets -- and only that one: a
+/// config error suppresses the semantic pass on both sides.
+#[test]
+fn check_reports_a_removed_base_url_like_tsgo() {
+    write_temp(
+        "cfgdir-baseurl/node_modules/@acme/tsconfig/base.json",
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "baseUrl": "${configDir}" },
+  "include": ["${configDir}/src"] }"#,
+    );
+    write_temp(
+        "cfgdir-baseurl/tsconfig.json",
+        r#"{ "extends": "@acme/tsconfig/base.json" }"#,
+    );
+    let proj = write_temp(
+        "cfgdir-baseurl/src/main.ts",
+        "import { McpServer } from \"oam:mcp\";\n\
+         export const server = new McpServer({ name: \"demo\" });\n\
+         export const n: number = \"no\";\n",
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .to_path_buf();
+    let out = oam(&["check", proj.to_str().unwrap(), "--json", "--no-daemon"]);
+    if !tsgo_available(&out) {
+        eprintln!("skipping: tsgo not installed");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(
+        oam_diagnostics(&stderr),
+        vec![("TS5102".to_string(), String::new(), 0)],
+        "{stderr}"
+    );
+    assert_matches_direct_tsgo(&proj, &stderr, None);
+    assert_eq!(
+        in_tree_wrapper(&proj)["compilerOptions"]["baseUrl"],
+        serde_json::json!(slashed(&proj))
+    );
+}
+
 #[test]
 fn mcp_serves_the_agent_loop_over_stdio() {
     use std::io::{BufRead, BufReader, Write};
@@ -14001,6 +14486,263 @@ C7rRXUYQtUTmtwTetACx3EEz7k2ixAxxdDCUPJIxGcVIPVKt6sTovr3yGLMuc4f7\n\
 I5PYIZ3kyY8EsQqX4JpTtbY=\n\
 -----END PRIVATE KEY-----";
 
+// Fixtures for the handshake getters (#138), generated once with OpenSSL
+// 3.5.5 (MSYS_NO_PATHCONV=1 on Git Bash, or the -subj is rewritten):
+//   EC (P-256, self-signed, SAN with an IPv6 entry, two AIA entries, EKU):
+//     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes
+//       -keyout ec.key -out ec.crt -days 3650 -subj "/CN=localhost/O=OAM Test"
+//       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1,email:oam@example.test,URI:https://example.test/x"
+//       -addext "authorityInfoAccess=OCSP;URI:http://ocsp.example.test/,caIssuers;URI:http://ca.example.test/ca.crt"
+//       -addext "extendedKeyUsage=serverAuth,clientAuth" -addext "keyUsage=digitalSignature"
+//   Chain (RSA 2048 CA, leaf with a repeated O and a SAN, signed by it):
+//     openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 -subj "/C=US/O=OAM Test/CN=Test CA"
+//     openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=localhost/O=OAM Test/O=Second O"
+//     openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out leaf.crt -days 3650 -extfile leaf.ext
+//       (leaf.ext: subjectAltName=DNS:localhost,IP:127.0.0.1 / basicConstraints=CA:FALSE / extendedKeyUsage=serverAuth)
+//   Low serial (a serial whose top nibble is zero, so BN_bn2hex's "0ABC" is pinned):
+//     openssl req -x509 -newkey rsa:2048 -nodes -keyout lowserial.key -out lowserial.crt -days 3650 -subj "/CN=localhost" -set_serial 0x0abc
+const TLS_TEST_EC_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIICjjCCAjOgAwIBAgIUXOZdy5EZsIcB1u7YHib8IKSt0ogwCgYIKoZIzj0EAwIw
+JzESMBAGA1UEAwwJbG9jYWxob3N0MREwDwYDVQQKDAhPQU0gVGVzdDAeFw0yNjA5
+MTQxMTQwMDlaFw0zNjA5MTExMTQwMDlaMCcxEjAQBgNVBAMMCWxvY2FsaG9zdDER
+MA8GA1UECgwIT0FNIFRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARoQ+K9
+2C1/U+oMMu9YeGgKq26iSMeaRY2M3U90rk513s4bDPUnyte8lj6ox7aIynK9/sRd
+K+rvV5iup8hTjDBlo4IBOzCCATcwHQYDVR0OBBYEFIf6f7za8yL3hn9zuoMR8Sro
+UP/mMB8GA1UdIwQYMBaAFIf6f7za8yL3hn9zuoMR8SroUP/mMA8GA1UdEwEB/wQF
+MAMBAf8wVgYDVR0RBE8wTYIJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAA
+AAABgRBvYW1AZXhhbXBsZS50ZXN0hhZodHRwczovL2V4YW1wbGUudGVzdC94MGAG
+CCsGAQUFBwEBBFQwUjAlBggrBgEFBQcwAYYZaHR0cDovL29jc3AuZXhhbXBsZS50
+ZXN0LzApBggrBgEFBQcwAoYdaHR0cDovL2NhLmV4YW1wbGUudGVzdC9jYS5jcnQw
+HQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMAsGA1UdDwQEAwIHgDAKBggq
+hkjOPQQDAgNJADBGAiEAw+qdvX6YFomEXdQPG1vSJBl47I7t7e8dMaNpoUNBGbUC
+IQDi8RdNKrN+O1c/Akki7MgLI3ajlpybzMlfwAsjLw27eg==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_EC_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPvDDIEVSJU6WHVBH
+iloZy2/iYDqJmE94rSeR0TnYzwChRANCAARoQ+K92C1/U+oMMu9YeGgKq26iSMea
+RY2M3U90rk513s4bDPUnyte8lj6ox7aIynK9/sRdK+rvV5iup8hTjDBl
+-----END PRIVATE KEY-----"#;
+
+const TLS_TEST_CHAIN_LEAF_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDeDCCAmCgAwIBAgIUWm9SUcIRPRhgJMKLa2koUHS2xtMwDQYJKoZIhvcNAQEL
+BQAwMjELMAkGA1UEBhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdU
+ZXN0IENBMB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowOjESMBAGA1UE
+AwwJbG9jYWxob3N0MREwDwYDVQQKDAhPQU0gVGVzdDERMA8GA1UECgwIU2Vjb25k
+IE8wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCvZmi12M3z1+rgg0WX
+e6KTvMacHnqCDB86vMWsLmpEis7vlG1FCzbJglmLqEm2ezh2CrD6qX5ebrHHeBzD
+9N6hTl7HiC+a6iQQIC/MmPZwULkCfeH0buEwofYKs4TsY5L6BdPO9R1DMy7bj50D
+puDH2XrwlixmxBaF6lbG4Q3ru37cl9bOZ6fM38xyIdRsHOfBGEpYhA04IwwCHgiy
+iycbNw11stjh/pLxufIs6IC9gJtMtUs054Lwbl5FFckVmgZb/9C/yCyqGnf122Lj
+jalZpHG8KfTCnx8FA1pLsgw2BUfE+stFwYzIRUKEuM7knF1WTi2tkutm5NNw0DWP
+N6R9AgMBAAGjfjB8MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRME
+AjAAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBR/ecaB7hyGk0XWC4M9
+KcI7NGCIXjAfBgNVHSMEGDAWgBT5bt4TsEwfzDeUQU2IIqf07dYoKDANBgkqhkiG
+9w0BAQsFAAOCAQEADZG+rI1Y4/OMKmhy3mEBaCKs5EdIv8QW9OInE1VIL0kr1LF4
+dkMGJemaj5dxzagXz4Y5e4qK/Qt9vu2YeEM8deND5cSUCWeYD9ksfsC6Yo2wM1+X
+NmeTFXt+tZ6tAjrAcfy1efWdRkHXRmRxhA068Bg9+WQqRoyFAv1usiS2ji/dGhsT
+ZcIjyDq7ppE+EIQ3Cyl7SoLqQEoWM4nXo/gl1swXL1jEeJBHOGyugGEyUT6A3Xp+
+T+9f+hQU9pUGSnA0FxKez9p2qloULtNcuQI8FTBlLkqIjLlFVhIgYc9GrybgEcZz
+sWzAKNllrZyIqRKhxZPdy9SJT2RPDN299G6wdw==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_CHAIN_CA_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDRTCCAi2gAwIBAgIUZWBXiNnxahPBrN+4Oc8+hnskUDkwDQYJKoZIhvcNAQEL
+BQAwMjELMAkGA1UEBhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdU
+ZXN0IENBMB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowMjELMAkGA1UE
+BhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdUZXN0IENBMIIBIjAN
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw1Sc6jaJpCV1SzxQ5EGC9z/AZdUS
+Og6XI8qTbkcUTxoMYqlLtJ3VAo9o5miiei0w9y4pGPu3tRqg42K9e2gJokkZ4yLC
+xExxBmBSZ4KSsGpAKQExsAkup3XN2MqELLOgVhqAJWXuvtnbQhVUtkPkR9aMBD6Y
+62Y2ik04v3Ufd1mGXJSntSXkfCDi705fjOItlY8REw35N+HxptBvbIomdBwLAYOx
+oPKfdfIVmuxm594SRJ0Dfj6biJumX69PEjUpPuDdVYK4FvFcNf6zIt04hMnfHDm4
+rjQZq2TeczNFMIBXAPLjS+l3lqaj6FG0FsbIdHKp6hY1r9Y/qxjH5kTogwIDAQAB
+o1MwUTAdBgNVHQ4EFgQU+W7eE7BMH8w3lEFNiCKn9O3WKCgwHwYDVR0jBBgwFoAU
++W7eE7BMH8w3lEFNiCKn9O3WKCgwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B
+AQsFAAOCAQEAUyUboZTClFMkAWbH42DHOijK8GJPxg/8wjal7O2McQQ+y5HVQzva
+JUzxnK3FOfmkokbh4xBvqR2HCD5qBEG1bb8owu5cd9+m8FIs0IsaNjhXmWLjmP1x
+KYe9tEmzN3H3IIbwJYECLv+3qNOfEA+VFB2L/+e96KRgowMhvDtB4inY3opnba9d
+KPRrnVp1aJc0i6KJizs+Ba+XkZA5qL8qZpMoE1ExGv0yvaXgiY2Y5sI6tMhHJNzU
+7dWBcLpBQESYuhXsX4dWcZR2TqNKI2Sc72XfurodDx6wLqt66cOtCtSKBpGsn0/D
+l+tacbAs/ZF/7Hwrhdt/N6xypEi/dDQJAw==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_CHAIN_LEAF_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCvZmi12M3z1+rg
+g0WXe6KTvMacHnqCDB86vMWsLmpEis7vlG1FCzbJglmLqEm2ezh2CrD6qX5ebrHH
+eBzD9N6hTl7HiC+a6iQQIC/MmPZwULkCfeH0buEwofYKs4TsY5L6BdPO9R1DMy7b
+j50DpuDH2XrwlixmxBaF6lbG4Q3ru37cl9bOZ6fM38xyIdRsHOfBGEpYhA04IwwC
+HgiyiycbNw11stjh/pLxufIs6IC9gJtMtUs054Lwbl5FFckVmgZb/9C/yCyqGnf1
+22LjjalZpHG8KfTCnx8FA1pLsgw2BUfE+stFwYzIRUKEuM7knF1WTi2tkutm5NNw
+0DWPN6R9AgMBAAECggEAGKJs/XFUR7WhHuRA/2wVYuOGD4I2WZKDRlgh+TNRqIvI
+UZzKlgJjsPyWQAekRrVasjWBMstgXLn2TRohDCKVrBkaNbL6YKsW4o7qt7UaE586
+xM9ST2bNSOvOZyVce2jmySfNXklN0VTcdWjfuBYVhuwUGLs2xD4xHaDSjD8qmdtx
+MO95lxlhpvHWtbsI6EVcmDPHasjuXAXAN2AT5jK90ff9jkMhIAr5V9htZdDd9skI
+OA/6DoLKAqA7bmAb8iJ79iRESbjBNpM6SPO3ScO7wRA5aAB5xJKiPfYZy6GiE3MK
+yCAQUuEb8mEJpudKqMNkIm2EwjiVnbt0Z019i8dgIQKBgQDsAq6jNbqKoUl1DTeu
+IN/4ayAfNMOtpDhFPtM+542QNZgIW+NyKnC2eozWVHQtQ0kXeEtpglnf+IZKDfb5
+C59R88uq2P4OEvgpjA/M5fBrvAd3+Rz0HdbHf1Sjs51+IyS/lU73MD8iBmK1jWe7
+EBOGpHcjCxTklrlzjaCO2RpzDQKBgQC+QYkfY3jDjKOhps88t1ZxVF+rWnoLpBnU
+GG6PtnmXRD6X5uh9wT55P+Chr7OltvWc+Dd7attixABw7NwjHzrhHLNLdm0IbbV+
+bTA3/CrY8Kz/GHro8jOM3Sg4BuMgXXeE/z10vpHJyv51qS3Z6MC3fn5wj5H8kcGZ
+k8jRmspbMQKBgQDZq2+eH8O4cCDr0BD2jGOFHmg139hJohgz5Um3zqAFzSg3LWiM
+tw/VfRm/44xy4ofbGZuT6CE0LGbOjiqmb021rAC/xfoqyNwQlZlNBRXEh1rsD9ng
+XFTnEkzh3pr25zrRZ8e4u8q+et03TP/Ky3z2xWEL9QCEA29vX8Qhe6KlUQKBgQCO
+gEmzb+7hEPLyvh1UzcF6SwcJMlBdbcFGwjH1hGhYK25ymiojHt2rNXQLxq1Y/svC
+kYwE7cl6lXH7Iv3TdK3GNJf6eq459OpO0nueQ0rYiJQa0XwmBFsmM/PO2yG9eSRv
+QjoGukI6Ecg72saUA6htB9qudmqS8Z0/aZitnjHY0QKBgQCJyCFv6XwC/jULjfdl
+IQoQxWfXsICLQ+jEoCbdg6FITRXcRlp22U/ucmf66fToDNefCpkOUG3M42WhBe86
+K0P/Guh98jAuquxrSBL2RryVotaRGXG06uk7QylEDJUSgDbNkgzNjm20JFy3stmM
+l2eb728Ku35DtszRy9AJ/GxD+A==
+-----END PRIVATE KEY-----"#;
+
+const TLS_TEST_LOW_SERIAL_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIC9zCCAd+gAwIBAgICCrwwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAwwJbG9j
+YWxob3N0MB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowFDESMBAGA1UE
+AwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvu/j
+pbQ5kU8rwvs8vsUbILMlxmI3eEHbwXannFb7ijtel0BRLOYTdYB4fLBdsQwlP4/7
+LPw/3o2864hWE3IuiBw0wTP0exXEDwdvRWyVDwb1NIBJrxkWrCp3BMFg1q8aMCTM
+sojAwF+g8UF4LYcuFK2OJgYT1GtCWZ6VXFgCC4T66dIO2UcO7MVszaeCQxJerl1l
+WIupc9jnNjRqSeIMZ7Df2CMNioTxXevytELIHuPew6z6uZqv8bDxbkbXBy6iAfK6
+Q8uZ3appwrK982jtUhnycrV4tY/lpZnQunxOkgNQy2zzaQOqmhSqzdlzYMe1Bbjn
+X7rsaoKh/ufUNsr1FQIDAQABo1MwUTAdBgNVHQ4EFgQUJX1gtCO0bakG4he2XxVh
+gDiD5ZIwHwYDVR0jBBgwFoAUJX1gtCO0bakG4he2XxVhgDiD5ZIwDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAuxe0ZA035glmQ8mEEvQITy6TUre6
+gRmqzfA+8BC5ObFJwtVuRb/rH+nGfk6iH51Hzwp5+HxfO4UZZQUIBIscDOULR1+y
+PbnlefYZkUf4jj1dbwhlJEC6+TEw7+ElIdLwVyYka4/oXTRE/jbIjpbSx8S3o3de
+ggS/YSxC+JRTs5aE9JQGp4AGcOKt4UBv+g0ZT9/Z0gfM262IDqaxNTqSGizvqelf
+aeFBtZdNvnXHVPNgIywtWS811oMLwHmGVxOVvSmUk/ffh4Z7pvJPCoycp69fRV9q
+AA9axd3ErHhDfmyy9li24ebetMzFtzQvn8WbK7RYw5e07Mg1+3SEfvTZFQ==
+-----END CERTIFICATE-----"#;
+
+/// A throwaway private CA (CA:TRUE, valid to 2126) and the localhost leaf it
+/// signed (SAN DNS:localhost, IP:127.0.0.1), for the trust-store tests: the
+/// server presents the leaf alone, and only a client that trusts the CA --
+/// through `ca` or NODE_EXTRA_CA_CERTS -- connects. Generated once with
+/// openssl and embedded; no test shells out to regenerate them.
+const TLS_TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDHzCCAgegAwIBAgIUX5ir308lg8m4hQdNnUz0UdN33DwwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwIBcNMjYwOTE0MTExMTI0WhgPMjEy\n\
+NjA4MjExMTExMjRaMBYxFDASBgNVBAMMC29hbSB0ZXN0IENBMIIBIjANBgkqhkiG\n\
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5oXf7XNg5MHjC511VA64HF8kdBHebuI207US\n\
+fCQg9EYTe3hzOBACwsn78SNXFfmDw5E7hlF2xTuZmD3OJx9a0Ax54EoF67Z4Bigw\n\
+My6GF1oKNsmeCGn9nv62+7jm9UspForbmWE8/rC3bM37BbvS87FoogEdXQS5uNQz\n\
+4AuGbduhr27IXlScHsub4paSIrW6etllby5Ja+81NpVmwuZ32QNk+s0bwcLq8YIq\n\
+5zpemaKeTGDBbG3mIt3vYsfjg8zUTdCdkjOs8q0+BSB8OkhGpe888d5JyUxd1WiK\n\
+qiTpfG3+2Pbr0eK7pzIzeT+HDfzUInFfr7lu6lBtfjQRWSZWGwIDAQABo2MwYTAd\n\
+BgNVHQ4EFgQUKmakijzWE71HQeyNAwaTnq9/xyMwHwYDVR0jBBgwFoAUKmakijzW\n\
+E71HQeyNAwaTnq9/xyMwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw\n\
+DQYJKoZIhvcNAQELBQADggEBACX/zgcVyya26/+5t6Be9duAAJs1X0VSKSzXP/Au\n\
+A+ngqWqFBPDhIzorx84d+siuRKVLOZUjObba245P4oiaJwNSz3Ihix5V3FHGZTVM\n\
+vHpVP8V7tzKpoEz89vfhueFOB0u2TVJe/099DAHrjaaza0zWa1zfxucrBAFQiQIA\n\
+2GK95UN3sSv9/rl3QlxQx8ld5QlpIjjhQL7N1JWWKcuBqDHgbfN1qwB2CWSB+v3g\n\
+YyTiYg/yyeFi173xPPS3CoiyyVyO+6ySfhwvopDJVkTdZafDpV5/d1o+AssKYX3R\n\
+Jd1U3J1YgXh3HzZEI9Yeo2jZzDogNzNObNoYdXRUoDVPMXo=\n\
+-----END CERTIFICATE-----";
+
+const TLS_TEST_LEAF_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDRzCCAi+gAwIBAgIUXMdiPT0RoKd1ynyNQq5kRcwrF9UwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwIBcNMjYwOTE0MTExMTI1WhgPMjEy\n\
+NjA4MjExMTExMjVaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcN\n\
+AQEBBQADggEPADCCAQoCggEBALtUgW8legRgDaIObCQ75gb63jPvvGLkgrmfvL+z\n\
+zuIpFr6McD3Em6aX0fje4x8SjVF10F1HTa8pLDy4G6T/UiBuATovjMsEIqk1MLW2\n\
+F6/KfQLO35pVC6PeUCYW8UkqymVifxsPQuzdV+Hbp9VDaamHtCFhJN0sl0TAbc37\n\
+xp4WZwI1HTSQ4q+ReLSslNQiK+bwJQeKdiL7u6jzXqkb0uTxOJ2bSS2BhpPbPiNR\n\
+fZObJiFr6wtURUvy0AY9AmbNJwuWkuM0aJlOibaVIPPgVGDtZJCd8gQEdV4pKIMZ\n\
+avTN3AbNeIMmn3nZehk5jvEHxL+tjTXG8no5f5X2KFlMwi0CAwEAAaOBjDCBiTAa\n\
+BgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADALBgNVHQ8EBAMC\n\
+BaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFJpXOwzKMtLLnbaIViTA\n\
+QsTBV5+8MB8GA1UdIwQYMBaAFCpmpIo81hO9R0HsjQMGk56vf8cjMA0GCSqGSIb3\n\
+DQEBCwUAA4IBAQCsP5gsrw1RHvEN9oBR1Pf+CXylfpH7It7ZMWDFW73rdhuC3Zxr\n\
+22zgG04mRt2Gd4Ufq4FCjqELVoecWx5U/hv2v/4KmVqegJkcTnMOmQ3Bs391XXa9\n\
+C+07yxnaDXE19agNm4ZACwmdf30LPaSqeVp3Y3aw8lH+5KeWrrVBpi7m8NMyHThC\n\
+Yn0a/DcxRET01zHZb6AEve5eJT6Lm0YF/DF6r4+YfGehLX892VDoWgrNCz7DpDuC\n\
+1ALfON7I9FSAJGh3iBvTbX9R7xVuKd8Za2f8Xwr/t7jK/zYxLAT9oyTH1FXIFAnP\n\
+H5shelNOFfKjeO2TTJ9u7hMSzF9fWd4EOB7u\n\
+-----END CERTIFICATE-----";
+
+const TLS_TEST_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC7VIFvJXoEYA2i\n\
+DmwkO+YG+t4z77xi5IK5n7y/s87iKRa+jHA9xJuml9H43uMfEo1RddBdR02vKSw8\n\
+uBuk/1IgbgE6L4zLBCKpNTC1thevyn0Czt+aVQuj3lAmFvFJKsplYn8bD0Ls3Vfh\n\
+26fVQ2mph7QhYSTdLJdEwG3N+8aeFmcCNR00kOKvkXi0rJTUIivm8CUHinYi+7uo\n\
+816pG9Lk8Tidm0ktgYaT2z4jUX2TmyYha+sLVEVL8tAGPQJmzScLlpLjNGiZTom2\n\
+lSDz4FRg7WSQnfIEBHVeKSiDGWr0zdwGzXiDJp952XoZOY7xB8S/rY01xvJ6OX+V\n\
+9ihZTMItAgMBAAECggEADSEodpMjMNilRqJ0JJCo1/xlQ9vy/DYVONAKo/UE9Fz6\n\
+Nx4TZSuOgpKe04Prr0CBnx/+xqA6FaNxHPWvxP9le4MPmvW84c3HECJQ6QDQ5YVF\n\
+AG63b/2zSdJJvncFL6JMJTxODvt22VskzwkHg68B4jFHXWo4Rzgvh1C6tsvavoxS\n\
+DA/J/Pl+saC6iccDtLp4lbJaMzCGGRDPjb13hqBcHoPEjF5JtN9I1bCVUZn/QFbY\n\
+7PHRptS2SDuAcoPiC8SlqZff7PSMakZzBT7Ng7kSdW3mFapJkN2NM5IsmIlTyG83\n\
+1GfTXCH1o00HXpoJ8N5YundxoG5FWlCIgcrEO1jNEQKBgQDbCJapOXVz6ULoTevi\n\
+SzdQH38UH1Ckd1rp0QYxm/MWXXyupWnBBt2iBekbFygT2bRwhtIA33CEusYmh4sN\n\
+nal6ERh5wbYYzngPaO0sHX4QVzBYleu344/pkgZxCEpG8G5oxjggj/ds15TsgLVS\n\
+KEsvXnodKmVsvDqfDFWD+ZnEzwKBgQDa8ijtlbO2ro9HgvqAr88kS/8nVlnZdXE5\n\
+9YT/DEYVsLQzduIze9G4uzI/dgSn8UtUatCvgREFB2CkQUvSeUEF4LIH6zhiI2eu\n\
+yJzhAR3tU6hXWsJSLSMildlv6ooWngdNmQg9pXTNbUjJ4dtfn1Rip5A/FKzsLxDG\n\
+/mjx6R3AQwKBgHTfA0zuXM5pY4sCsN+BVNVKyQranrPy/66NGqnz1WRUo8eoeWJG\n\
+oJHoZ3ZOB9N3sYDtXzaaAra/1iUO49JzEtAQOSgWhWx9FrDaQtrsLazYaPKLpEft\n\
+g4eUpB1B2Cg7+B2tzpsJVnNcIJmFH7rjxyJSXgQb8Bxx3zGoaiTOVQ8fAoGAST2G\n\
+iWtxkaO1FEPxTkkBbu/pK5yMM91AghXqZnMRosHYlfqn0ncSAczFE0uEZTWncFbG\n\
+9l6jdd4w6uFY3tBm+vNeOp3p35JeZa6AJBh+jVxVzNr0dA7bWP9tnC2GAejdIo0V\n\
+n6GQgAOVvMrL2qHu1Y2eCCv/aIaaAycprfrAVAcCgYBF6Hs47CZ4RPMzUnlMV8F+\n\
+F7McNeFuVRqpneXVSNB7UDuID2ttb7RTchZaG2hc84LWRV0/yjElLrG6yPxyGFIq\n\
+hnNgLVJt6pGXwWKx6CgqUvijJFPNwDhZRYtLfyCWXHDQ4E9T3C5DO7T+8lafH6NO\n\
+lAvLJ1NDDacIcdciXw6fZg==\n\
+-----END PRIVATE KEY-----";
+
+/// The leaf's key under a certificate the CA signed for 2020-01-01 to
+/// 2021-01-01: expired, and otherwise identical to TLS_TEST_LEAF_CERT.
+const TLS_TEST_EXPIRED_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDRTCCAi2gAwIBAgIUXMdiPT0RoKd1ynyNQq5kRcwrF9YwDQYJKoZIhvcNAQEL\n\
+BQAwFjEUMBIGA1UEAwwLb2FtIHRlc3QgQ0EwHhcNMjAwMTAxMDAwMDAwWhcNMjEw\n\
+MTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQC7VIFvJXoEYA2iDmwkO+YG+t4z77xi5IK5n7y/s87i\n\
+KRa+jHA9xJuml9H43uMfEo1RddBdR02vKSw8uBuk/1IgbgE6L4zLBCKpNTC1thev\n\
+yn0Czt+aVQuj3lAmFvFJKsplYn8bD0Ls3Vfh26fVQ2mph7QhYSTdLJdEwG3N+8ae\n\
+FmcCNR00kOKvkXi0rJTUIivm8CUHinYi+7uo816pG9Lk8Tidm0ktgYaT2z4jUX2T\n\
+myYha+sLVEVL8tAGPQJmzScLlpLjNGiZTom2lSDz4FRg7WSQnfIEBHVeKSiDGWr0\n\
+zdwGzXiDJp952XoZOY7xB8S/rY01xvJ6OX+V9ihZTMItAgMBAAGjgYwwgYkwGgYD\n\
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgWg\n\
+MBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBSaVzsMyjLSy522iFYkwELE\n\
+wVefvDAfBgNVHSMEGDAWgBQqZqSKPNYTvUdB7I0DBpOer3/HIzANBgkqhkiG9w0B\n\
+AQsFAAOCAQEAPWFcRQF+fBqgAxRdsItGEcWK+wuodRNmnZ0qLd1bRTaqUASUW5ek\n\
+lNI65QaHbmCbFNgSqzkHfKT8sGs2NzHy1jvrEb2IcQrrrHzX8e19MrMCx0P0qqpr\n\
+1b19Yz9MMojQqKbIsJkh9aeQeD0ogelP571Bu0FmXHVuPb0RXyXF23z3dpjUtkAQ\n\
+QamNnNaq5R45wdYHJlNQsj9CLn7M7drDQFIsC2iakqMGHwounusQGWtzlgfmd8b+\n\
+gscDe/porMSzoYIdHpwkyK3hxLY96eO63Yhr7TzUWNCmn4P2QTiWl0Sn3OF9yTNA\n\
+z8RNjndsbTHaEcGslUIMehEVlS40ozOotw==\n\
+-----END CERTIFICATE-----";
+
+/// The client half every trust-store e2e shares: connect with `opts` over
+/// the base options and report the verdict -- `secureConnect` with the
+/// socket's `authorized` / `authorizationError`, or the error's code,
+/// message and own keys plus the socket's verdict fields. Every await is
+/// bounded.
+const TLS_VERDICT_HELPER: &str = r#"
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const verdict = (port, opts) => within(8000, 'verdict', new Promise((resolve) => {
+  const s = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', ...opts });
+  s.on('secureConnect', () => {
+    resolve({ ok: true, authorized: s.authorized, authorizationError: s.authorizationError });
+    s.end();
+  });
+  s.on('error', (e) => {
+    const out = { ok: false, code: e.code, message: e.message, keys: Object.keys(e), hasSyscall: 'syscall' in e, hasErrno: 'errno' in e };
+    if ('reason' in e) out.reason = e.reason;
+    if ('host' in e) out.host = e.host;
+    out.authorized = s.authorized;
+    out.authorizationError = s.authorizationError;
+    resolve(out);
+  });
+}));
+"#;
+
 #[test]
 fn https_create_server_serves_tls() {
     let src = format!(
@@ -14339,9 +15081,10 @@ fn tls_connect_server_auth_does_not_require_client_cert() {
     // (Some("undefined") instead of None), so the optional clientCert/clientKey
     // arrived as present-but-bogus and failed with
     // `no private key found in client key PEM` (tls.rs) before any handshake.
-    // Here the self-signed test cert is also passed as `ca`, so validation still
-    // fails (CaUsedAsEndEntity) -- but that proves build_client_config succeeded
-    // with no client auth; the bug error string must be absent.
+    // The self-signed CA:TRUE test cert is passed as `ca`: Node trusts a leaf
+    // that is itself in the store and connects (#136), so the verdict must be
+    // a clean connection -- rustls alone refused it as CaUsedAsEndEntity, and
+    // this test used to settle for "reached validation at all".
     let src = format!(
         r#"
 import tls from 'node:tls';
@@ -14357,7 +15100,7 @@ let outcome;
 try {{
   const sock = tls.connect({{ host: '127.0.0.1', port, ca: cert, servername: 'localhost', rejectUnauthorized: true }});
   await new Promise((res, rej) => {{ sock.on('secureConnect', () => res()); sock.on('error', rej); }});
-  outcome = 'connected';
+  outcome = 'connected authorized=' + sock.authorized + ' authorizationError=' + sock.authorizationError;
   sock.end();
 }} catch (e) {{
   outcome = 'err:' + e.message;
@@ -14380,11 +15123,309 @@ server.close();
         !combined.contains("no private key found in client key PEM"),
         "server-auth tls.connect wrongly entered the client-auth path (arg_string bug regressed): {combined}"
     );
-    // It reached cert validation rather than the config error.
     assert!(
-        combined.contains("outcome="),
-        "probe did not run: {combined}"
+        combined.contains("outcome=connected authorized=true authorizationError=null"),
+        "a self-signed certificate passed as `ca` is the server's own certificate and must connect: {combined}"
     );
+}
+
+/// #136: `NODE_EXTRA_CA_CERTS` adds a private CA to the default trust store,
+/// so a server whose certificate chains to it connects without a `ca`
+/// option. A `ca` option REPLACES the extras (Node reads the variable into
+/// its default store only), yet the chain is still completed through the
+/// extra CA before it is refused -- so the refusal is
+/// SELF_SIGNED_CERT_IN_CHAIN, not UNABLE_TO_VERIFY_LEAF_SIGNATURE (both
+/// probed on v22.22.2).
+#[test]
+fn tls_node_extra_ca_certs_trusts_a_private_ca() {
+    let bundle = write_temp("extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const selfSigned = `{self_signed}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+console.log('env=' + JSON.stringify(await verdict(port, {{}})));
+console.log('ca=' + JSON.stringify(await verdict(port, {{ ca: selfSigned }})));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        self_signed = TLS_TEST_CERT,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_extra_ca.mjs", &src);
+    let output = oam_with_env(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(r#"env={"ok":true,"authorized":true,"authorizationError":null}"#),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            r#"ca={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"SELF_SIGNED_CERT_IN_CHAIN"}"#
+        ),
+        "stdout: {stdout}"
+    );
+    assert!(!stderr.contains("Warning:"), "stderr: {stderr}");
+}
+
+/// #136, the other half: without the variable the same server is refused
+/// with Node's code and message -- `code` alone on the error, no syscall or
+/// errno (it used to be `EIO: invalid peer certificate: UnknownIssuer`) --
+/// and the socket carries the verdict; `ca` trusts it; rejectUnauthorized:
+/// false connects but still reports the verdict (all probed on v22.22.2).
+#[test]
+fn tls_private_ca_is_refused_with_node_s_code_unless_trusted() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const ca = `{ca}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+console.log('none=' + JSON.stringify(await verdict(port, {{}})));
+console.log('ca=' + JSON.stringify(await verdict(port, {{ ca }})));
+console.log('array=' + JSON.stringify(await verdict(port, {{ ca: [cert, ca] }})));
+console.log('advisory=' + JSON.stringify(await verdict(port, {{ rejectUnauthorized: false }})));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_private_ca.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"none={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+        r#"ca={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"array={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"advisory={"ok":true,"authorized":false,"authorizationError":"UNABLE_TO_VERIFY_LEAF_SIGNATURE"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+/// #136: a bundle that will not load is a warning, never an error. Node
+/// prints it at startup -- a bare `Warning: ...` line on stderr, with no
+/// `(node:PID)` prefix, even for a script that never touches TLS -- and the
+/// process runs on with the default store. A bundle that fails part-way
+/// keeps every certificate before the bad section; one with no certificate
+/// in it is silently empty (all probed on v22.22.2).
+#[test]
+fn tls_node_extra_ca_certs_load_failures_warn_and_still_run() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+{helper}
+const server = tls.createServer({{ cert, key }}, (s) => s.end('hi'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const v = await verdict(port, {{}});
+console.log('verdict=' + (v.ok ? 'connected' : v.code));
+server.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_extra_ca_warn.mjs", &src);
+    let bad_section = "-----BEGIN CERTIFICATE-----\nnot base64 !!!\n-----END CERTIFICATE-----\n";
+    let missing = write_temp("extra-ca/present.pem", "")
+        .parent()
+        .unwrap()
+        .join("does-not-exist.pem");
+    let good_then_bad = write_temp(
+        "extra-ca/good-then-bad.pem",
+        &format!("{TLS_TEST_CA_CERT}\n{bad_section}"),
+    );
+    let bad_then_good = write_temp(
+        "extra-ca/bad-then-good.pem",
+        &format!("{bad_section}{TLS_TEST_CA_CERT}\n"),
+    );
+    let no_certs = write_temp("extra-ca/no-certs.pem", "just some text, no certificates\n");
+
+    let run = |bundle: &std::path::Path, script: &std::path::Path| {
+        let output = oam_with_env(
+            &["run", script.to_str().unwrap(), "--no-check"],
+            &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+        );
+        assert!(
+            output.status.success(),
+            "bundle {}: exit {:?}\nstdout: {}\nstderr: {}",
+            bundle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (stdout, stderr) = run(&missing, &file);
+    let expected = format!(
+        "Warning: Ignoring extra certs from `{}`, load failed: error:80000002:system library::No such file or directory",
+        missing.display()
+    );
+    assert_eq!(
+        stderr.matches("Warning: Ignoring extra certs").count(),
+        1,
+        "exactly one warning, once per process: {stderr}"
+    );
+    assert!(stderr.contains(&expected), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("(node:"),
+        "not a process warning: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "the connection is still attempted against the default store: {stdout}"
+    );
+
+    // Boot-time, not first-TLS-use: a script with no TLS in it warns too.
+    let no_tls = write_temp("tls_extra_ca_no_tls.mjs", "console.log('no tls');\n");
+    let (stdout, stderr) = run(&missing, &no_tls);
+    assert!(stderr.contains(&expected), "stderr: {stderr}");
+    assert!(stdout.contains("no tls"), "stdout: {stdout}");
+
+    let (stdout, stderr) = run(&good_then_bad, &file);
+    assert!(
+        stderr.contains("load failed: error:04800064:PEM routines::bad base64 decode"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=connected"),
+        "the certificate before the bad section is trusted: {stdout}"
+    );
+
+    let (stdout, stderr) = run(&bad_then_good, &file);
+    assert!(stderr.contains("bad base64 decode"), "stderr: {stderr}");
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "nothing after the bad section loads: {stdout}"
+    );
+
+    let (stdout, stderr) = run(&no_certs, &file);
+    assert!(
+        !stderr.contains("Warning:"),
+        "no certificate is not an error: {stderr}"
+    );
+    assert!(
+        stdout.contains("verdict=UNABLE_TO_VERIFY_LEAF_SIGNATURE"),
+        "stdout: {stdout}"
+    );
+}
+
+/// #136: a refused certificate is reported with the code and message Node
+/// gives it, decided the way OpenSSL decides (self-signed leaf, self-signed
+/// chain top, validity period before everything else, hostname only on a
+/// trusted chain), and ERR_TLS_CERT_ALTNAME_INVALID carries Node's
+/// `reason` / `host` / `cert` in Node's key order. Every value probed on
+/// v22.22.2.
+#[test]
+fn tls_refused_certificates_carry_node_s_codes() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const leaf = `{leaf}`;
+const leafKey = `{key}`;
+const ca = `{ca}`;
+const expired = `{expired}`;
+const selfSigned = `{self_signed}`;
+const selfSignedKey = `{self_signed_key}`;
+{helper}
+const serve = async (opts) => {{
+  const server = tls.createServer(opts, (s) => s.end('hi'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return server;
+}};
+const selfServer = await serve({{ cert: selfSigned, key: selfSignedKey }});
+console.log('selfsigned=' + JSON.stringify(await verdict(selfServer.address().port, {{}})));
+console.log('selfsigned-ip=' + JSON.stringify(await verdict(selfServer.address().port, {{ servername: undefined, ca: selfSigned }})));
+selfServer.close();
+const leafServer = await serve({{ cert: leaf, key: leafKey }});
+console.log('hostname=' + JSON.stringify(await verdict(leafServer.address().port, {{ ca, servername: 'example.com' }})));
+console.log('hostname-advisory=' + JSON.stringify(await verdict(leafServer.address().port, {{ ca, servername: 'example.com', rejectUnauthorized: false }})));
+console.log('untrusted-wrong-host=' + JSON.stringify(await verdict(leafServer.address().port, {{ servername: 'example.com' }})));
+leafServer.close();
+const chainServer = await serve({{ cert: leaf + '\n' + ca, key: leafKey }});
+console.log('chain=' + JSON.stringify(await verdict(chainServer.address().port, {{}})));
+console.log('chain-ca=' + JSON.stringify(await verdict(chainServer.address().port, {{ ca }})));
+chainServer.close();
+const expiredServer = await serve({{ cert: expired, key: leafKey }});
+console.log('expired=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca }})));
+console.log('expired-wrong-host=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca, servername: 'example.com' }})));
+console.log('expired-advisory=' + JSON.stringify(await verdict(expiredServer.address().port, {{ ca, rejectUnauthorized: false }})));
+expiredServer.close();
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+        expired = TLS_TEST_EXPIRED_CERT,
+        self_signed = TLS_TEST_CERT,
+        self_signed_key = TLS_TEST_KEY,
+        helper = TLS_VERDICT_HELPER,
+    );
+    let file = write_temp("tls_verdicts.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"selfsigned={"ok":false,"code":"DEPTH_ZERO_SELF_SIGNED_CERT","message":"self-signed certificate","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"DEPTH_ZERO_SELF_SIGNED_CERT"}"#,
+        // The e2e cert has no subjectAltName at all (CN=localhost only), so
+        // the IP the host resolved to is checked against an empty list --
+        // Node's exact wording.
+        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        // An untrusted chain is refused before the name is looked at.
+        r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,
+        r#"chain={"ok":false,"code":"SELF_SIGNED_CERT_IN_CHAIN","message":"self-signed certificate in certificate chain","keys":["code"]"#,
+        r#"chain-ca={"ok":true,"authorized":true,"authorizationError":null}"#,
+        r#"expired={"ok":false,"code":"CERT_HAS_EXPIRED","message":"certificate has expired","keys":["code"],"hasSyscall":false,"hasErrno":false,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
+        // The validity period is checked last by OpenSSL and so wins over
+        // every other failure, the hostname included.
+        r#"expired-wrong-host={"ok":false,"code":"CERT_HAS_EXPIRED""#,
+        r#"expired-advisory={"ok":true,"authorized":false,"authorizationError":"CERT_HAS_EXPIRED"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -15134,6 +16175,470 @@ server.close();
         out.status
     );
     assert!(stdout.contains("closed=true"), "{stdout}");
+}
+
+// ─── net / tls: ref() / unref() and loop-liveness (#140) ─────────────
+
+/// Run oam with a wall-clock bound. A `None` status means the child was
+/// still running at the deadline and has been killed: the failure mode of
+/// a liveness test is a hang, and a hang must fail one named test in
+/// seconds rather than wedge the suite.
+fn oam_bounded(
+    args: &[&str],
+    deadline: std::time::Duration,
+) -> (Option<std::process::ExitStatus>, String, String) {
+    use std::io::Read;
+    use std::process::Stdio;
+    let cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .args(args)
+        .env("OAM_ENABLE_NATIVE_ADDONS", "1")
+        .env("OAM_CACHE_DIR", cache)
+        .env("OAM_DAEMON_IDLE_MS", "45000")
+        .env("OAM_CHECK_WAIT_MS", "60000")
+        .env_remove("FORCE_COLOR")
+        .env_remove("NO_COLOR")
+        .env_remove("NODE_DISABLE_COLORS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("oam binary runs");
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let end = std::time::Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= end => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    (status, out.join().unwrap(), err.join().unwrap())
+}
+
+/// The `exit=0 after=<ms>` line a liveness script prints from 'exit': how
+/// long the process lived past the moment it unref'd its handles. Measured
+/// by the script itself so a loaded box's slow startup cannot fake a hold.
+fn exit_after_ms(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("exit=0 after="))
+        .unwrap_or_else(|| panic!("no `exit=0 after=` line in: {stdout}"))
+        .trim()
+        .parse()
+        .expect("elapsed ms")
+}
+
+// #140: a connected, reading, unref'd socket let node exit at once while
+// oam stayed alive -- the parked read counted toward loop-liveness whatever
+// the JS flag said. Every handle is unref'd here, the accepted server-side
+// socket included: node keeps that one ref'd until told otherwise, and it
+// alone holds the process (probed on v22.22.2).
+#[test]
+fn net_socket_unref_releases_the_event_loop() {
+    let file = write_temp(
+        "net_unref_releases.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', (d) => {
+    console.log('data=' + d);
+    client.unref();
+    server.unref();
+    t0 = Date.now();
+    console.log('active=' + JSON.stringify(process.getActiveResourcesInfo()));
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd socket held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("data=hello"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("active=[]"),
+        "unref'd handles leave the view: {stdout}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    // The runtime drops with three reads and an accept still parked: no
+    // panic, no complaint on the way out.
+    assert!(
+        stderr.trim().is_empty(),
+        "shutdown with reads parked must be silent: {stderr}"
+    );
+}
+
+// The inverse: with nothing unref'd the same program is still running at
+// 1.5s, and it is the test that kills it.
+#[test]
+fn net_socket_left_referenced_keeps_the_event_loop() {
+    let file = write_temp(
+        "net_ref_keeps.mjs",
+        r#"
+import net from 'node:net';
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hello'); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', () => {});
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_millis(1500),
+    );
+    assert!(
+        status.is_none(),
+        "exited {status:?} with every socket still referenced\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+// #140, the pre-connect ordering the post-connect test misses: unref() called
+// on a net.Socket BEFORE it connects has no handle to act on yet, so node
+// defers it (`once('connect', this.unref)`) and oam records the flag and
+// applies `tcpSetRef(handle, false)` once the handle appears. A fire-and-
+// forget background connection written as `net.connect(...); c.unref()` must
+// still let the process exit; if the deferred application regressed, the
+// parked read would pin the loop and the process would hang at exit.
+#[test]
+fn net_socket_unref_before_connect_releases_the_event_loop() {
+    let file = write_temp(
+        "net_unref_before_connect.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = net.createServer((conn) => { conn.on('data', () => {}); conn.write('hi'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  // unref() BEFORE 'connect' fires -- deferred to once('connect', unref).
+  client.unref();
+  server.unref();
+  client.on('data', () => {});
+  t0 = Date.now();
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: unref() before 'connect' did not release the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after a pre-connect unref(): the deferred unref did not take\nstdout: {stdout}"
+    );
+}
+
+// #140 parity: net.connect({ timeout }) must arm the idle timer at
+// construction (createConnection wires options.timeout to setTimeout), where
+// the existing coverage only drives the setTimeout() method. A connection
+// pool that sets an inactivity timeout this way relies on the 'timeout' event
+// firing; without the wiring it never would. The socket stays open on
+// timeout, as in node (the event does not destroy it).
+#[test]
+fn net_connect_options_timeout_arms_an_idle_timer() {
+    let file = write_temp(
+        "net_connect_timeout_option.mjs",
+        r#"
+import net from 'node:net';
+// A server that accepts and then sends nothing: the client's idle timer,
+// armed by net.connect's `timeout` option, is the only thing that fires.
+const server = net.createServer(() => {});
+server.listen(0, '127.0.0.1', () => {
+  const c = net.connect({ port: server.address().port, host: '127.0.0.1', timeout: 60 });
+  c.on('timeout', () => {
+    console.log('timeout readyState=' + c.readyState + ' destroyed=' + c.destroyed);
+    c.destroy();
+    server.close();
+  });
+  c.on('error', () => {});
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(10),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 10s: net.connect({{ timeout }}) never armed an idle timer\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("timeout readyState=open destroyed=false"),
+        "the option's idle timer must fire with the socket still open: {stdout}"
+    );
+}
+
+// ref() after unref() pins the loop again. An UNREF'D timer fires only
+// while something else keeps the process alive -- here the re-ref'd client
+// -- so 'alive-at-1500' is printed only if ref() took. Had it been a no-op
+// on the loop, the process would have exited straight after the data line.
+#[test]
+fn net_socket_ref_after_unref_keeps_the_event_loop() {
+    let file = write_temp(
+        "net_ref_after_unref.mjs",
+        r#"
+import net from 'node:net';
+process.on('exit', (code) => console.log('exit=' + code));
+let accepted;
+const server = net.createServer((conn) => { accepted = conn; conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = net.connect(server.address().port, '127.0.0.1');
+  client.on('data', () => {
+    client.unref();
+    server.unref();
+    console.log('chained=' + (client.ref() === client));
+    setTimeout(() => {
+      console.log('alive-at-1500');
+      client.destroy();
+      accepted.destroy();
+      server.close();
+    }, 1500).unref();
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status =
+        status.unwrap_or_else(|| panic!("still alive at 20s\nstdout: {stdout}\nstderr: {stderr}"));
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in ["chained=true", "alive-at-1500", "exit=0"] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+// server.unref() lets the process exit with the server still listening
+// (node), whether called before listen() -- remembered and applied once
+// bound -- or after.
+#[test]
+fn net_server_unref_releases_the_event_loop() {
+    let file = write_temp(
+        "net_server_unref.mjs",
+        r#"
+import net from 'node:net';
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const early = net.createServer(() => {});
+early.unref();
+early.listen(0, '127.0.0.1', () => {
+  const late = net.createServer(() => {});
+  late.listen(0, '127.0.0.1', () => {
+    t0 = Date.now();
+    console.log('chained=' + (late.unref() === late) + ' listening=' + (early.listening && late.listening));
+  });
+});
+"#,
+    );
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd listener held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("chained=true listening=true"),
+        "stdout: {stdout}"
+    );
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    assert!(stderr.trim().is_empty(), "stderr: {stderr}");
+}
+
+// The tls shape of #140: a TLSSocket unref'd BEFORE it connected (node
+// defers that to 'connect'), a tls.Server unref'd once listening, the
+// accepted TLSSocket unref'd on 'secureConnection'.
+#[test]
+fn tls_socket_unref_releases_the_event_loop() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let t0 = 0;
+process.on('exit', (code) => console.log('exit=' + code + ' after=' + (Date.now() - t0)));
+const server = tls.createServer({ cert, key }, (conn) => { conn.on('data', () => {}); conn.write('hello'); conn.unref(); });
+server.listen(0, '127.0.0.1', () => {
+  const client = tls.connect({ host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false });
+  console.log('chained=' + (client.unref() === client));
+  client.on('data', (d) => {
+    console.log('data=' + d);
+    server.unref();
+    t0 = Date.now();
+    console.log('active=' + JSON.stringify(process.getActiveResourcesInfo()));
+  });
+});
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let file = write_temp("tls_unref_releases.mjs", &src);
+    let (status, stdout, stderr) = oam_bounded(
+        &["run", file.to_str().unwrap(), "--no-check"],
+        std::time::Duration::from_secs(20),
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!("still alive at 20s: an unref'd TLS socket held the loop\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert!(
+        status.success(),
+        "exit {status}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in ["chained=true", "data=hello", "active=[]"] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+    let after = exit_after_ms(&stdout);
+    assert!(
+        after < 1500,
+        "exited {after}ms after unref(): the loop was held\nstdout: {stdout}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "shutdown with TLS reads parked must be silent: {stderr}"
+    );
+}
+
+// net.Socket state follows the handle, as node's does (every line below
+// is node v22.22.2's output for the same script): address() is `{}` before
+// connect and again after close, `pending` is `!handle || connecting` --
+// true on a FRESH socket, not only while connecting -- readyState walks
+// open (fresh) -> opening -> open -> readOnly -> closed, writeOnly once the
+// peer ended a half-open socket, and 'close' carries hadError.
+#[test]
+fn net_socket_address_pending_and_ready_state_follow_the_handle() {
+    let file = write_temp(
+        "net_socket_state.mjs",
+        r#"
+import net from 'node:net';
+const j = JSON.stringify;
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+
+const fresh = new net.Socket();
+console.log('fresh=' + j({ address: fresh.address(), pending: fresh.pending, readyState: fresh.readyState }));
+const server = net.createServer({ allowHalfOpen: true }, (s) => { s.on('data', () => {}); s.on('end', () => s.end()); });
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  const c = net.connect(port, '127.0.0.1');
+  console.log('connecting=' + j({ address: c.address(), pending: c.pending, readyState: c.readyState }));
+  await once(c, 'connect');
+  const a = c.address();
+  console.log('connected=' + j({ keys: Object.keys(a), address: a.address, family: a.family, portOk: typeof a.port === 'number' && a.port !== port, pending: c.pending, readyState: c.readyState }));
+  c.on('data', () => {});
+  c.end();
+  console.log('ended=' + j({ pending: c.pending, readyState: c.readyState, keys: Object.keys(c.address()) }));
+  const hadError = await once(c, 'close');
+  console.log('closed=' + j({ address: c.address(), pending: c.pending, readyState: c.readyState, hadError }));
+  // destroy(err): 'close' carries hadError=true, and the handle is gone.
+  const d = net.connect(port, '127.0.0.1');
+  await once(d, 'connect');
+  d.on('error', () => {});
+  const dClose = once(d, 'close');
+  d.destroy(new Error('boom'));
+  console.log('destroyErr=' + j({ hadError: await dClose, address: d.address(), pending: d.pending }));
+  // The peer ends first on a half-open socket: writeOnly, not pending.
+  const half = net.createServer({ allowHalfOpen: true }, (s) => s.end('bye'));
+  await new Promise((r) => half.listen(0, '127.0.0.1', r));
+  const w = net.connect({ port: half.address().port, host: '127.0.0.1', allowHalfOpen: true });
+  w.on('data', () => {});
+  await once(w, 'end');
+  console.log('peerEnded=' + j({ readyState: w.readyState, pending: w.pending }));
+  w.end();
+  await once(w, 'close');
+  half.close();
+  server.close();
+});
+"#,
+    );
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"fresh={"address":{},"pending":true,"readyState":"open"}"#,
+        r#"connecting={"address":{},"pending":true,"readyState":"opening"}"#,
+        r#"connected={"keys":["address","family","port"],"address":"127.0.0.1","family":"IPv4","portOk":true,"pending":false,"readyState":"open"}"#,
+        r#"ended={"pending":false,"readyState":"readOnly","keys":["address","family","port"]}"#,
+        r#"closed={"address":{},"pending":true,"readyState":"closed","hadError":false}"#,
+        r#"destroyErr={"hadError":true,"address":{},"pending":true}"#,
+        r#"peerEnded={"readyState":"writeOnly","pending":false}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }
 
 // ======================================= dns.resolve + dns.reverse
@@ -20586,4 +22091,271 @@ console.log('TRANSCRIPT_GREW=' + String(seen[0].count === 1 && seen.find((s) => 
         stdout.contains("TRANSCRIPT_GREW=true"),
         "the tool_result was not fed back. {ctx}"
     );
+}
+
+// ─── #138: handshake getters and the peer certificate ───────────────
+
+// getProtocol / getCipher / getEphemeralKeyInfo / getPeerCertificate /
+// getPeerX509Certificate report OpenSSL's names and Node's legacy
+// certificate object -- before the handshake, after it on both the client
+// and the accepted socket, and after 'close'. Every value was probed on
+// v22.22.2; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
+// objects against a live node, this pins the shapes with no node on PATH.
+// They used to be rustls's Debug names ("TLSv1_3", "TLS13_AES_256_GCM_SHA384")
+// and getPeerCertificate() was {} on a connected socket.
+#[test]
+fn tls_handshake_getters_report_node_names_and_peer_certificate() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let section = 'start';
+const watchdog = setTimeout(() => { console.log('WATCHDOG ' + section); process.exit(9); }, 20000);
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+const getters = (s) => ({
+  protocol: s.getProtocol(), cipher: String(s.getCipher()), ephemeral: s.getEphemeralKeyInfo(),
+  peer: s.getPeerCertificate(), detailed: s.getPeerCertificate(true), x509: String(s.getPeerX509Certificate()),
+});
+
+let accepted;
+const serverSide = new Promise((r) => { accepted = r; });
+const server = tls.createServer({ cert, key }, (s) => { s.on('data', (d) => s.write(d)); accepted(s); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const s = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost' });
+section = 'before';
+show('before', getters(s));
+await once(s, 'secureConnect');
+section = 'after';
+show('protocol', s.getProtocol());
+show('cipher', s.getCipher());
+show('ephemeral', s.getEphemeralKeyInfo());
+const p = s.getPeerCertificate();
+show('keys', Object.keys(p));
+show('scalars', {
+  subject: p.subject, issuer: p.issuer, ca: p.ca, bits: p.bits, exponent: p.exponent,
+  modulus: p.modulus.slice(0, 12) + '/' + p.modulus.length,
+  pubkey: p.pubkey.length + ':' + p.pubkey.toString('hex').slice(0, 8),
+  valid_from: p.valid_from, valid_to: p.valid_to, fingerprint: p.fingerprint, fingerprint256: p.fingerprint256,
+  fingerprint512: p.fingerprint512.length, serialNumber: p.serialNumber, raw: p.raw.length,
+});
+show('shape', [Object.getPrototypeOf(p) === Object.prototype, Object.getPrototypeOf(p.subject) === null, Buffer.isBuffer(p.raw), 'issuerCertificate' in p, s.getPeerCertificate() !== p]);
+const d = s.getPeerCertificate(true);
+show('detailed', [Object.keys(d).length - Object.keys(p).length, d.issuerCertificate === d]);
+const x = s.getPeerX509Certificate();
+show('x509', {
+  ctor: x.constructor.name, subject: x.subject, serialNumber: x.serialNumber, validFrom: x.validFrom,
+  sameFingerprint: x.fingerprint512 === p.fingerprint512, sameRaw: x.raw.equals(p.raw),
+  fresh: s.getPeerX509Certificate() !== x, san: String(x.subjectAltName), keyUsage: String(x.keyUsage),
+});
+section = 'server';
+const ss = await within(5000, 'secureConnection', serverSide);
+show('server', getters(ss));
+section = 'close';
+s.end();
+await once(s, 'close');
+show('closed', getters(s));
+ss.destroy();
+server.close();
+clearTimeout(watchdog);
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let file = write_temp("tls_getters_rsa.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        // Before the handshake: the handle answers -- the configured maximum
+        // for the protocol, undefined for the cipher, {} for the rest.
+        r#"before={"protocol":"TLSv1.3","cipher":"undefined","ephemeral":{},"peer":{},"detailed":{},"x509":"undefined"}"#,
+        r#"protocol="TLSv1.3""#,
+        r#"cipher={"name":"TLS_AES_256_GCM_SHA384","standardName":"TLS_AES_256_GCM_SHA384","version":"TLSv1.3"}"#,
+        // {} after a TLS 1.3 handshake: OpenSSL keeps no peer temporary key.
+        "ephemeral={}",
+        r#"keys=["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"]"#,
+        r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jun 15 12:30:07 2026 GMT","valid_to":"Jun 15 12:30:07 2027 GMT","fingerprint":"F3:9E:27:5B:08:05:32:D6:FA:BD:2E:DD:B6:41:6B:69:01:B6:DF:11","fingerprint256":"02:92:43:F0:41:85:E0:BE:02:14:8A:4B:51:9B:6C:D4:64:16:34:4A:6F:8C:64:5D:8A:8F:AF:AD:6E:FE:F0:31","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":781}"#,
+        // A plain object with null-prototype names, a fresh one per call, no
+        // issuerCertificate unless detailed.
+        "shape=[true,true,true,false,true]",
+        // detailed: one more key, and a self-signed certificate points at itself.
+        "detailed=[1,true]",
+        r#"x509={"ctor":"X509Certificate","subject":"CN=localhost","serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","validFrom":"Jun 15 12:30:07 2026 GMT","sameFingerprint":true,"sameRaw":true,"fresh":true,"san":"undefined","keyUsage":"undefined"}"#,
+        // The accepted socket: no key info (null), no peer certificate ({}).
+        r#"server={"protocol":"TLSv1.3","cipher":"[object Object]","ephemeral":null,"peer":{},"detailed":{},"x509":"undefined"}"#,
+        // The handle is gone: null everywhere, undefined for the X509Certificate.
+        r#"closed={"protocol":null,"cipher":"null","ephemeral":null,"peer":null,"detailed":null,"x509":"undefined"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+// The legacy object's key-type and extension fields: an EC certificate
+// carries bits/pubkey (the raw point)/asn1Curve/nistCurve in place of the RSA
+// modulus/exponent, plus subjectaltname (with an IPv6 entry spelled as Node
+// spells it), a null-prototype infoAccess of arrays, ext_key_usage, and --
+// its KeyUsage lacking keyCertSign -- `ca: false` and no self link from
+// getPeerCertificate(true), as X509_check_ca / X509_check_issued decide. A
+// CA-signed leaf served with its CA links leaf -> CA -> itself, with the
+// leaf's repeated O as an array. Both probed on v22.22.2.
+#[test]
+fn tls_peer_certificate_ec_and_chain_legacy_shapes() {
+    let src = r#"
+import tls from 'node:tls';
+const ecCert = `__EC_CERT__`;
+const ecKey = `__EC_KEY__`;
+const chainCert = `__LEAF_CERT__` + '\n' + `__CA_CERT__`;
+const chainKey = `__LEAF_KEY__`;
+let section = 'start';
+const watchdog = setTimeout(() => { console.log('WATCHDOG ' + section); process.exit(9); }, 20000);
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+
+async function connect(name, cert, key) {
+  section = name;
+  let accepted;
+  const serverSide = new Promise((r) => { accepted = r; });
+  const server = tls.createServer({ cert, key }, (s) => { s.on('data', (d) => s.write(d)); accepted(s); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const s = tls.connect({ host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false, servername: 'localhost' });
+  await once(s, 'secureConnect');
+  const ss = await within(5000, 'secureConnection', serverSide);
+  return { s, done: async () => { s.end(); await once(s, 'close'); ss.destroy(); server.close(); } };
+}
+
+{
+  const { s, done } = await connect('ec', ecCert, ecKey);
+  const p = s.getPeerCertificate();
+  show('ec.keys', Object.keys(p));
+  show('ec.fields', {
+    subject: p.subject, subjectaltname: p.subjectaltname, infoAccess: p.infoAccess,
+    infoAccessProto: Object.getPrototypeOf(p.infoAccess) === null, ca: p.ca, bits: p.bits,
+    pubkey: p.pubkey.length + ':' + p.pubkey.toString('hex').slice(0, 2), asn1Curve: p.asn1Curve, nistCurve: p.nistCurve,
+    ext_key_usage: p.ext_key_usage, valid_from: p.valid_from, serialNumber: p.serialNumber, hasModulus: 'modulus' in p,
+  });
+  show('ec.detailed', 'issuerCertificate' in s.getPeerCertificate(true));
+  const x = s.getPeerX509Certificate();
+  show('ec.x509', { subject: x.subject, subjectAltName: x.subjectAltName, infoAccess: x.infoAccess, keyUsage: x.keyUsage, fingerprint512: x.fingerprint512.split(':').length, ca: x.ca });
+  show('ec.legacy', Object.keys(x.toLegacyObject()).join(',') === Object.keys(p).join(','));
+  await done();
+}
+{
+  const { s, done } = await connect('chain', chainCert, chainKey);
+  const p = s.getPeerCertificate();
+  show('chain.keys', Object.keys(p));
+  show('chain.leaf', [p.subject, p.issuer, p.ca, p.ext_key_usage, p.subjectaltname]);
+  const d = s.getPeerCertificate(true);
+  const i = d.issuerCertificate;
+  show('chain.issuer', { linked: i !== undefined && i !== d, subject: i.subject, ca: i.ca, serial: i.serialNumber, circular: i.issuerCertificate === i, keys: Object.keys(i).length });
+  show('chain.short', 'issuerCertificate' in p);
+  const x = s.getPeerX509Certificate();
+  show('chain.x509', [x.subject, x.issuer, String(x.infoAccess), x.keyUsage]);
+  await done();
+}
+clearTimeout(watchdog);
+"#
+    .replace("__EC_CERT__", TLS_TEST_EC_CERT)
+    .replace("__EC_KEY__", TLS_TEST_EC_KEY)
+    .replace("__LEAF_CERT__", TLS_TEST_CHAIN_LEAF_CERT)
+    .replace("__CA_CERT__", TLS_TEST_CHAIN_CA_CERT)
+    .replace("__LEAF_KEY__", TLS_TEST_CHAIN_LEAF_KEY);
+    let file = write_temp("tls_getters_ec_chain.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":false}"#,
+        "ec.detailed=false",
+        r#"ec.x509={"subject":"CN=localhost\nO=OAM Test","subjectAltName":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"fingerprint512":64,"ca":false}"#,
+        "ec.legacy=true",
+        r#"chain.keys=["subject","issuer","subjectaltname","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"chain.leaf=[{"CN":"localhost","O":["OAM Test","Second O"]},{"C":"US","O":"OAM Test","CN":"Test CA"},false,["1.3.6.1.5.5.7.3.1"],"DNS:localhost, IP Address:127.0.0.1"]"#,
+        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":15}"#,
+        "chain.short=false",
+        r#"chain.x509=["CN=localhost\nO=OAM Test\nO=Second O","C=US\nO=OAM Test\nCN=Test CA","undefined",["1.3.6.1.5.5.7.3.1"]]"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+// crypto.X509Certificate's fields that came with the legacy object (#138):
+// validFrom/validTo in OpenSSL's "Jun 15 12:30:07 2026 GMT" (they used to
+// carry "+00:00"), fingerprint512, infoAccess (newline-joined lines),
+// keyUsage as the EXTENDED key usage OIDs, subjectAltName undefined without
+// the extension, a full toLegacyObject(), and BN_bn2hex's serial with a
+// leading zero nibble kept ("0ABC"; the old parse trimmed it to "ABC").
+// Every value probed on v22.22.2.
+#[test]
+fn crypto_x509_certificate_legacy_fields() {
+    let src = r#"
+import crypto from 'node:crypto';
+const { X509Certificate } = crypto;
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+const rsa = new X509Certificate(`__RSA_CERT__`);
+const ec = new X509Certificate(`__EC_CERT__`);
+const low = new X509Certificate(`__LOW_CERT__`);
+show('rsa', { validFrom: rsa.validFrom, validTo: rsa.validTo, san: String(rsa.subjectAltName), infoAccess: String(rsa.infoAccess), keyUsage: String(rsa.keyUsage), fp512: rsa.fingerprint512.split(':').length, ca: rsa.ca });
+const legacy = rsa.toLegacyObject();
+show('rsa.legacy', {
+  keys: Object.keys(legacy), subject: legacy.subject, subjectProto: Object.getPrototypeOf(legacy.subject) === null,
+  bits: legacy.bits, exponent: legacy.exponent, modulus: legacy.modulus.length,
+  pubkey: Buffer.isBuffer(legacy.pubkey) && legacy.pubkey.length, raw: legacy.raw.equals(rsa.raw), fresh: rsa.toLegacyObject() !== legacy,
+});
+show('ec', { infoAccess: ec.infoAccess, keyUsage: ec.keyUsage, san: ec.subjectAltName, ca: ec.ca });
+show('ec.legacy', { keys: Object.keys(ec.toLegacyObject()), infoAccess: ec.toLegacyObject().infoAccess });
+show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
+"#
+    .replace("__RSA_CERT__", TLS_TEST_CERT)
+    .replace("__EC_CERT__", TLS_TEST_EC_CERT)
+    .replace("__LOW_CERT__", TLS_TEST_LOW_SERIAL_CERT);
+    let file = write_temp("crypto_x509_legacy.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"rsa={"validFrom":"Jun 15 12:30:07 2026 GMT","validTo":"Jun 15 12:30:07 2027 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
+        r#"rsa.legacy={"keys":["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
+        r#"ec={"infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"san":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","ca":false}"#,
+        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
+        r#"low=["0ABC","0ABC"]"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }

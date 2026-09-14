@@ -18,6 +18,107 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`socket.unref()` and `server.unref()` did not release the event loop**
+  (#140). They removed the handle from `process.getActiveResourcesInfo()` as
+  Node's do, but a connected, reading, unref'd `net.Socket` or `tls.TLSSocket`,
+  and an unref'd listening `net.Server` or `tls.Server`, still kept an oam
+  process alive where Node exits at once, so a client library that opens a
+  keep-alive connection and `unref()`s it (redis clients, loggers, telemetry
+  exporters) hung the process. The engine's stdin-only ref accounting is now
+  per-handle accounting: a parked read or accept on an unref'd handle stops
+  counting toward liveness, `ref()` re-pins it, an unref'd socket still
+  receives data while something else keeps the process alive, writes and
+  shutdowns keep pinning the loop as libuv's requests do, and `unref()` before
+  the handle exists is applied once it does, as Node defers it to
+  `'connect'`. Pinned by three conformance cases (a net and a tls client with
+  every socket unref'd, and an `unref()` then `ref()` kept alive by an
+  unref'd timer) and wall-clock e2e tests.
+- **`net.Socket` state before connect and after close.** `socket.address()`
+  is `{}` before connect and after close (it always returned an endpoint
+  object); `socket.pending` is `!handle || connecting`, true on a fresh socket
+  (it read `connecting` alone); and `net.connect(options)` honours
+  `allowHalfOpen` and `timeout`, so a half-open client ended by its peer reads
+  `writeOnly`, not `closed`. A server-side (accepted) socket also reports its
+  own local address, so `socket.address()`, `localAddress`, `localPort` and
+  `localFamily` are populated on a `'connection'` socket where they were `{}`
+  and `undefined`. Every value measured on Node.
+
+- **`getProtocol()`, `getCipher()` and `getPeerCertificate()` on a TLS socket
+  were rustls's Debug names and `{}`** (#138). `getProtocol()` returned
+  `TLSv1_3` and `getCipher().name` `TLS13_AES_256_GCM_SHA384`, so code that
+  switches on `getProtocol() === 'TLSv1.3'` or logs a cipher name diverged,
+  and `getPeerCertificate()` gave a connected socket nothing to inspect. Both
+  a `tls.connect()` socket and an accepted one now report OpenSSL's names
+  (`TLSv1.3`; `{ name: 'TLS_AES_256_GCM_SHA384', standardName, version }`,
+  with the OpenSSL name next to the IANA `standardName` for the TLS 1.2
+  suites); `getPeerCertificate([detailed])` returns Node's legacy object
+  (`subject` and `issuer` as null-prototype objects, `modulus`/`bits`/
+  `exponent`/`pubkey` or `bits`/`pubkey`/`asn1Curve`/`nistCurve`,
+  `valid_from`/`valid_to` in OpenSSL's spelling, the three fingerprints,
+  `subjectaltname`, `infoAccess`, `ext_key_usage`, `serialNumber`, `raw`, and
+  with `detailed` an `issuerCertificate` link through the chain, a self-issued
+  last certificate pointing at itself); `getPeerX509Certificate()` and
+  `getEphemeralKeyInfo()` (`{}` after TLS 1.3, `{ type, name, size }` after
+  TLS 1.2, `null` on a server-side or destroyed socket) are added, and every
+  getter is `{}` or `undefined` before the handshake and `null` once the
+  socket is destroyed, as measured on Node. `crypto.X509Certificate` gains
+  `fingerprint512`, `infoAccess` and a complete `toLegacyObject()`, and four
+  of its fields now carry Node's values where they did not: `validFrom`/
+  `validTo` print as OpenSSL does (`Jun 15 12:30:07 2026 GMT`), `serialNumber`
+  keeps a leading zero nibble, `keyUsage` is the extended-key-usage OID list
+  and `subjectAltName` is `undefined` without the extension, and `ca` follows
+  `X509_check_ca` (a KeyUsage without keyCertSign is not a CA). Not covered:
+  `minVersion`/`maxVersion` are still not honoured, so a TLS 1.2 handshake
+  cannot be pinned from JS; the names of its six suites are unit-tested.
+
+- **`oam check` lost oam's declarations on any tsconfig chain that uses
+  `${configDir}`**, and on any project with an `outDir` but no `rootDir`. The
+  template names the root config's directory, and through the generated
+  wrapper the root was the wrapper, so #135 fell back to a bare check
+  (TS2307 on `oam:` imports) whenever the template appeared. The wrapper now
+  restates every key whose effective value names the template (`files`,
+  `include`, `exclude`, `outDir`, `declarationDir`, `rootDir`, `rootDirs`,
+  `outFile`, `tsBuildInfoFile`, `baseUrl`, `generateTrace`, `typeRoots` and
+  `paths` values) with the project's directory substituted, exactly as
+  `tsgo -p tsconfig.json` resolves them, measured against tsgo including its
+  start-of-value and case quirks; `types`, `references` and the source-map
+  roots are not substituted by tsgo and stay inherited. Separately,
+  TypeScript 7 defaults `rootDir` to the config directory and checks it
+  eagerly whenever `outDir`, `declarationDir`, `sourceRoot` or `mapRoot` is
+  set, so such a project without an explicit `rootDir` failed the wrapper
+  run with TS6059 and was silently checked without oam's declarations; the
+  wrapper now restates that default too. `OAM_DEBUG=1` names the keys
+  restated.
+
+- **A refused TCP connect took about 2 s to fail on Windows** (#137). The
+  stack retransmits the SYN of a connect to a closed loopback port before it
+  reports `ECONNREFUSED`; libuv tells it not to (`SIO_TCP_INITIAL_RTO`, for
+  loopback targets only), so node reports the refusal in milliseconds while
+  every `net.connect` and `tls.connect` under oam waited about 2 s, and
+  `tls.connect(port)` paid it on every call: its default host, `localhost`,
+  resolves to `::1` first on Windows, and an IPv4-only listener refuses that
+  before the `127.0.0.1` attempt. oam's connect now does what libuv does, for
+  `net` and `tls` alike; the resolved-address loop and the error shape are
+  tokio's, byte for byte. `http` and `fetch` go through reqwest's own
+  connector, which cannot be told this, and keep the 2 s on Windows
+  (`docs/node-divergences.md` #35).
+- **`fetch` and `http.request` reported a refused connection as
+  `ECONNRESET`, or with no code at all.** reqwest's error text stops at
+  "error sending request" and the refusal sits deeper in its source chain,
+  so the http client guessed `socket hang up` / `ECONNRESET` from the text
+  and `fetch` rejected with that text as its message and no `cause`; retry
+  logic keyed on `err.code === 'ECONNREFUSED'` never fired, and a hostname
+  that did not resolve looked the same as a dead server. The native op now
+  walks to the connector's `io::Error` and reports node's shape: `fetch`
+  rejects with the bare `TypeError: fetch failed` and the transport error as
+  `cause`, `http.request` emits that error, and both carry `errno`, `code`
+  (`ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, ...), `syscall`
+  and the peer (`address` and `port` for `connect`, `hostname` for
+  `getaddrinfo`), with node's `connect ECONNREFUSED 127.0.0.1:8080` and
+  `getaddrinfo ENOTFOUND host` messages. Pinned by
+  `conformance/cases/102-fetch-http-refused-error-shape.mjs`, byte-identical
+  with node for an IPv4 and an IPv6 refusal and an unresolvable name.
+
 - **A TLS socket lacked the `net.Socket` API, and ioredis crashed over
   `rediss://`** (#132). In Node `tls.TLSSocket` extends `net.Socket`; oam's
   extended `stream.Duplex` and shared no base with its `net.Socket`, so a
