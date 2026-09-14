@@ -14486,6 +14486,135 @@ C7rRXUYQtUTmtwTetACx3EEz7k2ixAxxdDCUPJIxGcVIPVKt6sTovr3yGLMuc4f7\n\
 I5PYIZ3kyY8EsQqX4JpTtbY=\n\
 -----END PRIVATE KEY-----";
 
+// Fixtures for the handshake getters (#138), generated once with OpenSSL
+// 3.5.5 (MSYS_NO_PATHCONV=1 on Git Bash, or the -subj is rewritten):
+//   EC (P-256, self-signed, SAN with an IPv6 entry, two AIA entries, EKU):
+//     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes
+//       -keyout ec.key -out ec.crt -days 3650 -subj "/CN=localhost/O=OAM Test"
+//       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1,email:oam@example.test,URI:https://example.test/x"
+//       -addext "authorityInfoAccess=OCSP;URI:http://ocsp.example.test/,caIssuers;URI:http://ca.example.test/ca.crt"
+//       -addext "extendedKeyUsage=serverAuth,clientAuth" -addext "keyUsage=digitalSignature"
+//   Chain (RSA 2048 CA, leaf with a repeated O and a SAN, signed by it):
+//     openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 -subj "/C=US/O=OAM Test/CN=Test CA"
+//     openssl req -newkey rsa:2048 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=localhost/O=OAM Test/O=Second O"
+//     openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out leaf.crt -days 3650 -extfile leaf.ext
+//       (leaf.ext: subjectAltName=DNS:localhost,IP:127.0.0.1 / basicConstraints=CA:FALSE / extendedKeyUsage=serverAuth)
+//   Low serial (a serial whose top nibble is zero, so BN_bn2hex's "0ABC" is pinned):
+//     openssl req -x509 -newkey rsa:2048 -nodes -keyout lowserial.key -out lowserial.crt -days 3650 -subj "/CN=localhost" -set_serial 0x0abc
+const TLS_TEST_EC_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIICjjCCAjOgAwIBAgIUXOZdy5EZsIcB1u7YHib8IKSt0ogwCgYIKoZIzj0EAwIw
+JzESMBAGA1UEAwwJbG9jYWxob3N0MREwDwYDVQQKDAhPQU0gVGVzdDAeFw0yNjA5
+MTQxMTQwMDlaFw0zNjA5MTExMTQwMDlaMCcxEjAQBgNVBAMMCWxvY2FsaG9zdDER
+MA8GA1UECgwIT0FNIFRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARoQ+K9
+2C1/U+oMMu9YeGgKq26iSMeaRY2M3U90rk513s4bDPUnyte8lj6ox7aIynK9/sRd
+K+rvV5iup8hTjDBlo4IBOzCCATcwHQYDVR0OBBYEFIf6f7za8yL3hn9zuoMR8Sro
+UP/mMB8GA1UdIwQYMBaAFIf6f7za8yL3hn9zuoMR8SroUP/mMA8GA1UdEwEB/wQF
+MAMBAf8wVgYDVR0RBE8wTYIJbG9jYWxob3N0hwR/AAABhxAAAAAAAAAAAAAAAAAA
+AAABgRBvYW1AZXhhbXBsZS50ZXN0hhZodHRwczovL2V4YW1wbGUudGVzdC94MGAG
+CCsGAQUFBwEBBFQwUjAlBggrBgEFBQcwAYYZaHR0cDovL29jc3AuZXhhbXBsZS50
+ZXN0LzApBggrBgEFBQcwAoYdaHR0cDovL2NhLmV4YW1wbGUudGVzdC9jYS5jcnQw
+HQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMAsGA1UdDwQEAwIHgDAKBggq
+hkjOPQQDAgNJADBGAiEAw+qdvX6YFomEXdQPG1vSJBl47I7t7e8dMaNpoUNBGbUC
+IQDi8RdNKrN+O1c/Akki7MgLI3ajlpybzMlfwAsjLw27eg==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_EC_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPvDDIEVSJU6WHVBH
+iloZy2/iYDqJmE94rSeR0TnYzwChRANCAARoQ+K92C1/U+oMMu9YeGgKq26iSMea
+RY2M3U90rk513s4bDPUnyte8lj6ox7aIynK9/sRdK+rvV5iup8hTjDBl
+-----END PRIVATE KEY-----"#;
+
+const TLS_TEST_CHAIN_LEAF_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDeDCCAmCgAwIBAgIUWm9SUcIRPRhgJMKLa2koUHS2xtMwDQYJKoZIhvcNAQEL
+BQAwMjELMAkGA1UEBhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdU
+ZXN0IENBMB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowOjESMBAGA1UE
+AwwJbG9jYWxob3N0MREwDwYDVQQKDAhPQU0gVGVzdDERMA8GA1UECgwIU2Vjb25k
+IE8wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCvZmi12M3z1+rgg0WX
+e6KTvMacHnqCDB86vMWsLmpEis7vlG1FCzbJglmLqEm2ezh2CrD6qX5ebrHHeBzD
+9N6hTl7HiC+a6iQQIC/MmPZwULkCfeH0buEwofYKs4TsY5L6BdPO9R1DMy7bj50D
+puDH2XrwlixmxBaF6lbG4Q3ru37cl9bOZ6fM38xyIdRsHOfBGEpYhA04IwwCHgiy
+iycbNw11stjh/pLxufIs6IC9gJtMtUs054Lwbl5FFckVmgZb/9C/yCyqGnf122Lj
+jalZpHG8KfTCnx8FA1pLsgw2BUfE+stFwYzIRUKEuM7knF1WTi2tkutm5NNw0DWP
+N6R9AgMBAAGjfjB8MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRME
+AjAAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBR/ecaB7hyGk0XWC4M9
+KcI7NGCIXjAfBgNVHSMEGDAWgBT5bt4TsEwfzDeUQU2IIqf07dYoKDANBgkqhkiG
+9w0BAQsFAAOCAQEADZG+rI1Y4/OMKmhy3mEBaCKs5EdIv8QW9OInE1VIL0kr1LF4
+dkMGJemaj5dxzagXz4Y5e4qK/Qt9vu2YeEM8deND5cSUCWeYD9ksfsC6Yo2wM1+X
+NmeTFXt+tZ6tAjrAcfy1efWdRkHXRmRxhA068Bg9+WQqRoyFAv1usiS2ji/dGhsT
+ZcIjyDq7ppE+EIQ3Cyl7SoLqQEoWM4nXo/gl1swXL1jEeJBHOGyugGEyUT6A3Xp+
+T+9f+hQU9pUGSnA0FxKez9p2qloULtNcuQI8FTBlLkqIjLlFVhIgYc9GrybgEcZz
+sWzAKNllrZyIqRKhxZPdy9SJT2RPDN299G6wdw==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_CHAIN_CA_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDRTCCAi2gAwIBAgIUZWBXiNnxahPBrN+4Oc8+hnskUDkwDQYJKoZIhvcNAQEL
+BQAwMjELMAkGA1UEBhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdU
+ZXN0IENBMB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowMjELMAkGA1UE
+BhMCVVMxETAPBgNVBAoMCE9BTSBUZXN0MRAwDgYDVQQDDAdUZXN0IENBMIIBIjAN
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw1Sc6jaJpCV1SzxQ5EGC9z/AZdUS
+Og6XI8qTbkcUTxoMYqlLtJ3VAo9o5miiei0w9y4pGPu3tRqg42K9e2gJokkZ4yLC
+xExxBmBSZ4KSsGpAKQExsAkup3XN2MqELLOgVhqAJWXuvtnbQhVUtkPkR9aMBD6Y
+62Y2ik04v3Ufd1mGXJSntSXkfCDi705fjOItlY8REw35N+HxptBvbIomdBwLAYOx
+oPKfdfIVmuxm594SRJ0Dfj6biJumX69PEjUpPuDdVYK4FvFcNf6zIt04hMnfHDm4
+rjQZq2TeczNFMIBXAPLjS+l3lqaj6FG0FsbIdHKp6hY1r9Y/qxjH5kTogwIDAQAB
+o1MwUTAdBgNVHQ4EFgQU+W7eE7BMH8w3lEFNiCKn9O3WKCgwHwYDVR0jBBgwFoAU
++W7eE7BMH8w3lEFNiCKn9O3WKCgwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B
+AQsFAAOCAQEAUyUboZTClFMkAWbH42DHOijK8GJPxg/8wjal7O2McQQ+y5HVQzva
+JUzxnK3FOfmkokbh4xBvqR2HCD5qBEG1bb8owu5cd9+m8FIs0IsaNjhXmWLjmP1x
+KYe9tEmzN3H3IIbwJYECLv+3qNOfEA+VFB2L/+e96KRgowMhvDtB4inY3opnba9d
+KPRrnVp1aJc0i6KJizs+Ba+XkZA5qL8qZpMoE1ExGv0yvaXgiY2Y5sI6tMhHJNzU
+7dWBcLpBQESYuhXsX4dWcZR2TqNKI2Sc72XfurodDx6wLqt66cOtCtSKBpGsn0/D
+l+tacbAs/ZF/7Hwrhdt/N6xypEi/dDQJAw==
+-----END CERTIFICATE-----"#;
+
+const TLS_TEST_CHAIN_LEAF_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCvZmi12M3z1+rg
+g0WXe6KTvMacHnqCDB86vMWsLmpEis7vlG1FCzbJglmLqEm2ezh2CrD6qX5ebrHH
+eBzD9N6hTl7HiC+a6iQQIC/MmPZwULkCfeH0buEwofYKs4TsY5L6BdPO9R1DMy7b
+j50DpuDH2XrwlixmxBaF6lbG4Q3ru37cl9bOZ6fM38xyIdRsHOfBGEpYhA04IwwC
+HgiyiycbNw11stjh/pLxufIs6IC9gJtMtUs054Lwbl5FFckVmgZb/9C/yCyqGnf1
+22LjjalZpHG8KfTCnx8FA1pLsgw2BUfE+stFwYzIRUKEuM7knF1WTi2tkutm5NNw
+0DWPN6R9AgMBAAECggEAGKJs/XFUR7WhHuRA/2wVYuOGD4I2WZKDRlgh+TNRqIvI
+UZzKlgJjsPyWQAekRrVasjWBMstgXLn2TRohDCKVrBkaNbL6YKsW4o7qt7UaE586
+xM9ST2bNSOvOZyVce2jmySfNXklN0VTcdWjfuBYVhuwUGLs2xD4xHaDSjD8qmdtx
+MO95lxlhpvHWtbsI6EVcmDPHasjuXAXAN2AT5jK90ff9jkMhIAr5V9htZdDd9skI
+OA/6DoLKAqA7bmAb8iJ79iRESbjBNpM6SPO3ScO7wRA5aAB5xJKiPfYZy6GiE3MK
+yCAQUuEb8mEJpudKqMNkIm2EwjiVnbt0Z019i8dgIQKBgQDsAq6jNbqKoUl1DTeu
+IN/4ayAfNMOtpDhFPtM+542QNZgIW+NyKnC2eozWVHQtQ0kXeEtpglnf+IZKDfb5
+C59R88uq2P4OEvgpjA/M5fBrvAd3+Rz0HdbHf1Sjs51+IyS/lU73MD8iBmK1jWe7
+EBOGpHcjCxTklrlzjaCO2RpzDQKBgQC+QYkfY3jDjKOhps88t1ZxVF+rWnoLpBnU
+GG6PtnmXRD6X5uh9wT55P+Chr7OltvWc+Dd7attixABw7NwjHzrhHLNLdm0IbbV+
+bTA3/CrY8Kz/GHro8jOM3Sg4BuMgXXeE/z10vpHJyv51qS3Z6MC3fn5wj5H8kcGZ
+k8jRmspbMQKBgQDZq2+eH8O4cCDr0BD2jGOFHmg139hJohgz5Um3zqAFzSg3LWiM
+tw/VfRm/44xy4ofbGZuT6CE0LGbOjiqmb021rAC/xfoqyNwQlZlNBRXEh1rsD9ng
+XFTnEkzh3pr25zrRZ8e4u8q+et03TP/Ky3z2xWEL9QCEA29vX8Qhe6KlUQKBgQCO
+gEmzb+7hEPLyvh1UzcF6SwcJMlBdbcFGwjH1hGhYK25ymiojHt2rNXQLxq1Y/svC
+kYwE7cl6lXH7Iv3TdK3GNJf6eq459OpO0nueQ0rYiJQa0XwmBFsmM/PO2yG9eSRv
+QjoGukI6Ecg72saUA6htB9qudmqS8Z0/aZitnjHY0QKBgQCJyCFv6XwC/jULjfdl
+IQoQxWfXsICLQ+jEoCbdg6FITRXcRlp22U/ucmf66fToDNefCpkOUG3M42WhBe86
+K0P/Guh98jAuquxrSBL2RryVotaRGXG06uk7QylEDJUSgDbNkgzNjm20JFy3stmM
+l2eb728Ku35DtszRy9AJ/GxD+A==
+-----END PRIVATE KEY-----"#;
+
+const TLS_TEST_LOW_SERIAL_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIC9zCCAd+gAwIBAgICCrwwDQYJKoZIhvcNAQELBQAwFDESMBAGA1UEAwwJbG9j
+YWxob3N0MB4XDTI2MDkxNDExMTIxNFoXDTM2MDkxMTExMTIxNFowFDESMBAGA1UE
+AwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvu/j
+pbQ5kU8rwvs8vsUbILMlxmI3eEHbwXannFb7ijtel0BRLOYTdYB4fLBdsQwlP4/7
+LPw/3o2864hWE3IuiBw0wTP0exXEDwdvRWyVDwb1NIBJrxkWrCp3BMFg1q8aMCTM
+sojAwF+g8UF4LYcuFK2OJgYT1GtCWZ6VXFgCC4T66dIO2UcO7MVszaeCQxJerl1l
+WIupc9jnNjRqSeIMZ7Df2CMNioTxXevytELIHuPew6z6uZqv8bDxbkbXBy6iAfK6
+Q8uZ3appwrK982jtUhnycrV4tY/lpZnQunxOkgNQy2zzaQOqmhSqzdlzYMe1Bbjn
+X7rsaoKh/ufUNsr1FQIDAQABo1MwUTAdBgNVHQ4EFgQUJX1gtCO0bakG4he2XxVh
+gDiD5ZIwHwYDVR0jBBgwFoAUJX1gtCO0bakG4he2XxVhgDiD5ZIwDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAuxe0ZA035glmQ8mEEvQITy6TUre6
+gRmqzfA+8BC5ObFJwtVuRb/rH+nGfk6iH51Hzwp5+HxfO4UZZQUIBIscDOULR1+y
+PbnlefYZkUf4jj1dbwhlJEC6+TEw7+ElIdLwVyYka4/oXTRE/jbIjpbSx8S3o3de
+ggS/YSxC+JRTs5aE9JQGp4AGcOKt4UBv+g0ZT9/Z0gfM262IDqaxNTqSGizvqelf
+aeFBtZdNvnXHVPNgIywtWS811oMLwHmGVxOVvSmUk/ffh4Z7pvJPCoycp69fRV9q
+AA9axd3ErHhDfmyy9li24ebetMzFtzQvn8WbK7RYw5e07Mg1+3SEfvTZFQ==
+-----END CERTIFICATE-----"#;
+
 #[test]
 fn https_create_server_serves_tls() {
     let src = format!(
@@ -21071,4 +21200,271 @@ console.log('TRANSCRIPT_GREW=' + String(seen[0].count === 1 && seen.find((s) => 
         stdout.contains("TRANSCRIPT_GREW=true"),
         "the tool_result was not fed back. {ctx}"
     );
+}
+
+// ─── #138: handshake getters and the peer certificate ───────────────
+
+// getProtocol / getCipher / getEphemeralKeyInfo / getPeerCertificate /
+// getPeerX509Certificate report OpenSSL's names and Node's legacy
+// certificate object -- before the handshake, after it on both the client
+// and the accepted socket, and after 'close'. Every value was probed on
+// v22.22.2; conformance/cases/103-tls-cipher-and-peer-cert.mjs pins the full
+// objects against a live node, this pins the shapes with no node on PATH.
+// They used to be rustls's Debug names ("TLSv1_3", "TLS13_AES_256_GCM_SHA384")
+// and getPeerCertificate() was {} on a connected socket.
+#[test]
+fn tls_handshake_getters_report_node_names_and_peer_certificate() {
+    let src = r#"
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let section = 'start';
+const watchdog = setTimeout(() => { console.log('WATCHDOG ' + section); process.exit(9); }, 20000);
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+const getters = (s) => ({
+  protocol: s.getProtocol(), cipher: String(s.getCipher()), ephemeral: s.getEphemeralKeyInfo(),
+  peer: s.getPeerCertificate(), detailed: s.getPeerCertificate(true), x509: String(s.getPeerX509Certificate()),
+});
+
+let accepted;
+const serverSide = new Promise((r) => { accepted = r; });
+const server = tls.createServer({ cert, key }, (s) => { s.on('data', (d) => s.write(d)); accepted(s); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const s = tls.connect({ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost' });
+section = 'before';
+show('before', getters(s));
+await once(s, 'secureConnect');
+section = 'after';
+show('protocol', s.getProtocol());
+show('cipher', s.getCipher());
+show('ephemeral', s.getEphemeralKeyInfo());
+const p = s.getPeerCertificate();
+show('keys', Object.keys(p));
+show('scalars', {
+  subject: p.subject, issuer: p.issuer, ca: p.ca, bits: p.bits, exponent: p.exponent,
+  modulus: p.modulus.slice(0, 12) + '/' + p.modulus.length,
+  pubkey: p.pubkey.length + ':' + p.pubkey.toString('hex').slice(0, 8),
+  valid_from: p.valid_from, valid_to: p.valid_to, fingerprint: p.fingerprint, fingerprint256: p.fingerprint256,
+  fingerprint512: p.fingerprint512.length, serialNumber: p.serialNumber, raw: p.raw.length,
+});
+show('shape', [Object.getPrototypeOf(p) === Object.prototype, Object.getPrototypeOf(p.subject) === null, Buffer.isBuffer(p.raw), 'issuerCertificate' in p, s.getPeerCertificate() !== p]);
+const d = s.getPeerCertificate(true);
+show('detailed', [Object.keys(d).length - Object.keys(p).length, d.issuerCertificate === d]);
+const x = s.getPeerX509Certificate();
+show('x509', {
+  ctor: x.constructor.name, subject: x.subject, serialNumber: x.serialNumber, validFrom: x.validFrom,
+  sameFingerprint: x.fingerprint512 === p.fingerprint512, sameRaw: x.raw.equals(p.raw),
+  fresh: s.getPeerX509Certificate() !== x, san: String(x.subjectAltName), keyUsage: String(x.keyUsage),
+});
+section = 'server';
+const ss = await within(5000, 'secureConnection', serverSide);
+show('server', getters(ss));
+section = 'close';
+s.end();
+await once(s, 'close');
+show('closed', getters(s));
+ss.destroy();
+server.close();
+clearTimeout(watchdog);
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let file = write_temp("tls_getters_rsa.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        // Before the handshake: the handle answers -- the configured maximum
+        // for the protocol, undefined for the cipher, {} for the rest.
+        r#"before={"protocol":"TLSv1.3","cipher":"undefined","ephemeral":{},"peer":{},"detailed":{},"x509":"undefined"}"#,
+        r#"protocol="TLSv1.3""#,
+        r#"cipher={"name":"TLS_AES_256_GCM_SHA384","standardName":"TLS_AES_256_GCM_SHA384","version":"TLSv1.3"}"#,
+        // {} after a TLS 1.3 handshake: OpenSSL keeps no peer temporary key.
+        "ephemeral={}",
+        r#"keys=["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"]"#,
+        r#"scalars={"subject":{"CN":"localhost"},"issuer":{"CN":"localhost"},"ca":true,"bits":2048,"exponent":"0x10001","modulus":"A10E5AFDF878/512","pubkey":"294:30820122","valid_from":"Jun 15 12:30:07 2026 GMT","valid_to":"Jun 15 12:30:07 2027 GMT","fingerprint":"F3:9E:27:5B:08:05:32:D6:FA:BD:2E:DD:B6:41:6B:69:01:B6:DF:11","fingerprint256":"02:92:43:F0:41:85:E0:BE:02:14:8A:4B:51:9B:6C:D4:64:16:34:4A:6F:8C:64:5D:8A:8F:AF:AD:6E:FE:F0:31","fingerprint512":191,"serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","raw":781}"#,
+        // A plain object with null-prototype names, a fresh one per call, no
+        // issuerCertificate unless detailed.
+        "shape=[true,true,true,false,true]",
+        // detailed: one more key, and a self-signed certificate points at itself.
+        "detailed=[1,true]",
+        r#"x509={"ctor":"X509Certificate","subject":"CN=localhost","serialNumber":"26C71188C6C4CF1578E4AB40C43F8B972E1D26B4","validFrom":"Jun 15 12:30:07 2026 GMT","sameFingerprint":true,"sameRaw":true,"fresh":true,"san":"undefined","keyUsage":"undefined"}"#,
+        // The accepted socket: no key info (null), no peer certificate ({}).
+        r#"server={"protocol":"TLSv1.3","cipher":"[object Object]","ephemeral":null,"peer":{},"detailed":{},"x509":"undefined"}"#,
+        // The handle is gone: null everywhere, undefined for the X509Certificate.
+        r#"closed={"protocol":null,"cipher":"null","ephemeral":null,"peer":null,"detailed":null,"x509":"undefined"}"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+// The legacy object's key-type and extension fields: an EC certificate
+// carries bits/pubkey (the raw point)/asn1Curve/nistCurve in place of the RSA
+// modulus/exponent, plus subjectaltname (with an IPv6 entry spelled as Node
+// spells it), a null-prototype infoAccess of arrays, ext_key_usage, and --
+// its KeyUsage lacking keyCertSign -- `ca: false` and no self link from
+// getPeerCertificate(true), as X509_check_ca / X509_check_issued decide. A
+// CA-signed leaf served with its CA links leaf -> CA -> itself, with the
+// leaf's repeated O as an array. Both probed on v22.22.2.
+#[test]
+fn tls_peer_certificate_ec_and_chain_legacy_shapes() {
+    let src = r#"
+import tls from 'node:tls';
+const ecCert = `__EC_CERT__`;
+const ecKey = `__EC_KEY__`;
+const chainCert = `__LEAF_CERT__` + '\n' + `__CA_CERT__`;
+const chainKey = `__LEAF_KEY__`;
+let section = 'start';
+const watchdog = setTimeout(() => { console.log('WATCHDOG ' + section); process.exit(9); }, 20000);
+const within = (ms, label, p) => {
+  let t;
+  return Promise.race([
+    p,
+    new Promise((r) => { t = setTimeout(r, ms); }).then(() => { console.log(label + '=NEVER'); process.exit(3); }),
+  ]).finally(() => clearTimeout(t));
+};
+const once = (em, ev, ms = 5000) => within(ms, ev, new Promise((r) => em.once(ev, r)));
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+
+async function connect(name, cert, key) {
+  section = name;
+  let accepted;
+  const serverSide = new Promise((r) => { accepted = r; });
+  const server = tls.createServer({ cert, key }, (s) => { s.on('data', (d) => s.write(d)); accepted(s); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const s = tls.connect({ host: '127.0.0.1', port: server.address().port, rejectUnauthorized: false, servername: 'localhost' });
+  await once(s, 'secureConnect');
+  const ss = await within(5000, 'secureConnection', serverSide);
+  return { s, done: async () => { s.end(); await once(s, 'close'); ss.destroy(); server.close(); } };
+}
+
+{
+  const { s, done } = await connect('ec', ecCert, ecKey);
+  const p = s.getPeerCertificate();
+  show('ec.keys', Object.keys(p));
+  show('ec.fields', {
+    subject: p.subject, subjectaltname: p.subjectaltname, infoAccess: p.infoAccess,
+    infoAccessProto: Object.getPrototypeOf(p.infoAccess) === null, ca: p.ca, bits: p.bits,
+    pubkey: p.pubkey.length + ':' + p.pubkey.toString('hex').slice(0, 2), asn1Curve: p.asn1Curve, nistCurve: p.nistCurve,
+    ext_key_usage: p.ext_key_usage, valid_from: p.valid_from, serialNumber: p.serialNumber, hasModulus: 'modulus' in p,
+  });
+  show('ec.detailed', 'issuerCertificate' in s.getPeerCertificate(true));
+  const x = s.getPeerX509Certificate();
+  show('ec.x509', { subject: x.subject, subjectAltName: x.subjectAltName, infoAccess: x.infoAccess, keyUsage: x.keyUsage, fingerprint512: x.fingerprint512.split(':').length, ca: x.ca });
+  show('ec.legacy', Object.keys(x.toLegacyObject()).join(',') === Object.keys(p).join(','));
+  await done();
+}
+{
+  const { s, done } = await connect('chain', chainCert, chainKey);
+  const p = s.getPeerCertificate();
+  show('chain.keys', Object.keys(p));
+  show('chain.leaf', [p.subject, p.issuer, p.ca, p.ext_key_usage, p.subjectaltname]);
+  const d = s.getPeerCertificate(true);
+  const i = d.issuerCertificate;
+  show('chain.issuer', { linked: i !== undefined && i !== d, subject: i.subject, ca: i.ca, serial: i.serialNumber, circular: i.issuerCertificate === i, keys: Object.keys(i).length });
+  show('chain.short', 'issuerCertificate' in p);
+  const x = s.getPeerX509Certificate();
+  show('chain.x509', [x.subject, x.issuer, String(x.infoAccess), x.keyUsage]);
+  await done();
+}
+clearTimeout(watchdog);
+"#
+    .replace("__EC_CERT__", TLS_TEST_EC_CERT)
+    .replace("__EC_KEY__", TLS_TEST_EC_KEY)
+    .replace("__LEAF_CERT__", TLS_TEST_CHAIN_LEAF_CERT)
+    .replace("__CA_CERT__", TLS_TEST_CHAIN_CA_CERT)
+    .replace("__LEAF_KEY__", TLS_TEST_CHAIN_LEAF_KEY);
+    let file = write_temp("tls_getters_ec_chain.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"ec.keys=["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"ec.fields={"subject":{"CN":"localhost","O":"OAM Test"},"subjectaltname":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]},"infoAccessProto":true,"ca":false,"bits":256,"pubkey":"65:04","asn1Curve":"prime256v1","nistCurve":"P-256","ext_key_usage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"valid_from":"Sep 14 11:40:09 2026 GMT","serialNumber":"5CE65DCB9119B08701D6EED81E26FC20A4ADD288","hasModulus":false}"#,
+        "ec.detailed=false",
+        r#"ec.x509={"subject":"CN=localhost\nO=OAM Test","subjectAltName":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"fingerprint512":64,"ca":false}"#,
+        "ec.legacy=true",
+        r#"chain.keys=["subject","issuer","subjectaltname","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"]"#,
+        r#"chain.leaf=[{"CN":"localhost","O":["OAM Test","Second O"]},{"C":"US","O":"OAM Test","CN":"Test CA"},false,["1.3.6.1.5.5.7.3.1"],"DNS:localhost, IP Address:127.0.0.1"]"#,
+        r#"chain.issuer={"linked":true,"subject":{"C":"US","O":"OAM Test","CN":"Test CA"},"ca":true,"serial":"65605788D9F16A13C1ACDFB839CF3E867B245039","circular":true,"keys":15}"#,
+        "chain.short=false",
+        r#"chain.x509=["CN=localhost\nO=OAM Test\nO=Second O","C=US\nO=OAM Test\nCN=Test CA","undefined",["1.3.6.1.5.5.7.3.1"]]"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
+}
+
+// crypto.X509Certificate's fields that came with the legacy object (#138):
+// validFrom/validTo in OpenSSL's "Jun 15 12:30:07 2026 GMT" (they used to
+// carry "+00:00"), fingerprint512, infoAccess (newline-joined lines),
+// keyUsage as the EXTENDED key usage OIDs, subjectAltName undefined without
+// the extension, a full toLegacyObject(), and BN_bn2hex's serial with a
+// leading zero nibble kept ("0ABC"; the old parse trimmed it to "ABC").
+// Every value probed on v22.22.2.
+#[test]
+fn crypto_x509_certificate_legacy_fields() {
+    let src = r#"
+import crypto from 'node:crypto';
+const { X509Certificate } = crypto;
+const show = (label, v) => console.log(label + '=' + JSON.stringify(v));
+const rsa = new X509Certificate(`__RSA_CERT__`);
+const ec = new X509Certificate(`__EC_CERT__`);
+const low = new X509Certificate(`__LOW_CERT__`);
+show('rsa', { validFrom: rsa.validFrom, validTo: rsa.validTo, san: String(rsa.subjectAltName), infoAccess: String(rsa.infoAccess), keyUsage: String(rsa.keyUsage), fp512: rsa.fingerprint512.split(':').length, ca: rsa.ca });
+const legacy = rsa.toLegacyObject();
+show('rsa.legacy', {
+  keys: Object.keys(legacy), subject: legacy.subject, subjectProto: Object.getPrototypeOf(legacy.subject) === null,
+  bits: legacy.bits, exponent: legacy.exponent, modulus: legacy.modulus.length,
+  pubkey: Buffer.isBuffer(legacy.pubkey) && legacy.pubkey.length, raw: legacy.raw.equals(rsa.raw), fresh: rsa.toLegacyObject() !== legacy,
+});
+show('ec', { infoAccess: ec.infoAccess, keyUsage: ec.keyUsage, san: ec.subjectAltName, ca: ec.ca });
+show('ec.legacy', { keys: Object.keys(ec.toLegacyObject()), infoAccess: ec.toLegacyObject().infoAccess });
+show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
+"#
+    .replace("__RSA_CERT__", TLS_TEST_CERT)
+    .replace("__EC_CERT__", TLS_TEST_EC_CERT)
+    .replace("__LOW_CERT__", TLS_TEST_LOW_SERIAL_CERT);
+    let file = write_temp("crypto_x509_legacy.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for expected in [
+        r#"rsa={"validFrom":"Jun 15 12:30:07 2026 GMT","validTo":"Jun 15 12:30:07 2027 GMT","san":"undefined","infoAccess":"undefined","keyUsage":"undefined","fp512":64,"ca":true}"#,
+        r#"rsa.legacy={"keys":["subject","issuer","ca","modulus","bits","exponent","pubkey","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","serialNumber","raw"],"subject":{"CN":"localhost"},"subjectProto":true,"bits":2048,"exponent":"0x10001","modulus":512,"pubkey":294,"raw":true,"fresh":true}"#,
+        r#"ec={"infoAccess":"OCSP - URI:http://ocsp.example.test/\nCA Issuers - URI:http://ca.example.test/ca.crt","keyUsage":["1.3.6.1.5.5.7.3.1","1.3.6.1.5.5.7.3.2"],"san":"DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1, email:oam@example.test, URI:https://example.test/x","ca":false}"#,
+        r#"ec.legacy={"keys":["subject","issuer","subjectaltname","infoAccess","ca","bits","pubkey","asn1Curve","nistCurve","valid_from","valid_to","fingerprint","fingerprint256","fingerprint512","ext_key_usage","serialNumber","raw"],"infoAccess":{"OCSP - URI":["http://ocsp.example.test/"],"CA Issuers - URI":["http://ca.example.test/ca.crt"]}}"#,
+        r#"low=["0ABC","0ABC"]"#,
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected}\nstdout: {stdout}"
+        );
+    }
 }
