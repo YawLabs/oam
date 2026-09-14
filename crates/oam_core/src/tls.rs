@@ -120,9 +120,112 @@ fn build_client_config(
     }
 }
 
+// ------------------------------------------------------------ Node's names
+// What rustls negotiated, spelled the way Node spells it (#138). Node reports
+// OpenSSL's names -- "TLSv1.3" for the protocol, getCipher()'s OpenSSL `name`
+// next to the IANA `standardName`, getEphemeralKeyInfo()'s { type, name,
+// size } for the key-exchange group -- and code switches on them
+// (`getProtocol() === 'TLSv1.3'`, cipher-name logs). rustls's Debug
+// spellings ("TLSv1_3", "TLS13_AES_256_GCM_SHA384") never leave this module.
+
+/// OpenSSL's name for a protocol version: what `socket.getProtocol()` and
+/// `getCipher().version` report.
+pub fn protocol_name(version: rustls::ProtocolVersion) -> String {
+    use rustls::ProtocolVersion as V;
+    match version {
+        V::TLSv1_3 => "TLSv1.3".to_string(),
+        V::TLSv1_2 => "TLSv1.2".to_string(),
+        V::TLSv1_1 => "TLSv1.1".to_string(),
+        V::TLSv1_0 => "TLSv1".to_string(),
+        V::SSLv3 => "SSLv3".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// (`name`, `standardName`) of a cipher suite as `socket.getCipher()` reports
+/// them: OpenSSL's name and the IANA name. The table is every suite the ring
+/// provider (with tls12) can negotiate; a TLS 1.3 suite has one name in both
+/// columns, as in Node. Anything else -- unreachable today -- keeps rustls's
+/// spelling rather than a guessed OpenSSL one.
+pub fn cipher_names(suite: rustls::CipherSuite) -> (String, String) {
+    use rustls::CipherSuite as S;
+    let (name, standard) = match suite {
+        S::TLS13_AES_128_GCM_SHA256 => ("TLS_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"),
+        S::TLS13_AES_256_GCM_SHA384 => ("TLS_AES_256_GCM_SHA384", "TLS_AES_256_GCM_SHA384"),
+        S::TLS13_CHACHA20_POLY1305_SHA256 => (
+            "TLS_CHACHA20_POLY1305_SHA256",
+            "TLS_CHACHA20_POLY1305_SHA256",
+        ),
+        S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => (
+            "ECDHE-ECDSA-AES128-GCM-SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        ),
+        S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => (
+            "ECDHE-ECDSA-AES256-GCM-SHA384",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        ),
+        S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => (
+            "ECDHE-ECDSA-CHACHA20-POLY1305",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        ),
+        S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => (
+            "ECDHE-RSA-AES128-GCM-SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        ),
+        S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => (
+            "ECDHE-RSA-AES256-GCM-SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        ),
+        S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => (
+            "ECDHE-RSA-CHACHA20-POLY1305",
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        ),
+        other => {
+            let name = format!("{other:?}");
+            return (name.clone(), name);
+        }
+    };
+    (name.to_string(), standard.to_string())
+}
+
+/// `socket.getEphemeralKeyInfo()`'s { type, name, size } for a key-exchange
+/// group, with OpenSSL's curve names and bit sizes (X25519 is 253 bits).
+pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value> {
+    use rustls::NamedGroup as G;
+    let (name, size) = match group {
+        G::X25519 => ("X25519", 253),
+        G::secp256r1 => ("prime256v1", 256),
+        G::secp384r1 => ("secp384r1", 384),
+        G::secp521r1 => ("secp521r1", 521),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "type": "ECDH", "name": name, "size": size }))
+}
+
+/// The peer's certificate chain as base64 DER, leaf first -- what the JS side
+/// builds `getPeerCertificate()` and `getPeerX509Certificate()` from. None
+/// when the peer sent no certificate (a server whose client sent none).
+fn peer_certificates_b64(
+    chain: Option<&[rustls::pki_types::CertificateDer<'static>]>,
+) -> Option<Vec<String>> {
+    use base64::Engine;
+    let chain = chain?;
+    if chain.is_empty() {
+        return None;
+    }
+    Some(
+        chain
+            .iter()
+            .map(|c| base64::engine::general_purpose::STANDARD.encode(c.as_ref()))
+            .collect(),
+    )
+}
+
 /// tls.connect: TCP connect + TLS handshake.
-/// Returns Json {handle, protocol, cipher, authorized, alpnProtocol,
-/// localAddr?, remoteAddr?} -- the address pair in the same shape as
+/// Returns Json {handle, protocol, cipher, cipherStandardName, authorized,
+/// alpnProtocol, ephemeralKeyInfo?, peerCertificates?, localAddr?,
+/// remoteAddr?} -- the names in Node's spelling (see above), the peer chain
+/// as base64 DER leaf first, and the address pair in the same shape as
 /// tcp_connect's, so a TLSSocket can report `address()`, `localPort` and the
 /// resolved `remoteAddress` the way a net.Socket does.
 #[allow(clippy::too_many_arguments)]
@@ -177,12 +280,16 @@ pub async fn tls_connect(
     let (_, client_conn) = tls_stream.get_ref();
     let protocol = client_conn
         .protocol_version()
-        .map(|v| format!("{v:?}"))
+        .map(protocol_name)
         .unwrap_or_default();
-    let cipher = client_conn
+    let (cipher, cipher_standard_name) = client_conn
         .negotiated_cipher_suite()
-        .map(|c| format!("{:?}", c.suite()))
+        .map(|c| cipher_names(c.suite()))
         .unwrap_or_default();
+    let ephemeral_key_info = client_conn
+        .negotiated_key_exchange_group()
+        .and_then(|g| ephemeral_key_info(g.name()));
+    let peer_certificates = peer_certificates_b64(client_conn.peer_certificates());
     let alpn = client_conn
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned())
@@ -204,9 +311,16 @@ pub async fn tls_connect(
         "handle": handle,
         "protocol": protocol,
         "cipher": cipher,
+        "cipherStandardName": cipher_standard_name,
         "authorized": reject_unauthorized,
         "alpnProtocol": alpn,
     });
+    if let Some(info) = ephemeral_key_info {
+        payload["ephemeralKeyInfo"] = info;
+    }
+    if let Some(chain) = peer_certificates {
+        payload["peerCertificates"] = serde_json::Value::from(chain);
+    }
     if let Some(la) = local_addr {
         payload["localAddr"] = crate::tcp::addr_to_json(la);
     }
@@ -376,12 +490,16 @@ pub async fn tls_accept_wrap(
     let (_, server_conn) = tls_stream.get_ref();
     let protocol = server_conn
         .protocol_version()
-        .map(|v| format!("{v:?}"))
+        .map(protocol_name)
         .unwrap_or_default();
-    let cipher = server_conn
+    let (cipher, cipher_standard_name) = server_conn
         .negotiated_cipher_suite()
-        .map(|c| format!("{:?}", c.suite()))
+        .map(|c| cipher_names(c.suite()))
         .unwrap_or_default();
+    // The client's chain, if it sent one (this server requests none, so it
+    // is absent today); no ephemeralKeyInfo -- Node reports null on a
+    // server-side socket.
+    let peer_certificates = peer_certificates_b64(server_conn.peer_certificates());
     let alpn = server_conn
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned())
@@ -403,8 +521,12 @@ pub async fn tls_accept_wrap(
         "handle": handle,
         "protocol": protocol,
         "cipher": cipher,
+        "cipherStandardName": cipher_standard_name,
         "alpnProtocol": alpn,
     });
+    if let Some(chain) = peer_certificates {
+        payload["peerCertificates"] = serde_json::Value::from(chain);
+    }
     if let Some(la) = local_addr {
         payload["localAddr"] = crate::tcp::addr_to_json(la);
     }
@@ -470,5 +592,134 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod node_names {
+    use super::*;
+    use rustls::CipherSuite as S;
+    use rustls::NamedGroup as G;
+    use rustls::ProtocolVersion as V;
+
+    fn names(suite: S) -> (String, String) {
+        cipher_names(suite)
+    }
+
+    #[test]
+    fn protocol_names_are_openssls() {
+        assert_eq!(protocol_name(V::TLSv1_3), "TLSv1.3");
+        assert_eq!(protocol_name(V::TLSv1_2), "TLSv1.2");
+        assert_eq!(protocol_name(V::TLSv1_1), "TLSv1.1");
+        assert_eq!(protocol_name(V::TLSv1_0), "TLSv1");
+    }
+
+    // Node's getCipher() after a TLS 1.3 handshake (probed on v22.22.2):
+    // name and standardName are both the IANA spelling.
+    #[test]
+    fn tls13_suites_have_one_name() {
+        for (suite, expected) in [
+            (S::TLS13_AES_128_GCM_SHA256, "TLS_AES_128_GCM_SHA256"),
+            (S::TLS13_AES_256_GCM_SHA384, "TLS_AES_256_GCM_SHA384"),
+            (
+                S::TLS13_CHACHA20_POLY1305_SHA256,
+                "TLS_CHACHA20_POLY1305_SHA256",
+            ),
+        ] {
+            assert_eq!(names(suite), (expected.to_string(), expected.to_string()));
+        }
+    }
+
+    // A TLS 1.2 handshake (a Node server pinned with maxVersion) reports
+    // OpenSSL's name next to the IANA standardName -- probed:
+    // ECDHE-RSA-AES128-GCM-SHA256 / TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.
+    // oam's tls has no minVersion/maxVersion to pin 1.2 from JS, so the six
+    // 1.2 suites are covered here rather than end to end.
+    #[test]
+    fn tls12_suites_carry_openssl_and_iana_names() {
+        for (suite, name, standard) in [
+            (
+                S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                "ECDHE-RSA-AES128-GCM-SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            ),
+            (
+                S::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                "ECDHE-RSA-AES256-GCM-SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            ),
+            (
+                S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                "ECDHE-RSA-CHACHA20-POLY1305",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ),
+            (
+                S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                "ECDHE-ECDSA-AES128-GCM-SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            ),
+            (
+                S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                "ECDHE-ECDSA-AES256-GCM-SHA384",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            ),
+            (
+                S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                "ECDHE-ECDSA-CHACHA20-POLY1305",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            ),
+        ] {
+            assert_eq!(names(suite), (name.to_string(), standard.to_string()));
+        }
+    }
+
+    // Every suite the ring provider can negotiate is in the table: none falls
+    // through to rustls's own spelling.
+    #[test]
+    fn every_ring_suite_is_tabled() {
+        for suite in rustls::crypto::ring::ALL_CIPHER_SUITES {
+            let (name, standard) = names(suite.suite());
+            assert!(
+                !name.starts_with("TLS13_") && !name.contains("_WITH_"),
+                "{name}"
+            );
+            assert!(standard.starts_with("TLS_"), "{standard}");
+        }
+    }
+
+    #[test]
+    fn ephemeral_key_info_is_openssls() {
+        assert_eq!(
+            ephemeral_key_info(G::X25519),
+            Some(serde_json::json!({ "type": "ECDH", "name": "X25519", "size": 253 }))
+        );
+        assert_eq!(
+            ephemeral_key_info(G::secp256r1),
+            Some(serde_json::json!({ "type": "ECDH", "name": "prime256v1", "size": 256 }))
+        );
+        assert_eq!(
+            ephemeral_key_info(G::secp384r1),
+            Some(serde_json::json!({ "type": "ECDH", "name": "secp384r1", "size": 384 }))
+        );
+        // Every group the ring provider offers has a Node name.
+        for group in rustls::crypto::ring::ALL_KX_GROUPS {
+            assert!(
+                ephemeral_key_info(group.name()).is_some(),
+                "{:?}",
+                group.name()
+            );
+        }
+    }
+
+    #[test]
+    fn peer_chain_is_base64_der_leaf_first() {
+        let leaf = rustls::pki_types::CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x01]);
+        let ca = rustls::pki_types::CertificateDer::from(vec![0x30, 0x00]);
+        assert_eq!(peer_certificates_b64(None), None);
+        assert_eq!(peer_certificates_b64(Some(&[])), None);
+        assert_eq!(
+            peer_certificates_b64(Some(&[leaf, ca])),
+            Some(vec!["MAMCAQE=".to_string(), "MAA=".to_string()])
+        );
     }
 }

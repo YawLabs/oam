@@ -14785,6 +14785,85 @@
     };
   };
 
+  // Node's legacy certificate object (crypto_x509.cc X509ToObject, then
+  // tls's translatePeerCertificate): what socket.getPeerCertificate() and
+  // X509Certificate#toLegacyObject() return, built from cryptoX509Parse's
+  // fields in Node's key order (probed on v22.22.2): subject, issuer,
+  // [subjectaltname], [infoAccess], ca, the key fields (RSA: modulus, bits,
+  // exponent, pubkey = the SubjectPublicKeyInfo DER; EC: bits, pubkey = the
+  // raw point, asn1Curve, [nistCurve]; other key types: none), valid_from,
+  // valid_to, fingerprint, fingerprint256, fingerprint512, [ext_key_usage],
+  // serialNumber, raw. subject and issuer are null-prototype objects keyed
+  // by the attribute short names, a repeated key becoming an array; infoAccess
+  // is a null-prototype object of arrays keyed "METHOD - LOCATION". Shared
+  // by the crypto and tls factories.
+  function x509NameObject(entries) {
+    var out = Object.create(null);
+    for (var i = 0; i < entries.length; i++) {
+      var key = entries[i][0], value = entries[i][1];
+      if (key in out) {
+        if (Array.isArray(out[key])) out[key].push(value);
+        else out[key] = [out[key], value];
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+  function x509InfoAccessObject(text) {
+    var out = Object.create(null);
+    var lines = text.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var colon = lines[i].indexOf(":");
+      if (colon < 0) continue;
+      var key = lines[i].slice(0, colon), value = lines[i].slice(colon + 1);
+      if (key in out) out[key].push(value);
+      else out[key] = [value];
+    }
+    return out;
+  }
+  function x509LegacyObject(parsed) {
+    var Buffer = globalThis.Buffer;
+    var out = {};
+    out.subject = x509NameObject(parsed.subjectEntries);
+    out.issuer = x509NameObject(parsed.issuerEntries);
+    if (parsed.subjectAltName !== undefined) out.subjectaltname = parsed.subjectAltName;
+    if (parsed.infoAccess !== undefined) out.infoAccess = x509InfoAccessObject(parsed.infoAccess);
+    out.ca = parsed.ca;
+    if (parsed.keyType === "rsa") {
+      out.modulus = parsed.modulus;
+      out.bits = parsed.bits;
+      out.exponent = parsed.exponent;
+      out.pubkey = Buffer.from(parsed.pubkey);
+    } else if (parsed.keyType === "ec") {
+      out.bits = parsed.bits;
+      out.pubkey = Buffer.from(parsed.pubkey);
+      out.asn1Curve = parsed.asn1Curve;
+      if (parsed.nistCurve !== undefined) out.nistCurve = parsed.nistCurve;
+    }
+    out.valid_from = parsed.validFrom;
+    out.valid_to = parsed.validTo;
+    out.fingerprint = parsed.fingerprint;
+    out.fingerprint256 = parsed.fingerprint256;
+    out.fingerprint512 = parsed.fingerprint512;
+    if (parsed.extKeyUsage !== undefined) out.ext_key_usage = parsed.extKeyUsage.slice();
+    out.serialNumber = parsed.serialNumber;
+    out.raw = Buffer.from(parsed.raw);
+    return out;
+  }
+  // The parts of OpenSSL's X509_check_issued that decide the legacy object's
+  // issuerCertificate links (probed: a self-signed certificate whose KeyUsage
+  // lacks keyCertSign does NOT point at itself): the names match, the
+  // subject's authority key id matches the issuer's subject key id when both
+  // are present, and an issuer carrying a KeyUsage extension has keyCertSign.
+  // The signature-algorithm and serial checks are not mirrored.
+  function x509IssuedBy(issuer, subject) {
+    if (issuer.subject !== subject.issuer) return false;
+    if (subject.authorityKeyId !== undefined && issuer.subjectKeyId !== undefined &&
+        subject.authorityKeyId !== issuer.subjectKeyId) return false;
+    return issuer.keyCertSign !== false;
+  }
+
   // ---------------------------------------------------------- node:crypto
   // Wave-1 surface: streaming hashes + HMAC (md5/sha1/sha224-512, the
   // workhorses of etags, cache keys, and HS256 JWTs), OS randomness, and
@@ -16130,6 +16209,7 @@
         if (typeof buf === "string") buf = BufferCtor.from(buf);
         else if (!BufferCtor.isBuffer(buf)) buf = BufferCtor.from(buf);
         var parsed = natives.cryptoX509Parse(new Uint8Array(buf));
+        this._parsed = parsed;
         this._subject = parsed.subject;
         this._issuer = parsed.issuer;
         this._serialNumber = parsed.serialNumber;
@@ -16137,9 +16217,17 @@
         this._validTo = parsed.validTo;
         this._fingerprint = parsed.fingerprint;
         this._fingerprint256 = parsed.fingerprint256;
+        this._fingerprint512 = parsed.fingerprint512;
         this._ca = parsed.ca;
-        this._subjectAltName = parsed.subjectAltName || "";
-        this._keyUsage = parsed.keyUsage || [];
+        // undefined without the extension, as in Node (probed on v22.22.2:
+        // a certificate with no SAN reports undefined, not "").
+        this._subjectAltName = parsed.subjectAltName;
+        this._infoAccess = parsed.infoAccess;
+        // Node's keyUsage is the EXTENDED key usage -- the EKU OIDs, undefined
+        // without that extension (probed: a certificate carrying only a
+        // KeyUsage extension reports undefined). The KeyUsage bits have no
+        // getter in Node.
+        this._keyUsage = parsed.extKeyUsage;
         this._raw = BufferCtor.from(parsed.raw);
       }
       get subject() { return this._subject; }
@@ -16149,8 +16237,10 @@
       get validTo() { return this._validTo; }
       get fingerprint() { return this._fingerprint; }
       get fingerprint256() { return this._fingerprint256; }
+      get fingerprint512() { return this._fingerprint512; }
       get ca() { return this._ca; }
       get subjectAltName() { return this._subjectAltName; }
+      get infoAccess() { return this._infoAccess; }
       get keyUsage() { return this._keyUsage; }
       get raw() { return this._raw; }
       toString() {
@@ -16160,17 +16250,8 @@
         return "-----BEGIN CERTIFICATE-----\n" + out.join("\n") + "\n-----END CERTIFICATE-----\n";
       }
       toJSON() { return this.toString(); }
-      toLegacyObject() {
-        return {
-          subject: this._subject,
-          issuer: this._issuer,
-          serialNumber: this._serialNumber,
-          valid_from: this._validFrom,
-          valid_to: this._validTo,
-          fingerprint: this._fingerprint,
-          fingerprint256: this._fingerprint256,
-        };
-      }
+      // A fresh legacy object each call, in Node's shape (x509LegacyObject).
+      toLegacyObject() { return x509LegacyObject(this._parsed); }
     }
 
     const webcrypto = { subtle, getRandomValues, randomUUID };
@@ -23783,6 +23864,14 @@
         this._reading = false;
         this._protocol = null;
         this._cipher = null;
+        this._cipherStandardName = null;
+        // From the handshake: the peer's chain (base64 DER, leaf first) that
+        // getPeerCertificate() builds Node's legacy object from, and the
+        // key-exchange group behind getEphemeralKeyInfo(). _isServer marks
+        // the accept loop's sockets, where Node reports no key info.
+        this._peerCertificates = null;
+        this._ephemeralKeyInfo = null;
+        this._isServer = false;
         // Node: a TLSSocket built without a transport is `connecting` from
         // construction until 'connect' (pending, readyState "opening"); the
         // accept loop clears it on a socket born connected. _connectPending
@@ -23927,10 +24016,80 @@
         // after awaiting 'end' still sees it.
         globalThis.setImmediate(() => this.emit("close", !!err));
       }
-      getPeerCertificate() { return {}; }
-      getProtocol() { return this._protocol || null; }
+      // The handshake getters read Node's TLSWrap handle, which exists from
+      // construction and is gone once the socket is destroyed: null then
+      // (probed on v22.22.2, after 'close': getProtocol, getCipher,
+      // getEphemeralKeyInfo and getPeerCertificate all null,
+      // getPeerX509Certificate undefined). Before the handshake the handle
+      // answers with what it has: the configured maximum "TLSv1.3" for the
+      // protocol, undefined for the cipher, {} for the key info and the
+      // peer certificate. The names are OpenSSL's, mapped in tls.rs (#138).
+      getProtocol() {
+        if (this.destroyed) return null;
+        return this._protocol || "TLSv1.3";
+      }
       getCipher() {
-        return this._cipher ? { name: this._cipher, standardName: this._cipher, version: this._protocol } : null;
+        if (this.destroyed) return null;
+        if (!this._cipher) return undefined;
+        return { name: this._cipher, standardName: this._cipherStandardName || this._cipher, version: this._protocol };
+      }
+      // Node: null on a server-side socket; {} when the exchange is not
+      // reported as ephemeral -- which, probed, is every TLS 1.3 handshake
+      // (OpenSSL keeps no peer temporary key once a 1.3 handshake is done);
+      // the { type, name, size } object appears after a TLS 1.2 handshake.
+      getEphemeralKeyInfo() {
+        if (this.destroyed || this._isServer) return null;
+        if (this._ephemeralKeyInfo === null || this._protocol === "TLSv1.3") return {};
+        return Object.assign({}, this._ephemeralKeyInfo);
+      }
+      // Node's legacy object for the peer's leaf, a fresh one per call; {}
+      // when the peer sent no certificate (before the handshake; a server
+      // whose client sent none). `detailed` links each certificate to the
+      // next in the chain through issuerCertificate, and the last one to
+      // itself when it is self-issued. Node would otherwise look the last
+      // issuer up in the trust store; oam has no store to consult, so a
+      // chain ending in a certificate the peer did not send stops there.
+      getPeerCertificate(detailed) {
+        if (this.destroyed) return null;
+        var chain = this._peerCertificates;
+        if (chain === null || chain.length === 0) return {};
+        var parsed = [];
+        for (var i = 0; i < chain.length; i++) {
+          parsed.push(natives.cryptoX509Parse(new Uint8Array(globalThis.Buffer.from(chain[i], "base64"))));
+          if (!detailed) break;
+        }
+        var objects = parsed.map(x509LegacyObject);
+        if (detailed) {
+          // Node's AddIssuerChainToObject: from the leaf, find its issuer
+          // among the remaining certificates (X509_check_issued), link, and
+          // go on from that one; the last links to itself when it issued
+          // itself.
+          var rest = [];
+          for (var j = 1; j < parsed.length; j++) rest.push(j);
+          var current = 0;
+          for (;;) {
+            var found = -1;
+            for (var r = 0; r < rest.length; r++) {
+              if (x509IssuedBy(parsed[rest[r]], parsed[current])) { found = r; break; }
+            }
+            if (found < 0) break;
+            objects[current].issuerCertificate = objects[rest[found]];
+            current = rest[found];
+            rest.splice(found, 1);
+          }
+          if (x509IssuedBy(parsed[current], parsed[current])) objects[current].issuerCertificate = objects[current];
+        }
+        return objects[0];
+      }
+      // A fresh X509Certificate of the peer's leaf each call (Node builds
+      // one per call); undefined without a peer certificate or once
+      // destroyed.
+      getPeerX509Certificate() {
+        if (this.destroyed) return undefined;
+        var chain = this._peerCertificates;
+        if (chain === null || chain.length === 0) return undefined;
+        var X509Certificate = registry.get("crypto").X509Certificate;
+        return new X509Certificate(globalThis.Buffer.from(chain[0], "base64"));
       }
       setMaxSendFragment() { return true; }
       enableTrace() {}
@@ -24083,6 +24242,9 @@
           socket.authorized = info.authorized;
           socket._protocol = info.protocol;
           socket._cipher = info.cipher;
+          socket._cipherStandardName = info.cipherStandardName || null;
+          socket._peerCertificates = info.peerCertificates || null;
+          socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
           if (info.remoteAddr) {
             socket.remoteAddress = info.remoteAddr.address;
@@ -24203,6 +24365,9 @@
               socket.timeout = 0;
               socket._protocol = info.protocol;
               socket._cipher = info.cipher;
+              socket._cipherStandardName = info.cipherStandardName || null;
+              socket._peerCertificates = info.peerCertificates || null;
+              socket._isServer = true;
               socket.alpnProtocol = info.alpnProtocol || false;
               socket.encrypted = true;
               var remote = info.remoteAddr || accepted.remoteAddr;
