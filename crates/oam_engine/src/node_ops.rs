@@ -2776,6 +2776,10 @@ fn op_https_serve(
         throw_type_error(scope, "httpsServe requires key PEM");
         return;
     };
+    // Effective minVersion / maxVersion, validated by the JS https layer (#144);
+    // empty means Node's default range.
+    let min_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -2784,7 +2788,15 @@ fn op_https_serve(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::https_serve(state, host, port, cert_pem, key_pem),
+        oam_core::http_server::https_serve(
+            state,
+            host,
+            port,
+            cert_pem,
+            key_pem,
+            min_version,
+            max_version,
+        ),
     );
 }
 
@@ -3043,6 +3055,11 @@ fn op_tls_connect(
     // otherwise a server-auth-only connection wrongly enters that branch.
     let client_cert_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
     let client_key_pem = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
+    // Effective minVersion / maxVersion, already resolved and validated by the
+    // JS tls layer (secureProtocol folded in, invalid names thrown); empty
+    // means "Node's default range" (min TLSv1.2, max TLSv1.3).
+    let min_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 8).filter(|s| !s.is_empty());
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3063,6 +3080,8 @@ fn op_tls_connect(
             reject_unauthorized,
             client_cert_pem,
             client_key_pem,
+            min_version,
+            max_version,
         ),
     );
 }
@@ -3146,6 +3165,10 @@ fn op_tls_accept_wrap(
         throw_type_error(scope, "tlsAcceptWrap requires key PEM");
         return;
     };
+    // The server's effective minVersion / maxVersion (JS-resolved); empty is
+    // Node's default range.
+    let min_version = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
     let core = core_runtime!(scope);
     let tls = core.tls();
     let tcp = core.tcp();
@@ -3153,7 +3176,16 @@ fn op_tls_accept_wrap(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tls::tls_accept_wrap(tls, tcp, ids, tcp_handle, cert_pem, key_pem),
+        oam_core::tls::tls_accept_wrap(
+            tls,
+            tcp,
+            ids,
+            tcp_handle,
+            cert_pem,
+            key_pem,
+            min_version,
+            max_version,
+        ),
     );
 }
 

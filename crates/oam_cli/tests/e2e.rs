@@ -14892,6 +14892,278 @@ server.close();
     );
 }
 
+/// Issue #144: tls.connect honours minVersion / maxVersion / secureProtocol.
+/// A pin threads all the way to rustls (getProtocol reports the capped
+/// version), a client floor above the server's ceiling reports Node's
+/// `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, an empty range reports
+/// `ERR_SSL_NO_PROTOCOLS_AVAILABLE`, and -- because Node builds the SSL context
+/// only after the transport connects -- an empty range against a closed port
+/// still fails with `ECONNREFUSED`, not the range error. Codes match Node
+/// (probed on v22.22.2); the OpenSSL message blobs do not and are not asserted.
+#[test]
+fn tls_min_max_version_pins_and_reports_node_codes() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{cert}`;
+const key = `{key}`;
+
+function listen(opts) {{
+  return new Promise((resolve) => {{
+    const server = tls.createServer({{ cert, key, ...opts }}, (s) => {{ s.resume(); s.on('error', () => {{}}); }});
+    server.on('tlsClientError', () => {{}});
+    server.on('error', () => {{}});
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  }});
+}}
+function clientResult(server, clientOpts) {{
+  const port = server.address().port;
+  return new Promise((resolve) => {{
+    const c = tls.connect(
+      {{ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost', ...clientOpts }},
+      () => {{ const p = c.getProtocol(); c.destroy(); resolve('proto:' + p); }},
+    );
+    c.on('error', (e) => resolve('code:' + e.code));
+  }});
+}}
+
+// A client max-version pin threads through to the negotiated protocol.
+let server = await listen({{}});
+console.log('max1.2=' + await clientResult(server, {{ maxVersion: 'TLSv1.2' }}));
+console.log('sp1.2=' + await clientResult(server, {{ secureProtocol: 'TLSv1_2_method' }}));
+console.log('default=' + await clientResult(server, {{}}));
+await new Promise((r) => server.close(r));
+
+// A server max-version pin caps a default client.
+server = await listen({{ maxVersion: 'TLSv1.2' }});
+console.log('serverMax1.2=' + await clientResult(server, {{}}));
+// Client floor above the server's ceiling: a protocol_version alert.
+console.log('mismatch=' + await clientResult(server, {{ minVersion: 'TLSv1.3' }}));
+await new Promise((r) => server.close(r));
+
+// An empty range against a reachable peer: no protocols available.
+server = await listen({{}});
+console.log('noProtocols=' + await clientResult(server, {{ maxVersion: 'TLSv1.1' }}));
+await new Promise((r) => server.close(r));
+
+// The same empty range against a CLOSED port fails at the transport first.
+const closed = await new Promise((resolve) => {{
+  const c = tls.connect(
+    {{ host: '127.0.0.1', port: 1, rejectUnauthorized: false, maxVersion: 'TLSv1.1' }},
+    () => {{ c.destroy(); resolve('CONNECTED'); }},
+  );
+  c.on('error', (e) => resolve(e.code));
+}});
+console.log('closedPortEmptyRange=' + closed);
+
+// Synchronous throws at tls.connect() carry Node's codes.
+function syncThrow(opts) {{
+  try {{ tls.connect({{ host: '127.0.0.1', port: 1, ...opts }}, () => {{}}); return 'NOTHROW'; }}
+  catch (e) {{ return e.code; }}
+}}
+console.log('badVersion=' + syncThrow({{ minVersion: 'TLSv9' }}));
+console.log('badMethod=' + syncThrow({{ secureProtocol: 'bogus_method' }}));
+console.log('conflict=' + syncThrow({{ secureProtocol: 'TLSv1_2_method', maxVersion: 'TLSv1.3' }}));
+process.exit(0);
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_min_max_version.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("max1.2=proto:TLSv1.2"), "stdout: {stdout}");
+    assert!(stdout.contains("sp1.2=proto:TLSv1.2"), "stdout: {stdout}");
+    assert!(stdout.contains("default=proto:TLSv1.3"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("serverMax1.2=proto:TLSv1.2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("mismatch=code:ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("noProtocols=code:ERR_SSL_NO_PROTOCOLS_AVAILABLE"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("closedPortEmptyRange=ECONNREFUSED"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("badVersion=ERR_TLS_INVALID_PROTOCOL_VERSION"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("badMethod=ERR_TLS_INVALID_PROTOCOL_METHOD"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("conflict=ERR_TLS_PROTOCOL_VERSION_CONFLICT"),
+        "stdout: {stdout}"
+    );
+}
+
+/// Issue #144, the https side and the server side. https.createServer threads
+/// its pin to the handshake and, for a range with nothing to offer, binds and
+/// refuses each handshake with the alert (the shape that used to hang the
+/// client -- bounded here by the harness timeout); https.request validates
+/// the options synchronously on both of its paths, carries the pin on the
+/// non-verifying one, and says ONCE, on stderr, that the verifying path's
+/// shared client does not take it. All measured on Node v22.22.2 except the
+/// warning, which is oam's own.
+#[test]
+fn https_min_max_version_threads_pins_and_warns_once_on_the_shared_client() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+
+function tlsClient(port, opts) {{
+  return new Promise((resolve) => {{
+    const c = tls.connect({{ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost', ...opts }},
+      () => {{ const p = c.getProtocol(); c.destroy(); resolve('proto:' + p); }});
+    c.on('error', (e) => resolve('code:' + e.code));
+  }});
+}}
+async function httpsServer(opts) {{
+  const server = https.createServer({{ cert, key, ...opts }}, (req, res) => res.end('ok'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return server;
+}}
+
+let server = await httpsServer({{ maxVersion: 'TLSv1.2' }});
+console.log('httpsServerMax1.2=' + await tlsClient(server.address().port, {{}}));
+await new Promise((r) => server.close(r));
+
+server = await httpsServer({{ maxVersion: 'TLSv1.1' }});
+console.log('httpsServerEmptyRange=' + await tlsClient(server.address().port, {{}}));
+// The server is still up and still refusing: a second client is refused too.
+console.log('httpsServerEmptyRangeAgain=' + await tlsClient(server.address().port, {{}}));
+await new Promise((r) => server.close(r));
+
+function syncThrow(fn) {{ try {{ const r = fn(); if (r && r.destroy) r.destroy(); return 'NOTHROW'; }} catch (e) {{ return e.code + '/' + (e instanceof TypeError); }} }}
+console.log('httpsServerBadMin=' + syncThrow(() => https.createServer({{ cert, key, minVersion: 'TLSv9' }})));
+console.log('httpsRequestBadMin=' + syncThrow(() => https.request({{ host: '127.0.0.1', port: 1, minVersion: 'TLSv9' }}, () => {{}})));
+console.log('httpsRequestBadMinRejectFalse=' + syncThrow(() => https.request({{ host: '127.0.0.1', port: 1, rejectUnauthorized: false, minVersion: 'TLSv9' }}, () => {{}})));
+
+// The non-verifying request carries its pin: a tls server speaking minimal
+// HTTP/1.1 reports what was negotiated.
+const echo = tls.createServer({{ cert, key }}, (s) => {{
+  let seen = '';
+  s.on('data', (d) => {{
+    seen += d;
+    if (seen.includes('\r\n\r\n')) {{
+      const body = 'proto=' + s.getProtocol();
+      s.end('HTTP/1.1 200 OK\r\nContent-Length: ' + body.length + '\r\nConnection: close\r\n\r\n' + body);
+    }}
+  }});
+  s.on('error', () => {{}});
+}});
+await new Promise((r) => echo.listen(0, '127.0.0.1', r));
+const echoPort = echo.address().port;
+function viaRequest(opts) {{
+  return new Promise((resolve) => {{
+    const r = https.request({{ host: '127.0.0.1', port: echoPort, path: '/', ...opts }},
+      (res) => {{ let b = ''; res.on('data', (d) => (b += d)); res.on('end', () => resolve(b)); }});
+    r.on('error', (e) => resolve('code:' + e.code));
+    r.end();
+  }});
+}}
+console.log('rejectFalseMax1.2=' + await viaRequest({{ rejectUnauthorized: false, maxVersion: 'TLSv1.2' }}));
+console.log('rejectFalseSp1.2=' + await viaRequest({{ rejectUnauthorized: false, secureProtocol: 'TLSv1_2_method' }}));
+console.log('rejectFalseDefault=' + await viaRequest({{ rejectUnauthorized: false }}));
+await new Promise((r) => echo.close(r));
+
+// The verifying path: a pin that changes nothing stays quiet; one that would
+// change the negotiated version warns, once, however many times it is asked.
+let warnings = 0;
+process.on('warning', (w) => {{ if (String(w.message).includes('minVersion, maxVersion and secureProtocol are not applied')) warnings++; }});
+function verifying(opts) {{
+  const r = https.request({{ host: '127.0.0.1', port: 1, path: '/', ...opts }}, () => {{}});
+  r.on('error', () => {{}});
+  r.end();
+}}
+verifying({{ minVersion: 'TLSv1.2' }});
+verifying({{ maxVersion: 'TLSv1.3' }});
+verifying({{ secureProtocol: 'TLS_method' }});
+await new Promise((r) => setTimeout(r, 50));
+console.log('quietPins=' + warnings);
+verifying({{ maxVersion: 'TLSv1.2' }});
+verifying({{ minVersion: 'TLSv1.3' }});
+verifying({{ secureProtocol: 'TLSv1_2_method' }});
+await new Promise((r) => setTimeout(r, 50));
+console.log('loudPins=' + warnings);
+process.exit(0);
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("https_min_max_version.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("httpsServerMax1.2=proto:TLSv1.2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("httpsServerEmptyRange=code:ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("httpsServerEmptyRangeAgain=code:ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("httpsServerBadMin=ERR_TLS_INVALID_PROTOCOL_VERSION/true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("httpsRequestBadMin=ERR_TLS_INVALID_PROTOCOL_VERSION/true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("httpsRequestBadMinRejectFalse=ERR_TLS_INVALID_PROTOCOL_VERSION/true"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("rejectFalseMax1.2=proto=TLSv1.2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("rejectFalseSp1.2=proto=TLSv1.2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("rejectFalseDefault=proto=TLSv1.3"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("quietPins=0"), "stdout: {stdout}");
+    assert!(stdout.contains("loudPins=1"), "stdout: {stdout}");
+    assert_eq!(
+        stderr
+            .matches("minVersion, maxVersion and secureProtocol are not applied")
+            .count(),
+        1,
+        "the shared-client warning prints once.\nstderr: {stderr}"
+    );
+}
+
 /// Issue #132: Node's tls.TLSSocket extends net.Socket, so a TLS socket
 /// carries the whole socket API; oam's did not (no shared base), and ioredis
 /// crashed over rediss:// on its first `stream.setNoDelay(true)`. Every
