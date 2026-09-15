@@ -973,7 +973,7 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
   is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
   exists, open the TLS connection with `tls.connect({ host, port })` instead.
-- **`minVersion` / `maxVersion` / `secureProtocol` are not honoured**, so a TLS 1.2
+- **`minVersion` / `maxVersion` / `secureProtocol` are not honoured** (#144), so a TLS 1.2
   handshake cannot be pinned from JS (every handshake here is TLS 1.3 when the peer allows
   it). `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
   peer sent; Node also consults the client's trust store for the issuer of the last one.
@@ -985,7 +985,7 @@ it waits for the `net` tranche of the vendored Node suite to gate it.
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
 described; the bare-`connect()` and `socket`-option shapes as described.
 
-### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written
+### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written (#143)
 
 Windows retransmits the SYN of a connect to a closed loopback port for about 2 s before it
 reports the refusal; libuv turns that off per socket (`SIO_TCP_INITIAL_RTO`, loopback targets
