@@ -967,12 +967,24 @@ pub async fn https_serve(
     port: u16,
     cert_pem: String,
     key_pem: String,
+    min_version: Option<String>,
+    max_version: Option<String>,
 ) -> super::OpOutcome {
-    let tls_config = match crate::tls::build_server_config(&cert_pem, &key_pem) {
-        Ok(c) => c,
-        Err(e) => return super::OpOutcome::Failed(format!("https tls config: {e}")),
-    };
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    // The server's minVersion / maxVersion (#144), already validated by the JS
+    // https layer; empty means Node's default range. A range with nothing to
+    // offer still binds -- Node's server does, and fails each handshake -- so
+    // the acceptor is absent and every connection is refused with the alert
+    // the client expects (`refuse_no_protocols`). Node also emits
+    // `tlsClientError` per connection there; this server has no
+    // per-connection channel to JS, so that event is not raised (documented).
+    let acceptor =
+        match crate::tls::protocol_versions(min_version.as_deref(), max_version.as_deref()) {
+            Ok(versions) => match crate::tls::build_server_config(&cert_pem, &key_pem, &versions) {
+                Ok(c) => Some(tokio_rustls::TlsAcceptor::from(c)),
+                Err(e) => return super::OpOutcome::Failed(format!("https tls config: {e}")),
+            },
+            Err(_) => None,
+        };
 
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -1006,7 +1018,13 @@ pub async fn https_serve(
                         drop(stream);
                         continue;
                     };
-                    let conn_acceptor = acceptor.clone();
+                    let Some(conn_acceptor) = acceptor.clone() else {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            crate::tls::refuse_no_protocols(stream).await;
+                        });
+                        continue;
+                    };
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let mut conn_shutdown = shutdown_rx.clone();

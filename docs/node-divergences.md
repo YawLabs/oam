@@ -973,9 +973,34 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
   is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
   exists, open the TLS connection with `tls.connect({ host, port })` instead.
-- **`minVersion` / `maxVersion` / `secureProtocol` are not honoured** (#144), so a TLS 1.2
-  handshake cannot be pinned from JS (every handshake here is TLS 1.3 when the peer allows
-  it). `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
+- **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
+  `tls.createServer`, `https.createServer` and the non-verifying `https.request` (#144), with
+  Node's synchronous `TypeError`s and its asynchronous codes
+  (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
+  `conformance/cases/109-tls-protocol-version.mjs`. What still differs:
+  - The **verifying `https.request`** (the default, `rejectUnauthorized` not `false`) goes
+    through one shared HTTPS client, which negotiates the default TLS 1.2-1.3 range and takes
+    no per-request `minVersion` / `maxVersion` / `secureProtocol` -- nor `ca`. The options are
+    validated (the same throws as Node), and a pin that would change the negotiated version
+    prints one `Warning` per process rather than being silently dropped. `tls.connect` honours
+    the pin; a per-request client keyed by these options is the fix (#146).
+  - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
+    which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
+    either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).
+  - The **asynchronous error messages** are rustls's (`no protocols available for the
+    requested TLS version range`, `received fatal alert: ProtocolVersion`); Node's are OpenSSL
+    diagnostics carrying its build path. Only the `code` is matched.
+  - A **TLS 1.2 handshake negotiates `ECDHE-RSA-AES256-GCM-SHA384`** where Node's OpenSSL
+    prefers `ECDHE-RSA-AES128-GCM-SHA256`: rustls orders AES-256 first. `getCipher()` reports
+    it in OpenSSL's spelling either way.
+  - An **`https.createServer` with a range that offers nothing** refuses each handshake with
+    the same alert as `tls.createServer` (the client sees `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`)
+    but does not emit `tlsClientError` for it; that server has no per-connection channel to
+    JS.
+  - A **`_server_method` name on a client** (or `_client_method` on a server) is taken as its
+    base method here; Node's OpenSSL accepts the name and then fails the handshake with
+    `ERR_SSL_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL`, a misuse it does not check up front.
+- `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
   peer sent; Node also consults the client's trust store for the issuer of the last one.
 
 The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting

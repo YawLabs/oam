@@ -152,6 +152,55 @@ fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: TlsWriter) -> bo
     }
 }
 
+/// Node's error `code` for a rustls handshake failure that maps to a specific
+/// OpenSSL code rather than a transport errno. Today the one mapping is a
+/// received `protocol_version` fatal alert -- the peer's highest offered
+/// version is below our `minVersion` -- which Node reports as
+/// `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION` (measured on v22). tokio-rustls wraps
+/// the `rustls::Error` as the source of an `InvalidData` io error, so it can be
+/// recovered by downcast. The accompanying message stays rustls's own: Node's
+/// is an OpenSSL diagnostic blob carrying its build path, which no runtime can
+/// reproduce (see docs/node-divergences.md), so only the code is matched.
+fn tls_alert_code(error: &std::io::Error) -> Option<&'static str> {
+    match error.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion) => {
+            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
+        }
+        _ => None,
+    }
+}
+
+/// The TLS `protocol_version` fatal alert as one record on the wire: content
+/// type alert (21), record-layer version TLS 1.2, length 2, level fatal (2),
+/// description protocol_version (70).
+const PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x46];
+
+/// Refuse an accepted connection on a server that has no protocol version to
+/// offer (`maxVersion` below TLS 1.2, or `minVersion` above `maxVersion`), the
+/// way OpenSSL's server does: answer the ClientHello with a fatal
+/// `protocol_version` alert and close. The client -- rustls or OpenSSL alike
+/// -- then reports `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, as it does against
+/// Node, instead of waiting on a ServerHello that never comes (measured: an
+/// unanswered accept hung the client until its own timeout). The hello is
+/// read first so the close sends FIN rather than RST -- unread inbound bytes
+/// at close reset the connection on every platform, and a reset can discard
+/// the alert before the client reads it -- and the socket is then drained to
+/// the client's close so the alert is delivered before it goes. Both waits
+/// are bounded, for a client that sends nothing or never closes.
+pub(crate) async fn refuse_no_protocols(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let bound = std::time::Duration::from_secs(5);
+    let mut hello = [0u8; 4096];
+    let _ = tokio::time::timeout(bound, stream.read(&mut hello)).await;
+    let _ = stream.write_all(&PROTOCOL_VERSION_ALERT).await;
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(bound, async {
+        let mut sink = [0u8; 1024];
+        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
+
 fn tls_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
     let code = node_error_code(&error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
@@ -894,11 +943,64 @@ fn check_server_identity(server_name: &ServerName<'_>, der: &[u8]) -> Result<(),
 /// NODE_EXTRA_CA_CERTS bundle -- `ca` replaces the extras rather than
 /// adding to them, as in Node (measured). The returned slot is where the
 /// verifier leaves its verdict.
+/// A rank for the four TLS version names Node accepts, low to high. The JS
+/// layer validates the strings (an unknown one throws
+/// `ERR_TLS_INVALID_PROTOCOL_VERSION` before the op is spawned) and resolves
+/// `secureProtocol`, so a name here is expected valid; an unknown one is still
+/// treated as "no usable version" rather than trusted.
+fn tls_version_rank(name: &str) -> Option<u8> {
+    match name {
+        "TLSv1" => Some(1),
+        "TLSv1.1" => Some(2),
+        "TLSv1.2" => Some(3),
+        "TLSv1.3" => Some(4),
+        _ => None,
+    }
+}
+
+/// The rustls protocol-version set for Node's `minVersion` / `maxVersion`
+/// (each `None` = Node's default: min `TLSv1.2`, max `TLSv1.3`). rustls offers
+/// only TLS 1.2 and 1.3, so the floor is clamped up to 1.2 -- observationally
+/// identical to Node, whose openssl also negotiates the highest version both
+/// peers allow (a requested 1.0/1.1 floor changes nothing when the peer speaks
+/// 1.2+; measured). An effective range with no version at or above 1.2 (a
+/// `maxVersion` of `TLSv1`/`TLSv1.1`, or `min > max`) has nothing rustls can
+/// offer: `Err`, which the caller reports as Node's
+/// `ERR_SSL_NO_PROTOCOLS_AVAILABLE`. The slice is high-to-low, matching
+/// rustls's own `ALL_VERSIONS` order.
+pub(crate) fn protocol_versions(
+    min_version: Option<&str>,
+    max_version: Option<&str>,
+) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, String> {
+    let min = match min_version {
+        Some(name) => tls_version_rank(name).ok_or("no protocols available")?,
+        None => 3, // TLSv1.2
+    };
+    let max = match max_version {
+        Some(name) => tls_version_rank(name).ok_or("no protocols available")?,
+        None => 4, // TLSv1.3
+    };
+    let floor = min.max(3); // rustls cannot offer below TLS 1.2
+    if max < floor {
+        return Err("no protocols available".into());
+    }
+    let mut versions = Vec::with_capacity(2);
+    if (floor..=max).contains(&4) {
+        versions.push(&rustls::version::TLS13);
+    }
+    if (floor..=max).contains(&3) {
+        versions.push(&rustls::version::TLS12);
+    }
+    Ok(versions)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_client_config(
     ca_pem: Option<&str>,
     client_cert_pem: Option<&str>,
     client_key_pem: Option<&str>,
     reject_unauthorized: bool,
+    versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> Result<(rustls::ClientConfig, VerifySlot), String> {
     let mut root_store = rustls::RootCertStore::empty();
     let extras = extra_ca_certs();
@@ -949,7 +1051,7 @@ fn build_client_config(
         advisory: !reject_unauthorized,
         outcome: outcome.clone(),
     });
-    let builder = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder_with_protocol_versions(versions)
         .dangerous()
         .with_custom_certificate_verifier(verifier);
 
@@ -1092,11 +1194,31 @@ pub async fn tls_connect(
     reject_unauthorized: bool,
     client_cert_pem: Option<String>,
     client_key_pem: Option<String>,
+    min_version: Option<String>,
+    max_version: Option<String>,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
+
+    // Node connects the transport first and only sets the SSL handshake up once
+    // the socket is open, so a closed port fails with `ECONNREFUSED` even when
+    // the requested version range is itself empty (measured on v22). Connect,
+    // then resolve the range: a range with no version rustls can offer surfaces
+    // as Node's `ERR_SSL_NO_PROTOCOLS_AVAILABLE` -- the code its handshake setup
+    // raises, asynchronously, once the peer is reachable -- and no handshake is
+    // attempted.
     let tcp = match crate::tcp::connect_tcp(&host, port).await {
         Ok(s) => s,
         Err(e) => return tls_fail(e, "connect", &addr),
+    };
+
+    let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
+        Ok(v) => v,
+        Err(_) => {
+            return OpOutcome::node_failed(
+                "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
+                "no protocols available for the requested TLS version range".to_string(),
+            );
+        }
     };
 
     // Node strips one trailing dot (`unfqdn`) before it checks the name.
@@ -1111,6 +1233,7 @@ pub async fn tls_connect(
         client_cert_pem.as_deref(),
         client_key_pem.as_deref(),
         reject_unauthorized,
+        &versions,
     ) {
         Ok(built) => built,
         Err(e) => return OpOutcome::Failed(e),
@@ -1127,6 +1250,9 @@ pub async fn tls_connect(
                 }) = verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
             {
                 return OpOutcome::node_failed(code, message);
+            }
+            if let Some(code) = tls_alert_code(&e) {
+                return OpOutcome::node_failed(code, e.to_string());
             }
             return tls_fail(e, "connect", &addr);
         }
@@ -1339,6 +1465,7 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn tls_accept_wrap(
     tls_registry: TlsRegistry,
     tcp_registry: crate::tcp::TcpRegistry,
@@ -1346,6 +1473,8 @@ pub async fn tls_accept_wrap(
     tcp_handle: u64,
     cert_pem: String,
     key_pem: String,
+    min_version: Option<String>,
+    max_version: Option<String>,
 ) -> OpOutcome {
     let Some((reader, writer)) = tcp_registry
         .lock()
@@ -1360,7 +1489,22 @@ pub async fn tls_accept_wrap(
         Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
     };
 
-    let tls_config = match build_server_config(&cert_pem, &key_pem) {
+    // A server range with nothing to offer fails this connection with Node's
+    // per-connection `tlsClientError` code -- the socket is answered with the
+    // alert the client expects (`refuse_no_protocols`), off this op so the
+    // accept loop is not held for it, and the server keeps listening.
+    let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
+        Ok(v) => v,
+        Err(_) => {
+            tokio::spawn(refuse_no_protocols(tcp_stream));
+            return OpOutcome::node_failed(
+                "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
+                "no protocols available for the requested TLS version range".to_string(),
+            );
+        }
+    };
+
+    let tls_config = match build_server_config(&cert_pem, &key_pem, &versions) {
         Ok(c) => c,
         Err(e) => return OpOutcome::Failed(format!("tls accept config: {e}")),
     };
@@ -1424,6 +1568,7 @@ pub async fn tls_accept_wrap(
 pub fn build_server_config(
     cert_pem: &str,
     key_pem: &str,
+    versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> Result<Arc<rustls::ServerConfig>, String> {
     let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
@@ -1431,11 +1576,17 @@ pub fn build_server_config(
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
         .map_err(|e| format!("server key parse: {e}"))?
         .ok_or("no private key found in server key PEM")?;
-    let config = rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder_with_protocol_versions(versions)
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("server tls config: {e}"))?;
     Ok(Arc::new(config))
+}
+
+/// The full TLS 1.2 + 1.3 set -- Node's default range, for callers that do
+/// not (yet) thread `minVersion` / `maxVersion` (the https server).
+pub fn default_protocol_versions() -> Vec<&'static rustls::SupportedProtocolVersion> {
+    vec![&rustls::version::TLS13, &rustls::version::TLS12]
 }
 
 #[cfg(test)]
@@ -1740,10 +1891,143 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
     }
 
+    /// The `ProtocolVersion`s of a `protocol_versions` result, high-to-low, so
+    /// a test can name the selected set without pointer comparisons.
+    fn selected(
+        min: Option<&str>,
+        max: Option<&str>,
+    ) -> Result<Vec<rustls::ProtocolVersion>, String> {
+        protocol_versions(min, max).map(|v| v.iter().map(|p| p.version).collect())
+    }
+
+    #[test]
+    fn tls_version_rank_maps_only_nodes_four_names() {
+        assert_eq!(tls_version_rank("TLSv1"), Some(1));
+        assert_eq!(tls_version_rank("TLSv1.1"), Some(2));
+        assert_eq!(tls_version_rank("TLSv1.2"), Some(3));
+        assert_eq!(tls_version_rank("TLSv1.3"), Some(4));
+        assert_eq!(tls_version_rank("TLSv1.4"), None);
+        assert_eq!(tls_version_rank("SSLv3"), None);
+        assert_eq!(tls_version_rank(""), None);
+    }
+
+    #[test]
+    fn protocol_versions_selects_the_rustls_set_node_would() {
+        use rustls::ProtocolVersion::{TLSv1_2, TLSv1_3};
+        // Node's default range: min TLSv1.2, max TLSv1.3 -> both, high-to-low.
+        assert_eq!(selected(None, None), Ok(vec![TLSv1_3, TLSv1_2]));
+        // Pin one version each way.
+        assert_eq!(selected(Some("TLSv1.3"), None), Ok(vec![TLSv1_3]));
+        assert_eq!(selected(None, Some("TLSv1.2")), Ok(vec![TLSv1_2]));
+        assert_eq!(
+            selected(Some("TLSv1.2"), Some("TLSv1.2")),
+            Ok(vec![TLSv1_2])
+        );
+        assert_eq!(
+            selected(Some("TLSv1.3"), Some("TLSv1.3")),
+            Ok(vec![TLSv1_3])
+        );
+        // A floor below 1.2 is clamped up to 1.2 (rustls offers nothing lower),
+        // which is what Node negotiates too when the peer speaks 1.2+.
+        assert_eq!(selected(Some("TLSv1"), None), Ok(vec![TLSv1_3, TLSv1_2]));
+        assert_eq!(
+            selected(Some("TLSv1.1"), Some("TLSv1.2")),
+            Ok(vec![TLSv1_2])
+        );
+    }
+
+    #[test]
+    fn protocol_versions_is_empty_when_no_offerable_version_remains() {
+        // A ceiling below rustls's 1.2 floor: nothing to offer.
+        assert!(selected(None, Some("TLSv1")).is_err());
+        assert!(selected(None, Some("TLSv1.1")).is_err());
+        // The same ceiling with an explicit floor at or below it: a well-formed
+        // range (min <= max) that rustls still cannot offer any version of. This
+        // is the one shape where the 1.2 clamp decides the result -- without
+        // it the range would resolve to an EMPTY version list, which rustls's
+        // builder refuses -- so it is what keeps the clamp load-bearing.
+        assert!(selected(Some("TLSv1"), Some("TLSv1.1")).is_err());
+        assert!(selected(Some("TLSv1"), Some("TLSv1")).is_err());
+        assert!(selected(Some("TLSv1.1"), Some("TLSv1.1")).is_err());
+        // min above max.
+        assert!(selected(Some("TLSv1.3"), Some("TLSv1.2")).is_err());
+        // An unparseable name (the JS layer validates first, but the range
+        // resolver refuses it rather than trusting it) is "no protocols".
+        assert!(selected(Some("TLSv9"), None).is_err());
+        assert!(selected(None, Some("bogus")).is_err());
+    }
+
+    /// A received `protocol_version` fatal alert keys to Node's code; any other
+    /// io error (or a rustls error that is not that alert) does not.
+    #[test]
+    fn tls_alert_code_maps_only_the_protocol_version_alert() {
+        let alert = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
+        );
+        assert_eq!(
+            tls_alert_code(&alert),
+            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
+        );
+
+        let other_alert = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+        );
+        assert_eq!(tls_alert_code(&other_alert), None);
+
+        let refused = std::io::Error::from_raw_os_error(10061);
+        assert_eq!(tls_alert_code(&refused), None);
+    }
+
+    /// A server with no version to offer answers the ClientHello with a
+    /// `protocol_version` alert and closes, and a client that reaches it
+    /// reports Node's `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION` -- the alert
+    /// bytes, their delivery before the close, and the client-side mapping
+    /// in one: a wrong record would surface as a different rustls error, a
+    /// dropped mapping as `EIO`, and an unanswered socket would hang here.
+    #[tokio::test]
+    async fn refused_no_protocols_connection_reports_the_alert_code() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            refuse_no_protocols(tcp).await;
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tls_connect(
+                registry,
+                ids,
+                "127.0.0.1".into(),
+                port,
+                Some("localhost".into()),
+                Some(CERT.into()),
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("a refused connection must not hang");
+        match outcome {
+            OpOutcome::NodeFailed { code, .. } => {
+                assert_eq!(code, "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
+            }
+            other => panic!("expected the alert code, got {other:?}"),
+        }
+    }
+
     /// Accepts N connections; each echoes its first read, waits for the
     /// client to finish (so a second client read can park), then closes.
     async fn echo_server(listener: tokio::net::TcpListener, connections: usize) {
-        let acceptor = tokio_rustls::TlsAcceptor::from(build_server_config(CERT, KEY).unwrap());
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            build_server_config(CERT, KEY, &default_protocol_versions()).unwrap(),
+        );
         for _ in 0..connections {
             let (tcp, _) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();
@@ -1784,6 +2068,8 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 Some("localhost".into()),
                 Some(CERT.into()),
                 true,
+                None,
+                None,
                 None,
                 None,
             )
@@ -1874,6 +2160,8 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             true,
             None,
             None,
+            None,
+            None,
         )
         .await
         else {
@@ -1951,6 +2239,8 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 Some(sni.into()),
                 ca.map(String::from),
                 reject,
+                None,
+                None,
                 None,
                 None,
             )

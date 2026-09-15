@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "d0b22b4+wip",
-  "oamVersion": "oam 0.15.2",
+  "commit": "ed891ec+wip",
+  "oamVersion": "oam 0.15.3",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 110,
-      "total": 110,
+      "pass": 111,
+      "total": 111,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -96,6 +96,10 @@
         },
         {
           "case": "108-accepted-socket-local-address.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "109-tls-protocol-version.mjs",
           "status": "pass"
         },
         {

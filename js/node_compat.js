@@ -20655,6 +20655,14 @@
   registry.factories.https = (natives) => {
     const http = registry.get("http");
     const EventEmitter = registry.get("events");
+    // tls's minVersion / maxVersion / secureProtocol resolver (#144): the same
+    // validation Node runs when it builds a SecureContext for a server or a
+    // request, so the same calls throw synchronously here.
+    function resolveTlsVersions(options) {
+      registry.get("tls");
+      return registry._resolveTlsVersions(options);
+    }
+    let httpsVersionPinWarned = false;
 
     class Server extends EventEmitter {
       constructor(options, handler) {
@@ -20664,6 +20672,9 @@
           options = {};
         }
         this._options = options || {};
+        var serverVersions = resolveTlsVersions(this._options);
+        this._tlsMin = serverVersions.min;
+        this._tlsMax = serverVersions.max;
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
@@ -20686,7 +20697,7 @@
           ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
         var keyPem = typeof this._options.key === "object" && this._options.key instanceof Uint8Array
           ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
-        natives.httpsServe(hostname, port || 0, certPem, keyPem).then(
+        natives.httpsServe(hostname, port || 0, certPem, keyPem, this._tlsMin, this._tlsMax).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
@@ -20743,8 +20754,29 @@
         if (!options.protocol) options.protocol = "https:";
         if (!options.port) options.port = 443;
       }
+      // Node validates the version options when it builds the request's
+      // SecureContext, so an invalid name or method, or a secureProtocol +
+      // min/max conflict, throws here at https.request() on either path.
+      var tlsVersions = resolveTlsVersions(options);
       if (options.rejectUnauthorized === false) {
         return new TlsClientRequest(options, callback);
+      }
+      // The verifying path goes through the shared HTTPS client, which
+      // negotiates the default TLS 1.2-1.3 range and takes no per-request pin
+      // (docs/node-divergences.md). A pin that would change what is negotiated
+      // is said so once, rather than silently connecting with a version the
+      // caller ruled out; the default-range spellings (minVersion TLSv1.2,
+      // maxVersion TLSv1.3, TLS_method) change nothing and stay quiet.
+      if (
+        !httpsVersionPinWarned &&
+        (tlsVersions.min === "TLSv1.3" || (tlsVersions.max !== "" && tlsVersions.max !== "TLSv1.3"))
+      ) {
+        httpsVersionPinWarned = true;
+        process.emitWarning(
+          "https.request: minVersion, maxVersion and secureProtocol are not applied to a " +
+            "verifying request in oam; the shared HTTPS client negotiates TLS 1.2-1.3 " +
+            "(YawLabs/oam#146). tls.connect honours them. See docs/node-divergences.md.",
+        );
       }
       return http.request(options, callback);
     }
@@ -20807,7 +20839,13 @@
         var host = self._options.hostname || "localhost";
         var port = Number(self._options.port || 443);
         var path = self._options.path || "/";
-        var sock = tls.connect({ host: host, port: port, rejectUnauthorized: false });
+        // The version pin travels with the request (#144); the other TLS
+        // options (ca, servername) do not on this path, which does not verify.
+        var o = self._options;
+        var sock = tls.connect({
+          host: host, port: port, rejectUnauthorized: false,
+          minVersion: o.minVersion, maxVersion: o.maxVersion, secureProtocol: o.secureProtocol,
+        });
         sock.on("error", function(err) { self.emit("error", err); });
         sock.on("secureConnect", function() {
           var lc = self._headers; // header names already lowercased
@@ -24282,6 +24320,91 @@
 
     // The connect flow tls.connect() and TLSSocket.prototype.connect() share.
     // One native op does the TCP connect and the handshake, so 'connect',
+    // Node validates and resolves the TLS protocol-version options when it
+    // builds the SecureContext -- synchronously, at tls.connect() and
+    // tls.createServer(). `minVersion` / `maxVersion` are one of 'TLSv1.3' /
+    // 'TLSv1.2' / 'TLSv1.1' / 'TLSv1' (an unknown one throws
+    // ERR_TLS_INVALID_PROTOCOL_VERSION); `secureProtocol` is an OpenSSL method
+    // name that pins a single version, or 'TLS_method' for the default range
+    // (an unknown one throws ERR_TLS_INVALID_PROTOCOL_METHOD). The two options
+    // cannot be given together (ERR_TLS_PROTOCOL_VERSION_CONFLICT). Returns the
+    // effective { min, max } as version strings, empty for Node's default
+    // (min TLSv1.2, max TLSv1.3); rustls's TLS 1.2 floor is applied natively.
+    // There is no `TLSv1_3_method` -- OpenSSL never defined one (measured).
+    var TLS_VERSION_NAMES = ["TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"];
+    var SECURE_PROTOCOL_TO_VERSION = {
+      TLSv1_method: "TLSv1",
+      "TLSv1_1_method": "TLSv1.1",
+      "TLSv1_2_method": "TLSv1.2",
+    };
+    // util.format's %j, which Node renders the offending value with in these
+    // messages: a string comes out quoted, a number, boolean or object does not.
+    function formatJ(value) {
+      try {
+        var s = JSON.stringify(value);
+        return s === undefined ? String(value) : s;
+      } catch (e) {
+        return String(value);
+      }
+    }
+    // Node's minVersion / maxVersion / secureProtocol semantics, measured on
+    // v22.22.2 (all three errors are TypeErrors there):
+    //  - a truthy secureProtocol conflicts with a minVersion or maxVersion that
+    //    is not null/undefined ('' counts, null does not);
+    //  - only a string names a method (Node's C++ checks IsString): '' is looked
+    //    up and unknown, a non-string is ignored and the default range applies;
+    //    TLS_method and its _client/_server forms are the default range, the
+    //    SSLv23_* forms cap it at TLS 1.2 (the name predates 1.3, and Node keeps
+    //    that meaning); the SSLv2 / SSLv3 families are refused with their own
+    //    message; there is no TLSv1_3_method;
+    //  - a version that is not one of the four names is invalid whatever its
+    //    type ('' and 771 included); null / undefined means Node's default.
+    // Returns the effective {min, max} as names, '' for Node's default.
+    function resolveTlsVersions(options) {
+      var min = options.minVersion, max = options.maxVersion, sp = options.secureProtocol;
+      if (sp && (min != null || max != null)) {
+        throw nodeTypeError(
+          "TLS protocol version " + formatJ(min != null ? min : max) +
+            " conflicts with secureProtocol " + formatJ(sp),
+          "ERR_TLS_PROTOCOL_VERSION_CONFLICT",
+        );
+      }
+      if (typeof sp === "string") {
+        var base = sp.replace(/_(client|server)_method$/, "_method");
+        if (base === "TLS_method") return { min: "", max: "" };
+        if (base === "SSLv23_method") return { min: "", max: "TLSv1.2" };
+        var v = SECURE_PROTOCOL_TO_VERSION[base];
+        if (v === undefined) {
+          // Thrown from C++ in Node: a plain TypeError carrying the code, with
+          // no "[CODE]" in its rendered name.
+          var method = new TypeError(
+            base === "SSLv2_method" || base === "SSLv3_method"
+              ? base.slice(0, 5) + " methods disabled"
+              : "Unknown method: " + sp,
+          );
+          method.code = "ERR_TLS_INVALID_PROTOCOL_METHOD";
+          throw method;
+        }
+        return { min: v, max: v };
+      }
+      if (min != null && TLS_VERSION_NAMES.indexOf(min) < 0) {
+        throw nodeTypeError(
+          formatJ(min) + " is not a valid minimum TLS protocol version",
+          "ERR_TLS_INVALID_PROTOCOL_VERSION",
+        );
+      }
+      if (max != null && TLS_VERSION_NAMES.indexOf(max) < 0) {
+        throw nodeTypeError(
+          formatJ(max) + " is not a valid maximum TLS protocol version",
+          "ERR_TLS_INVALID_PROTOCOL_VERSION",
+        );
+      }
+      return { min: min != null ? min : "", max: max != null ? max : "" };
+    }
+    // The https factory validates the same options at https.createServer() and
+    // https.request(); shared through the registry rather than as an export.
+    registry._resolveTlsVersions = resolveTlsVersions;
+
     // 'ready' and 'secureConnect' fire back to back -- Node's order, probed
     // -- and the transport's addresses land as they would on a net.Socket:
     // remoteAddress is the resolved IP, never the host name.
@@ -24295,6 +24418,9 @@
       var cert = options.cert != null ? String(options.cert) : undefined;
       var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
+      // Throws synchronously for an invalid version / method / conflict, as
+      // Node does at tls.connect(); the effective range goes to the native.
+      var tlsVersions = resolveTlsVersions(options);
 
       if (socket._connectPending || socket._handle !== null) {
         // Node: a connect() on a socket that is connecting or connected
@@ -24329,7 +24455,7 @@
       // handle).
       registry._activeHandles.set(socket, "TCPSocketWrap");
 
-      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key).then(
+      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max).then(
         (info) => {
           socket._connectPending = false;
           if (socket.destroyed) {
@@ -24418,6 +24544,11 @@
           options = {};
         }
         this._options = options || {};
+        // Node validates the version options when it builds the server's
+        // SecureContext, at createServer() -- so throw here, synchronously.
+        var serverVersions = resolveTlsVersions(this._options);
+        this._tlsMin = serverVersions.min;
+        this._tlsMax = serverVersions.max;
         if (connectionListener) this.on("secureConnection", connectionListener);
         this._serverId = null;
         this._port = null;
@@ -24481,7 +24612,7 @@
             if (accepted === undefined) break;
             var tcpHandle = accepted.handle;
             try {
-              var info = await natives.tlsAcceptWrap(tcpHandle, certPem, keyPem);
+              var info = await natives.tlsAcceptWrap(tcpHandle, certPem, keyPem, this._tlsMin, this._tlsMax);
               var socket = new TLSSocket(null, {});
               socket._handle = info.handle;
               socket.connecting = false;
