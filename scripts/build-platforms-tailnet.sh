@@ -38,9 +38,12 @@
 #
 # Prereqs:
 #   - Tailscale up on this box + the Air; ACLs allow SSH (22).
-#   - Air toolchain: Xcode CLT + Node 22 (already there for yaw builds);
-#     Rosetta 2 for the x64 leg (build-remote.sh names the install command
-#     if missing). rustup auto-installs on first prep.
+#   - Air toolchain: Xcode CLT; Rosetta 2 for the x64 leg (build-remote.sh
+#     names the install command if missing). rustup auto-installs on first
+#     prep, and so does the conformance oracle: exactly the Node in
+#     .node-version, from nodejs.org into ~/.cache/oam-node. The Air's own
+#     node (/usr/local/bin, Homebrew's node@22) is NOT used -- see
+#     scripts/lib/node-pin.sh.
 # =============================================================================
 
 set -euo pipefail

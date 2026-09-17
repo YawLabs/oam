@@ -32,20 +32,48 @@ pub fn run(release: bool) -> Result<()> {
             .map(|v| v == "1")
             .unwrap_or(false);
     let repo = repo_root()?;
-    let oam = ensure_oam_built(&repo, release)?;
+
+    // The oracle is checked BEFORE the build: a wrong node should fail in a
+    // second, not after a cold cargo build. See node_pin for why the
+    // differential must run against exactly the pinned Node.
+    let pinned_node = crate::node_pin::pinned_node_version(&repo)?;
     let node = which_node();
+    let found_node_version = node
+        .as_deref()
+        .map(|node| capture_version(Path::new(node), &["--version"]));
+    let oracle_warning = crate::node_pin::enforce(
+        &pinned_node,
+        found_node_version.as_deref(),
+        crate::node_pin::mismatch_allowed(),
+    )?;
+    if let Some(warning) = &oracle_warning {
+        println!("WARNING: {warning}");
+    }
+    let node_version = found_node_version.unwrap_or_else(|| "absent".to_string());
+
+    let oam = ensure_oam_built(&repo, release)?;
     let cache = std::env::temp_dir().join(format!("oam-conformance-{}", std::process::id()));
     std::fs::create_dir_all(&cache)?;
 
     let oam_version = capture_version(&oam, &["--version"]);
-    let node_version = node
-        .as_deref()
-        .map(|node| capture_version(Path::new(node), &["--version"]))
-        .unwrap_or_else(|| "absent".to_string());
 
     // oam_version already carries the "oam " program-name prefix from
-    // `oam --version`; don't prepend another (was "oam oam 0.0.1").
-    println!("{oam_version} vs node {node_version}");
+    // `oam --version`; don't prepend another (was "oam oam 0.0.1"). The node
+    // PATH is printed because "which node" is the question every leg's log has
+    // to answer -- the version alone cannot tell a provisioned pin from a
+    // same-numbered binary somewhere else.
+    let node_path = node
+        .as_deref()
+        .map(|node| capture_version(Path::new(node), &["-p", "process.execPath"]))
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "{oam_version} vs node {node_version} ({node_path}); pinned {pinned_node} ({})",
+        if oracle_warning.is_none() {
+            "matches"
+        } else {
+            "MISMATCH, allowed"
+        }
+    );
 
     // ------------------------------------------------------------ wpt-url
     println!("suite: wpt-url");
@@ -356,6 +384,16 @@ pub fn run(release: bool) -> Result<()> {
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
+    // Its own line, NOT folded into the Commit stamp above: write_receipts
+    // ignores that line when deciding whether results changed, and a receipt
+    // produced against the wrong Node must never compare equal to one
+    // produced against the pin.
+    if oracle_warning.is_some() {
+        md.push_str(&format!(
+            "> **Not a parity receipt:** the oracle was node {node_version}, not the {pinned_node} \
+             pinned in `.node-version` (run with `OAM_ALLOW_NODE_MISMATCH=1`).\n\n"
+        ));
+    }
     md.push_str("## WPT: URL (official web-platform-tests data)\n\n");
     md.push_str("| suite | pass | total | % |\n|---|---|---|---|\n");
     md.push_str(&format!(

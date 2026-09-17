@@ -10,22 +10,25 @@
 # Usage (invoked remotely):  bash scripts/build-remote.sh <dispatch>
 #   <dispatch>:
 #     prep         -- toolchain guard + one-time install: rustup (auto-installs
-#                     if missing), toolchain per rust-toolchain.toml, cc/node
-#                     presence checks, tsgo best-effort (ci.yml parity:
-#                     continue-on-error). Run ONCE per synced tree; the
-#                     sub-steps below never re-prep.
+#                     if missing), toolchain per rust-toolchain.toml, cc
+#                     presence check, the pinned Node oracle (best-effort
+#                     here -- see "Pinned Node" below), tsgo best-effort
+#                     (ci.yml parity: continue-on-error). Run ONCE per synced
+#                     tree; the sub-steps below never re-prep.
 #     gate         -- cargo fmt --check + clippy -D warnings   (ci.yml parity)
 #     test         -- cargo build --workspace + cargo test --workspace
 #                     (15-min ceiling where `timeout` exists) + debug smoke
 #     surface-gaps -- node scripts/gen-surface-gaps.mjs (records THIS host's
-#                     section of the builtin export-parity ratchet)
+#                     section of the builtin export-parity ratchet; pinned
+#                     node)
 #     conformance  -- cargo run -p xtask -- conformance  (node-differential
-#                     gate; needs node on PATH)
-#     node-suite   -- cargo run -p xtask -- node-suite   (ratchet + scorecard)
+#                     gate; pinned node)
+#     node-suite   -- cargo run -p xtask -- node-suite   (ratchet + scorecard;
+#                     runs no node -- its oracle is each test's exit code)
 #     build        -- release build for the HOST triple -> dist/oam-<triple>
 #                     + release-binary smoke
 #     bench        -- cargo run -p xtask -- bench --release --compare
-#                     (node required for the comparison columns; missing bun
+#                     (pinned node for the comparison columns; missing bun
 #                     just drops that column -- best-effort install attempted)
 #     io-uring-ab  -- Linux-only same-binary A/B (bench.yml io-uring-ab parity)
 #     gc           -- reclaim accreted cargo output (scripts/gc-target.sh):
@@ -47,6 +50,16 @@
 # a genuinely-x64 process, so host arch == target arch and the snapshot is
 # correct by construction. Slower than native, but it is the only way to ship
 # the x64 targets without dedicated x64 hardware.
+#
+# Pinned Node: the oracle dispatches (conformance, surface-gaps, bench) run
+# against exactly the Node in .node-version, provisioned from nodejs.org into
+# ~/.cache/oam-node/node-v<version>-<platform> (sha256-verified against the
+# release's SHASUMS256.txt, cached per version) and put FIRST on PATH -- never
+# whatever node the host image or a package manager happens to carry. Fail-
+# closed: a host that cannot provision it fails those dispatches with the
+# reason. Mechanism and rationale: scripts/lib/node-pin.sh.
+# OAM_ALLOW_NODE_MISMATCH=1 (which the orchestrators do NOT forward) downgrades
+# that to a warning for a dispatch run by hand on the host.
 #
 # Cache layout: everything stays repo-relative (xtask resolves the oam binary
 # at `<repo>/target/<profile>/oam` and self-builds there, ignoring
@@ -102,6 +115,29 @@ smoke() {
   note "smoke ok ($bin)"
 }
 
+# use_pinned_node: put the pinned Node (.node-version) first on PATH for the
+# rest of this shell, provisioning it on first use. Dies unless it can -- the
+# value of the oracle is that it is the SAME Node on every leg, so a silent
+# fallback to the host's own node is exactly the failure this exists to stop.
+#
+# The lib is sourced HERE, not at the top: dispatches that never touch node
+# (gc above all) must keep working in a tree that carries only this script.
+use_pinned_node() {
+  local lib="scripts/lib/node-pin.sh"
+  [ -f "$lib" ] || die "$lib is missing -- cannot provision the pinned Node oracle (is the cwd the repo root?)"
+  # shellcheck source=lib/node-pin.sh
+  . "$lib"
+  if node_pin_use "."; then
+    note "node $(node --version) at $(command -v node) (pinned by .node-version)"
+    return 0
+  fi
+  if [ "${OAM_ALLOW_NODE_MISMATCH:-0}" = "1" ]; then
+    warn "pinned Node unavailable (reason above) -- OAM_ALLOW_NODE_MISMATCH=1, continuing with $(command -v node || echo 'NO node') $(node --version 2>/dev/null || true). Receipts from this run do NOT describe the pinned Node."
+    return 0
+  fi
+  die "could not put the pinned Node (.node-version) first on PATH -- reason above. The oracle must be that exact Node on every leg: fix the host (outbound HTTPS to nodejs.org, curl or wget, sha256sum or shasum) rather than fall back to its own node."
+}
+
 remote_prep() {
   # rustup auto-install: first run on a freshly-imaged host. `--default-
   # toolchain none` because the real toolchain comes from rust-toolchain.toml
@@ -121,14 +157,28 @@ remote_prep() {
   command -v cc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 \
     || die "no C compiler/linker driver (cc/clang). On Ubuntu: sudo apt-get install -y build-essential"
 
-  # node: required by conformance (differential oracle), node-suite, and the
-  # bench comparison columns. Warn here, hard-fail in the dispatches that
-  # actually need it -- a build-only run must not require node.
+  # node: the oracle dispatches need EXACTLY the pinned version. Provisioned
+  # here so the one-time download happens up front with its log in the prep
+  # step, but only WARNED on: a build-only run (OAM_LINUX_FAST=1) must not
+  # require node at all. The dispatches that need it call use_pinned_node
+  # themselves and die there.
+  #
+  # The host's own node is logged first. It is what these legs used to compare
+  # against, and naming it is how a reader sees what the pin replaced.
   if command -v node >/dev/null 2>&1; then
-    note "node $(node --version) on PATH"
+    note "host node: $(node --version) at $(command -v node) (NOT the oracle)"
   else
-    warn "node not on PATH -- conformance/node-suite/bench dispatches will fail"
+    note "host node: none on PATH (not needed -- the oracle is provisioned)"
   fi
+  # Subshell: prep only proves the pinned Node CAN be provisioned. Its PATH
+  # change stays in there, so the tsgo install below keeps using the host's
+  # npm exactly as before.
+  (
+    # shellcheck source=lib/node-pin.sh
+    . scripts/lib/node-pin.sh \
+      && node_pin_use "." \
+      && note "pinned node: $(node --version) at $(command -v node)"
+  ) || warn "could not provision the pinned Node (reason above) -- conformance/surface-gaps/bench dispatches will fail"
 
   # tsgo for the `oam check` tests: ci.yml ran this continue-on-error, so
   # best-effort here too. A USER prefix, not npm's system prefix: stock
@@ -164,7 +214,7 @@ run_test() {
 }
 
 run_conformance() {
-  command -v node >/dev/null 2>&1 || die "conformance needs node on PATH (differential oracle)"
+  use_pinned_node
   cargo run -p xtask -- conformance
 }
 
@@ -177,15 +227,20 @@ run_conformance() {
 # and the accumulated result covers every platform the gate runs on.
 # Until a host has a section the gate MEASURES but does not GATE there.
 run_surface_gaps() {
-  command -v node >/dev/null 2>&1 || die "surface-gaps needs node on PATH (parity oracle)"
+  use_pinned_node
   # The generator shells out to `cargo build` before probing; without this the
   # failure surfaces as a bare "cargo: not found" from inside a Node script.
   command -v cargo >/dev/null 2>&1 || die "surface-gaps needs cargo on PATH (run the prep dispatch first)"
   node scripts/gen-surface-gaps.mjs
 }
 
+# No node here, on purpose. The node-suite's oracle is each vendored test's own
+# exit code under oam: xtask never spawns node for it, and no vendored test
+# spawns `node` by name (they use process.execPath, which is oam). What ties it
+# to the pinned version is the CORPUS -- xtask refuses to run when
+# conformance/vendor/node/manifest.json names a different Node than
+# .node-version. Requiring node on PATH here only ever added a failure mode.
 run_node_suite() {
-  command -v node >/dev/null 2>&1 || die "node-suite needs node on PATH"
   cargo run -p xtask -- node-suite
 }
 
@@ -217,7 +272,7 @@ build_mac_x64() {
 }
 
 run_bench() {
-  command -v node >/dev/null 2>&1 || die "bench --compare needs node on PATH"
+  use_pinned_node
   # bun is optional (a missing bun just drops that column) -- try the official
   # installer once, non-blocking, matching bench.yml's install step.
   if ! command -v bun >/dev/null 2>&1; then

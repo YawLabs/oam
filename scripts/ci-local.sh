@@ -70,6 +70,11 @@
 #   OAM_SKIP_ATTRIBUTION=1   downgrade step 10 to a warning. Step 10 fails CLOSED,
 #                            so an offline box (cargo-about resolves some license
 #                            texts over the network) cannot push without this.
+#   OAM_ALLOW_NODE_MISMATCH=1  let steps 8-9 run against a `node` that is not the
+#                            version pinned in .node-version (warns instead of
+#                            refusing; xtask conformance honours it too). For an
+#                            ad-hoc run only -- the receipts then name the node
+#                            that really ran, which is not the parity target.
 #
 # Install as a pre-push hook (so you can't push without it passing). A
 # wrapper, NOT `ln -s`: MSYS/Git Bash `ln -s` silently COPIES the file, and
@@ -129,6 +134,11 @@ ko()  { echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 # release-local.sh's preflight reconcile and driven by scripts/test-scripts.sh.
 # shellcheck source=lib/attribution.sh
 . scripts/lib/attribution.sh
+
+# The pinned Node oracle (.node-version): the parse and the verdict the
+# preflight below makes, shared with the remote legs' provisioning.
+# shellcheck source=lib/node-pin.sh
+. scripts/lib/node-pin.sh
 
 # Leftovers under target/debug are, by definition, orphans of an earlier run:
 # nothing a human uses long-term runs out of the debug tree. Clearing them
@@ -195,6 +205,36 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT
+
+# Preflight, not a numbered step: the conformance oracle must be EXACTLY the
+# Node pinned in .node-version. xtask conformance refuses any other node too,
+# but it only runs at step 8 -- after the build, both test runs and the smoke
+# -- so a box with the wrong node would learn it ten minutes in. Checked here
+# it fails in a second. --fast skips steps 8-9, the only consumers, so it skips
+# this with them. The remote legs PROVISION the pinned Node instead
+# (scripts/build-remote.sh); this box is expected to carry it already.
+node_oracle_preflight() {
+  local pinned found verdict
+  pinned="$(node_pin_read .)" || ko "cannot read the pinned Node version (reason above)"
+  found="$(node --version 2>/dev/null || true)"
+  verdict="$(node_pin_verdict "$pinned" "$found" "${OAM_ALLOW_NODE_MISMATCH:-0}" || true)"
+  case "$verdict" in
+    pinned)
+      ok "node $found on PATH is the pinned oracle (.node-version)" ;;
+    mismatch-allowed)
+      warn "node on PATH is $found, NOT the pinned v$pinned -- continuing because OAM_ALLOW_NODE_MISMATCH=1; conformance receipts from this run do not describe the parity target" ;;
+    absent-allowed)
+      warn "no node on PATH (pinned: v$pinned) -- OAM_ALLOW_NODE_MISMATCH=1 does not make step 8 runnable without one" ;;
+    mismatch)
+      ko "node on PATH is $found ($(command -v node)), but .node-version pins v$pinned -- the conformance oracle must be exactly that Node. Install v$pinned and put it first on PATH, or set OAM_ALLOW_NODE_MISMATCH=1 for an ad-hoc run (or use --fast, which skips conformance)." ;;
+    *)
+      ko "no node on PATH, and conformance (step 8) needs exactly v$pinned (.node-version) -- install it, or use --fast, which skips conformance." ;;
+  esac
+}
+if [ "$FAST" -eq 0 ]; then
+  say "Preflight: pinned Node oracle"
+  node_oracle_preflight
+fi
 
 say "1/14 Control bytes (raw C0 in tracked text)"
 # FIRST because it is the cheapest gate in the file (~1s over 859 tracked

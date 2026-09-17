@@ -1504,6 +1504,212 @@ CURLSTUB
 fi
 
 # =============================================================================
+group "node-pin.sh -- the pinned Node oracle"
+# =============================================================================
+# The mac and linux legs compared oam against v22.23.1 for their whole lives
+# while every receipt claimed parity with v22.22.2, because each leg used
+# whatever `node` its PATH found and nothing checked. These drive the real
+# provisioning path end to end -- a planted release served over file:// with
+# real curl, tar and sha256 -- so the only thing not exercised is nodejs.org.
+# shellcheck source=lib/node-pin.sh
+. scripts/lib/node-pin.sh
+
+# The parse is duplicated in xtask/src/node_pin.rs (parse_pin) and
+# gen-surface-gaps.mjs; these are the same cases xtask's unit tests pin.
+it "the pin parse accepts the spellings version managers accept"
+NP_BAD=""
+for np_in in "22.22.2" "v22.22.2" "  22.22.2"$'\r\n' "22.22.2"$'\n'; do
+  [ "$(node_pin_parse "$np_in")" = "22.22.2" ] || NP_BAD="$NP_BAD $(printf '%q' "$np_in")"
+done
+if [ -z "$NP_BAD" ]; then pass; else fail "not parsed to 22.22.2:$NP_BAD"; fi
+
+it "the pin parse refuses anything but one exact MAJOR.MINOR.PATCH"
+NP_BAD=""
+for np_in in "" "22" "22.22" "22.22.2.1" "lts/jod" "22.x" "^22.22.2" "vv22.22.2" \
+             "22..2" "22.22.2"$'\n'"22.23.1" "22.22.2 # comment" "22.22. 2" "22.22.-2"; do
+  node_pin_parse "$np_in" >/dev/null 2>&1 && NP_BAD="$NP_BAD $(printf '%q' "$np_in")"
+done
+if [ -z "$NP_BAD" ]; then pass; else fail "accepted:$NP_BAD"; fi
+
+# The corpus is a snapshot of one Node tag, and the pin names the oracle. xtask
+# node-suite refuses to run when these disagree; this catches it on a box that
+# never runs the node-suite.
+it "the committed .node-version matches the vendored corpus's nodeVersion"
+NP_PIN="$(node_pin_read .)"
+NP_CORPUS="$(grep -o '"nodeVersion"[[:space:]]*:[[:space:]]*"[^"]*"' conformance/vendor/node/manifest.json | head -1 | grep -o 'v[0-9.]*')"
+eq "v$NP_PIN" "$NP_CORPUS"
+
+it "a missing pin file is refused with the reason, not read as empty"
+mkdir -p "$SUITE_TMP/np-nopin"
+NP_OUT="$(node_pin_read "$SUITE_TMP/np-nopin" 2>&1)"; NP_RC=$?
+if [ "$NP_RC" != "0" ] && grep -q 'is missing' <<<"$NP_OUT"; then pass; else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+# verdict: "<echoed verdict> <return code>" for each input.
+np_verdict(){ local v rc; v="$(node_pin_verdict "$@")"; rc=$?; echo "$v $rc"; }
+it "the verdict passes exactly the pinned version"
+eq "$(np_verdict 22.22.2 v22.22.2 0)" "pinned 0"
+it "the verdict refuses another version, including a prefix-sibling"
+eq "$(np_verdict 22.22.2 v22.23.1 0) / $(np_verdict 22.22.2 v22.22.20 0) / $(np_verdict 22.22.2 22.22.2 0)" \
+   "mismatch 1 / mismatch 1 / mismatch 1"
+it "the verdict refuses an absent node"
+eq "$(np_verdict 22.22.2 "" 0)" "absent 1"
+it "only a literal 1 opens the escape hatch"
+eq "$(np_verdict 22.22.2 v22.23.1 1) / $(np_verdict 22.22.2 "" 1) / $(np_verdict 22.22.2 v22.23.1 true) / $(np_verdict 22.22.2 v22.23.1 "")" \
+   "mismatch-allowed 0 / absent-allowed 0 / mismatch 1 / mismatch 1"
+
+it "tarball platforms map from uname, and a host without one is refused"
+eq "$(node_dist_platform Darwin arm64) $(node_dist_platform Linux x86_64) $(node_dist_platform Linux aarch64) $(node_dist_platform Darwin x86_64) $(node_dist_platform MINGW64_NT-10.0-26200 aarch64 || echo refused) $(node_dist_platform Linux ppc64le || echo refused)" \
+   "darwin-arm64 linux-x64 linux-arm64 darwin-x64 refused refused"
+
+NP_SUMS="$SUITE_TMP/np-SHASUMS256.txt"
+NP_H1="1111111111111111111111111111111111111111111111111111111111111111"
+NP_H2="2222222222222222222222222222222222222222222222222222222222222222"
+# The longer names come FIRST: a prefix or substring match would stop on them
+# before ever reaching the real line (a mutation with the lines the other way
+# round sailed through).
+printf '%s  node-v9.8.7-linux-x64.tar.gz.sig\n%s  node-v9.8.7-linux-x64.tar.xz\n%s  node-v9.8.7-linux-x64.tar.gz\nnothex  node-v9.8.7-darwin-arm64.tar.gz\n' \
+  "$NP_H1" "$NP_H1" "$NP_H2" > "$NP_SUMS"
+it "the checksum lookup matches the whole file name, not a prefix-sibling"
+eq "$(node_shasum_for "$NP_SUMS" node-v9.8.7-linux-x64.tar.gz)" "$NP_H2"
+it "the checksum lookup refuses an unlisted name and a malformed digest"
+eq "$(node_shasum_for "$NP_SUMS" node-v9.8.7-linux-arm64.tar.gz || echo refused) $(node_shasum_for "$NP_SUMS" node-v9.8.7-darwin-arm64.tar.gz || echo refused)" \
+   "refused refused"
+
+# A planted release: node-v9.8.7-linux-x64.tar.gz whose bin/node is a shell
+# script reporting its version, so it runs on every host this suite does
+# (including the Windows box, which has no nodejs.org tarball of its own).
+NP_DIST="$SUITE_TMP/np-dist"
+NP_CACHE="$SUITE_TMP/np-cache"
+np_stage="$SUITE_TMP/np-stage/node-v9.8.7-linux-x64/bin"
+mkdir -p "$np_stage" "$NP_DIST/v9.8.7"
+printf '#!/bin/sh\necho v9.8.7\n' > "$np_stage/node"
+chmod +x "$np_stage/node"
+tar -czf "$NP_DIST/v9.8.7/node-v9.8.7-linux-x64.tar.gz" -C "$SUITE_TMP/np-stage" node-v9.8.7-linux-x64
+# The same bytes under the arm64 name, listed with a WRONG digest below.
+cp "$NP_DIST/v9.8.7/node-v9.8.7-linux-x64.tar.gz" "$NP_DIST/v9.8.7/node-v9.8.7-linux-arm64.tar.gz"
+printf '%s  node-v9.8.7-linux-x64.tar.gz\n%s  node-v9.8.7-linux-arm64.tar.gz\n' \
+  "$(node_sha256 "$NP_DIST/v9.8.7/node-v9.8.7-linux-x64.tar.gz")" "$NP_H1" > "$NP_DIST/v9.8.7/SHASUMS256.txt"
+# curl on the Windows box is a native program and wants a drive-letter URL.
+if command -v cygpath >/dev/null 2>&1; then NP_URL="file:///$(cygpath -m "$NP_DIST")"; else NP_URL="file://$NP_DIST"; fi
+np_partials(){ ls -A "$NP_CACHE" 2>/dev/null | grep -c '^\.partial-' || true; }
+
+# A cache entry that exists but does not report the pinned version -- a
+# truncated extract, a hand edit -- must be replaced, never believed.
+mkdir -p "$NP_CACHE/node-v9.8.7-linux-x64/bin"
+printf '#!/bin/sh\necho v0.0.1\n' > "$NP_CACHE/node-v9.8.7-linux-x64/bin/node"
+chmod +x "$NP_CACHE/node-v9.8.7-linux-x64/bin/node"
+it "provisioning verifies, installs and replaces a broken cache entry"
+NP_OUT="$(OAM_NODE_DIST_URL="$NP_URL" OAM_NODE_CACHE="$NP_CACHE" node_pin_provision 9.8.7 linux-x64 2>&1)"; NP_RC=$?
+if [ "$NP_RC" = "0" ] && [ "$NP_OUT" = "$NP_CACHE/node-v9.8.7-linux-x64/bin" ] \
+   && [ "$("$NP_CACHE/node-v9.8.7-linux-x64/bin/node")" = "v9.8.7" ] && [ "$(np_partials)" = "0" ]; then pass
+else fail "rc=$NP_RC out=$NP_OUT partials=$(np_partials)"; fi
+
+it "a warm cache needs no network, and node_pin_use puts it first on PATH"
+printf '9.8.7\n' > "$SUITE_TMP/np-nopin/.node-version"
+NP_OUT="$(
+  OAM_NODE_DIST_URL="file:///nonexistent-dist" OAM_NODE_CACHE="$NP_CACHE"
+  node_pin_use "$SUITE_TMP/np-nopin" linux-x64 || exit 1
+  echo "$(command -v node) $(node --version)"
+)"; NP_RC=$?
+eq "$NP_RC $NP_OUT" "0 $NP_CACHE/node-v9.8.7-linux-x64/bin/node v9.8.7"
+
+it "a download that fails its checksum is refused and never installed"
+NP_OUT="$(OAM_NODE_DIST_URL="$NP_URL" OAM_NODE_CACHE="$NP_CACHE" node_pin_provision 9.8.7 linux-arm64 2>&1)"; NP_RC=$?
+if [ "$NP_RC" != "0" ] && grep -q 'CHECKSUM MISMATCH' <<<"$NP_OUT" \
+   && [ ! -e "$NP_CACHE/node-v9.8.7-linux-arm64" ] && [ "$(np_partials)" = "0" ]; then pass
+else fail "rc=$NP_RC partials=$(np_partials) out=$NP_OUT"; fi
+
+it "a platform the release does not list is refused with the reason"
+NP_OUT="$(OAM_NODE_DIST_URL="$NP_URL" OAM_NODE_CACHE="$NP_CACHE" node_pin_provision 9.8.7 darwin-arm64 2>&1)"; NP_RC=$?
+if [ "$NP_RC" != "0" ] && grep -q 'publishes no official build' <<<"$NP_OUT" && [ "$(np_partials)" = "0" ]; then pass
+else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+# --- the consumers ------------------------------------------------------------
+
+# A leg that cannot get the pinned Node must STOP, not quietly compare against
+# the host's own -- which is exactly what every leg used to do. The bare tree
+# has no Cargo.toml, so if the dispatch got past the oracle it would say so.
+it "build-remote.sh conformance dies before cargo when the pinned Node is unavailable"
+NP_BARE="$SUITE_TMP/np-bare"
+mkdir -p "$NP_BARE/scripts/lib"
+cp scripts/build-remote.sh "$NP_BARE/scripts/"
+cp scripts/lib/node-pin.sh "$NP_BARE/scripts/lib/"
+printf '9.8.6\n' > "$NP_BARE/.node-version"
+NP_OUT="$(cd "$NP_BARE" && OAM_NODE_DIST_URL="file:///nonexistent-dist" OAM_NODE_CACHE="$SUITE_TMP/np-empty-cache" \
+  OAM_ALLOW_NODE_MISMATCH= bash scripts/build-remote.sh conformance 2>&1)"; NP_RC=$?
+if [ "$NP_RC" != "0" ] && grep -q 'could not put the pinned Node' <<<"$NP_OUT" && ! grep -q 'Cargo.toml' <<<"$NP_OUT"; then pass
+else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+it "OAM_ALLOW_NODE_MISMATCH=1 lets a hand-run dispatch continue, loudly"
+NP_OUT="$(cd "$NP_BARE" && OAM_NODE_DIST_URL="file:///nonexistent-dist" OAM_NODE_CACHE="$SUITE_TMP/np-empty-cache" \
+  OAM_ALLOW_NODE_MISMATCH=1 PATH="/usr/bin:/bin" HOME="$SUITE_TMP/np-home" bash scripts/build-remote.sh conformance 2>&1)"
+if grep -q 'OAM_ALLOW_NODE_MISMATCH=1, continuing' <<<"$NP_OUT" && ! grep -q 'could not put the pinned Node' <<<"$NP_OUT"; then pass
+else fail "out=$NP_OUT"; fi
+
+# Source-level, like the ci-local wiring group: which dispatches take the
+# oracle. `bash -c` over a sourced copy would run them; this reads them.
+np_body(){ awk -v f="$1() {" '$0 == f {on = 1; next} on && /^}/ {exit} on {print}' scripts/build-remote.sh; }
+it "every oracle dispatch goes through use_pinned_node"
+NP_BAD=""
+for fn in run_conformance run_surface_gaps run_bench; do
+  grep -q '^[[:space:]]*use_pinned_node$' <<<"$(np_body "$fn")" || NP_BAD="$NP_BAD $fn"
+done
+if [ -z "$NP_BAD" ]; then pass; else fail "not provisioning the pinned Node:$NP_BAD"; fi
+
+it "no dispatch checks for a bare node on PATH instead of the pin"
+NP_HITS="$(grep -n 'command -v node >/dev/null 2>&1 ||' scripts/build-remote.sh || true)"
+if [ -z "$NP_HITS" ]; then pass; else fail "bare node checks remain: $NP_HITS"; fi
+
+it "the node-suite dispatch does not require node (its oracle is the exit code)"
+if ! grep -q 'node' <<<"$(np_body run_node_suite | grep -v 'node-suite')"; then pass
+else fail "run_node_suite mentions node: $(np_body run_node_suite)"; fi
+
+it "ci-local.sh checks the pinned Node before step 1, and only when conformance runs"
+NP_PRE="$(grep -n 'node_oracle_preflight$' scripts/ci-local.sh | tail -1 | cut -d: -f1)"
+NP_STEP1="$(grep -n 'say "1/14' scripts/ci-local.sh | cut -d: -f1)"
+NP_GUARD="$(sed -n "$((NP_PRE - 2))p" scripts/ci-local.sh)"
+if [ -n "$NP_PRE" ] && [ -n "$NP_STEP1" ] && [ "$NP_PRE" -lt "$NP_STEP1" ] \
+   && [[ "$NP_GUARD" == *'"$FAST" -eq 0'* ]] && grep -q 'node_pin_verdict' scripts/ci-local.sh; then pass
+else fail "preflight line=$NP_PRE step1=$NP_STEP1 guard='$NP_GUARD'"; fi
+
+# gen-surface-gaps.mjs writes COMMITTED ratchet data, so a wrong node there
+# poisons every later gate run. A copy in a scratch tree: the pin check has to
+# fire before it builds anything, and the tree has nothing to build.
+if ! command -v node >/dev/null 2>&1; then
+  it "gen-surface-gaps.mjs refuses a node that is not the pin"
+  skip "node not on PATH -- the generator cannot run here"
+else
+  NP_SG="$SUITE_TMP/np-sg"
+  mkdir -p "$NP_SG/scripts"
+  cp scripts/gen-surface-gaps.mjs "$NP_SG/scripts/"
+  np_sg(){ ( cd "$NP_SG" && node scripts/gen-surface-gaps.mjs "$@" 2>&1 ); }
+
+  it "gen-surface-gaps.mjs refuses a node that is not the pin, before building"
+  printf '0.0.1\n' > "$NP_SG/.node-version"
+  NP_OUT="$(OAM_ALLOW_NODE_MISMATCH= np_sg)"; NP_RC=$?
+  if [ "$NP_RC" != "0" ] && grep -q 'refusing to record' <<<"$NP_OUT" && ! grep -q 'building oam' <<<"$NP_OUT"; then pass
+  else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+  it "gen-surface-gaps.mjs refuses a malformed pin"
+  printf 'lts/jod\n' > "$NP_SG/.node-version"
+  NP_OUT="$(np_sg)"; NP_RC=$?
+  if [ "$NP_RC" != "0" ] && grep -q 'MAJOR.MINOR.PATCH' <<<"$NP_OUT"; then pass; else fail "rc=$NP_RC out=$NP_OUT"; fi
+
+  # Past the check, the explicit (nonexistent) oam path is what fails -- which
+  # is how these two tell "the gate let it through" from "the gate refused".
+  it "gen-surface-gaps.mjs lets the pinned node through without a warning"
+  node --version > "$NP_SG/.node-version"
+  NP_OUT="$(np_sg "$SUITE_TMP/no-such-oam")"
+  if ! grep -q 'refusing to record\|WARNING' <<<"$NP_OUT"; then pass; else fail "out=$NP_OUT"; fi
+
+  it "gen-surface-gaps.mjs honours OAM_ALLOW_NODE_MISMATCH=1, loudly"
+  printf '0.0.1\n' > "$NP_SG/.node-version"
+  NP_OUT="$(OAM_ALLOW_NODE_MISMATCH=1 np_sg "$SUITE_TMP/no-such-oam")"
+  if grep -q 'WARNING: recording against node' <<<"$NP_OUT" && ! grep -q 'refusing to record' <<<"$NP_OUT"; then pass
+  else fail "out=$NP_OUT"; fi
+fi
+
+# =============================================================================
 # The front-page conformance figures are a RECEIPT, and README.md says two
 # lines above them that receipts are "never hand-edited". They drifted anyway:
 # the docs claimed 429/431 with "both remaining failures" long after the
