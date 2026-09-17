@@ -15,9 +15,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # node:zlib compression backend.
 flate2 = { workspace = true }
-# HTTP server (hyper rides in-tree via reqwest).
-hyper = { workspace = true }
-hyper-util = { workspace = true }
+# HTTP server (hyper rides in-tree via reqwest), and since #143 the client
+# half of the fetch transport: hyper-util's pooled legacy client with oam's
+# own connector, its env-proxy Matcher and CONNECT tunnel. reqwest already
+# enables every one of these features on the same versions.
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "client-proxy", "http1", "http2"] }
+h2 = { workspace = true }
+tower-service = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 # http_client (#143): request preparation and the redirect step.
@@ -62,7 +68,9 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 #
 # NOT new supply chain: socket2 0.6.4 already compiles in the graph via tokio
 # and hyper-util. A new dependency EDGE onto a crate already being built.
-socket2 = "0.6"
+# "all" for the fetch connector's keepalive probe count and TCP_USER_TIMEOUT;
+# hyper-util already builds socket2 with it.
+socket2 = { version = "0.6", features = ["all"] }
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

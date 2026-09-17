@@ -133,6 +133,15 @@ brotli-decompressor = { version = "5", default-features = false, features = ["st
 # that cannot tell). Already compiled: it IS flate2's rust_backend, and
 # flate2 enables with-alloc + simd on it, so no feature changes either.
 miniz_oxide = { version = "0.8", default-features = false }
+# oam's fetch transport (http_client/{connector,transport,send}.rs, #143 slice
+# C). All three already compile in the graph through oam_loader's reqwest
+# (the install client), with these features: new dependency EDGES, no new
+# packages. h2 is named only to classify a retryable stream error (hyper does
+# not re-export it); tower-service is the connector's `Service<Uri>`;
+# rustls-platform-verifier is the trust store fetch has always used.
+h2 = "0.4"
+tower-service = "0.3"
+rustls-platform-verifier = "0.7"
 # TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
 # bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
 # All three are already compiled transitively via tokio-tungstenite --
