@@ -6,9 +6,11 @@
 //     caller picks the authority a name-based virtual host, a cache or an
 //     SSRF filter sees while the connection goes somewhere else.
 //   - `transfer-encoding`, `keep-alive`, `upgrade`, `expect` and a
-//     `connection` that is not `close` are refused before anything dials
-//     (the CL.TE evasion is the `connection: "close, transfer-encoding"`
-//     case). `connection: close` alone IS sent.
+//     `connection` that is neither `close` nor `keep-alive` are refused
+//     before anything dials (the CL.TE evasion is the
+//     `connection: "close, transfer-encoding"` case). `close` and
+//     `keep-alive` ARE sent, lowercased. `te` -- also hop-by-hop -- is sent
+//     untouched, because node sends it.
 //   - A `content-length` longer than the body is refused. oam refuses a
 //     SHORT one too, where node hangs instead -- not asserted here, it is an
 //     e2e test.
@@ -50,6 +52,7 @@ const srv = http.createServer((req, res) => {
         method: req.method,
         hostIsOrigin: req.headers.host === `127.0.0.1:${PORT}`,
         connectionClose: req.headers.connection === "close",
+        te: req.headers.te ?? null,
         contentType: req.headers["content-type"] ?? null,
         xd: req.headers["x-d"] ?? null,
         auth: req.headers.authorization ?? null,
@@ -79,6 +82,12 @@ async function one(label, url, init) {
 await one("baseline", U, {});
 await one("caller host dropped", U, { headers: { host: "spoof.test" } });
 await one("connection close", U, { headers: { connection: "close" } });
+// The `connection` rule turns on the VALUE, case-insensitively: `close` and
+// `keep-alive` are both accepted, anything else is refused. oam refused
+// `keep-alive` and `CLOSE` on a first cut of this guard.
+await one("connection CLOSE", U, { headers: { connection: "CLOSE" } });
+await one("connection keep-alive", U, { headers: { connection: "keep-alive" } });
+await one("te alone", U, { headers: { te: "trailers" } });
 await one("connection close,te", U, {
   method: "POST",
   body: "AB",

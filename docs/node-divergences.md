@@ -1297,6 +1297,11 @@ an error where oam used to send something)
   a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
+- A `Request` object as the first argument is NOT a supported input (it never was): the
+  argument is stringified, so `fetch(new Request(url))` throws
+  `TypeError: Failed to parse URL from [object Request]`. A string or a `URL` works. This is
+  a gap rather than a refusal -- it is loud, it loses nothing, and half-supporting it (the
+  url and method but not the body) would be worse than throwing. Tracked as a follow-up.
 - `transfer-encoding`, `keep-alive`, `upgrade`, a `connection` whose value is not `close`,
   and `expect` are refused with undici's texts (`invalid transfer-encoding header`,
   `invalid keep-alive header`, `invalid upgrade header`, `invalid connection header`,

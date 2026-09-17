@@ -1123,29 +1123,38 @@
   // Request headers undici refuses to dispatch, and the error each one
   // raises. Measured on node v22.22.2 + undici 6.24.1 against a raw-socket
   // server: every one of these fails the fetch BEFORE anything reaches the
-  // wire. `connection` is refused only when its value is not `close`
-  // (`connection: close` alone is sent), which is what makes
-  // `connection: "close, transfer-encoding"` -- the CL.TE evasion -- fail.
+  // wire.
+  //
+  // `connection` is the one that turns on the VALUE, case-insensitively:
+  // `close` and `keep-alive` are both accepted and go out lowercased
+  // (`{connection: 'CLOSE'}` writes `connection: close`), and anything else --
+  // notably `close, transfer-encoding`, the CL.TE evasion -- is refused.
   //
   // This is NOT the Fetch Standard's forbidden-header list: node sends
   // `via`, `date`, `dnt`, `origin`, `referer`, `cookie`, `cookie2`,
-  // `accept-charset`, `set-cookie`, `trailer`, `proxy-*` and
+  // `accept-charset`, `set-cookie`, `trailer`, `te`, `proxy-*` and
   // `access-control-request-*` straight through (all measured), so oam does
   // too. `host` is the one node silently drops.
-  function dispatchRefusal(name, value) {
+  //
+  // Returns `[name, message]` to refuse with, or the value to send.
+  function dispatchHeader(name, value) {
     switch (name) {
       case "transfer-encoding":
-        return ["InvalidArgumentError", "invalid transfer-encoding header"];
+        return { refuse: ["InvalidArgumentError", "invalid transfer-encoding header"] };
       case "keep-alive":
-        return ["InvalidArgumentError", "invalid keep-alive header"];
+        return { refuse: ["InvalidArgumentError", "invalid keep-alive header"] };
       case "upgrade":
-        return ["InvalidArgumentError", "invalid upgrade header"];
+        return { refuse: ["InvalidArgumentError", "invalid upgrade header"] };
       case "expect":
-        return ["NotSupportedError", "expect header not supported"];
-      case "connection":
-        return value === "close" ? null : ["InvalidArgumentError", "invalid connection header"];
+        return { refuse: ["NotSupportedError", "expect header not supported"] };
+      case "connection": {
+        const lower = value.toLowerCase();
+        return lower === "close" || lower === "keep-alive"
+          ? { value: lower }
+          : { refuse: ["InvalidArgumentError", "invalid connection header"] };
+      }
       default:
-        return null;
+        return { value };
     }
   }
 
@@ -1211,13 +1220,13 @@
           // controls the authority a name-based virtual host, a cache or an
           // SSRF filter sees while the connection goes somewhere else.
           if (name === "host") continue;
-          const refusal = dispatchRefusal(name, value);
-          if (refusal !== null) {
-            const cause = new Error(refusal[1]);
-            cause.name = refusal[0];
+          const verdict = dispatchHeader(name, value);
+          if (verdict.refuse !== undefined) {
+            const cause = new Error(verdict.refuse[1]);
+            cause.name = verdict.refuse[0];
             throw new TypeError("fetch failed", { cause });
           }
-          headers.push([name, value]);
+          headers.push([name, verdict.value]);
         }
       }
     }
