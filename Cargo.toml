@@ -127,6 +127,12 @@ percent-encoding = "2"
 # stream directly for bounded output. Already compiled: brotli (node:zlib)
 # depends on it with the same features.
 brotli-decompressor = { version = "5", default-features = false, features = ["std"] }
+# fetch's gzip/deflate response decoding drives miniz_oxide's core inflate
+# directly, holding the window itself so a copy from before the start of the
+# output fails as zlib's does (flate2's wrapper keeps a wrapping dictionary
+# that cannot tell). Already compiled: it IS flate2's rust_backend, and
+# flate2 enables with-alloc + simd on it, so no feature changes either.
+miniz_oxide = { version = "0.8", default-features = false }
 # TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
 # bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
 # All three are already compiled transitively via tokio-tungstenite --

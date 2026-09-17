@@ -1927,6 +1927,7 @@ dependencies = [
  "hyper-util",
  "io-uring",
  "libc",
+ "miniz_oxide",
  "oam_diagnostics",
  "percent-encoding",
  "reqwest",

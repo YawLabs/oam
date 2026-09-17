@@ -30,10 +30,24 @@
 //! Rust backend (miniz_oxide) has no gzip-wrapped `Decompress` (`new_gzip` is
 //! `cfg(any_zlib)`): header, raw inflate, CRC32 + ISIZE trailer, following
 //! zlib's inflate.c and node_zlib.cc for which bytes are an error and when.
+//!
+//! Inflate itself is miniz_oxide's core decoder (the one under flate2) driven
+//! with the history held here, not flate2's `Decompress`: that keeps miniz's
+//! wrapping 32 KiB dictionary, where a copy from before the first output byte
+//! is not detected and reads whatever the dictionary holds -- zeros, or the
+//! previous gzip member -- while zlib fails it ("invalid distance too far
+//! back"). See [`Inflater`]. Error TEXTS for corrupt deflate data are not
+//! zlib's: miniz reports one failure for every kind.
 
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
 use bytes::{Buf, Bytes};
-use flate2::{Crc, Decompress, FlushDecompress, Status};
+use flate2::Crc;
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::inflate_flags::{
+    TINFL_FLAG_COMPUTE_ADLER32, TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_IGNORE_ADLER32,
+    TINFL_FLAG_PARSE_ZLIB_HEADER, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+};
+use miniz_oxide::inflate::core::{DecompressorOxide, decompress};
 
 /// undici fetch/index.js:2140: more content-codings than this fails the fetch
 /// ("too many content-encodings in response: N, maximum allowed is 5"), a
@@ -158,7 +172,8 @@ impl std::error::Error for DecodeError {}
 /// A streaming decoder for one response body.
 ///
 /// Memory is bounded independently of the body: one [`OUT_CAP`] window per
-/// stage, the inflate state (a 32 KiB dictionary) or the brotli state (its
+/// stage, the inflate state (its 32 KiB window plus one chunk of room, and
+/// miniz's 10.5 KB of decoder state) or the brotli state (its
 /// ring buffer, at most the stream's declared window), and nothing that grows
 /// with the input or output size.
 pub struct Decoder {
@@ -398,21 +413,84 @@ impl Stage {
     }
 }
 
-/// One step of raw or zlib inflate with sync-flush semantics.
-fn inflate_step(
-    inflate: &mut Decompress,
-    src: &[u8],
-    dst: &mut [u8],
-) -> Result<(Step, bool), DecodeError> {
-    let (in_before, out_before) = (inflate.total_in(), inflate.total_out());
-    let status = inflate
-        .decompress(src, dst, FlushDecompress::Sync)
-        .map_err(|_| DecodeError("invalid deflate data"))?;
-    let step = Step {
-        consumed: (inflate.total_in() - in_before) as usize,
-        produced: (inflate.total_out() - out_before) as usize,
-    };
-    Ok((step, status == Status::StreamEnd))
+/// The deflate window: the farthest a copy can reach back (RFC 1951), and the
+/// window node's zlib inflates with (windowBits 15 for gunzip and raw; a
+/// zlib header's smaller CINFO does not shrink it, inflate.c keeps `wbits`).
+const WINDOW: usize = 32 * 1024;
+
+/// Raw or zlib inflate with sync-flush semantics over miniz_oxide's core
+/// decoder, in its non-wrapping mode: the output buffer is the history, and
+/// a copy reaching past its start fails -- zlib's "invalid distance too far
+/// back" check (inflate.c `state->offset > state->whave + out - left`).
+///
+/// `hist[..pos]` holds the last `min(output so far, WINDOW)` bytes, and each
+/// step decodes into the [`OUT_CAP`] after them, so a step's output is at
+/// most one chunk -- zlib's granularity with node's 16 KiB `chunkSize`, where
+/// flate2 inflated up to its 32 KiB dictionary per call. When the next step
+/// would not fit, the last `WINDOW` bytes slide to the front; `pos` only
+/// exceeds `WINDOW` once the stream has, so the check stays exact.
+struct Inflater {
+    core: Box<DecompressorOxide>,
+    hist: Box<[u8]>,
+    pos: usize,
+    zlib: bool,
+}
+
+impl Inflater {
+    fn new(zlib: bool) -> Inflater {
+        Inflater {
+            core: Box::default(),
+            hist: vec![0u8; WINDOW + OUT_CAP].into_boxed_slice(),
+            pos: 0,
+            zlib,
+        }
+    }
+
+    /// Start a new stream: zlib's `inflateReset` empties the window too
+    /// (`whave = 0`), so the next gzip member cannot copy from this one.
+    fn reset(&mut self) {
+        self.core.init();
+        self.pos = 0;
+    }
+
+    /// One step: consume from `src`, write at most `dst.len().min(OUT_CAP)`
+    /// bytes to `dst`. The bool is true once the stream (and for zlib its
+    /// Adler-32) is complete.
+    fn step(&mut self, src: &[u8], dst: &mut [u8]) -> Result<(Step, bool), DecodeError> {
+        let room = dst.len().min(OUT_CAP);
+        if self.pos + room > self.hist.len() {
+            self.hist.copy_within(self.pos - WINDOW..self.pos, 0);
+            self.pos = WINDOW;
+        }
+        // HAS_MORE_INPUT: running out of input mid-stream is NeedsMoreInput,
+        // never an error -- truncation is not one (undici's `finishFlush`).
+        let mut flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | TINFL_FLAG_HAS_MORE_INPUT;
+        flags |= if self.zlib {
+            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32
+        } else {
+            TINFL_FLAG_IGNORE_ADLER32
+        };
+        let (status, consumed, produced) = decompress(
+            &mut self.core,
+            src,
+            &mut self.hist[..self.pos + room],
+            self.pos,
+            flags,
+        );
+        let out = self.pos..self.pos + produced;
+        dst[..produced].copy_from_slice(&self.hist[out]);
+        self.pos += produced;
+        let step = Step { consumed, produced };
+        match status {
+            TINFLStatus::Done => Ok((step, true)),
+            TINFLStatus::NeedsMoreInput | TINFLStatus::HasMoreOutput => Ok((step, false)),
+            TINFLStatus::Adler32Mismatch => Err(DecodeError("incorrect data check")),
+            // Failed (a bad block, code, length or distance -- including one
+            // from before the start of the output), and the two statuses
+            // these flags rule out (BadParam, FailedCannotMakeProgress).
+            _ => Err(DecodeError("invalid deflate data")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +535,7 @@ enum Gz {
 
 struct GzipStage {
     at: Gz,
-    inflate: Decompress,
+    inflate: Inflater,
     /// CRC32 and size of the member's decoded bytes.
     crc: Crc,
     /// CRC32 of the header bytes, for FHCRC.
@@ -473,7 +551,7 @@ impl GzipStage {
     fn new() -> GzipStage {
         GzipStage {
             at: Gz::Id1,
-            inflate: Decompress::new(false),
+            inflate: Inflater::new(false),
             crc: Crc::new(),
             header_crc: Crc::new(),
             held: 0,
@@ -485,7 +563,7 @@ impl GzipStage {
 
     fn next_member(&mut self) {
         self.at = Gz::Id1;
-        self.inflate.reset(false);
+        self.inflate.reset();
         self.crc = Crc::new();
         self.header_crc = Crc::new();
     }
@@ -501,7 +579,7 @@ impl GzipStage {
                     });
                 }
                 Gz::Body => {
-                    let (step, end) = inflate_step(&mut self.inflate, &src[consumed..], dst)?;
+                    let (step, end) = self.inflate.step(&src[consumed..], dst)?;
                     consumed += step.consumed;
                     self.crc.update(&dst[..step.produced]);
                     if end {
@@ -668,7 +746,7 @@ enum DeflateStage {
     /// one: `(b & 0x0f) === 0x08` is a zlib header (CM 8), anything else raw
     /// deflate.
     Detect,
-    Inflate(Decompress),
+    Inflate(Inflater),
     /// The deflate stream ended. node's zlib ignores whatever follows
     /// (Inflate/InflateRaw only look past the end for gzip members); measured:
     /// zlib+"JUNK" and raw+"JUNK" both decode without error.
@@ -686,11 +764,11 @@ impl DeflateStage {
                     produced: 0,
                 });
             };
-            *self = DeflateStage::Inflate(Decompress::new(first & 0x0f == 0x08));
+            *self = DeflateStage::Inflate(Inflater::new(first & 0x0f == 0x08));
         }
         match self {
             DeflateStage::Inflate(inflate) => {
-                let (step, end) = inflate_step(inflate, src, dst)?;
+                let (step, end) = inflate.step(src, dst)?;
                 if end {
                     *self = DeflateStage::Done;
                 }
@@ -1889,9 +1967,7 @@ mod tests {
         let h = head(0);
         assert!(decode(&[&cat(&[&h, &[0x07]])]).is_err());
         assert_eq!(decode(&[&h, &[0x07]]), Ok((b"head".to_vec(), true)));
-        // 40000 rather than node's 20000: flate2's miniz backend inflates up
-        // to its 32 KiB dictionary per call, not zlib's 16 KiB.
-        for fill in [40_000, 100_000, 1_000_000] {
+        for fill in [20_000, 100_000, 1_000_000] {
             let wire = cat(&[&head(fill), &[0x07]]);
             assert_eq!(decode(&[&wire]), Ok((b"head".to_vec(), true)), "{fill}");
         }
@@ -1970,6 +2046,191 @@ mod tests {
                     let fed = ((i + 1) * size).min(wire.len());
                     let want = end.is_some_and(|e| fed > e);
                     assert_eq!(*got, want, "{name}: size {size} after {fed} bytes");
+                }
+            }
+        }
+    }
+
+    // -- back-references before the start of the output ----------------------
+
+    /// A deflate bit writer for hand-built streams (RFC 1951 fixed-Huffman
+    /// and stored blocks): header fields LSB-first, Huffman codes MSB-first.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        cur: u32,
+        n: u32,
+    }
+
+    impl Bits {
+        fn bits(&mut self, v: u32, n: u32) {
+            for i in 0..n {
+                self.cur |= ((v >> i) & 1) << self.n;
+                self.n += 1;
+                if self.n == 8 {
+                    self.out.push(self.cur as u8);
+                    (self.cur, self.n) = (0, 0);
+                }
+            }
+        }
+
+        fn huff(&mut self, code: u32, len: u32) {
+            for i in (0..len).rev() {
+                self.bits((code >> i) & 1, 1);
+            }
+        }
+
+        fn align(&mut self) {
+            if self.n > 0 {
+                self.out.push(self.cur as u8);
+                (self.cur, self.n) = (0, 0);
+            }
+        }
+
+        fn stored(&mut self, last: bool, data: &[u8]) {
+            self.bits(u32::from(last), 1);
+            self.bits(0, 2);
+            self.align();
+            let len = u16::try_from(data.len()).unwrap();
+            self.out.extend_from_slice(&len.to_le_bytes());
+            self.out.extend_from_slice(&(!len).to_le_bytes());
+            self.out.extend_from_slice(data);
+        }
+
+        fn fixed(&mut self, last: bool) {
+            self.bits(u32::from(last), 1);
+            self.bits(1, 2);
+        }
+
+        fn literal(&mut self, b: u8) {
+            match b {
+                0..=143 => self.huff(0x30 + u32::from(b), 8),
+                _ => self.huff(0x190 + u32::from(b) - 144, 9),
+            }
+        }
+
+        /// A match of length 3 or 258 (symbols 257 and 285, no extra bits).
+        fn copy(&mut self, len: u32, dist: u32) {
+            match len {
+                3 => self.huff(1, 7),
+                258 => self.huff(0xc0 + 5, 8),
+                _ => unreachable!(),
+            }
+            const BASE: [u32; 30] = [
+                1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+                1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+            ];
+            let code = BASE.iter().rposition(|&b| b <= dist).unwrap() as u32;
+            let extra = if code < 4 { 0 } else { (code >> 1) - 1 };
+            self.huff(code, 5);
+            self.bits(dist - BASE[code as usize], extra);
+        }
+
+        fn end_block(mut self) -> Vec<u8> {
+            self.huff(0, 7);
+            self.align();
+            self.out
+        }
+    }
+
+    /// The raw stream in the review of #143 slice B: literal 'a', then a
+    /// length-3 copy from `dist` back.
+    fn a_then_copy(dist: u32) -> Vec<u8> {
+        let mut w = Bits::default();
+        w.fixed(true);
+        w.literal(b'a');
+        w.copy(3, dist);
+        w.end_block()
+    }
+
+    fn zlib_wrap(raw: &[u8], plain: &[u8]) -> Vec<u8> {
+        let adler = {
+            let (mut a, mut b) = (1u32, 0u32);
+            for &x in plain {
+                a = (a + u32::from(x)) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        };
+        cat(&[&[0x78, 0x01], raw, &adler.to_be_bytes()])
+    }
+
+    fn gzip_wrap(raw: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut crc = Crc::new();
+        crc.update(plain);
+        cat(&[
+            &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255],
+            raw,
+            &crc.sum().to_le_bytes(),
+            &crc.amount().to_le_bytes(),
+        ])
+    }
+
+    /// zlib fails a copy from before the first output byte ("invalid distance
+    /// too far back"); miniz_oxide's wrapping dictionary would copy whatever
+    /// the dictionary held -- zeros on a fresh stream, the previous member's
+    /// bytes after a gzip reset. Every expectation measured on node v22.22.2
+    /// (`zlib.inflateRawSync` / `gunzipSync` on the same bytes; fetch rejects
+    /// the gzip-wrapped body with that cause).
+    #[test]
+    fn a_copy_from_before_the_output_is_an_error() {
+        // Node's message is "invalid distance too far back"; miniz has one
+        // failure status for every kind of corrupt data.
+        const TOO_FAR: DecodeError = DecodeError("invalid deflate data");
+        // The checksums match the bytes a wrapping dictionary produces, so
+        // nothing but the distance check can refuse these.
+        let garbage = b"a\0\0\0";
+        let raw = a_then_copy(5);
+        assert_eq!(raw, [0x4b, 0x04, 0x12, 0x00]);
+        assert_eq!(decode_all(&[Coding::Deflate], &raw), Err(TOO_FAR));
+        let z = zlib_wrap(&raw, garbage);
+        assert_eq!(decode_all(&[Coding::Deflate], &z), Err(TOO_FAR));
+        let g = gzip_wrap(&raw, garbage);
+        assert_eq!(decode_all(&[Coding::Gzip], &g), Err(TOO_FAR));
+        // Exactly as far back as the output reaches is fine; one more is not.
+        assert_eq!(
+            decode_all(&[Coding::Deflate], &a_then_copy(1)),
+            Ok(b"aaaa".to_vec())
+        );
+        assert_eq!(
+            decode_all(&[Coding::Deflate], &a_then_copy(2)),
+            Err(TOO_FAR)
+        );
+
+        // A gzip reset starts the history over (zlib inflateReset: whave = 0),
+        // so member 2 cannot reach member 1's bytes.
+        let m1 = gzip(b"XYZWVU");
+        assert_eq!(decode_all(&[Coding::Gzip], &cat(&[&m1, &g])), Err(TOO_FAR));
+        for garbage in [&b"aYZW"[..], b"aZWV", b"aWVU"] {
+            let m2 = gzip_wrap(&raw, garbage);
+            assert_eq!(decode_all(&[Coding::Gzip], &cat(&[&m1, &m2])), Err(TOO_FAR));
+        }
+    }
+
+    /// The history is a 32 KiB window over everything decoded so far, at any
+    /// frame split: a 258-byte copy from 32768 back fails after 32767 output
+    /// bytes and succeeds after 32768 or 40000 (node v22.22.2: the same).
+    #[test]
+    fn the_window_reaches_exactly_32_kib_back() {
+        let data = text(40_000, 31);
+        for (n, ok) in [(32_767usize, false), (32_768, true), (40_000, true)] {
+            let mut w = Bits::default();
+            w.stored(false, &data[..n]);
+            w.fixed(true);
+            w.copy(258, 32_768);
+            let raw = w.end_block();
+            for size in [1usize, 7, 300, 16_384, 20_000, usize::MAX] {
+                let got = decode_split(&[Coding::Deflate], &raw, || size);
+                if ok {
+                    let start = n - 32_768;
+                    let want = cat(&[&data[..n], &data[start..start + 258]]);
+                    assert!(got.as_ref() == Ok(&want), "{n} at {size}");
+                } else {
+                    assert_eq!(
+                        got,
+                        Err(DecodeError("invalid deflate data")),
+                        "{n} at {size}"
+                    );
                 }
             }
         }
