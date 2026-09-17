@@ -10,6 +10,8 @@
 //!   whose name or value is not a legal header fail as `builder error`;
 //! - user headers go out in the order given, a repeated name as separate
 //!   lines;
+//! - more distinct header names than `http::HeaderMap` holds fail as
+//!   `fetch: too many request headers` (reqwest panicked; node has no cap);
 //! - URL userinfo becomes `authorization: Basic base64(user:pass)`
 //!   (percent-decoded, password optional -- reqwest request.rs:582-606 and
 //!   util.rs:4-25) and never reaches the wire as userinfo;
@@ -53,6 +55,11 @@ pub enum PrepareError {
     Builder,
     /// A method that is not an HTTP token, carrying the method as given.
     InvalidMethod(String),
+    /// More distinct header names than `http::HeaderMap` can hold (24576 at
+    /// most, fewer once its hash-flooding defence rebuilds the table). Node
+    /// has no such cap -- 25000 distinct headers get a 200 -- and reqwest
+    /// panicked ("size overflows MAX_SIZE"), so this text is oam's own.
+    TooManyHeaders,
 }
 
 impl std::fmt::Display for PrepareError {
@@ -60,6 +67,7 @@ impl std::fmt::Display for PrepareError {
         match self {
             PrepareError::Builder => f.write_str(BUILDER_ERROR),
             PrepareError::InvalidMethod(m) => write!(f, "fetch: invalid method '{m}'"),
+            PrepareError::TooManyHeaders => f.write_str("fetch: too many request headers"),
         }
     }
 }
@@ -99,7 +107,13 @@ pub fn prepare(
     let basic = take_userinfo(&mut url);
     url.set_fragment(None);
 
-    let mut headers = HeaderMap::with_capacity(user_headers.len() + 4);
+    // Every map operation here is the fallible `try_*` form: the infallible
+    // ones panic past `HeaderMap`'s size cap, and JS picks the header count.
+    // The capacity is only a hint -- one name repeated 30000 times is a single
+    // entry -- so a hint too large for the map falls back to growing on demand.
+    let mut headers =
+        HeaderMap::try_with_capacity(user_headers.len().saturating_add(4)).unwrap_or_default();
+    let too_many = |_: http::header::MaxSizeReached| PrepareError::TooManyHeaders;
     // reqwest appended the userinfo credential when the request was built,
     // BEFORE the user's headers, so it led the wire order. It appended it
     // even next to a user `authorization`, sending two; a request carries one
@@ -109,7 +123,7 @@ pub fn prepare(
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION.as_str()))
     {
-        headers.append(AUTHORIZATION, basic);
+        headers.try_append(AUTHORIZATION, basic).map_err(too_many)?;
     }
     for (name, value) in user_headers {
         // `HeaderName::from_bytes` lower-cases; `HeaderValue::from_bytes`
@@ -118,20 +132,26 @@ pub fn prepare(
         // ran.
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| PrepareError::Builder)?;
         let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| PrepareError::Builder)?;
-        headers.append(name, value);
+        headers.try_append(name, value).map_err(too_many)?;
     }
     if default_headers {
         if !headers.contains_key(ACCEPT) {
-            headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+            headers
+                .try_insert(ACCEPT, HeaderValue::from_static("*/*"))
+                .map_err(too_many)?;
         }
         if !headers.contains_key(http::header::USER_AGENT) {
-            headers.insert(http::header::USER_AGENT, user_agent.clone());
+            headers
+                .try_insert(http::header::USER_AGENT, user_agent.clone())
+                .map_err(too_many)?;
         }
         if !headers.contains_key(ACCEPT_ENCODING) {
-            headers.insert(
-                ACCEPT_ENCODING,
-                HeaderValue::from_static(DEFAULT_ACCEPT_ENCODING),
-            );
+            headers
+                .try_insert(
+                    ACCEPT_ENCODING,
+                    HeaderValue::from_static(DEFAULT_ACCEPT_ENCODING),
+                )
+                .map_err(too_many)?;
         }
     }
     Ok(Prepared {

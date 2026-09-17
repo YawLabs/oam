@@ -318,3 +318,39 @@ fn origin_eq_normalizes() {
     assert!(!eq("https://a.test/", "https://a.test:444/"));
     assert!(!eq("http://[::1]/", "http://127.0.0.1/"));
 }
+
+/// `http::HeaderMap` holds at most 24576 distinct names (MAX_SIZE 32768 at a
+/// 3/4 load factor), and `with_capacity` / `append` panic past it. Node sends
+/// 25000 distinct headers and gets its 200 (review of #143 slice B), so there
+/// is no Node text to mirror; the op must fail cleanly instead of crashing
+/// with "size overflows MAX_SIZE" as reqwest did.
+#[test]
+fn too_many_distinct_headers_is_an_error_not_a_panic() {
+    let many: Vec<(String, String)> = (0..30_000)
+        .map(|i| (format!("x-{i}"), "v".to_string()))
+        .collect();
+    for defaults in [true, false] {
+        let got = prepare::prepare("http://a.test/", "GET", &many, defaults, &ua());
+        assert_eq!(got.unwrap_err(), PrepareError::TooManyHeaders);
+    }
+    assert_eq!(
+        PrepareError::TooManyHeaders.to_string(),
+        "fetch: too many request headers"
+    );
+
+    // The cap is on distinct names, not lines: one name repeated 30000 times
+    // is one entry with 29999 extra values, and still goes out in full.
+    let repeated: Vec<(String, String)> = (0..30_000)
+        .map(|i| ("x-same".to_string(), i.to_string()))
+        .collect();
+    let p = prepare::prepare("http://a.test/", "GET", &repeated, true, &ua()).unwrap();
+    assert_eq!(p.headers.get_all("x-same").iter().count(), 30_000);
+    assert_eq!(p.headers.get("user-agent").unwrap(), "oam/test");
+
+    // Well past the size a capacity hint can take, but under the name cap.
+    let below: Vec<(String, String)> = (0..20_000)
+        .map(|i| (format!("x-{i}"), "v".to_string()))
+        .collect();
+    let p = prepare::prepare("http://a.test/", "GET", &below, true, &ua()).unwrap();
+    assert_eq!(p.headers.keys_len(), 20_003);
+}
