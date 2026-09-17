@@ -1239,6 +1239,45 @@ async fn outbound_entry_lifecycle() {
         let seen = server.seen();
         assert_eq!(seen[0].body, b"x");
         assert_eq!(seen[1].body, b"y");
+
+        // A redirect that fails the fetch after the take removes it too.
+        let bad =
+            serve_replies(|_| response("302 Found", &[("location", "http://[::1")], b"")).await;
+        let (handle, tx) = reg.channel(8);
+        tx.send(Ok(b"z".to_vec())).await.unwrap();
+        let outbound = reg.outbound.clone();
+        let fetch = reg.fetch(
+            &t,
+            json!({
+                "url": format!("http://127.0.0.1:{}/", bad.port),
+                "method": "POST",
+                "body_stream": handle,
+            }),
+        );
+        let ender = async move {
+            // The server answers once the body ends; end it after the take.
+            for _ in 0..400 {
+                if outbound
+                    .lock()
+                    .unwrap()
+                    .get(&handle)
+                    .is_some_and(|e| e.1.is_none())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(tx);
+            let sender = outbound
+                .lock()
+                .unwrap()
+                .get_mut(&handle)
+                .and_then(|e| e.0.take());
+            drop(sender);
+        };
+        let (outcome, ()) = tokio::join!(fetch, ender);
+        assert_eq!(failed(outcome), INVALID_URL);
+        assert_eq!(reg.entry(handle), None);
     })
     .await;
 }

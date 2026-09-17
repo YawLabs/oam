@@ -361,7 +361,10 @@ async fn run(
             // cannot be replayed -- the 3xx is the result (reqwest's
             // behaviour, kept until #149/#148).
             Next::Done | Next::ReturnResponse => break response,
-            Next::Fail(text) => return OpOutcome::Failed(text.to_string()),
+            Next::Fail(text) => {
+                state.source.request_failed();
+                return OpOutcome::Failed(text.to_string());
+            }
             Next::Follow {
                 url,
                 method,
@@ -385,7 +388,7 @@ async fn run(
 
 /// The payload for the final response; its body goes into `bodies`.
 fn respond(
-    state: LoopState,
+    mut state: LoopState,
     response: http::Response<Incoming>,
     bodies: &FetchBodies,
     ids: &AtomicU64,
@@ -400,6 +403,7 @@ fn respond(
             .collect();
         match decode::plan(&state.method, status.as_u16(), &encodings) {
             Plan::TooMany(n) => {
+                state.source.request_failed();
                 return OpOutcome::Failed(format!(
                     "too many content-encodings in response: {n}, maximum allowed is {MAX_CODINGS}"
                 ));
