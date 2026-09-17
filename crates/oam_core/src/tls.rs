@@ -1196,6 +1196,7 @@ pub async fn tls_connect(
     client_key_pem: Option<String>,
     min_version: Option<String>,
     max_version: Option<String>,
+    attempt_timeout: std::time::Duration,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
@@ -1206,9 +1207,18 @@ pub async fn tls_connect(
     // as Node's `ERR_SSL_NO_PROTOCOLS_AVAILABLE` -- the code its handshake setup
     // raises, asynchronously, once the peer is reachable -- and no handshake is
     // attempted.
-    let tcp = match crate::tcp::connect_tcp(&host, port).await {
-        Ok(s) => s,
-        Err(e) => return tls_fail(e, "connect", &addr),
+    // The transport is net.connect's (crate::net_connect): node's address
+    // selection, and a failure in node's shape -- `connect ECONNREFUSED
+    // 127.0.0.1:8080` with address and port, or the NodeAggregateError of a
+    // `localhost` whose every address refused -- which tls.connect emits
+    // unchanged.
+    let opts = crate::net_connect::ConnectOptions {
+        attempt_timeout,
+        pin: None,
+    };
+    let tcp = match crate::net_connect::connect(&host, port, &opts).await {
+        Ok(connected) => connected.stream,
+        Err(e) => return e.to_outcome(),
     };
 
     let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
@@ -2010,6 +2020,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 None,
                 None,
+                crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
             ),
         )
         .await
@@ -2072,6 +2083,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 None,
                 None,
+                crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
             )
             .await
             else {
@@ -2162,6 +2174,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             None,
             None,
             None,
+            crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
         )
         .await
         else {
@@ -2243,6 +2256,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 None,
                 None,
+                crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
             )
         };
         match connect(None, true, "localhost").await {

@@ -2812,6 +2812,9 @@ fn op_tcp_connect(
         return;
     };
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
+    // connect; JS owns the value, so nothing is cached per runtime.
+    let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -2822,8 +2825,25 @@ fn op_tcp_connect(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tcp::tcp_connect(tcp, ids, host, port),
+        oam_core::tcp::tcp_connect(tcp, ids, host, port, attempt_timeout),
     );
+}
+
+/// The optional per-connect attempt timeout (milliseconds) a connect op takes
+/// as argument `index`: node's 250 ms default when it is absent or not a
+/// positive finite number, floored at node's 10 ms.
+fn attempt_timeout_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> std::time::Duration {
+    let value = args.get(index);
+    let ms = if value.is_number() {
+        value.number_value(scope)
+    } else {
+        None
+    };
+    oam_core::net_connect::attempt_timeout_from_ms(ms)
 }
 
 fn op_tcp_read(
@@ -3060,6 +3080,7 @@ fn op_tls_connect(
     // means "Node's default range" (min TLSv1.2, max TLSv1.3).
     let min_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 8).filter(|s| !s.is_empty());
+    let attempt_timeout = attempt_timeout_arg(scope, &args, 9);
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3082,6 +3103,7 @@ fn op_tls_connect(
             client_key_pem,
             min_version,
             max_version,
+            attempt_timeout,
         ),
     );
 }

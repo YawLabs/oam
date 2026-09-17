@@ -17787,7 +17787,12 @@
         var host = opts.hostname || opts.host || "localhost";
         var port = opts.port || (protocol === "https:" ? 443 : 80);
         var reqPath = opts.path || "/";
-        this._url = protocol + "//" + host + ":" + port + reqPath;
+        // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
+        // `http://::1:80/` would not parse and the request would fail with
+        // "fetch failed" where node connects to ::1. A URL's hostname already
+        // carries its brackets (net.isIP('[::1]') is 0).
+        var urlHost = registry.get("net").isIP(host) === 6 ? "[" + host + "]" : host;
+        this._url = protocol + "//" + urlHost + ":" + port + reqPath;
         this._headers = {};
         if (opts.headers) {
           var keys = Object.keys(opts.headers);
@@ -18099,7 +18104,14 @@
         var host = parsed.hostname;
         var port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
         var reqPath = parsed.pathname + parsed.search;
-        natives.tcpConnect(host, port).then(function (result) {
+        // Node's http hands net the hostname without URL brackets
+        // (urlToHttpOptions); the Host header keeps them.
+        var connectHost = host.charAt(0) === "[" ? host.slice(1, -1) : host;
+        var net = registry.get("net");
+        // A refusal is emitted as the connect op rejected it: node's own
+        // shape (address/port, or the NodeAggregateError of a `localhost`
+        // whose every address refused).
+        natives.tcpConnect(connectHost, port, net.getDefaultAutoSelectFamilyAttemptTimeout()).then(function (result) {
           var handle = result.handle;
           if (!self._headers["host"]) {
             self._headers["host"] = port === 80 ? host : host + ":" + port;
@@ -18489,6 +18501,13 @@
     function _shapeConnectError(err, host, port) {
       const code = err && err.code;
       if (!code) return err;
+      // The connect op already rejects with node's exact error (#143): the
+      // ExceptionWithHostPort / DNSException shape with node's key order and
+      // the RESOLVED address, or the NodeAggregateError of a name whose every
+      // address failed. Rebuilding it here would reorder the keys and name the
+      // host as written (`localhost`) instead of the address that refused.
+      // Only an error without that shape is rebuilt.
+      if (err.syscall !== undefined || err instanceof AggregateError) return err;
       const errno = _netErrno(code);
       let e;
       if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
@@ -18619,7 +18638,7 @@
         // _doClose() both early-return and the entry would be pinned in this
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
-        const pending = natives.tcpConnect(host, port).then(
+        const pending = natives.tcpConnect(host, port, autoSelectFamilyAttemptTimeoutDefault).then(
           (result) => {
             if (this.destroyed) {
               // destroy() raced the connect: close the just-established
@@ -24455,7 +24474,8 @@
       // handle).
       registry._activeHandles.set(socket, "TCPSocketWrap");
 
-      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max).then(
+      var attemptTimeout = registry.get("net").getDefaultAutoSelectFamilyAttemptTimeout();
+      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max, attemptTimeout).then(
         (info) => {
           socket._connectPending = false;
           if (socket.destroyed) {
@@ -24501,9 +24521,11 @@
           socket._connectPending = false;
           socket.connecting = false;
           if (typeof err === "string") err = new Error(err);
-          if (err && typeof err.code === "string" && err.syscall === undefined) {
+          if (err && typeof err.code === "string" && err.syscall === undefined && !(err instanceof AggregateError)) {
             // The verifier refused the certificate (a connect-syscall error
-            // carries `syscall`; this one carries only Node's code): Node
+            // carries `syscall`, and a NodeAggregateError of refused addresses
+            // carries neither but is no verdict; this one carries only Node's
+            // code): Node
             // records the verdict on the socket before destroying it, and
             // its ERR_TLS_CERT_ALTNAME_INVALID carries the reason, the name
             // it checked and the peer certificate.
