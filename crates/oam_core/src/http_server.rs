@@ -1,4 +1,5 @@
-//! Inbound HTTP/1.1 server on hyper (already in-tree via reqwest).
+//! Inbound HTTP/1.1 server on hyper (the same hyper the fetch transport's
+//! client, `http_client`, is built on).
 //!
 //! Flow: `http_serve` binds a tokio listener and spawns an accept loop;
 //! each hyper request collects its body (wave-1: BUFFERED, capped — most

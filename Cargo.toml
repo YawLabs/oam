@@ -32,21 +32,17 @@ thiserror = "2"
 # io-util: AsyncReadExt/AsyncWriteExt for the streaming file ops.
 # net/sync/macros: the HTTP server (TcpListener, channels, select!).
 tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util", "io-std", "net", "sync", "macros", "process", "signal"] }
+# reqwest is oam_loader's `oam install` client only: `fetch` and
+# `http.request` left it in #143 for oam's own transport (oam_core
+# http_client), which decodes response bodies itself. It stays in the build,
+# and in process.versions, because the installer links it.
 # rustls-no-provider + explicit ring: reqwest's default rustls provider is
 # aws-lc-rs, whose C build (aws-lc-sys) fails under MSVC on ARM64. ring
 # compiles clean on every tier-1 target (same choice Deno ships).
-# "stream": Body::wrap_stream, for streaming outbound request bodies
-# (docs/design/streaming-bodies.md slice 4).
-# "gzip"/"deflate": content-encoding negotiation and decoding. Without them
-# reqwest neither advertises an encoding nor decodes one, so a server that
-# compressed anyway (httpbin.org/gzip, any CDN doing it unsolicited) handed
-# JavaScript the raw DEFLATE bytes with `content-encoding: gzip` still on the
-# response -- silent corruption of the most-used web API, not an error. The set
-# is exactly what Node v22.22.2's fetch advertises ("gzip, deflate"), measured
-# rather than assumed: adding "brotli" here would also add `br` to the request
-# header and make oam ask for something Node does not, trading one divergence
-# for another. flate2 was already in the tree for node:zlib; this adds
-# async-compression over it.
+# "stream" (Body::wrap_stream) and "gzip"/"deflate" (async-compression over
+# flate2) were chosen for the fetch op, which no longer uses reqwest. The
+# install client never streams a request body; the features stay only
+# because dropping one changes the dependency graph, a change of its own.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream", "gzip", "deflate"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
@@ -109,8 +105,10 @@ tar = "0.4"
 # node:zlib brotli backend -- pure-Rust, default features only (std + alloc-stdlib).
 # No native deps, no ffi-api, no simd -- builds on every tier-1 target.
 brotli = { version = "8", default-features = false, features = ["std"] }
-# HTTP server: hyper + adapters (already in-tree transitively through
-# reqwest — declaring them adds no new compilation units).
+# HTTP server, and since #143 the fetch client (oam_core adds the client
+# features in its own manifest): hyper + adapters. reqwest, the install
+# client, builds the same versions, so declaring them adds no new
+# compilation units.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

@@ -105,9 +105,11 @@ sharpest case is `modules`/`napi`: addon loaders read those to decide a precompi
 working JS fallback into a crash.
 
 What oam publishes instead is its own real dependency tree, under real names: `tokio`
-(event loop), `hyper` + `h2` (HTTP), `reqwest` (client), `rustls` + `ring` (TLS/crypto),
+(event loop), `hyper` + `h2` (the HTTP server, and the `fetch` / `http.request` client
+since #143), `reqwest` (the `oam install` client), `rustls` + `ring` (TLS/crypto),
 `hickory` (DNS), `flate2` + `brotli` (compression), `oxc` (JS/TS parser), `url`
-(WHATWG URL). The versions are read from `Cargo.lock` at build time
+(WHATWG URL). `reqwest` stays listed because `oam install` still links it; `fetch` no
+longer goes through it. The versions are read from `Cargo.lock` at build time
 (`crates/oam_engine/build.rs`) — a missing or version-ambiguous crate fails the build,
 so the published numbers can never drift from what is linked. `brotli` appears in both
 lists and means the same thing in both: the brotli implementation genuinely in the
@@ -847,20 +849,47 @@ it is holding. oam removes both, which is self-consistent but is a real differen
 Node and from a browser: code that branches on `res.headers.get('content-encoding')` takes
 the other path here.
 
-This is a property of the decoding layer rather than a decision made per response --
-`reqwest` strips both headers as it decodes, and the pre-strip values are not recoverable
-above it. Restoring Node's shape means decoding in oam's own body pump instead, keeping the
-original header map; that is the fix if this ever bites, and it is not free, because the
-body streams a chunk per op and the decoder has to hold state across them.
+The headers go exactly when oam decodes, and since #143 it decodes by undici's rules, in
+its own body reader: every `content-encoding` line, joined, split on commas and lowercased;
+`gzip` / `x-gzip`, `deflate` (zlib-wrapped or raw, told apart by the first byte) and `br`,
+stacked and undone last-first, up to five (a sixth fails the fetch at the response head with
+`too many content-encodings in response: 6, maximum allowed is 5`). A response oam does not
+decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 205 or 304,
+and a coding list holding any other token -- `identity`, an unknown coding, or the empty
+token of `gzip,`.
 
-What is NOT divergent: the decoded bytes. Before the negotiation shipped, oam advertised no
-encoding at all and did not decode, so a server that compressed anyway handed JavaScript
-raw DEFLATE bytes with `content-encoding: gzip` still attached -- silent corruption rather
-than an error. oam now advertises exactly what Node's `fetch` advertises, `gzip` and
-`deflate`, differing only in that oam omits the optional whitespace after the comma
-(`gzip,deflate` against Node's `gzip, deflate`; both are the same list to any RFC 9110
-parser). Brotli is deliberately not advertised -- Node's `fetch` does not ask for it either,
-and adding it would trade this divergence for a request-header one.
+Why oam still strips them: `http.request` goes through the same native op as `fetch` until
+#148, and it gets the decoded body too. Node's `http` hands over the raw bytes with the
+headers intact, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
+`content-encoding` says gzip). Keeping the header on a body oam already decoded would send
+that code into a second, failing decode. The op already has the switch (a request can ask
+for the raw body and the original headers); once `http.request` uses it (#148), `fetch` can
+keep Node's headers.
+
+What is NOT divergent: the decoded bytes, and how they arrive. The body is decoded as it
+streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
+server-sent event is readable as soon as its unit arrives and a 106-byte brotli bomb
+inflating to 64 MiB never sits in memory whole. A truncated body is the data that decoded,
+not an error; a multi-member gzip body is every member; and bytes after the end of the
+compressed stream end the body, where Node ends it. The decoding rules and chunk sizes are
+pinned byte-identical with Node by `conformance/cases/112-fetch-content-decoding.mjs`; the
+flushed event stream and the bomb by e2e tests.
+
+What else still differs:
+
+- **The request header.** oam sends `accept-encoding: gzip,deflate` on every request. Node's
+  `fetch` sends `gzip, deflate` over http and `br, gzip, deflate` over https (measured;
+  undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
+  parser, but over https oam does not offer brotli, so a server that honours the header
+  sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
+- **A corrupt body.** Reading a body that fails to decode rejects with a plain `Error`,
+  `fetch: body read failed: error decoding response body`, with no `cause`. Node fails the
+  read with `TypeError: terminated`, and the zlib error as the `cause` (for example
+  `invalid distance too far back`, `code` `Z_DATA_ERROR`, `errno` `-3`).
+
+_(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
+headers over http and https, and a `deflate` body holding a copy from before the start of
+the output.
 
 ### 22. An invalid `napi_ref` is refused, where Node's behavior is undefined
 
@@ -1010,28 +1039,54 @@ it waits for the `net` tranche of the vendored Node suite to gate it.
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
 described; the bare-`connect()` and `socket`-option shapes as described.
 
-### 35. `http` and `fetch` to a refused loopback port take about 2 s on Windows, and name the host as written (#143)
+### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 
-Windows retransmits the SYN of a connect to a closed loopback port for about 2 s before it
-reports the refusal; libuv turns that off per socket (`SIO_TCP_INITIAL_RTO`, loopback targets
-only), so node's `net`, `tls`, `http` and `fetch` all see `ECONNREFUSED` within milliseconds.
-oam's `net.connect` and `tls.connect` do the same since #137 (pinned by
-`conformance/cases/101-net-refused-loopback-connect-fast.mjs`). `http.request` and `fetch`
-go through reqwest's connector, which has no way to set that option, so on Windows they still
-wait about 2 s before reporting the refusal.
+This entry used to record two `http` / `fetch` gaps that `net.connect` and `tls.connect` had
+already closed (#137). On Windows a refused loopback connect took about 2 s, because Windows
+retransmits the SYN to a closed loopback port before it reports the refusal and reqwest's
+connector could not set the option libuv uses to stop that (`SIO_TCP_INITIAL_RTO`). And the
+error named the URL's host as written: reqwest did not say which resolved address was
+refused, so `fetch('http://localhost:8080/')` failed with one `Error` carrying
+`address: 'localhost'` where Node names each address it tried.
 
-The error itself has node's shape on every platform (`fetch failed` with the transport error
-as `cause`; `errno`, `code`, `syscall`, `address`, `port`; pinned by
-`conformance/cases/102-fetch-http-refused-error-shape.mjs`), with one difference: the
-`address` on it, and in the `connect ECONNREFUSED <address>:<port>` message, is the URL's host
-as written. reqwest does not say which resolved address was refused, so
-`fetch('http://localhost:8080/')` fails with `address: 'localhost'` where node names the IP it
-tried and, for a name with several addresses, reports one error per address inside an
-`AggregateError` (`code` on the aggregate, message empty). An IP literal matches node exactly.
+`fetch`, `http.request`, `https.request` and the `http2` compat client now dial through
+the connector `net.connect` and `tls.connect` use: Node's connect algorithm
+(`lookupAndConnect`: an IP literal as written, a name's addresses interleaved by family, and
+every attempt but the last bounded by the 250 ms attempt timeout from
+`net.getDefaultAutoSelectFamilyAttemptTimeout()`) on a libuv-style socket per attempt. A
+refusal reports what Node reports: `connect ECONNREFUSED <resolved address>:<port>` with
+`errno`, `code`, `syscall`, `address` and `port` in Node's order, and when every address of
+a name fails, Node's `AggregateError` (`code` its only enumerable key, one error per attempt
+in `errors`, a stack header `AggregateError [ECONNREFUSED]: `). `fetch` rejects with the
+bare `TypeError: fetch failed` carrying it as `cause`; `http.request` emits it.
 
-_(probed)_ Node v22.22.2 vs oam on Windows, same closed port: `fetch` failed at 9 ms / 2033 ms,
-`http.get` at 4 ms / 2024 ms; `localhost` gave node an `AggregateError` over `::1` and
-`127.0.0.1`, oam a single `Error` naming `localhost`.
+Measured on Windows, a port that was listening a moment before, three runs each:
+
+| target | Node v22.22.2 (`fetch` / `http.get`) | oam 0.16.1, reqwest | oam now |
+|---|---|---|---|
+| `127.0.0.1` | 2-14 ms / 1-6 ms | 2024-2049 ms / 2036-2044 ms | 1-3 ms / 1-3 ms |
+| `localhost` | 2-14 ms / 2-3 ms, `AggregateError` (`::1`, `127.0.0.1`) | 2354-2459 ms / 2346-2389 ms, one `Error` naming `localhost` | 2-11 ms / 2 ms, `AggregateError` (`::1`, `127.0.0.1`) |
+| `[::1]` | 1-4 ms / 1-3 ms | 2034-2051 ms / 2020-2042 ms | 1 ms / 1 ms |
+
+(oam timings are from debug builds.) Pinned by
+`conformance/cases/110-connect-refused-shapes.mjs` (`net`, `tls`, `http.get` in the URL and
+options forms, `https.get` and `fetch`, against `127.0.0.1`, `::1` and `localhost`: the
+timing class everywhere, and the full `localhost` shape on Windows) and
+`102-fetch-http-refused-error-shape.mjs`, both byte-identical with Node. A failure that
+`connect(2)` reports at once carries Node's ` - Local (address:port)` detail, read from the
+attempt's own socket.
+
+Two things this moved rather than removed:
+
+- **Off Windows `localhost` can resolve differently** (entry 37): oam does not pass
+  `AI_ADDRCONFIG`, so case 110 prints only shape invariants there.
+- **A request to `localhost` now tries `::1` first**, which is Node's order. reqwest's
+  client carried an IPv4-first override for `localhost`; the owned transport does not. Against
+  a listener that is IPv4 only -- which is every oam `listen(port)`, entry 36 -- the first
+  request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
+  `localhost`, six runs: 8.9-28.8 ms now against 4.1-7.8 ms before (Node: 22.8-28.3 ms);
+  through a dual-stack `::` listener, 8-22 ms now against 305-326 ms before, when reqwest
+  waited out its happy-eyeballs delay (Node: 20-33 ms). Pooled requests do not change.
 
 ### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
 
@@ -1040,11 +1095,138 @@ host `localhost`) reaches it over `::1`, so `server.address()` reports `{ addres
 'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0` and
 `connect(port)` defaults to `127.0.0.1`: same program, same data, `IPv4` in every observable.
 `tls.connect(port)` defaults to `localhost` on both runtimes and, since #137, reaches an
-IPv4-only listener as fast as Node does. Switching the connect default alone would not close
-the gap; it needs a dual-stack listen default first.
+IPv4-only listener as fast as Node does. `http.request` defaults to `localhost` as well, and
+since #143 its first request to an oam listener tries `::1` first, as Node's does, paying one
+refused attempt (a few milliseconds; entry 35). Switching the connect default alone would
+not close the gap; it needs a dual-stack listen default first.
 
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
 program.
+
+### 37. Name resolution does not pass `AI_ADDRCONFIG` off Windows
+
+`net.connect`, `tls.connect`, `http.request` and `fetch` resolve a name through the system
+`getaddrinfo` (tokio's `lookup_host`) with no flags. Node's `net` passes `dns.ADDRCONFIG` off
+Windows (`lib/net.js` `lookupAndConnect`), which drops a family the host has no configured
+address for. On a Linux or macOS host with no routable IPv6 address, Node can resolve
+`localhost` to `127.0.0.1` alone while oam also gets `::1`: a refused connect there is a
+plain `Error` in Node and an `AggregateError` over both addresses in oam, and a successful
+one may try `::1` first. On Windows Node passes no flags either, and the two agree
+(`conformance/cases/110-connect-refused-shapes.mjs` prints the full shape only there).
+
+Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
+why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
+flags either, but oam's `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are all `0`, where
+Node on Windows reports `1024`, `2048` and `256` (measured), so a caller cannot ask for them.
+
+_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`; the `dns` constants probed on
+Windows.)_
+
+### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
+
+Since #143 `fetch`, `http.request`, `https.request` and the `http2` compat client run on
+oam's own transport: hyper's pooled client over the connector `net` and `tls` share
+(entry 35), rustls, and the redirect and decoding rules of undici 6.24.1, the `fetch` Node
+v22.22.2 bundles. Redirect handling and decoding are pinned byte-identical with Node by
+`conformance/cases/111-fetch-redirect-and-bad-port.mjs` and `112-fetch-content-decoding.mjs`.
+What still differs:
+
+**Connecting**
+
+- **No 10 s connect timeout on `fetch`.** undici gives up on a connect after 10 s. oam waits
+  for the operating system. Measured against a blackholed address on Windows: Node rejects
+  after 10669 ms with a `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`,
+  `Connect Timeout Error (attempted address: 10.255.255.1:81, timeout: 10000ms)`); oam
+  rejects after 21046 ms with `connect ETIMEDOUT 10.255.255.1:81`. Node's `http.request` has
+  no such timeout, so only `fetch` differs.
+- **Aborting a `fetch` does not cancel the request.** The promise rejects with the abort
+  reason at once, as in Node, but the request stays on the wire and its response is read and
+  thrown away. Measured with a server that answers after 600 ms and an abort at 100 ms: under
+  Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
+  `req` `'close'`); under oam the response finishes. A `fetch` waiting on its
+  `connect.lookup` hook (below) is dropped when it aborts.
+- **TLS verdicts carry no code.** A `fetch` to a server whose certificate does not verify
+  rejects with the uncoded cause `error sending request for url (https://host:port/)`, and the
+  verifying `https.request` emits `ECONNRESET` `socket hang up`. Node reports the verdict:
+  `self-signed certificate`, `code` `DEPTH_ZERO_SELF_SIGNED_CERT`, on both. (`tls.connect`
+  reports Node's verdict codes since #136.)
+- **The trust store is the operating system's.** `fetch` and the verifying `https.request`
+  verify with the platform verifier plus `NODE_EXTRA_CA_CERTS`; Node's `fetch`, and
+  `tls.connect` in both runtimes, use Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A
+  root the OS trusts and Mozilla does not (a corporate inspection proxy's, say) is trusted by
+  oam's `fetch` and not by Node's. The verifier is built on the first https request, so a
+  machine without a usable certificate store still runs; its https requests then fail with
+  `tls configuration error: ...`. _(source)_
+- **`ClientRequest.socket` does not describe the connection.** Against a dual-stack server
+  reached through `localhost`, Node's `req.socket` reports `remoteAddress` `::1`,
+  `remoteFamily` `IPv6` and the real local port; oam's reports `localhost`, `undefined` and
+  a local port the server never saw.
+- **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
+  so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
+  the `'error'` event is a plain `Event` where Node's is an `ErrorEvent` with the message
+  `Received network error or non-101 status code.`
+
+**`connect.lookup` on an undici `Agent`**
+
+Passed as `fetch`'s `dispatcher`, an `Agent({ connect: { lookup } })` hook is called for the
+first host and every redirect hop to another host name, never for an IP literal and never for
+a URL on a bad port, with `{ family: undefined, hints, all: true }`. The connection dials only
+the addresses it returned, with Node's filtering and errors (`ERR_INVALID_IP_ADDRESS`,
+`ERR_INVALID_ADDRESS_FAMILY`, an `AggregateError` when every address refuses), and a hook
+that fails -- or throws -- fails the fetch closed with its error as the `cause`, identity
+kept. A hooked fetch never goes through the environment proxy (below): an undici `Agent`
+does not read it, and a proxy that resolved the name again would undo the pin. What differs:
+
+- **How often it is called.** Node calls the hook once per connection it opens, oam once per
+  host per `fetch`. A redirect chain `a -> a -> b` made 3 calls in Node (its pool opened a
+  second connection for the same-host hop) and 2 in oam; a second `fetch` on the same
+  `Agent` made 0 calls in Node (a pooled connection) and calls again in oam, which does not
+  pool hooked connections. Every connection oam opens still dials only addresses the hook
+  returned for that host.
+- **A hook that calls back twice.** One that answers and then calls back again with an
+  error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
+  answer and connects.
+- **A scoped IPv6 address** (`fe80::1%lo0`) is refused with `ERR_INVALID_IP_ADDRESS`, because
+  oam's `net.isIP('fe80::1%lo0')` is `0`; Node's is `6` and it dials the address.
+
+**Redirects**
+
+- **`redirect: 'manual'` and `'error'` are not implemented**: every redirect is followed
+  (#149).
+- **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
+  the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
+  `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
+- **`http.request` follows redirects** (#148), by the same rules as `fetch`: 20 hops, no
+  `Referer`, credentials dropped for good after a cross-origin hop, and the bad-port block on
+  every hop -- though not on the URL it was given, which Node's `http.request` dials whatever
+  the port. It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does
+  neither.
+
+**Responses and requests**
+
+- **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
+  `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **The request header count is capped.** More than 24,576 distinct header names (fewer if
+  the header table's hash-flooding defence rebuilds it) fails with
+  `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
+- **Decoding** keeps its own entry: 32.
+
+**The environment proxy, an oam extension**
+
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (uppercase first, then lowercase)
+route `fetch` and `http.request`; Node 22's `fetch` and `http` ignore them. The variables are
+read from the OS environment once per run, so assigning `process.env.HTTP_PROXY` changes
+nothing, and a set `REQUEST_METHOD` (a CGI environment) turns them all off. An http
+destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
+URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
+credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
+handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
+fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
+fails every request it applies to: `fetch` with `error sending request for url (...)`,
+`http.request` with `ECONNRESET` `socket hang up`.
+
+_(probed)_ Node v22.22.2 + undici 6.24.1 vs oam on Windows, the same scripts, unless marked
+_(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
@@ -1266,11 +1448,21 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   flowing mode, so `_readableState.length` stays `0`. That is an internal some libraries
   (e.g. `ws`) read; not measured here.
 - **`req.socket` on an HTTP server** may be a synthetic `EventEmitter` with a fixed
-  `remoteAddress` of `127.0.0.1` rather than the real peer.
+  `remoteAddress` of `127.0.0.1` rather than the real peer. Measured so far only from a
+  `127.0.0.1` client, where `remoteAddress` is right but `localAddress`, `localPort` and
+  `remotePort` are `undefined` and the server emits no `'connection'` event (Node: all
+  populated, one `'connection'`).
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.
-- **`fetch(url, { signal })`** may reject the promise without cancelling at the socket.
+- **A Windows resolver failure with `WSANO_DATA`** is reported as `ENOTFOUND` (errno
+  `-3008`), the row `WSAHOST_NOT_FOUND` uses. libuv's table has no row for it, so its generic
+  translation would say `ENOENT` (`-4058`); the code could not be triggered on the dev box to
+  see what Node shows. _(source: `crates/oam_core/src/net_connect.rs` `classify_resolve`)_
+- **The `hints` a `connect.lookup` hook receives off Windows.** Node passes `dns.ADDRCONFIG`
+  there; oam passes the platform's `AI_ADDRCONFIG` header value, `1024` on macOS and `32`
+  elsewhere, without having compared either against Node on those hosts. On Windows both pass
+  `0` (measured).
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 

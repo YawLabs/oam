@@ -490,8 +490,9 @@ impl JsRuntime {
         // CoreRuntime is NOT created here: execute_module / execute_cjs call
         // reset_run_slots() which builds a fresh CoreRuntime before any ops
         // run. Skipping the construction here avoids a wasted multi-thread
-        // Tokio runtime (2 worker threads + TLS init + reqwest Client) that
-        // would be dropped and rebuilt on the first module execution.
+        // Tokio runtime (2 worker threads, the TLS provider and the
+        // NODE_EXTRA_CA_CERTS read, the fetch transport) that would be
+        // dropped and rebuilt on the first module execution.
         //
         // The REPL path (which doesn't call reset_run_slots) lazily inits
         // via ensure_core_runtime() before its first tick/eval.
