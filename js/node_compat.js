@@ -17866,6 +17866,17 @@
         this.errored = null;
         this._bodyLength = 0;
         this._bodyStream = null;
+        // Every operation on the outbound body channel queues behind the one
+        // before it (see _channelWrite). Unordered calls race: the write op is
+        // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
+        // sender before a spawned write has cloned it, that write fails as an
+        // unknown stream, and the chunk is LOST -- the server sees a
+        // well-formed, complete chunked body missing its tail and neither side
+        // reports an error. Measured on node v22.22.2: write('aa') write('bb')
+        // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
+        // most runs before this chain existed. Two writes in flight at once
+        // could also reach the mpsc channel out of order (multi-thread tokio).
+        this._channelTail = null;
         this._streamArmed = false;
         this._sent = false;
         this._droppedWrites = false;
@@ -17917,7 +17928,7 @@
           // Already streaming: hand the chunk to the transport. The op
           // resolves once the socket accepts it, so write() backpressure
           // follows the wire rather than buffering.
-          natives.fetchBodyChannelWrite(this._bodyStream, bytes).then(
+          this._channelWrite(bytes).then(
             () => { if (callback) callback(); },
             () => { if (callback) callback(); },
           );
@@ -17935,6 +17946,34 @@
           queueMicrotask(() => this._startBodyStreamIfOpen());
         }
         return true;
+      }
+
+      // One chunk onto the outbound body channel, after everything already
+      // queued. Resolves when the transport has accepted it, so write()
+      // backpressure still follows the wire.
+      _channelWrite(bytes) {
+        var stream = this._bodyStream;
+        var next = this._channelTail === null
+          ? natives.fetchBodyChannelWrite(stream, bytes)
+          : this._channelTail.then(function () {
+              return natives.fetchBodyChannelWrite(stream, bytes);
+            });
+        // The tail never rejects: a failed write is the transport's report,
+        // not a reason to strand the writes queued behind it.
+        this._channelTail = next.then(function () {}, function () {});
+        return next;
+      }
+
+      // Close the channel -- which ends the request body -- after every write
+      // already queued has reached it.
+      _channelEnd() {
+        var stream = this._bodyStream;
+        var end = function () { natives.fetchBodyChannelEnd(stream); };
+        if (this._channelTail === null) {
+          end();
+          return;
+        }
+        this._channelTail = this._channelTail.then(end, end);
       }
 
       _startBodyStreamIfOpen() {
@@ -17968,7 +18007,7 @@
         // Send now; the body follows over the channel.
         this._doFetchRequest(null);
         for (const chunk of pending) {
-          natives.fetchBodyChannelWrite(this._bodyStream, chunk).then(
+          this._channelWrite(chunk).then(
             () => {},
             () => {},
           );
@@ -18011,14 +18050,8 @@
         if (self._bodyStream !== null) {
           // Already in flight: flush the tail and close the channel, which
           // ends the body. Must NOT send a second request.
-          if (bodyData) {
-            natives.fetchBodyChannelWrite(self._bodyStream, bodyData).then(
-              () => natives.fetchBodyChannelEnd(self._bodyStream),
-              () => natives.fetchBodyChannelEnd(self._bodyStream),
-            );
-          } else {
-            natives.fetchBodyChannelEnd(self._bodyStream);
-          }
+          if (bodyData) self._channelWrite(bodyData).then(() => {}, () => {});
+          self._channelEnd();
         } else if (self._sent) {
           // Dispatched bodyless on first write (GET/HEAD): nothing further
           // goes on the wire, and re-sending would fire a second request.

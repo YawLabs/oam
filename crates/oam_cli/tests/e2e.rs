@@ -11238,6 +11238,63 @@ fn http_full_duplex_pipeline_echoes_while_request_streams() {
 }
 
 #[test]
+fn http_chunked_write_before_end_is_never_dropped() {
+    // Node parity (measured, node v22.22.2): a chunked request body whose
+    // last write() lands in the tick before end() always arrives whole --
+    // `write('aa'); write('bb'); write('cc'); end()` echoes "aabbcc" on every
+    // request. oam used to LOSE the tail: write() is an async op and
+    // fetchBodyChannelEnd is synchronous, so end() dropped the channel's
+    // sender before the spawned write had cloned it, the write failed as an
+    // unknown stream, and the server saw a well-formed, complete chunked body
+    // missing its last chunk -- silent truncation, no error on either side.
+    // Measured before the fix on this shape: "aabb" on 17 of 20 requests.
+    let stdout = run_ok(
+        "http_chunked_tail.mjs",
+        "import http from 'node:http';\n\
+         const server = http.createServer((req, res) => {\n\
+           let body = '';\n\
+           req.setEncoding('utf8');\n\
+           req.on('data', (c) => (body += c));\n\
+           req.on('end', () => res.end(body));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const port = server.address().port;\n\
+         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n\
+         function post(gap) {\n\
+           return new Promise((resolve, reject) => {\n\
+             const req = http.request({ host: '127.0.0.1', port, method: 'POST' }, (res) => {\n\
+               let b = '';\n\
+               res.on('data', (c) => (b += c));\n\
+               res.on('end', () => resolve(b));\n\
+             });\n\
+             req.on('error', reject);\n\
+             req.write('aa');\n\
+             (async () => {\n\
+               await sleep(gap);\n\
+               req.write('bb');\n\
+               await sleep(gap);\n\
+               req.write('cc');\n\
+               req.end();\n\
+             })();\n\
+           });\n\
+         }\n\
+         const seen = [];\n\
+         for (const gap of [0, 5, 20]) {\n\
+           for (let i = 0; i < 5; i++) seen.push(await post(gap));\n\
+         }\n\
+         console.log('every_body_whole:', seen.every((b) => b === 'aabbcc'));\n\
+         console.log('count_15:', seen.length === 15);\n\
+         server.close();",
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.ends_with("true"),
+            "assertion failed: {line}\nfull output: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn http_get_with_piped_body_dispatches_and_settles() {
     // Node parity (test-stream-pipeline b008): a Readable piped into a GET
     // that never end()s must dispatch immediately as a BODYLESS request --
