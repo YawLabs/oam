@@ -637,8 +637,14 @@
     const other = [];
     for (const value of expected) {
       const low = String(value).toLowerCase();
+      // node's kTypes (lib/internal/errors.js): 'string', 'function',
+      // 'number', 'object', 'Function', 'Object', 'boolean', 'bigint',
+      // 'symbol'. "undefined" and "null" are NOT types -- they fall to
+      // `other`, which is why node writes `must be of type string or one of
+      // undefined or null` and not `one of type string or undefined or null`
+      // (measured on node v22.22.2 for http.request's hostname check).
       if (
-        ["string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function"].includes(low)
+        ["string", "number", "bigint", "boolean", "symbol", "object", "function"].includes(low)
       ) {
         types.push(low);
       } else if (/^[A-Z]/.test(String(value))) {
@@ -729,9 +735,13 @@
         return "an instance of Object";
       }
     }
+    // `require` is not in scope here (this runs inside the errors factory),
+    // so the old `require("util").inspect` ALWAYS threw and fell back to
+    // String(value) -- a string then showed with no quotes where node writes
+    // `type string ('abc')`. nodeInspect resolves util off the registry, late.
     let inspected;
     try {
-      inspected = require("util").inspect(value, { colors: false });
+      inspected = nodeInspect(value, { colors: false });
     } catch {
       inspected = String(value);
     }
@@ -836,8 +846,18 @@
   codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
     return 'Child closed before reply';
   });
+  // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
+  // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
+  // (not quoted, no " option" suffix) and the value goes through
+  // determineSpecificType, so a string shows its quotes. Measured on node
+  // v22.22.2: `Port should be >= 0 and < 65536. Received type string ('abc').`
+  // oam carried an older node's wording; nothing raised it before
+  // ClientRequest's port check, so no call site moves with it.
   codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
-    return '"' + name + '" option should be >= ' + (allowZero ? '0' : '1') + ' and < 65536. Received ' + port;
+    var operator = allowZero === false ? '>' : '>=';
+    var floor = allowZero === false ? '1' : '0';
+    return name + ' should be ' + operator + ' ' + floor + ' and < 65536. Received ' +
+      determineSpecificType(port) + '.';
   });
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
@@ -17817,29 +17837,181 @@
       closeAllConnections() {}
     }
 
+    // Node's urlToHttpOptions (lib/internal/url.js): the options a URL or a
+    // URL string stands for. `hostname` loses its IPv6 brackets, `port` is ""
+    // for a scheme default (so the caller's default wins), and userinfo
+    // becomes `auth` -- ALWAYS in `user:pass` form, both parts
+    // percent-decoded. Measured on node v22.22.2:
+    // `http.request('http://onlyu@h/')` sends `Basic b25seXU6` ("onlyu:")
+    // and `http://u:p%40w@h/` sends `Basic dTpwQHc=` ("u:p@w").
+    function urlToHttpOptions(url) {
+      var hostname = url.hostname;
+      if (hostname.charAt(0) === "[") hostname = hostname.slice(1, -1);
+      var options = {
+        protocol: url.protocol,
+        hostname: hostname,
+        port: url.port,
+        path: (url.pathname || "") + (url.search || ""),
+        href: url.href,
+      };
+      if (url.username || url.password) {
+        options.auth =
+          decodeURIComponent(url.username) + ":" + decodeURIComponent(url.password);
+      }
+      return options;
+    }
+
+    // Node's ClientRequest argument normalisation (lib/_http_client.js): a
+    // string or URL first argument becomes options, a second object is merged
+    // OVER it (so `http.request(url, { path })` wins), and only a function is
+    // taken as the listener. Measured on node v22.22.2: all three of
+    // `(url, options, cb)`, `(url, cb)` and `(options, cb)` send; oam threw
+    // `The "listener" argument must be a function` on the three-argument form.
+    function normalizeClientArgs(input, options, cb) {
+      var derived = null;
+      if (typeof input === "string") {
+        derived = urlToHttpOptions(new URL(input));
+      } else if (input instanceof URL) {
+        derived = urlToHttpOptions(input);
+      } else {
+        // (options[, cb]): the second argument IS the listener.
+        cb = options;
+        options = input;
+        derived = null;
+      }
+      if (typeof options === "function") {
+        cb = options;
+        options = derived || {};
+      } else {
+        options = Object.assign(derived || {}, options);
+      }
+      return { options: options, callback: cb };
+    }
+
+    // Node's INVALID_PATH_REGEX (lib/_http_client.js): a request path carries
+    // only 0x21-0xFF. A space, a tab or a CR/LF -- request-line and header
+    // injection -- is refused before anything dials, and so is any code point
+    // past 0xFF. Measured on node v22.22.2: '/a b', '/a\tb', '/a\r\nX: 1\r\n'
+    // and '/cafĀ' throw ERR_UNESCAPED_CHARACTERS; '/café',
+    // '/%20' and even a target with no leading slash are accepted.
+    var INVALID_PATH_REGEX = /[^!-ÿ]/;
+
+    // Node's validateHost: only a string, undefined or null. It is checked on
+    // `hostname` first and on `host` only when `hostname` is absent, so
+    // `{hostname: '127.0.0.1', host: 0}` is fine and `{host: 0}` is not
+    // (measured on node v22.22.2, both messages name the option that failed).
+    function validateHost(host, name) {
+      if (host !== null && host !== undefined && typeof host !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options." + name,
+          ["string", "undefined", "null"],
+          host,
+        );
+      }
+      return host;
+    }
+
+    // Node's validatePort, as ClientRequest applies it: the port is defaulted
+    // FIRST, so a falsy one (0, '', NaN, null) becomes the scheme default and
+    // is never rejected. Measured on node v22.22.2: 65536, -1, 1.5, 70000,
+    // 'abc', ' ' and '1@127.0.0.1:2' throw RangeError ERR_SOCKET_BAD_PORT;
+    // '80', '0x50', '80 ' and ' 80' are accepted; a boolean or an object
+    // throws TypeError ERR_INVALID_ARG_TYPE.
+    //
+    // It returns the NUMBER, because node dials the coercion and not the
+    // spelling: `port: '0x50'`, `'80 '` and `' 80'` all reach a server on port
+    // 80 (measured -- the request completes). oam carries the target as a URL
+    // string, where every one of those three spellings fails to parse, and the
+    // request died with a bare `TypeError: fetch failed`. The one thing that
+    // does not follow node is the Host header: node writes the caller's raw
+    // spelling there (`Host: 127.0.0.1:0xc4df`, and `127.0.0.1: 50399` for a
+    // leading space -- both measured on v22.22.2), oam writes the normalised
+    // port. See docs/node-divergences.md.
+    function validateClientPort(port) {
+      if (typeof port !== "number" && typeof port !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.port", ["number", "string"], port);
+      }
+      if (
+        (typeof port === "string" && port.trim().length === 0) ||
+        +port !== (+port >>> 0) ||
+        port > 0xffff
+      ) {
+        throw codes.ERR_SOCKET_BAD_PORT("Port", port, true);
+      }
+      return +port;
+    }
+
     class ClientRequest extends EventEmitter {
-      constructor(options, callback) {
+      constructor(input, options, callback) {
         super();
-        if (typeof options === "string") options = new URL(options);
-        if (options instanceof URL) {
-          options = {
-            hostname: options.hostname,
-            port: options.port || (options.protocol === "https:" ? 443 : 80),
-            path: options.pathname + options.search,
-            protocol: options.protocol,
-          };
-        }
-        var opts = options || {};
+        var normalized = normalizeClientArgs(input, options, callback);
+        var opts = normalized.options || {};
+        callback = normalized.callback;
         this.method = (opts.method || "GET").toUpperCase();
         var protocol = opts.protocol || "http:";
-        var host = opts.hostname || opts.host || "localhost";
-        var port = opts.port || (protocol === "https:" ? 443 : 80);
+        // Node's order: the path is validated before the port (measured with
+        // both bad -- ERR_UNESCAPED_CHARACTERS wins).
         var reqPath = opts.path || "/";
+        if (opts.path) {
+          reqPath = String(opts.path);
+          if (INVALID_PATH_REGEX.test(reqPath)) {
+            throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+          }
+        }
+        var host =
+          validateHost(opts.hostname, "hostname") ||
+          validateHost(opts.host, "host") ||
+          "localhost";
+        var port = validateClientPort(opts.port || (protocol === "https:" ? 443 : 80));
         // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
         // `http://::1:80/` would not parse and the request would fail with
         // "fetch failed" where node connects to ::1. A URL's hostname already
         // carries its brackets (net.isIP('[::1]') is 0).
         var urlHost = registry.get("net").isIP(host) === 6 ? "[" + host + "]" : host;
+        // The connect target must not be movable by the caller's `path` or
+        // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
+        // as an OPAQUE request target. oam carries the request as a URL
+        // string, and plain concatenation let both escape -- measured before
+        // this guard, `{hostname: SAFE, port: GOOD, path: '@127.0.0.1:EVIL/x'}`
+        // and `{hostname: 'u:p@127.0.0.1', ...}` both reached the OTHER origin,
+        // and take_userinfo then sent the intended origin to it as
+        // `Authorization: Basic base64(SAFE:GOOD)`.
+        //
+        // A path that does not start with "/" is given one, so it can only
+        // ever be a path (node would send it verbatim, which its own servers
+        // answer with 400); and a `host` the URL parser cannot hold as a bare
+        // authority fails the request, where node fails it in the resolver
+        // (see docs/node-divergences.md).
+        if (reqPath.charAt(0) !== "/") reqPath = "/" + reqPath;
+        this._urlError = null;
+        var authority = null;
+        try {
+          var probe = new URL(protocol + "//" + urlHost + "/");
+          if (
+            probe.username === "" &&
+            probe.password === "" &&
+            probe.port === "" &&
+            probe.pathname === "/" &&
+            probe.search === "" &&
+            probe.hash === ""
+          ) {
+            authority = probe;
+          }
+        } catch {
+          authority = null;
+        }
+        if (authority === null) {
+          // node resolves the literal string and fails there. Its own code
+          // varies by spelling on Windows (ENOTFOUND for '127.0.0.1/x',
+          // EAI_FAIL for 'u:p@127.0.0.1'); oam reports the ENOTFOUND shape.
+          this._urlError = globalThis.__oamMakeSysError({
+            message: "getaddrinfo ENOTFOUND " + host,
+            errno: -3008,
+            code: "ENOTFOUND",
+            syscall: "getaddrinfo",
+            hostname: host,
+          });
+        }
         this._url = protocol + "//" + urlHost + ":" + port + reqPath;
         this._headers = {};
         if (opts.headers) {
@@ -17847,6 +18019,19 @@
           for (var i = 0; i < keys.length; i++) {
             this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
           }
+        }
+        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
+        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
+        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
+        // string's UTF-8 (measured: `auth: 'café:p'` sends
+        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
+        // nothing, and an explicit authorization header wins in either case.
+        // oam dropped the documented option entirely, so every caller using it
+        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
+        // this option -- talked to the server unauthenticated and got a 401.
+        if (opts.auth && this._headers["authorization"] === undefined) {
+          this._headers["authorization"] =
+            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
         }
         this._body = [];
         this._ended = false;
@@ -18082,6 +18267,20 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
+        // A `host` the URL parser cannot hold as a bare authority: the request
+        // never goes out, and the failure surfaces as the resolver error node
+        // reports for the same options (see the constructor).
+        if (self._urlError !== null) {
+          var urlError = self._urlError;
+          process.nextTick(function () {
+            if (self._aborted) return;
+            self.errored = urlError;
+            self.destroyed = true;
+            self._emitClose();
+            self.emit("error", urlError);
+          });
+          return;
+        }
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
@@ -18188,6 +18387,18 @@
       }
       _doUpgradeRequest(bodyData) {
         var self = this;
+        // Same guard as _doFetchRequest: an unusable `host` never dials.
+        if (self._urlError !== null) {
+          var urlError = self._urlError;
+          process.nextTick(function () {
+            if (self._aborted) return;
+            self.errored = urlError;
+            self.destroyed = true;
+            self._emitClose();
+            self.emit("error", urlError);
+          });
+          return;
+        }
         var parsed = new URL(self._url);
         var host = parsed.hostname;
         var port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
@@ -18343,12 +18554,14 @@
       }
     }
 
-    function request(options, callback) {
-      return new ClientRequest(options, callback);
+    // Node's documented signatures are (options[, cb]), (url[, cb]) and
+    // (url, options[, cb]); ClientRequest normalises all three.
+    function request(input, options, callback) {
+      return new ClientRequest(input, options, callback);
     }
 
-    function get(options, callback) {
-      var req = request(options, callback);
+    function get(input, options, callback) {
+      var req = request(input, options, callback);
       req.end();
       return req;
     }
@@ -20846,18 +21059,31 @@
       return new Server(options, handler);
     }
 
+    // node lib/https.js builds a FRESH options object (`options = {}` /
+    // `urlToHttpOptions(url)`, then `ObjectAssign(options, args.shift())`), so
+    // the caller's object is never written to. oam used to assign into it,
+    // which leaks derived state into a reused options literal: after
+    // `https.request(urlA, shared)` the `shared` object carries urlA's
+    // hostname, port and path, and `https.request(urlB, shared)` then keeps
+    // sending to A. Copy first.
     function request(url, options, callback) {
       if (typeof url === "string" || url instanceof URL) {
         var parsed = typeof url === "string" ? new URL(url) : url;
         if (typeof options === "function") { callback = options; options = {}; }
-        options = options || {};
+        options = Object.assign({}, options);
         options.hostname = options.hostname || parsed.hostname;
         options.port = options.port || parsed.port || 443;
         options.path = options.path || parsed.pathname + parsed.search;
         options.protocol = "https:";
+        // node's urlToHttpOptions turns a URL's userinfo into the `auth`
+        // option, which ClientRequest then sends as Basic credentials.
+        if (!options.auth && (parsed.username || parsed.password)) {
+          options.auth =
+            decodeURIComponent(parsed.username) + ":" + decodeURIComponent(parsed.password);
+        }
       } else {
         callback = options;
-        options = url || {};
+        options = Object.assign({}, url);
         if (!options.protocol) options.protocol = "https:";
         if (!options.port) options.port = 443;
       }
@@ -20897,6 +21123,12 @@
         if (options.headers) {
           var keys = Object.keys(options.headers);
           for (var i = 0; i < keys.length; i++) this._headers[keys[i].toLowerCase()] = options.headers[keys[i]];
+        }
+        // node's `auth` option (or a URL's userinfo) as Basic credentials, the
+        // same rule http.ClientRequest applies.
+        if (options.auth && this._headers["authorization"] === undefined) {
+          this._headers["authorization"] =
+            "Basic " + globalThis.Buffer.from(String(options.auth), "utf8").toString("base64");
         }
         this._body = [];
         this._ended = false;
