@@ -1,5 +1,5 @@
-// A refused or unresolvable connect through net.connect and tls.connect
-// reports node's exact error (#143). An IP-literal host is ONE attempt and a
+// A refused or unresolvable connect through net.connect, tls.connect,
+// http.get, https.get and fetch reports node's exact error (#143). An IP-literal host is ONE attempt and a
 // plain Error -- node's ExceptionWithHostPort: its prototype is a subclass of
 // Error.prototype, own `stack` and `message`, then enumerable errno, code,
 // syscall, address, port in that order, and a `connect CODE address:port`
@@ -9,6 +9,9 @@
 // key, the attempts as non-enumerable `errors`, no own message, a stack header
 // `AggregateError [CODE]: `. oam used to report `localhost` itself as the
 // address, name only the last refusal, and (tls) word it like an fs error.
+// http emits that same error; fetch rejects with the bare TypeError "fetch
+// failed" and carries it as `cause` (oam's fetch used to patch the URL's host
+// onto a reqwest error, so a name reported itself as the address).
 //
 // `localhost` prints the full shape only on win32, where node and oam both call
 // getaddrinfo with no flags. Off Windows node adds AI_ADDRCONFIG and oam does
@@ -18,6 +21,8 @@
 // list are printed. A failure connect(2) reports synchronously carries the
 // local socket's ephemeral port (` - Local (0.0.0.0:55035)`), so that detail is
 // redacted everywhere.
+import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import tls from "node:tls";
 
@@ -103,9 +108,42 @@ function failure(label, host, open) {
   });
 }
 
+// A request emits the connect error itself.
+function requestFailure(label, host, open) {
+  return new Promise((resolve) => {
+    const since = Date.now();
+    const req = open();
+    req.on("response", (res) => {
+      console.log(label, host, "response?!", res.statusCode);
+      res.resume();
+      resolve();
+    });
+    req.on("error", (e) => {
+      console.log(label, host, timing(since), render(host, e));
+      resolve();
+    });
+  });
+}
+
+async function fetchFailure(label, host, url) {
+  const since = Date.now();
+  try {
+    const res = await fetch(url);
+    console.log(label, host, "resolved?!", res.status);
+  } catch (e) {
+    console.log(label, host, timing(since), e.constructor.name, e.message, JSON.stringify(Object.keys(e)),
+      render(host, e.cause));
+  }
+}
+
 for (const host of ["127.0.0.1", "::1", "localhost"]) {
   await failure("net", host, () => net.connect({ host, port }));
   await failure("tls", host, () => tls.connect({ host, port, rejectUnauthorized: false }));
+  const urlHost = host === "::1" ? "[::1]" : host;
+  await requestFailure("http.get url", host, () => http.get(`http://${urlHost}:${port}/`));
+  await requestFailure("http.get options", host, () => http.get({ host, port }));
+  await requestFailure("https.get", host, () => https.get(`https://${urlHost}:${port}/`, { rejectUnauthorized: false }));
+  await fetchFailure("fetch", host, `http://${urlHost}:${port}/`);
 }
 
 // Unresolvable: node's DNSException, never aggregated.
@@ -125,3 +163,17 @@ await new Promise((resolve) => {
   c.on("close", resolve);
 });
 listener.close();
+
+// fetch to the unspecified address reaches a 127.0.0.1 listener the same way.
+const web = http.createServer((req, res) => res.end("ok"));
+await new Promise((resolve) => web.listen(0, "127.0.0.1", resolve));
+{
+  const since = Date.now();
+  try {
+    const res = await fetch(`http://0.0.0.0:${web.address().port}/`);
+    console.log("fetch 0.0.0.0 -> 127.0.0.1 listener:", res.status, await res.text(), timing(since));
+  } catch (e) {
+    console.log("fetch 0.0.0.0 error?!", e.cause?.code);
+  }
+}
+web.close();
