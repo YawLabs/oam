@@ -1237,6 +1237,37 @@ mod tests {
         assert_eq!(decode_split(&[], &a, || 40_000), Ok(a.clone()));
     }
 
+    /// Bodies too short for zlib to judge, measured through node v22.22.2's
+    /// fetch: an error needs the bytes the check reads (two for the magic,
+    /// two for CM+FLG), so fewer is truncation.
+    #[test]
+    fn short_bodies_match_node() {
+        let hello = gzip(b"hello");
+        assert_eq!(decode_all(&[Coding::Gzip], b"x"), Ok(Vec::new()));
+        assert_eq!(
+            decode_all(&[Coding::Gzip], &[0x1f, 0x8b, 7]),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            decode_all(&[Coding::Gzip], &[0x1f, 0x8b, 8, 0x20]),
+            err("unknown header flags set")
+        );
+        assert_eq!(
+            decode_all(&[Coding::Gzip], &cat(&[&hello, b"J"])),
+            Ok(b"hello".to_vec())
+        );
+        let mut bad_crc = hello.clone();
+        let n = bad_crc.len();
+        bad_crc[n - 8] ^= 1;
+        assert_eq!(
+            decode_all(&[Coding::Gzip], &bad_crc[..n - 2]),
+            err("incorrect data check")
+        );
+        assert_eq!(decode_all(&[Coding::Deflate], b"x"), Ok(Vec::new()));
+        assert_eq!(decode_all(&[Coding::Deflate], &[0x78]), Ok(Vec::new()));
+        assert_eq!(decode_all(&[Coding::Brotli], &[0x0b]), Ok(Vec::new()));
+    }
+
     #[test]
     fn errors_are_sticky() {
         let mut d = Decoder::new(&[Coding::Gzip]);
