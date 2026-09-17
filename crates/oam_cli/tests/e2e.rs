@@ -4946,6 +4946,64 @@ a.close(); b.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// The guard applies however the dispatcher is installed. undici offers five
+/// ways and node enforces the hook in all five (measured, node v22.22.2 +
+/// undici 6.24.1); oam honoured only `fetch`'s `dispatcher` option and the
+/// other four silently made an UNPINNED request -- a security control that
+/// fails open. The hook refuses `localhost` and the server listens on
+/// 127.0.0.1, so a request that arrives proves the guard was never consulted.
+#[test]
+fn undici_connect_lookup_guard_applies_to_every_dispatcher_entry_point() {
+    let script = write_temp(
+        "undici_lookup_forms/main.mjs",
+        r#"import http from 'node:http';
+import * as undici from 'undici';
+const hits = [];
+const srv = http.createServer((req, res) => { hits.push(req.url); res.end('REACHED'); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const base = `http://localhost:${srv.address().port}`;
+const calls = [];
+const guard = Object.assign(new Error('blocked by ssrf guard'), { code: 'EBLOCKED' });
+const mkAgent = () => new undici.Agent({ connect: { lookup: (host, opts, cb) => {
+  calls.push(host);
+  if (host === 'localhost') return cb(guard);
+  cb(null, [{ address: '127.0.0.1', family: 4 }]);
+} } });
+async function probe(name, run) {
+  calls.length = 0; hits.length = 0;
+  let verdict;
+  try {
+    const r = await run();
+    verdict = `NO-GUARD status ${r?.status ?? r?.statusCode}`;
+  } catch (e) {
+    verdict = (e === guard || e?.cause === guard) ? 'guarded' : `other ${e?.code ?? ''} ${e?.message}`;
+  }
+  console.log(name, verdict, JSON.stringify(calls), JSON.stringify(hits));
+}
+await probe('init-dispatcher', () => fetch(base + '/1', { dispatcher: mkAgent() }));
+undici.setGlobalDispatcher(mkAgent());
+await probe('global-fetch', () => fetch(base + '/2'));
+await probe('undici-fetch', () => undici.fetch(base + '/3'));
+const agent = mkAgent();
+await probe('agent-request', () => agent.request({ origin: base, path: '/4', method: 'GET' }));
+await probe('request-dispatcher', () => undici.request(base + '/5', { dispatcher: mkAgent() }));
+// init.dispatcher still overrides the global one, as it does in node.
+undici.setGlobalDispatcher(new undici.Agent());
+await probe('global-unhooked', () => fetch(base + '/6'));
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "init-dispatcher guarded [\"localhost\"] []\n\
+         global-fetch guarded [\"localhost\"] []\n\
+         undici-fetch guarded [\"localhost\"] []\n\
+         agent-request guarded [\"localhost\"] []\n\
+         request-dispatcher guarded [\"localhost\"] []\n\
+         global-unhooked NO-GUARD status 200 [] [\"/6\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// An abort ends a hooked fetch where node ends it. Aborted in the same tick
 /// as fetch(), the first host is still passed to the hook (undici has begun
 /// connecting); aborted while a request is on the wire, the redirect it

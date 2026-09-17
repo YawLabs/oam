@@ -1168,9 +1168,12 @@ What still differs:
 
 **`connect.lookup` on an undici `Agent`**
 
-Passed as `fetch`'s `dispatcher`, an `Agent({ connect: { lookup } })` hook is called for the
-first host and every redirect hop to another host name, never for an IP literal and never for
-a URL on a bad port, with `{ family: undefined, hints, all: true }`. The connection dials only
+An `Agent({ connect: { lookup } })` hook is called for the first host and every redirect hop
+to another host name, never for an IP literal and never for
+a URL on a bad port, with `{ family: undefined, hints, all: true }`. All five ways undici
+installs a dispatcher carry the hook, as they do in Node: `fetch`'s `dispatcher` option,
+`setGlobalDispatcher` + global `fetch`, `undici.fetch`, `agent.request()`, and
+`undici.request(url, { dispatcher })`. The connection dials only
 the addresses it returned, with Node's filtering and errors (`ERR_INVALID_IP_ADDRESS`,
 `ERR_INVALID_ADDRESS_FAMILY`, an `AggregateError` when every address refuses), and a hook
 that fails -- or throws -- fails the fetch closed with its error as the `cause`, identity
@@ -1188,6 +1191,12 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   answer and connects.
 - **A scoped IPv6 address** (`fe80::1%lo0`) is refused with `ERR_INVALID_IP_ADDRESS`, because
   oam's `net.isIP('fe80::1%lo0')` is `0`; Node's is `6` and it dials the address.
+- **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
+  `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
+  hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.
+- **The hook is not a `--permission` boundary.** `--allow-net=<name>` grants the NAME; a hook
+  may then answer with any address (`127.0.0.1`, a link-local metadata address) and oam dials
+  it, because the gate checks the URL's hostname and not the address the connection uses.
 
 **Redirects**
 

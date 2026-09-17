@@ -1070,10 +1070,15 @@
       // undici.request) opt out.
       fetch_semantics: init.__oamFetchSemantics !== false,
     };
-    // An undici-style dispatcher (init.dispatcher) may carry a connect.lookup
-    // hook -- the DNS-rebind / SSRF pin. The oam:undici shim exposes it as
-    // `_oamConnectLookup`. No dispatcher / no hook = the plain path, no cost.
-    const dispatcher = init.dispatcher;
+    // An undici-style dispatcher may carry a connect.lookup hook -- the
+    // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
+    // `_oamConnectLookup`. node honours that hook however the dispatcher was
+    // installed, so the GLOBAL one counts too (undici.setGlobalDispatcher,
+    // which plain fetch() and undici.fetch() both dispatch through);
+    // `init.dispatcher` overrides it, as in node. No dispatcher / no hook =
+    // the plain path, no cost -- the holder does not exist until a run imports
+    // undici.
+    const dispatcher = init.dispatcher ?? globalThis.__oamUndiciDispatcher?.current;
     const lookup = dispatcher && dispatcher._oamConnectLookup;
     if (typeof lookup === "function") request.lookup_hook = true;
     // Internal escape hatch: a request whose body is produced over time
