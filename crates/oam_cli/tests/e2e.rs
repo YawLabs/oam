@@ -22198,6 +22198,73 @@ Error.prepareStackTrace = saved;
     );
 }
 
+/// The two http client paths that open their own TCP connection report a
+/// refusal exactly as net.connect does (#143). An upgrade request
+/// (`_doUpgradeRequest`) emits the connect op's error unchanged: node's plain
+/// `connect ECONNREFUSED 127.0.0.1:PORT`, and for `localhost` on Windows the
+/// NodeAggregateError over `::1` then `127.0.0.1` -- expected strings measured
+/// on node v22.22.2 on Windows with the same program. And `http.get({host:
+/// '::1'})` reaches the transport: the request URL used to be built without
+/// brackets (`http://::1:PORT/`), which failed as "fetch failed" before any
+/// connect. Off Windows `localhost` may resolve to one address or two
+/// (AI_ADDRCONFIG), and `::1` may fail synchronously on a host with no IPv6,
+/// so only the platform-proof parts are asserted there.
+#[test]
+fn http_upgrade_and_ipv6_host_refusals_have_the_net_connect_shape() {
+    let stdout = run_ok(
+        "http_upgrade_refused.mjs",
+        r#"import net from 'node:net';
+import http from 'node:http';
+const probe = net.createServer();
+await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+const port = probe.address().port;
+await new Promise((r) => probe.close(r));
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+const show = (label, e) => console.log(label, P(JSON.stringify({
+  ctor: e.constructor.name, agg: e instanceof AggregateError, message: e.message,
+  keys: Object.keys(e), code: e.code, address: e.address,
+  children: e.errors?.map((c) => c.message),
+})));
+for (const host of ['127.0.0.1', 'localhost']) {
+  await new Promise((resolve) => {
+    const req = http.request({ host, port, headers: { Connection: 'Upgrade', Upgrade: 'websocket' } });
+    req.on('upgrade', () => { console.log('upgraded?!'); resolve(); });
+    req.on('error', (e) => { show('upgrade ' + host, e); resolve(); });
+    req.end();
+  });
+}
+await new Promise((resolve) => {
+  const req = http.get({ host: '::1', port }, () => { console.log('response?!'); resolve(); });
+  req.on('error', (e) => {
+    console.log('ipv6 host', JSON.stringify({ ctor: e.constructor.name, keys: Object.keys(e), address: e.address }));
+    resolve();
+  });
+});
+"#,
+    );
+    let mut expected = vec![
+        r#"upgrade 127.0.0.1 {"ctor":"Error","agg":false,"message":"connect ECONNREFUSED 127.0.0.1:PORT","keys":["errno","code","syscall","address","port"],"code":"ECONNREFUSED","address":"127.0.0.1"}"#,
+        r#"ipv6 host {"ctor":"Error","keys":["errno","code","syscall","address","port"],"address":"::1"}"#,
+    ];
+    if cfg!(windows) {
+        expected.push(
+            r#"upgrade localhost {"ctor":"AggregateError","agg":true,"message":"","keys":["code"],"code":"ECONNREFUSED","children":["connect ECONNREFUSED ::1:PORT","connect ECONNREFUSED 127.0.0.1:PORT"]}"#,
+        );
+    } else {
+        assert!(
+            stdout.lines().any(|l| l.starts_with("upgrade localhost ")),
+            "no localhost upgrade error in:\n{stdout}"
+        );
+    }
+    for line in expected {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "missing line `{line}` in:\n{stdout}"
+        );
+    }
+    assert!(!stdout.contains("?!"), "{stdout}");
+}
+
 /// The promises wrapper must not re-type what it wraps, and must not reach the
 /// callback layer.
 ///
