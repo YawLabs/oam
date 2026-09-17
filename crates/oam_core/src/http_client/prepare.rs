@@ -246,3 +246,30 @@ pub fn origin_eq(a: &url::Url, b: &url::Url) -> bool {
         && a.host() == b.host()
         && a.port_or_known_default() == b.port_or_known_default()
 }
+
+/// The Fetch Standard's "bad port" list as undici 6.24.1 ships it
+/// (fetch/constants.js:14-21, `badPortsSet`), sorted. Port 0 is not on it.
+const BAD_PORTS: [u16; 82] = [
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
+    103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
+    512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+    995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
+    6669, 6679, 6697, 10080,
+];
+
+/// undici's `requestBadPort` (fetch/util.js:104-116): an http(s) URL whose
+/// port is on the bad-port list. The port is the URL's explicit one -- an
+/// elided default (`url.port === ""` in JS, `None` here) is never bad, so
+/// `http://host:443/` is allowed and `http://host:25/` is not.
+///
+/// Node's fetch runs this in `mainFetch` for the first request and for every
+/// redirect hop, failing with a network error whose cause is `bad port`
+/// before anything dials (measured on node v22.22.2: a 302 to
+/// `http://127.0.0.1:25/` sends no second request). `http.request` has no
+/// such check, so it is not part of [`prepare`].
+pub fn is_bad_port(url: &url::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url
+            .port()
+            .is_some_and(|port| BAD_PORTS.binary_search(&port).is_ok())
+}

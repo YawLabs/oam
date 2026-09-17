@@ -15,13 +15,14 @@
 //! | unparseable Location | network error `Invalid URL` | returned the 3xx |
 //! | non-http(s) Location | `URL scheme must be a HTTP(S) scheme` | `builder error for url (...)` |
 //! | Location with userinfo | network error (see [`CREDENTIALS`]) | converted to Basic auth |
+//! | Location on a bad port (e.g. 25) | network error `bad port`, not sent | followed |
 
 use http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION,
     CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
 };
 
-use super::prepare::origin_eq;
+use super::prepare::{is_bad_port, origin_eq};
 
 /// undici fetch/index.js:1247: `if (request.redirectCount === 20)` is checked
 /// before the increment, so twenty redirects are followed and the 21st 3xx
@@ -40,6 +41,9 @@ pub const COUNT_EXCEEDED: &str = "redirect count exceeded";
 /// or not it points at the same origin -- measured on node v22.22.2 for both
 /// `http://u:p@<same host:port>/` and a different host.
 pub const CREDENTIALS: &str = "cross origin not allowed for request mode \"cors\"";
+/// fetch/index.js:541-543, run by `mainFetch` for the hop the redirect starts
+/// (fetch/index.js:1351). See [`super::prepare::is_bad_port`].
+pub const BAD_PORT: &str = "bad port";
 
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +99,8 @@ pub fn location(headers: &HeaderMap) -> Option<HeaderValue> {
 /// `body_replayable` is true when the request has no body or a buffered one.
 ///
 /// The checks run in undici's order: Location parse, scheme, count,
-/// credentials, then the method/body rewrite.
+/// credentials, then the method/body rewrite, and last the bad-port check
+/// `mainFetch` runs on the new URL before it dials.
 pub fn next(
     status: u16,
     method: &http::Method,
@@ -133,15 +138,21 @@ pub fn next(
     // headers (content-type included -- reqwest dropped it).
     let rewrite = (matches!(status, 301 | 302) && *method == http::Method::POST)
         || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD);
+    if !rewrite && !body_replayable {
+        return Next::ReturnResponse;
+    }
+    // fetch/index.js:1351 hands the hop to `mainFetch`, whose first network
+    // decision is the bad-port block (index.js:541-543): the fetch fails
+    // before the next request is sent.
+    if is_bad_port(&target) {
+        return Next::Fail(BAD_PORT);
+    }
     if rewrite {
         return Next::Follow {
             url: target,
             method: http::Method::GET,
             drop_body: true,
         };
-    }
-    if !body_replayable {
-        return Next::ReturnResponse;
     }
     Next::Follow {
         url: target,

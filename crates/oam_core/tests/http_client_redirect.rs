@@ -5,8 +5,9 @@
 
 use http::Method;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
+use oam_core::http_client::prepare;
 use oam_core::http_client::redirect::{
-    self, BAD_SCHEME, COUNT_EXCEEDED, CREDENTIALS, INVALID_URL, MAX_REDIRECTS, Next,
+    self, BAD_PORT, BAD_SCHEME, COUNT_EXCEEDED, CREDENTIALS, INVALID_URL, MAX_REDIRECTS, Next,
 };
 
 fn url(s: &str) -> url::Url {
@@ -197,6 +198,96 @@ fn location_errors_in_undici_order() {
     );
 }
 
+/// undici 6.24.1 fetch/constants.js:14-21, copied from the source as strings.
+const UNDICI_BAD_PORTS: &str = "1 7 9 11 13 15 17 19 20 21 22 23 25 37 42 43 53 69 77 79 87 95     101 102 103 104 109 110 111 113 115 117 119 123 135 137 139 143 161 179 389 427 465 512 513     514 515 526 530 531 532 540 548 554 556 563 587 601 636 989 990 993 995 1719 1720 1723 2049     3659 4045 4190 5060 5061 6000 6566 6665 6666 6667 6668 6669 6679 6697 10080";
+
+#[test]
+fn bad_port_list_is_undicis_for_every_port() {
+    let listed: Vec<u16> = UNDICI_BAD_PORTS
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    assert_eq!(listed.len(), 82);
+    for port in 0..=u16::MAX {
+        let want = listed.contains(&port);
+        for scheme in ["http", "https"] {
+            let u = url(&format!("{scheme}://a.test:{port}/"));
+            // An explicit default port is elided by the parser (`url.port`
+            // is "" in JS), and neither 80 nor 443 is listed anyway.
+            assert_eq!(prepare::is_bad_port(&u), want, "{u}");
+        }
+    }
+    // The elided port is never bad; the scheme's default is not looked up.
+    assert!(!prepare::is_bad_port(&url("http://a.test/")));
+    assert!(!prepare::is_bad_port(&url("https://a.test:443/")));
+    assert!(!prepare::is_bad_port(&url("http://a.test:443/")));
+    assert!(prepare::is_bad_port(&url("https://[::1]:25/")));
+    // Only http(s) URLs are checked (undici `urlIsHttpHttpsScheme`).
+    assert!(!prepare::is_bad_port(&url("ftp://a.test:25/")));
+}
+
+/// Measured on node v22.22.2: `302 Location: http://127.0.0.1:25/` fails the
+/// fetch with cause `bad port`, and only the first request reaches a server.
+#[test]
+fn a_hop_to_a_bad_port_fails_after_every_other_check() {
+    let cur = url("http://a.test:8080/x");
+    let get = Method::GET;
+    for loc in [
+        "http://127.0.0.1:25/",
+        "https://a.test:6000/",
+        "http://[::1]:10080/",
+        "//a.test:22/y",
+    ] {
+        for status in [301u16, 302, 303, 307, 308] {
+            assert_eq!(
+                follow(status, &get, cur.as_str(), loc, true),
+                Next::Fail(BAD_PORT),
+                "{status} {loc}"
+            );
+        }
+    }
+    // A relative Location inherits the current URL's port.
+    assert_eq!(
+        follow(302, &get, "http://a.test:25/x", "/y", true),
+        Next::Fail(BAD_PORT)
+    );
+    // The body rewrite does not skip it.
+    assert_eq!(
+        follow(302, &Method::POST, cur.as_str(), "http://a.test:25/", false),
+        Next::Fail(BAD_PORT)
+    );
+    // Allowed ports still follow.
+    for loc in [
+        "http://a.test:8081/",
+        "http://a.test:443/",
+        "https://a.test/",
+    ] {
+        assert!(
+            matches!(
+                follow(302, &get, cur.as_str(), loc, true),
+                Next::Follow { .. }
+            ),
+            "{loc}"
+        );
+    }
+    // Every httpRedirectFetch check comes first: the count, the credentials,
+    // and the unreplayable body (undici fails there with a network error of
+    // its own; oam returns the 3xx, design-143 section 0).
+    let bad = hv("http://a.test:25/");
+    assert_eq!(
+        redirect::next(302, &get, &cur, Some(&bad), MAX_REDIRECTS, true),
+        Next::Fail(COUNT_EXCEEDED)
+    );
+    assert_eq!(
+        redirect::next(302, &get, &cur, Some(&hv("http://u@a.test:25/")), 0, true),
+        Next::Fail(CREDENTIALS)
+    );
+    assert_eq!(
+        redirect::next(307, &Method::PUT, &cur, Some(&bad), 0, false),
+        Next::ReturnResponse
+    );
+}
+
 /// Measured on node v22.22.2: a Location with userinfo fails the fetch with
 /// `cross origin not allowed for request mode "cors"`, same-origin or not.
 /// It is never turned into an Authorization header.
@@ -306,9 +397,12 @@ fn repeated_location_lines_are_joined() {
     headers.append("location", hv("/t5"));
     let joined = redirect::location(&headers).unwrap();
     assert_eq!(joined, hv("/t4, /t5"));
-    let cur = url("http://127.0.0.1:9/two");
+    // Port 9 (discard) would be a bad port; any allowed one shows the join.
+    let cur = url("http://127.0.0.1:9000/two");
     match redirect::next(302, &Method::GET, &cur, Some(&joined), 0, true) {
-        Next::Follow { url: got, .. } => assert_eq!(got.as_str(), "http://127.0.0.1:9/t4,%20/t5"),
+        Next::Follow { url: got, .. } => {
+            assert_eq!(got.as_str(), "http://127.0.0.1:9000/t4,%20/t5")
+        }
         other => panic!("{other:?}"),
     }
 }
