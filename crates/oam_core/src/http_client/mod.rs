@@ -25,14 +25,23 @@
 //! - [`transport`]: the pooled hyper-util client, a hooked fetch's one-off
 //!   client, the request bodies, and the send-failure mapping.
 //!
+//! And the op on top of it:
+//!
+//! - [`send`]: the request JS sends, the redirect loop, the lookup-hook
+//!   continuation, and the payload a fetch resolves with.
+//! - [`body`]: the response body reader and the outbound request-body
+//!   channel lifecycle.
+//!
 //! The modules are `pub` so the URL-heavy tests live in
 //! `crates/oam_core/tests/http_client_*.rs`, outside the published-URLs gate's
 //! scan (an `http://[::1]` literal parses to the host `[` there).
 
+pub mod body;
 mod connector;
 pub mod decode;
 pub mod prepare;
 pub mod redirect;
+pub mod send;
 pub mod tls_config;
 pub mod transport;
 
