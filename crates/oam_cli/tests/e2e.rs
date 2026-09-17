@@ -5421,6 +5421,140 @@ try {
     server.join().unwrap();
 }
 
+/// The request shapes conformance case 114 cannot assert, because node's own
+/// http server cannot parse them or because node never answers at all.
+///
+///  - A method outside the six the Fetch Standard normalises keeps the
+///    caller's spelling: `{method: 'patch'}` writes `patch` on the request
+///    line, as node does. oam uppercased every method.
+///  - A `content-length` SHORTER than the body is refused. hyper would
+///    otherwise frame the request at the declared length and silently
+///    truncate the body, returning 200 -- data loss, and a request-smuggling
+///    primitive if anything downstream re-frames. node does not dispatch it
+///    either; it simply hangs, so this cannot be a differential case.
+///  - A caller `host` header never reaches the wire; the real authority does.
+#[test]
+fn fetch_request_shapes_a_node_server_cannot_answer() {
+    let script = write_temp(
+        "fetch_wire_shapes/main.mjs",
+        r#"import net from 'node:net';
+const heads = [];
+const srv = net.createServer((s) => {
+  let buf = '';
+  s.on('error', () => {});
+  s.on('data', (c) => {
+    buf += c.toString('latin1');
+    const i = buf.indexOf('\r\n\r\n');
+    if (i < 0) return;
+    heads.push(buf.slice(0, i).split('\r\n').join(' | '));
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+    buf = '';
+  });
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const P = srv.address().port;
+const U = `http://127.0.0.1:${P}/p`;
+async function one(label, init) {
+  const before = heads.length;
+  try {
+    const r = await fetch(U, init);
+    await r.text();
+    console.log(label, 'ok', heads.length > before ? heads[heads.length - 1].replaceAll(String(P), 'PORT') : 'NO-HEAD');
+  } catch (e) {
+    console.log(label, 'reject', e.cause?.message ?? e.message, '| wire:', heads.length > before ? 'SENT' : 'nothing');
+  }
+}
+await one('method-patch', { method: 'patch' });
+await one('cl-short', { method: 'POST', body: 'AB', headers: { 'content-length': '1' } });
+await one('host-header', { headers: { host: 'spoof.test' } });
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let lines: Vec<String> = stdout
+        .trim()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert!(
+        lines[0].starts_with("method-patch ok patch /p HTTP/1.1"),
+        "the method keeps its case on the wire: {:?}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1],
+        "cl-short reject Request body length does not match content-length header | wire: nothing",
+        "a short content-length is refused, not framed"
+    );
+    assert!(
+        lines[2].starts_with("host-header ok"),
+        "the request is sent: {:?}",
+        lines[2]
+    );
+    assert!(
+        !lines[2].contains("spoof.test"),
+        "a caller host header must not reach the wire: {:?}",
+        lines[2]
+    );
+    assert!(
+        lines[2].contains("host: 127.0.0.1:PORT"),
+        "the real authority is sent instead: {:?}",
+        lines[2]
+    );
+}
+
+/// An abort after the response head ends the BODY too, where oam used to keep
+/// reading and hand over the whole thing with a clean end -- so a guard that
+/// aborted on a size limit downloaded everything anyway. node errors the body
+/// stream with the abort reason and stops; the chunks already delivered stay
+/// delivered in both. The byte count differs (chunk boundaries do), so this
+/// asserts the error and that the read stopped short.
+#[test]
+fn an_abort_ends_a_response_body_that_is_already_being_read() {
+    let script = write_temp(
+        "abort_mid_body/main.mjs",
+        r#"import http from 'node:http';
+const TOTAL = 300000;
+const srv = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-length': String(TOTAL), 'content-type': 'application/octet-stream' });
+  let sent = 0;
+  const tick = setInterval(() => {
+    if (sent >= TOTAL) { clearInterval(tick); res.end(); return; }
+    res.write(Buffer.alloc(30000, 0x61));
+    sent += 30000;
+  }, 20);
+  res.on('close', () => clearInterval(tick));
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const ac = new AbortController();
+const r = await fetch(`http://127.0.0.1:${srv.address().port}/big`, { signal: ac.signal });
+const reader = r.body.getReader();
+let bytes = 0;
+let verdict = 'ENDED CLEAN';
+try {
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.length;
+    ac.abort();
+  }
+} catch (e) {
+  verdict = `${e.constructor.name} ${e.name}`;
+}
+console.log(verdict, 'short:', bytes < TOTAL);
+srv.close();
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "DOMException AbortError short: true"
+    );
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without

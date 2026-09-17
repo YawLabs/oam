@@ -358,12 +358,23 @@
   // Headers (Fetch-standard subset): case-insensitive, repeated values
   // combine per the comma rule, iterable. Shared by fetch responses,
   // server requests, and the Response constructor.
+  //
+  // The store is a LIST of [lowercased name, value], not a Map, because
+  // `set-cookie` is the one name the standard never combines: a cookie's
+  // `Expires` attribute contains a comma, so `a=1, b=2` cannot be split back
+  // into the two lines the server sent, and cookie-handling code was silently
+  // reading one broken cookie where node gives it two. Every other name still
+  // combines in place, so iteration order is unchanged for them: wire order,
+  // which is what `oam.serve` writes back out. (The standard also sorts
+  // iteration by name and node does; oam does not -- see
+  // docs/node-divergences.md.)
   class Headers {
     constructor(init) {
-      this._map = new Map();
+      /** @type {Array<[string, string]>} */
+      this._list = [];
       if (init === undefined || init === null) return;
       if (init instanceof Headers) {
-        for (const [k, v] of init) this._map.set(k, v);
+        for (const [k, v] of init) this.append(k, v);
       } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
         for (const pair of init) this.append(pair[0], pair[1]);
       } else {
@@ -373,32 +384,56 @@
     append(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
-      this._map.set(key, this._map.has(key) ? `${this._map.get(key)}, ${text}` : text);
+      if (key === "set-cookie") {
+        this._list.push([key, text]);
+        return;
+      }
+      const entry = this._list.find((e) => e[0] === key);
+      if (entry === undefined) this._list.push([key, text]);
+      else entry[1] = `${entry[1]}, ${text}`;
     }
     set(name, value) {
-      this._map.set(String(name).toLowerCase(), String(value));
+      const key = String(name).toLowerCase();
+      const text = String(value);
+      const at = this._list.findIndex((e) => e[0] === key);
+      if (at < 0) {
+        this._list.push([key, text]);
+        return;
+      }
+      this._list[at][1] = text;
+      // set() replaces every entry for the name; only set-cookie can repeat.
+      if (key === "set-cookie") {
+        this._list = this._list.filter((e, i) => e[0] !== key || i === at);
+      }
     }
     get(name) {
-      const value = this._map.get(String(name).toLowerCase());
-      return value === undefined ? null : value;
+      const key = String(name).toLowerCase();
+      const values = this._list.filter((e) => e[0] === key).map((e) => e[1]);
+      return values.length === 0 ? null : values.join(", ");
+    }
+    /** Every `set-cookie` line, uncombined (Fetch Standard, node 19.7+). */
+    getSetCookie() {
+      return this._list.filter((e) => e[0] === "set-cookie").map((e) => e[1]);
     }
     has(name) {
-      return this._map.has(String(name).toLowerCase());
+      const key = String(name).toLowerCase();
+      return this._list.some((e) => e[0] === key);
     }
     delete(name) {
-      this._map.delete(String(name).toLowerCase());
+      const key = String(name).toLowerCase();
+      this._list = this._list.filter((e) => e[0] !== key);
     }
     forEach(fn, thisArg) {
-      for (const [key, value] of this._map) fn.call(thisArg, value, key, this);
+      for (const [key, value] of this._list.slice()) fn.call(thisArg, value, key, this);
     }
     *entries() {
-      yield* this._map.entries();
+      for (const [key, value] of this._list.slice()) yield [key, value];
     }
     *keys() {
-      yield* this._map.keys();
+      for (const [key] of this._list.slice()) yield key;
     }
     *values() {
-      yield* this._map.values();
+      for (const [, value] of this._list.slice()) yield value;
     }
     [Symbol.iterator]() {
       return this.entries();
@@ -832,7 +867,7 @@
     return headers;
   }
 
-  function makeResponse(raw) {
+  function makeResponse(raw, signal) {
     const handle = raw.bodyHandle;
     let consumed = false;
     let bodyStream = null;
@@ -843,8 +878,39 @@
     // a read op; the handle dies with the run's CoreRuntime.
     function ensureBody() {
       bodyStream ??= new ReadableStream({
+        start(controller) {
+          if (!signal) return;
+          // An abort AFTER the response head still ends the body: node errors
+          // the body stream with the abort reason, and stopping a large
+          // download part-way through is the case an AbortController is
+          // normally reached for. oam used to keep reading and hand over the
+          // whole body, then report a clean end -- so a guard that aborted on
+          // a size limit downloaded everything anyway. The chunks already
+          // delivered stay delivered, as in node.
+          const onAbort = () => {
+            try {
+              globalThis.__oam.fetchBodyCancel(handle);
+            } catch {
+              /* already drained */
+            }
+            try {
+              controller.error(
+                signal.reason ??
+                  new globalThis.DOMException("This operation was aborted", "AbortError"),
+              );
+            } catch {
+              /* already closed or errored */
+            }
+          };
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
+        },
         async pull(controller) {
           const chunk = await globalThis.__oam.fetchBodyRead(handle);
+          // The read that was in flight when the abort landed returns here
+          // against a stream that is already errored; closing or enqueuing
+          // on it throws, and the throw would surface as a bogus rejection.
+          if (signal?.aborted) return;
           if (chunk === undefined) controller.close();
           else controller.enqueue(chunk);
         },
@@ -983,6 +1049,12 @@
   // hostname that did not resolve), or node's AggregateError when every
   // address of a name refused.
   function fetchFailed(e) {
+    // A --permission refusal is not a network failure: the initial URL's
+    // denial reaches the caller as the ERR_ACCESS_DENIED error itself, and a
+    // refusal raised later (the connect.lookup hook's addresses, checked when
+    // the fetch resumes) has to look the same or a policy failure reads as an
+    // unreachable host.
+    if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
     return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
   }
 
@@ -1039,7 +1111,42 @@
         throw fetchFailed(e);
       }
     }
-    return makeResponse(raw);
+    return makeResponse(raw, signal);
+  }
+
+  // The methods the Fetch Standard byte-uppercases. Anything else keeps the
+  // caller's spelling: node sends `patch /p HTTP/1.1` for `{method: 'patch'}`
+  // and `fooBar /p` for `{method: 'fooBar'}` (measured on v22.22.2), where
+  // oam used to uppercase every method unconditionally.
+  const NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+
+  // Request headers undici refuses to dispatch, and the error each one
+  // raises. Measured on node v22.22.2 + undici 6.24.1 against a raw-socket
+  // server: every one of these fails the fetch BEFORE anything reaches the
+  // wire. `connection` is refused only when its value is not `close`
+  // (`connection: close` alone is sent), which is what makes
+  // `connection: "close, transfer-encoding"` -- the CL.TE evasion -- fail.
+  //
+  // This is NOT the Fetch Standard's forbidden-header list: node sends
+  // `via`, `date`, `dnt`, `origin`, `referer`, `cookie`, `cookie2`,
+  // `accept-charset`, `set-cookie`, `trailer`, `proxy-*` and
+  // `access-control-request-*` straight through (all measured), so oam does
+  // too. `host` is the one node silently drops.
+  function dispatchRefusal(name, value) {
+    switch (name) {
+      case "transfer-encoding":
+        return ["InvalidArgumentError", "invalid transfer-encoding header"];
+      case "keep-alive":
+        return ["InvalidArgumentError", "invalid keep-alive header"];
+      case "upgrade":
+        return ["InvalidArgumentError", "invalid upgrade header"];
+      case "expect":
+        return ["NotSupportedError", "expect header not supported"];
+      case "connection":
+        return value === "close" ? null : ["InvalidArgumentError", "invalid connection header"];
+      default:
+        return null;
+    }
   }
 
   globalThis.fetch = async function fetch(input, init) {
@@ -1049,26 +1156,79 @@
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
+    // Internal callers that are not fetch in node (http.request, the http2
+    // client, undici.request) opt out of every Fetch-level rule below.
+    const fetchSemantics = init.__oamFetchSemantics !== false;
+    const rawUrl = wellFormed(input);
+    if (fetchSemantics) {
+      // node parses the URL in the Request constructor, so a bad URL is a URL
+      // error and not a network failure -- the caller can tell them apart.
+      // oam reported both as `TypeError: fetch failed` with cause
+      // `Error: builder error`, which named neither.
+      let parsed;
+      try {
+        parsed = new URL(rawUrl);
+      } catch {
+        const cause = new TypeError("Invalid URL");
+        cause.code = "ERR_INVALID_URL";
+        throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
+      }
+      // node: `TypeError: Request cannot be constructed from a URL that
+      // includes credentials` -- nothing reaches the wire. oam converted the
+      // userinfo to `Authorization: Basic ...` and sent it, which is also
+      // inconsistent with this slice's own redirect rule (a Location with
+      // userinfo already fails as `cross origin not allowed ...`). The
+      // http.request path keeps the conversion: there the userinfo IS node's
+      // documented `auth` option.
+      if (parsed.username !== "" || parsed.password !== "") {
+        throw new TypeError(
+          `Request cannot be constructed from a URL that includes credentials: ${rawUrl}`,
+        );
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
+      }
+    }
     let headers = [];
     if (init.headers) {
       // Branch on iterability, not Array-ness: a Map (valid HeadersInit)
       // is not an Array, and Object.entries(map) is [] — auth headers were
       // silently dropped.
       const h = init.headers;
-      headers =
+      const pairs =
         typeof h !== "string" && typeof h[Symbol.iterator] === "function"
           ? [...h].map(([k, v]) => [wellFormed(k), wellFormed(v)])
           : Object.entries(h).map(([k, v]) => [wellFormed(k), wellFormed(v)]);
+      if (!fetchSemantics) {
+        headers = pairs;
+      } else {
+        // Repeated names combine, as node's Headers does: two `x-d` entries
+        // go out as one `x-d: 1, 2` line, not two lines.
+        const combined = new Headers();
+        for (const [k, v] of pairs) combined.append(k, v);
+        for (const [name, value] of combined) {
+          // `host` is node's one silent drop. Left through, a caller
+          // controls the authority a name-based virtual host, a cache or an
+          // SSRF filter sees while the connection goes somewhere else.
+          if (name === "host") continue;
+          const refusal = dispatchRefusal(name, value);
+          if (refusal !== null) {
+            const cause = new Error(refusal[1]);
+            cause.name = refusal[0];
+            throw new TypeError("fetch failed", { cause });
+          }
+          headers.push([name, value]);
+        }
+      }
     }
+    const method = init.method ? String(init.method) : "GET";
     const request = {
-      url: wellFormed(input),
-      method: init.method ? String(init.method).toUpperCase() : "GET",
+      url: rawUrl,
+      method: NORMALIZED_METHODS.has(method.toUpperCase()) ? method.toUpperCase() : method,
       headers,
       attempt_timeout_ms: netAttemptTimeoutMs(),
-      // undici's Fetch-spec bad-port block on the initial URL. Internal
-      // callers that are not fetch in node (http.request, the http2 client,
-      // undici.request) opt out.
-      fetch_semantics: init.__oamFetchSemantics !== false,
+      // undici's Fetch-spec bad-port block on the initial URL.
+      fetch_semantics: fetchSemantics,
     };
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
@@ -1097,6 +1257,39 @@
         request.body_base64 = btoa(binary);
       } else {
         request.body = wellFormed(init.body);
+        // node's "extract a body": a string body's Content-Type is
+        // `text/plain;charset=UTF-8` unless the caller set one (measured).
+        // Servers branch on it, and oam sent none at all.
+        if (fetchSemantics && !headers.some((h) => h[0] === "content-type")) {
+          headers.push(["content-type", "text/plain;charset=UTF-8"]);
+        }
+      }
+    }
+    // A caller `content-length` that disagrees with the body is refused, not
+    // framed. hyper writes exactly the declared length, so a short one
+    // SILENTLY TRUNCATED the body and still returned 200 -- data loss, and
+    // the classic CL desync primitive if anything downstream re-frames.
+    // node never dispatches either shape: a long one rejects with
+    // `RequestContentLengthMismatchError: Request body length does not match
+    // content-length header`, a short one hangs until its timeout (measured).
+    // oam rejects both with node's long-form error.
+    if (fetchSemantics) {
+      const declared = headers.find((h) => h[0] === "content-length");
+      if (declared !== undefined) {
+        const want = Number(declared[1]);
+        const have =
+          request.body_base64 !== undefined
+            ? atob(request.body_base64).length
+            : request.body !== undefined
+              ? new TextEncoder().encode(request.body).length
+              : request.body_stream !== undefined
+                ? null
+                : 0;
+        if (have !== null && (!Number.isInteger(want) || want < 0 || want !== have)) {
+          const cause = new Error("Request body length does not match content-length header");
+          cause.name = "RequestContentLengthMismatchError";
+          throw new TypeError("fetch failed", { cause });
+        }
       }
     }
     // Started synchronously: a malformed request or a --permission refusal
