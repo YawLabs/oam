@@ -1302,12 +1302,15 @@ an error where oam used to send something)
   `TypeError: Failed to parse URL from [object Request]`. A string or a `URL` works. This is
   a gap rather than a refusal -- it is loud, it loses nothing, and half-supporting it (the
   url and method but not the body) would be worse than throwing. Tracked as a follow-up.
-- `transfer-encoding`, `keep-alive`, `upgrade`, a `connection` whose value is not `close`,
-  and `expect` are refused with undici's texts (`invalid transfer-encoding header`,
-  `invalid keep-alive header`, `invalid upgrade header`, `invalid connection header`,
-  `expect header not supported`), as `cause.name` on a `TypeError: fetch failed`. Node's
-  cause is an instance of the matching undici error class; oam's is a plain `Error` with that
-  `name`.
+- `transfer-encoding`, `keep-alive`, `upgrade`, `expect`, and a `connection` whose value is
+  neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
+  CL.TE evasion, is the one that matters) are refused with undici's texts
+  (`invalid transfer-encoding header`, `invalid keep-alive header`, `invalid upgrade header`,
+  `expect header not supported`, `invalid connection header`), as `cause.name` on a
+  `TypeError: fetch failed`. Node's cause is an instance of the matching undici error class;
+  oam's is a plain `Error` with that `name` and no `UND_ERR_*` code. An accepted `connection`
+  goes out lowercased, as node's does; `te`, also hop-by-hop, goes out untouched, because
+  node sends it.
 - A `content-length` that disagrees with the body is refused as
   `Request body length does not match content-length header`, where hyper would otherwise
   frame the request at the DECLARED length and silently truncate the body. Node refuses a
