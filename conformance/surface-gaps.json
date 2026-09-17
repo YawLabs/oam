@@ -500,11 +500,11 @@
       }
     },
     "linux": {
-      "generatedAgainst": "v22.23.1 on linux-x64",
+      "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1422,
-        "missing": 366,
+        "present": 1423,
+        "missing": 365,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },

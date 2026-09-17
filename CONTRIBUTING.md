@@ -28,6 +28,12 @@ small PRs are welcome, large changes should start as a discussion.
 Rust stable (pinned by `rust-toolchain.toml`). `cargo build --workspace`,
 `cargo test --workspace`, `cargo clippy --workspace`, `cargo fmt --check`.
 
+Node exactly as pinned by `.node-version` for the conformance steps: the node-differential
+compares oam with the `node` on PATH, and `cargo run -p xtask -- conformance` (and the
+`ci-local.sh` preflight) refuse any other version, because every recorded expectation was
+measured against that one. `OAM_ALLOW_NODE_MISMATCH=1` downgrades the refusal to a warning for
+an ad-hoc run. The remote build legs provision the pinned Node themselves.
+
 CI is script-driven, not GitHub Actions: `./scripts/ci-local.sh` runs the full gate
 (fmt, clippy `-D warnings`, build, tests, smoke, conformance, node-suite ratchet,
 THIRD_PARTY_LICENSES drift, unsafe audit) and installs as a pre-push hook. Cross-platform legs run on remote
