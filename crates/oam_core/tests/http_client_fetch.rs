@@ -64,7 +64,7 @@ impl Reg {
     async fn resume(&self, token: u64, ips: &[&str]) -> OpOutcome {
         send::fetch_continue(
             token,
-            &json!({ "ips": ips }).to_string(),
+            json!({ "ips": ips }).to_string(),
             self.bodies.clone(),
             self.ids.clone(),
             self.continuations.clone(),
@@ -1339,7 +1339,7 @@ async fn lookup_unknown_token_and_bad_answers() {
         );
         assert_eq!(reg.parked(), 0);
 
-        let (token, _, _) = lookup_of(reg.fetch(&t, request).await);
+        let (token, _, _) = lookup_of(reg.fetch(&t, request.clone()).await);
         match reg.resume(token, &[]).await {
             OpOutcome::NodeFailed { code, message, .. } => {
                 assert_eq!(code, "ERR_INVALID_IP_ADDRESS");
@@ -1347,6 +1347,24 @@ async fn lookup_unknown_token_and_bad_answers() {
             }
             other => panic!("{other:?}"),
         }
+
+        // A malformed answer consumes the parked fetch.
+        let (token, _, _) = lookup_of(reg.fetch(&t, request).await);
+        let text = failed(
+            send::fetch_continue(
+                token,
+                "[]".to_string(),
+                reg.bodies.clone(),
+                reg.ids.clone(),
+                reg.continuations.clone(),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with("fetch: malformed lookup result: "),
+            "{text}"
+        );
+        assert_eq!(reg.parked(), 0);
     })
     .await;
 }
@@ -1503,7 +1521,7 @@ fn static_checks() {
     ));
     assert_op_future(send::fetch_continue(
         1,
-        "{}",
+        String::from("{}"),
         reg.bodies.clone(),
         reg.ids.clone(),
         reg.continuations.clone(),

@@ -95,7 +95,13 @@ pub enum RedirectMode {
     Manual,
 }
 
-/// Parked hook-mode fetches by continuation token.
+/// Parked hook-mode fetches by continuation token (ids from the runtime's
+/// shared handle allocator).
+///
+/// An entry lives until JS continues or abandons it -- bootstrap.js does one
+/// or the other on every path -- or until the runtime drops. A hook that
+/// never calls back parks one entry for the life of the run: the same
+/// resource a never-settling lookup pins in node, a socket left connecting.
 pub type FetchContinuations = Arc<Mutex<HashMap<u64, PendingFetch>>>;
 
 /// A fetch waiting for its `connect.lookup` hook to resolve `host`. Dropping
@@ -231,10 +237,11 @@ pub async fn fetch(
 
 /// `fetchContinue`: resume the fetch parked under `token` with its hook's
 /// answer, `{"ips": ["addr", ...]}` in the hook's order (JS has already
-/// applied node's address filtering). Resolves like [`fetch`].
+/// applied node's address filtering). Resolves like [`fetch`]. The parked
+/// fetch is consumed whatever happens: a malformed answer fails it.
 pub async fn fetch_continue(
     token: u64,
-    lookup: &str,
+    lookup: String,
     bodies: FetchBodies,
     ids: Arc<AtomicU64>,
     continuations: FetchContinuations,
@@ -247,7 +254,7 @@ pub async fn fetch_continue(
     struct Lookup {
         ips: Vec<String>,
     }
-    let lookup: Lookup = match serde_json::from_str(lookup) {
+    let lookup: Lookup = match serde_json::from_str(&lookup) {
         Ok(lookup) => lookup,
         Err(e) => return OpOutcome::Failed(format!("fetch: malformed lookup result: {e}")),
     };
