@@ -438,6 +438,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Changed
 
+- **The conformance oracle is now one pinned Node on every build leg.** oam claims
+  parity with Node v22.22.2 -- the vendored node-suite corpus is a snapshot of that
+  tag, and the 111 node-differential cases and the builtin export-parity ratchet were
+  measured against it -- but each leg compared against whatever `node` its PATH found,
+  and nothing checked which. The Windows dev box happened to carry v22.22.2; the
+  tailnet Mac ran a hand-copied `/usr/local/bin/node` v22.23.1 and the GCP Linux
+  builder its image's v22.23.1, so two of the three legs had never once run the
+  differential against the version their receipts claimed, and
+  `conformance/surface-gaps.json` recorded both their sections as
+  `generatedAgainst: v22.23.1`. `.node-version` at the repo root is now the single
+  source of truth: the remote legs provision exactly that Node from nodejs.org (the
+  official tarball, sha256-verified against the release's `SHASUMS256.txt`, cached per
+  version under `~/.cache/oam-node`) and put it first on PATH for the conformance,
+  surface-gaps and bench dispatches; `xtask conformance` and the `ci-local.sh`
+  preflight refuse any other version before doing any work; `xtask node-suite` refuses
+  a vendored corpus whose manifest names a different Node and stamps its receipts from
+  the pin rather than a hard-coded string; and `gen-surface-gaps.mjs` refuses to record
+  a ratchet section against another node. `OAM_ALLOW_NODE_MISMATCH=1` downgrades each
+  refusal to a warning for an ad-hoc local run, and a conformance receipt produced that
+  way says on its own line that it is not a parity receipt. Measured after the change:
+  linux-x64 is 111/111 on the differential and 0 new / 0 stale on the export ratchet
+  against v22.22.2, so the swap changed no result -- only the honesty of the receipt.
+  The linux ratchet section is re-recorded against the pin (its name lists are
+  unchanged; its stored counts had drifted from the list they summarize).
 - **The sidecar release gate reports what it tested.** Each row carries the resolved
   sidecar version, the summary states how many of the advertised tools were actually
   called, `--json=<path>` writes a machine-readable report (release-local.sh keeps it
