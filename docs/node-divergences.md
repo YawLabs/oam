@@ -1111,8 +1111,8 @@ Windows (`lib/net.js` `lookupAndConnect`), which drops a family the host has no 
 address for. On a Linux or macOS host with no routable IPv6 address, Node can resolve
 `localhost` to `127.0.0.1` alone while oam also gets `::1`: a refused connect there is a
 plain `Error` in Node and an `AggregateError` over both addresses in oam, and a successful
-one may try `::1` first. On Windows Node passes no flags either, and the two agree
-(`conformance/cases/110-connect-refused-shapes.mjs` prints the full shape only there).
+one may try `::1` first. On Windows Node's `net` passes no flags, so the two agree there
+(`conformance/cases/110-connect-refused-shapes.mjs` prints the full shape only on Windows).
 
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
 why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
