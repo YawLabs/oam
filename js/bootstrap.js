@@ -1333,12 +1333,21 @@
 //   String(err) "AggregateError"; stack header `AggregateError [CODE]: `.
 // - Anything else (the fs shape: errno, code, syscall, path) is a plain Error,
 //   as before.
-// Errors built by JS carry at least one stack frame; one built natively with no
-// JS on the stack has none, and util.inspect brackets that (`[Error: ...] {`)
-// in node and oam alike, where node prints a connect error unbracketed. The
-// factory frames are therefore deliberately kept (no captureStackTrace).
+// Stack frames are observable: util.inspect brackets an error with none
+// (`[Error: ...] {`), and an uncaught throw of one is headed by the user's
+// throw site rather than by the error's first frame. Node's connect and DNS
+// errors are built in JS and print unbracketed, so those classes keep the
+// factory frame. Node's fs errors are built by the binding (uvException) with
+// no JS on the stack: an fs.readFile / readdir / access / unlink callback
+// error and a createReadStream 'error' print bracketed, and
+// `fs.readFile(p, (e) => { throw e })` is headed by the `throw e` line
+// (measured on v22.22.2). So the plain-Error branch drops its frame, exactly
+// as the native build it replaced did. fs/promises adds node's frames at its
+// own boundary (node_compat.js asAlwaysRejecting), as node does in
+// handleErrorFromBinding, not here.
 (() => {
   const ErrorCtor = Error;
+  const captureStackTrace = ErrorCtor.captureStackTrace;
   const AggregateErrorCtor = AggregateError;
   const SymbolIterator = Symbol.iterator;
   const kIsNodeError = Symbol("kIsNodeError");
@@ -1366,6 +1375,9 @@
       err = new DNSException(message);
     } else {
       err = new ErrorCtor(message);
+      // Skipping makeSysError and everything above it leaves no frames: the
+      // engine calls this with no JS below it.
+      captureStackTrace(err, makeSysError);
     }
     if (fields.errno !== undefined) err.errno = fields.errno;
     err.code = fields.code;

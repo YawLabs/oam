@@ -450,6 +450,13 @@
   /// as node does; only the exported module object is wrapped.
   let rawFsPromises = null;
 
+  /// Captured when node_compat.js is evaluated, so a script that replaces
+  /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
+  /// fs/promises settles.
+  const PromiseCtor = Promise;
+  const promiseThen = Promise.prototype.then;
+  const captureStackTrace = Error.captureStackTrace;
+
   function asAlwaysRejecting(api) {
     const out = {};
     for (const key of Object.keys(api)) {
@@ -466,19 +473,40 @@
         out[key] = fn;
         continue;
       }
+      // A system error from the native op is built with no stack frames (as
+      // node's binding builds it), and node's fs/promises gives it frames at
+      // the promise boundary: every binding call is
+      // `PromisePrototypeThen(binding.x(..., kUsePromises), undefined,
+      // handleErrorFromBinding)`, which re-captures the stack
+      // (lib/internal/fs/promises.js). So `await fsp.readFile(missing)` prints
+      // unbracketed with `at async open` frames on v22.22.2, while the callback
+      // form -- built on the unwrapped functions -- stays frameless and
+      // bracketed. The handler carries the method's name so the frame reads
+      // `at readFile (...)`; an async caller adds its `at async` frames below.
+      const onRejected = {
+        [key]: function (err) {
+          if (err !== null && typeof err === "object" && typeof err.syscall === "string") {
+            captureStackTrace(err);
+          }
+          throw err;
+        },
+      }[key];
       // Named + arity-preserving: `fsp.unlink.name` and `.length` are
       // observable, and node's own tests read them.
       const wrapped = {
         [key]: function (...args) {
           // The RETURN VALUE is passed through untouched -- only a synchronous
-          // THROW is converted. `Promise.resolve(...)` on the way out would
-          // silently re-type any future non-promise member the set above has
-          // not caught yet, which is exactly how `glob` broke.
+          // THROW is converted, and a native promise's rejection re-framed.
+          // `Promise.resolve(...)` on the way out would silently re-type any
+          // future non-promise member the set above has not caught yet, which
+          // is exactly how `glob` broke.
+          let ret;
           try {
-            return fn.apply(this, args);
+            ret = fn.apply(this, args);
           } catch (e) {
             return Promise.reject(e);
           }
+          return ret instanceof PromiseCtor ? promiseThen.call(ret, undefined, onRejected) : ret;
         },
       }[key];
       Object.defineProperty(wrapped, "length", { value: fn.length, configurable: true });

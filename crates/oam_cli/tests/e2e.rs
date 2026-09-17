@@ -22069,9 +22069,13 @@ fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
 /// Every async op rejection (`OpOutcome::NodeFailed`) is built by the locked JS
 /// factory `__oamMakeSysError` in js/bootstrap.js, and must keep the shape the
 /// native builder gave it: own `errno, code, syscall, path` in that order on a
-/// plain Error. What the factory adds is one JS stack frame -- a natively built
-/// error had none, so util.inspect bracketed it (`[Error: ENOENT: ...] {`)
-/// where node prints an fs.promises error with its frames.
+/// plain Error. Stack frames follow node's binding (v22.22.2): the fs error is
+/// built frameless, so the callback and stream forms print bracketed
+/// (`[Error: ENOENT: ...] {`), and only fs/promises re-captures frames at its
+/// boundary (node's handleErrorFromBinding), so an awaited fs.promises error
+/// prints unbracketed. The factory once gave every shape its own frame, which
+/// unbracketed the callback forms and headed an uncaught `throw e` from a
+/// callback with the factory's source line.
 ///
 /// The factories are locked globals: user code can neither replace nor delete
 /// them, and swapping `globalThis.Error` changes nothing because they captured
@@ -22087,7 +22091,8 @@ fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
 fn async_op_rejections_are_built_by_the_locked_error_factories() {
     let stdout = run_ok(
         "locked_error_factories.mjs",
-        r#"import fsp from 'node:fs/promises';
+        r#"import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import util from 'node:util';
 const OriginalError = Error;
 const OriginalAggregateError = AggregateError;
@@ -22103,6 +22108,15 @@ catch (e) {
   console.log('has a frame:', String(e.stack).includes('\n    at '));
   console.log('inspect bracketed:', util.inspect(e).startsWith('['));
 }
+const frameless = (label, e) => console.log(label, JSON.stringify(Object.keys(e)),
+  'has a frame:', String(e.stack).includes('\n    at '),
+  'inspect bracketed:', util.inspect(e).startsWith('['));
+await new Promise((resolve) => fs.readFile('oam-missing-factory-probe.txt', (e) => {
+  frameless('readFile callback', e);
+  resolve();
+}));
+await new Promise((resolve) => fs.createReadStream('oam-missing-factory-probe.txt')
+  .on('error', (e) => { frameless('read stream', e); resolve(); }));
 
 for (const name of ['__oamMakeSysError', '__oamMakeAggregateError']) {
   const d = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -22173,6 +22187,8 @@ Error.prepareStackTrace = saved;
         format!("fsp {fs_shape}"),
         "has a frame: true".to_string(),
         "inspect bracketed: false".to_string(),
+        r#"readFile callback ["errno","code","syscall","path"] has a frame: false inspect bracketed: true"#.to_string(),
+        r#"read stream ["errno","code","syscall","path"] has a frame: false inspect bracketed: true"#.to_string(),
         "__oamMakeSysError function false false false".to_string(),
         "__oamMakeAggregateError function false false false".to_string(),
         "assign refused: TypeError".to_string(),

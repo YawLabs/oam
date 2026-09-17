@@ -555,12 +555,21 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
     // then SO_ERROR, then peer_addr (a spurious wakeup answers NotConnected /
     // EINPROGRESS: clear the readiness and wait again).
     loop {
-        stream.writable().await.map_err(async_failure)?;
+        let ready = stream
+            .ready(tokio::io::Interest::WRITABLE)
+            .await
+            .map_err(async_failure)?;
         if let Some(error) = stream.take_error().map_err(async_failure)? {
             return Err(async_failure(error));
         }
         match stream.peer_addr() {
             Ok(_) => return Ok(stream),
+            // Closed for writing with neither SO_ERROR nor a peer: the socket
+            // is not connecting and never will be. tokio's clear_readiness
+            // keeps closed states, so waiting again would return at once
+            // forever -- an unbounded spin, where the error is the only
+            // honest outcome.
+            Err(error) if ready.is_write_closed() => return Err(async_failure(error)),
             Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
             Err(error) if connect_in_progress(&error) => {}
             Err(error) => return Err(async_failure(error)),
@@ -572,16 +581,21 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
 }
 
 /// `connect(2)` on a non-blocking socket started rather than finished:
-/// WSAEWOULDBLOCK on Windows, EINPROGRESS on unix.
+/// WSAEWOULDBLOCK on Windows, and only EINPROGRESS on unix. A unix EAGAIN
+/// (== EWOULDBLOCK, std's WouldBlock kind) is a real synchronous failure --
+/// libuv's `uv__tcp_connect` (src/unix/tcp.c) and mio's unix `connect` both
+/// accept EINPROGRESS alone -- so node reports it as `connect EAGAIN ... -
+/// Local (...)`. Waiting on such a socket would wait on one that is not
+/// connecting.
 fn connect_in_progress(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return true;
+    #[cfg(windows)]
+    {
+        error.kind() == std::io::ErrorKind::WouldBlock
     }
     #[cfg(unix)]
-    if error.raw_os_error() == Some(libc::EINPROGRESS) {
-        return true;
+    {
+        error.raw_os_error() == Some(libc::EINPROGRESS)
     }
-    false
 }
 
 /// Node's ` - Local (...)` detail: getsockname as `address:port`, IPv6
@@ -1148,6 +1162,35 @@ mod tests {
             panic!("expected a resolver error");
         };
         assert_eq!((e.code.as_str(), e.errno), ("ENOTFOUND", Some(-3008)));
+    }
+
+    /// Only the platform's own in-progress code means a connect is under way.
+    /// A unix EAGAIN is a synchronous failure (libuv, mio); treating it as in
+    /// progress waited on a socket that was never connecting.
+    #[test]
+    fn only_the_platform_in_progress_code_means_connecting() {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::{WSAECONNREFUSED, WSAEWOULDBLOCK};
+            assert!(connect_in_progress(&io::Error::from_raw_os_error(
+                WSAEWOULDBLOCK
+            )));
+            assert!(!connect_in_progress(&io::Error::from_raw_os_error(
+                WSAECONNREFUSED
+            )));
+        }
+        #[cfg(unix)]
+        {
+            assert!(connect_in_progress(&io::Error::from_raw_os_error(
+                libc::EINPROGRESS
+            )));
+            assert!(!connect_in_progress(&io::Error::from_raw_os_error(
+                libc::EAGAIN
+            )));
+            assert!(!connect_in_progress(&io::Error::from_raw_os_error(
+                libc::ECONNREFUSED
+            )));
+        }
     }
 
     #[cfg(windows)]

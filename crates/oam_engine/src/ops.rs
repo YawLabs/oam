@@ -682,11 +682,13 @@ fn clear_factory_throw(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::Handl
 ///
 /// The JS factory `__oamMakeSysError` is preferred: it builds node's classes
 /// (`ExceptionWithHostPort` for an address / port, `DNSException` for a
-/// hostname, a plain Error otherwise) and, being JS, gives the error a stack
-/// frame. An error built here with no JS on the stack has none, and both
-/// node's and oam's util.inspect then bracket it (`[Error: ...] {`) where node
-/// prints a connect or DNS error unbracketed with its frames. The native build
-/// below is the fallback, with the same own properties in the same order.
+/// hostname, a plain Error otherwise) and, being JS, gives the connect and DNS
+/// classes a stack frame. An error built here with no JS on the stack has none,
+/// and both node's and oam's util.inspect then bracket it (`[Error: ...] {`)
+/// where node prints a connect or DNS error unbracketed with its frames. The
+/// plain-Error (fs) shape is left frameless by the factory on purpose: node's
+/// fs callback errors have no frames either. The native build below is the
+/// fallback, with the same own properties in the same order.
 ///
 /// Property order is observable (`Object.keys(err)`): errno, code, syscall,
 /// path, hostname, address, port -- errno FIRST, as on the sync path
