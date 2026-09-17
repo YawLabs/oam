@@ -995,15 +995,28 @@
   // abort while parked drops the parked fetch.
   async function settleFetch(pending, lookup, signal) {
     const internal = globalThis.__oam;
+    const aborted = () =>
+      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     let raw;
     try {
       raw = await pending;
     } catch (e) {
       throw fetchFailed(e);
     }
+    let resumed = false;
     while (raw && raw.lookup) {
       const { token, host, port } = raw.lookup;
       const abandon = () => internal.fetchAbandon(token);
+      // Aborted while the previous hop was on the wire: node ends the fetch
+      // there and never looks the redirect target up (measured). The FIRST
+      // host is looked up even after an abort that follows fetch() in the
+      // same tick -- undici has already started connecting (measured: one
+      // call) -- so only a resumed fetch stops here. The abort race already
+      // rejected the fetch with the reason.
+      if (resumed && signal?.aborted) {
+        abandon();
+        throw aborted();
+      }
       signal?.addEventListener("abort", abandon, { once: true });
       let ips;
       try {
@@ -1017,8 +1030,9 @@
       if (signal?.aborted) {
         abandon();
         // The abort race already rejected the fetch with the reason.
-        throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+        throw aborted();
       }
+      resumed = true;
       try {
         raw = await internal.fetchContinue(token, JSON.stringify({ ips }));
       } catch (e) {

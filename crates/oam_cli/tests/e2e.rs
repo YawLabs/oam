@@ -4946,6 +4946,66 @@ a.close(); b.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// An abort ends a hooked fetch where node ends it. Aborted in the same tick
+/// as fetch(), the first host is still passed to the hook (undici has begun
+/// connecting); aborted while a request is on the wire, the redirect it
+/// answers with is not followed and its host never reaches the hook -- oam
+/// used to look it up before noticing the abort. Distinct hosts, because
+/// node's count is per connection; measured on node v22.22.2 + undici 6.24.1.
+#[test]
+fn fetch_connect_lookup_is_not_called_after_an_abort() {
+    let script = write_temp(
+        "fetch_lookup_abort/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+// The on-the-wire case holds the 302 until the abort has landed.
+let gate = null;
+const server = http.createServer(async (req, res) => {
+  if (gate) await gate;
+  res.writeHead(302, { location: `http://second.test:${server.address().port}/` });
+  res.end();
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const settle = () => new Promise((r) => setTimeout(r, 200));
+{
+  const hosts = new Set();
+  const agent = new Agent({ connect: { lookup: (h, o, cb) => { hosts.add(h); cb(null, [{ address: '127.0.0.1', family: 4 }]); } } });
+  const controller = new AbortController();
+  const p = fetch(`http://first.test:${port}/`, { dispatcher: agent, signal: controller.signal });
+  controller.abort();
+  try { await p; console.log('same-tick resolved?!'); } catch (e) { console.log('same-tick', e.name); }
+  await settle();
+  console.log('same-tick hosts', JSON.stringify([...hosts]));
+}
+{
+  const hosts = new Set();
+  const controller = new AbortController();
+  gate = new Promise((r) => controller.signal.addEventListener("abort", r));
+  const agent = new Agent({ connect: { lookup: (h, o, cb) => {
+    hosts.add(h);
+    cb(null, [{ address: '127.0.0.1', family: 4 }]);
+    if (h === 'first.test') setTimeout(() => controller.abort(), 0);
+  } } });
+  const p = fetch(`http://first.test:${port}/`, { dispatcher: agent, signal: controller.signal });
+  try { await p; console.log('on-the-wire resolved?!'); } catch (e) { console.log('on-the-wire', e.name); }
+  await settle();
+  console.log('on-the-wire hosts', JSON.stringify([...hosts]));
+}
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "same-tick AbortError\n\
+         same-tick hosts [\"first.test\"]\n\
+         on-the-wire AbortError\n\
+         on-the-wire hosts [\"first.test\"]"
+    );
+}
+
 /// What a hook's answer turns into is node's lookupAndConnectMultiple: the
 /// usable entries in order (a family other than 4 or 6, or an address that is
 /// not an IP, is skipped), every refused address in an AggregateError, and
