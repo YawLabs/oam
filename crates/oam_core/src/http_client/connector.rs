@@ -202,9 +202,25 @@ impl Shared {
     }
 }
 
-/// A lookup-hooked fetch's resolved hosts: the lowercased host name -> the
+/// A lookup-hooked fetch's resolved authorities: [`authority_key`] -> the
 /// addresses its `connect.lookup` hook returned, in the hook's order.
 pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<IpAddr>>>>;
+
+/// The key one hook answer is filed under: `host:port`, host lowercased and
+/// unbracketed, port defaulted by scheme so `http://h/` and `http://h:80/`
+/// are the same authority. It must agree between `Route::lookup_needed`,
+/// which files the answer, and [`OamConnector::connect`], which reads it.
+pub(crate) fn authority_key(uri: &Uri) -> Option<String> {
+    let host = host_for_connect(uri)?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    Some(format!("{}:{port}", host.to_ascii_lowercase()))
+}
 
 /// Which client a connector serves.
 #[derive(Clone)]
@@ -283,11 +299,16 @@ impl OamConnector {
                 let pin = if host.parse::<IpAddr>().is_ok() {
                     None
                 } else {
-                    let resolved = addrs
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&host.to_ascii_lowercase())
-                        .cloned();
+                    // Keyed on the authority the hook was asked about, so a
+                    // hop to the same name on another port cannot be dialled
+                    // on the first port's approved addresses.
+                    let resolved = authority_key(&dst).and_then(|key| {
+                        addrs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&key)
+                            .cloned()
+                    });
                     let Some(resolved) = resolved else {
                         return Err(Box::new(UnresolvedHost(host)));
                     };

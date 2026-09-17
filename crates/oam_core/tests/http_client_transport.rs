@@ -98,9 +98,14 @@ async fn hooked_route_two_refused_addresses_is_an_aggregate() {
         let port = closed_port().await;
         let target = format!("http://pinned.test:{port}/");
         let uri: http::Uri = target.parse().unwrap();
-        assert_eq!(route.lookup_needed(&uri).as_deref(), Some("pinned.test"));
+        let (key, host) = route.lookup_needed(&uri).unwrap();
+        assert_eq!(host, "pinned.test");
+        // The key is the AUTHORITY, and the host half of it is lowercased, so
+        // a hook answer files under the same key however the URL spelled the
+        // name.
+        assert_eq!(key, format!("pinned.test:{port}"));
         route.set_addrs(
-            "PINNED.test",
+            &key,
             vec![
                 "127.0.0.1".parse::<IpAddr>().unwrap(),
                 "::1".parse::<IpAddr>().unwrap(),
@@ -130,12 +135,15 @@ async fn hooked_route_dials_only_hosts_the_hook_resolved() {
         let server = serve_replies(ok_reply).await;
         let transport = transport(ProxySource::None);
         let route = transport.route(true, ATTEMPT);
-        route.set_addrs("a.test", vec!["127.0.0.1".parse().unwrap()]);
+        route.set_addrs("a.test:80", vec!["127.0.0.1".parse().unwrap()]);
         let local = format!("http://localhost:{}/", server.port);
         let literal = format!("http://127.0.0.1:{}/", server.port);
         assert_eq!(
-            route.lookup_needed(&local.parse().unwrap()).as_deref(),
-            Some("localhost")
+            route.lookup_needed(&local.parse().unwrap()),
+            Some((
+                format!("localhost:{}", server.port),
+                "localhost".to_string()
+            ))
         );
         assert_eq!(route.lookup_needed(&literal.parse().unwrap()), None);
         let err = send(&transport, &route, get(&local)).await.unwrap_err();
@@ -152,6 +160,50 @@ async fn hooked_route_dials_only_hosts_the_hook_resolved() {
         let pooled = transport.route(false, ATTEMPT);
         assert!(!pooled.is_hooked());
         assert_eq!(pooled.lookup_needed(&local.parse().unwrap()), None);
+    })
+    .await;
+}
+
+/// The hook is asked per AUTHORITY, not per host: the same name on another
+/// port parks again, and its answer does not dial on the first port's
+/// addresses. A guard whose policy turns on the port (allow 443 on an
+/// internal name, refuse 22 or 6379) is consulted for every port a redirect
+/// chain reaches, which is what node does -- it asks per connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hooked_route_asks_the_hook_again_for_the_same_host_on_another_port() {
+    within(async {
+        let transport = transport(ProxySource::None);
+        let route = transport.route(true, ATTEMPT);
+        let first: http::Uri = "http://guarded.test:8443/a".parse().unwrap();
+        let second: http::Uri = "http://guarded.test:6379/b".parse().unwrap();
+        let default_port: http::Uri = "http://guarded.test/c".parse().unwrap();
+        let explicit_80: http::Uri = "http://guarded.test:80/d".parse().unwrap();
+        let https_default: http::Uri = "https://guarded.test/e".parse().unwrap();
+
+        let (key, host) = route.lookup_needed(&first).unwrap();
+        assert_eq!(
+            (key.as_str(), host.as_str()),
+            ("guarded.test:8443", "guarded.test")
+        );
+        route.set_addrs(&key, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(route.lookup_needed(&first), None);
+
+        // Same host, different port: the hook must be asked again.
+        let (second_key, second_host) = route.lookup_needed(&second).unwrap();
+        assert_eq!(second_key, "guarded.test:6379");
+        assert_eq!(second_host, "guarded.test");
+
+        // An elided default port is the same authority as the explicit one,
+        // so answering one covers the other and the hook is not asked twice.
+        let (default_key, _) = route.lookup_needed(&default_port).unwrap();
+        assert_eq!(default_key, "guarded.test:80");
+        route.set_addrs(&default_key, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(route.lookup_needed(&explicit_80), None);
+        // ... and https:443 is a third authority of its own.
+        assert_eq!(
+            route.lookup_needed(&https_default),
+            Some(("guarded.test:443".to_string(), "guarded.test".to_string()))
+        );
     })
     .await;
 }
@@ -324,9 +376,10 @@ async fn hooked_route_bypasses_the_proxy() {
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
         let route = transport.route(true, ATTEMPT);
-        route.set_addrs("origin.test", vec!["127.0.0.1".parse().unwrap()]);
         let target = format!("http://origin.test:{}/h", server.port);
         let uri: http::Uri = target.parse().unwrap();
+        let (key, _) = route.lookup_needed(&uri).unwrap();
+        route.set_addrs(&key, vec!["127.0.0.1".parse().unwrap()]);
         assert_eq!(transport.proxy_authorization(&route, &uri), None);
         let response = send(&transport, &route, get(&target)).await.unwrap();
         assert_eq!(body_text(response).await, "ok");

@@ -132,6 +132,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// (closing its connection) instead of reinserting it. The signal is
 /// broadcast, so a wake for another handle's cancel is checked against the
 /// tombstones and the read carries on with its state intact.
+///
+/// The wake cannot be lost. `Notify::notify_waiters` stores no permit: it
+/// wakes only the waiters already registered, so a cancel landing on the V8
+/// thread before this task first polls `notified()` used to be dropped
+/// outright -- and against a peer that stops sending without closing the
+/// connection `next_chunk()` never resolves, so the op never completed,
+/// `inflight` never dropped and the loop could not drain. The waiter is
+/// therefore registered with [`Notified::enable`] BEFORE the tombstone is
+/// read, and re-registered before the tombstone is re-read on every wake:
+/// a cancel either precedes the registration, and the tombstone check sees
+/// it, or follows it, and the registration catches it.
 pub async fn read(
     bodies: FetchBodies,
     cancelled: CancelledBodies,
@@ -142,10 +153,17 @@ pub async fn read(
     let Some(mut body) = body else {
         return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
     };
+    let mut cancelled_wake = Box::pin(cancel_signal.notified());
+    cancelled_wake.as_mut().enable();
+    if lock(&cancelled).remove(&handle) {
+        return OpOutcome::Done;
+    }
     let result = loop {
         tokio::select! {
             result = body.next_chunk() => break result,
-            _ = cancel_signal.notified() => {
+            () = cancelled_wake.as_mut() => {
+                cancelled_wake.set(cancel_signal.notified());
+                cancelled_wake.as_mut().enable();
                 if lock(&cancelled).remove(&handle) {
                     return OpOutcome::Done;
                 }

@@ -24,7 +24,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::proxy::matcher::Matcher;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 
-use super::connector::{HostAddrs, OamConnector, Shared, TlsSetupError, Via};
+use super::connector::{HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key};
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
 use crate::OpOutcome;
@@ -92,13 +92,10 @@ impl HttpTransport {
                 u64::try_from(DEFAULT_ATTEMPT_TIMEOUT.as_millis()).unwrap_or(250),
             ),
         });
-        let client = build_client(
-            OamConnector {
-                shared: shared.clone(),
-                via: Via::Pooled,
-            },
-            true,
-        );
+        let client = build_client(OamConnector {
+            shared: shared.clone(),
+            via: Via::Pooled,
+        });
         HttpTransport { client, shared }
     }
 
@@ -107,23 +104,20 @@ impl HttpTransport {
     }
 
     /// The route one fetch takes. With `lookup_hook`, the fetch gets its own
-    /// unpooled client whose connector dials a host name only at the
-    /// addresses recorded with [`Route::set_addrs`], and never through the
-    /// environment proxy; it dies with the route. Otherwise the fetch shares
-    /// the pool.
+    /// client, whose connector dials a host name only at the addresses
+    /// recorded with [`Route::set_addrs`] and never through the environment
+    /// proxy; its pool is its own and dies with the route. Otherwise the
+    /// fetch shares the process pool.
     pub fn route(&self, lookup_hook: bool, attempt_timeout: Duration) -> Route {
         let hooked = lookup_hook.then(|| {
             let addrs: HostAddrs = Arc::new(Mutex::new(HashMap::new()));
-            let client = build_client(
-                OamConnector {
-                    shared: self.shared.clone(),
-                    via: Via::Hooked {
-                        addrs: addrs.clone(),
-                        attempt_timeout,
-                    },
+            let client = build_client(OamConnector {
+                shared: self.shared.clone(),
+                via: Via::Hooked {
+                    addrs: addrs.clone(),
+                    attempt_timeout,
                 },
-                false,
-            );
+            });
             Hooked { addrs, client }
         });
         Route {
@@ -165,13 +159,21 @@ impl HttpTransport {
 }
 
 /// One client builder for both kinds of client.
-fn build_client(connector: OamConnector, pooled: bool) -> Client<OamConnector, ReqBody> {
+///
+/// Both pool. A hooked client's pool is scoped to its own fetch -- the
+/// [`Route`] that owns it is dropped in `send::respond`, and its idle
+/// connections die with it -- and hyper-util keys the pool on the request's
+/// scheme and authority, so a pooled connection can only ever be reused for
+/// the origin it was opened to. Without it a single hooked fetch through four
+/// same-host redirects opened FIVE connections where node opens two
+/// (measured), paying a TCP -- and over https a full TLS -- handshake per hop
+/// for an authority whose hook-approved address set had not changed.
+fn build_client(connector: OamConnector) -> Client<OamConnector, ReqBody> {
     Client::builder(TokioExecutor::new())
         .timer(TokioTimer::new())
         .pool_timer(TokioTimer::new())
         .pool_idle_timeout(Duration::from_secs(90))
-        // hyper-util disables the pool at zero idle connections per host.
-        .pool_max_idle_per_host(if pooled { usize::MAX } else { 0 })
+        .pool_max_idle_per_host(usize::MAX)
         .build(connector)
 }
 
@@ -192,33 +194,41 @@ impl Route {
         self.hooked.is_some()
     }
 
-    /// On a hooked route, the host the hook must resolve before `uri` can be
-    /// dialled: `None` for an IP literal (node never looks one up), for a
-    /// host this fetch already resolved (node reuses the connection it
-    /// opened, and within one fetch the addresses stand), and on a pooled
-    /// route.
-    pub fn lookup_needed(&self, uri: &Uri) -> Option<String> {
+    /// On a hooked route, the authority the hook must resolve before `uri`
+    /// can be dialled, as `(key, host)`: `None` for an IP literal (node never
+    /// looks one up), for an authority this fetch already resolved (node
+    /// reuses the connection it opened, and within one fetch its addresses
+    /// stand), and on a pooled route.
+    ///
+    /// The key is the whole authority, not the host. A guard's policy can
+    /// turn on the PORT -- allow 443 on an internal name, refuse 22 or 6379 --
+    /// and while the map was keyed on the host alone a 302 to the same name
+    /// on another port was followed without asking it again. node asks per
+    /// connection, so it asks for the new authority too.
+    pub fn lookup_needed(&self, uri: &Uri) -> Option<(String, String)> {
         let hooked = self.hooked.as_ref()?;
         let host = host_for_connect(uri)?;
         if host.parse::<IpAddr>().is_ok() {
             return None;
         }
+        let key = authority_key(uri)?;
         let known = hooked
             .addrs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&host.to_ascii_lowercase());
-        (!known).then_some(host)
+            .contains_key(&key);
+        (!known).then_some((key, host))
     }
 
-    /// Record the hook's addresses for `host` (no-op on a pooled route).
-    pub fn set_addrs(&self, host: &str, addrs: Vec<IpAddr>) {
+    /// Record the hook's addresses under the `key` [`Route::lookup_needed`]
+    /// returned (no-op on a pooled route).
+    pub fn set_addrs(&self, key: &str, addrs: Vec<IpAddr>) {
         if let Some(hooked) = &self.hooked {
             hooked
                 .addrs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(host.to_ascii_lowercase(), addrs);
+                .insert(key.to_string(), addrs);
         }
     }
 }

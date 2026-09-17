@@ -110,6 +110,10 @@ pub type FetchContinuations = Arc<Mutex<HashMap<u64, PendingFetch>>>;
 pub struct PendingFetch {
     state: LoopState,
     host: String,
+    /// The authority key the hook's answer is filed under
+    /// (`connector::authority_key`), which is not the host: a hop to the same
+    /// name on another port is a separate authority and parks again.
+    key: String,
 }
 
 impl PendingFetch {
@@ -259,7 +263,12 @@ pub async fn fetch_continue(
     continuations: FetchContinuations,
 ) -> OpOutcome {
     let pending = lock(&continuations).remove(&token);
-    let Some(PendingFetch { state, host }) = pending else {
+    let Some(PendingFetch {
+        state,
+        host: _,
+        key,
+    }) = pending
+    else {
         return OpOutcome::Failed(format!("fetch: lookup continuation {token} is gone"));
     };
     #[derive(serde::Deserialize)]
@@ -283,7 +292,7 @@ pub async fn fetch_continue(
     }
     // An empty list reaches the connector, which fails it as node's
     // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here).
-    state.route.set_addrs(&host, addrs);
+    state.route.set_addrs(&key, addrs);
     run(state, &bodies, &ids, &continuations).await
 }
 
@@ -308,7 +317,7 @@ async fn run(
             Ok(uri) => uri,
             Err(text) => return OpOutcome::Failed(text.to_string()),
         };
-        if let Some(host) = state.route.lookup_needed(&uri) {
+        if let Some((key, host)) = state.route.lookup_needed(&uri) {
             // The port as undici's connector hands it to net.connect, which
             // is what node's ERR_INVALID_ADDRESS_FAMILY carries: the URL's
             // port STRING when the URL names one, else the number 80 / 443
@@ -324,7 +333,7 @@ async fn run(
             let payload = serde_json::json!({
                 "lookup": { "token": token, "host": host, "port": port },
             });
-            lock(continuations).insert(token, PendingFetch { state, host });
+            lock(continuations).insert(token, PendingFetch { state, host, key });
             return OpOutcome::Json(payload.to_string());
         }
         let mut hop_url = state.current.clone();
