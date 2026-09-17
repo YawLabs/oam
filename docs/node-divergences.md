@@ -866,14 +866,31 @@ that code into a second, failing decode. The op already has the switch (a reques
 for the raw body and the original headers); once `http.request` uses it (#148), `fetch` can
 keep Node's headers.
 
-What is NOT divergent: the decoded bytes, and how they arrive. The body is decoded as it
-streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
+What is NOT divergent: which codings are undone, and the decoded bytes. The body is decoded
+as it streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
 server-sent event is readable as soon as its unit arrives and a 106-byte brotli bomb
 inflating to 64 MiB never sits in memory whole. A truncated body is the data that decoded,
-not an error; a multi-member gzip body is every member; and bytes after the end of the
-compressed stream end the body, where Node ends it. The decoding rules and chunk sizes are
-pinned byte-identical with Node by `conformance/cases/112-fetch-content-decoding.mjs`; the
-flushed event stream and the bomb by e2e tests.
+not an error, and a multi-member gzip body is every member. The decoding rules are pinned
+with Node by `conformance/cases/112-fetch-content-decoding.mjs`; the flushed event stream
+and the bomb by e2e tests.
+
+Two things about the arrival are NOT identical, and an earlier wording of this entry had
+both backwards:
+
+- **Bytes after the end of a complete compressed stream fail the read in both runtimes** --
+  neither ends the body there. Both treat the trailing bytes as the start of another
+  member and fail on its header. What differs is when: Node hands over NO chunk
+  (`TypeError: terminated`, cause `incorrect header check`), oam hands over the chunk that
+  decoded and fails on the next read, with the plain-`Error` text in the bullet below.
+- **Chunk boundaries are Node's only for the shapes case 112 pins.** A multi-member gzip
+  body arrives as one chunk in Node and as one chunk per member in oam
+  (`gzip('aa') + gzip('bb')`: Node `[4]`, oam `[2, 2]`). The bytes are the same either
+  way; code that assumes a chunk boundary is a record boundary is not portable in either
+  direction.
+
+_(probed)_ Node v22.22.2 vs oam on Windows, a raw-socket server sending
+`gzip(x*23) + "TRAILINGJUNK"` and `gzip('aa') + gzip('bb')` under
+`content-encoding: gzip`.
 
 What else still differs:
 
@@ -1144,7 +1161,10 @@ What still differs:
   thrown away. Measured with a server that answers after 600 ms and an abort at 100 ms: under
   Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
   `req` `'close'`); under oam the response finishes. A `fetch` waiting on its
-  `connect.lookup` hook (below) is dropped when it aborts.
+  `connect.lookup` hook (below) is dropped when it aborts. An abort that lands AFTER the
+  response head does end the body: the stream errors with the abort reason and the native
+  body is cancelled, as in Node -- the chunks already delivered stay delivered, and only the
+  chunk boundary at which it stops differs.
 - **TLS verdicts carry no code.** A `fetch` to a server whose certificate does not verify
   rejects with the uncoded cause `error sending request for url (https://host:port/)`, and the
   verifying `https.request` emits `ECONNRESET` `socket hang up`. Node reports the verdict:
@@ -1157,6 +1177,16 @@ What still differs:
   oam's `fetch` and not by Node's. The verifier is built on the first https request, so a
   machine without a usable certificate store still runs; its https requests then fail with
   `tls configuration error: ...`. _(source)_
+- **The happy-eyeballs attempt timeout is latched at the dial, not at the request.** Both
+  runtimes take it from one process-wide value
+  (`net.setDefaultAutoSelectFamilyAttemptTimeout`), and for the usual case -- every caller
+  reading the same default -- they agree. Node latches it per socket when `net.connect` is
+  called; on a POOLED `fetch` route oam stores it for the shared connector, which reads it
+  when and if hyper decides it needs a new connection. A request that changes the default
+  between another request's start and that request's dial therefore applies its stagger to
+  the other one. The consequence is a wrong 10-250 ms stagger on one multi-address connect,
+  never a wrong address or a wrong error, and a `connect.lookup`-hooked route is unaffected
+  (its connector carries its own value). _(source)_
 - **`ClientRequest.socket` does not describe the connection.** Against a dual-stack server
   reached through `localhost`, Node's `req.socket` reports `remoteAddress` `::1`,
   `remoteFamily` `IPv6` and the real local port; oam's reports `localhost`, `undefined` and
@@ -1181,11 +1211,16 @@ kept. A hooked fetch never goes through the environment proxy (below): an undici
 does not read it, and a proxy that resolved the name again would undo the pin. What differs:
 
 - **How often it is called.** Node calls the hook once per connection it opens, oam once per
-  host per `fetch`. A redirect chain `a -> a -> b` made 3 calls in Node (its pool opened a
-  second connection for the same-host hop) and 2 in oam; a second `fetch` on the same
-  `Agent` made 0 calls in Node (a pooled connection) and calls again in oam, which does not
-  pool hooked connections. Every connection oam opens still dials only addresses the hook
-  returned for that host.
+  AUTHORITY per `fetch`. Within one `fetch` that is usually the same number: the same host
+  on another port parks again in both (measured: a 302 from `localhost:P1` to
+  `localhost:P2` calls the hook twice in each runtime), so a guard whose policy turns on the
+  port is asked about every port the chain reaches. Where they part is reuse: a redirect
+  chain `a -> a -> b` made 3 calls in Node (its pool opened a second connection for the
+  same-host hop) and 2 in oam; a hop to the same authority spelled in another case makes 2
+  calls in Node and 1 in oam; and a second `fetch` on the same `Agent` made 0 calls in Node
+  (a pooled connection) and calls again in oam, whose hooked client is per-`fetch` and so
+  pools within one `fetch` but never across two. Every connection oam opens still dials only
+  addresses the hook returned for that authority.
 - **A hook that calls back twice.** One that answers and then calls back again with an
   error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
   answer and connects.
@@ -1194,9 +1229,14 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
   `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
   hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.
-- **The hook is not a `--permission` boundary.** `--allow-net=<name>` grants the NAME; a hook
-  may then answer with any address (`127.0.0.1`, a link-local metadata address) and oam dials
-  it, because the gate checks the URL's hostname and not the address the connection uses.
+- **A hook's addresses ARE a `--permission` boundary** (not a divergence, but the bullet
+  that used to say otherwise is worth replacing rather than deleting). `--allow-net=<name>`
+  grants the name, and every address the hook answers with is checked against the same
+  grant, exactly as a URL naming that address directly would be -- so
+  `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
+  `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
+  allows it. Node has no `--permission` net grant to compare against. Redirect HOPS are
+  still not checked (only the initial URL's hostname is).
 
 **Redirects**
 
@@ -1218,7 +1258,80 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
+- **`Headers` iteration is in wire order, not sorted.** The Fetch Standard sorts a header
+  list by name on iteration and Node does; oam yields the order the server sent (and, for a
+  `Response` a script builds, the order it set them). `set-cookie` is not combined and
+  `getSetCookie()` is there, so no value is lost -- only the order differs. `oam.serve`
+  writes response headers out in this same order, which is why it is not sorted.
+- **Header values on the wire are UTF-8, where undici writes latin1.** A request header value
+  of `café` goes out as `cafÃ©` in oam and `café` in Node. Response header values
+  are decoded as latin1 in both, so the round trip is asymmetric: a value oam sent is not the
+  value oam reads back.
+- **Six request-header shapes still differ from Node's `fetch`** -- measured against a
+  raw-socket server, with everything else on the request line and in the header block
+  identical. oam does not send `connection: keep-alive`, `accept-language: *` or
+  `sec-fetch-mode: cors`; it writes `accept-encoding: gzip,deflate` where Node writes
+  `gzip, deflate`; it does not add `content-length: 0` for a body-less or empty-bodied
+  `POST`; and its header ORDER differs (oam ends with `host`, Node begins with it). What now
+  matches, and used to not: a caller `host` header is dropped (Node's one silent drop), a
+  string body gets `content-type: text/plain;charset=UTF-8`, repeated names are combined into
+  one comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
+  `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
+- **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
+  TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
+  undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
+  on, so Node's `fetch` is HTTP/1.1 only. Anything a server does differently per protocol
+  version -- trailers, 1xx handling, per-version rate limits, request logs -- differs with
+  it. `http.request` in Node is h1-only as well. _(source: `tls_config.rs` ALPN list;
+  undici 6.24.1 `allowH2` default)_
 - **Decoding** keeps its own entry: 32.
+
+**What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
+an error where oam used to send something)
+
+- A URL carrying credentials (`http://u:p@host/`) is refused with Node's
+  `TypeError: Request cannot be constructed from a URL that includes credentials: <url>`;
+  nothing reaches the wire. `http.request` and `https.request` still turn userinfo into
+  Basic credentials, because there it IS Node's documented `auth` option.
+- A URL that does not parse throws Node's `TypeError: Failed to parse URL from <input>` with
+  a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
+  the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
+  `Error: builder error`, which named neither.
+- `transfer-encoding`, `keep-alive`, `upgrade`, a `connection` whose value is not `close`,
+  and `expect` are refused with undici's texts (`invalid transfer-encoding header`,
+  `invalid keep-alive header`, `invalid upgrade header`, `invalid connection header`,
+  `expect header not supported`), as `cause.name` on a `TypeError: fetch failed`. Node's
+  cause is an instance of the matching undici error class; oam's is a plain `Error` with that
+  `name`.
+- A `content-length` that disagrees with the body is refused as
+  `Request body length does not match content-length header`, where hyper would otherwise
+  frame the request at the DECLARED length and silently truncate the body. Node refuses a
+  content-length LONGER than the body with the same message, and a SHORTER one by never
+  dispatching the request at all (it hangs until its own timeout); oam refuses both.
+
+Everything in that list applies to `fetch` only. `http.request`, `https.request`,
+`undici.request` and the `http2` compat client share the op but opt out, because Node applies
+none of it to them.
+
+**`http.request` argument and option handling**
+
+- **A request path is normalised, where Node sends it verbatim.** Node writes `path` as an
+  opaque request target: `{path: 'noslash'}` puts `GET noslash HTTP/1.1` on the wire and
+  `{path: '/café'}` writes the raw byte `0xE9`. oam carries the request as a URL, so a
+  path that does not start with `/` is given one and a non-ASCII path is percent-encoded.
+  Node's two guards -- `ERR_UNESCAPED_CHARACTERS` for a path outside `0x21-0xFF` (a space, a
+  tab, a CR/LF) and `ERR_SOCKET_BAD_PORT` / `ERR_INVALID_ARG_TYPE` for the port -- are
+  applied first, with Node's exact messages, so the normalisation only ever sees a path Node
+  would also have sent. This is what keeps the connect target where `hostname` says: without
+  it, `{hostname: SAFE, port: GOOD, path: '@other.host:PORT/x'}` reached the OTHER origin.
+- **A `host` the URL parser cannot hold as a bare authority fails the request in oam and the
+  resolver in Node**, with the same class of error but not always the same code: for
+  `{hostname: 'u:p@127.0.0.1:PORT'}` Node reports `getaddrinfo EAI_FAIL` on Windows and oam
+  reports `getaddrinfo ENOTFOUND`; for `{hostname: '127.0.0.1/x'}` both report `ENOTFOUND`.
+- **A port that is a coercible string dials the same place, but the `Host` header differs.**
+  Node dials the coercion and writes the caller's raw spelling: `port: '0x50'` sends
+  `Host: 127.0.0.1:0xc4df`, and `port: ' 50399'` sends `Host: 127.0.0.1: 50399`. oam dials
+  the same port and writes the normalised number.
 
 **The environment proxy, an oam extension**
 
