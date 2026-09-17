@@ -20,6 +20,10 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# http_client (#143): request preparation and the redirect step.
+url = { workspace = true }
+http = { workspace = true }
+percent-encoding = { workspace = true }
 # V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

@@ -22,6 +22,8 @@ pub use oam_diagnostics as diagnostics;
 pub mod child;
 pub mod cluster;
 pub mod dns;
+/// oam's own HTTP client transport for the `fetch` op (#143).
+pub mod http_client;
 pub mod http_server;
 pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
