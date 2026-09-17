@@ -1704,7 +1704,9 @@ mod tests {
         let z = zlib(b"zz");
         let r = raw_deflate(b"rr");
         let b = br(b"bb");
-        let cases: Vec<(&str, Vec<Coding>, Vec<Vec<u8>>, Vec<u8>, Vec<bool>)> = vec![
+        // (name, codings, frames, decoded, is_done after each frame)
+        type Case = (&'static str, Vec<Coding>, Vec<Vec<u8>>, Vec<u8>, Vec<bool>);
+        let cases: Vec<Case> = vec![
             (
                 "gzip_zero_same_write",
                 vec![Gzip],
@@ -1914,7 +1916,8 @@ mod tests {
         let a = text(20_000, 22);
         let b = text(500, 23);
         // (name, codings, wire, data, offset of the first byte past the end)
-        let cases: Vec<(&str, Vec<Coding>, Vec<u8>, Vec<u8>, Option<usize>)> = vec![
+        type Case = (&'static str, Vec<Coding>, Vec<u8>, Vec<u8>, Option<usize>);
+        let cases: Vec<Case> = vec![
             (
                 "gzip + zero pad + member",
                 vec![Coding::Gzip],
