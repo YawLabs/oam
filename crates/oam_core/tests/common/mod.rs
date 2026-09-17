@@ -24,6 +24,14 @@ pub async fn within<F: Future>(fut: F) -> F::Output {
         .expect("test timed out")
 }
 
+/// hyper-util returns a connection whose response body was read to the end
+/// to the pool from a task of its own, so a request sent the instant the
+/// previous body ended can race it and dial afresh. Tests that count
+/// accepts give the pool this long first.
+pub async fn let_the_pool_settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 pub const USER_AGENT: &str = "oam/0.0.0-test";
 
 /// rustls needs a process-wide provider for the configs the tests build with

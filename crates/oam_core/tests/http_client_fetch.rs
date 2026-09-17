@@ -1011,8 +1011,12 @@ async fn cancel_for_another_handle_loses_nothing() {
             parked_read(&reg, handle).await;
             let other = handle + 1000;
             reg.cancelled.lock().unwrap().insert(other);
-            reg.signal.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Several wakes, so at least one lands while the read waits.
+            for _ in 0..5 {
+                reg.signal.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!read.is_finished());
             go.send(()).unwrap();
             let outcome = read.await.unwrap();
             assert!(
@@ -1040,7 +1044,15 @@ async fn cancel_tombstone_mid_read_is_done_and_not_reinserted() {
         });
         parked_read(&reg, handle).await;
         reg.cancelled.lock().unwrap().insert(handle);
-        reg.signal.notify_waiters();
+        // `notify_waiters` wakes only a read already waiting: repeat it
+        // until the read has seen one (the tombstone stays until then).
+        for _ in 0..250 {
+            reg.signal.notify_waiters();
+            if read.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(matches!(read.await.unwrap(), OpOutcome::Done));
         assert!(!reg.bodies.lock().unwrap().contains_key(&handle));
         assert!(reg.cancelled.lock().unwrap().is_empty());

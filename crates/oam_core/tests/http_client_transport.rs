@@ -184,6 +184,7 @@ async fn http_proxy_gets_absolute_form_and_caller_adds_proxy_authorization() {
         with_auth.headers_mut().insert(PROXY_AUTHORIZATION, auth);
         let response = send(&transport, &route, with_auth).await.unwrap();
         assert_eq!(body_text(response).await, "ok");
+        let_the_pool_settle().await;
         let response = send(&transport, &route, get(target)).await.unwrap();
         assert_eq!(body_text(response).await, "ok");
 
@@ -399,6 +400,7 @@ partial",
         for _ in 0..2 {
             let response = send(&transport, &route, get(&kept)).await.unwrap();
             assert_eq!(body_text(response).await, "kept");
+            let_the_pool_settle().await;
         }
         assert_eq!(server.accepts(), 1);
 
