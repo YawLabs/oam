@@ -349,6 +349,15 @@ fn op_fetch(
 /// `fetch`: a response, a failure, or the next hop's lookup request. The
 /// `--permission` net check in `op_fetch` covers the initial URL only; a
 /// redirect hop is not checked there either.
+///
+/// Every address the hook hands back IS checked here, because the hook
+/// decides where the grant's host is dialled. `op_fetch` only sees the URL's
+/// hostname, so `--allow-net=granted.invalid` plus a hook answering
+/// `127.0.0.1` used to be a grant to connect ANYWHERE -- to loopback, to a
+/// link-local metadata address, to an RFC 1918 host -- while the wire still
+/// carried the granted name. An address is checked exactly as a URL naming it
+/// directly would be, so `--allow-net=127.0.0.1` still admits a hook that
+/// answers `127.0.0.1`, and `--allow-net` (all) costs nothing.
 fn op_fetch_continue(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -362,6 +371,27 @@ fn op_fetch_continue(
         return;
     };
     let answer = answer.to_rust_string_lossy(scope);
+    {
+        let permissions = scope
+            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
+            .cloned()
+            .unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            #[serde(default)]
+            ips: Vec<String>,
+        }
+        // A malformed answer is not this gate's business: the op itself
+        // reports it, with its own message.
+        if let Ok(parsed) = serde_json::from_str::<Answer>(&answer) {
+            for ip in &parsed.ips {
+                if let Err(denial) = permissions.check_net(ip) {
+                    crate::node_ops::throw_permission_denied(scope, &denial);
+                    return;
+                }
+            }
+        }
+    }
     let core = core_runtime!(scope);
     let bodies = core.bodies();
     let ids = core.body_ids();

@@ -5338,6 +5338,89 @@ console.log('http.get', got);
     );
 }
 
+/// Every address a `connect.lookup` hook answers with is a `--permission`
+/// subject. The hook decides where the granted NAME is dialled, so without
+/// this check `--allow-net=<one name>` was a grant to connect anywhere: the
+/// script names the granted host, the hook hands back 127.0.0.1 (or a
+/// link-local metadata address, or an internal RFC 1918 address), and the
+/// connection is made while the wire still carries the granted name. The
+/// refusal is the same ERR_ACCESS_DENIED a URL naming the address directly
+/// gets, and a grant that DOES cover the address still allows it.
+#[test]
+fn a_connect_lookup_answer_is_checked_against_the_net_permission() {
+    let script = write_temp(
+        "lookup_permission/main.mjs",
+        r#"import { Agent } from 'undici';
+const port = Number(process.argv[2]);
+const agent = () => new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]) } });
+try {
+  const r = await fetch(`http://granted.invalid:${port}/via-hook`, { dispatcher: agent() });
+  console.log('ALLOWED', r.status, await r.text());
+} catch (e) {
+  console.log('DENIED', e.code ?? e.constructor.name, JSON.stringify(e.resource ?? null));
+}
+"#,
+    );
+    // A server the hook's address reaches. It answers one request: the
+    // refused run must never arrive, the granted run must.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_thread = hits.clone();
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let Ok(mut stream) = stream else { continue };
+            hits_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+        }
+    });
+
+    let path = script.to_str().unwrap().to_string();
+    let port_arg = port.to_string();
+    // The name is granted; the address the hook answers with is not.
+    let out = oam(&[
+        "--permission",
+        "--allow-net=granted.invalid",
+        "--",
+        &path,
+        &port_arg,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "DENIED ERR_ACCESS_DENIED \"127.0.0.1\"",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refused request must never reach the server"
+    );
+
+    // The same run with the address granted too: allowed, and it connects.
+    let out = oam(&[
+        "--permission",
+        "--allow-net=granted.invalid,127.0.0.1",
+        "--",
+        &path,
+        &port_arg,
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "ALLOWED 200 ok",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    server.join().unwrap();
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without
