@@ -4726,6 +4726,697 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     assert!(stdout.contains("control=failed"), "{stdout}");
 }
 
+// ------------------------------------ #143: fetch on oam's own transport
+
+/// Run a script with `oam run --no-check` and return (stdout, stderr), failing
+/// loudly on a bad exit.
+fn run_script_ok(script: &std::path::Path, out: Output) -> (String, String) {
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "{} exited {}\nstdout: {stdout}\nstderr: {stderr}",
+        script.display(),
+        out.status
+    );
+    (stdout, stderr)
+}
+
+/// A loopback port nothing listens on: bound, read and released.
+fn closed_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A recording proxy on std threads: every connection's request head is kept,
+/// then `reply` goes back verbatim and the socket closes.
+fn spawn_recording_proxy(
+    reply: &'static str,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = stream.write_all(reply.as_bytes());
+            });
+        }
+    });
+    (port, heads)
+}
+
+/// `oam run --no-check <script>` with every proxy variable the host might
+/// export removed, then `vars` set. Windows compares variable names without
+/// case, so the removals come first or they would undo the sets.
+fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Output {
+    let cache = write_temp("oam-proxy-env-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.args(["run", "--no-check", script.to_str().unwrap()])
+        .env("OAM_CACHE_DIR", cache);
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+        "NODE_EXTRA_CA_CERTS",
+    ] {
+        cmd.env_remove(name);
+    }
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("oam binary runs")
+}
+
+/// undici calls a dispatcher's `connect.lookup` before it connects to a host
+/// NAME -- the first request and every redirect hop to another host -- with
+/// `{ family: undefined, hints, all: true }`, and never for an IP literal.
+/// oam used to call it once, for the first host only, so a 302 to another
+/// name was dialled through system DNS without the hook seeing it.
+///
+/// Measured on node v22.22.2 + undici 6.24.1 (Windows), same script: the same
+/// response, hosts, options and wire hits. The one difference is the call
+/// COUNT: node calls the hook once per connection it opens (3 here: its pool
+/// opens a second connection for the same-host hop), oam once per host per
+/// fetch (2) -- every connection oam opens still dials addresses the hook
+/// returned for that host.
+#[test]
+fn fetch_connect_lookup_runs_for_every_host_a_redirect_reaches() {
+    let script = write_temp(
+        "fetch_lookup_hops/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+const hits = [];
+const a = http.createServer((req, res) => {
+  hits.push(['a', req.url, req.headers.host]);
+  if (req.url === '/start') { res.writeHead(302, { location: '/same' }); return res.end(); }
+  if (req.url === '/same') { res.writeHead(302, { location: `http://B.example.test:${b.address().port}/cross` }); return res.end(); }
+  res.end('done');
+});
+const b = http.createServer((req, res) => {
+  hits.push(['b', req.url, req.headers.host]);
+  res.writeHead(302, { location: `http://127.0.0.1:${a.address().port}/ip` });
+  res.end();
+});
+await new Promise((r) => a.listen(0, '127.0.0.1', r));
+await new Promise((r) => b.listen(0, '127.0.0.1', r));
+const P = (s) => String(s).replaceAll(String(a.address().port), 'PA').replaceAll(String(b.address().port), 'PB');
+const calls = [];
+const agent = new Agent({ connect: { lookup: (host, opts, cb) => {
+  calls.push([host, Object.keys(opts), opts.family === undefined, opts.hints, opts.all, typeof cb]);
+  cb(null, [{ address: '127.0.0.1', family: 4 }]);
+} } });
+const res = await fetch(`http://a.example.test:${a.address().port}/start`, { dispatcher: agent });
+console.log('response', res.status, res.redirected, await res.text(), P(res.url));
+console.log('hosts', JSON.stringify([...new Set(calls.map((c) => c[0]))]));
+console.log('options', JSON.stringify(calls[0].slice(1)), calls.every((c) => JSON.stringify(c.slice(1)) === JSON.stringify(calls[0].slice(1))));
+console.log('calls', calls.length);
+console.log('hits', P(JSON.stringify(hits)));
+a.close(); b.close();
+await agent.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    // node's net.connect hints: 0 on Windows (measured), the platform's
+    // AI_ADDRCONFIG elsewhere. TODO(#143 legs): confirm 1024 / 32 against
+    // node on the macOS and Linux legs; these are the <netdb.h> values.
+    let hints = if cfg!(windows) {
+        0
+    } else if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+        1024
+    } else {
+        32
+    };
+    let expected = format!(
+        "response 200 true done http://127.0.0.1:PA/ip\n\
+         hosts [\"a.example.test\",\"b.example.test\"]\n\
+         options [[\"family\",\"hints\",\"all\"],true,{hints},true,\"function\"] true\n\
+         calls 2\n\
+         hits [[\"a\",\"/start\",\"a.example.test:PA\"],[\"a\",\"/same\",\"a.example.test:PA\"],[\"b\",\"/cross\",\"b.example.test:PB\"],[\"a\",\"/ip\",\"127.0.0.1:PA\"]]"
+    );
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// The SSRF guard: a hook that refuses a host fails the fetch CLOSED -- a
+/// TypeError "fetch failed" whose `cause` is the hook's error object itself --
+/// and nothing is dialled, neither for the first host nor for a redirect's
+/// target (which oam used to dial through system DNS). A hook that throws
+/// synchronously is the same. All measured identical on node v22.22.2 +
+/// undici 6.24.1.
+#[test]
+fn fetch_connect_lookup_error_fails_closed_and_never_dials() {
+    let script = write_temp(
+        "fetch_lookup_guard/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+const hits = { a: [], b: [] };
+const a = http.createServer((req, res) => {
+  hits.a.push(req.url);
+  if (req.url === '/start') { res.writeHead(302, { location: `http://Internal.test:${b.address().port}/secret` }); return res.end(); }
+  res.writeHead(302, { location: `http://other.test:${b.address().port}/public` });
+  res.end();
+});
+const b = http.createServer((req, res) => { hits.b.push([req.url, req.headers.host.replace(/\d+$/, 'PB')]); res.end('reached'); });
+await new Promise((r) => a.listen(0, '127.0.0.1', r));
+await new Promise((r) => b.listen(0, '127.0.0.1', r));
+const guard = Object.assign(new Error('blocked by ssrf guard'), { code: 'EBLOCKED' });
+const report = (label, calls, e) => console.log(label, e instanceof TypeError, e.message, e.cause === guard, e.cause.message, JSON.stringify(Object.keys(e.cause)), JSON.stringify(calls), JSON.stringify(hits));
+{
+  const calls = [];
+  const agent = new Agent({ connect: { lookup: (host, opts, cb) => { calls.push(host); cb(guard); } } });
+  try { await fetch(`http://guarded.test:${a.address().port}/start`, { dispatcher: agent }); console.log('first: resolved?!'); }
+  catch (e) { report('first', calls, e); }
+}
+{
+  const calls = [];
+  const agent = new Agent({ connect: { lookup: (host, opts, cb) => {
+    calls.push(host);
+    if (host === 'internal.test') return cb(guard);
+    cb(null, [{ address: '127.0.0.1', family: 4 }]);
+  } } });
+  try { await fetch(`http://public.test:${a.address().port}/start`, { dispatcher: agent }); console.log('redirect: resolved?!'); }
+  catch (e) { report('redirect', calls, e); }
+  calls.length = 0;
+  const res = await fetch(`http://public.test:${a.address().port}/ok`, { dispatcher: agent });
+  console.log('allowed', res.status, await res.text(), JSON.stringify(calls), JSON.stringify(hits.b));
+}
+{
+  const thrown = new Error('thrown by hook');
+  const agent = new Agent({ connect: { lookup: () => { throw thrown; } } });
+  try { await fetch(`http://public.test:${a.address().port}/ok`, { dispatcher: agent }); console.log('throw: resolved?!'); }
+  catch (e) { console.log('throw', e instanceof TypeError, e.message, e.cause === thrown); }
+}
+a.close(); b.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "first true fetch failed true blocked by ssrf guard [\"code\"] [\"guarded.test\"] {\"a\":[],\"b\":[]}\n\
+         redirect true fetch failed true blocked by ssrf guard [\"code\"] [\"public.test\",\"internal.test\"] {\"a\":[\"/start\"],\"b\":[]}\n\
+         allowed 200 reached [\"public.test\",\"other.test\"] [[\"/public\",\"other.test:PB\"]]\n\
+         throw true fetch failed true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// What a hook's answer turns into is node's lookupAndConnectMultiple: the
+/// usable entries in order (a family other than 4 or 6, or an address that is
+/// not an IP, is skipped), every refused address in an AggregateError, and
+/// with no usable entry node's own TypeError / RangeError for the first one.
+/// A bad-port URL fails before the hook is called, and an IP-literal URL never
+/// calls it. Every line below is node v22.22.2 + undici 6.24.1's output for
+/// the same script on Windows.
+#[test]
+fn fetch_connect_lookup_answers_follow_node_s_address_rules() {
+    let script = write_temp(
+        "fetch_lookup_rules/main.mjs",
+        r#"import net from 'node:net';
+import http from 'node:http';
+import { Agent } from 'undici';
+const probe = net.createServer();
+await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+const port = probe.address().port;
+await new Promise((r) => probe.close(r));
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+async function run(label, url, answer) {
+  let calls = 0;
+  const agent = new Agent({ connect: { lookup: (h, o, cb) => { calls++; return answer(cb); } } });
+  try {
+    const r = await fetch(url, { dispatcher: agent });
+    console.log(label, 'resolved', r.status, await r.text(), 'calls', calls);
+  } catch (e) {
+    const c = e.cause;
+    const errors = c instanceof AggregateError ? ' ' + P(JSON.stringify(c.errors.map((x) => [x.address, x.port === port, x.message, Object.keys(x)]))) : '';
+    console.log(label, e.constructor.name, e.message, '|', c.constructor.name, P(c.message), JSON.stringify(Object.keys(c)), c.code, c.host === undefined ? '' : 'host=' + c.host, c.port === undefined ? '' : 'port=' + P(JSON.stringify(c.port)), errors, 'calls', calls);
+  }
+  await agent.close();
+}
+const v4 = [{ address: '127.0.0.1', family: 4 }];
+await run('bad-port', 'http://x.example.test:1/', (cb) => cb(null, v4));
+await run('two', `http://x.example.test:${port}/`, (cb) => cb(null, [...v4, { address: '::1', family: 6 }]));
+await run('not-an-ip', `http://x.example.test:${port}/`, (cb) => cb(null, [{ address: 'nope', family: 4 }]));
+await run('not-all-form', `http://x.example.test:${port}/`, (cb) => cb(null, '127.0.0.1', 4));
+await run('family-5', `http://x.example.test:${port}/`, (cb) => cb(null, [{ address: '127.0.0.1', family: 5 }]));
+await run('family-string', `http://x.example.test/`, (cb) => cb(null, [{ address: '127.0.0.1', family: 'IPv4' }]));
+await run('repeated', `http://x.example.test:${port}/`, (cb) => cb(null, [...v4, ...v4]));
+await run('skips-bad-entries', `http://x.example.test:${port}/`, (cb) => cb(null, [{ address: 'nope', family: 4 }, ...v4]));
+await run('empty', `http://x.example.test:${port}/`, (cb) => cb(null, []));
+const server = http.createServer((req, res) => res.end('ip ' + req.headers.host.replace(/\d+$/, 'PORT')));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+await run('ip-literal', `http://127.0.0.1:${server.address().port}/`, (cb) => cb(new Error('never called')));
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = [
+        "bad-port TypeError fetch failed | Error bad port [] undefined    calls 0",
+        "two TypeError fetch failed | AggregateError  [\"code\"] ECONNREFUSED    [[\"127.0.0.1\",true,\"connect ECONNREFUSED 127.0.0.1:PORT\",[\"errno\",\"code\",\"syscall\",\"address\",\"port\"]],[\"::1\",true,\"connect ECONNREFUSED ::1:PORT\",[\"errno\",\"code\",\"syscall\",\"address\",\"port\"]]] calls 1",
+        "not-an-ip TypeError fetch failed | TypeError Invalid IP address: nope [\"code\"] ERR_INVALID_IP_ADDRESS    calls 1",
+        "not-all-form TypeError fetch failed | TypeError Invalid IP address: undefined [\"code\"] ERR_INVALID_IP_ADDRESS    calls 1",
+        "family-5 TypeError fetch failed | RangeError Invalid address family: 5 x.example.test:PORT [\"code\",\"host\",\"port\"] ERR_INVALID_ADDRESS_FAMILY host=x.example.test port=\"PORT\"  calls 1",
+        "family-string TypeError fetch failed | RangeError Invalid address family: IPv4 x.example.test:80 [\"code\",\"host\",\"port\"] ERR_INVALID_ADDRESS_FAMILY host=x.example.test port=80  calls 1",
+        "repeated TypeError fetch failed | Error connect ECONNREFUSED 127.0.0.1:PORT [\"errno\",\"code\",\"syscall\",\"address\",\"port\"] ECONNREFUSED  port=PORT  calls 1",
+        "skips-bad-entries TypeError fetch failed | Error connect ECONNREFUSED 127.0.0.1:PORT [\"errno\",\"code\",\"syscall\",\"address\",\"port\"] ECONNREFUSED  port=PORT  calls 1",
+        "empty TypeError fetch failed | TypeError Cannot destructure property 'address' of 'addresses[0]' as it is undefined. [] undefined    calls 1",
+        "ip-literal resolved 200 ip 127.0.0.1:PORT calls 0",
+    ]
+    .join("\n");
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A streamed request body and a lookup hook: the fetch parks BEFORE it takes
+/// the body channel's receiver, so a write can block on the full channel
+/// while the hook runs. Abandoning the parked fetch -- the hook refused, or
+/// the signal aborted while the hook never answered -- drops the receiver, so
+/// every blocked write settles instead of hanging; an answer resumes the fetch,
+/// which takes the receiver and streams the whole body. oam-only (the channel
+/// is internal: http.ClientRequest's), so there is no node output to match.
+#[test]
+fn fetch_connect_lookup_parks_a_streamed_body_until_answered() {
+    let script = write_temp(
+        "fetch_lookup_stream/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+const natives = globalThis.__oam.node;
+const encode = (s) => new TextEncoder().encode(s);
+let received = null;
+const server = http.createServer((req, res) => {
+  let body = '';
+  req.setEncoding('utf8');
+  req.on('data', (c) => (body += c));
+  req.on('end', () => { received = body; res.end('got ' + body.length); });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 20000);
+{
+  const handle = natives.fetchBodyChannelNew();
+  let settled = 0;
+  let atAnswer = -1;
+  let writes = null;
+  const agent = new Agent({ connect: { lookup: (host, opts, cb) => {
+    const pending = [];
+    for (let i = 0; i < 12; i++) pending.push(natives.fetchBodyChannelWrite(handle, encode('chunk' + i + ';')).then(() => settled++));
+    writes = Promise.all(pending);
+    setTimeout(() => { atAnswer = settled; cb(new Error('refused by hook')); }, 50);
+  } } });
+  try {
+    await fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
+    console.log('refused: resolved?!');
+  } catch (e) {
+    console.log('refused', e.message, e.cause.message, 'settled while parked', atAnswer);
+  }
+  await writes;
+  console.log('refused: writes settled', settled, 'server saw', received);
+  natives.fetchBodyChannelEnd(handle);
+}
+{
+  const handle = natives.fetchBodyChannelNew();
+  const writes = [];
+  let calls = 0;
+  const agent = new Agent({ connect: { lookup: () => { calls++; } } });
+  const controller = new AbortController();
+  const p = fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
+  for (let i = 0; i < 10; i++) writes.push(natives.fetchBodyChannelWrite(handle, encode('x')));
+  setTimeout(() => controller.abort(), 50);
+  try { await p; console.log('aborted: resolved?!'); } catch (e) { console.log('aborted', e.name, 'calls', calls); }
+  await Promise.all(writes);
+  console.log('aborted: writes settled, server saw', received);
+  natives.fetchBodyChannelEnd(handle);
+}
+{
+  const handle = natives.fetchBodyChannelNew();
+  const agent = new Agent({ connect: { lookup: (host, opts, cb) => setTimeout(() => cb(null, [{ address: '127.0.0.1', family: 4 }]), 20) } });
+  const writer = (async () => {
+    for (let i = 0; i < 12; i++) await natives.fetchBodyChannelWrite(handle, encode('chunk' + i + ';'));
+    natives.fetchBodyChannelEnd(handle);
+  })();
+  const res = await fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
+  await writer;
+  const expected = Array.from({ length: 12 }, (_, i) => 'chunk' + i + ';').join('');
+  console.log('answered', res.status, await res.text(), received === expected);
+}
+clearTimeout(watchdog);
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    // The channel holds 8 chunks (CoreRuntime::new_outbound_body), so 4 of
+    // the 12 writes were blocked on the parked fetch.
+    let expected = "refused fetch failed refused by hook settled while parked 8\n\
+         refused: writes settled 12 server saw null\n\
+         aborted AbortError calls 1\n\
+         aborted: writes settled, server saw null\n\
+         answered 200 got 86 true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// HTTP_PROXY is honoured by fetch and http.request alike -- an oam extension
+/// (node 22 ignores the variable) that the reqwest transport had and the owned
+/// one keeps: absolute-form request line, `proxy-authorization` from the
+/// proxy URL's userinfo. Wire and texts measured on the reqwest build first.
+#[test]
+fn fetch_and_http_honour_http_proxy_env() {
+    let (proxy, heads) = spawn_recording_proxy(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+    );
+    let script = write_temp(
+        "proxy_env_http/main.mjs",
+        r#"import http from 'node:http';
+const res = await fetch('http://example.invalid:81/x');
+console.log('fetch', res.status, await res.text());
+const got = await new Promise((resolve) => {
+  http.get('http://example.invalid:81/x', (r) => {
+    let b = '';
+    r.setEncoding('utf8');
+    r.on('data', (c) => (b += c));
+    r.on('end', () => resolve(r.statusCode + ' ' + b));
+  }).on('error', (e) => resolve('error ' + e.code + ' ' + e.message));
+});
+console.log('http.get', got);
+"#,
+    );
+    let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
+    let out = oam_run_with_proxy_env(&script, &[("HTTP_PROXY", &proxy_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch 200 ok\nhttp.get 200 ok"
+    );
+    let heads = heads.lock().unwrap();
+    assert_eq!(heads.len(), 2, "{heads:?}");
+    for head in heads.iter() {
+        assert!(
+            head.starts_with("GET http://example.invalid:81/x HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("\r\nproxy-authorization: basic dtpw\r\n"),
+            "{head}"
+        );
+    }
+}
+
+/// HTTPS_PROXY: the tunnel is a CONNECT carrying oam's user-agent and the
+/// proxy credentials, and a refused tunnel keeps the texts the reqwest
+/// transport produced (measured on that build): fetch's cause is `error
+/// sending request for url (...)`, https.get emits ECONNRESET `socket hang up`.
+#[test]
+fn https_proxy_env_sends_connect_and_keeps_error_texts() {
+    let (proxy, heads) =
+        spawn_recording_proxy("HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n");
+    let script = write_temp(
+        "proxy_env_https/main.mjs",
+        r#"import https from 'node:https';
+try { await fetch('https://example.invalid/'); console.log('fetch resolved?!'); }
+catch (e) { console.log('fetch', e.message, '|', e.cause.message); }
+const got = await new Promise((resolve) => {
+  https.get('https://example.invalid/', () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message));
+});
+console.log('https.get', got);
+"#,
+    );
+    let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
+    let out = oam_run_with_proxy_env(&script, &[("HTTPS_PROXY", &proxy_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch fetch failed | error sending request for url (https://example.invalid/)\n\
+         https.get ECONNRESET socket hang up"
+    );
+    let heads = heads.lock().unwrap();
+    assert_eq!(heads.len(), 2, "{heads:?}");
+    for head in heads.iter() {
+        assert!(
+            head.starts_with("CONNECT example.invalid:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("\r\nuser-agent: oam/"), "{head}");
+        assert!(
+            lower.contains("\r\nproxy-authorization: basic dtpw\r\n"),
+            "{head}"
+        );
+    }
+}
+
+/// ALL_PROXY with a SOCKS URL: neither transport speaks SOCKS, and the
+/// failure keeps the reqwest build's texts (measured there).
+#[test]
+fn all_proxy_socks_keeps_error_texts() {
+    let socks = closed_loopback_port();
+    let target = closed_loopback_port();
+    let script = write_temp(
+        "proxy_env_socks/main.mjs",
+        &r#"import http from 'node:http';
+const url = 'http://127.0.0.1:__TARGET__/';
+try { await fetch(url); console.log('fetch resolved?!'); }
+catch (e) { console.log('fetch', e.message, '|', e.cause.message.replace('__TARGET__', 'P')); }
+const got = await new Promise((resolve) => {
+  http.get(url, () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message));
+});
+console.log('http.get', got);
+"#
+        .replace("__TARGET__", &target.to_string()),
+    );
+    let socks_url = format!("socks5://127.0.0.1:{socks}");
+    let out = oam_run_with_proxy_env(&script, &[("ALL_PROXY", &socks_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch fetch failed | error sending request for url (http://127.0.0.1:P/)\n\
+         http.get ECONNRESET socket hang up"
+    );
+}
+
+/// A fetch whose dispatcher carries a connect.lookup hook never goes through
+/// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
+/// pin that a proxy resolved again would pin nothing. The same fetch without
+/// the hook does use the proxy, so the proxy is live.
+#[test]
+fn fetch_connect_lookup_bypasses_the_env_proxy() {
+    let (proxy, heads) = spawn_recording_proxy(
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nproxy",
+    );
+    let script = write_temp(
+        "proxy_env_hooked/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+const server = http.createServer((req, res) => res.end('origin'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]) } });
+const hooked = await fetch(`http://hooked.test:${port}/`, { dispatcher: agent });
+console.log('hooked', hooked.status, await hooked.text());
+const plain = await fetch(`http://plain.test:${port}/`);
+console.log('plain', plain.status, await plain.text());
+server.close();
+"#,
+    );
+    let proxy_url = format!("http://127.0.0.1:{proxy}");
+    let out = oam_run_with_proxy_env(&script, &[("HTTP_PROXY", &proxy_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "hooked 200 origin\nplain 200 proxy"
+    );
+    let heads = heads.lock().unwrap();
+    assert_eq!(
+        heads.len(),
+        1,
+        "only the unhooked fetch may reach the proxy: {heads:?}"
+    );
+    assert!(
+        heads[0].starts_with("GET http://plain.test:"),
+        "{}",
+        heads[0]
+    );
+}
+
+/// fetch trusts NODE_EXTRA_CA_CERTS through the platform verifier, for a
+/// plain fetch, a hooked one (whose connection is pinned but whose
+/// certificate is still checked against the host name) and https.get; without
+/// the variable the private CA is refused. Not on macOS: Security.framework
+/// caps a server certificate's validity at 825 days, and this 100-year leaf
+/// would be refused there for that reason alone.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn fetch_https_trusts_node_extra_ca_certs() {
+    let bundle = write_temp("fetch-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import { Agent } from 'undici';
+const server = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => res.end('secure ' + req.headers.host.replace(/\d+$/, 'PORT')));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const show = async (label, run) => {
+  try { console.log(label, await run()); }
+  catch (e) { console.log(label, 'failed', e.code ?? '', e.message, '|', e.cause?.message?.replaceAll(String(port), 'PORT')); }
+};
+await show('ip', async () => { const r = await fetch(`https://127.0.0.1:${port}/`); return r.status + ' ' + await r.text(); });
+const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]) } });
+await show('hooked', async () => { const r = await fetch(`https://localhost:${port}/`, { dispatcher: agent }); return r.status + ' ' + await r.text(); });
+await show('https.get', () => new Promise((resolve, reject) => {
+  https.get(`https://localhost:${port}/`, (r) => { let s = ''; r.on('data', (d) => (s += d)); r.on('end', () => resolve(r.statusCode + ' ' + s)); }).on('error', reject);
+}));
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_extra_ca/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "ip 200 secure 127.0.0.1:PORT\nhooked 200 secure localhost:PORT\nhttps.get 200 secure localhost:PORT",
+        "stderr: {stderr}"
+    );
+    let out = oam_run_with_proxy_env(&script, &[]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "stdout: {stdout}\nstderr: {stderr}");
+    for line in &lines {
+        assert!(
+            line.contains(" failed "),
+            "a private CA must be refused without NODE_EXTRA_CA_CERTS: {stdout}"
+        );
+    }
+}
+
+/// A server-sent-events body compressed with gzip and sync-flushed per event
+/// reaches JavaScript event by event: each flushed unit decodes as soon as it
+/// arrives, instead of waiting for the next unit or the end of the stream.
+/// The server withholds unit 2 until the client has read unit 1, so a decoder
+/// that buffers ahead hangs (the watchdog) rather than passing by luck. The
+/// units come from flate2 here, not from oam's zlib.
+#[test]
+fn fetch_sync_flushed_gzip_sse_arrives_per_unit() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut units = Vec::new();
+    let mut taken = 0;
+    for event in ["data: tok1\n\n", "data: tok2\n\n", "data: tok3\n\n"] {
+        encoder.write_all(event.as_bytes()).unwrap();
+        encoder.flush().unwrap();
+        let so_far = encoder.get_ref();
+        units.push(base64::engine::general_purpose::STANDARD.encode(&so_far[taken..]));
+        taken = so_far.len();
+    }
+    let all = encoder.finish().unwrap();
+    units.push(base64::engine::general_purpose::STANDARD.encode(&all[taken..]));
+    let units_json = format!("[\"{}\"]", units.join("\",\""));
+    let src = r#"import net from 'node:net';
+const units = __UNITS__.map((u) => Buffer.from(u, 'base64'));
+const watchdog = setTimeout(() => { console.log('HANG: a sync-flushed unit was held back'); process.exit(1); }, 20000);
+const releases = [];
+const released = (i) => new Promise((r) => { releases[i] = r; });
+const server = net.createServer((socket) => {
+  socket.once('data', async () => {
+    socket.write('HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-encoding: gzip\r\nconnection: close\r\n\r\n');
+    socket.write(units[0]);
+    await released(0);
+    socket.write(units[1]);
+    await released(1);
+    socket.write(units[2]);
+    socket.end(units[3]);
+  });
+  socket.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const res = await fetch(`http://127.0.0.1:${server.address().port}/events`);
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let text = '';
+let first = null;
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  text += decoder.decode(value, { stream: true });
+  first ??= text;
+  if (text.includes('tok1') && releases[0]) { releases[0](); releases[0] = null; }
+  if (text.includes('tok2') && releases[1]) { releases[1](); releases[1] = null; }
+}
+clearTimeout(watchdog);
+console.log('first read', JSON.stringify(first));
+console.log('text', JSON.stringify(text));
+server.close();
+"#
+    .replace("__UNITS__", &units_json);
+    let stdout = run_ok("fetch_gzip_sse/main.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "first read \"data: tok1\\n\\n\"\ntext \"data: tok1\\n\\ndata: tok2\\n\\ndata: tok3\\n\\n\""
+    );
+}
+
+/// 106 bytes of brotli that inflate to 64 MiB of zeros: the decoded body
+/// arrives in chunks of at most 16 KiB (node's largest is 16384 too,
+/// measured), never as one buffer the size of the output. The fixture was made
+/// once with brotli quality 11 and is embedded, so the test does not depend on
+/// any runtime's encoder.
+#[test]
+fn fetch_decoded_br_bomb_chunks_stay_bounded() {
+    let stdout = run_ok(
+        "fetch_br_bomb/main.mjs",
+        r#"import net from 'node:net';
+const br = Buffer.from('y///P/gnAOKxQCD3/o///3/wTwDEYRGA7v0f////4J8AiMMCAN37P/7//8E/ARCHBQC693/8//+DfwIgDgsAdO//+P//B/8EQBwWAOje//H//w/+CYA4LADQvf/L//8//BMAcVgAoHv/Bw==', 'base64');
+const server = net.createServer((socket) => {
+  socket.once('data', () => {
+    socket.write(`HTTP/1.1 200 OK\r\ncontent-encoding: br\r\ncontent-length: ${br.length}\r\nconnection: close\r\n\r\n`);
+    socket.end(br);
+  });
+  socket.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const res = await fetch(`http://127.0.0.1:${server.address().port}/`);
+let total = 0;
+let largest = 0;
+let zeros = true;
+for await (const chunk of res.body) {
+  total += chunk.length;
+  largest = Math.max(largest, chunk.length);
+  if (zeros && chunk.some((b) => b !== 0)) zeros = false;
+}
+console.log('total', total, 'largest <= 16384', largest <= 16384, 'zeros', zeros);
+server.close();
+"#,
+    );
+    assert_eq!(stdout, "total 67108864 largest <= 16384 true zeros true");
+}
+
 #[test]
 fn cjs_modules_can_require_builtins() {
     write_temp(
@@ -5583,11 +6274,17 @@ fn fetch_posts_body_and_headers() {
 
 #[test]
 fn fetch_network_error_rejects_with_typeerror() {
-    // Port 1 on loopback: reliably refused, no external network involved.
+    // A loopback port nothing listens on: reliably refused, no external
+    // network involved. Not port 1: fetch refuses that one itself, before any
+    // connect (the Fetch spec's bad-port block, conformance case 111), and
+    // this test is about a failure on the wire.
     // WHATWG requires fetch to reject with a TypeError specifically.
+    let port = closed_loopback_port();
     let main = write_temp(
         "fetch_refused.ts",
-        "try {\n  await fetch('http://127.0.0.1:1/');\n} catch (e) {\n  console.log('caught:', e instanceof TypeError && (e as Error).message.includes('fetch failed'));\n}",
+        &format!(
+            "try {{\n  await fetch('http://127.0.0.1:{port}/');\n}} catch (e) {{\n  console.log('caught:', e instanceof TypeError && (e as Error).message.includes('fetch failed'), ((e as Error).cause as {{ code?: string }}).code);\n}}"
+        ),
     );
     let out = oam(&["run", main.to_str().unwrap()]);
     assert!(
@@ -5595,7 +6292,10 @@ fn fetch_network_error_rejects_with_typeerror() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "caught: true");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "caught: true ECONNREFUSED"
+    );
 }
 
 #[test]
