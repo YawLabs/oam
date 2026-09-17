@@ -123,6 +123,10 @@ bytes = "1"
 url = "2"
 http = "1"
 percent-encoding = "2"
+# fetch's `br` response decoding (http_client/decode.rs) drives the decoder
+# stream directly for bounded output. Already compiled: brotli (node:zlib)
+# depends on it with the same features.
+brotli-decompressor = { version = "5", default-features = false, features = ["std"] }
 # TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
 # bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
 # All three are already compiled transitively via tokio-tungstenite --

@@ -24,6 +24,8 @@ bytes = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
 percent-encoding = { workspace = true }
+# http_client response decoding: brotli's decoder stream, driven directly.
+brotli-decompressor = { workspace = true }
 # V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

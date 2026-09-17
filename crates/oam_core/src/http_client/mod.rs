@@ -10,6 +10,8 @@
 //! This module holds the pure, transport-free halves -- nothing in here dials,
 //! awaits or touches the runtime:
 //!
+//! - [`decode`]: the content-encoding plan and a bounded-output streaming
+//!   decoder (gzip, deflate, br, stacked), undici fetch/index.js:2129-2172.
 //! - [`redirect`]: the "follow" redirect step, undici fetch/index.js:1210-1318.
 //! - [`prepare`]: URL, method and header preparation, keeping today's error
 //!   texts so `http.request`'s mapping of them stays unchanged.
@@ -18,5 +20,6 @@
 //! `crates/oam_core/tests/http_client_*.rs`, outside the published-URLs gate's
 //! scan (an `http://[::1]` literal parses to the host `[` there).
 
+pub mod decode;
 pub mod prepare;
 pub mod redirect;

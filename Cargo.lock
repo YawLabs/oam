@@ -1916,6 +1916,7 @@ version = "0.16.1"
 dependencies = [
  "base64",
  "brotli",
+ "brotli-decompressor",
  "bytes",
  "flate2",
  "futures-util",
