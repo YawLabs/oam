@@ -8,7 +8,8 @@
 //! - [`Decoder`] turns compressed frames into decoded chunks of at most
 //!   [`OUT_CAP`] bytes, pull-style: [`Decoder::push`] consumes only as much
 //!   input as it needs to fill one chunk and leaves the rest in the caller's
-//!   `Bytes`.
+//!   `Bytes`; [`Decoder::is_done`] reports a stream that ended before the
+//!   body did, where node ends the body.
 //!
 //! Why not the node:zlib backends in lib.rs (measured for #143, review
 //! "behaviour-preservation"):
@@ -168,6 +169,11 @@ pub struct Decoder {
     windows: Vec<Window>,
     /// The first error, returned again by every later call.
     error: Option<DecodeError>,
+    /// The furthest-downstream stage that was handed input after its stream
+    /// ended (see [`Decoder::is_done`]). Nothing upstream of it runs again.
+    overrun: Option<usize>,
+    /// `overrun` is set and every chunk before it was returned.
+    done: bool,
 }
 
 impl Decoder {
@@ -180,7 +186,31 @@ impl Decoder {
             stages,
             windows,
             error: None,
+            overrun: None,
+            done: false,
         }
+    }
+
+    /// True once decoding has ended before the body did: some stage's stream
+    /// ended and more input followed it (gzip: a zero byte where the next
+    /// member would start; deflate and br: any byte), and every chunk that
+    /// preceded it has been returned. Check it when [`Decoder::push`] returns
+    /// `None`: when true, stop reading frames and end the body there.
+    ///
+    /// That is when node's fetch ends it. lib/zlib.js `processCallback` calls
+    /// `push(null)` when a write leaves input unconsumed with output room to
+    /// spare (for gzip, node_zlib.cc stops consuming at a zero byte after a
+    /// member), and undici pipes the decoders, so any stage ending ends the
+    /// body -- a downstream stage gets end-of-input, which with
+    /// `Z_SYNC_FLUSH` finishing is draining. Measured on node v22.22.2 with
+    /// the server holding the response open afterwards: gzip followed by a
+    /// zero byte (in the same write or a later one), zlib, raw deflate or br
+    /// followed by any byte, and `gzip, br` or `deflate, gzip` with the end
+    /// in either layer all resolve at once; a gzip body with nothing after
+    /// it, or with a second member or a lone `1f` after it, waits for the
+    /// wire. Bytes after the end are dropped, as node drops them.
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 
     /// Feed compressed input (may be empty) and take the next decoded chunk.
@@ -188,12 +218,17 @@ impl Decoder {
     /// Returns `Some(chunk)` with `1..=OUT_CAP` bytes, consuming only as much
     /// of `input` as that took (the rest stays in `input` for the next call),
     /// or `None` once `input` is fully consumed and nothing more is decodable
-    /// from it -- read the next frame then. Everything a frame makes
+    /// from it -- read the next frame then, unless [`Decoder::is_done`] says
+    /// the body is over (its unread rest is dropped). Everything a frame makes
     /// decodable (a sync-flushed unit) is returned before `None`. Never
     /// allocates more than [`OUT_CAP`] for output and never blocks.
     pub fn push(&mut self, input: &mut Bytes) -> Result<Option<Bytes>, DecodeError> {
         if let Some(e) = &self.error {
             return Err(e.clone());
+        }
+        if self.done {
+            input.clear();
+            return Ok(None);
         }
         let Some(last) = self.stages.len().checked_sub(1) else {
             if input.is_empty() {
@@ -204,7 +239,15 @@ impl Decoder {
         if self.windows[last].is_empty() {
             match self.pull(last, input) {
                 Ok(true) => {}
-                Ok(false) => return Ok(None),
+                Ok(false) => {
+                    if self.overrun.is_some() {
+                        // `pull` stops at the overrun stage, so `input` may
+                        // still hold bytes nothing will read.
+                        input.clear();
+                        self.done = true;
+                    }
+                    return Ok(None);
+                }
                 Err(e) => {
                     self.error = Some(e.clone());
                     return Err(e);
@@ -251,6 +294,9 @@ impl Decoder {
                 _ => upstream[j - 1].start += step.consumed,
             }
             dst.end = step.produced;
+            if self.stages[j].overrun() {
+                self.overrun = self.overrun.max(Some(j));
+            }
             if step.produced > 0 {
                 if j == k {
                     return Ok(true);
@@ -263,7 +309,11 @@ impl Decoder {
                     // clearing a window that still holds data.
                     return Err(DecodeError("decoder made no progress"));
                 }
-                if j == 0 {
+                // Stage j is dry. At or below an overrun stage there is nothing
+                // left to want: its stream is over, and decoding what feeds it
+                // would only burn CPU on bytes node drops (a small br frame
+                // can inflate to gigabytes).
+                if j == 0 || self.overrun.is_some_and(|o| o + 1 >= j) {
                     return Ok(false);
                 }
                 j -= 1;
@@ -324,6 +374,15 @@ impl Stage {
             Coding::Gzip => Stage::Gzip(Box::new(GzipStage::new())),
             Coding::Deflate => Stage::Deflate(DeflateStage::Detect),
             Coding::Brotli => Stage::Brotli(Box::new(BrotliStage::new())),
+        }
+    }
+
+    /// True once the stage was handed input past the end of its stream.
+    fn overrun(&self) -> bool {
+        match self {
+            Stage::Gzip(s) => s.at == Gz::Ignore,
+            Stage::Deflate(s) => matches!(s, DeflateStage::Overrun),
+            Stage::Brotli(s) => s.overrun,
         }
     }
 
@@ -614,6 +673,8 @@ enum DeflateStage {
     /// (Inflate/InflateRaw only look past the end for gzip members); measured:
     /// zlib+"JUNK" and raw+"JUNK" both decode without error.
     Done,
+    /// Done, and input followed: the body is over.
+    Overrun,
 }
 
 impl DeflateStage {
@@ -635,10 +696,15 @@ impl DeflateStage {
                 }
                 Ok(step)
             }
-            _ => Ok(Step {
-                consumed: src.len(),
-                produced: 0,
-            }),
+            _ => {
+                if !src.is_empty() {
+                    *self = DeflateStage::Overrun;
+                }
+                Ok(Step {
+                    consumed: src.len(),
+                    produced: 0,
+                })
+            }
         }
     }
 }
@@ -652,6 +718,8 @@ struct BrotliStage {
     /// The stream is complete; like zlib, node's brotli decoder drops the
     /// bytes after it (measured: br+"JUNK" decodes without error).
     done: bool,
+    /// Done, and input followed: the body is over.
+    overrun: bool,
 }
 
 impl BrotliStage {
@@ -663,11 +731,13 @@ impl BrotliStage {
                 StandardAlloc::default(),
             ),
             done: false,
+            overrun: false,
         }
     }
 
     fn run(&mut self, src: &[u8], dst: &mut [u8]) -> Result<Step, DecodeError> {
         if self.done {
+            self.overrun |= !src.is_empty();
             return Ok(Step {
                 consumed: src.len(),
                 produced: 0,
@@ -696,6 +766,9 @@ impl BrotliStage {
             BrotliResult::ResultFailure => Err(DecodeError("brotli decompression failed")),
             BrotliResult::ResultSuccess => {
                 self.done = true;
+                // The last meta-block ends on a byte boundary; what the
+                // decoder left unread follows the stream.
+                self.overrun = input_offset < src.len();
                 Ok(Step {
                     consumed: src.len(),
                     produced: output_offset,
@@ -1589,5 +1662,313 @@ mod tests {
         }
         assert_eq!(total, zeros.len());
         assert_eq!(max, OUT_CAP);
+    }
+
+    // -- early end: input past the end of a stream --------------------------
+
+    /// Feed `frames` one by one, draining each, and record `is_done` after
+    /// each; then finish. Checks that `is_done` never flips while a chunk is
+    /// still coming, and that a done decoder drops later input.
+    fn decode_frames(codings: &[Coding], frames: &[&[u8]]) -> (Vec<u8>, Vec<bool>) {
+        let mut d = Decoder::new(codings);
+        let mut out = Vec::new();
+        let mut done = Vec::new();
+        for f in frames {
+            let mut frame = Bytes::copy_from_slice(f);
+            while let Some(chunk) = d.push(&mut frame).unwrap() {
+                assert!(!d.is_done(), "done with a chunk still being returned");
+                out.extend_from_slice(&chunk);
+            }
+            assert!(frame.is_empty());
+            done.push(d.is_done());
+        }
+        let was_done = d.is_done();
+        while let Some(chunk) = d.finish().unwrap() {
+            assert!(!was_done, "a done decoder returned more at finish");
+            out.extend_from_slice(&chunk);
+        }
+        // Finishing is not an early end.
+        assert_eq!(d.is_done(), was_done);
+        (out, done)
+    }
+
+    /// The node v22.22.2 measurements behind `is_done` (#143 review of slice
+    /// B): each frame is one server write, the server holding the response
+    /// open for 1.5-2 s afterwards. `true` = node's `text()` resolved right
+    /// after that write, `false` = only when the response ended.
+    #[test]
+    fn early_end_matches_node() {
+        use Coding::*;
+        let hello = b"hello world";
+        let g = gzip(hello);
+        let z = zlib(b"zz");
+        let r = raw_deflate(b"rr");
+        let b = br(b"bb");
+        let cases: Vec<(&str, Vec<Coding>, Vec<Vec<u8>>, Vec<u8>, Vec<bool>)> = vec![
+            (
+                "gzip_zero_same_write",
+                vec![Gzip],
+                vec![cat(&[&g, &[0, 0]])],
+                hello.to_vec(),
+                vec![true],
+            ),
+            (
+                "gzip_exact_then_zero_later",
+                vec![Gzip],
+                vec![g.clone(), vec![0]],
+                hello.to_vec(),
+                vec![false, true],
+            ),
+            (
+                "gzip_exact_nothing_after",
+                vec![Gzip],
+                vec![g.clone()],
+                hello.to_vec(),
+                vec![false],
+            ),
+            (
+                "gzip_second_member_later",
+                vec![Gzip],
+                vec![g.clone(), g.clone()],
+                cat(&[hello, hello]),
+                vec![false, false],
+            ),
+            (
+                "gzip_1f_later",
+                vec![Gzip],
+                vec![g.clone(), vec![0x1f]],
+                hello.to_vec(),
+                vec![false, false],
+            ),
+            (
+                "empty_zero_gzip",
+                vec![Gzip],
+                vec![vec![0]],
+                vec![],
+                vec![false],
+            ),
+            (
+                "zlib_junk_same_write",
+                vec![Deflate],
+                vec![cat(&[&z, b"JUNK"])],
+                b"zz".to_vec(),
+                vec![true],
+            ),
+            (
+                "zlib_exact_then_junk_later",
+                vec![Deflate],
+                vec![z.clone(), b"J".to_vec()],
+                b"zz".to_vec(),
+                vec![false, true],
+            ),
+            (
+                "raw_junk_same_write",
+                vec![Deflate],
+                vec![cat(&[&r, b"JUNK"])],
+                b"rr".to_vec(),
+                vec![true],
+            ),
+            (
+                "raw_exact_then_junk_later",
+                vec![Deflate],
+                vec![r.clone(), b"J".to_vec()],
+                b"rr".to_vec(),
+                vec![false, true],
+            ),
+            (
+                "br_junk_same_write",
+                vec![Brotli],
+                vec![cat(&[&b, b"JUNK"])],
+                b"bb".to_vec(),
+                vec![true],
+            ),
+            (
+                "br_exact_then_junk_later",
+                vec![Brotli],
+                vec![b.clone(), b"J".to_vec()],
+                b"bb".to_vec(),
+                vec![false, true],
+            ),
+            (
+                "gzip_br_inner_zero",
+                vec![Gzip, Brotli],
+                vec![br(&cat(&[&g, &[0]]))],
+                hello.to_vec(),
+                vec![true],
+            ),
+            (
+                "gzip_br_outer_junk",
+                vec![Gzip, Brotli],
+                vec![cat(&[&br(&g), b"JUNK"])],
+                hello.to_vec(),
+                vec![true],
+            ),
+            (
+                "deflate_gzip_inner_junk",
+                vec![Deflate, Gzip],
+                vec![gzip(&cat(&[&z, b"JUNK"]))],
+                b"zz".to_vec(),
+                vec![true],
+            ),
+        ];
+        for (name, codings, frames, data, done) in cases {
+            let frames: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+            assert_eq!(decode_frames(&codings, &frames), (data, done), "{name}");
+        }
+
+        // Node: an outer br ending with junk after it ends a truncated inner
+        // gzip too, delivering what decoded ("hell" there) without an error.
+        let cut = &g[..15];
+        let (out, done) = decode_frames(&[Gzip, Brotli], &[&cat(&[&br(cut), b"JUNK"])]);
+        assert_eq!(done, vec![true]);
+        assert_eq!(out, decode_all(&[Gzip], cut).unwrap());
+        assert!(!out.is_empty() && hello.starts_with(&out), "{out:?}");
+    }
+
+    #[test]
+    fn a_done_decoder_drops_everything_after() {
+        let a = text(40_000, 21);
+        // Several OUT_CAP chunks come out before the end is reported.
+        let (out, done) = decode_frames(
+            &[Coding::Deflate],
+            &[&cat(&[&zlib(&a), b"J"]), b"more", &zlib(b"another stream")],
+        );
+        assert_eq!(out, a);
+        assert_eq!(done, vec![true, true, true]);
+
+        // A gzip member after the zero pad is dropped, and later frames too.
+        let (out, done) = decode_frames(
+            &[Coding::Gzip],
+            &[&gzip(&a), &cat(&[&[0], &gzip(b"x")]), &gzip(b"y")],
+        );
+        assert_eq!(out, a);
+        assert_eq!(done, vec![false, true, true]);
+
+        // No codings: a pass-through has no stream to end.
+        let (out, done) = decode_frames(&[], &[b"abc", &[0], b"def"]);
+        assert_eq!(out, b"abc\0def");
+        assert_eq!(done, vec![false; 3]);
+    }
+
+    /// An inner stage that ended stops the stages feeding it: the rest of the
+    /// frame is dropped, not decoded just to be dropped -- an outer layer can
+    /// inflate a small frame to gigabytes.
+    ///
+    /// Observable through a corrupt outer block after the inner end: body
+    /// `zlib(gzip("head") + 00 + fill, sync-flushed) + 07` (BFINAL=1,
+    /// BTYPE=11) as `content-encoding: gzip, deflate`. Node v22.22.2's fetch,
+    /// the server writing it in one write: `fill` 0 fails ("invalid block
+    /// type" -- zlib reached the bad block within the write's first 16 KiB of
+    /// output, before gunzip saw any), 20000 / 100000 / 1000000 resolve
+    /// "head" (gunzip ended on the first 16 KiB chunk); written as two writes
+    /// split before the bad byte, `fill` 0 resolves "head" too.
+    #[test]
+    fn an_ended_inner_stage_does_not_decode_the_rest_of_the_frame() {
+        let head = |fill: usize| {
+            let mut plain = cat(&[&gzip(b"head"), &[0]]);
+            plain.resize(plain.len() + fill, 7);
+            let mut c = Compress::new(Compression::default(), true);
+            let mut wire = Vec::with_capacity(plain.len() / 2 + 256);
+            c.compress_vec(&plain, &mut wire, FlushCompress::Sync)
+                .unwrap();
+            wire
+        };
+        let decode = |frames: &[&[u8]]| {
+            let mut d = Decoder::new(&[Coding::Gzip, Coding::Deflate]);
+            let mut out = Vec::new();
+            for f in frames {
+                let mut frame = Bytes::copy_from_slice(f);
+                while let Some(chunk) = d.push(&mut frame)? {
+                    out.extend_from_slice(&chunk);
+                }
+            }
+            Ok::<_, DecodeError>((out, d.is_done()))
+        };
+        let h = head(0);
+        assert!(decode(&[&cat(&[&h, &[0x07]])]).is_err());
+        assert_eq!(decode(&[&h, &[0x07]]), Ok((b"head".to_vec(), true)));
+        // 40000 rather than node's 20000: flate2's miniz backend inflates up
+        // to its 32 KiB dictionary per call, not zlib's 16 KiB.
+        for fill in [40_000, 100_000, 1_000_000] {
+            let wire = cat(&[&head(fill), &[0x07]]);
+            assert_eq!(decode(&[&wire]), Ok((b"head".to_vec(), true)), "{fill}");
+        }
+
+        // A 64 MiB tail: the push that reports the end returns at once, with
+        // the frame dropped.
+        let mut payload = cat(&[&gzip(b"head"), &[0]]);
+        payload.resize(payload.len() + 64 * 1024 * 1024, 0);
+        let wire = br(&payload);
+        assert!(wire.len() < 64 * 1024, "{}", wire.len());
+        let mut d = Decoder::new(&[Coding::Gzip, Coding::Brotli]);
+        let mut frame = Bytes::from(wire);
+        assert_eq!(d.push(&mut frame).unwrap().as_deref(), Some(&b"head"[..]));
+        assert_eq!(d.push(&mut frame).unwrap(), None);
+        assert!(d.is_done() && frame.is_empty());
+    }
+
+    /// Where the network cuts the body never changes when the decoder is
+    /// done: exactly once the first byte past the end has been pushed.
+    #[test]
+    fn early_end_at_every_split_point() {
+        let a = text(20_000, 22);
+        let b = text(500, 23);
+        // (name, codings, wire, data, offset of the first byte past the end)
+        let cases: Vec<(&str, Vec<Coding>, Vec<u8>, Vec<u8>, Option<usize>)> = vec![
+            (
+                "gzip + zero pad + member",
+                vec![Coding::Gzip],
+                cat(&[&gzip(&a), &[0], &gzip(&b)]),
+                a.clone(),
+                Some(gzip(&a).len()),
+            ),
+            (
+                "gzip members",
+                vec![Coding::Gzip],
+                cat(&[&gzip(&a), &gzip(&b)]),
+                cat(&[&a, &b]),
+                None,
+            ),
+            (
+                "zlib + junk",
+                vec![Coding::Deflate],
+                cat(&[&zlib(&a), b"JUNK"]),
+                a.clone(),
+                Some(zlib(&a).len()),
+            ),
+            (
+                "raw + junk",
+                vec![Coding::Deflate],
+                cat(&[&raw_deflate(&a), b"JUNK"]),
+                a.clone(),
+                Some(raw_deflate(&a).len()),
+            ),
+            (
+                "br + junk",
+                vec![Coding::Brotli],
+                cat(&[&br(&a), b"JUNK"]),
+                a.clone(),
+                Some(br(&a).len()),
+            ),
+            (
+                "gzip, br + junk",
+                vec![Coding::Gzip, Coding::Brotli],
+                cat(&[&br(&gzip(&b)), b"JUNK"]),
+                b.clone(),
+                Some(br(&gzip(&b)).len()),
+            ),
+        ];
+        for (name, codings, wire, data, end) in cases {
+            for size in 1..=17usize {
+                let frames: Vec<&[u8]> = wire.chunks(size).collect();
+                let (out, done) = decode_frames(&codings, &frames);
+                assert!(out == data, "{name}: size {size}");
+                for (i, got) in done.iter().enumerate() {
+                    let fed = ((i + 1) * size).min(wire.len());
+                    let want = end.is_some_and(|e| fed > e);
+                    assert_eq!(*got, want, "{name}: size {size} after {fed} bytes");
+                }
+            }
+        }
     }
 }
