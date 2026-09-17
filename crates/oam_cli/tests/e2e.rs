@@ -5554,7 +5554,11 @@ srv.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let lines: Vec<String> = stdout.trim().lines().map(|l| l.trim().to_string()).collect();
+    let lines: Vec<String> = stdout
+        .trim()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
     assert!(
         lines[0].contains("host: spoof.test"),
         "undici.request sends a caller host, as node does: {:?}",
