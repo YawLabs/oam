@@ -71,6 +71,37 @@ pub type OpId = u64;
 /// counted in `inflight`) and route it to `process.emit(name)`.
 pub const SIGNAL_OP_ID: OpId = 0;
 
+/// One Node system error, fully shaped on the native side: the fields node
+/// puts on the error a libuv or resolver failure produces.
+///
+/// Two of node's error classes are built from exactly these fields (node
+/// v22.22.2 lib/internal/errors.js): `ExceptionWithHostPort` for a connect
+/// failure (`errno, code, syscall, address, port`, message `connect
+/// ECONNREFUSED 127.0.0.1:8080`) and `DNSException` for a resolver failure
+/// (`errno, code, syscall, hostname`, message `getaddrinfo ENOTFOUND host`).
+/// The engine hands the fields to the JS factory `__oamMakeSysError`
+/// (js/bootstrap.js), which picks the class from which of `address` / `port` /
+/// `hostname` is present. One of these is also a child of an aggregate
+/// (`OpOutcome::NodeAggregateFailed`).
+///
+/// `port` is `None` for port 0: node sets the key only when the port is
+/// truthy, and the message then carries the address alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeSysError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscall: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -98,6 +129,10 @@ pub enum OpOutcome {
     /// packages that branch on `err.syscall === "open"` or read `err.path`
     /// (graceful-fs, chokidar, rimraf) saw nothing. Optional because the
     /// non-fs producers (dns/net/tls) have no path to report.
+    ///
+    /// `hostname` / `address` / `port` name the peer the way node does on a
+    /// resolver or connect failure (see `NodeSysError`). All three are serde
+    /// defaults, so a replay file recorded before they existed still loads.
     NodeFailed {
         code: String,
         message: String,
@@ -107,6 +142,21 @@ pub enum OpOutcome {
         path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         errno: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+    },
+    /// Every address of a multi-address connect failed: node's
+    /// `NodeAggregateError` (lib/net.js `internalConnectMultiple`), one child
+    /// per attempt, in attempt order. The aggregate itself has no message and
+    /// takes `code` from its first child; the engine builds it through the JS
+    /// factory `__oamMakeAggregateError`. A new variant rather than more
+    /// fields, so a replay file recorded before it existed still loads.
+    NodeAggregateFailed {
+        errors: Vec<NodeSysError>,
     },
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
@@ -124,6 +174,24 @@ impl OpOutcome {
             syscall: None,
             path: None,
             errno: None,
+            hostname: None,
+            address: None,
+            port: None,
+        }
+    }
+
+    /// A fully shaped system error (a connect or resolver failure). It never
+    /// carries a filesystem path.
+    pub fn sys(err: NodeSysError) -> Self {
+        OpOutcome::NodeFailed {
+            code: err.code,
+            message: err.message,
+            syscall: err.syscall,
+            path: None,
+            errno: err.errno,
+            hostname: err.hostname,
+            address: err.address,
+            port: err.port,
         }
     }
 
@@ -149,6 +217,9 @@ impl OpOutcome {
             syscall: Some(syscall.to_string()),
             path: path.map(|p| p.to_string()),
             errno,
+            hostname: None,
+            address: None,
+            port: None,
         }
     }
 }
@@ -5042,5 +5113,149 @@ mod tests {
         let registry: SyncFileRegistry =
             std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
         assert!(!adopt_inherited_fd(&registry, fd));
+    }
+}
+
+/// The op-outcome error contract as record/replay persists it: replay.rs
+/// writes every outcome with serde_json and reads it back on replay, so a file
+/// recorded before a field existed must still load (and falls back to the live
+/// outcome only if it does not parse at all).
+#[cfg(test)]
+mod op_outcome_serde_tests {
+    use super::*;
+
+    fn sys(code: &str) -> NodeSysError {
+        NodeSysError {
+            code: code.to_string(),
+            message: format!("connect {code} 127.0.0.1:8080"),
+            errno: Some(-4078),
+            syscall: Some("connect".to_string()),
+            hostname: None,
+            address: Some("127.0.0.1".to_string()),
+            port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn a_node_failed_recorded_before_the_peer_fields_still_loads() {
+        // The exact shape an older oam wrote: no hostname / address / port.
+        let old = r#"{"NodeFailed":{"code":"ENOENT","message":"ENOENT: no such file or directory, open 'x'","syscall":"open","path":"x","errno":-4058}}"#;
+        match serde_json::from_str::<OpOutcome>(old).expect("old payload parses") {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                path,
+                errno,
+                hostname,
+                address,
+                port,
+            } => {
+                assert_eq!(code, "ENOENT");
+                assert_eq!(message, "ENOENT: no such file or directory, open 'x'");
+                assert_eq!(syscall.as_deref(), Some("open"));
+                assert_eq!(path.as_deref(), Some("x"));
+                assert_eq!(errno, Some(-4058));
+                assert_eq!((hostname, address, port), (None, None, None));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+        // The minimal old form (node_failed: code + message only) too.
+        let minimal = r#"{"NodeFailed":{"code":"ENOTFOUND","message":"m"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<OpOutcome>(minimal).expect("minimal payload parses"),
+            OpOutcome::NodeFailed {
+                syscall: None,
+                path: None,
+                errno: None,
+                hostname: None,
+                address: None,
+                port: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn absent_fields_are_not_written() {
+        // A new recording of an fs-shaped failure is byte-identical to what an
+        // older oam wrote, so an older oam can still replay it.
+        let outcome = OpOutcome::node_failed_at("ENOENT", "m", "open", Some("x"), Some(-2));
+        assert_eq!(
+            serde_json::to_string(&outcome).unwrap(),
+            r#"{"NodeFailed":{"code":"ENOENT","message":"m","syscall":"open","path":"x","errno":-2}}"#
+        );
+        let bare = NodeSysError {
+            code: "EAI_AGAIN".to_string(),
+            message: "getaddrinfo EAI_AGAIN".to_string(),
+            errno: None,
+            syscall: None,
+            hostname: None,
+            address: None,
+            port: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"code":"EAI_AGAIN","message":"getaddrinfo EAI_AGAIN"}"#
+        );
+    }
+
+    #[test]
+    fn sys_fills_node_failed_without_a_path() {
+        match OpOutcome::sys(sys("ECONNREFUSED")) {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                path,
+                errno,
+                hostname,
+                address,
+                port,
+            } => {
+                assert_eq!(code, "ECONNREFUSED");
+                assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
+                assert_eq!(syscall.as_deref(), Some("connect"));
+                assert_eq!(path, None);
+                assert_eq!(errno, Some(-4078));
+                assert_eq!(hostname, None);
+                assert_eq!(address.as_deref(), Some("127.0.0.1"));
+                assert_eq!(port, Some(8080));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_fields_and_aggregates_round_trip() {
+        let single = OpOutcome::sys(sys("ECONNREFUSED"));
+        let json = serde_json::to_string(&single).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::NodeFailed { address, port, .. } => {
+                assert_eq!((address.as_deref(), port), (Some("127.0.0.1"), Some(8080)));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+        let aggregate = OpOutcome::NodeAggregateFailed {
+            errors: vec![sys("ECONNREFUSED"), sys("ETIMEDOUT")],
+        };
+        let json = serde_json::to_string(&aggregate).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::NodeAggregateFailed { errors } => {
+                assert_eq!(errors, vec![sys("ECONNREFUSED"), sys("ETIMEDOUT")]);
+            }
+            other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
+        // A child missing every optional field (an older writer) loads too.
+        let sparse =
+            r#"{"NodeAggregateFailed":{"errors":[{"code":"ECONNREFUSED","message":"m"}]}}"#;
+        match serde_json::from_str::<OpOutcome>(sparse).unwrap() {
+            OpOutcome::NodeAggregateFailed { errors } => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].errno, None);
+                assert_eq!(errors[0].port, None);
+            }
+            other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
     }
 }

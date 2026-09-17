@@ -22066,6 +22066,138 @@ fn fs_promises_reject_rather_than_throw_on_a_bad_path() {
     );
 }
 
+/// Every async op rejection (`OpOutcome::NodeFailed`) is built by the locked JS
+/// factory `__oamMakeSysError` in js/bootstrap.js, and must keep the shape the
+/// native builder gave it: own `errno, code, syscall, path` in that order on a
+/// plain Error. What the factory adds is one JS stack frame -- a natively built
+/// error had none, so util.inspect bracketed it (`[Error: ENOENT: ...] {`)
+/// where node prints an fs.promises error with its frames.
+///
+/// The factories are locked globals: user code can neither replace nor delete
+/// them, and swapping `globalThis.Error` changes nothing because they captured
+/// the intrinsics at snapshot time. If the factory throws anyway (a user
+/// accessor on Error.prototype whose setter throws), the engine's native
+/// fallback still rejects the promise with the whole shape -- a settle that
+/// swallowed the throw without rejecting would leave the await hanging forever.
+///
+/// The aggregate factory has no producer until net_connect lands, so its
+/// node-measured NodeAggregateError shape (v22.22.2, a refused `localhost`) is
+/// checked by calling it directly.
+#[test]
+fn async_op_rejections_are_built_by_the_locked_error_factories() {
+    let stdout = run_ok(
+        "locked_error_factories.mjs",
+        r#"import fsp from 'node:fs/promises';
+import util from 'node:util';
+const OriginalError = Error;
+const OriginalAggregateError = AggregateError;
+const shape = (label, e) => console.log(label, JSON.stringify({
+  keys: Object.keys(e), code: e.code, syscall: e.syscall, path: typeof e.path,
+  errnoIsNumber: typeof e.errno === 'number',
+  isError: e instanceof OriginalError,
+  protoIsError: Object.getPrototypeOf(e) === OriginalError.prototype,
+}));
+try { await fsp.readFile('oam-missing-factory-probe.txt'); console.log('resolved?!'); }
+catch (e) {
+  shape('fsp', e);
+  console.log('has a frame:', String(e.stack).includes('\n    at '));
+  console.log('inspect bracketed:', util.inspect(e).startsWith('['));
+}
+
+for (const name of ['__oamMakeSysError', '__oamMakeAggregateError']) {
+  const d = Object.getOwnPropertyDescriptor(globalThis, name);
+  console.log(name, typeof d.value, d.writable, d.enumerable, d.configurable);
+  try { globalThis[name] = () => { throw new Error('hijacked'); }; console.log('assigned?!'); }
+  catch (e) { console.log('assign refused:', e.constructor.name); }
+  try { delete globalThis[name]; console.log('deleted?!'); }
+  catch (e) { console.log('delete refused:', e.constructor.name); }
+}
+globalThis.Error = function FakeError() {};
+globalThis.AggregateError = function FakeAggregateError() {};
+try { await fsp.readFile('oam-missing-factory-probe.txt'); console.log('resolved?!'); }
+catch (e) { shape('after global swap', e); }
+globalThis.Error = OriginalError;
+globalThis.AggregateError = OriginalAggregateError;
+
+Object.defineProperty(OriginalError.prototype, 'code', {
+  get() { return 'TRAPPED'; }, set() { throw new OriginalError('setter trap'); }, configurable: true,
+});
+try { await fsp.readFile('oam-missing-factory-probe.txt'); console.log('resolved?!'); }
+catch (e) {
+  shape('setter trap', e);
+  console.log('own code:', Object.getOwnPropertyDescriptor(e, 'code').value);
+}
+delete OriginalError.prototype.code;
+
+const connect = (address) => __oamMakeSysError(Object.assign(Object.create(null), {
+  message: `connect ECONNREFUSED ${address}:8080`, errno: -4078, code: 'ECONNREFUSED',
+  syscall: 'connect', address, port: 8080,
+}));
+const child = connect('127.0.0.1');
+console.log('child', JSON.stringify(Object.keys(child)), child.constructor === OriginalError,
+  Object.getPrototypeOf(child) === OriginalError.prototype, child instanceof OriginalError);
+const dnsErr = __oamMakeSysError(Object.assign(Object.create(null), {
+  message: 'getaddrinfo ENOTFOUND host.invalid', errno: -3008, code: 'ENOTFOUND',
+  syscall: 'getaddrinfo', hostname: 'host.invalid',
+}));
+console.log('dns', JSON.stringify(Object.keys(dnsErr)), dnsErr.constructor === OriginalError,
+  Object.getPrototypeOf(dnsErr) === OriginalError.prototype);
+const portZero = __oamMakeSysError(Object.assign(Object.create(null), {
+  message: 'connect EADDRNOTAVAIL 127.0.0.1', errno: -4090, code: 'EADDRNOTAVAIL',
+  syscall: 'connect', address: '127.0.0.1', port: 0,
+}));
+console.log('port zero', JSON.stringify(Object.keys(portZero)));
+
+const agg = __oamMakeAggregateError([connect('::1'), child]);
+const own = Reflect.ownKeys(agg).map((k) => {
+  const d = Object.getOwnPropertyDescriptor(agg, k);
+  return `${String(k)}${'value' in d ? ':data' : ':accessor'}${d.enumerable ? '+' : '-'}`;
+});
+const proto = Object.getPrototypeOf(agg);
+console.log('agg', JSON.stringify({
+  own, keys: Object.keys(agg), code: agg.code, string: String(agg), json: JSON.stringify(agg),
+  header: String(agg.stack).split('\n')[0], ctorIsAggregate: agg.constructor === AggregateError,
+  protoIsAggregate: proto === AggregateError.prototype,
+  protoParentIsAggregate: Object.getPrototypeOf(proto) === AggregateError.prototype,
+  protoKeys: Reflect.ownKeys(proto).map(String), ownMessage: Object.hasOwn(agg, 'message'),
+  errors: agg.errors.map((c) => c.address),
+}));
+const saved = Error.prepareStackTrace;
+Error.prepareStackTrace = (e) => 'CUSTOM:' + e.name;
+console.log('user prepareStackTrace kept:', __oamMakeAggregateError([child]).stack);
+Error.prepareStackTrace = saved;
+"#,
+    );
+    let fs_shape = r#"{"keys":["errno","code","syscall","path"],"code":"ENOENT","syscall":"open","path":"string","errnoIsNumber":true,"isError":true,"protoIsError":true}"#;
+    let expected = [
+        format!("fsp {fs_shape}"),
+        "has a frame: true".to_string(),
+        "inspect bracketed: false".to_string(),
+        "__oamMakeSysError function false false false".to_string(),
+        "__oamMakeAggregateError function false false false".to_string(),
+        "assign refused: TypeError".to_string(),
+        "delete refused: TypeError".to_string(),
+        format!("after global swap {fs_shape}"),
+        format!("setter trap {fs_shape}"),
+        "own code: ENOENT".to_string(),
+        r#"child ["errno","code","syscall","address","port"] true false true"#.to_string(),
+        r#"dns ["errno","code","syscall","hostname"] true false"#.to_string(),
+        r#"port zero ["errno","code","syscall","address"]"#.to_string(),
+        r#"agg {"own":["stack:accessor-","errors:data-","code:data+"],"keys":["code"],"code":"ECONNREFUSED","string":"AggregateError","json":"{\"code\":\"ECONNREFUSED\"}","header":"AggregateError [ECONNREFUSED]: ","ctorIsAggregate":true,"protoIsAggregate":false,"protoParentIsAggregate":true,"protoKeys":["constructor","Symbol(kIsNodeError)"],"ownMessage":false,"errors":["::1","127.0.0.1"]}"#.to_string(),
+        "user prepareStackTrace kept: CUSTOM:AggregateError".to_string(),
+    ];
+    for line in &expected {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "missing line `{line}` in:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("?!"),
+        "a tampered global or a throwing factory must not change the outcome:\n{stdout}"
+    );
+}
+
 /// The promises wrapper must not re-type what it wraps, and must not reach the
 /// callback layer.
 ///

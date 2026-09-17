@@ -597,51 +597,224 @@ pub(crate) fn settle_completion(
             syscall,
             path,
             errno,
+            hostname,
+            address,
+            port,
         } => {
-            let message = v8::String::new(tc, &message)
-                .unwrap_or_else(|| v8::String::new(tc, &code).unwrap());
-            let exception = v8::Exception::error(tc, message);
-            if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                // The same four properties throw_node_error sets on the SYNC
-                // path. Without syscall/path/errno an async rejection was
-                // distinguishable from its sync twin, and ecosystem code that
-                // reads err.syscall / err.path got undefined.
-                //
-                // errno goes on FIRST, exactly as on the sync path: node
-                // enumerates errno, code, syscall and `Object.keys(err)` is
-                // observable. Setting it last gave async rejections
-                // ["code","syscall","errno"] where the sync twin -- and node --
-                // give ["errno","code","syscall"].
-                // errno is a Number (node's negative libuv code), not a string.
-                if let Some(errno) = errno
-                    && let Some(key) = v8::String::new(tc, "errno")
-                {
-                    let value = v8::Integer::new(tc, errno);
-                    obj.set(tc, key.into(), value.into());
-                }
-                // `path` is absent (not empty) for an fd operation -- see
-                // OpOutcome::node_failed_at.
-                let strings = [
-                    ("code", Some(code.as_str())),
-                    ("syscall", syscall.as_deref()),
-                    ("path", path.as_deref()),
-                ];
-                for (name, value) in strings {
-                    let Some(value) = value else { continue };
-                    let (Some(key), Some(value)) =
-                        (v8::String::new(tc, name), v8::String::new(tc, value))
-                    else {
-                        continue;
-                    };
-                    obj.set(tc, key.into(), value.into());
-                }
-            }
-            resolver.reject(tc, exception);
+            let fields = SysFields {
+                code: &code,
+                message: &message,
+                errno,
+                syscall: syscall.as_deref(),
+                path: path.as_deref(),
+                hostname: hostname.as_deref(),
+                address: address.as_deref(),
+                port,
+            };
+            let error = sys_error(tc, &fields);
+            let error = v8::Local::new(tc, &error);
+            resolver.reject(tc, error);
+        }
+        OpOutcome::NodeAggregateFailed { errors } => {
+            let error = aggregate_error(tc, &errors);
+            let error = v8::Local::new(tc, &error);
+            resolver.reject(tc, error);
         }
         // Handled by the SIGNAL_OP_ID early return above; a Signal outcome on a
         // non-signal id would be a logic error — drop it rather than resolve.
         OpOutcome::Signal(_) => {}
     }
+}
+
+/// One system error's fields, borrowed from a `NodeFailed` or a
+/// `NodeSysError` (which has no path).
+struct SysFields<'a> {
+    code: &'a str,
+    message: &'a str,
+    errno: Option<i32>,
+    syscall: Option<&'a str>,
+    path: Option<&'a str>,
+    hostname: Option<&'a str>,
+    address: Option<&'a str>,
+    port: Option<u16>,
+}
+
+impl<'a> SysFields<'a> {
+    fn of(err: &'a oam_core::NodeSysError) -> Self {
+        SysFields {
+            code: &err.code,
+            message: &err.message,
+            errno: err.errno,
+            syscall: err.syscall.as_deref(),
+            path: None,
+            hostname: err.hostname.as_deref(),
+            address: err.address.as_deref(),
+            port: err.port,
+        }
+    }
+}
+
+/// Look up one of the locked error factories bootstrap.js defines on the
+/// global (`__oamMakeSysError` / `__oamMakeAggregateError`). They are
+/// snapshotted JS, not part of `__oam` -- that object does not exist when the
+/// snapshot is taken and ops::install replaces it after restore -- and they are
+/// non-writable and non-configurable, so user code cannot swap them out. None
+/// only if the global is somehow absent (a stripped build).
+fn locked_factory<'s>(
+    tc: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let key = v8::String::new(tc, name)?;
+    v8::Local::<v8::Function>::try_from(global.get(tc, key.into())?).ok()
+}
+
+/// A factory call threw (or the lookup did): clear it so the settle path
+/// leaves the loop's TryCatch as it found it. A termination is never cleared.
+fn clear_factory_throw(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
+    if tc.has_caught() && !tc.has_terminated() {
+        tc.reset();
+    }
+}
+
+/// Build the error a `NodeFailed` rejects with.
+///
+/// The JS factory `__oamMakeSysError` is preferred: it builds node's classes
+/// (`ExceptionWithHostPort` for an address / port, `DNSException` for a
+/// hostname, a plain Error otherwise) and, being JS, gives the error a stack
+/// frame. An error built here with no JS on the stack has none, and both
+/// node's and oam's util.inspect then bracket it (`[Error: ...] {`) where node
+/// prints a connect or DNS error unbracketed with its frames. The native build
+/// below is the fallback, with the same own properties in the same order.
+///
+/// Property order is observable (`Object.keys(err)`): errno, code, syscall,
+/// path, hostname, address, port -- errno FIRST, as on the sync path
+/// (throw_node_error) and in node. Setting it last once gave async rejections
+/// ["code","syscall","errno"]. `path` is absent (not empty) for an fd
+/// operation (OpOutcome::node_failed_at); `port` only when non-zero, as node's
+/// `if (port)`.
+fn sys_error(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    fields: &SysFields<'_>,
+) -> v8::Global<v8::Value> {
+    let message = v8::String::new(tc, fields.message)
+        .unwrap_or_else(|| v8::String::new(tc, fields.code).unwrap());
+    let mut props: Vec<(&str, v8::Local<v8::Value>)> = Vec::with_capacity(7);
+    // errno is a Number (node's negative libuv code), not a string.
+    if let Some(errno) = fields.errno {
+        props.push(("errno", v8::Integer::new(tc, errno).into()));
+    }
+    let strings = [
+        ("code", Some(fields.code)),
+        ("syscall", fields.syscall),
+        ("path", fields.path),
+        ("hostname", fields.hostname),
+        ("address", fields.address),
+    ];
+    for (name, value) in strings {
+        if let Some(value) = value.and_then(|v| v8::String::new(tc, v)) {
+            props.push((name, value.into()));
+        }
+    }
+    if let Some(port) = fields.port.filter(|port| *port != 0) {
+        props.push((
+            "port",
+            v8::Integer::new_from_unsigned(tc, u32::from(port)).into(),
+        ));
+    }
+
+    if let Some(factory) = locked_factory(tc, "__oamMakeSysError") {
+        // A null-prototype record: the factory tests fields for presence, and
+        // an Object.prototype a user script extended must not answer for an
+        // absent one.
+        let mut names: Vec<v8::Local<v8::Name>> = Vec::with_capacity(props.len() + 1);
+        let mut values: Vec<v8::Local<v8::Value>> = Vec::with_capacity(props.len() + 1);
+        names.push(v8::String::new(tc, "message").unwrap().into());
+        values.push(message.into());
+        for (name, value) in &props {
+            names.push(v8::String::new(tc, name).unwrap().into());
+            values.push(*value);
+        }
+        let null = v8::null(tc).into();
+        let record = v8::Object::with_prototype_and_properties(tc, null, &names, &values);
+        let recv = v8::undefined(tc).into();
+        if let Some(error) = factory.call(tc, recv, &[record.into()]) {
+            return v8::Global::new(tc, error);
+        }
+    }
+    clear_factory_throw(tc);
+
+    // The factory is locked, so the realistic way to get here is a user
+    // accessor on Error.prototype (a throwing `code` setter, say) that threw
+    // inside it. The own properties are therefore DEFINED, not assigned: an
+    // assignment would run that same setter again and leave the error
+    // half-shaped. On an untouched prototype the two are indistinguishable
+    // (same order; enumerable, writable, configurable).
+    let exception = v8::Exception::error(tc, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        for (name, value) in props {
+            if let Some(key) = v8::String::new(tc, name) {
+                obj.create_data_property(tc, key.into(), value);
+            }
+        }
+    }
+    // Defining on a fresh extensible Error does not throw; clear defensively
+    // so the loop's TryCatch is never left holding anything. The promise is
+    // rejected regardless.
+    clear_factory_throw(tc);
+    v8::Global::new(tc, exception)
+}
+
+/// Build the error a `NodeAggregateFailed` rejects with: node's
+/// `NodeAggregateError` through `__oamMakeAggregateError`, each child through
+/// `sys_error`. The fallback is a plain Error with no message, the children as
+/// a non-enumerable own `errors` and the first child's `code` -- AggregateError's
+/// observable surface without its class.
+fn aggregate_error(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    errors: &[oam_core::NodeSysError],
+) -> v8::Global<v8::Value> {
+    let mut children: Vec<v8::Global<v8::Value>> = Vec::with_capacity(errors.len());
+    for error in errors {
+        children.push(sys_error(tc, &SysFields::of(error)));
+    }
+    let children: Vec<v8::Local<v8::Value>> = children
+        .iter()
+        .map(|child| v8::Local::new(tc, child))
+        .collect();
+    let array = v8::Array::new_with_elements(tc, &children);
+
+    if let Some(factory) = locked_factory(tc, "__oamMakeAggregateError") {
+        let recv = v8::undefined(tc).into();
+        if let Some(error) = factory.call(tc, recv, &[array.into()]) {
+            return v8::Global::new(tc, error);
+        }
+    }
+    clear_factory_throw(tc);
+
+    let empty = v8::String::empty(tc);
+    let exception = v8::Exception::error(tc, empty);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        if let Some(key) = v8::String::new(tc, "errors") {
+            obj.define_own_property(
+                tc,
+                key.into(),
+                array.into(),
+                v8::PropertyAttribute::DONT_ENUM,
+            );
+        }
+        if let Some(first) = errors.first()
+            && let (Some(key), Some(code)) = (
+                v8::String::new(tc, "code"),
+                v8::String::new(tc, &first.code),
+            )
+        {
+            obj.create_data_property(tc, key.into(), code.into());
+        }
+    }
+    clear_factory_throw(tc);
+    v8::Global::new(tc, exception)
 }
 
 // ---------------------------------------------------------------------------

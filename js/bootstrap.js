@@ -1305,6 +1305,146 @@
   globalThis.WebSocket = WebSocket;
 })();
 
+// Node's system-error classes, for the errors native ops reject with. The
+// engine's settle path (crates/oam_engine/src/ops.rs sys_error /
+// aggregate_error) calls these for every OpOutcome::NodeFailed and
+// NodeAggregateFailed, and builds the same own properties natively only if
+// they are unreachable.
+//
+// Locked globals, not `__oam` members: __oam does not exist while this file is
+// snapshotted and ops::install replaces it after restore, and it is writable
+// by user code. Every worker and fork isolate restores the same snapshot, so
+// each has its own copy. Built from intrinsics captured HERE, never looked up
+// at call time, so a script that replaces globalThis.Error or AggregateError
+// changes nothing.
+//
+// Shapes measured on node v22.22.2 (lib/internal/errors.js):
+// - ExceptionWithHostPort (a connect failure) and DNSException (a resolver
+//   failure) are Error subclasses whose prototype carries only a `constructor`
+//   getter answering `Error`: `err.constructor === Error`, yet
+//   `Object.getPrototypeOf(err) === Error.prototype` is false. Own properties:
+//   stack, message, then enumerable errno, code, syscall, address, port -- or
+//   errno, code, syscall, hostname. `port` only when truthy. The stack header
+//   is the plain `Error: <message>` (they are not kIsNodeError).
+// - NodeAggregateError (every address of a multi-address connect failed):
+//   `extends AggregateError` with `code` = errors[0].code and prototype getters
+//   `constructor` (answering AggregateError) and [kIsNodeError]. Own
+//   properties stack, errors, code; no own message; Object.keys ["code"];
+//   String(err) "AggregateError"; stack header `AggregateError [CODE]: `.
+// - Anything else (the fs shape: errno, code, syscall, path) is a plain Error,
+//   as before.
+// Errors built by JS carry at least one stack frame; one built natively with no
+// JS on the stack has none, and util.inspect brackets that (`[Error: ...] {`)
+// in node and oam alike, where node prints a connect error unbracketed. The
+// factory frames are therefore deliberately kept (no captureStackTrace).
+(() => {
+  const ErrorCtor = Error;
+  const AggregateErrorCtor = AggregateError;
+  const SymbolIterator = Symbol.iterator;
+  const kIsNodeError = Symbol("kIsNodeError");
+
+  class ExceptionWithHostPort extends ErrorCtor {
+    get ["constructor"]() {
+      return ErrorCtor;
+    }
+  }
+
+  class DNSException extends ErrorCtor {
+    get ["constructor"]() {
+      return ErrorCtor;
+    }
+  }
+
+  // `fields` is a null-prototype record from the engine: message, code and,
+  // each only when present, errno, syscall, path, hostname, address, port.
+  function makeSysError(fields) {
+    const message = fields.message;
+    let err;
+    if (fields.address !== undefined || fields.port !== undefined) {
+      err = new ExceptionWithHostPort(message);
+    } else if (fields.hostname !== undefined) {
+      err = new DNSException(message);
+    } else {
+      err = new ErrorCtor(message);
+    }
+    if (fields.errno !== undefined) err.errno = fields.errno;
+    err.code = fields.code;
+    if (fields.syscall !== undefined) err.syscall = fields.syscall;
+    if (fields.path !== undefined) err.path = fields.path;
+    if (fields.hostname !== undefined) err.hostname = fields.hostname;
+    if (fields.address !== undefined) err.address = fields.address;
+    if (fields.port) err.port = fields.port;
+    return err;
+  }
+
+  // Node passes `new SafeArrayIterator(errors)`: the children are read without
+  // consulting an Array.prototype[Symbol.iterator] user code may have replaced.
+  function listIterable(list) {
+    return {
+      [SymbolIterator]() {
+        let i = 0;
+        return {
+          next() {
+            return i < list.length
+              ? { value: list[i++], done: false }
+              : { value: undefined, done: true };
+          },
+        };
+      },
+    };
+  }
+
+  class NodeAggregateError extends AggregateErrorCtor {
+    constructor(errors, message) {
+      super(listIterable(errors), message);
+      this.code = errors[0]?.code;
+    }
+
+    get [kIsNodeError]() {
+      return true;
+    }
+
+    get ["constructor"]() {
+      return AggregateErrorCtor;
+    }
+  }
+
+  function makeAggregateError(errors) {
+    const err = new NodeAggregateError(errors);
+    // Node's prepareStackTrace writes `${name} [${code}]: ${message}` for a
+    // kIsNodeError error. Rewrite line 0 only when it is the default render
+    // (`AggregateError`, an empty message): a user's Error.prepareStackTrace
+    // output is theirs to keep, exactly as in node. `stack` stays an accessor
+    // after the assignment.
+    try {
+      const stack = err.stack;
+      if (typeof stack === "string") {
+        const nl = stack.indexOf("\n");
+        const head = nl === -1 ? stack : stack.slice(0, nl);
+        if (head === "AggregateError") {
+          err.stack = `AggregateError [${err.code}]: ${nl === -1 ? "" : stack.slice(nl)}`;
+        }
+      }
+    } catch {
+      // A throwing user Error.prepareStackTrace: the error is still whole.
+    }
+    return err;
+  }
+
+  Object.defineProperty(globalThis, "__oamMakeSysError", {
+    value: makeSysError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  Object.defineProperty(globalThis, "__oamMakeAggregateError", {
+    value: makeAggregateError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+})();
+
 // Node reports an uncaught exception as util.inspect(err): the stack, then a
 // block of any extra own properties (code/errno/syscall/permission/...). The
 // Rust fatal path only holds V8's one-line message summary, so it calls this
