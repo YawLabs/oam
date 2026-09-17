@@ -5161,9 +5161,10 @@ server.close();
 }
 
 /// HTTP_PROXY is honoured by fetch and http.request alike -- an oam extension
-/// (node 22 ignores the variable) that the reqwest transport had and the owned
-/// one keeps: absolute-form request line, `proxy-authorization` from the
-/// proxy URL's userinfo. Wire and texts measured on the reqwest build first.
+/// (node v22.22.2 ignores the variable unless NODE_USE_ENV_PROXY=1 is set,
+/// measured) that the reqwest transport had and the owned one keeps:
+/// absolute-form request line, `proxy-authorization` from the proxy URL's
+/// userinfo. Wire and texts measured on the reqwest build first.
 #[test]
 fn fetch_and_http_honour_http_proxy_env() {
     let (proxy, heads) = spawn_recording_proxy(

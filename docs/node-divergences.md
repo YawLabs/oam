@@ -852,8 +852,8 @@ the other path here.
 The headers go exactly when oam decodes, and since #143 it decodes by undici's rules, in
 its own body reader: every `content-encoding` line, joined, split on commas and lowercased;
 `gzip` / `x-gzip`, `deflate` (zlib-wrapped or raw, told apart by the first byte) and `br`,
-stacked and undone last-first, up to five (a sixth fails the fetch at the response head with
-`too many content-encodings in response: 6, maximum allowed is 5`). A response oam does not
+stacked and undone last-first, up to five (a sixth fails the fetch at the response head, with
+the cause `too many content-encodings in response: 6, maximum allowed is 5`). A response oam does not
 decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 205 or 304,
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
@@ -1214,9 +1214,13 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 **The environment proxy, an oam extension**
 
 `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (uppercase first, then lowercase)
-route `fetch` and `http.request`; Node 22's `fetch` and `http` ignore them. The variables are
-read from the OS environment once per run, so assigning `process.env.HTTP_PROXY` changes
-nothing, and a set `REQUEST_METHOD` (a CGI environment) turns them all off. An http
+always route `fetch` and `http.request` in oam. Node v22.22.2 ignores them unless
+`NODE_USE_ENV_PROXY=1` is set, which oam does not read; with it set, Node's `http.get` sends
+an http destination to the proxy in absolute form as oam does, but its `fetch` tunnels even
+an http destination through `CONNECT` (and warns that `EnvHttpProxyAgent` is experimental).
+The variables are read from the OS environment once per run, so assigning
+`process.env.HTTP_PROXY` changes nothing, and a set `REQUEST_METHOD` (a CGI environment)
+turns them all off. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
 credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
