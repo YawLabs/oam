@@ -31,11 +31,12 @@
 //! Resolution stays on std's getaddrinfo (tokio `lookup_host`) with no
 //! AI_ADDRCONFIG, where node passes it off Windows: on a POSIX host without a
 //! routable IPv6 address node may resolve `localhost` to `127.0.0.1` alone
-//! while oam also tries `::1`. A narrowed divergence (docs/node-divergences.md);
-//! on Windows node passes no flags either, so the two agree there.
+//! while oam also tries `::1` -- a narrowed divergence, kept because passing
+//! AI_ADDRCONFIG means calling getaddrinfo by hand, through new unsafe. On
+//! Windows node passes no flags either, so the two agree there.
 
 use crate::{NodeSysError, OpOutcome, node_errno, node_error_code};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Node's `autoSelectFamilyAttemptTimeout` default (src/node_options.h).
@@ -429,8 +430,8 @@ fn dns_error(host: &str, code: &str, errno: i32) -> NodeSysError {
 /// renames (errors.js `DNSException`: EAI_NODATA and EAI_NONAME are
 /// `ENOTFOUND`, keeping their errno). WSANO_DATA is kept as ENOTFOUND/-3008:
 /// libuv has no row for it (its generic table would say ENOENT/-4058), but it
-/// could not be triggered on the dev box to confirm what node shows -- listed
-/// under "Unverified" in docs/node-divergences.md.
+/// could not be triggered on the dev box to confirm what node shows, so this
+/// row is unverified against node.
 ///
 /// std builds a POSIX resolver failure with no OS number, only gai_strerror's
 /// text (EAI_SYSTEM excepted, which carries errno), so there the text decides:
@@ -521,10 +522,10 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
         // off, failure ignored as libuv ignores it) so `::ffff:127.0.0.1`
         // connects.
         let unspecified = if dialled.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
         } else {
             let _ = socket.set_only_v6(false);
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
         };
         if let Err(error) = socket.bind(&SockAddr::from(unspecified)) {
             return Err(sync_failure(&socket, error));
@@ -602,8 +603,8 @@ fn dialled_address(target: SocketAddr) -> SocketAddr {
     #[cfg(windows)]
     {
         let ip = match target.ip() {
-            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
             ip => ip,
         };
         let mut dialled = target;
@@ -1275,7 +1276,7 @@ mod tests {
             .expect("connects");
         assert_eq!(
             connected.stream.peer_addr().unwrap().ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
         accept.await.unwrap();
     }
