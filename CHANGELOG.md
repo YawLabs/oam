@@ -458,10 +458,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   a ratchet section against another node. `OAM_ALLOW_NODE_MISMATCH=1` downgrades each
   refusal to a warning for an ad-hoc local run, and a conformance receipt produced that
   way says on its own line that it is not a parity receipt. Measured after the change:
-  linux-x64 is 111/111 on the differential and 0 new / 0 stale on the export ratchet
-  against v22.22.2, so the swap changed no result -- only the honesty of the receipt.
-  The linux ratchet section is re-recorded against the pin (its name lists are
-  unchanged; its stored counts had drifted from the list they summarize).
+  linux-x64 and macos-arm64 are each 111/111 on the differential and 0 new / 0 stale on
+  the export ratchet against v22.22.2, so the swap changed no result on either -- only
+  the honesty of the receipt. The linux and darwin ratchet sections are re-recorded
+  against the pin (their name lists are unchanged -- pinning exposed no export
+  difference the newer Node had hidden; their stored counts had drifted from the list
+  they summarize).
 - **The sidecar release gate reports what it tested.** Each row carries the resolved
   sidecar version, the summary states how many of the advertised tools were actually
   called, `--json=<path>` writes a machine-readable report (release-local.sh keeps it
