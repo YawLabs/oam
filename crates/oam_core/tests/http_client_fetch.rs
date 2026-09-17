@@ -270,6 +270,94 @@ async fn payload_shape() {
     .await;
 }
 
+/// Header values reach JS as latin1, one code point per byte, as undici holds
+/// them (`value.toString('latin1')`). Measured on node v22.22.2 against a raw
+/// server sending these exact bytes: `x-latin1` reads `café` (code points 63
+/// 61 66 e9), `content-disposition` keeps its 0xEF, and the `set-cookie`
+/// bytes `e2 82 ac` read as THREE code points, not as the single `€` a UTF-8
+/// decode produces. The lossy UTF-8 decode this replaces turned 0xE9 into
+/// U+FFFD, destroying the byte with no way for the caller to recover it.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_header_values_are_latin1_not_lossy_utf8() {
+    within(async {
+        let server = serve_replies(|_| {
+            b"HTTP/1.1 200 OK\r\nx-latin1: caf\xe9-\xff\r\ncontent-disposition: attachment; filename=\"na\xefve.txt\"\r\nset-cookie: a=\xe2\x82\xac\r\ncontent-length: 2\r\n\r\nhi".to_vec()
+        })
+        .await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let headers = headers_of(&p);
+        assert_eq!(header(&headers, "x-latin1"), Some("caf\u{e9}-\u{ff}"));
+        assert_eq!(
+            header(&headers, "content-disposition"),
+            Some("attachment; filename=\"na\u{ef}ve.txt\"")
+        );
+        assert_eq!(header(&headers, "set-cookie"), Some("a=\u{e2}\u{82}\u{ac}"));
+    })
+    .await;
+}
+
+/// A request on a pooled connection the server closes without answering is
+/// sent again on a fresh one, so long as it is idempotent. This is the shape
+/// a server that hit its idle timeout leaves behind, and the one a redirect
+/// hop meets: the 3xx's connection goes back into the pool a moment before
+/// its FIN is processed, then the hop writes into a dead socket. Measured on
+/// node v22.22.2: 20 of 20 such redirects succeed on all five server shapes,
+/// where oam failed the whole fetch with `error sending request for url (...)`
+/// on most iterations.
+///
+/// Deterministic here: connection 0 answers the first request (so it is
+/// pooled, healthy) and closes on the second without a byte of response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
+    within(async {
+        // Every connection answers its first request and FINs on its second
+        // without a byte of response.
+        let server = serve(|mut conn, _, seen| async move {
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+                conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+            }
+        })
+        .await;
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/x", server.port);
+        // Warm the pool, then let hyper-util put the connection back into it.
+        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        let_the_pool_settle().await;
+        assert_eq!(server.accepts(), 1);
+
+        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(server.accepts(), 2, "the retry dialled afresh");
+        assert_eq!(
+            server.seen().len(),
+            3,
+            "the dead connection read the first try"
+        );
+
+        // A POST is NOT replayed: oam DID put the request on the wire and
+        // cannot know the server ignored it (RFC 9110 s9.2.2, idempotent
+        // methods only).
+        let_the_pool_settle().await;
+        let text = failed(
+            reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
+                .await,
+        );
+        assert_eq!(text, format!("error sending request for url ({url})"));
+        assert_eq!(server.accepts(), 2, "no fresh connection for a POST");
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]

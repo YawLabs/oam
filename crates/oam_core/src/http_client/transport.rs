@@ -255,6 +255,22 @@ impl SendError {
         OpOutcome::Failed(format!("error sending request for url ({url})"))
     }
 
+    /// hyper's `IncompleteMessage`, "connection closed before message
+    /// completed": the connection died before ANY part of the response
+    /// arrived. hyper-util retries a request its dispatcher handed back
+    /// UNSENT (`retry_canceled_requests`, on by default) but not this one,
+    /// where the request had already gone onto the connection.
+    ///
+    /// Why oam hits it where node does not: a server that advertises
+    /// keep-alive and then FINs (the idle-timeout shape) leaves a pooled
+    /// connection whose FIN has not been processed yet, because oam's
+    /// redirect loop stays in Rust with no event-loop tick between the 3xx
+    /// and the hop. Node's loop reads the FIN first and opens a fresh socket,
+    /// so node succeeded on 20 of 20 iterations where oam failed on most.
+    pub fn is_incomplete_message(&self) -> bool {
+        find_in_chain::<hyper::Error>(&self.0).is_some_and(|e| e.is_incomplete_message())
+    }
+
     /// reqwest's retry classification (retry.rs:303-313): the server refused
     /// the stream before processing it (REFUSED_STREAM) or is shutting the
     /// connection down gracefully (GOAWAY with NO_ERROR). Either way the

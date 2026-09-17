@@ -174,6 +174,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// RFC 9110 s9.2.2's idempotent methods: sending the request twice has the
+/// same effect on the server as sending it once, so a request whose response
+/// never started may be sent again.
+fn is_idempotent(method: &http::Method) -> bool {
+    *method == http::Method::GET
+        || *method == http::Method::HEAD
+        || *method == http::Method::PUT
+        || *method == http::Method::DELETE
+        || *method == http::Method::OPTIONS
+        || *method == http::Method::TRACE
+}
+
 /// The fetch op. Resolves at the response head with the payload JSON (the
 /// body stays in `bodies` under `bodyHandle`), or in hook mode possibly with
 /// a lookup request (see the module docs).
@@ -329,6 +341,7 @@ async fn run(
         }
 
         let mut retries = 0;
+        let mut stale_retried = false;
         let response = loop {
             let body = match state.source.build() {
                 Ok(body) => body,
@@ -346,6 +359,21 @@ async fn run(
                         && e.is_h2_retryable() =>
                 {
                     retries += 1;
+                }
+                // A pooled connection the server had already closed: no part
+                // of a response arrived, so the request may go out again on a
+                // fresh one (RFC 9112 s9.6). Once per hop, only for a body
+                // that can be sent twice, and only for an idempotent method
+                // -- oam DID put the request on the wire and cannot know the
+                // server ignored it. node loses this race far less often
+                // because its event loop reads the FIN before it writes.
+                Err(e)
+                    if !stale_retried
+                        && state.source.replayable()
+                        && is_idempotent(&state.method)
+                        && e.is_incomplete_message() =>
+                {
+                    stale_retried = true;
                 }
                 Err(e) => {
                     state.source.request_failed();
@@ -395,6 +423,24 @@ async fn run(
     respond(state, response, bodies, ids)
 }
 
+/// A response header value as JS sees it: latin1, one code point per byte.
+///
+/// undici holds header values as latin1 (`value.toString('latin1')`), so a
+/// `content-disposition` filename or a legacy vendor header carrying obs-text
+/// (0x80-0xFF) reads back byte for byte. Measured on node v22.22.2 with a raw
+/// `x-latin1: caf\xe9` header: node reports `café` (code point 0xE9). A lossy
+/// UTF-8 decode turned that byte into U+FFFD, which is IRREVERSIBLE -- the
+/// caller could not recover it -- and a value whose bytes happened to be
+/// valid UTF-8 (`a=\xe2\x82\xac`) came back as a different string than node
+/// reports.
+///
+/// `redirect::resolve_location` keeps its UTF-8-lossy decode on purpose:
+/// undici really does read `Location` as
+/// `Buffer.from(location, 'binary').toString('utf8')`.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
 /// The payload for the final response; its body goes into `bodies`.
 fn respond(
     mut state: LoopState,
@@ -431,12 +477,7 @@ fn respond(
         .headers()
         .iter()
         .filter(|(name, _)| !(strip && (*name == CONTENT_ENCODING || *name == CONTENT_LENGTH)))
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(name, value)| (name.as_str().to_string(), latin1(value.as_bytes())))
         .collect();
     // node's Response.url never carries the fragment.
     let mut url = state.current;
