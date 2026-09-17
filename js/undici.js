@@ -193,8 +193,15 @@
         // global dispatcher.
         dispatcher: opts.dispatcher || undefined,
         // undici.request is not fetch: node's has no Fetch-spec bad-port
-        // block, so port 1 or 25 is dialled like any other.
+        // block, so port 1 or 25 is dialled like any other, a caller `host`
+        // header is SENT (fetch drops it) and the method is not normalised.
         __oamFetchSemantics: false,
+        // It does share undici's dispatch-level header rules, because both
+        // build the same internal Request: `transfer-encoding`, `keep-alive`,
+        // `upgrade`, `expect` and a bad `connection` are refused, and a
+        // `content-length` that disagrees with the body is refused rather
+        // than framed (measured on node v22.22.2 + undici 6.24.1).
+        __oamDispatchSemantics: true,
       };
       // undici allows a `query` object appended to the URL.
       if (opts.query && typeof opts.query === "object") {

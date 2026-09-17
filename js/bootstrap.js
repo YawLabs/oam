@@ -1168,6 +1168,17 @@
     // Internal callers that are not fetch in node (http.request, the http2
     // client, undici.request) opt out of every Fetch-level rule below.
     const fetchSemantics = init.__oamFetchSemantics !== false;
+    // undici's DISPATCH-level rules are a smaller set that node applies to
+    // `undici.request` as well, because both build the same internal Request:
+    // the five hop-by-hop header refusals and the content-length check, but
+    // NOT the Fetch-level ones. Measured on node v22.22.2 + undici 6.24.1:
+    // `undici.request` throws `invalid transfer-engine header` /
+    // `expect header not supported` / `Request body length does not match
+    // content-length header` exactly as `fetch` does, and at the same time
+    // SENDS a caller `host` (which fetch drops) and leaves the method alone.
+    // `http.request` and the http2 client set these headers legitimately in
+    // node and are not subject to either set.
+    const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
     const rawUrl = wellFormed(input);
     if (fetchSemantics) {
       // node parses the URL in the Request constructor, so a bad URL is a URL
@@ -1208,32 +1219,44 @@
         typeof h !== "string" && typeof h[Symbol.iterator] === "function"
           ? [...h].map(([k, v]) => [wellFormed(k), wellFormed(v)])
           : Object.entries(h).map(([k, v]) => [wellFormed(k), wellFormed(v)]);
-      if (!fetchSemantics) {
+      if (!dispatchSemantics) {
         headers = pairs;
       } else {
         // Repeated names combine, as node's Headers does: two `x-d` entries
-        // go out as one `x-d: 1, 2` line, not two lines.
-        const combined = new Headers();
-        for (const [k, v] of pairs) combined.append(k, v);
-        for (const [name, value] of combined) {
-          // `host` is node's one silent drop. Left through, a caller
-          // controls the authority a name-based virtual host, a cache or an
-          // SSRF filter sees while the connection goes somewhere else.
-          if (name === "host") continue;
+        // go out as one `x-d: 1, 2` line, not two lines. Fetch only --
+        // `undici.request` sends them as the caller wrote them.
+        let list = pairs;
+        if (fetchSemantics) {
+          const combined = new Headers();
+          for (const [k, v] of pairs) combined.append(k, v);
+          list = [...combined];
+        }
+        for (const [rawName, value] of list) {
+          const name = fetchSemantics ? rawName : String(rawName).toLowerCase();
+          // `host` is node's one silent drop, and it is fetch-only: node's
+          // `undici.request` sends a caller host. Left through on a fetch, a
+          // caller controls the authority a name-based virtual host, a cache
+          // or an SSRF filter sees while the connection goes somewhere else.
+          if (fetchSemantics && name === "host") continue;
           const verdict = dispatchHeader(name, value);
           if (verdict.refuse !== undefined) {
             const cause = new Error(verdict.refuse[1]);
             cause.name = verdict.refuse[0];
             throw new TypeError("fetch failed", { cause });
           }
-          headers.push([name, verdict.value]);
+          headers.push([rawName, verdict.value]);
         }
       }
     }
     const method = init.method ? String(init.method) : "GET";
     const request = {
       url: rawUrl,
-      method: NORMALIZED_METHODS.has(method.toUpperCase()) ? method.toUpperCase() : method,
+      // Fetch-level normalisation only: `undici.request` and the http2
+      // client send the method as written in node.
+      method:
+        fetchSemantics && NORMALIZED_METHODS.has(method.toUpperCase())
+          ? method.toUpperCase()
+          : method,
       headers,
       attempt_timeout_ms: netAttemptTimeoutMs(),
       // undici's Fetch-spec bad-port block on the initial URL.
@@ -1282,8 +1305,8 @@
     // `RequestContentLengthMismatchError: Request body length does not match
     // content-length header`, a short one hangs until its timeout (measured).
     // oam rejects both with node's long-form error.
-    if (fetchSemantics) {
-      const declared = headers.find((h) => h[0] === "content-length");
+    if (dispatchSemantics) {
+      const declared = headers.find((h) => h[0].toLowerCase() === "content-length");
       if (declared !== undefined) {
         const want = Number(declared[1]);
         const have =

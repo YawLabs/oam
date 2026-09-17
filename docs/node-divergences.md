@@ -1317,9 +1317,19 @@ an error where oam used to send something)
   content-length LONGER than the body with the same message, and a SHORTER one by never
   dispatching the request at all (it hangs until its own timeout); oam refuses both.
 
-Everything in that list applies to `fetch` only. `http.request`, `https.request`,
-`undici.request` and the `http2` compat client share the op but opt out, because Node applies
-none of it to them.
+Node draws the line in two places, and so does oam. The five hop-by-hop refusals and the
+content-length check are undici's DISPATCH rules -- `undici.request` builds the same internal
+Request as `fetch`, so it gets them too (measured: `undici.request` with
+`transfer-encoding: chunked` throws `invalid transfer-encoding header` and nothing reaches
+the wire). Everything else in that list is Fetch-level and `fetch` only: `undici.request`
+SENDS a caller `host` header and leaves the method as written, both measured. `http.request`,
+`https.request` and the `http2` compat client share the op but get neither set, because Node
+applies neither to them -- they set these headers legitimately.
+
+The one thing `undici.request` does not reproduce is the error's SHAPE: it runs on `fetch` in
+oam, so a refusal arrives as `TypeError: fetch failed` carrying the undici-named error as
+`cause`, where Node throws that error itself. Same wrapping as the `connect.lookup` bullet
+above.
 
 **`http.request` argument and option handling**
 

@@ -5504,6 +5504,81 @@ srv.close();
     );
 }
 
+/// `undici.request` is not `fetch`, and node draws the line in a particular
+/// place: both build the same internal undici Request, so both refuse the
+/// hop-by-hop headers and a content-length that disagrees with the body --
+/// but `undici.request` SENDS a caller `host` header (fetch drops it) and does
+/// not normalise the method. Measured on node v22.22.2 + undici 6.24.1 against
+/// a raw-socket server; oam applied none of the refusals to `undici.request`
+/// until the `__oamDispatchSemantics` tier existed.
+#[test]
+fn undici_request_shares_the_dispatch_header_rules_but_not_fetch_s() {
+    let script = write_temp(
+        "undici_dispatch_rules/main.mjs",
+        r#"import net from 'node:net';
+import * as undici from 'undici';
+const heads = [];
+const srv = net.createServer((s) => {
+  let buf = '';
+  s.on('error', () => {});
+  s.on('data', (c) => {
+    buf += c.toString('latin1');
+    const i = buf.indexOf('\r\n\r\n');
+    if (i < 0) return;
+    heads.push(buf.slice(0, i).split('\r\n').join(' | '));
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+    buf = '';
+  });
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const P = srv.address().port;
+const U = `http://127.0.0.1:${P}/p`;
+for (const [n, opts] of [
+  ['host-sent', { headers: { host: 'spoof.test' } }],
+  ['method-kept', { method: 'patch' }],
+  ['transfer-encoding', { method: 'POST', body: 'AB', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { headers: { expect: '100-continue' } }],
+  ['cl-mismatch', { method: 'POST', body: 'AB', headers: { 'content-length': '9' } }],
+]) {
+  const before = heads.length;
+  try {
+    const r = await undici.request(U, opts);
+    await r.body.text();
+    console.log(n, 'ok', heads[heads.length - 1].replaceAll(String(P), 'PORT'));
+  } catch (e) {
+    console.log(n, 'throw', (e.cause ?? e).name + ':', (e.cause ?? e).message, '| wire:', heads.length > before ? 'SENT' : 'nothing');
+  }
+}
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let lines: Vec<String> = stdout.trim().lines().map(|l| l.trim().to_string()).collect();
+    assert!(
+        lines[0].contains("host: spoof.test"),
+        "undici.request sends a caller host, as node does: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("method-kept ok patch /p HTTP/1.1"),
+        "and does not normalise the method: {:?}",
+        lines[1]
+    );
+    assert_eq!(
+        lines[2],
+        "transfer-encoding throw InvalidArgumentError: invalid transfer-encoding header | wire: nothing"
+    );
+    assert_eq!(
+        lines[3],
+        "expect throw NotSupportedError: expect header not supported | wire: nothing"
+    );
+    assert_eq!(
+        lines[4],
+        "cl-mismatch throw RequestContentLengthMismatchError: Request body length does not match content-length header | wire: nothing"
+    );
+}
+
 /// An abort after the response head ends the BODY too, where oam used to keep
 /// reading and hand over the whole thing with a clean end -- so a guard that
 /// aborted on a size limit downloaded everything anyway. node errors the body
