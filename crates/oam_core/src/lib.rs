@@ -24,6 +24,9 @@ pub mod cluster;
 pub mod dns;
 pub mod http_server;
 pub mod inspector;
+/// The outbound TCP connector net.connect and tls.connect share: node's
+/// lookupAndConnectMultiple algorithm and its error shapes.
+pub mod net_connect;
 /// Inbound OS signal delivery (SIGTERM/SIGINT/SIGHUP). Unix uses
 /// tokio::signal::unix; Windows uses SetConsoleCtrlHandler. Both feed the op
 /// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine

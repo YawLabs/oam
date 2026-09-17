@@ -46,6 +46,15 @@ rustls-pemfile = { workspace = true }
 # enables. These are new dependency EDGES onto crates already being built.
 x509-parser = { workspace = true }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+# The outbound connector net.connect and tls.connect share (net_connect.rs):
+# one socket per attempt, created, bound and connected by hand so a failure
+# connect(2) reports synchronously can be told from one that arrives later
+# (node words the two differently) and so Windows can pre-bind a dual-stack
+# IPv6 socket before connecting, as libuv does.
+#
+# NOT new supply chain: socket2 0.6.4 already compiles in the graph via tokio
+# and hyper-util. A new dependency EDGE onto a crate already being built.
+socket2 = "0.6"
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std
