@@ -171,15 +171,28 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// A lookup request: (token, host, port).
+/// A lookup request: (token, host, port). The port is a string when the URL
+/// names one and a number for the scheme default, as undici passes it.
 fn lookup_of(outcome: OpOutcome) -> (u64, String, u16) {
     let value = payload(outcome);
     let lookup = &value["lookup"];
     assert!(lookup.is_object(), "expected a lookup request, got {value}");
+    let port = match &lookup["port"] {
+        Value::String(port) => port.parse().unwrap(),
+        Value::Number(port) => {
+            let port = port.as_u64().unwrap() as u16;
+            assert!(
+                port == 80 || port == 443,
+                "a numeric port is a default: {value}"
+            );
+            port
+        }
+        other => panic!("port {other} in {value}"),
+    };
     (
         lookup["token"].as_u64().unwrap(),
         lookup["host"].as_str().unwrap().to_string(),
-        lookup["port"].as_u64().unwrap() as u16,
+        port,
     )
 }
 

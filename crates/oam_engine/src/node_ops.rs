@@ -2523,21 +2523,16 @@ fn op_fetch_body_channel_write(
     });
 }
 
-/// Close the channel: drops the sender, which ends the request body.
+/// Close the channel: drops the sender, which ends the request body, and
+/// the entry itself once the fetch has taken the receiver (it used to stay
+/// behind as `(None, None)` for the rest of the run).
 fn op_fetch_body_channel_end(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    if let Some(slot) = core_runtime!(scope)
-        .outbound_bodies()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_mut(&handle)
-    {
-        slot.0 = None;
-    }
+    core_runtime!(scope).end_outbound_body(handle);
 }
 
 /// Abort an in-flight upload (req.destroy()): send an error so the transport

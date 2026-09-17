@@ -3,7 +3,7 @@
 // Why a shim, not the real package: undici reimplements the HTTP/1.1+H2
 // stack with an llhttp WASM parser and pulls node:sqlite, node:worker_threads,
 // node:diagnostics_channel, etc. -- it neither loads nor adds anything over
-// oam's web-standard fetch (reqwest+rustls). So `import 'undici'` resolves to
+// oam's web-standard fetch (oam's own hyper + rustls transport). So `import 'undici'` resolves to
 // this factory (registered as the virtual builtin "oam:undici"; the resolver
 // maps the bare specifier 'undici' to it before the node_modules walk), the
 // same approach Bun and Deno take.
@@ -14,16 +14,20 @@
 //
 // Supported transport control:
 //  - A Dispatcher/Agent passed as fetch's `dispatcher` with a
-//    `connect.lookup` hook IS honored: globalThis.fetch resolves the hook to
-//    an IP and pins the connection to it (Host header + TLS SNI preserved).
+//    `connect.lookup` hook IS honored, as undici honors it: the hook is called
+//    before the fetch connects to a host name -- the first request AND every
+//    redirect hop to another host -- and the connection is pinned to the
+//    addresses it returns (Host header + TLS SNI preserved; node's address
+//    filtering; never the environment proxy). A hook error fails the fetch
+//    closed with that error as `cause`, never falling back to system DNS.
 //    This makes the DNS-rebind / SSRF pin used by e.g. @yawlabs/fetch-mcp a
 //    real control, not a no-op. (See the Dispatcher constructor's
-//    _oamConnectLookup bridge and globalThis.fetch's pin handling.)
+//    _oamConnectLookup bridge and globalThis.fetch's lookup continuation.)
 //
 // Documented divergences (a shim over fetch cannot honor everything):
 //  - Other connection-level dispatcher options (TLS opts, connection
 //    pooling, keep-alive tuning) are accepted but NOT applied -- oam's fetch
-//    owns the transport beyond the connect pin.
+//    owns the transport beyond the connect.lookup hook.
 //  - Mock* (MockAgent/MockPool/...) are minimal stubs: constructible, but
 //    they do not intercept requests.
 
@@ -159,6 +163,9 @@
         body: opts.body != null ? opts.body : undefined,
         signal: opts.signal || undefined,
         redirect: opts.redirect || (opts.maxRedirections > 0 ? "follow" : undefined),
+        // undici.request is not fetch: node's has no Fetch-spec bad-port
+        // block, so port 1 or 25 is dialled like any other.
+        __oamFetchSemantics: false,
       };
       // undici allows a `query` object appended to the URL.
       if (opts.query && typeof opts.query === "object") {
@@ -198,8 +205,9 @@
 
     // ---- dispatchers ------------------------------------------------------
     // All dispatchers delegate to request() -- oam's fetch owns the transport,
-    // so connection-level options (connect.lookup, pooling, TLS) are accepted
-    // and stored but NOT applied. See the module-level divergence note.
+    // so connection-level options (pooling, TLS) are accepted and stored but
+    // NOT applied; connect.lookup is the exception, honored by fetch() (not by
+    // request()). See the module-level notes.
     class Dispatcher extends EventEmitter {
       constructor(options) {
         super();
@@ -208,11 +216,13 @@
         this.closed = false;
         // Bridge for connection pinning: oam's globalThis.fetch looks for
         // `_oamConnectLookup` on a dispatcher passed via init.dispatcher and,
-        // if present, resolves it to an IP and pins the connection (Host +
-        // SNI preserved). This is how a connect.lookup hook -- e.g. the
-        // DNS-rebind pin in @yawlabs/fetch-mcp -- becomes a REAL transport
-        // control instead of a no-op. The hook signature is Node's
-        // lookup(hostname, options, cb) with cb(null, [{address, family}]).
+        // if present, calls it for every host name the fetch connects to and
+        // pins those connections to its addresses (Host + SNI preserved).
+        // This is how a connect.lookup hook -- e.g. the DNS-rebind pin in
+        // @yawlabs/fetch-mcp -- becomes a REAL transport control instead of a
+        // no-op. The hook signature is Node's lookup(hostname, options, cb)
+        // with options { family, hints, all: true } and
+        // cb(null, [{address, family}]).
         const connect = this._options.connect;
         this._oamConnectLookup =
           connect && typeof connect.lookup === "function" ? connect.lookup : null;

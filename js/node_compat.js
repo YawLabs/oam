@@ -775,7 +775,27 @@
   codes.ERR_UNESCAPED_CHARACTERS = E("ERR_UNESCAPED_CHARACTERS", TypeError, function(name) {
     return name + ' contains unescaped characters';
   });
+  // A connect.lookup hook's answer that net cannot dial (node
+  // lib/internal/errors.js; thrown by bootstrap.js's fetch the way node's
+  // lookupAndConnectMultiple throws it). `%s` formatting, as node's message.
+  codes.ERR_INVALID_IP_ADDRESS = E("ERR_INVALID_IP_ADDRESS", TypeError, function(ip) {
+    return registry.get("util").format("Invalid IP address: %s", ip);
+  });
   // ---- RangeError family ----
+  // node's message function also sets `host` and `port` on the error; E()
+  // calls a message function with no instance, so they are set after the code,
+  // which keeps node's enumerable order (code, host, port -- measured).
+  {
+    const AddressFamilyError = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
+      return `Invalid address family: ${addressType} ${host}:${port}`;
+    });
+    codes.ERR_INVALID_ADDRESS_FAMILY = function ERR_INVALID_ADDRESS_FAMILY(addressType, host, port) {
+      const err = AddressFamilyError(addressType, host, port);
+      err.host = host;
+      err.port = port;
+      return err;
+    };
+  }
   // node's addNumericalSeparator (lib/internal/errors.js): group a big
   // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
   // Works on the STRING form and is sign-aware -- the leading "-" is never
@@ -18032,6 +18052,9 @@
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
+          // node's http.request has no Fetch-spec bad-port block: port 1
+          // or 25 is dialled (and refused), not refused by the client.
+          __oamFetchSemantics: false,
         };
         if (self._bodyStream !== null) {
           fetchOpts.__oamBodyStream = self._bodyStream;
@@ -18098,17 +18121,21 @@
           // ECONNRESET is never re-emitted on the destroyed request.
           if (self._aborted) return;
           // Map transport failures to Node-shaped codes: retry logic keys
-          // on err.code, and reqwest's strings carry none.
+          // on err.code, and the transport's own texts carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
           // fetch() rejects with the bare "fetch failed" and the transport
           // error as `cause`: a connect or resolver failure arrives there
           // already in node's shape (errno, code, syscall, address/port or
-          // hostname) and is emitted as-is; anything else is matched on the
-          // cause's text, which is where reqwest's detail now lives.
+          // hostname; node's AggregateError when a name resolved to several
+          // addresses and every one refused) and is emitted as-is -- node's
+          // http.request emits exactly that error. Anything else is matched
+          // on the cause's text.
           var cause = err && err.cause;
           var detail = cause && cause.message ? cause.message : msg;
           var mapped;
           if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+            mapped = cause;
+          } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
@@ -23794,7 +23821,8 @@
           }
           bodyData = merged;
         }
-        var fetchOpts = { method: method, headers: fetchHeaders };
+        // node's http2 client has no Fetch-spec bad-port block.
+        var fetchOpts = { method: method, headers: fetchHeaders, __oamFetchSemantics: false };
         if (bodyData && method !== "GET" && method !== "HEAD") {
           fetchOpts.body = bodyData;
         }

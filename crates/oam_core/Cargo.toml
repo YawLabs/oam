@@ -9,16 +9,15 @@ license.workspace = true
 [dependencies]
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # node:zlib compression backend.
 flate2 = { workspace = true }
-# HTTP server (hyper rides in-tree via reqwest), and since #143 the client
-# half of the fetch transport: hyper-util's pooled legacy client with oam's
-# own connector, its env-proxy Matcher and CONNECT tunnel. reqwest already
-# enables every one of these features on the same versions.
+# HTTP server, and since #143 the client half: the fetch transport is
+# hyper-util's pooled legacy client with oam's own connector, its env-proxy
+# Matcher and CONNECT tunnel (reqwest is oam_loader's install client only; it
+# enables every one of these features on the same versions).
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "client-proxy", "http1", "http2"] }
 h2 = { workspace = true }

@@ -90,8 +90,18 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 17] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 19] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
+        // A fetch whose dispatcher has a `connect.lookup` hook parks before
+        // dialling a host name; JS runs the hook and resumes or drops it.
+        (
+            "fetchContinue",
+            v8::Function::new(scope, op_fetch_continue).unwrap(),
+        ),
+        (
+            "fetchAbandon",
+            v8::Function::new(scope, op_fetch_abandon).unwrap(),
+        ),
         (
             "fetchBodyRead",
             v8::Function::new(scope, op_fetch_body_read).unwrap(),
@@ -322,15 +332,59 @@ fn op_fetch(
         }
     }
     let core = core_runtime!(scope);
-    let client = core.http_client();
+    let transport = core.http_client();
     let bodies = core.bodies();
     let ids = core.body_ids();
     let outbound = core.outbound_bodies();
+    let continuations = core.fetch_continuations();
     spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fetch(client, request, bodies, ids, outbound),
+        oam_core::ops::fetch(transport, request, bodies, ids, outbound, continuations),
     );
+}
+
+/// `__oam.fetchContinue(token, answerJson)`: resume the fetch parked under
+/// `token` with its lookup hook's answer (`{"ips": [...]}`). Settles like
+/// `fetch`: a response, a failure, or the next hop's lookup request. The
+/// `--permission` net check in `op_fetch` covers the initial URL only; a
+/// redirect hop is not checked there either.
+fn op_fetch_continue(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(answer) = args.get(1).to_string(scope) else {
+        let message = v8::String::new(scope, "fetchContinue requires a lookup answer").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    let answer = answer.to_rust_string_lossy(scope);
+    let core = core_runtime!(scope);
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    let continuations = core.fetch_continuations();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fetch_continue(token, answer, bodies, ids, continuations),
+    );
+}
+
+/// `__oam.fetchAbandon(token)`, synchronous: drop the fetch parked under
+/// `token` (its hook failed or the fetch was aborted). Returns whether it was
+/// still parked; an untaken streamed request body is released with it.
+fn op_fetch_abandon(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let continuations = core_runtime!(scope).fetch_continuations();
+    let dropped = oam_core::ops::fetch_abandon(token, &continuations);
+    rv.set(v8::Boolean::new(scope, dropped).into());
 }
 
 fn op_fetch_body_read(
@@ -349,10 +403,10 @@ fn op_fetch_body_read(
     );
 }
 
-/// Synchronous: drop the stored response (connection closes). Safe to call
+/// Synchronous: drop the stored body (connection closes). Safe to call
 /// on an already-drained handle. A handle absent from the registry may have
 /// a read IN FLIGHT (remove-await-reinsert); tombstone it so the returning
-/// read drops the response instead of reviving it.
+/// read drops the body instead of reviving it.
 fn op_fetch_body_cancel(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

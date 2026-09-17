@@ -2,11 +2,16 @@
 // creation today; compiled into the startup snapshot once that pipeline
 // lands (same source, faster boot).
 //
-// M1 fetch subset: buffered bodies (no ReadableStream yet), plain-object
-// Response/Headers shapes (real spec classes arrive with oam_web + WPT).
-// Wire contract with crates/oam_core ops::fetch:
-//   request:  JSON string {url, method, headers: [[k,v]], body}
-//   response: {status, statusText, url, headers: [[k,v]], body}
+// fetch: plain-object Response/Headers shapes (real spec classes arrive with
+// oam_web + WPT) over a streamed body. Wire contract with crates/oam_core
+// http_client::send (__oam.fetch / fetchContinue / fetchAbandon):
+//   request:  JSON string {url, method, headers: [[k,v]],
+//             body | body_base64 | body_stream, attempt_timeout_ms,
+//             fetch_semantics, lookup_hook?}
+//   response: {status, statusText, url, redirected, headers: [[k,v]],
+//             bodyHandle} -- or, for a lookup_hook request,
+//             {lookup: {token, host, port}}: run the hook, then
+//             fetchContinue(token, JSON {ips}) or fetchAbandon(token)
 // SNAPSHOT CONSTRAINT: this file is evaluated at BUILD time into the V8
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
@@ -895,24 +900,132 @@
     return String(value).toWellFormed();
   }
 
-  function shapeFetchCause(e, url) {
-    if (!(e instanceof Error)) return new Error(String(e));
-    if (e.syscall !== "connect" && e.syscall !== "getaddrinfo") return e;
-    let parsed = null;
+  // net's happy-eyeballs attempt timeout
+  // (net.setDefaultAutoSelectFamilyAttemptTimeout) is process-wide, and node's
+  // fetch connects with it too (undici passes none of its own). A net module
+  // nobody has loaded cannot have changed it: node's 250 ms.
+  function netAttemptTimeoutMs() {
     try {
-      parsed = new URL(url);
+      const net = globalThis.__oamNode?.cache?.get?.("net");
+      const ms = net?.getDefaultAutoSelectFamilyAttemptTimeout?.();
+      if (typeof ms === "number") return ms;
     } catch {
-      return e;
+      // the default below
     }
-    // URL keeps the brackets of an IPv6 literal; node's address does not.
-    const host = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
-    if (e.syscall === "getaddrinfo") {
-      e.hostname = host;
-    } else {
-      e.address = host;
-      e.port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
+    return 250;
+  }
+
+  // The `hints` node's net.connect hands a connect.lookup hook
+  // (lib/net.js lookupAndConnect): 0 on Windows, dns.ADDRCONFIG -- the
+  // platform's AI_ADDRCONFIG -- elsewhere. Measured: node v22.22.2 passes
+  // `{ family: undefined, hints: 0, all: true }` on win32; AI_ADDRCONFIG is
+  // 1024 in macOS's <netdb.h> (compiled on the mac leg). glibc's 0x20 is the
+  // header value, not yet confirmed against node on the Linux leg. oam's own
+  // dns.ADDRCONFIG is still 0 everywhere (a separate follow-up).
+  function lookupHints() {
+    const platform = globalThis.process?.platform;
+    if (platform === "win32") return 0;
+    if (platform === "darwin" || platform === "freebsd") return 1024;
+    return 0x20;
+  }
+
+  // node lib/net.js lookupAndConnectMultiple (v22.22.2): keep the addresses
+  // net would dial -- isIP(address) and family 4 or 6 -- in the hook's order,
+  // and with none, fail on the FIRST entry. The statements are node's own, so
+  // the TypeErrors are too: an empty list throws "Cannot destructure property
+  // 'address' of 'addresses[0]' as it is undefined." (measured as fetch's
+  // cause), and a string answer (`cb(null, ip, family)`, the non-`all` form)
+  // walks its characters and fails as `Invalid IP address: undefined`.
+  // Family interleaving and repeats are Rust's (net_connect).
+  function pinAddresses(addresses, host, port) {
+    const reg = globalThis.__oamNode;
+    const { isIP } = reg.get("net");
+    const ips = [];
+    for (let i = 0, l = addresses.length; i < l; i++) {
+      const address = addresses[i];
+      const { address: ip, family: addressType } = address;
+      if (isIP(ip) && (addressType === 4 || addressType === 6)) ips.push(ip);
     }
-    return e;
+    if (ips.length > 0) return ips;
+    const { address: firstIp, family: firstAddressType } = addresses[0];
+    const { codes } = reg.get("internal/errors");
+    if (!isIP(firstIp)) throw new codes.ERR_INVALID_IP_ADDRESS(firstIp);
+    throw new codes.ERR_INVALID_ADDRESS_FAMILY(firstAddressType, host, port);
+  }
+
+  // One connect.lookup call, as net.connect makes it for a fetch: the host,
+  // `{ family, hints, all: true }`, a callback. The first callback wins; an
+  // error (or a synchronous throw) rejects with that value unchanged.
+  function runConnectLookup(lookup, host, port) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      lookup(host, { family: undefined, hints: lookupHints(), all: true }, (err, addresses) => {
+        if (settled) return;
+        settled = true;
+        if (err) {
+          reject(err);
+          return;
+        }
+        try {
+          resolve(pinAddresses(addresses, host, port));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  // WHATWG: fetch() rejects with a TypeError on a network failure, and node's
+  // message is the bare "fetch failed" with the transport error underneath as
+  // `cause` -- that is where `code` (ECONNREFUSED, ENOTFOUND, ...) lives and
+  // what retry logic reads. The native op builds that error itself, in node's
+  // shape: errno / code / syscall and the address that refused (or the
+  // hostname that did not resolve), or node's AggregateError when every
+  // address of a name refused.
+  function fetchFailed(e) {
+    return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
+  }
+
+  // The op, settled: a response, or -- for a fetch whose dispatcher carries a
+  // connect.lookup hook -- a lookup request first. undici calls the hook for
+  // every connection to a host name, redirect hops included, so the native
+  // loop parks before it dials a name it has no addresses for and hands the
+  // name up here. A hook that fails fails the fetch CLOSED (its error is the
+  // cause, unchanged, as in node) and never falls back to system DNS; an
+  // abort while parked drops the parked fetch.
+  async function settleFetch(pending, lookup, signal) {
+    const internal = globalThis.__oam;
+    let raw;
+    try {
+      raw = await pending;
+    } catch (e) {
+      throw fetchFailed(e);
+    }
+    while (raw && raw.lookup) {
+      const { token, host, port } = raw.lookup;
+      const abandon = () => internal.fetchAbandon(token);
+      signal?.addEventListener("abort", abandon, { once: true });
+      let ips;
+      try {
+        ips = await runConnectLookup(lookup, host, port);
+      } catch (err) {
+        abandon();
+        throw new TypeError("fetch failed", { cause: err });
+      } finally {
+        signal?.removeEventListener("abort", abandon);
+      }
+      if (signal?.aborted) {
+        abandon();
+        // The abort race already rejected the fetch with the reason.
+        throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      }
+      try {
+        raw = await internal.fetchContinue(token, JSON.stringify({ ips }));
+      } catch (e) {
+        throw fetchFailed(e);
+      }
+    }
+    return makeResponse(raw);
   }
 
   globalThis.fetch = async function fetch(input, init) {
@@ -937,45 +1050,18 @@
       url: wellFormed(input),
       method: init.method ? String(init.method).toUpperCase() : "GET",
       headers,
+      attempt_timeout_ms: netAttemptTimeoutMs(),
+      // undici's Fetch-spec bad-port block on the initial URL. Internal
+      // callers that are not fetch in node (http.request, the http2 client,
+      // undici.request) opt out.
+      fetch_semantics: init.__oamFetchSemantics !== false,
     };
-    // Connection pin: an undici-style dispatcher (init.dispatcher) may carry a
-    // connect.lookup hook used for DNS-rebind / SSRF pinning. oam owns the
-    // transport (reqwest), so we resolve the hook HERE to an IP and pass it as
-    // a pin: reqwest then dials that IP while keeping Host + TLS SNI = the
-    // hostname. The dispatcher exposes the hook as `_oamConnectLookup` (set by
-    // the oam:undici shim). No dispatcher / no hook = the normal path, no cost.
+    // An undici-style dispatcher (init.dispatcher) may carry a connect.lookup
+    // hook -- the DNS-rebind / SSRF pin. The oam:undici shim exposes it as
+    // `_oamConnectLookup`. No dispatcher / no hook = the plain path, no cost.
     const dispatcher = init.dispatcher;
-    const connectLookup = dispatcher && dispatcher._oamConnectLookup;
-    if (typeof connectLookup === "function") {
-      let host = "";
-      try {
-        host = new globalThis.URL(request.url).hostname;
-      } catch {
-        host = "";
-      }
-      if (host) {
-        const ip = await new Promise((resolve) => {
-          let settled = false;
-          const done = (value) => {
-            if (!settled) {
-              settled = true;
-              resolve(value);
-            }
-          };
-          try {
-            connectLookup(host, { all: true }, (err, addrs) => {
-              if (err) return done(null);
-              if (Array.isArray(addrs) && addrs[0] && addrs[0].address) return done(addrs[0].address);
-              if (typeof addrs === "string" && addrs) return done(addrs);
-              done(null);
-            });
-          } catch {
-            done(null);
-          }
-        });
-        if (ip) request.pin = { host, ip };
-      }
-    }
+    const lookup = dispatcher && dispatcher._oamConnectLookup;
+    if (typeof lookup === "function") request.lookup_hook = true;
     // Internal escape hatch: a request whose body is produced over time
     // rides an outbound body channel instead of a materialized body
     // (docs/design/streaming-bodies.md). Not part of the WHATWG surface --
@@ -994,19 +1080,9 @@
         request.body = wellFormed(init.body);
       }
     }
-    const op = globalThis.__oam
-      .fetch(JSON.stringify(request))
-      .then(makeResponse, (e) => {
-        // WHATWG: fetch() rejects with a TypeError on network failure, and
-        // node's message is the bare "fetch failed" with the transport error
-        // underneath as `cause` -- that is where `code` (ECONNREFUSED,
-        // ENOTFOUND, ...) lives and what retry logic reads. The native op
-        // rejects with node's errno / code / syscall for a connect or
-        // resolver failure; node also names the peer on it, which the
-        // request URL supplies here: address + port for connect, hostname
-        // for getaddrinfo.
-        throw new TypeError("fetch failed", { cause: shapeFetchCause(e, request.url) });
-      });
+    // Started synchronously: a malformed request or a --permission refusal
+    // throws from here, as it always has.
+    const op = settleFetch(globalThis.__oam.fetch(JSON.stringify(request)), lookup, signal);
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch

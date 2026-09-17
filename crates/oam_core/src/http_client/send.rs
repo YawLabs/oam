@@ -297,8 +297,17 @@ async fn run(
             Err(text) => return OpOutcome::Failed(text.to_string()),
         };
         if let Some(host) = state.route.lookup_needed(&uri) {
-            let https = uri.scheme_str() == Some("https");
-            let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+            // The port as undici's connector hands it to net.connect, which
+            // is what node's ERR_INVALID_ADDRESS_FAMILY carries: the URL's
+            // port STRING when the URL names one, else the number 80 / 443
+            // (`port || 80`, undici core/connect.js; measured: `port` is
+            // "4567" for `:4567` and 80 for no port). A default port never
+            // survives URL parsing, so an explicit one is never 80 on http.
+            let port = match uri.port_u16() {
+                Some(port) => serde_json::Value::from(port.to_string()),
+                None if uri.scheme_str() == Some("https") => serde_json::Value::from(443),
+                None => serde_json::Value::from(80),
+            };
             let token = ids.fetch_add(1, Ordering::Relaxed);
             let payload = serde_json::json!({
                 "lookup": { "token": token, "host": host, "port": port },
