@@ -133,17 +133,6 @@ impl PendingFetch {
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
-/// How many times one hop's idempotent request may be resent after a pooled
-/// connection the server had closed swallowed it. Each resend follows a
-/// failure on a REUSED connection, which takes that connection out of the
-/// pool, so the cap binds only when the server keeps closing idle
-/// connections as fast as the resends use them. Measured with eight
-/// concurrent redirect chains against a server that FINs after every 302
-/// (6000 fetches per run, Windows arm64): 1 resend failed 78-110 fetches per
-/// run, 2 failed 0-5, and 3 failed none in 10 runs. node v22.22.2 failed
-/// none.
-pub const MAX_STALE_RESENDS: u32 = 3;
-
 /// Everything the loop needs between hops, and across a park.
 struct LoopState {
     transport: HttpTransport,
@@ -387,7 +376,7 @@ async fn run(
         }
 
         let mut retries = 0;
-        let mut stale_resends = 0;
+        let mut stale_resent = false;
         let response = loop {
             let body = match state.source.build() {
                 Ok(body) => body,
@@ -411,8 +400,6 @@ async fn run(
                 // (RFC 9112 s9.6). Only for a body that can be sent twice,
                 // and only for an idempotent method -- oam DID put the
                 // request on the wire and cannot know the server ignored it.
-                // node loses this race far less often because its event loop
-                // reads the FIN before it writes.
                 //
                 // Only on a REUSED connection: a fresh one that dies before
                 // the response is the server's answer to this request, not a
@@ -420,23 +407,30 @@ async fn run(
                 // server that closes every connection unanswered saw a GET
                 // twice from oam when this retried on any connection).
                 //
-                // Up to MAX_STALE_RESENDS times, not once. The resend goes
-                // back through the pool, and when several connections are
-                // idle for the origin the server may be closing those too.
-                // Each failure takes one dead connection out of the pool, and
-                // a resend that dials afresh ends the run: its failure is
-                // final. With a single resend, eight concurrent redirect
-                // chains against a server that FINs after each 302 failed
-                // 78-110 of 6000 fetches, with the resend landing on a second
-                // dead connection, where node failed none.
+                // Only when NOT A BYTE of a response arrived: hyper reports a
+                // connection that closed halfway through a response head with
+                // the same IncompleteMessage, and a server that had started
+                // answering did not ignore the request (RFC 9110 s9.2.2: a
+                // retry only "before any part of a response is received").
+                //
+                // Once per hop: RFC 9110 s9.2.2 "SHOULD NOT automatically
+                // retry a failed automatic retry", and node sends it once and
+                // rejects (undici fails the request on the wire with
+                // UND_ERR_SOCKET, http.Agent with "socket hang up"). A resend
+                // that meets another closing connection fails the fetch.
+                // oam needs this one resend at all only because it can write
+                // into a FIN that is still in flight sooner than node does;
+                // a FIN the kernel already holds is read before the write
+                // (`connector::EagerTcp`), and the request goes back UNSENT.
                 Err(e)
-                    if stale_resends < MAX_STALE_RESENDS
+                    if !stale_resent
                         && state.source.replayable()
                         && is_idempotent(&state.method)
                         && e.is_incomplete_message()
-                        && e.on_reused_connection() =>
+                        && e.on_reused_connection()
+                        && !e.response_started() =>
                 {
-                    stale_resends += 1;
+                    stale_resent = true;
                 }
                 Err(e) => {
                     state.source.request_failed();

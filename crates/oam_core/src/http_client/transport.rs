@@ -26,7 +26,7 @@ use hyper_util::client::proxy::matcher::Matcher;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 
 use super::connector::{
-    ConnUses, HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key,
+    ConnStats, HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key,
 };
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
@@ -145,17 +145,25 @@ impl HttpTransport {
         let capture = capture_connection(&mut request);
         let result = client.request(request).await;
         // Count this request in on the connection it went out on, whatever
-        // the outcome, and learn whether an earlier request had used it. No
-        // connection at all (a connect that failed) is not a reused one.
-        let reused = capture
-            .connection_metadata()
-            .as_ref()
-            .is_some_and(|connected| {
+        // the outcome, and learn whether an earlier request had used it and
+        // whether any of a response arrived. No connection at all (a connect
+        // that failed) is not a reused one, and no response started on it.
+        let (reused, response_started) = match capture.connection_metadata().as_ref() {
+            Some(connected) => {
                 let mut extras = http::Extensions::new();
                 connected.get_extras(&mut extras);
-                extras.get::<ConnUses>().is_some_and(ConnUses::count_one)
-            });
-        result.map_err(|error| SendError { error, reused })
+                match extras.get::<ConnStats>() {
+                    Some(stats) => (stats.count_one(), stats.response_started()),
+                    None => (false, true),
+                }
+            }
+            None => (false, false),
+        };
+        result.map_err(|error| SendError {
+            error,
+            reused,
+            response_started,
+        })
     }
 
     /// The `proxy-authorization` value this hop needs: only an http request
@@ -255,6 +263,9 @@ pub struct SendError {
     error: hyper_util::client::legacy::Error,
     /// It went out on a connection an earlier request had already used.
     reused: bool,
+    /// Some part of a response arrived on that connection after this request
+    /// took it (see `ConnStats`).
+    response_started: bool,
 }
 
 impl SendError {
@@ -286,19 +297,33 @@ impl SendError {
     }
 
     /// hyper's `IncompleteMessage`, "connection closed before message
-    /// completed": the connection died before ANY part of the response
-    /// arrived. hyper-util retries a request its dispatcher handed back
-    /// UNSENT (`retry_canceled_requests`, on by default) but not this one,
-    /// where the request had already gone onto the connection.
+    /// completed": the connection died before a WHOLE response head arrived.
+    /// hyper reports it the same way whether nothing arrived or half a head
+    /// did (h1 io.rs `parse`: EOF is `new_incomplete` either way), so pair
+    /// it with [`SendError::response_started`]. hyper-util retries a request
+    /// its dispatcher handed back UNSENT (`retry_canceled_requests`, on by
+    /// default) but not this one, where the request had already gone onto
+    /// the connection.
     ///
     /// Why oam hits it where node does not: a server that advertises
     /// keep-alive and then FINs (the idle-timeout shape) leaves a pooled
-    /// connection whose FIN has not been processed yet, because oam's
-    /// redirect loop stays in Rust with no event-loop tick between the 3xx
-    /// and the hop. Node's loop reads the FIN first and opens a fresh socket,
-    /// so node succeeded on 20 of 20 iterations where oam failed on most.
+    /// connection that the next request can be written onto before the FIN
+    /// arrives, because oam's redirect loop stays in Rust with no event-loop
+    /// tick between the 3xx and the hop. A FIN the kernel already holds is
+    /// caught before the write (`connector::EagerTcp`); one still in flight
+    /// is not, in oam or in node.
     pub fn is_incomplete_message(&self) -> bool {
         find_in_chain::<hyper::Error>(&self.error).is_some_and(|e| e.is_incomplete_message())
+    }
+
+    /// Some part of a response -- even a few bytes of a status line --
+    /// arrived for this request before its connection failed. The server had
+    /// then started answering, so the request is not one it ignored, and
+    /// RFC 9110 s9.2.2 allows an automatic retry only when the connection
+    /// closed "before any part of a response is received". Also true when
+    /// oam cannot tell.
+    pub fn response_started(&self) -> bool {
+        self.response_started
     }
 
     /// The request went out on a connection an earlier request had already

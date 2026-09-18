@@ -405,13 +405,16 @@ async fn fill_the_pool(reg: &Reg, transport: &HttpTransport, url: &str, pooled: 
     let_the_pool_settle().await;
 }
 
-/// When the server has closed more than one idle connection, the resend goes
-/// back through the pool and can meet another dead one. It is resent again
-/// until a connection answers: with a single resend, eight concurrent
-/// redirect chains against a server that FINs after each 302 failed 78-110
-/// of 6000 fetches, where node failed none.
+/// The stale-connection resend happens once per hop. When the resend meets
+/// a second pooled connection the server is closing, the fetch fails -- the
+/// request has then reached the server twice, and RFC 9110 s9.2.2 says a
+/// client "SHOULD NOT automatically retry a failed automatic retry". node
+/// never resends a written request at all: undici fails it with
+/// UND_ERR_SOCKET and http.Agent with "socket hang up", and the server sees
+/// it once. (An earlier cut resent up to three times, which delivered one
+/// GET four times and reported success where node rejected.)
 #[tokio::test(flavor = "multi_thread")]
-async fn a_resend_that_meets_another_closed_pooled_connection_is_resent() {
+async fn a_stale_resend_is_sent_once() {
     within(async {
         let server = closes_on_second_request(2).await;
         let transport = plain();
@@ -420,43 +423,160 @@ async fn a_resend_that_meets_another_closed_pooled_connection_is_resent() {
         fill_the_pool(&reg, &transport, &url, 2).await;
         assert_eq!(server.accepts(), 2);
 
-        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(p["status"], 200);
-        assert_eq!(reg.text(handle_of(&p)).await, "ok");
-        assert_eq!(server.accepts(), 3, "the second resend dialled afresh");
+        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(text, format!("error sending request for url ({url})"));
+        assert_eq!(server.accepts(), 2, "no connection was dialled");
         assert_eq!(
             server.seen().len(),
-            2 + 3,
-            "each dead connection read one try, the fresh one the last"
+            2 + 2,
+            "the first try and one resend, each read by a dead connection"
         );
     })
     .await;
 }
 
-/// The resends are bounded: a pool of dead connections deeper than
-/// `MAX_STALE_RESENDS` fails the fetch after the first try and that many
-/// resends, rather than walking the whole pool.
+/// A pooled connection that closes halfway through a response head is not a
+/// connection that ignored the request: the server had started answering.
+/// hyper reports it with the same IncompleteMessage as a connection that
+/// died before a byte arrived, so the send path counts the response bytes
+/// itself, and does not resend. RFC 9110 s9.2.2 allows the automatic retry
+/// only when the connection closed "before any part of a response is
+/// received"; node sends such a request once and rejects.
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_resends_stop_at_the_cap() {
+async fn a_pooled_connection_that_closes_mid_head_is_not_resent() {
     within(async {
-        let pooled = send::MAX_STALE_RESENDS as usize + 2;
-        let server = closes_on_second_request(pooled).await;
+        let server = serve(|mut conn, _, seen| async move {
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+                conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+                conn.send(b"HTTP/1.1 200 OK\r\ncontent-le").await;
+            }
+        })
+        .await;
         let transport = plain();
         let reg = Reg::new();
         let url = format!("http://127.0.0.1:{}/x", server.port);
-        fill_the_pool(&reg, &transport, &url, pooled).await;
-        assert_eq!(server.accepts(), pooled);
+        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        let_the_pool_settle().await;
+        assert_eq!(server.accepts(), 1);
 
         let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
         assert_eq!(text, format!("error sending request for url ({url})"));
-        assert_eq!(server.accepts(), pooled, "no connection was dialled");
-        assert_eq!(
-            server.seen().len(),
-            pooled + 1 + send::MAX_STALE_RESENDS as usize,
-            "the first try and MAX_STALE_RESENDS resends, each on a dead connection"
-        );
+        assert_eq!(server.accepts(), 1, "no resend dialled afresh");
+        assert_eq!(server.seen().len(), 2, "the GET reached the server once");
     })
     .await;
+}
+
+/// A blocking HTTP/1 request read: the head and a content-length body.
+fn read_request_blocking(stream: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return Some(head);
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// A pooled connection whose server has closed it, with the FIN already in
+/// the kernel but not yet seen by tokio's reactor, is not written to: the
+/// connection reads the EOF before it takes the request, hands the request
+/// back unsent, and hyper-util sends it on a fresh connection. So a POST,
+/// which is never resent, succeeds with one delivery, as node's does (node's
+/// event loop reads the FIN before it writes).
+///
+/// Deterministic: the client runs on a current-thread runtime and blocks
+/// that thread while the server closes, so the reactor has not been polled
+/// since the FIN arrived when the POST goes out. Before `EagerTcp` the read
+/// came back `Pending` from tokio's readiness cache, the POST was written
+/// into the dead connection, and the fetch failed with `error sending
+/// request for url (...)`.
+#[test]
+fn a_pooled_connection_whose_fin_has_arrived_is_not_written_to() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let seen = Arc::new(Mutex::new(Vec::<(usize, String)>::new()));
+    let server = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+            // Connection 0: answer one request (so it is pooled), then close
+            // on the test's signal.
+            let (mut first, _) = listener.accept().unwrap();
+            if let Some(head) = read_request_blocking(&mut first) {
+                seen.lock().unwrap().push((0, head));
+                first.write_all(answer).unwrap();
+            }
+            close_rx.recv().unwrap();
+            drop(first);
+            closed_tx.send(()).unwrap();
+            // Connection 1: whatever comes next, answered, until EOF.
+            let (mut second, _) = listener.accept().unwrap();
+            while let Some(head) = read_request_blocking(&mut second) {
+                seen.lock().unwrap().push((1, head));
+                second.write_all(answer).unwrap();
+            }
+        })
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .event_interval(1024)
+        .build()
+        .unwrap();
+    runtime.block_on(within(async {
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{port}/p");
+        let post = json!({ "url": &url, "method": "POST", "body": "x" });
+        let p = payload(reg.fetch(&transport, post.clone()).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        let_the_pool_settle().await;
+
+        // The server closes; this thread blocks, so nothing polls the
+        // reactor until the POST below has been handed to the connection.
+        close_tx.send(()).unwrap();
+        closed_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = reg.fetch(&transport, post).await;
+        let p = payload(outcome);
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+    }));
+    // Closes connection 1, which ends the server thread.
+    drop(runtime);
+    server.join().unwrap();
+    let conns: Vec<usize> = seen.lock().unwrap().iter().map(|(c, _)| *c).collect();
+    assert_eq!(
+        conns,
+        [0, 1],
+        "one POST per connection: the closed one never read the second"
+    );
 }
 
 // ---------------------------------------------------------------- redirects
