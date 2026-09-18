@@ -168,8 +168,11 @@ features = [
 optional = true
 
 [dependencies.tokio]
-version = "1"
-features = ["sync"]
+version = "1.44"
+features = [
+    "sync",
+    "rt",
+]
 
 [dependencies.tracing]
 version = "0.1"

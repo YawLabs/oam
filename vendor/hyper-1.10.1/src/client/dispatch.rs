@@ -211,6 +211,34 @@ impl<T, U> Drop for Receiver<T, U> {
         // Notify the giver about the closure first, before dropping
         // the mpsc::Receiver.
         self.taker.cancel();
+
+        // oam patch: close the channel, then drain it until tokio reports it
+        // closed AND idle, so that no envelope outlives the receiver.
+        //
+        // A `Sender::try_send` can pass `can_send()` and reserve its slot in
+        // the channel just before this close, then publish the envelope just
+        // after tokio's own `Rx::drop` drain has looked. That envelope would
+        // stay in the channel until the last sender drops, and the caller of
+        // `try_send_request` (hyper-util's pooled client) holds that sender
+        // while it awaits the envelope's callback: the request never
+        // completes. `recv()` on a closed channel returns `None` only once no
+        // send is in flight, so this loop also collects such an envelope.
+        // Dropping an envelope answers its callback with a canceled
+        // "connection closed" error that hands the unsent request back.
+        //
+        // `unconstrained`: an exhausted coop budget would make `recv()`
+        // return `Pending` forever here. A `Pending` otherwise means a send
+        // is between reserving its slot and publishing into it, a
+        // synchronous window, so yielding until it lands is bounded.
+        self.inner.close();
+        loop {
+            let recv = tokio::task::coop::unconstrained(self.inner.recv());
+            match crate::common::task::now_or_never(recv) {
+                Some(Some(envelope)) => drop(envelope),
+                Some(None) => break,
+                None => std::thread::yield_now(),
+            }
+        }
     }
 }
 
