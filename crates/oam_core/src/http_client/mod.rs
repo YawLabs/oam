@@ -47,6 +47,37 @@ pub mod transport;
 
 pub use transport::{HttpTransport, ProxySource, Route, SendError, TlsSource, TransportOptions};
 
+/// A host a fetch is about to connect to, as [`NetCheck`] sees it.
+///
+/// `host` is the URL's host exactly as the loop will resolve and dial it:
+/// `url::Url::host_str`, which is the WHATWG serialization -- a domain
+/// lower-cased and IDNA-mapped to ASCII, percent-decoding applied, a trailing
+/// dot KEPT (`localhost.` is its own name); an IPv4 address in dotted-quad
+/// form whatever it was written as (`0x7f.1`, `2130706433`); an IPv6 address
+/// compressed and bracketed (`[::1]`). Userinfo is never part of it. It is the
+/// DESTINATION, never the environment proxy a request may be tunnelled
+/// through.
+///
+/// `port` is the port it will be dialled on: the URL's own, or the scheme's
+/// default (80 / 443) when the URL names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetTarget<'a> {
+    pub host: &'a str,
+    pub port: u16,
+}
+
+/// A `--permission` net grant, applied by the fetch loop to every host it is
+/// about to dial -- the initial URL and each redirect hop -- before it dials
+/// it and before a `connect.lookup` hook is asked to resolve it.
+///
+/// The grant lives in the engine (its `Permissions`), and this crate stays
+/// v8-free and permission-model-free, so the engine hands the loop its check
+/// as a closure. `None` means the grant covers every host (no `--permission`,
+/// or a bare `--allow-net`): the loop then does no work at all. A refusal
+/// fails the fetch with `OpOutcome::AccessDenied` carrying the verdict.
+pub type NetCheck =
+    std::sync::Arc<dyn Fn(&NetTarget<'_>) -> Result<(), crate::AccessDenial> + Send + Sync>;
+
 /// The error type the connector and request bodies carry.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

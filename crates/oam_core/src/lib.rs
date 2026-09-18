@@ -107,6 +107,23 @@ pub struct NodeSysError {
     pub port: Option<u16>,
 }
 
+/// A `--permission` refusal an async op raised after its synchronous gate had
+/// already passed -- a `fetch` whose redirect leads to a host the net grant
+/// does not cover (`http_client::NetCheck`).
+///
+/// The engine rejects with the same error its synchronous gates throw
+/// (`throw_permission_denied`): Node's `ERR_ACCESS_DENIED`, message `Access to
+/// this API has been restricted`, carrying `permission` and `resource`. oam_core
+/// has no permission model of its own (the grant lives in the engine), so this
+/// only carries the verdict the engine's check returned.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccessDenial {
+    /// The permission's name as the refusal reports it (`Net`).
+    pub permission: String,
+    /// What was refused, as the check saw it (a host).
+    pub resource: String,
+}
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -163,6 +180,11 @@ pub enum OpOutcome {
     NodeAggregateFailed {
         errors: Vec<NodeSysError>,
     },
+    /// A `--permission` refusal raised mid-op (see [`AccessDenial`]): the
+    /// engine rejects with the `ERR_ACCESS_DENIED` error its synchronous gates
+    /// throw. A new variant, so a replay file recorded before it existed still
+    /// loads.
+    AccessDenied(AccessDenial),
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
     /// maps it to `process.emit(name)` rather than resolving a promise. serde-

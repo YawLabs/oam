@@ -5386,14 +5386,29 @@ pub(crate) fn throw_permission_denied(
     scope: &mut v8::PinScope<'_, '_>,
     denial: &crate::permissions::PermissionDenial,
 ) {
-    let msg_v8 = v8::String::new(scope, &denial.to_string())
+    let exception = access_denied_error(scope, denial.permission, &denial.resource);
+    scope.throw_exception(exception);
+}
+
+/// The error every `--permission` refusal surfaces as, thrown by a
+/// synchronous gate ([`throw_permission_denied`]) or rejected by an async op
+/// that refused mid-flight (`OpOutcome::AccessDenied`: a fetch redirect to a
+/// host the net grant does not cover). One builder, so the two cannot drift:
+/// a caller branching on `err.code === 'ERR_ACCESS_DENIED'` or reading
+/// `err.resource` sees the same shape either way.
+pub(crate) fn access_denied_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    permission: &str,
+    resource: &str,
+) -> v8::Local<'s, v8::Value> {
+    let msg_v8 = v8::String::new(scope, crate::permissions::ACCESS_DENIED_MESSAGE)
         .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
         for (key, value) in [
             ("code", "ERR_ACCESS_DENIED"),
-            ("permission", denial.permission),
-            ("resource", denial.resource.as_str()),
+            ("permission", permission),
+            ("resource", resource),
         ] {
             if let (Some(k), Some(v)) = (v8::String::new(scope, key), v8::String::new(scope, value))
             {
@@ -5401,7 +5416,7 @@ pub(crate) fn throw_permission_denied(
             }
         }
     }
-    scope.throw_exception(exception);
+    exception
 }
 
 /// The isolate's permission set, for code that needs to HAND IT to a child

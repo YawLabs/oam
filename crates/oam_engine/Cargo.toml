@@ -105,6 +105,11 @@ rustix = { version = "1.1.4", features = ["process"] }
 # Snapshot generation evaluates js/bootstrap.js at build time (build.rs).
 v8 = { workspace = true }
 
+[dev-dependencies]
+# The fetch net gate reads a URL's host with ada (op_fetch) and the transport's
+# redirect loop with `url` (oam_core); a test pins that the two agree.
+url = { workspace = true }
+
 [lints.clippy]
 # Per-site `unsafe` coverage is compiler-enforced here (AI-POLICY gate 5),
 # not counted: a `// SAFETY:` on every unsafe block/impl, a `/// # Safety`

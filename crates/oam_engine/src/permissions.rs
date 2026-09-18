@@ -373,10 +373,62 @@ pub struct PermissionDenial {
     pub resource: String,
 }
 
+/// Node's message for `ERR_ACCESS_DENIED`.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access to this API has been restricted";
+
 impl std::fmt::Display for PermissionDenial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Access to this API has been restricted")
+        f.write_str(ACCESS_DENIED_MESSAGE)
     }
+}
+
+impl From<PermissionDenial> for oam_core::AccessDenial {
+    fn from(denial: PermissionDenial) -> Self {
+        oam_core::AccessDenial {
+            permission: denial.permission.to_string(),
+            resource: denial.resource,
+        }
+    }
+}
+
+/// The `--permission` net check a fetch applies to every host it dials: the
+/// URL JS passed in (at the op, synchronously) and every redirect hop (in the
+/// transport's loop, before the hop parks for a `connect.lookup` hook or
+/// dials). `None` when the grant covers every host -- no `--permission`, or a
+/// bare `--allow-net` -- so an unrestricted run pays nothing per hop.
+///
+/// Both call sites go through this one closure, so the initial URL and a
+/// redirect cannot be judged by different rules. The rule is
+/// [`Permissions::check_net`] on the URL's HOST ALONE, as the fetch gate has
+/// always applied it:
+///
+/// - The host is the WHATWG serialization (see `oam_core::http_client::
+///   NetTarget`): case, percent-encoding and non-canonical IP spellings are
+///   folded by the URL parser before the grant is asked, so `LOCALHOST`,
+///   `%6c%6fcalhost`, `0x7f.1` and `[0:0::1]` are judged as `localhost`,
+///   `localhost`, `127.0.0.1` and `[::1]`. Userinfo is never part of it.
+/// - A trailing dot is NOT folded: `localhost.` is a different string from a
+///   `localhost` grant, so it is refused. That fails closed; granting it takes
+///   an entry spelled with the dot.
+/// - An IPv6 literal is checked in brackets, so a grant names it `[::1]`.
+/// - The port is not part of the resource. A bare-host entry admits the host
+///   on any port, and a port-scoped entry (`127.0.0.1:8080`) never matches a
+///   fetch -- it grants `net.connect` to that port, not `fetch`. Fail-closed,
+///   and unchanged from the initial-URL gate's behaviour.
+pub fn fetch_net_check(
+    permissions: &std::sync::Arc<Permissions>,
+) -> Option<oam_core::http_client::NetCheck> {
+    if matches!(permissions.net, PermValue::All) {
+        return None;
+    }
+    let permissions = std::sync::Arc::clone(permissions);
+    Some(std::sync::Arc::new(
+        move |target: &oam_core::http_client::NetTarget<'_>| {
+            permissions
+                .check_net(target.host)
+                .map_err(oam_core::AccessDenial::from)
+        },
+    ))
 }
 
 /// Caller-facing descriptor for `JsRuntime::with_permissions`.
@@ -536,6 +588,108 @@ mod tests {
         );
         assert!(p.check_net("[::1]:8080").is_ok());
         assert!(p.check_net("[::2]:8080").is_err());
+    }
+
+    // ------------------------------------------- fetch: every hop, one rule
+
+    fn target(host: &str, port: u16) -> oam_core::http_client::NetTarget<'_> {
+        oam_core::http_client::NetTarget { host, port }
+    }
+
+    #[test]
+    fn fetch_net_check_costs_nothing_when_every_host_is_granted() {
+        // No --permission, and a bare --allow-net: no closure at all, so the
+        // redirect loop does no per-hop work.
+        let unrestricted = std::sync::Arc::new(Permissions::default());
+        assert!(fetch_net_check(&unrestricted).is_none());
+        let bare = std::sync::Arc::new(Permissions::from_opts(Some(PermissionsOptions {
+            net: BoolOrList::Bool(true),
+            ..opts_net_only(vec![])
+        })));
+        assert!(fetch_net_check(&bare).is_none());
+        // Denied outright, or an empty list: a check that refuses.
+        for net in [BoolOrList::Bool(false), BoolOrList::List(vec![])] {
+            let p = std::sync::Arc::new(Permissions::from_opts(Some(PermissionsOptions {
+                net,
+                ..opts_net_only(vec![])
+            })));
+            let check = fetch_net_check(&p).expect("a restricted grant must check");
+            assert!(check(&target("127.0.0.1", 80)).is_err());
+        }
+    }
+
+    #[test]
+    fn fetch_net_check_is_check_net_on_the_host_alone() {
+        let p = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
+            "127.0.0.1",
+            "[::1]",
+            "granted.test",
+            "10.0.0.1:5432",
+        ]))));
+        let check = fetch_net_check(&p).unwrap();
+        // A bare-host entry admits the host on any port.
+        assert!(check(&target("127.0.0.1", 80)).is_ok());
+        assert!(check(&target("127.0.0.1", 65535)).is_ok());
+        assert!(check(&target("[::1]", 8080)).is_ok());
+        assert!(check(&target("granted.test", 443)).is_ok());
+        // The refusal is the synchronous gate's, naming the host.
+        let denial = check(&target("localhost", 80)).unwrap_err();
+        assert_eq!(
+            denial,
+            oam_core::AccessDenial {
+                permission: "Net".to_string(),
+                resource: "localhost".to_string(),
+            }
+        );
+        // A trailing dot is its own name, and a suffix is not the grant.
+        assert!(check(&target("granted.test.", 80)).is_err());
+        assert!(check(&target("granted.test.evil.example", 80)).is_err());
+        // An unbracketed IPv6 host never matches the bracketed entry.
+        assert!(check(&target("::1", 80)).is_err());
+        // A port-scoped entry grants net.connect to that port, never a fetch:
+        // the port is not part of a fetch's resource. Fail-closed.
+        assert!(p.check_net("10.0.0.1:5432").is_ok());
+        assert!(check(&target("10.0.0.1", 5432)).is_err());
+        // The empty host (a URL that did not parse) is never granted.
+        assert!(check(&target("", 80)).is_err());
+    }
+
+    /// The initial URL's host is read by ada (`op_fetch`), a redirect hop's
+    /// by the `url` crate (the transport's loop, which is what dials). Both
+    /// are WHATWG parsers; if they ever disagreed on a host, the same URL
+    /// would get one verdict as the URL a script passed in and another as a
+    /// redirect target. Each spelling here is one a grant could be probed
+    /// with.
+    #[test]
+    fn the_two_fetch_gates_read_the_same_host() {
+        for raw in [
+            "http://LOCALHOST:1/",
+            "http://LocalHost./",
+            "http://%6c%6fcalhost/",
+            "http://[0:0:0:0:0:0:0:1]:8080/",
+            "http://[::FFFF:127.0.0.1]/",
+            "http://0x7f.1/",
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://127.1/",
+            "http://B%C3%BCcher.test/",
+            "http://b\u{fc}cher.test/",
+            "http://u:p@127.0.0.1@localhost/",
+            "http://127.0.0.1:80@localhost:81/",
+            r"http://granted.test\@localhost/",
+            "https://granted.test:443/",
+            "http://granted.test#@localhost/",
+            "http://granted.test?@localhost/",
+        ] {
+            let by_ada = ada_url::Url::parse(raw, None)
+                .ok()
+                .map(|u| u.hostname().to_string());
+            let by_url = url::Url::parse(raw)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string));
+            assert_eq!(by_ada, by_url, "{raw}");
+            assert!(by_ada.is_some(), "{raw} should parse");
+        }
     }
 
     #[test]

@@ -15,6 +15,13 @@
 //! The order of the checks is undici's: the initial bad-port block runs
 //! before the first park (a bad-port URL never reaches the hook), and a
 //! hop's redirect checks, bad port included, run before that hop parks.
+//!
+//! Under `--permission`, the engine's net grant ([`NetCheck`]) is applied to
+//! every hop's host at the top of the loop: before the hop parks for its
+//! lookup hook, before anything dials, and whichever route (pooled, hooked,
+//! proxied) will carry it. The engine's synchronous gate only ever saw the
+//! URL JS passed in; the loop is where a redirect picks the next host, so the
+//! loop is where the grant has to be asked again.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -31,7 +38,7 @@ use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
 use super::transport::{channel_body, empty_body, full_body};
-use super::{HttpTransport, ReqBody, Route};
+use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
 use crate::OutboundBodies;
 use crate::net_connect::attempt_timeout_from_ms;
@@ -140,6 +147,10 @@ struct LoopState {
     hops: u32,
     redirect: RedirectMode,
     decode: bool,
+    /// The `--permission` net grant, asked about every hop's host before it
+    /// is dialled. Carried across a park, so a resumed fetch keeps enforcing
+    /// it. `None`: every host is granted.
+    net_check: Option<NetCheck>,
 }
 
 enum BodySource {
@@ -193,6 +204,10 @@ fn is_idempotent(method: &http::Method) -> bool {
 /// The fetch op. Resolves at the response head with the payload JSON (the
 /// body stays in `bodies` under `bodyHandle`), or in hook mode possibly with
 /// a lookup request (see the module docs).
+///
+/// `net_check` is the `--permission` net grant (`None` when it covers every
+/// host). It is a parameter rather than a [`FetchRequest`] field because the
+/// request is JSON from JS, and nothing JS sends may widen or drop it.
 pub async fn fetch(
     transport: HttpTransport,
     req: FetchRequest,
@@ -200,6 +215,7 @@ pub async fn fetch(
     ids: Arc<AtomicU64>,
     outbound: OutboundBodies,
     continuations: FetchContinuations,
+    net_check: Option<NetCheck>,
 ) -> OpOutcome {
     // Claimed first, so every early return below releases the receiver.
     let stream = req
@@ -247,6 +263,7 @@ pub async fn fetch(
         hops: 0,
         redirect: req.redirect,
         decode: req.decode,
+        net_check,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -311,6 +328,15 @@ async fn run(
     continuations: &FetchContinuations,
 ) -> OpOutcome {
     let response = loop {
+        // The net grant, before this hop parks for its lookup hook or dials.
+        // Every hop: the first (which the engine's synchronous gate also
+        // checked, on its own parse of the URL JS sent) and each redirect
+        // target. A hop resumed after a park is asked again -- the grant
+        // cannot have changed, and asking is cheaper than tracking it.
+        if let Some(denial) = net_denial(&state) {
+            state.source.request_failed();
+            return OpOutcome::AccessDenied(denial);
+        }
         // A Follow URL can hold a host `http::Uri` refuses (`"`, `` ` ``,
         // `{`, `}`): reqwest failed those as a builder error too.
         let uri = match prepare::to_uri(&state.current) {
@@ -437,6 +463,26 @@ async fn run(
         }
     };
     respond(state, response, bodies, ids)
+}
+
+/// The net grant's verdict on the hop in `state`, or `None` when it may be
+/// dialled (or no grant restricts it).
+///
+/// The host is the one the connector will resolve: `host_str` of the same
+/// `url::Url` [`prepare::to_uri`] turns into the request URI, so no spelling
+/// of the Location (case, percent-encoding, a non-canonical IPv4 or IPv6
+/// literal, userinfo) can put one host in front of the check and another in
+/// front of the dialler. An http(s) URL always has a host; were one ever to
+/// lack it, the check is asked about the empty host, which no allow-list
+/// grants.
+fn net_denial(state: &LoopState) -> Option<crate::AccessDenial> {
+    let check = state.net_check.as_ref()?;
+    let url = &state.current;
+    let target = NetTarget {
+        host: url.host_str().unwrap_or_default(),
+        port: url.port_or_known_default().unwrap_or_default(),
+    };
+    check(&target).err()
 }
 
 /// A response header value as JS sees it: latin1, one code point per byte.

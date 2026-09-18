@@ -1995,6 +1995,7 @@ dependencies = [
  "sha2",
  "sysinfo",
  "tokio-tungstenite",
+ "url",
  "v8",
  "x509-parser",
 ]

@@ -5422,6 +5422,324 @@ try {
     server.join().unwrap();
 }
 
+/// A thread-per-connection HTTP/1.1 server for the redirect-permission test:
+/// each connection is one request (head plus a content-length body), recorded
+/// as `METHOD target`, answered with `reply(target)` and closed.
+fn spawn_one_shot_http(
+    listener: std::net::TcpListener,
+    reply: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use std::io::{Read, Write};
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reply = std::sync::Arc::new(reply);
+    let record = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let record = record.clone();
+            let reply = reply.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let mut lines = head.lines();
+                let mut request_line = lines.next().unwrap_or_default().split_whitespace();
+                let method = request_line.next().unwrap_or_default().to_string();
+                let target = request_line.next().unwrap_or_default().to_string();
+                let length: usize = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut have = buf.len() - head_end;
+                while have < length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => have += n,
+                    }
+                }
+                record.lock().unwrap().push(format!("{method} {target}"));
+                let _ = stream.write_all(reply(&target).as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    seen
+}
+
+/// `oam` with no environment proxy: this test is about where a fetch goes,
+/// and a proxy inherited from the shell would change that.
+fn oam_without_proxy_env(args: &[&str]) -> Output {
+    let cache = write_temp("oam-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.args(args).env("OAM_CACHE_DIR", cache);
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ] {
+        cmd.env_remove(name);
+    }
+    cmd.output().expect("oam binary runs")
+}
+
+/// `--allow-net` is enforced on every redirect hop, not only on the URL the
+/// script passed in. The grant was checked once, on the initial URL, and the
+/// redirect loop that follows runs natively, so a granted host that answered
+/// `302 Location: http://<ungranted host>/` handed the script a response from
+/// a host it was never granted -- through `fetch`, `http.request` and
+/// `undici.request`, on the pooled route and on a `connect.lookup`-hooked one
+/// (whose hook was asked about the ungranted name and whose address answer,
+/// 127.0.0.1, WAS granted). Present in 0.16.1 and every release before it.
+///
+/// Under `--allow-net=127.0.0.1,granted.invalid`, the granted origin
+/// (127.0.0.1) redirects each request to a target named by the case:
+///
+///  - every spelling of an ungranted host is refused with the same
+///    `ERR_ACCESS_DENIED` a direct request gets, naming the host as the URL
+///    parser normalised it (`LOCALHOST` and `%6c%6fcalhost` are `localhost`,
+///    `[0:0:0:0:0:0:0:1]` is `[::1]`; `localhost.` stays itself, which no
+///    grant for `localhost` covers), and the target server never sees a
+///    request -- not even the re-sent body of a 307 POST;
+///  - a userinfo Location that names 127.0.0.1 before the `@` is still a hop
+///    to `localhost`, and fails on the redirect's own credentials rule;
+///  - a granted hop (`127.0.0.1`, or `0x7f.1`, the same address) is followed;
+///  - on the hooked route, the ungranted name is refused before the hook is
+///    asked to resolve it: the hook only ever sees granted names.
+///
+/// With no `--permission`, and with a bare `--allow-net`, the same redirects
+/// are followed as before.
+#[test]
+fn allow_net_is_enforced_on_every_redirect_hop() {
+    let script = write_temp(
+        "redirect_permission/main.mjs",
+        r#"import http from 'node:http';
+import { Agent, request } from 'undici';
+const outer = Number(process.argv[2]);
+const inner = Number(process.argv[3]);
+const full = process.argv[4] === 'full';
+const url = (api, c) => `http://127.0.0.1:${outer}/${api}/${c}`;
+const shapes = new Set();
+const fail = (e) => {
+  if (e && e.code === 'ERR_ACCESS_DENIED') {
+    shapes.add(`${e.constructor.name}|${e.message}|${Object.keys(e).join(',')}`);
+    return `DENIED ${e.permission} ${JSON.stringify(e.resource)}`;
+  }
+  return `ERR ${e?.name}: ${e?.message} / ${e?.cause?.message}`;
+};
+const viaFetch = async (target, init) => {
+  try {
+    const r = await fetch(target, init);
+    return `${r.status} ${await r.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const viaHttp = (c) =>
+  new Promise((resolve) => {
+    const req = http.request(url('http', c), (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve(`${res.statusCode} ${body}`));
+    });
+    req.on('error', (e) => resolve(fail(e)));
+    req.end();
+  });
+const viaUndici = async (c) => {
+  try {
+    const r = await request(url('undici', c));
+    return `${r.statusCode} ${await r.body.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const hookCalls = [];
+const agent = new Agent({
+  connect: {
+    lookup: (host, _opts, cb) => {
+      hookCalls.push(host);
+      cb(null, [{ address: '127.0.0.1', family: 4 }]);
+    },
+  },
+});
+const viaHook = (c) =>
+  viaFetch(`http://granted.invalid:${outer}/hook/${c}`, { dispatcher: agent });
+
+const lines = [];
+if (full) {
+  for (const c of ['localhost', 'upper', 'dot', 'pct', 'v6', 'v6long', 'userinfo', 'ip', 'hex']) {
+    lines.push(`fetch ${c} ${await viaFetch(url('fetch', c))}`);
+  }
+  lines.push(`fetch307 localhost ${await viaFetch(url('fetch307', 'localhost'), { method: 'POST', body: 'payload' })}`);
+  lines.push(`http localhost ${await viaHttp('localhost')}`);
+  lines.push(`http ip ${await viaHttp('ip')}`);
+  lines.push(`undici localhost ${await viaUndici('localhost')}`);
+  lines.push(`undici ip ${await viaUndici('ip')}`);
+  lines.push(`hook denied ${await viaHook('denied')}`);
+  lines.push(`hook granted ${await viaHook('granted')}`);
+  lines.push(`direct ${await viaFetch(`http://localhost:${inner}/direct`)}`);
+} else {
+  lines.push(`fetch localhost ${await viaFetch(url('fetch', 'localhost'))}`);
+  lines.push(`http localhost ${await viaHttp('localhost')}`);
+  lines.push(`undici localhost ${await viaUndici('localhost')}`);
+  lines.push(`hook denied ${await viaHook('denied')}`);
+}
+lines.push(`hook-calls ${JSON.stringify(hookCalls)}`);
+lines.push(`shapes ${JSON.stringify([...shapes])}`);
+console.log(lines.join('\n'));
+"#,
+    );
+    let run = |flags: &[&str], mode: &str| {
+        // Fresh servers per run, so each run's hits are its own.
+        let inner_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let inner = inner_listener.local_addr().unwrap().port();
+        let inner_seen = spawn_one_shot_http(inner_listener, |target| {
+            let body = format!("inner {target}");
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        // The IPv6 cases aim at a real [::1] listener where the box has one,
+        // so "no request arrived" is asserted there too.
+        let (inner6, inner6_seen) = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(listener) => {
+                let port = listener.local_addr().unwrap().port();
+                let seen = spawn_one_shot_http(listener, |_| {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\ninner6"
+                        .to_string()
+                });
+                (port, Some(seen))
+            }
+            Err(_) => (inner, None),
+        };
+        let outer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let outer = outer_listener.local_addr().unwrap().port();
+        spawn_one_shot_http(outer_listener, move |target| {
+            let mut parts = target.trim_start_matches('/').splitn(2, '/');
+            let api = parts.next().unwrap_or_default();
+            let case = parts.next().unwrap_or_default();
+            let authority = match case {
+                "localhost" => format!("localhost:{inner}"),
+                "upper" => format!("LOCALHOST:{inner}"),
+                "dot" => format!("localhost.:{inner}"),
+                "pct" => format!("%6c%6fcalhost:{inner}"),
+                "v6" => format!("[::1]:{inner6}"),
+                "v6long" => format!("[0:0:0:0:0:0:0:1]:{inner6}"),
+                "userinfo" => format!("127.0.0.1:{inner}@localhost:{inner}"),
+                "ip" => format!("127.0.0.1:{inner}"),
+                "hex" => format!("0x7f.1:{inner}"),
+                "denied" => format!("denied.invalid:{inner}"),
+                "granted" => format!("granted.invalid:{inner}"),
+                _ => return "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_string(),
+            };
+            let status = if api == "fetch307" {
+                "307 Temporary Redirect"
+            } else {
+                "302 Found"
+            };
+            format!(
+                "HTTP/1.1 {status}\r\nlocation: http://{authority}{target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+        });
+        let path = script.to_str().unwrap().to_string();
+        let (outer, inner) = (outer.to_string(), inner.to_string());
+        let mut argv: Vec<&str> = flags.to_vec();
+        argv.extend(["--", &path, &outer, &inner, mode]);
+        let out = oam_without_proxy_env(&argv);
+        let stdout = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{argv:?}: {stdout}\n{stderr}");
+        let inner_seen = inner_seen.lock().unwrap().clone();
+        let inner6_seen = inner6_seen.map(|seen| seen.lock().unwrap().clone());
+        (stdout, stderr, inner_seen, inner6_seen)
+    };
+
+    let granted = "--allow-net=127.0.0.1,granted.invalid";
+    let (stdout, stderr, inner_seen, inner6_seen) = run(&["--permission", granted], "full");
+    let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    assert_eq!(
+        stdout,
+        [
+            r#"fetch localhost DENIED Net "localhost""#,
+            r#"fetch upper DENIED Net "localhost""#,
+            r#"fetch dot DENIED Net "localhost.""#,
+            r#"fetch pct DENIED Net "localhost""#,
+            r#"fetch v6 DENIED Net "[::1]""#,
+            r#"fetch v6long DENIED Net "[::1]""#,
+            r#"fetch userinfo ERR TypeError: fetch failed / cross origin not allowed for request mode "cors""#,
+            "fetch ip 200 inner /fetch/ip",
+            "fetch hex 200 inner /fetch/hex",
+            r#"fetch307 localhost DENIED Net "localhost""#,
+            r#"http localhost DENIED Net "localhost""#,
+            "http ip 200 inner /http/ip",
+            r#"undici localhost DENIED Net "localhost""#,
+            "undici ip 200 inner /undici/ip",
+            r#"hook denied DENIED Net "denied.invalid""#,
+            "hook granted 200 inner /hook/granted",
+            r#"direct DENIED Net "localhost""#,
+            // The outer origin twice (the second fetch is a new hooked
+            // client), then the granted hop. Never `denied.invalid`.
+            r#"hook-calls ["granted.invalid","granted.invalid","granted.invalid"]"#,
+            // A refused hop and the refused initial URL are the same error.
+            &format!(r#"shapes ["{denied}"]"#),
+        ]
+        .join("\n"),
+        "stderr: {stderr}"
+    );
+    // Only the granted hops arrived: nothing refused reached a server.
+    assert_eq!(
+        inner_seen,
+        [
+            "GET /fetch/ip",
+            "GET /fetch/hex",
+            "GET /http/ip",
+            "GET /undici/ip",
+            "GET /hook/granted",
+        ]
+    );
+    if let Some(seen) = inner6_seen {
+        assert!(seen.is_empty(), "a refused IPv6 hop was dialled: {seen:?}");
+    }
+
+    // No --permission, and a bare --allow-net: the redirects are followed.
+    let followed = [
+        "fetch localhost 200 inner /fetch/localhost",
+        "http localhost 200 inner /http/localhost",
+        "undici localhost 200 inner /undici/localhost",
+        "hook denied 200 inner /hook/denied",
+        r#"hook-calls ["granted.invalid","denied.invalid"]"#,
+        "shapes []",
+    ]
+    .join("\n");
+    for flags in [&[][..], &["--permission", "--allow-net"][..]] {
+        let (stdout, stderr, inner_seen, _) = run(flags, "off");
+        assert_eq!(stdout, followed, "{flags:?} stderr: {stderr}");
+        assert_eq!(inner_seen.len(), 4, "{flags:?}: {inner_seen:?}");
+    }
+}
+
 /// The request shapes conformance case 114 cannot assert, because node's own
 /// http server cannot parse them or because node never answers at all.
 ///

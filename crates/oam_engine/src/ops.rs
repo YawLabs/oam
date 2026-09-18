@@ -315,19 +315,39 @@ fn op_fetch(
             return;
         }
     };
-    // Net permission gate: check the hostname extracted from the URL.
-    {
-        let host = ada_url::Url::parse(&request.url, None)
-            .ok()
+    // Net permission gate. The same check goes into the transport's loop,
+    // which asks it again about every host the fetch is about to dial:
+    // checking only the URL JS passed in let a granted host's 302 lead the
+    // fetch anywhere (a host the grant never named, loopback, a metadata
+    // address). Here it is asked about the initial URL synchronously, so a
+    // refused URL throws before anything starts; `None` = every host granted.
+    let permissions = scope
+        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
+        .cloned()
+        .unwrap_or_default();
+    let net_check = crate::permissions::fetch_net_check(&permissions);
+    if let Some(check) = &net_check {
+        let parsed = ada_url::Url::parse(&request.url, None).ok();
+        let host = parsed
+            .as_ref()
             .map(|u| u.hostname().to_string())
             .unwrap_or_default();
-        if let Err(denial) = scope
-            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-            .cloned()
-            .unwrap_or_default()
-            .check_net(&host)
-        {
-            crate::node_ops::throw_permission_denied(scope, &denial);
+        let port = parsed
+            .as_ref()
+            .and_then(|u| match u.port() {
+                "" => match u.protocol() {
+                    "https:" => Some(443),
+                    "http:" => Some(80),
+                    _ => None,
+                },
+                explicit => explicit.parse().ok(),
+            })
+            .unwrap_or_default();
+        let target = oam_core::http_client::NetTarget { host: &host, port };
+        if let Err(denial) = check(&target) {
+            let exception =
+                crate::node_ops::access_denied_error(scope, &denial.permission, &denial.resource);
+            scope.throw_exception(exception);
             return;
         }
     }
@@ -340,19 +360,28 @@ fn op_fetch(
     spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::fetch(transport, request, bodies, ids, outbound, continuations),
+        oam_core::ops::fetch(
+            transport,
+            request,
+            bodies,
+            ids,
+            outbound,
+            continuations,
+            net_check,
+        ),
     );
 }
 
 /// `__oam.fetchContinue(token, answerJson)`: resume the fetch parked under
 /// `token` with its lookup hook's answer (`{"ips": [...]}`). Settles like
 /// `fetch`: a response, a failure, or the next hop's lookup request. The
-/// `--permission` net check in `op_fetch` covers the initial URL only; a
-/// redirect hop is not checked there either.
+/// hop's HOST was checked against the `--permission` net grant before it
+/// parked (the parked loop carries the check from `op_fetch`, and asks it
+/// about every later hop too).
 ///
 /// Every address the hook hands back IS checked here, because the hook
-/// decides where the grant's host is dialled. `op_fetch` only sees the URL's
-/// hostname, so `--allow-net=granted.invalid` plus a hook answering
+/// decides where the grant's host is dialled. The check before the park sees
+/// only the host NAME, so `--allow-net=granted.invalid` plus a hook answering
 /// `127.0.0.1` used to be a grant to connect ANYWHERE -- to loopback, to a
 /// link-local metadata address, to an RFC 1918 host -- while the wire still
 /// carried the granted name. An address is checked exactly as a URL naming it
@@ -702,6 +731,13 @@ pub(crate) fn settle_completion(
         OpOutcome::NodeAggregateFailed { errors } => {
             let error = aggregate_error(tc, &errors);
             let error = v8::Local::new(tc, &error);
+            resolver.reject(tc, error);
+        }
+        // The error a synchronous gate throws, rejected instead: a refusal
+        // the op raised mid-flight must read exactly like one raised at entry.
+        OpOutcome::AccessDenied(denial) => {
+            let error =
+                crate::node_ops::access_denied_error(tc, &denial.permission, &denial.resource);
             resolver.reject(tc, error);
         }
         // Handled by the SIGNAL_OP_ID early return above; a Signal outcome on a

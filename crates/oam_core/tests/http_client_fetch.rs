@@ -19,8 +19,8 @@ use oam_core::http_client::body::{self, BODY_READ_FAILED, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
 use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, INVALID_URL};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
-use oam_core::http_client::{HttpTransport, ProxySource};
-use oam_core::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
+use oam_core::http_client::{HttpTransport, NetCheck, NetTarget, ProxySource};
+use oam_core::{AccessDenial, BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------- harness
@@ -34,6 +34,8 @@ struct Reg {
     continuations: FetchContinuations,
     cancelled: CancelledBodies,
     signal: BodyCancelSignal,
+    /// The `--permission` net check every fetch gets (`None`: unrestricted).
+    net_check: Option<NetCheck>,
 }
 
 impl Reg {
@@ -45,6 +47,15 @@ impl Reg {
             continuations: Arc::new(Mutex::new(HashMap::new())),
             cancelled: Arc::new(Mutex::new(HashSet::new())),
             signal: Arc::new(tokio::sync::Notify::new()),
+            net_check: None,
+        }
+    }
+
+    /// A registry whose fetches carry `check`.
+    fn with_net_check(check: NetCheck) -> Reg {
+        Reg {
+            net_check: Some(check),
+            ..Reg::new()
         }
     }
 
@@ -57,6 +68,7 @@ impl Reg {
             self.ids.clone(),
             self.outbound.clone(),
             self.continuations.clone(),
+            self.net_check.clone(),
         )
         .await
     }
@@ -1650,6 +1662,321 @@ async fn lookup_same_host_and_ip_literal_hops_do_not_park() {
     .await;
 }
 
+// ---------------------------------------------------------------- net permission
+//
+// The engine hands the loop its `--permission` net grant as a closure; these
+// drive the loop with a stand-in that grants a fixed set of hosts and records
+// every target it is asked about. What it proves is the plumbing: the loop
+// asks about every hop, before the hop is dialled and before it parks for a
+// lookup hook, about the destination and not a proxy, and a refusal fails the
+// fetch with the verdict. The grant's own matching is the engine's (tested
+// there and end to end).
+
+type Asked = Arc<Mutex<Vec<(String, u16)>>>;
+
+/// A check granting exactly `allowed`, and the targets it was asked about.
+fn recording_check(allowed: &'static [&'static str]) -> (NetCheck, Asked) {
+    let asked: Asked = Arc::new(Mutex::new(Vec::new()));
+    let record = asked.clone();
+    let check: NetCheck = Arc::new(move |target: &NetTarget<'_>| {
+        record
+            .lock()
+            .unwrap()
+            .push((target.host.to_string(), target.port));
+        if allowed.contains(&target.host) {
+            Ok(())
+        } else {
+            Err(net(target.host))
+        }
+    });
+    (check, asked)
+}
+
+fn net(resource: &str) -> AccessDenial {
+    AccessDenial {
+        permission: "Net".to_string(),
+        resource: resource.to_string(),
+    }
+}
+
+fn refused(outcome: OpOutcome) -> AccessDenial {
+    match outcome {
+        OpOutcome::AccessDenied(denial) => denial,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+fn asked(record: &Asked) -> Vec<(String, u16)> {
+    record.lock().unwrap().clone()
+}
+
+/// A redirect to a host the grant does not cover fails the fetch with the
+/// refusal, and the host is never dialled: not for a GET, and not for the
+/// re-sent body of a 307 POST. The check was asked about the first hop too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_redirect_hop_is_never_dialled() {
+    within(async {
+        let target = serve_replies(|_| response("200 OK", &[], b"secret")).await;
+        let target_port = target.port;
+        let origin = serve_replies(move |r| {
+            let status = if r.head.method == "POST" {
+                "307 Temporary Redirect"
+            } else {
+                "302 Found"
+            };
+            let next = format!("http://localhost:{target_port}/secret");
+            response(status, &[("location", &next)], b"")
+        })
+        .await;
+        let (check, record) = recording_check(&["127.0.0.1"]);
+        let reg = Reg::with_net_check(check);
+        let url = format!("http://127.0.0.1:{}/start", origin.port);
+
+        let get = reg.fetch(&plain(), json!({ "url": url })).await;
+        assert_eq!(refused(get), net("localhost"));
+        let post = reg
+            .fetch(
+                &plain(),
+                json!({ "url": url, "method": "POST", "body": "payload" }),
+            )
+            .await;
+        assert_eq!(refused(post), net("localhost"));
+
+        assert_eq!(target.accepts(), 0, "a refused hop was dialled");
+        assert_eq!(origin.seen().len(), 2);
+        let hop = ("localhost".to_string(), target.port);
+        let first = ("127.0.0.1".to_string(), origin.port);
+        assert_eq!(asked(&record), [first.clone(), hop.clone(), first, hop]);
+    })
+    .await;
+}
+
+/// Granted hops are followed, and the check is asked about each one, with
+/// the port it will be dialled on (the scheme default when the URL names
+/// none). With no check, the same chain is followed without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn granted_hops_are_followed_and_each_is_checked() {
+    within(async {
+        let end = serve_replies(|_| response("200 OK", &[], b"end")).await;
+        let end_port = end.port;
+        let mid = serve_replies(move |_| {
+            let next = format!("http://127.0.0.1:{end_port}/end");
+            response("302 Found", &[("location", &next)], b"")
+        })
+        .await;
+        let mid_port = mid.port;
+        let origin = serve_replies(move |_| {
+            let next = format!("http://127.0.0.1:{mid_port}/mid");
+            response("301 Moved Permanently", &[("location", &next)], b"")
+        })
+        .await;
+        let url = format!("http://127.0.0.1:{}/", origin.port);
+        let (check, record) = recording_check(&["127.0.0.1"]);
+        for reg in [Reg::with_net_check(check), Reg::new()] {
+            let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+            assert_eq!(p["status"], 200);
+            assert_eq!(p["redirected"], true);
+            assert_eq!(reg.text(handle_of(&p)).await, "end");
+        }
+        let ip = |port| ("127.0.0.1".to_string(), port);
+        assert_eq!(
+            asked(&record),
+            [ip(origin.port), ip(mid.port), ip(end.port)]
+        );
+
+        // No port in the URL: the scheme's default is what gets dialled.
+        let (check, record) = recording_check(&[]);
+        let reg = Reg::with_net_check(check);
+        for (url, host, port) in [
+            ("http://example.test/", "example.test", 80),
+            ("https://example.test/", "example.test", 443),
+        ] {
+            assert_eq!(
+                refused(reg.fetch(&plain(), json!({ "url": url })).await),
+                net(host)
+            );
+            assert_eq!(asked(&record).pop(), Some((host.to_string(), port)));
+        }
+    })
+    .await;
+}
+
+/// The check sees the host the dialler will resolve: the URL parser's
+/// normalisation of the Location, never its raw spelling. Case,
+/// percent-encoding, IDNA and non-canonical IP literals are folded before the
+/// check is asked; a trailing dot is not (`localhost.` is its own name). A
+/// spelling that normalises to a granted address is followed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_sees_the_normalised_host() {
+    within(async {
+        let target = serve_replies(|_| response("200 OK", &[], b"target")).await;
+        let port = target.port;
+        let origin = serve_replies(move |r| {
+            // The Location's authority is the request path, verbatim.
+            let authority = r.head.target.trim_start_matches('/');
+            let next = format!("http://{authority}/");
+            response("302 Found", &[("location", &next)], b"")
+        })
+        .await;
+        let (check, record) = recording_check(&["127.0.0.1"]);
+        let reg = Reg::with_net_check(check);
+        let refusals = [
+            (format!("LOCALHOST:{port}"), "localhost"),
+            (format!("LocalHost:{port}"), "localhost"),
+            (format!("%6c%6fcalhost:{port}"), "localhost"),
+            (format!("localhost.:{port}"), "localhost."),
+            (format!("[0:0:0:0:0:0:0:1]:{port}"), "[::1]"),
+            (format!("[::FFFF:127.0.0.1]:{port}"), "[::ffff:7f00:1]"),
+            (format!("xn--bcher-kva.test:{port}"), "xn--bcher-kva.test"),
+            (format!("B%C3%BCcher.test:{port}"), "xn--bcher-kva.test"),
+        ];
+        for (authority, host) in &refusals {
+            let url = format!("http://127.0.0.1:{}/{authority}", origin.port);
+            let outcome = reg.fetch(&plain(), json!({ "url": url })).await;
+            assert_eq!(refused(outcome), net(host), "{authority}");
+            assert_eq!(asked(&record).pop().unwrap().0, *host, "{authority}");
+        }
+        assert_eq!(target.accepts(), 0, "a refused spelling was dialled");
+
+        // The same address, spelled another way, IS the granted host.
+        for authority in [format!("0x7f.1:{port}"), format!("2130706433:{port}")] {
+            let url = format!("http://127.0.0.1:{}/{authority}", origin.port);
+            let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+            assert_eq!(p["status"], 200, "{authority}");
+            reg.text(handle_of(&p)).await;
+            assert_eq!(
+                asked(&record).pop(),
+                Some(("127.0.0.1".to_string(), port)),
+                "{authority}"
+            );
+        }
+        assert_eq!(target.accepts(), 2);
+    })
+    .await;
+}
+
+/// On the hooked route the check comes before the park: a refused hop fails
+/// without asking the hook to resolve its name (the hook only ever sees
+/// granted names), and so does a refused first host. The check travels with
+/// the parked fetch, so the resumed loop still enforces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_runs_before_a_hop_parks_for_its_lookup_hook() {
+    within(async {
+        let target = serve_replies(|_| response("200 OK", &[], b"b")).await;
+        let target_port = target.port;
+        let origin = serve_replies(move |_| {
+            let next = format!("http://b.test:{target_port}/");
+            response("302 Found", &[("location", &next)], b"")
+        })
+        .await;
+        let (check, record) = recording_check(&["a.test"]);
+        let reg = Reg::with_net_check(check);
+        let t = plain();
+
+        let first = reg
+            .fetch(
+                &t,
+                json!({ "url": format!("http://a.test:{}/", origin.port), "lookup_hook": true }),
+            )
+            .await;
+        let (token, host, _) = lookup_of(first);
+        assert_eq!(host, "a.test");
+        assert_eq!(reg.parked(), 1);
+        let outcome = reg.resume(token, &["127.0.0.1"]).await;
+        assert_eq!(refused(outcome), net("b.test"));
+        assert_eq!(reg.parked(), 0);
+        assert_eq!(origin.seen().len(), 1);
+        assert_eq!(target.accepts(), 0);
+
+        // A refused first host never parks.
+        let outcome = reg
+            .fetch(
+                &t,
+                json!({ "url": format!("http://b.test:{target_port}/"), "lookup_hook": true }),
+            )
+            .await;
+        assert_eq!(refused(outcome), net("b.test"));
+        assert_eq!(reg.parked(), 0);
+        assert_eq!(target.accepts(), 0);
+
+        let hosts: Vec<String> = asked(&record).into_iter().map(|(h, _)| h).collect();
+        // a.test before its park and again when the loop resumes, then the
+        // refused hop; then the refused first host.
+        assert_eq!(hosts, ["a.test", "a.test", "b.test", "b.test"]);
+    })
+    .await;
+}
+
+/// Behind an environment proxy the check is asked about the destination, not
+/// the proxy: the proxy carries the first request, answers it with a
+/// redirect, and the refused hop never reaches the proxy either.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_check_is_asked_about_the_destination_not_the_proxy() {
+    within(async {
+        let next = closed_port().await;
+        let reply: &'static [u8] = Box::leak(
+            response(
+                "302 Found",
+                &[("location", &format!("http://localhost:{next}/"))],
+                b"",
+            )
+            .into_boxed_slice(),
+        );
+        let proxy = proxy(None, reply).await;
+        let rules = Matcher::builder()
+            .http(format!("http://127.0.0.1:{}", proxy.port))
+            .build();
+        let t = transport(ProxySource::Fixed(Box::new(rules)));
+        let (check, record) = recording_check(&["dest.test"]);
+        let reg = Reg::with_net_check(check);
+
+        let outcome = reg
+            .fetch(&t, json!({ "url": "http://dest.test:8080/start" }))
+            .await;
+        assert_eq!(refused(outcome), net("localhost"));
+        let seen: Vec<String> = proxy.seen().into_iter().map(|r| r.head.target).collect();
+        assert_eq!(seen, ["http://dest.test:8080/start"]);
+        assert_eq!(
+            asked(&record),
+            [
+                ("dest.test".to_string(), 8080),
+                ("localhost".to_string(), next)
+            ]
+        );
+    })
+    .await;
+}
+
+/// A refusal releases a streamed request body like any other failure: a
+/// producer blocked on a full channel is let go instead of hanging.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_releases_a_streamed_body() {
+    within(async {
+        let (check, _) = recording_check(&[]);
+        let reg = Reg::with_net_check(check);
+        let (handle, tx) = reg.channel(1);
+        tx.try_send(Ok(b"fill".to_vec())).unwrap();
+        let blocked = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.send(Ok(b"more".to_vec())).await.is_err() }
+        });
+        let outcome = reg
+            .fetch(
+                &plain(),
+                json!({ "url": "http://refused.test/", "method": "POST", "body_stream": handle }),
+            )
+            .await;
+        assert_eq!(refused(outcome), net("refused.test"));
+        let released = tokio::time::timeout(Duration::from_secs(2), blocked)
+            .await
+            .expect("the blocked write never resolved")
+            .unwrap();
+        assert!(released);
+        assert_eq!(reg.entry(handle), None);
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- static
 
 fn assert_send<T: Send>() {}
@@ -1670,6 +1997,7 @@ fn static_checks() {
         reg.ids.clone(),
         reg.outbound.clone(),
         reg.continuations.clone(),
+        reg.net_check.clone(),
     ));
     assert_op_future(send::fetch_continue(
         1,
