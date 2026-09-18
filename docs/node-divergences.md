@@ -1468,12 +1468,15 @@ different answer:
   `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
   and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
   `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
-  values and `Transfer-Encoding` codings other than a final `chunked` stay refused.
+  values, `Transfer-Encoding` codings other than a final `chunked`, and whitespace after
+  a chunk size stay refused.
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
-  implement).
-- A malformed chunked body gets no `400`: the handler was already running, so the request
-  stream errors and the connection closes.
+  implement); whitespace or other bytes inside a chunk extension (`3;e =1`), which hyper
+  skips unread.
+- A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
+  extensions over the limit) when the handler has not responded yet, and the handler's
+  request aborts with `ECONNRESET`, as in Node.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone), except on the upgrade path, which
   writes Node's bytes. There is no `'clientError'` event.
@@ -1487,7 +1490,7 @@ different answer:
   effect there and not here.
 
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
-request heads over TCP.
+request heads over TCP, and 16 chunked bodies.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

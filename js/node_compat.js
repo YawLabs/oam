@@ -17392,7 +17392,17 @@
             // rather than producing a status.
             this._reading = false;
             this._bodyDone = true;
-            this.destroy(err instanceof Error ? err : new Error(String(err)));
+            // A body the connection failed on -- malformed (node's parser
+            // refused it) or cut short -- ends the exchange the way a lost
+            // socket does in node: 'aborted', then ECONNRESET "aborted".
+            const text = err instanceof Error ? err.message : String(err);
+            if (text.startsWith("request body: ")) {
+              const reset = new Error("aborted");
+              reset.code = "ECONNRESET";
+              this.destroy(reset);
+              return;
+            }
+            this.destroy(err instanceof Error ? err : new Error(text));
           },
         );
       }

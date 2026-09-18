@@ -86,28 +86,38 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
   `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
   and in `NODE_OPTIONS`.
-- **The `http` server took requests that were not upgrades for upgrades, and leaked
-  their sockets.** Any connection whose first bytes contained a `connection:` line
-  mentioning `upgrade` -- in a request body, or without any `Upgrade` header -- was
-  handed to the `'upgrade'` event, and with no `'upgrade'` listener the socket was never
-  answered or closed, outside the server's connection limit. A request is now an upgrade
-  only when its head has an `Upgrade` header and `upgrade` in `Connection`, as in Node;
-  anything else is an ordinary request, and an upgrade nobody listens for is closed.
-- **A bare LF in a chunked body's trailers was not refused.** The trailer reader and
-  the trailer parser disagreed about where the trailers end, so bytes after a bare-LF
-  blank line were read and silently dropped while the connection stayed open. Such a
-  body now fails and the connection is closed (Node answers `400`). The same applies to
-  chunked responses read by `fetch` and `http.request`.
+- **The `http` server could treat an ordinary request as an upgrade and leak its
+  socket.** Whether a connection was an upgrade was decided from its first bytes rather
+  than from the request head, so requests that were not upgrades could be handed to the
+  `'upgrade'` event; with no `'upgrade'` listener such a socket was never answered or
+  closed, and it no longer counted against the server's connection limit. A request is
+  now an upgrade only when its head has an `Upgrade` header and `upgrade` in
+  `Connection`, as in Node; anything else is an ordinary request, and an upgrade nobody
+  listens for is closed.
+- **A bare LF in a chunked body's trailers was not refused.** hyper's trailer reader and
+  its trailer parser disagreed about where the trailers end, so part of what followed
+  was read and discarded while the connection stayed open. Such a body is now answered
+  `400` and the connection is closed, as in Node. The same applies to chunked responses
+  read by `fetch` and `http.request`, which now fail.
+- **Whitespace after a chunk size was accepted.** A chunked request body whose size line
+  had spaces or tabs after the size was read as if they were not there, where Node, and
+  other parsers, refuse the line; a proxy in front of the server can frame such a body
+  differently. It is now answered `400` and the connection is closed, as in Node (also
+  under `insecureHTTPParser`, which Node relaxes here). Any other chunked body the
+  parser refuses is now answered with Node's status too -- `400`, or `413` for chunk
+  extensions over the limit -- where the connection used to close without one, and the
+  handler sees its request abort with `ECONNRESET`. `https` and `http2.createServer`
+  servers no longer hand a handler a body that failed part way as if it were complete.
 - **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
   and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
   head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
   for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
   and a cause coded `UND_ERR_HEADERS_OVERFLOW`, the others fail with a cause coded
   `HPE_HEADER_OVERFLOW`.
-- **One silent connection stopped an `http` server from accepting.** The server waited
-  for each new connection's first bytes before accepting the next, so a client that
-  connected and sent nothing (a browser preconnect, or anyone) held every later client
-  off until it spoke or closed. Each connection is now read on its own task.
+- **One idle connection stopped an `http` server from accepting.** The server waited
+  for a new connection's first bytes before accepting the next one, so a connection
+  that sent nothing, such as a browser preconnect, kept every later client waiting. Each
+  connection is now read on its own task.
 - **The `h2` crate is updated from 0.4.14 to 0.4.19**, which bounds the number of empty
   HTTP/2 DATA frames a peer can have queued (RUSTSEC-2026-0258, GHSA-q83h-524g-xf6h: a
   low-severity denial of service against a stream that is not being read). oam's

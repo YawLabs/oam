@@ -581,9 +581,11 @@ fn a_bare_lf_in_the_trailers_fails_the_request() {
            3\r\nabc\r\n0\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
     ] {
         let ex = exchange(target, None, bytes, Duration::from_secs(5));
-        assert!(
-            !ex.response.contains("HTTP/1.1 200"),
-            "the request must not complete: {:?}",
+        // node answers 400; the handler sees the request abort.
+        assert_eq!(
+            ex.statuses(),
+            ["HTTP/1.1 400 Bad Request"],
+            "{:?}",
             ex.response
         );
         assert!(ex.closed, "the connection must close: {:?}", ex.response);
@@ -618,4 +620,43 @@ fn an_upgrade_nobody_listens_for_is_closed() {
         Duration::from_secs(5),
     );
     assert!(ex.closed, "the connection must close: {:?}", ex.response);
+}
+
+/// Whitespace after a chunk size -- which parsers disagree about -- is
+/// refused with node's 400 and the connection closes; so is any other chunk
+/// size line node refuses, and chunk extensions over the limit get 413. The
+/// handler, already running, sees its request body fail. (hyper took the
+/// whitespace as part of the size line, and a malformed body used to close
+/// the connection without a status.)
+#[test]
+fn a_malformed_chunk_size_line_is_answered_like_node() {
+    let server = Server::start("chunksize.mjs", BODY_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let head = "POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let long_extension = format!("3;e={}\r\nabc\r\n0\r\n\r\n", "a".repeat(20_000));
+    for (body, status) in [
+        ("3 \r\nabc\r\n0\r\n\r\n", "HTTP/1.1 400 Bad Request"),
+        ("3\t\r\nabc\r\n0\r\n\r\n", "HTTP/1.1 400 Bad Request"),
+        ("3 ;e=1\r\nabc\r\n0\r\n\r\n", "HTTP/1.1 400 Bad Request"),
+        ("3\r\nabc\r\n0 \r\n\r\n", "HTTP/1.1 400 Bad Request"),
+        ("zz\r\nabc\r\n0\r\n\r\n", "HTTP/1.1 400 Bad Request"),
+        (long_extension.as_str(), "HTTP/1.1 413 Payload Too Large"),
+    ] {
+        let request = format!("{head}{body}");
+        let ex = exchange(target, None, request.as_bytes(), Duration::from_secs(5));
+        assert_eq!(ex.statuses(), [status], "{body:?}: {:?}", ex.response);
+        assert!(ex.closed, "{body:?}: the connection must close");
+        let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+        assert_eq!(seen["kind"], "body error", "{body:?}: {seen}");
+    }
+    // A well-formed chunked body with an extension is still read.
+    let ex = exchange(
+        target,
+        None,
+        format!("{head}3;e=1\r\nabc\r\n0\r\n\r\n").as_bytes(),
+        Duration::from_millis(500),
+    );
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+    assert_eq!(seen["body"], "abc");
 }

@@ -1,8 +1,9 @@
 # hyper 1.10.1, patched for oam
 
-This directory is hyper **1.10.1** as published on crates.io, plus three
+This directory is hyper **1.10.1** as published on crates.io, plus four
 changes: a fix for a client hang (items 1-3 below), one server extension
-(item 4) and a stricter chunked-trailer reader (item 5). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+(item 4), and two stricter rules in the chunked-body decoder (items 5 and
+6). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -18,8 +19,8 @@ changes: a fix for a client hang (items 1-3 below), one server extension
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix and item 5's, **and** oam
-  no longer needs item 4 (see "The request-head extension" below for what
+- **Remove it when** a hyper release ships the fix and items 5 and 6, **and**
+  oam no longer needs item 4 (see "The request-head extension" below for what
   replacing it takes). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
@@ -67,6 +68,11 @@ whole of it.
    in the trailer section of a chunked body is an error ("Invalid trailer:
    bare LF" / "Invalid chunk end: bare LF") instead of a trailer byte. See
    "Chunked trailers" below.
+6. **`src/proto/h1/decode.rs`, `read_size`.** Whitespace after a chunk size
+   is an error ("Invalid chunk size line: Invalid Size") instead of linear
+   white space; the `SizeLws` state and `read_size_lws` are gone, and the
+   crate's own `test_read_chunk_size` cases for it now expect the error. See
+   "Chunk size whitespace" below.
 
 ## Why
 
@@ -141,13 +147,7 @@ The chunked decoder reads the trailer section byte by byte until CR LF CR LF,
 treating a bare LF as an ordinary byte, and then hands the buffer to
 `decode_trailers`, whose `httparse::parse_headers` stops at the first empty
 line it sees -- and httparse accepts a bare LF as a line end. So in
-`0
-X: a
-
-GET /x HTTP/1.1
-Host: a
-
-` the decoder read up to the
+`0\r\nX: a\n\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n` the decoder read up to the
 final CR LF CR LF, the parse returned after `X: a`, and the bytes between --
 here a complete second request -- were consumed and dropped, with the
 connection kept alive. A front end that ends the trailers at the bare-LF
@@ -161,6 +161,26 @@ carrying such trailers now fails too, as it does in node.
 Tested by `crates/oam_cli/tests/http_server_wire.rs`
 `a_bare_lf_in_the_trailers_fails_the_request` (fails on stock 1.10.1).
 hyper 1.11.1's decoder is unchanged here.
+
+## Chunk size whitespace (item 6)
+
+hyper accepted spaces and tabs between a chunk size and the CRLF or `;`
+that follows it (`3 \r\n`, `3\t;ext\r\n`), reading them as linear white
+space. RFC 9112 allows none there, and parsers split on it: some reject the
+line, some stop at the space, some take it as hyper did. A front end that
+frames a chunked body differently from the server is the request smuggling
+pattern the other request rules here close, and node refuses the line (400).
+With the patch the size line fails at the whitespace; oam's server answers
+400 and closes the connection, as node does, and the handler sees its
+request body fail. The decoder is shared with the client, where a response
+with such a size line now fails too.
+
+node's `insecureHTTPParser` accepts the whitespace; oam refuses it in both
+modes (hyper has no per-connection switch for it).
+
+Tested by `crates/oam_cli/tests/http_server_wire.rs`
+`a_malformed_chunk_size_line_is_answered_like_node` and conformance case 134
+(both fail on stock 1.10.1). hyper 1.11.1's `read_size` is unchanged here.
 
 ## Reproduction
 

@@ -116,7 +116,57 @@ diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
 diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 --- a/src/proto/h1/decode.rs
 +++ b/src/proto/h1/decode.rs
-@@ -551,6 +551,15 @@
+@@ -70,7 +70,6 @@
+ enum ChunkedState {
+     Start,
+     Size,
+-    SizeLws,
+     Extension,
+     SizeLf,
+     Body,
+@@ -325,7 +324,6 @@
+         match *self {
+             Start => ChunkedState::read_start(cx, body, chunk_size),
+             Size => ChunkedState::read_size(cx, body, chunk_size),
+-            SizeLws => ChunkedState::read_size_lws(cx, body),
+             Extension => ChunkedState::read_extension(cx, body, extensions_cnt),
+             SizeLf => ChunkedState::read_size_lf(cx, body, *chunk_size),
+             Body => ChunkedState::read_body(cx, body, chunk_size, chunk_buf),
+@@ -399,7 +397,9 @@
+                 *size = or_overflow!(size.checked_mul(radix));
+                 *size = or_overflow!(size.checked_add((b + 10 - b'A') as u64));
+             }
+-            b'\t' | b' ' => return Poll::Ready(Ok(ChunkedState::SizeLws)),
++            // oam patch: no whitespace after the size (hyper took it as
++            // linear white space). Parsers disagree about `3 \r\n`, so a
++            // front end could frame the body differently; node refuses it.
+             b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
+             b'\r' => return Poll::Ready(Ok(ChunkedState::SizeLf)),
+             _ => {
+@@ -411,22 +411,6 @@
+         }
+         Poll::Ready(Ok(ChunkedState::Size))
+     }
+-    fn read_size_lws<R: MemRead>(
+-        cx: &mut Context<'_>,
+-        rdr: &mut R,
+-    ) -> Poll<Result<ChunkedState, io::Error>> {
+-        trace!("read_size_lws");
+-        match byte!(rdr, cx) {
+-            // LWS can follow the chunk size, but no more digits can come
+-            b'\t' | b' ' => Poll::Ready(Ok(ChunkedState::SizeLws)),
+-            b';' => Poll::Ready(Ok(ChunkedState::Extension)),
+-            b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
+-            _ => Poll::Ready(Err(io::Error::new(
+-                io::ErrorKind::InvalidInput,
+-                "Invalid chunk size linear white space",
+-            ))),
+-        }
+-    }
+     fn read_extension<R: MemRead>(
+         cx: &mut Context<'_>,
+         rdr: &mut R,
+@@ -551,6 +535,15 @@
  
          match byte {
              b'\r' => Poll::Ready(Ok(ChunkedState::TrailerLf)),
@@ -132,7 +182,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              _ => Poll::Ready(Ok(ChunkedState::Trailer)),
          }
      }
-@@ -603,6 +612,13 @@
+@@ -603,6 +596,13 @@
                  }
                  Poll::Ready(Ok(ChunkedState::EndLf))
              }
@@ -146,6 +196,30 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              byte => {
                  match trailers_buf {
                      None => {
+@@ -829,7 +829,9 @@
+         assert_eq!(10, read("A\r\n").await);
+         assert_eq!(10, read("a\r\n").await);
+         assert_eq!(255, read("Ff\r\n").await);
+-        assert_eq!(255, read("Ff   \r\n").await);
++        // oam patch: whitespace after the size is refused.
++        read_err("Ff   \r\n", InvalidInput).await;
++        read_err("1\t\r\n", InvalidInput).await;
+         // Missing LF or CRLF
+         read_err("F\rF", InvalidInput).await;
+         read_err("F", UnexpectedEof).await;
+@@ -847,9 +849,9 @@
+         assert_eq!(1, read("1;extension;extension2\r\n").await);
+         assert_eq!(1, read("1;;;  ;\r\n").await);
+         assert_eq!(2, read("2; extension...\r\n").await);
+-        assert_eq!(3, read("3   ; extension=123\r\n").await);
+-        assert_eq!(3, read("3   ;\r\n").await);
+-        assert_eq!(3, read("3   ;   \r\n").await);
++        read_err("3   ; extension=123\r\n", InvalidInput).await;
++        read_err("3   ;\r\n", InvalidInput).await;
++        assert_eq!(3, read("3;   \r\n").await);
+         // Invalid extensions cause an error
+         read_err("1 invalid extension\r\n", InvalidInput).await;
+         read_err("1 A\r\n", InvalidInput).await;
 diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
 --- a/src/proto/h1/role.rs
 +++ b/src/proto/h1/role.rs

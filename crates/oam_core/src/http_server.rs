@@ -782,27 +782,63 @@ fn status_body(status: u16, text: &'static [u8]) -> hyper::Response<BoxedBody> {
         .expect("static status body builds")
 }
 
-/// Collect up to `MAX_REQUEST_BODY` bytes from `body`, then drain up to
-/// `DRAIN_BUDGET` more (discarding them) before returning.
+/// The status node answers a request body its parser refuses with: `413`
+/// for chunk extensions over the limit, `431` for oversized trailers, `400`
+/// for any other malformed body (a bad chunk size -- whitespace after it
+/// included --, a missing CRLF, a bare LF in the trailers). `None` when the
+/// body did not fail on its bytes -- the client went away mid-body -- which
+/// node answers with nothing.
 ///
-/// The drain step is what makes 413 reliable on Windows.  Without it,
-/// closing a TcpStream with unread kernel recv-buffer data sends a TCP RST
-/// instead of FIN.  The RST races with the 413 bytes in the send-buffer;
-/// the client may read "connection reset" instead of "413".  Draining the
-/// recv-buffer lets the OS close the connection gracefully (FIN) so the
-/// 413 response lands first.
-///
-/// Returns `Ok(bytes)` when the body fit, `Err(())` when it exceeded the
-/// cap (the drain has already completed by the time `Err` is returned).
+/// hyper reports a body it could not decode as an `io::Error` of kind
+/// `InvalidInput` / `InvalidData` behind the `hyper::Error`, and a body cut
+/// short as `UnexpectedEof`; the texts are hyper's (decode.rs).
+fn refused_body_status(error: &hyper::Error) -> Option<u16> {
+    let io = std::error::Error::source(error)?.downcast_ref::<std::io::Error>()?;
+    match io.kind() {
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+            let text = io.to_string();
+            Some(match text.as_str() {
+                "chunk extensions over limit" => 413,
+                "chunk trailers bytes over limit" | "chunk trailers count overflow" => 431,
+                _ => 400,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Answer request `id` with `status` and `Connection: close` in place of
+/// the handler's response, as node does when its parser refuses a body
+/// before the response head went out. A handler that already responded
+/// took the responder out of `pending`, and nothing is sent.
+fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
+    let responder = state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+    if let Some(responder) = responder {
+        let _ = responder.send(ResponseSpec {
+            status,
+            headers: vec![("connection".to_string(), "close".to_string())],
+            body: ResponseBody::Full(Vec::new()),
+        });
+    }
+}
+
 /// Feed request chunks to the JS side as they arrive, enforcing
 /// MAX_REQUEST_BODY cumulatively. Exceeding it sends Err (the JS request
 /// stream errors) rather than a 413, because the handler was dispatched on
 /// headers and may already have responded. Ends by dropping the sender, which
 /// the reader sees as EOF.
+///
+/// A body the parser refuses is answered with node's status first (when the
+/// handler has not responded yet), then the error reaches the handler.
 async fn pump_request_body(
     mut body: hyper::body::Incoming,
     chunk_tx: mpsc::Sender<Result<BudgetedChunk, String>>,
     state: std::sync::Arc<HttpState>,
+    id: u64,
 ) {
     use http_body_util::BodyExt;
     let mut total: usize = 0;
@@ -810,6 +846,9 @@ async fn pump_request_body(
         let frame = match frame {
             Ok(f) => f,
             Err(e) => {
+                if let Some(status) = refused_body_status(&e) {
+                    refuse_unanswered(&state, id, status);
+                }
                 let _ = chunk_tx.send(Err(format!("request body: {e}"))).await;
                 return;
             }
@@ -855,7 +894,30 @@ async fn pump_request_body(
     }
 }
 
-async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, ()> {
+/// Why [`collect_body`] produced no body.
+enum CollectError {
+    /// Over `MAX_REQUEST_BODY` (the drain has run).
+    TooLarge,
+    /// The parser refused the body: answer with this status.
+    Refused(u16),
+    /// The body was cut short (the client went away): no answer.
+    Gone,
+}
+
+/// Collect up to `MAX_REQUEST_BODY` bytes from `body`, then drain up to
+/// `DRAIN_BUDGET` more (discarding them) before returning.
+///
+/// The drain step is what makes 413 reliable on Windows.  Without it,
+/// closing a TcpStream with unread kernel recv-buffer data sends a TCP RST
+/// instead of FIN.  The RST races with the 413 bytes in the send-buffer;
+/// the client may read "connection reset" instead of "413".  Draining the
+/// recv-buffer lets the OS close the connection gracefully (FIN) so the
+/// 413 response lands first.
+///
+/// A body that fails part way is never returned as if it were whole: a
+/// malformed one is `Refused` (node's status for it), a truncated one
+/// `Gone`.
+async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, CollectError> {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
     let mut over_cap = false;
@@ -864,7 +926,14 @@ async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, (
     loop {
         let frame = match body.frame().await {
             Some(Ok(f)) => f,
-            Some(Err(_)) | None => break,
+            None => break,
+            Some(Err(_)) if over_cap => break,
+            Some(Err(e)) => {
+                return Err(match refused_body_status(&e) {
+                    Some(status) => CollectError::Refused(status),
+                    None => CollectError::Gone,
+                });
+            }
         };
         let Some(chunk) = frame.into_data().ok() else {
             // Trailers and other frame types: ignore, keep going.
@@ -886,7 +955,11 @@ async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, (
         }
     }
 
-    if over_cap { Err(()) } else { Ok(buf.freeze()) }
+    if over_cap {
+        Err(CollectError::TooLarge)
+    } else {
+        Ok(buf.freeze())
+    }
 }
 
 /// Service-level error returned only for ResponseBody::Abort: hyper drops
@@ -951,7 +1024,15 @@ async fn handle_request(
     } else {
         let collected = match collect_body(body).await {
             Ok(bytes) => bytes,
-            Err(()) => return Ok(status_body(413, b"request body too large")),
+            Err(CollectError::TooLarge) => return Ok(status_body(413, b"request body too large")),
+            Err(CollectError::Refused(status)) => {
+                return Ok(hyper::Response::builder()
+                    .status(status)
+                    .header(hyper::header::CONNECTION, "close")
+                    .body(http_body_util::Empty::new().boxed())
+                    .expect("static refusal builds"));
+            }
+            Err(CollectError::Gone) => return Err(RequestAborted),
         };
         (collected, None)
     };
@@ -1001,6 +1082,7 @@ async fn handle_request(
             body,
             chunk_tx,
             std::sync::Arc::clone(&state),
+            id,
         ));
     } else {
         state
