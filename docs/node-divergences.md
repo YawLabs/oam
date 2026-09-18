@@ -1479,6 +1479,12 @@ different answer:
   writes Node's bytes. There is no `'clientError'` event.
 - A head that never ends is refused once it outgrows hyper's read buffer, four times the
   limit (64 KiB for the default), rather than when its count crosses the limit.
+- An upgrade request (an `Upgrade` header and `upgrade` in `Connection`) to a server with
+  no `'upgrade'` listener is closed; Node answers it as an ordinary request. Only the first
+  request on a connection can be an upgrade.
+- A server's `maxHeaderSize` and `insecureHTTPParser` are read when it starts listening;
+  Node reads them for each new connection, so changing them on a listening server takes
+  effect there and not here.
 
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP.
