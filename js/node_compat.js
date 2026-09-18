@@ -23312,7 +23312,13 @@
         }
 
         const doSend = () => {
-          natives.udpSend(this._handle, data, String(address), port).then((result) => {
+          // The op refuses an ungranted destination by THROWING
+          // (ERR_ACCESS_DENIED); run it inside the executor so that reaches
+          // the callback or 'error' like any other send failure, instead of
+          // escaping send() or the auto-bind's 'listening' listener.
+          new Promise((resolve) => {
+            resolve(natives.udpSend(this._handle, data, String(address), port));
+          }).then((result) => {
             if (cb) cb(null, result.bytesSent);
           }).catch((err) => {
             if (cb) cb(err);

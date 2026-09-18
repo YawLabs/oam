@@ -3021,6 +3021,15 @@ fn op_udp_send(
         return;
     };
     let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    // The DESTINATION is a net subject, by the same rule as `tcpConnect`.
+    // Only the bind was checked, and it names the LOCAL address, so any bind
+    // grant was a grant to send datagrams anywhere: with a loopback grant to
+    // every loopback port and address, with a 0.0.0.0 one to any host (a DNS
+    // or UDP exfil endpoint).
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
     let udp = core_runtime!(scope).udp();
     crate::ops::spawn_op(
         scope,

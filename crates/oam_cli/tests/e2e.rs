@@ -23002,6 +23002,80 @@ await attempt('https.request', () => https.request({ hostname: host, port, serve
     );
 }
 
+/// A UDP datagram's DESTINATION is checked against `--allow-net`, as a TCP
+/// connect's is. Only `bind` was checked, and it names the local address, so
+/// a script granted one bound port could send to any host and port (under a
+/// 0.0.0.0 grant, a DNS or UDP exfil endpoint anywhere). Grant exactly the
+/// socket's own `127.0.0.1:<port>`: a send to itself is allowed and arrives,
+/// a send to another port on the same host is refused through the callback
+/// and never reaches the listener there. Port-scoped so it needs no second
+/// loopback address (macOS configures only 127.0.0.1).
+#[test]
+fn allow_net_is_enforced_on_a_udp_send_destination() {
+    let script = write_temp(
+        "udp_permission/main.mjs",
+        r#"import dgram from 'node:dgram';
+const granted = Number(process.argv[2]);
+const other = Number(process.argv[3]);
+const fmt = (e) => e && e.code === 'ERR_ACCESS_DENIED'
+  ? `DENIED ${e.permission} ${JSON.stringify(e.resource)}`
+  : `ERR ${e?.code} ${e?.message}`;
+const s = dgram.createSocket('udp4');
+const got = new Promise((res) => s.once('message', (m) => res(String(m))));
+await new Promise((res) => s.bind(granted, '127.0.0.1', res));
+const send = (port) => new Promise((res) => {
+  try {
+    s.send(`to-${port === granted ? 'self' : 'other'}`, port, '127.0.0.1', (e) => res(e ? fmt(e) : 'ok'));
+  } catch (e) {
+    res(`THROWN ${fmt(e)}`);
+  }
+});
+console.log('ungranted', (await send(other)).replace(String(other), 'OTHER'));
+console.log('granted', await send(granted));
+console.log('received', await got);
+s.close();
+"#,
+    );
+    // The port the script binds (and the only one granted): free a
+    // kernel-assigned one for it.
+    let granted = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    // The ungranted destination, listening, so a datagram that got through
+    // would be seen.
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
+    let other = receiver.local_addr().unwrap().port();
+    let grant = format!("--allow-net=127.0.0.1:{granted}");
+    let path = script.to_string_lossy().to_string();
+    let out = oam(&[
+        "--permission",
+        &grant,
+        "--",
+        &path,
+        &granted.to_string(),
+        &other.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    assert_eq!(
+        stdout.trim(),
+        "ungranted DENIED Net \"127.0.0.1:OTHER\"\ngranted ok\nreceived to-self",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut buf = [0u8; 64];
+    let leaked = receiver.recv_from(&mut buf).ok();
+    assert!(
+        leaked.is_none(),
+        "the refused datagram reached the ungranted listener: {:?}",
+        leaked.map(|(n, from)| (String::from_utf8_lossy(&buf[..n]).to_string(), from))
+    );
+}
+
 // ------------------------------------------------- fs.watchFile / unwatchFile
 //
 // Timing-dependent (the poller is an interval), so these live here rather than

@@ -52,6 +52,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   Present since 0.15.0, when net grants became exact matches; before that the raw prefix
   match admitted the same names. A bracketed entry now matches only the literal itself,
   alone or followed by `:<port>`. (#151)
+- **A UDP datagram's destination was never checked against `--allow-net`.** Only
+  `dgram`'s `bind` was, and it names the local address, so a script granted any address
+  to bind could `send()` to any host and port: with a loopback grant to every other
+  loopback address and port, with a `0.0.0.0` grant to any host (a DNS or UDP exfil
+  endpoint). Measured on 0.16.1: under `--allow-net=127.0.0.1`, a datagram sent to
+  127.0.0.2 was delivered. Every release since `--allow-net` was added in 0.8.3 is
+  affected. The destination is now checked by the same rule as `net.connect`
+  (`host:port`), and a refused send fails with `ERR_ACCESS_DENIED` through the send
+  callback, or `'error'` without one, and is never sent. (#151)
 
 ### Fixed
 
