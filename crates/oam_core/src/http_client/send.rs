@@ -376,7 +376,7 @@ async fn run(
         }
 
         let mut retries = 0;
-        let mut stale_retried = false;
+        let mut stale_resent = false;
         let response = loop {
             let body = match state.source.build() {
                 Ok(body) => body,
@@ -396,26 +396,42 @@ async fn run(
                     retries += 1;
                 }
                 // A pooled connection the server had already closed: no part
-                // of a response arrived, so the request may go out again on a
-                // fresh one (RFC 9112 s9.6). Once per hop, only for a body
-                // that can be sent twice, and only for an idempotent method
-                // -- oam DID put the request on the wire and cannot know the
-                // server ignored it. node loses this race far less often
-                // because its event loop reads the FIN before it writes.
+                // of a response arrived, so the request may go out again
+                // (RFC 9112 s9.6). Only for a body that can be sent twice,
+                // and only for an idempotent method -- oam DID put the
+                // request on the wire and cannot know the server ignored it.
                 //
                 // Only on a REUSED connection: a fresh one that dies before
                 // the response is the server's answer to this request, not a
                 // stale pool entry, and node sends such a request once (a
                 // server that closes every connection unanswered saw a GET
                 // twice from oam when this retried on any connection).
+                //
+                // Only when NOT A BYTE of a response arrived: hyper reports a
+                // connection that closed halfway through a response head with
+                // the same IncompleteMessage, and a server that had started
+                // answering did not ignore the request. RFC 9110 s9.2.2's
+                // example of a guess worth making is a connection that
+                // "closed before any part of a response is received".
+                //
+                // Once per hop: RFC 9110 s9.2.2 "SHOULD NOT automatically
+                // retry a failed automatic retry", and node sends it once and
+                // rejects (undici fails the request on the wire with
+                // UND_ERR_SOCKET, http.Agent with "socket hang up"). A resend
+                // that meets another closing connection fails the fetch.
+                // oam needs this one resend at all only because it can write
+                // into a FIN that is still in flight sooner than node does;
+                // a FIN the kernel already holds is read before the write
+                // (`connector::EagerTcp`), and the request goes back UNSENT.
                 Err(e)
-                    if !stale_retried
+                    if !stale_resent
                         && state.source.replayable()
                         && is_idempotent(&state.method)
                         && e.is_incomplete_message()
-                        && e.on_reused_connection() =>
+                        && e.on_reused_connection()
+                        && !e.response_started() =>
                 {
-                    stale_retried = true;
+                    stale_resent = true;
                 }
                 Err(e) => {
                     state.source.request_failed();

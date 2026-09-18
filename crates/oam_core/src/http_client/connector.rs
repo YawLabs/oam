@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::pin::Pin as StdPin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +41,7 @@ use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower_service::Service;
 
 use super::BoxError;
@@ -53,25 +54,93 @@ use crate::net_connect::{self, ConnectOptions, Pin};
 pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> AsyncIo for T {}
 
-/// The requests one connection has carried, shared by every copy of its
-/// `Connected`: hyper-util clones that into each request that checks the
-/// connection out, extras included, and `capture_connection` hands the copy
-/// back to the sender.
+/// What one connection has carried, shared by every copy of its `Connected`:
+/// hyper-util clones that into each request that checks the connection out,
+/// extras included, and `capture_connection` hands the copy back to the
+/// sender.
 ///
-/// [`super::transport::HttpTransport::send`] counts a request in once it is
-/// done with the connection, so a request that finds the count above zero
-/// went out on a connection an earlier request had already used -- a POOLED
-/// connection, the only kind a server can have closed while it sat idle.
-/// hyper-util knows this too (`is_reused`) but keeps it to itself unless the
-/// request never left.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ConnUses(Arc<AtomicU64>);
+/// - **Requests.** [`super::transport::HttpTransport::send`] counts a request
+///   in once it is done with the connection, so a request that finds the
+///   count above zero went out on a connection an earlier request had
+///   already used -- a POOLED connection, the only kind a server can have
+///   closed while it sat idle. hyper-util knows this too (`is_reused`) but
+///   keeps it to itself unless the request never left.
+/// - **Response bytes.** Every byte of HTTP read off the connection (above
+///   TLS) is counted, and the copy a request gets records the count at the
+///   moment it checked the connection out (see the `Clone` impl). An HTTP/1
+///   connection carries one exchange at a time, so whatever was read after
+///   that moment is part of the response to this request: the send path can
+///   tell a connection that died before answering from one that died
+///   halfway through a response head, which hyper reports with the same
+///   `IncompleteMessage`.
+#[derive(Debug)]
+pub(crate) struct ConnStats {
+    counters: Arc<ConnCounters>,
+    /// The response-byte count when this copy was made from the pool's own
+    /// copy; `None` on the pool's own copy.
+    read_at_checkout: Option<u64>,
+}
 
-impl ConnUses {
+#[derive(Debug, Default)]
+struct ConnCounters {
+    uses: AtomicU64,
+    read: AtomicU64,
+}
+
+impl ConnStats {
+    fn new() -> ConnStats {
+        ConnStats {
+            counters: Arc::new(ConnCounters::default()),
+            read_at_checkout: None,
+        }
+    }
+
+    /// The copy the pool keeps (the one `Connection::connected` hands
+    /// hyper-util): no checkout count, so every copy made from it records
+    /// one.
+    fn clone_for_pool(&self) -> ConnStats {
+        ConnStats {
+            counters: self.counters.clone(),
+            read_at_checkout: None,
+        }
+    }
+
     /// Counts one more request on this connection: true when an earlier
     /// request had already used it.
     pub(crate) fn count_one(&self) -> bool {
-        self.0.fetch_add(1, Ordering::Relaxed) > 0
+        self.counters.uses.fetch_add(1, Ordering::Relaxed) > 0
+    }
+
+    /// Some part of a response arrived on this connection after the request
+    /// holding this copy checked it out. Also true when the copy carries no
+    /// checkout count, so an unknown answer never licenses a resend.
+    pub(crate) fn response_started(&self) -> bool {
+        self.read_at_checkout
+            .is_none_or(|at| self.counters.read.load(Ordering::Relaxed) > at)
+    }
+}
+
+/// A copy made from the pool's own copy records the response-byte count at
+/// that moment; a copy of a copy keeps the count it was made with.
+///
+/// This is when hyper-util makes the copies (0.1.20, client.rs
+/// `try_send_request`): right after checkout it clones the pool entry's
+/// `Connected` into the request's `capture_connection` slot, and only then
+/// hands the request to the connection. So the count in the captured copy is
+/// the count before a byte of this request's response could have been read,
+/// and reading the extras back out of that copy (`get_extras`, a clone of a
+/// copy) keeps it. An h2 connection's pool entries are clones too, so their
+/// counts are stale -- harmless, as the resend these counts gate is for
+/// HTTP/1's `IncompleteMessage` alone.
+impl Clone for ConnStats {
+    fn clone(&self) -> ConnStats {
+        ConnStats {
+            counters: self.counters.clone(),
+            read_at_checkout: Some(
+                self.read_at_checkout
+                    .unwrap_or_else(|| self.counters.read.load(Ordering::Relaxed)),
+            ),
+        }
     }
 }
 
@@ -79,23 +148,82 @@ impl ConnUses {
 /// the facts it carries are kept here and a fresh one is built on every
 /// call.
 pub(crate) struct OamConn {
-    io: TokioIo<Box<dyn AsyncIo>>,
+    io: TokioIo<Counted>,
     /// ALPN selected h2.
     h2: bool,
     /// An http request through a proxy: hyper writes the absolute form.
     proxied: bool,
-    /// The requests this connection has carried.
-    uses: ConnUses,
+    /// The requests and response bytes this connection has carried.
+    stats: ConnStats,
 }
 
 impl OamConn {
     fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool) -> OamConn {
+        let stats = ConnStats::new();
         OamConn {
-            io: TokioIo::new(io),
+            io: TokioIo::new(Counted {
+                io,
+                counters: stats.counters.clone(),
+            }),
             h2,
             proxied,
-            uses: ConnUses::default(),
+            stats,
         }
+    }
+}
+
+/// The byte stream under a connection, counting what is read from it into
+/// the connection's [`ConnStats`]. It sits above TLS, so the count is HTTP
+/// bytes only: a TLS close_notify or session ticket is not a response.
+struct Counted {
+    io: Box<dyn AsyncIo>,
+    counters: Arc<ConnCounters>,
+}
+
+impl AsyncRead for Counted {
+    fn poll_read(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = StdPin::new(&mut this.io).poll_read(cx, buf);
+        let read = buf.filled().len().saturating_sub(before);
+        if read > 0 {
+            this.counters.read.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl AsyncWrite for Counted {
+    fn poll_write(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -103,7 +231,7 @@ impl Connection for OamConn {
     fn connected(&self) -> Connected {
         let connected = Connected::new()
             .proxy(self.proxied)
-            .extra(self.uses.clone());
+            .extra(self.stats.clone_for_pool());
         if self.h2 {
             connected.negotiated_h2()
         } else {
@@ -450,16 +578,120 @@ impl Service<Uri> for ProxyTransport {
 }
 
 /// `net_connect::connect`, then the socket options.
-async fn dial(
-    host: &str,
-    port: u16,
-    opts: &ConnectOptions,
-) -> Result<tokio::net::TcpStream, BoxError> {
+async fn dial(host: &str, port: u16, opts: &ConnectOptions) -> Result<EagerTcp, BoxError> {
     let connected = net_connect::connect(host, port, opts)
         .await
         .map_err(|e| Box::new(e) as BoxError)?;
     tune(&connected.stream);
-    Ok(connected.stream)
+    Ok(EagerTcp(connected.stream))
+}
+
+/// The most one direct read takes. The part of the caller's buffer it reads
+/// into is zero-filled first (a safe read needs initialised memory), so this
+/// bounds that cost; the rest waits for the next read.
+const DIRECT_READ_MAX: usize = 16 * 1024;
+
+/// A fetch connection's TCP stream. A read tokio reports as pending is
+/// checked against the kernel before it is reported: an EOF or bytes the
+/// kernel already holds are returned now.
+///
+/// Why: hyper reads an idle HTTP/1 connection before it writes the next
+/// request onto it, and a connection that reads EOF there is closed and
+/// hands the request back UNSENT (hyper-util then takes another connection,
+/// or dials one). But tokio answers a read from its readiness cache, and the
+/// cache only learns of the server's FIN when a worker next polls the
+/// reactor. With both I/O workers busy -- requests going out back to back,
+/// a redirect loop that never leaves Rust -- the read comes back `Pending`
+/// without a syscall and hyper writes the request onto a connection the
+/// kernel already knows is closed. For a GET that cost a resend; a POST, which
+/// is never resent, failed with `fetch failed` where node's succeeded: node's
+/// event loop reads the FIN before it writes the next request.
+///
+/// The check is a one-byte `MSG_PEEK`, so the common answer (nothing there)
+/// costs one non-blocking syscall and copies nothing. Reading around tokio is
+/// sound: tokio has registered the waker before it returned `Pending`, and a
+/// readiness event for bytes read here costs tokio one `WouldBlock`. A FIN
+/// still in flight when the request is written is not covered; node loses
+/// that race too, and for an idempotent request the send path's single
+/// resend covers it.
+pub(crate) struct EagerTcp(tokio::net::TcpStream);
+
+impl AsyncRead for EagerTcp {
+    fn poll_read(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let stream = &mut self.get_mut().0;
+        if let ready @ Poll::Ready(_) = StdPin::new(&mut *stream).poll_read(cx, buf) {
+            return ready;
+        }
+        // No room: nothing to report, and a zero-byte read would read as EOF.
+        if buf.remaining() == 0 {
+            return Poll::Pending;
+        }
+        let socket = socket2::SockRef::from(&*stream);
+        let mut probe = [MaybeUninit::<u8>::uninit()];
+        match socket.peek(&mut probe) {
+            // EOF: the server closed, and the reactor has not reported it.
+            Ok(0) => Poll::Ready(Ok(())),
+            Ok(_) => {
+                let dst = buf.initialize_unfilled_to(buf.remaining().min(DIRECT_READ_MAX));
+                match std::io::Read::read(&mut &*socket, dst) {
+                    Ok(n) => {
+                        buf.advance(n);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => pending_or_error(e, cx),
+                }
+            }
+            Err(e) => pending_or_error(e, cx),
+        }
+    }
+}
+
+/// A direct read's error: `WouldBlock` is tokio's `Pending` standing, an
+/// interrupted call is retried on the next poll (no readiness event is owed
+/// for it), anything else is the read's error.
+fn pending_or_error(e: std::io::Error, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock => Poll::Pending,
+        std::io::ErrorKind::Interrupted => {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+        _ => Poll::Ready(Err(e)),
+    }
+}
+
+impl AsyncWrite for EagerTcp {
+    fn poll_write(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        StdPin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: StdPin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        StdPin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
 }
 
 /// reqwest's socket defaults (async_impl/client.rs:303-307, applied by

@@ -64,6 +64,86 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A `fetch` could hang forever when the server closed a keep-alive
+  connection just as the next request went out on it.** This also affected
+  `http.request`, `https.request` and `undici.request`, which ride the same
+  op. A typical case is a keep-alive idle timeout, or a `302` followed by a
+  FIN with the redirect hop sent at once.
+
+  The cause was in hyper 1.10.1. The request was pushed into the pooled
+  connection's dispatch channel while, on the other I/O worker, that
+  connection read the FIN, finished and dropped its receiver. tokio's
+  close-time drain misses a message that is still being published, so the
+  request stayed in the channel. The only thing that would ever answer it is
+  the channel's last sender, and hyper-util holds that sender while it
+  waits for the answer. There was no socket, no timer and no error: the
+  promise never settled, and nothing else could make it settle.
+
+  The fix: oam now builds hyper 1.10.1 with one patch. The dispatch
+  receiver's drop closes the channel and drains it until tokio reports no
+  send in flight, so the request is handed back unsent. hyper-util then
+  sends it again through its pool (an idle connection, or a new one) when
+  the closed connection had been reused; on a fresh connection it fails
+  with "connection closed", much as node's fails with "other side closed".
+  The patch is in `vendor/hyper-1.10.1/`: `OAM-PATCH.diff` is the whole of
+  it, `OAM-PATCH.md` has the reproduction and the upstream status
+  (hyperium/hyper#4122 and #4150, still open, and they do not cover this
+  path), and `scripts/check-vendor.sh` (`ci-local.sh` step 11) fails unless
+  the directory is the checksummed crates.io release plus that diff and
+  builds warning-free in every client/server x http1/http2 feature set.
+
+  Measured on Windows arm64 with a loop of 20 redirects answered `302` then
+  FIN, 500 processes, 6 at a time:
+  - 0.16.1 hung 3 processes;
+  - `main` before the fix hung 14 and 16 in two passes;
+  - the fix hung none in either pass.
+
+  A single process sending 20,000 such fetches hung 2 of 6 runs on 0.16.1
+  and 6 of 6 on `main` before the fix. With the fix, 0 of 6 runs hung.
+
+  This did ship. 0.16.1's `fetch` runs on reqwest over the same hyper 1.10.1,
+  and releases back to 0.13.2 pin that same hyper; releases before 0.13.2
+  were not checked. Pinned by
+  `crates/oam_core/tests/http_client_stale_pool.rs`. On stock hyper its
+  in-memory race test failed 10 of 10 runs, 5 on Windows and 5 on macOS.
+  (#151 follow-up)
+- **Requests were written onto keep-alive connections the server had already
+  closed, so a `POST` failed where node's succeeded and a `GET` reached the
+  server twice.** A pooled connection answered reads from tokio's readiness
+  cache, which learns of the server's FIN only when an I/O worker next polls
+  for events. With both workers busy -- a redirect loop sends its hop with no
+  event-loop tick after the 3xx -- a FIN the kernel already held went unseen,
+  and the next request was written into the dead connection. node's event
+  loop reads the FIN first and opens a new socket.
+
+  A read that tokio reports pending is now checked against the kernel (a
+  one-byte peek, no copy), so the idle connection reads the EOF before it
+  takes the request and hands the request back unsent. Measured on Windows
+  arm64 against a node server that sends a 3xx with keep-alive and then FINs
+  at once (320 processes of 50 fetches, 8 at a time):
+  - `POST` + `307`: 12,065 of 16,000 fetches failed before; 595 and 1,137 in
+    two runs after. node v22.22.2 failed none.
+  - `GET` + `302`: the server received the hop twice for 12,739 of 16,000
+    fetches before; 1,177 and 1,383 after. node: none.
+
+  What remains is a FIN still in flight when the hop is written. node sends
+  its hop late enough to miss that race in this shape; when the FIN comes 0-5
+  ms after the 3xx, node loses it too (2,587 of 16,000 such `POST`s failed in
+  node, 1,948 in oam). A pooled connection that dies before any part of a
+  response arrives costs an idempotent request one resend.
+
+  That resend now happens **at most once per hop**, and only when **not a
+  byte** of a response arrived. An earlier cut of this change resent up to
+  three times, which delivered one `GET` four times and reported success
+  where node delivers it once and rejects (RFC 9110 s9.2.2: no automatic
+  retry of a failed automatic retry). And hyper reports a connection that
+  closed halfway through a response head with the same error as one that
+  closed before answering; each connection now counts the response bytes it
+  reads, so a server that had started to answer is never sent the request
+  again. The resend is otherwise as before: idempotent methods, a body that
+  can be sent again, a connection an earlier request had used.
+  (#151 follow-up)
+
 - **`socket.unref()` and `server.unref()` did not release the event loop**
   (#140). They removed the handle from `process.getActiveResourcesInfo()` as
   Node's do, but a connected, reading, unref'd `net.Socket` or `tls.TLSSocket`,
