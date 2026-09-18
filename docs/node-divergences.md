@@ -1497,7 +1497,12 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
   size is `HPE_INVALID_CHUNK_SIZE`, as in Node. `req.destroy()` without an error emits no
-  `'socket hang up'` error (Node does, before a response).
+  `'socket hang up'` error (Node does, before a response). An upgrade's head is written
+  by hand, so a header value carrying CR or LF fails that request with Node's
+  `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).
+- **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots
+  plus `NODE_EXTRA_CA_CERTS`, and the request's or agent's `ca` -- as Node does, not with
+  the operating system's store oam's own client uses (entry 38).
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`

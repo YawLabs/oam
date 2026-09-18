@@ -5970,6 +5970,7 @@ import tls from 'node:tls';
 const cert = `__CERT__`;
 const key = `__KEY__`;
 let connections = 0;
+let injected = false;
 const onConn = (c) => {
   connections++;
   c.on('error', () => {});
@@ -5978,6 +5979,7 @@ const onConn = (c) => {
   c.on('data', (d) => {
     if (upgraded) { c.write(d); return; }
     head += d.toString('latin1');
+    if (/x-injected/i.test(head)) injected = true;
     if (!head.includes('\r\n\r\n')) return;
     upgraded = true;
     c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n');
@@ -5989,10 +5991,10 @@ secure.on('tlsClientError', () => {});
 await new Promise((r) => plain.listen(0, '127.0.0.1', r));
 await new Promise((r) => secure.listen(0, '127.0.0.1', r));
 const headers = { Connection: 'Upgrade', Upgrade: 'echo' };
-function upgrade(label, mod, options) {
+function upgrade(label, mod, options, extra = {}) {
   return new Promise((resolve) => {
     let req;
-    try { req = mod.request({ ...options, headers }); } catch (e) { resolve(`${label} threw ${e.code}`); return; }
+    try { req = mod.request({ ...options, headers: { ...headers, ...extra } }); } catch (e) { resolve(`${label} threw ${e.code}`); return; }
     req.on('upgrade', (res, socket, rest) => {
       socket.once('data', (d) => {
         resolve(`${label} ${res.statusCode} echo=${d.toString()} tls=${socket.encrypted === true} rest=${rest.length}`);
@@ -6014,6 +6016,11 @@ const refuse = (h, o, cb) => cb(Object.assign(new Error('no'), { code: 'EREFUSED
 console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.address().port, createConnection: netConnect, lookup: refuse }));
 await new Promise((r) => setTimeout(r, 50));
 console.log('connections after refusal', connections - before);
+// The upgrade head is written by hand: a header value carrying CR / LF is
+// refused, never sent.
+console.log(await upgrade('crlf', http, { host: '127.0.0.1', port: plain.address().port }, { 'X-Bad': 'a\r\nX-Injected: 1' }));
+await new Promise((r) => setTimeout(r, 50));
+console.log('injected header reached the server', injected);
 plain.close();
 secure.close();
 "#
@@ -6026,7 +6033,9 @@ secure.close();
          wss 101 echo=ping tls=true rest=0\n\
          plain request 101 echo=ping tls=false rest=0\n\
          refused error EREFUSED_BY_HOOK\n\
-         connections after refusal 0"
+         connections after refusal 0\n\
+         crlf error ERR_INVALID_CHAR\n\
+         injected header reached the server false"
     );
 }
 

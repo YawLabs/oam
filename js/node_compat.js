@@ -19015,9 +19015,29 @@
       // 'upgrade' listener with whatever followed the head.
       _upgradeOver(socket, bodyData) {
         var self = this;
-        var head = this.method + " " + this.path + " HTTP/1.1\r\n";
         var list = this._headerList(false);
-        for (var i = 0; i < list.length; i++) head += list[i][0] + ": " + list[i][1] + "\r\n";
+        // This head is written by hand, so it gets the checks the bridge's
+        // parser applies to every other request (node refuses the same
+        // names and values at setHeader()): a token for the method and each
+        // name, no CR / LF / NUL in a value.
+        var bad = null;
+        if (!HTTP_TOKEN.test(this.method)) {
+          bad = invalidHttpToken("Method", this.method);
+        }
+        for (var i = 0; bad === null && i < list.length; i++) {
+          if (!HTTP_TOKEN.test(list[i][0])) {
+            bad = invalidHttpToken("Header name", list[i][0]);
+          } else if (INVALID_HEADER_CHAR.test(list[i][1])) {
+            bad = invalidHeaderChar(list[i][0]);
+          }
+        }
+        if (bad !== null) {
+          this._failBeforeResponse(bad);
+          socket.destroy();
+          return;
+        }
+        var head = this.method + " " + this.path + " HTTP/1.1\r\n";
+        for (var h = 0; h < list.length; h++) head += list[h][0] + ": " + list[h][1] + "\r\n";
         socket.write(globalThis.Buffer.from(head + "\r\n", "latin1"));
         if (bodyData && bodyData.length > 0) socket.write(bodyData);
         var responseBuf = globalThis.Buffer.alloc(0);
@@ -19596,6 +19616,19 @@
     registry._httpAgents = { HttpsAgent, state: agentState };
 
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
+    // node's checkIsHttpToken (lib/_http_common.js), and the two errors its
+    // header checks throw.
+    var HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function invalidHttpToken(name, token) {
+      var err = new TypeError(name + " must be a valid HTTP token [\"" + token + "\"]");
+      err.code = "ERR_INVALID_HTTP_TOKEN";
+      return err;
+    }
+    function invalidHeaderChar(name) {
+      var err = new TypeError("Invalid character in header content [\"" + name + "\"]");
+      err.code = "ERR_INVALID_CHAR";
+      return err;
+    }
     function validateHeaderName(name) {
       if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
       if (INVALID_HEADER_CHAR.test(name)) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
