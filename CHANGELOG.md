@@ -18,6 +18,34 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Security
 
+- **The `lookup` connect option was ignored.** `net.connect`, `tls.connect`,
+  `http.request` and `https.request` -- the request's own `lookup` and an `http.Agent`'s
+  -- never called it and resolved the host through the system resolver, so a host check
+  an application put in its lookup function never ran; a replaced `dns.lookup` was not
+  consulted either. Both are now honoured as node honours them: the hook is called with
+  node's arguments before anything is dialled, a refusal fails the connection with the
+  hook's own error and never falls back to system DNS, every answered address is emitted
+  as the socket's `'lookup'` event first (a listener that destroys the socket stops the
+  connection), and only the answered addresses are dialled. `fetch` also resolves
+  through a replaced `dns.lookup`. Under `--permission --allow-net`, each address a hook
+  answers is checked against the grant as a connection to that address would be.
+- **An `http.Agent` whose `createConnection` was overridden was not used.**
+  `http.request` and `https.request` sent every request through oam's own HTTP client,
+  so a custom or patched agent -- the way request-filtering-agent, ssrf-req-filter and
+  similar packages vet a destination -- was never called, and neither were
+  `options.createConnection` or listeners on `req.socket`. A request that carries such
+  connection policy now goes over the socket the agent returns, as in node. So does
+  `https.request` with `rejectUnauthorized: false`, which ignored the agent too, and an
+  upgrade request. Such requests open a new connection each and send
+  `Connection: close` (oam keeps no agent socket pool yet).
+- **`req.socket` did not name the connection.** A `ClientRequest`'s socket reported the
+  host as written, `localAddress` `127.0.0.1` and `localPort` `0`, so a check of
+  `req.socket.remoteAddress` / `res.socket.remoteAddress` against a list of internal
+  addresses after connecting saw a host name. It now reports the dialled peer's address,
+  port and family and the local end (by `'response'`, and on `'connect'` for a request
+  sent over an agent's socket); `req.socket` is `null` until `'socket'`, and an https
+  socket carries the verified session (`getPeerCertificate()`, `authorized`).
+
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
   `undici.request`; the redirects those follow were not checked at all. So under
