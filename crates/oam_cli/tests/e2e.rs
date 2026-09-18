@@ -5537,7 +5537,8 @@ fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) 
     (port, hits)
 }
 
-/// net.connect / tls.connect's `lookup` hook decides where the granted NAME
+/// net.connect / tls.connect's `lookup` hook -- and so http.get's and
+/// https.get's -- decides where the granted NAME
 /// is dialled, so every address it answers is a `--permission` subject,
 /// checked as a connect naming that address directly is (`addr:port`): under
 /// `--allow-net=granted.invalid` a hook answering 127.0.0.1 is refused with
@@ -5551,6 +5552,8 @@ fn a_net_or_tls_lookup_answer_is_checked_against_the_net_permission() {
         "net_lookup_permission/main.mjs",
         r#"import net from 'node:net';
 import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
 const port = Number(process.argv[2]);
 const lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
 const attempt = (name, start) => new Promise((res) => {
@@ -5564,6 +5567,15 @@ const attempt = (name, start) => new Promise((res) => {
 });
 await attempt('net', () => net.connect({ host: 'granted.invalid', port, lookup }));
 await attempt('tls', () => tls.connect({ host: 'granted.invalid', port, lookup, rejectUnauthorized: false }));
+const request = (name, mod) => new Promise((res) => {
+  const req = mod.get({ host: 'granted.invalid', port, lookup, rejectUnauthorized: false }, () => { console.log(name, 'RESPONSE'); res(); });
+  req.on('error', (e) => {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'NOT DENIED');
+    res();
+  });
+});
+await request('http', http);
+await request('https', https);
 "#,
     );
     let path = script.to_str().unwrap().to_string();
@@ -5583,7 +5595,9 @@ await attempt('tls', () => tls.connect({ host: 'granted.invalid', port, lookup, 
     let resource = format!("\"127.0.0.1:{port}\"");
     assert_eq!(
         stdout,
-        format!("net DENIED {resource}\ntls DENIED {resource}"),
+        format!(
+            "net DENIED {resource}\ntls DENIED {resource}\nhttp DENIED {resource}\nhttps DENIED {resource}"
+        ),
         "stderr: {stderr}"
     );
     assert_eq!(
@@ -5592,11 +5606,14 @@ await attempt('tls', () => tls.connect({ host: 'granted.invalid', port, lookup, 
         "a refused answer must never be dialled"
     );
 
-    // Granted by the address too: both dial it (the listener speaks no TLS,
-    // so tls fails its handshake -- after the connection was made).
+    // Granted by the address too: each dials it (the listener speaks neither
+    // TLS nor HTTP, so the others fail -- after the connection was made).
     let (stdout, stderr) = run("--allow-net=granted.invalid,127.0.0.1");
-    assert_eq!(stdout, "net CONNECTED\ntls NOT DENIED", "stderr: {stderr}");
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        stdout, "net CONNECTED\ntls NOT DENIED\nhttp NOT DENIED\nhttps NOT DENIED",
+        "stderr: {stderr}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
 }
 
 /// oam's own resolver keeps a hostname grant working: the name's answer
@@ -5771,6 +5788,388 @@ setTimeout(() => hung.destroy(), 20);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(60),
         "the run must exit on its own"
+    );
+}
+
+/// http.request over an agent's socket, end to end against raw servers in the
+/// same script: a 10 MiB chunked response read through the bridge with a
+/// pause in the middle (memory stays bounded); a body streamed before the
+/// socket has connected; a server that closes before the head (`socket hang
+/// up`) or inside the body ('aborted'); HEAD, 204 and 304 (no body); a
+/// malformed status line (a coded parse error, no hang); and a request
+/// destroyed mid-response (the run still exits on its own). The agent path is
+/// forced with a `lookup` option (a name, mapped to 127.0.0.1).
+#[test]
+fn http_over_an_agent_socket_end_to_end() {
+    let src = r#"import http from 'node:http';
+import net from 'node:net';
+const map = (h, o, cb) => setTimeout(() => cb(null, [{ address: '127.0.0.1', family: 4 }]), 5);
+function serve(onRequest) {
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    let head = '';
+    let handled = false;
+    c.on('data', (d) => {
+      head += d.toString('latin1');
+      if (handled || !head.includes('\r\n\r\n')) return;
+      const [top, rest] = [head.slice(0, head.indexOf('\r\n\r\n')), head.slice(head.indexOf('\r\n\r\n') + 4)];
+      if (/transfer-encoding: chunked/i.test(top) && !rest.endsWith('0\r\n\r\n')) return;
+      handled = true;
+      onRequest(c, top, rest);
+    });
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}
+async function get(server, options = {}, write) {
+  const port = server.address().port;
+  return new Promise((resolve) => {
+    const req = http.request({ host: 'agent.test', port, lookup: map, ...options }, (res) => {
+      let bytes = 0;
+      const events = [`response ${res.statusCode}`];
+      res.on('data', (d) => { bytes += d.length; });
+      res.on('aborted', () => events.push('aborted'));
+      res.on('error', (e) => events.push(`res error ${e.code}`));
+      res.on('end', () => { events.push(`end ${bytes}`); resolve(events.join(' ')); });
+      res.on('close', () => { if (!res.complete) resolve(events.join(' ')); });
+    });
+    req.on('error', (e) => resolve(`error ${e.code} ${e.message.startsWith('Parse Error: ') ? 'Parse Error' : e.message}`));
+    if (write) write(req); else req.end();
+  });
+}
+
+// 10 MiB, chunked, written as the socket drains; the client pauses midway.
+{
+  const big = await serve(async (c) => {
+    c.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+    const chunk = Buffer.alloc(64 * 1024, 120);
+    for (let i = 0; i < 160; i++) {
+      const frame = Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n'), chunk, Buffer.from('\r\n')]);
+      if (!c.write(frame)) await new Promise((r) => c.once('drain', r));
+    }
+    c.end('0\r\n\r\n');
+  });
+  const rss0 = process.memoryUsage().rss;
+  let peak = rss0;
+  const port = big.address().port;
+  const result = await new Promise((resolve) => {
+    http.get({ host: 'agent.test', port, lookup: map }, (res) => {
+      let bytes = 0;
+      let paused = false;
+      res.on('data', (d) => {
+        bytes += d.length;
+        peak = Math.max(peak, process.memoryUsage().rss);
+        if (!paused && bytes > 2 * 1024 * 1024) {
+          paused = true;
+          res.pause();
+          setTimeout(() => res.resume(), 200);
+        }
+      });
+      res.on('end', () => resolve(`big ${bytes}`));
+    }).on('error', (e) => resolve(`big error ${e.message}`));
+  });
+  console.log(result, 'bounded', peak - rss0 < 96 * 1024 * 1024);
+  big.close();
+}
+
+// A body streamed before the connection exists (the lookup answers later).
+{
+  const echo = await serve((c, top, rest) => {
+    const chunked = /transfer-encoding: chunked/i.test(top);
+    let body = '';
+    for (let r = rest; r.length > 0;) {
+      const n = parseInt(r, 16);
+      if (!n) break;
+      const start = r.indexOf('\r\n') + 2;
+      body += r.slice(start, start + n);
+      r = r.slice(start + n + 2);
+    }
+    c.end(`HTTP/1.1 200 OK\r\ncontent-length: ${body.length + 8}\r\nconnection: close\r\n\r\n${chunked ? 'chunked:' : 'lengthd:'}${body}`);
+  });
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: 'agent.test', port: echo.address().port, lookup: map, method: 'POST' }, (res) => {
+      let s = '';
+      res.on('data', (d) => (s += d));
+      res.on('end', () => resolve(`streamed ${s}`));
+    });
+    req.on('error', (e) => resolve(`streamed error ${e.message}`));
+    req.write('ab');
+    setTimeout(() => { req.write('cd'); setTimeout(() => req.end('ef'), 5); }, 1);
+  });
+  console.log(result);
+  echo.close();
+}
+
+const early = await serve((c) => c.destroy());
+console.log('closed before head:', await get(early));
+early.close();
+const mid = await serve((c) => c.end('HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort'));
+console.log('closed inside body:', await get(mid));
+mid.close();
+for (const [label, reply, method] of [
+  ['HEAD', 'HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\n', 'HEAD'],
+  ['204', 'HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n', 'GET'],
+  ['304', 'HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\nconnection: close\r\n\r\n', 'GET'],
+]) {
+  const s = await serve((c) => c.write(reply));
+  console.log(label + ':', await get(s, { method }));
+  s.close();
+}
+const junk = await serve((c) => c.write('NOT HTTP AT ALL\r\n\r\n'));
+console.log('malformed status line:', await get(junk));
+junk.close();
+
+// Destroyed mid-response, with the server still sending: nothing is left
+// holding the run open.
+const endless = await serve((c) => {
+  c.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+  const t = setInterval(() => c.write('5\r\nhello\r\n'), 5);
+  c.on('close', () => clearInterval(t));
+});
+await new Promise((resolve) => {
+  const req = http.get({ host: 'agent.test', port: endless.address().port, lookup: map }, (res) => {
+    res.once('data', () => { req.destroy(); resolve(); });
+    res.on('error', () => {});
+  });
+  req.on('error', () => {});
+});
+console.log('destroyed mid-response');
+endless.close();
+"#;
+    let started = std::time::Instant::now();
+    let stdout = run_ok("http_agent_path_e2e.mjs", src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "big 10485760 bounded true\n\
+         streamed chunked:abcdef\n\
+         closed before head: error ECONNRESET socket hang up\n\
+         closed inside body: response 200 aborted res error ECONNRESET\n\
+         HEAD: response 200 end 0\n\
+         204: response 204 end 0\n\
+         304: response 304 end 0\n\
+         malformed status line: error HPE_INVALID_CONSTANT Parse Error\n\
+         destroyed mid-response"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the run must exit on its own"
+    );
+}
+
+/// An upgrade goes over a real socket: the ws library's shape
+/// (`createConnection: net.connect` / `tls.connect`, the upgrade headers) gets
+/// 'upgrade' with that socket and echoes over it, for ws and wss; and a
+/// `lookup` that refuses the host stops the upgrade before any connection.
+/// oam used to dial plain TCP itself for every upgrade, `lookup` ignored and
+/// https included.
+#[test]
+fn an_upgrade_goes_over_the_socket_createconnection_returns() {
+    let src = r#"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let connections = 0;
+const onConn = (c) => {
+  connections++;
+  c.on('error', () => {});
+  let head = '';
+  let upgraded = false;
+  c.on('data', (d) => {
+    if (upgraded) { c.write(d); return; }
+    head += d.toString('latin1');
+    if (!head.includes('\r\n\r\n')) return;
+    upgraded = true;
+    c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n');
+  });
+};
+const plain = net.createServer(onConn);
+const secure = tls.createServer({ cert, key }, onConn);
+secure.on('tlsClientError', () => {});
+await new Promise((r) => plain.listen(0, '127.0.0.1', r));
+await new Promise((r) => secure.listen(0, '127.0.0.1', r));
+const headers = { Connection: 'Upgrade', Upgrade: 'echo' };
+function upgrade(label, mod, options) {
+  return new Promise((resolve) => {
+    let req;
+    try { req = mod.request({ ...options, headers }); } catch (e) { resolve(`${label} threw ${e.code}`); return; }
+    req.on('upgrade', (res, socket, rest) => {
+      socket.once('data', (d) => {
+        resolve(`${label} ${res.statusCode} echo=${d.toString()} tls=${socket.encrypted === true} rest=${rest.length}`);
+        socket.destroy();
+      });
+      socket.write('ping');
+    });
+    req.on('error', (e) => resolve(`${label} error ${e.code}`));
+    req.end();
+  });
+}
+const netConnect = (o) => { o.path = o.socketPath; return net.connect(o); };
+const tlsConnect = (o) => { o.path = undefined; return tls.connect(o); };
+console.log(await upgrade('ws', http, { host: '127.0.0.1', port: plain.address().port, createConnection: netConnect }));
+console.log(await upgrade('wss', https, { host: '127.0.0.1', port: secure.address().port, createConnection: tlsConnect, rejectUnauthorized: false }));
+console.log(await upgrade('plain request', http, { host: '127.0.0.1', port: plain.address().port }));
+const before = connections;
+const refuse = (h, o, cb) => cb(Object.assign(new Error('no'), { code: 'EREFUSED_BY_HOOK' }));
+console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.address().port, createConnection: netConnect, lookup: refuse }));
+await new Promise((r) => setTimeout(r, 50));
+console.log('connections after refusal', connections - before);
+plain.close();
+secure.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let stdout = run_ok("http_upgrade_over_socket.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "ws 101 echo=ping tls=false rest=0\n\
+         wss 101 echo=ping tls=true rest=0\n\
+         plain request 101 echo=ping tls=false rest=0\n\
+         refused error EREFUSED_BY_HOOK\n\
+         connections after refusal 0"
+    );
+}
+
+/// fetch resolves a name through a replaced `dns.lookup`, as node's does
+/// (net.connect calls it for every connection undici opens): a refusal fails
+/// the fetch closed -- `TypeError: fetch failed` with the guard's error as the
+/// cause -- and the server never sees the request; with the original put
+/// back, fetch goes out as usual.
+#[test]
+fn fetch_resolves_through_a_replaced_dns_lookup() {
+    let src = r#"import http from 'node:http';
+import dns from 'node:dns';
+let hits = 0;
+const server = http.createServer((req, res) => { hits++; res.end('ok'); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const original = dns.lookup;
+const guard = Object.assign(new Error('guarded'), { code: 'EGUARD' });
+const calls = [];
+dns.lookup = (host, opts, cb) => { calls.push(`${host} ${JSON.stringify(opts)}`); cb(guard); };
+try {
+  await fetch(`http://localhost:${port}/`);
+  console.log('refused: fetched?!');
+} catch (e) {
+  console.log('refused:', e.name, e.message, 'cause is the guard', e.cause === guard);
+}
+console.log('calls', JSON.stringify(calls), 'hits', hits);
+dns.lookup = original;
+const r = await fetch(`http://localhost:${port}/`);
+console.log('restored:', r.status, await r.text(), 'hits', hits);
+server.close();
+"#;
+    let stdout = run_ok("fetch_replaced_dns_lookup.mjs", src);
+    let hints = if cfg!(windows) {
+        0
+    } else if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+        1024
+    } else {
+        32
+    };
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        format!(
+            "refused: TypeError fetch failed cause is the guard true\n\
+             calls [\"localhost {{\\\"hints\\\":{hints},\\\"all\\\":true}}\"] hits 0\n\
+             restored: 200 ok hits 1"
+        )
+    );
+}
+
+/// http.request never goes near globalThis.fetch: replacing it (a test mock,
+/// an instrumentation shim) intercepts fetch() and nothing else, as in node.
+#[test]
+fn replacing_global_fetch_does_not_intercept_http_request() {
+    let src = r#"import http from 'node:http';
+const server = http.createServer((req, res) => res.end('real'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+globalThis.fetch = () => { throw new Error('intercepted'); };
+const body = await new Promise((resolve, reject) => {
+  http.get(`http://127.0.0.1:${server.address().port}/`, (res) => {
+    let s = '';
+    res.on('data', (d) => (s += d));
+    res.on('end', () => resolve(s));
+  }).on('error', reject);
+});
+console.log('http.get', body);
+server.close();
+"#;
+    assert_eq!(run_ok("global_fetch_replaced.mjs", src), "http.get real");
+}
+
+/// On the fetch transport, an https request's socket is a TLSSocket carrying
+/// the connection the transport used: the dialled peer, the local port the
+/// server saw, the verifier's verdict and the peer certificate (a post-hoc
+/// pinning check reads the real one) -- for a fresh connection and again for
+/// a pooled one. The CA is trusted through NODE_EXTRA_CA_CERTS, which the
+/// transport's platform verifier honours. Not on macOS: Security.framework
+/// caps a server certificate's validity at 825 days, and this 100-year leaf
+/// is refused there for that reason alone.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_https_socket_on_the_fetch_transport_reports_its_connection() {
+    let bundle = write_temp("fetch-socket-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import tls from 'node:tls';
+const seen = [];
+const conns = new Set();
+const server = tls.createServer({ cert: `__CERT__`, key: `__KEY__` }, (c) => {
+  conns.add(c);
+  c.on('error', () => {});
+  let buf = '';
+  c.on('data', (d) => {
+    buf += d.toString('latin1');
+    while (buf.includes('\r\n\r\n')) {
+      buf = buf.slice(buf.indexOf('\r\n\r\n') + 4);
+      seen.push(c.remotePort);
+      c.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+for (const label of ['fresh', 'pooled']) {
+  const line = await new Promise((resolve, reject) => {
+    https.get(`https://localhost:${port}/`, (res) => {
+      const s = res.socket;
+      const facts = [
+        s instanceof tls.TLSSocket,
+        s === res.req.socket,
+        s.remoteAddress,
+        s.remotePort === port,
+        s.remoteFamily,
+        s.localPort === seen[seen.length - 1],
+        s.encrypted,
+        s.authorized,
+        s.getPeerCertificate().subject.CN,
+        /^TLSv1\.[23]$/.test(s.getProtocol()),
+      ];
+      res.resume();
+      res.on('end', () => resolve(`${label} ${facts.join(' ')}`));
+    }).on('error', reject);
+  });
+  console.log(line);
+}
+console.log('one connection', new Set(seen).size === 1);
+// The client pools the connection; close it from the server so the run ends.
+for (const c of conns) c.destroy();
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_socket_extra_ca/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fresh true true 127.0.0.1 true IPv4 true true true localhost true\n\
+         pooled true true 127.0.0.1 true IPv4 true true true localhost true\n\
+         one connection true",
+        "stderr: {stderr}"
     );
 }
 
