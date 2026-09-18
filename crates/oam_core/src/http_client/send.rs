@@ -410,8 +410,9 @@ async fn run(
                 // Only when NOT A BYTE of a response arrived: hyper reports a
                 // connection that closed halfway through a response head with
                 // the same IncompleteMessage, and a server that had started
-                // answering did not ignore the request (RFC 9110 s9.2.2: a
-                // retry only "before any part of a response is received").
+                // answering did not ignore the request. RFC 9110 s9.2.2's
+                // example of a guess worth making is a connection that
+                // "closed before any part of a response is received".
                 //
                 // Once per hop: RFC 9110 s9.2.2 "SHOULD NOT automatically
                 // retry a failed automatic retry", and node sends it once and

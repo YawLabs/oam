@@ -439,9 +439,9 @@ async fn a_stale_resend_is_sent_once() {
 /// connection that ignored the request: the server had started answering.
 /// hyper reports it with the same IncompleteMessage as a connection that
 /// died before a byte arrived, so the send path counts the response bytes
-/// itself, and does not resend. RFC 9110 s9.2.2 allows the automatic retry
-/// only when the connection closed "before any part of a response is
-/// received"; node sends such a request once and rejects.
+/// itself, and does not resend (RFC 9110 s9.2.2's example of a retry worth
+/// guessing at is a connection that "closed before any part of a response is
+/// received"). node sends such a request once and rejects.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pooled_connection_that_closes_mid_head_is_not_resent() {
     within(async {

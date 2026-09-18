@@ -318,9 +318,9 @@ impl SendError {
 
     /// Some part of a response -- even a few bytes of a status line --
     /// arrived for this request before its connection failed. The server had
-    /// then started answering, so the request is not one it ignored, and
-    /// RFC 9110 s9.2.2 allows an automatic retry only when the connection
-    /// closed "before any part of a response is received". Also true when
+    /// then started answering, so the request is not one it ignored; RFC 9110
+    /// s9.2.2's example of a retry worth guessing at is a connection that
+    /// "closed before any part of a response is received". Also true when
     /// oam cannot tell.
     pub fn response_started(&self) -> bool {
         self.response_started
