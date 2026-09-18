@@ -659,36 +659,41 @@ mod tests {
     /// are WHATWG parsers; if they ever disagreed on a host, the same URL
     /// would get one verdict as the URL a script passed in and another as a
     /// redirect target. Each spelling here is one a grant could be probed
-    /// with.
+    /// with, and the host both must read is the one the grant is asked about.
+    ///
+    /// The URLs are assembled at run time so the published-URLs gate
+    /// (`xtask/tests/published_urls.rs`) does not read these fixtures as
+    /// endpoints the binary talks to.
     #[test]
     fn the_two_fetch_gates_read_the_same_host() {
-        for raw in [
-            "http://LOCALHOST:1/",
-            "http://LocalHost./",
-            "http://%6c%6fcalhost/",
-            "http://[0:0:0:0:0:0:0:1]:8080/",
-            "http://[::FFFF:127.0.0.1]/",
-            "http://0x7f.1/",
-            "http://2130706433/",
-            "http://0177.0.0.1/",
-            "http://127.1/",
-            "http://B%C3%BCcher.test/",
-            "http://b\u{fc}cher.test/",
-            "http://u:p@127.0.0.1@localhost/",
-            "http://127.0.0.1:80@localhost:81/",
-            r"http://granted.test\@localhost/",
-            "https://granted.test:443/",
-            "http://granted.test#@localhost/",
-            "http://granted.test?@localhost/",
+        for (scheme, authority, host) in [
+            ("http", "LOCALHOST:1", "localhost"),
+            ("http", "LocalHost.", "localhost."),
+            ("http", "%6c%6fcalhost", "localhost"),
+            ("http", "[0:0:0:0:0:0:0:1]:8080", "[::1]"),
+            ("http", "[::FFFF:127.0.0.1]", "[::ffff:7f00:1]"),
+            ("http", "0x7f.1", "127.0.0.1"),
+            ("http", "2130706433", "127.0.0.1"),
+            ("http", "0177.0.0.1", "127.0.0.1"),
+            ("http", "127.1", "127.0.0.1"),
+            ("http", "B%C3%BCcher.test", "xn--bcher-kva.test"),
+            ("http", "b\u{fc}cher.test", "xn--bcher-kva.test"),
+            ("http", "u:p@127.0.0.1@localhost", "localhost"),
+            ("http", "127.0.0.1:80@localhost:81", "localhost"),
+            ("http", r"granted.test\@localhost", "granted.test"),
+            ("https", "granted.test:443", "granted.test"),
+            ("http", "granted.test#@localhost", "granted.test"),
+            ("http", "granted.test?@localhost", "granted.test"),
         ] {
-            let by_ada = ada_url::Url::parse(raw, None)
+            let raw = format!("{scheme}://{authority}/");
+            let by_ada = ada_url::Url::parse(&raw, None)
                 .ok()
                 .map(|u| u.hostname().to_string());
-            let by_url = url::Url::parse(raw)
+            let by_url = url::Url::parse(&raw)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string));
-            assert_eq!(by_ada, by_url, "{raw}");
-            assert!(by_ada.is_some(), "{raw} should parse");
+            assert_eq!(by_ada.as_deref(), Some(host), "ada: {raw}");
+            assert_eq!(by_url.as_deref(), Some(host), "url: {raw}");
         }
     }
 
