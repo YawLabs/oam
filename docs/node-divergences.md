@@ -1156,15 +1156,19 @@ What still differs:
   `Connect Timeout Error (attempted address: 10.255.255.1:81, timeout: 10000ms)`); oam
   rejects after 21046 ms with `connect ETIMEDOUT 10.255.255.1:81`. Node's `http.request` has
   no such timeout, so only `fetch` differs.
-- **Aborting a `fetch` does not cancel the request.** The promise rejects with the abort
-  reason at once, as in Node, but the request stays on the wire and its response is read and
-  thrown away. Measured with a server that answers after 600 ms and an abort at 100 ms: under
+- **Aborting a `fetch` before its response head does not cancel the request.** The promise
+  rejects with the abort reason at once, as in Node, but the request stays on the wire until
+  the response head arrives; that response is then cancelled on arrival, which closes its
+  connection. Measured with a server that answers after 600 ms and an abort at 100 ms: under
   Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
-  `req` `'close'`); under oam the response finishes. A `fetch` waiting on its
-  `connect.lookup` hook (below) is dropped when it aborts. An abort that lands AFTER the
-  response head does end the body: the stream errors with the abort reason and the native
-  body is cancelled, as in Node -- the chunks already delivered stay delivered, and only the
-  chunk boundary at which it stops differs.
+  `req` `'close'`); under oam the response finishes. A server that sends its head late and
+  then streams sees the client leave at the abort in Node and at the head in oam. A `fetch`
+  waiting on its `connect.lookup` hook (below) is dropped when it aborts. An abort that lands
+  AFTER the response head ends the body as in Node, whether or not anything is reading it:
+  the connection is closed, a stream being read errors with the abort reason (the chunks
+  already delivered stay delivered, and only the chunk boundary at which it stops differs),
+  and `text()` / `arrayBuffer()` / `json()` called afterwards reject with undici's own
+  `AbortError` `The operation was aborted.` rather than the reason, as Node's do.
 - **TLS verdicts carry no code.** A `fetch` to a server whose certificate does not verify
   rejects with the uncoded cause `error sending request for url (https://host:port/)`, and the
   verifying `https.request` emits `ECONNRESET` `socket hang up`. Node reports the verdict:

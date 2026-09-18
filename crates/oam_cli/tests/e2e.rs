@@ -5634,6 +5634,94 @@ process.exit(0);
     );
 }
 
+/// The abort listener that ends a body used to go on only when the body
+/// stream was first touched, so an abort after the head on a body nobody had
+/// read yet cancelled nothing: the connection stayed open and the server kept
+/// streaming into it for the rest of the run. node destroys the connection
+/// either way. Every line below is node v22.22.2's own output for this
+/// script: the connection ends whether or not the body was read, and whether
+/// the abort came before or after the head; consuming a body whose fetch
+/// was already aborted fails with undici's `The operation was aborted.`
+/// rather than the signal's reason; and a signal shared by five finished
+/// fetches carries node's five listeners -- one per fetch, none left by
+/// the finished bodies (oam's body listener used to add a second).
+#[test]
+fn an_abort_after_the_head_ends_a_body_nobody_reads() {
+    let script = write_temp(
+        "abort_unread_body/main.mjs",
+        r#"import net from 'node:net';
+import { getEventListeners } from 'node:events';
+const left = new Map();
+const server = net.createServer((sock) => {
+  let buf = '';
+  sock.on('data', (d) => {
+    buf += d.toString('latin1');
+    const i = buf.indexOf('\r\n\r\n');
+    if (i === -1) return;
+    const path = buf.slice(0, i).split(' ')[1];
+    buf = '';
+    if (path === '/small') { sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok'); return; }
+    let tick;
+    sock.on('close', () => { clearInterval(tick); left.get(path)?.(); });
+    // /late answers after the abort; the others at once. Every body trickles
+    // and never ends, so only the client can end the connection.
+    setTimeout(() => {
+      if (sock.destroyed) return;
+      sock.write('HTTP/1.1 200 OK\r\ncontent-length: 100000000\r\n\r\n');
+      tick = setInterval(() => sock.write(Buffer.alloc(1000, 0x61)), 20);
+    }, path === '/late' ? 150 : 0);
+  });
+  sock.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const leaves = (path) => new Promise((resolve) => {
+  left.set(path, () => resolve('the server saw the client leave'));
+  setTimeout(() => resolve('STILL CONNECTED after 3000 ms'), 3000);
+});
+{
+  const gone = leaves('/unread');
+  const ac = new AbortController();
+  const r = await fetch(`${base}/unread`, { signal: ac.signal });
+  ac.abort();
+  console.log('abort, body never touched:', await gone);
+}
+{
+  const ac = new AbortController();
+  const r = await fetch(`${base}/text`, { signal: ac.signal });
+  ac.abort(new Error('my reason'));
+  try { await r.text(); console.log('text after abort: RESOLVED'); }
+  catch (e) { console.log('text after abort:', e.constructor.name, e.name, e.message); }
+}
+{
+  const gone = leaves('/late');
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 30);
+  try { await fetch(`${base}/late`, { signal: ac.signal }); } catch {}
+  console.log('abort before the head:', await gone);
+}
+{
+  const ac = new AbortController();
+  for (let k = 0; k < 5; k++) {
+    const r = await fetch(`${base}/small`, { signal: ac.signal });
+    await r.text();
+  }
+  console.log('abort listeners after 5 finished fetches:', getEventListeners(ac.signal, 'abort').length);
+}
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "abort, body never touched: the server saw the client leave\n\
+         text after abort: DOMException AbortError The operation was aborted.\n\
+         abort before the head: the server saw the client leave\n\
+         abort listeners after 5 finished fetches: 5"
+    );
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without

@@ -871,6 +871,54 @@
     const handle = raw.bodyHandle;
     let consumed = false;
     let bodyStream = null;
+    let streamController = null;
+
+    // An abort AFTER the response head still ends the body, whether or not
+    // anything is reading it: node errors the body with the abort reason and
+    // destroys the connection, and stopping a large download part-way
+    // through is the case an AbortController is normally reached for. The
+    // listener therefore goes on here, at the head, not when the body stream
+    // is first touched -- registered lazily, an abort on a body nobody had
+    // read yet cancelled nothing, and the server kept streaming into a
+    // connection oam held for the rest of the run (measured: node's server
+    // sees the client leave at once, oam's never did). The chunks already
+    // delivered stay delivered, as in node.
+    //
+    // The same path finishes an abort that landed BEFORE the head: the fetch
+    // promise already rejected with the reason, and the response that turns
+    // up later is cancelled on arrival instead of holding its connection.
+    let bodyAborted = false;
+    let onAbort = null;
+    const abortReason = () =>
+      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    // Read to the end, failed or cancelled: nothing is left for an abort to
+    // stop. Stop listening, so a signal shared by many fetches does not
+    // collect one listener per response, and a late abort does not leave a
+    // cancel tombstone for a handle that is already gone.
+    function bodyOver() {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      onAbort = null;
+    }
+    if (signal) {
+      onAbort = () => {
+        onAbort = null;
+        bodyAborted = true;
+        try {
+          globalThis.__oam.fetchBodyCancel(handle);
+        } catch {
+          /* already drained */
+        }
+        if (streamController) {
+          try {
+            streamController.error(abortReason());
+          } catch {
+            /* already closed or errored */
+          }
+        }
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     // The body is a real ReadableStream over the wire handle: each pull is
     // one op, so chunks surface as the server flushes them (SSE / token
@@ -879,42 +927,31 @@
     function ensureBody() {
       bodyStream ??= new ReadableStream({
         start(controller) {
-          if (!signal) return;
-          // An abort AFTER the response head still ends the body: node errors
-          // the body stream with the abort reason, and stopping a large
-          // download part-way through is the case an AbortController is
-          // normally reached for. oam used to keep reading and hand over the
-          // whole body, then report a clean end -- so a guard that aborted on
-          // a size limit downloaded everything anyway. The chunks already
-          // delivered stay delivered, as in node.
-          const onAbort = () => {
-            try {
-              globalThis.__oam.fetchBodyCancel(handle);
-            } catch {
-              /* already drained */
-            }
-            try {
-              controller.error(
-                signal.reason ??
-                  new globalThis.DOMException("This operation was aborted", "AbortError"),
-              );
-            } catch {
-              /* already closed or errored */
-            }
-          };
-          if (signal.aborted) onAbort();
-          else signal.addEventListener("abort", onAbort, { once: true });
+          streamController = controller;
+          // Aborted before anything asked for the body: it starts errored,
+          // as node's does (a reader's first read rejects with the reason).
+          if (bodyAborted) controller.error(abortReason());
         },
         async pull(controller) {
-          const chunk = await globalThis.__oam.fetchBodyRead(handle);
+          let chunk;
+          try {
+            chunk = await globalThis.__oam.fetchBodyRead(handle);
+          } catch (e) {
+            if (bodyAborted) return;
+            bodyOver();
+            throw e;
+          }
           // The read that was in flight when the abort landed returns here
           // against a stream that is already errored; closing or enqueuing
           // on it throws, and the throw would surface as a bogus rejection.
-          if (signal?.aborted) return;
-          if (chunk === undefined) controller.close();
-          else controller.enqueue(chunk);
+          if (bodyAborted) return;
+          if (chunk === undefined) {
+            bodyOver();
+            controller.close();
+          } else controller.enqueue(chunk);
         },
         cancel() {
+          bodyOver();
           globalThis.__oam.fetchBodyCancel(handle);
         },
       });
@@ -923,6 +960,13 @@
 
     async function drainBytes() {
       if (consumed) throw new TypeError("Body already consumed");
+      // Consuming a body whose fetch was already aborted fails before it
+      // starts, with undici's own AbortError rather than the signal's
+      // reason (measured on node v22.22.2: `ac.abort(new Error('why'))` then
+      // `r.text()` rejects with `DOMException [AbortError]: The operation was
+      // aborted.`). An abort that lands DURING the read rejects with the
+      // reason, through the stream, in both.
+      if (bodyAborted) throw new globalThis.DOMException("The operation was aborted.", "AbortError");
       consumed = true;
       const chunks = [];
       let total = 0;
