@@ -86,6 +86,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
   `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
   and in `NODE_OPTIONS`.
+- **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
+  and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
+  head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
+  for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
+  and a cause coded `UND_ERR_HEADERS_OVERFLOW`, the others fail with a cause coded
+  `HPE_HEADER_OVERFLOW`.
 - **One silent connection stopped an `http` server from accepting.** The server waited
   for each new connection's first bytes before accepting the next, so a client that
   connected and sent nothing (a browser preconnect, or anyone) held every later client

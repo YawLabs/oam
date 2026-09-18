@@ -85,6 +85,12 @@ pub struct FetchRequest {
     /// it yet.
     #[serde(default = "yes")]
     pub default_headers: bool,
+    /// node's `maxHeaderSize` for the response heads of this request.
+    /// Absent: the process-wide `--max-http-header-size` (16384 unless set),
+    /// which is what node's fetch and `http.request` use by default. JS does
+    /// not send it yet (`http.request`'s per-request option).
+    #[serde(default)]
+    pub max_header_size: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -151,6 +157,10 @@ struct LoopState {
     /// is dialled. Carried across a park, so a resumed fetch keeps enforcing
     /// it. `None`: every host is granted.
     net_check: Option<NetCheck>,
+    /// The response-head limit, and which of node's two counts applies (see
+    /// [`response_head_overflow`]).
+    max_header_size: u64,
+    fetch_semantics: bool,
 }
 
 enum BodySource {
@@ -264,6 +274,10 @@ pub async fn fetch(
         redirect: req.redirect,
         decode: req.decode,
         net_check,
+        max_header_size: req
+            .max_header_size
+            .unwrap_or_else(crate::http_head::max_http_header_size),
+        fetch_semantics: req.fetch_semantics,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -439,6 +453,15 @@ async fn run(
                 }
             }
         };
+        // Every hop's head, a redirect's included: node's parser refuses an
+        // oversized head before anything looks at its status.
+        if let Some(refusal) =
+            response_head_overflow(&response, state.max_header_size, state.fetch_semantics)
+        {
+            drop(response);
+            state.source.request_failed();
+            return refusal;
+        }
 
         if state.redirect == RedirectMode::Manual {
             break response;
@@ -479,6 +502,51 @@ async fn run(
         }
     };
     respond(state, response, bodies, ids)
+}
+
+/// node's response-head limit (`maxHeaderSize`, 16 KiB by default): the
+/// refusal when `response`'s head is at or over `limit`, counted the way the
+/// API that sent the request counts it (measured on node v22.22.2):
+///
+/// - `fetch` (undici): header names plus values. It fails with
+///   `TypeError: fetch failed`, cause `UND_ERR_HEADERS_OVERFLOW` /
+///   `Headers Overflow Error` (undici's `HeadersOverflowError`).
+/// - `http.request` (node's own parser): the status line's reason phrase
+///   too. It fails with `Parse Error: Header overflow`, code
+///   `HPE_HEADER_OVERFLOW`.
+///
+/// The count comes from the parsed head, so trailing whitespace in a value,
+/// which node counts and the parser trims, is not counted. A head too large
+/// for hyper's read buffer (~400 KiB) already fails the request as a
+/// connection error.
+fn response_head_overflow(
+    response: &http::Response<Incoming>,
+    limit: u64,
+    fetch_semantics: bool,
+) -> Option<OpOutcome> {
+    let mut count: u64 = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str().len() + value.as_bytes().len()) as u64)
+        .sum();
+    if !fetch_semantics && response.version() < http::Version::HTTP_2 {
+        count += match response.extensions().get::<hyper::ext::ReasonPhrase>() {
+            Some(reason) => reason.as_bytes().len(),
+            None => response
+                .status()
+                .canonical_reason()
+                .unwrap_or_default()
+                .len(),
+        } as u64;
+    }
+    if count < limit {
+        return None;
+    }
+    Some(if fetch_semantics {
+        OpOutcome::node_failed("UND_ERR_HEADERS_OVERFLOW", "Headers Overflow Error")
+    } else {
+        OpOutcome::node_failed("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow")
+    })
 }
 
 /// The net grant's verdict on the hop in `state`, or `None` when it may be

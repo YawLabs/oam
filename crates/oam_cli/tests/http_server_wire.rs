@@ -475,3 +475,59 @@ fn the_parser_flags_apply_to_servers() {
     );
     assert_eq!(seen["url"], "/lenient");
 }
+
+/// A one-shot raw HTTP server on 127.0.0.1 that answers every connection
+/// with `response` and closes. Returns its port.
+fn raw_responder(response: Vec<u8>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(&response);
+        }
+    });
+    port
+}
+
+/// The response-head limit follows `--max-http-header-size` too: a 20 KiB
+/// response header fails `fetch` by default (node: `UND_ERR_HEADERS_OVERFLOW`)
+/// and is accepted under a 32 KiB limit.
+#[test]
+fn the_response_head_limit_follows_the_flag() {
+    let mut response = b"HTTP/1.1 200 OK\r\nX-A: ".to_vec();
+    response.extend(std::iter::repeat_n(b'a', 20_000));
+    response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let port = raw_responder(response);
+    let script = write_temp(
+        "fetch_limit.mjs",
+        "try { const r = await fetch(`http://127.0.0.1:${process.env.PORT}/`); \
+         console.log('status', r.status, await r.text()); } \
+         catch (e) { console.log('rejects', e.message, e.cause && e.cause.code); }",
+    );
+    let run = |flags: &[&str]| {
+        let bin = std::env::var("OAM_WIRE_TEST_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
+        let out = Command::new(bin)
+            .args(flags)
+            .args(["run", script.to_str().unwrap(), "--no-check"])
+            .env("PORT", port.to_string())
+            .env_remove("NODE_OPTIONS")
+            .output()
+            .expect("oam runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(
+        run(&[]),
+        "rejects fetch failed UND_ERR_HEADERS_OVERFLOW",
+        "the default limit"
+    );
+    assert_eq!(
+        run(&["--max-http-header-size=32768"]),
+        "status 200 ok",
+        "a raised limit"
+    );
+}
