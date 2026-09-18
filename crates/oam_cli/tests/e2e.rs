@@ -4821,8 +4821,9 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
 /// oam used to call it once, for the first host only, so a 302 to another
 /// name was dialled through system DNS without the hook seeing it.
 ///
-/// Measured on node v22.22.2 + undici 6.24.1 (Windows), same script: the same
-/// response, hosts, options and wire hits. The one difference is the call
+/// Measured on node v22.22.2 + undici 6.24.1 (Windows, macOS 26 arm64, Debian
+/// 12 x64), same script: the same response, hosts, options and wire hits on
+/// each. The one difference is the call
 /// COUNT: node calls the hook once per connection it opens (3 here: its pool
 /// opens a second connection for the same-host hop), oam once per host per
 /// fetch (2) -- every connection oam opens still dials addresses the hook
@@ -4865,9 +4866,9 @@ await agent.close();
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    // node's net.connect hints: 0 on Windows (measured), the platform's
-    // AI_ADDRCONFIG elsewhere. TODO(#143 legs): confirm 1024 / 32 against
-    // node on the macOS and Linux legs; these are the <netdb.h> values.
+    // node's net.connect hints: 0 on Windows, the platform's AI_ADDRCONFIG
+    // elsewhere -- 1024 on macOS, 32 on glibc. All three measured against
+    // node v22.22.2 on the #143 legs; FreeBSD's 1024 is its <netdb.h> value.
     let hints = if cfg!(windows) {
         0
     } else if cfg!(any(target_os = "macos", target_os = "freebsd")) {

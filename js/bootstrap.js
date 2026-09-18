@@ -1028,10 +1028,10 @@
   // The `hints` node's net.connect hands a connect.lookup hook
   // (lib/net.js lookupAndConnect): 0 on Windows, dns.ADDRCONFIG -- the
   // platform's AI_ADDRCONFIG -- elsewhere. Measured: node v22.22.2 passes
-  // `{ family: undefined, hints: 0, all: true }` on win32; AI_ADDRCONFIG is
-  // 1024 in macOS's <netdb.h> (compiled on the mac leg). glibc's 0x20 is the
-  // header value, not yet confirmed against node on the Linux leg. oam's own
-  // dns.ADDRCONFIG is still 0 everywhere (a separate follow-up).
+  // `{ family: undefined, hints, all: true }` with hints 0 on win32, 1024 on
+  // macOS 26 arm64 and 32 (0x20) on Debian 12 x64 (glibc 2.36). FreeBSD's
+  // 1024 is its <netdb.h> value, unmeasured. oam's own dns.ADDRCONFIG is
+  // still 0 everywhere (a separate follow-up).
   function lookupHints() {
     const platform = globalThis.process?.platform;
     if (platform === "win32") return 0;

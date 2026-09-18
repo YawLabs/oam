@@ -1617,10 +1617,6 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   `-3008`), the row `WSAHOST_NOT_FOUND` uses. libuv's table has no row for it, so its generic
   translation would say `ENOENT` (`-4058`); the code could not be triggered on the dev box to
   see what Node shows. _(source: `crates/oam_core/src/net_connect.rs` `classify_resolve`)_
-- **The `hints` a `connect.lookup` hook receives off Windows.** Node passes `dns.ADDRCONFIG`
-  there; oam passes the platform's `AI_ADDRCONFIG` header value, `1024` on macOS and `32`
-  elsewhere, without having compared either against Node on those hosts. On Windows both pass
-  `0` (measured).
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 
