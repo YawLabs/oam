@@ -1770,7 +1770,12 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
         if tok == "--pending-deprecation" {
             flags.pending_deprecation = true;
         } else if let Some(v) = tok.strip_prefix("--max-http-header-size=") {
-            flags.max_http_header_size = Some(v.to_string());
+            // node exits 9 on an empty value; this allowlist ignores a bad
+            // token instead (see the call site), and an empty value must not
+            // read as 0, which would refuse every request.
+            if !v.is_empty() {
+                flags.max_http_header_size = Some(v.to_string());
+            }
         } else if tok == "--max-http-header-size"
             && let Some(v) = it.next()
         {

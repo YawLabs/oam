@@ -447,11 +447,26 @@ fn the_parser_flags_apply_to_servers() {
             ex.response
         );
     }
-    // Without the flag the same head is fine.
-    let server = Server::start("noflag.mjs", ADDR_SERVER, &[], &[("HOST", "127.0.0.1")]);
-    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
-    let ex = exchange(target, None, head.as_bytes(), Duration::from_secs(5));
-    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    // Without the flag the same head is fine -- and so it is with an empty
+    // value in NODE_OPTIONS, which is ignored rather than read as 0 (a limit
+    // that would refuse every request).
+    for env in [
+        &[("HOST", "127.0.0.1")][..],
+        &[
+            ("HOST", "127.0.0.1"),
+            ("NODE_OPTIONS", "--max-http-header-size="),
+        ][..],
+    ] {
+        let server = Server::start("noflag.mjs", ADDR_SERVER, &[], env);
+        let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+        let ex = exchange(target, None, head.as_bytes(), Duration::from_secs(5));
+        assert_eq!(
+            ex.statuses(),
+            ["HTTP/1.1 200 OK"],
+            "{env:?}: {:?}",
+            ex.response
+        );
+    }
 
     let server = Server::start(
         "insecure.mjs",
