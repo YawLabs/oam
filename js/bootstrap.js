@@ -1353,6 +1353,11 @@
     // redirect, and an application that vets a URL before requesting it
     // relies on that.
     if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
+    // http.request's own maxHeaderSize for the response heads (without it
+    // the transport applies the process-wide limit).
+    if (rawPayload && typeof init.__oamMaxHeaderSize === "number") {
+      request.max_header_size = init.__oamMaxHeaderSize;
+    }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was

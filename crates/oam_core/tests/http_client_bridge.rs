@@ -244,6 +244,43 @@ async fn eof_mid_body_fails_the_body() {
     .await;
 }
 
+/// A response head at or over the request's maxHeaderSize -- counted as
+/// node's http.request counts it: reason phrase, names and values -- fails
+/// with node's HPE_HEADER_OVERFLOW; one byte under goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_head_over_max_header_size_is_refused() {
+    within(async {
+        // Counted: "OK" (2) + "x-a" (3) + value + "content-length" (14) + "1" (1).
+        for (value_len, refused) in [(79, true), (78, false)] {
+            let reg = Reg::new();
+            let id = reg.start(json!({
+                "method": "GET", "target": "/", "headers": [["host", "h"]],
+                "max_header_size": 99,
+            }));
+            let head = reg.response(id);
+            reg.written_until(id, "\r\n\r\n").await;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nx-a: {}\r\ncontent-length: 1\r\n\r\na",
+                "v".repeat(value_len)
+            );
+            reg.feed(id, reply.as_bytes()).await;
+            let outcome = head.await.unwrap();
+            if refused {
+                assert_eq!(
+                    node_failure(outcome),
+                    (
+                        "HPE_HEADER_OVERFLOW".to_string(),
+                        "Parse Error: Header overflow".to_string()
+                    )
+                );
+            } else {
+                assert_eq!(payload(outcome)["status"], 200);
+            }
+        }
+    })
+    .await;
+}
+
 /// A malformed chunk-size line fails the body with node's coded parse error
 /// (the fetch path keeps its one text for every body failure).
 #[tokio::test(flavor = "multi_thread")]

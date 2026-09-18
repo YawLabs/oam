@@ -17977,6 +17977,18 @@
       return err;
     }
 
+    // node's parser errors (`HPE_*`, `Parse Error: <reason>`) carry the
+    // reason on their own as well.
+    function withParseReason(err) {
+      if (
+        err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0 &&
+        err.reason === undefined && typeof err.message === "string"
+      ) {
+        err.reason = err.message.replace(/^Parse Error: /, "");
+      }
+      return err;
+    }
+
     function once(fn) {
       let called = false;
       return function (...args) {
@@ -18274,6 +18286,36 @@
         }
         if (port && +port !== defaultPort) hostHeader += ":" + port;
         this._hostHeader = hostHeader;
+        // node: the response head limit for this request (0 or absent: the
+        // process-wide --max-http-header-size, http.maxHeaderSize), and
+        // insecureHTTPParser, which does not lift it. Validated as node's
+        // constructor validates them; an agent's options are not consulted.
+        var maxHeaderSize = opts.maxHeaderSize;
+        if (maxHeaderSize !== undefined) {
+          if (typeof maxHeaderSize !== "number") {
+            throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
+          }
+          if (!Number.isInteger(maxHeaderSize)) {
+            throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
+          }
+          if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
+            throw codes.ERR_OUT_OF_RANGE(
+              "maxHeaderSize",
+              ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
+              maxHeaderSize,
+            );
+          }
+        }
+        this.maxHeaderSize = maxHeaderSize;
+        var insecureHTTPParser = opts.insecureHTTPParser;
+        if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "options.insecureHTTPParser",
+            "boolean",
+            insecureHTTPParser,
+          );
+        }
+        this.insecureHTTPParser = insecureHTTPParser;
         this._body = [];
         this._ended = false;
         this._aborted = false;
@@ -18665,6 +18707,9 @@
           // own (literal) host never needed, never saw them.
           __oamManualRedirect: true,
         };
+        // The request's own response-head limit; without one the transport
+        // applies the process-wide default.
+        if (self.maxHeaderSize) fetchOpts.__oamMaxHeaderSize = self.maxHeaderSize;
         if (self._bodyStream !== null) {
           fetchOpts.__oamBodyStream = self._bodyStream;
         } else if (bodyData && self.method !== "GET" && self.method !== "HEAD") {
@@ -18712,6 +18757,10 @@
             mapped = cause;
           } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
+          } else if (cause && typeof cause.code === "string" && cause.code.indexOf("HPE_") === 0) {
+            // node's parser error (an oversized response head): emitted as
+            // node emits it, with its `reason`.
+            mapped = withParseReason(cause);
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -18977,7 +19026,12 @@
           this._upgradeOver(socket, bodyData);
           return;
         }
-        var request = { method: this.method, target: this.path, headers: this._headerList(true) };
+        var request = {
+          method: this.method,
+          target: this.path,
+          headers: this._headerList(true),
+          max_header_size: this._maxHeaderSizeLimit(),
+        };
         if (this._bodyStream !== null) {
           request.body_stream = this._bodyStream;
         } else if (bodyData && bodyData.length > 0) {
@@ -19004,9 +19058,15 @@
           self._emitResponse(raw, true);
         }, function (err) {
           if (self._aborted) return;
-          self._failBeforeResponse(err);
+          self._failBeforeResponse(withParseReason(err));
           if (!socket.destroyed) socket.destroy();
         });
+      }
+
+      // node's parser limit for this request's response head: its own
+      // maxHeaderSize, or (0 / absent) the process-wide one.
+      _maxHeaderSizeLimit() {
+        return this.maxHeaderSize || registry.get("http").maxHeaderSize;
       }
 
       // Bytes between the socket and the bridge. The socket is paused while
@@ -19097,10 +19157,9 @@
         var responseBuf = globalThis.Buffer.alloc(0);
         // node's parser gives up on a head past maxHeaderSize (16 KiB by
         // default): a peer that never ends its head cannot grow this buffer
-        // without bound.
-        var maxHeaderSize = typeof this._options.maxHeaderSize === "number"
-          ? this._options.maxHeaderSize
-          : 16384;
+        // without bound. (The raw head is measured here, CRLFs included --
+        // a bound, not node's exact count.)
+        var maxHeaderSize = this._maxHeaderSizeLimit();
         var onEnd = function () {
           socket.removeListener("data", onData);
           self._failBeforeResponse(connResetException("socket hang up"));
@@ -19115,7 +19174,7 @@
               socket.removeListener("end", onEnd);
               var overflow = new Error("Parse Error: Header overflow");
               overflow.code = "HPE_HEADER_OVERFLOW";
-              self._failBeforeResponse(overflow);
+              self._failBeforeResponse(withParseReason(overflow));
               socket.destroy();
             }
             return;
@@ -19235,7 +19294,7 @@
                 // before the response is aborted; a connection that ends
                 // inside a body just aborts it.
                 if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
-                  self.errored = err;
+                  self.errored = withParseReason(err);
                   self.emit("error", err);
                 }
                 err = connResetException("aborted");
