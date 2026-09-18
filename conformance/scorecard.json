@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "4fdd17b+wip",
+  "commit": "6baa853+wip",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 117,
-      "total": 117,
+      "pass": 119,
+      "total": 119,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -132,6 +132,14 @@
         },
         {
           "case": "120-net-tls-connect-lookup.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "121-http-request-lookup-and-agents.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "122-http-client-socket-addresses.mjs",
           "status": "pass"
         },
         {
