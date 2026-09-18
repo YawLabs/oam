@@ -21,10 +21,13 @@ use http::header::HeaderValue;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::capture_connection;
 use hyper_util::client::proxy::matcher::Matcher;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 
-use super::connector::{HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key};
+use super::connector::{
+    ConnUses, HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key,
+};
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
 use crate::OpOutcome;
@@ -130,7 +133,7 @@ impl HttpTransport {
     pub async fn send(
         &self,
         route: &Route,
-        request: http::Request<ReqBody>,
+        mut request: http::Request<ReqBody>,
     ) -> Result<http::Response<Incoming>, SendError> {
         let client = match &route.hooked {
             Some(hooked) => &hooked.client,
@@ -139,7 +142,20 @@ impl HttpTransport {
                 &self.client
             }
         };
-        client.request(request).await.map_err(SendError)
+        let capture = capture_connection(&mut request);
+        let result = client.request(request).await;
+        // Count this request in on the connection it went out on, whatever
+        // the outcome, and learn whether an earlier request had used it. No
+        // connection at all (a connect that failed) is not a reused one.
+        let reused = capture
+            .connection_metadata()
+            .as_ref()
+            .is_some_and(|connected| {
+                let mut extras = http::Extensions::new();
+                connected.get_extras(&mut extras);
+                extras.get::<ConnUses>().is_some_and(ConnUses::count_one)
+            });
+        result.map_err(|error| SendError { error, reused })
     }
 
     /// The `proxy-authorization` value this hop needs: only an http request
@@ -235,14 +251,18 @@ impl Route {
 
 /// A request that produced no response.
 #[derive(Debug)]
-pub struct SendError(hyper_util::client::legacy::Error);
+pub struct SendError {
+    error: hyper_util::client::legacy::Error,
+    /// It went out on a connection an earlier request had already used.
+    reused: bool,
+}
 
 impl SendError {
     /// The connect failure behind this error, if a connect failed: through
     /// hyper-util's error and, for a proxied https request, through the
     /// tunnel's -- a proxy that refused or did not resolve is named in it.
     pub fn connect_error(&self) -> Option<&ConnectError> {
-        find_in_chain::<ConnectError>(&self.0)
+        find_in_chain::<ConnectError>(&self.error)
     }
 
     /// The op outcome for this failure of the hop to `url`:
@@ -259,7 +279,7 @@ impl SendError {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
         }
-        if let Some(tls) = find_in_chain::<TlsSetupError>(&self.0) {
+        if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
         OpOutcome::Failed(format!("error sending request for url ({url})"))
@@ -278,7 +298,17 @@ impl SendError {
     /// and the hop. Node's loop reads the FIN first and opens a fresh socket,
     /// so node succeeded on 20 of 20 iterations where oam failed on most.
     pub fn is_incomplete_message(&self) -> bool {
-        find_in_chain::<hyper::Error>(&self.0).is_some_and(|e| e.is_incomplete_message())
+        find_in_chain::<hyper::Error>(&self.error).is_some_and(|e| e.is_incomplete_message())
+    }
+
+    /// The request went out on a connection an earlier request had already
+    /// used -- a pooled one. Only such a connection can have been closed by
+    /// the server while it sat idle; a FRESH connection that dies before the
+    /// response is the server's answer, and sending the request again would
+    /// deliver it twice where node delivers it once (measured: a server that
+    /// closes every connection unanswered sees a GET once from node).
+    pub fn on_reused_connection(&self) -> bool {
+        self.reused
     }
 
     /// reqwest's retry classification (retry.rs:303-313): the server refused
@@ -286,7 +316,7 @@ impl SendError {
     /// connection down gracefully (GOAWAY with NO_ERROR). Either way the
     /// request was not processed and may be sent again (RFC 9113 s8.7).
     pub fn is_h2_retryable(&self) -> bool {
-        find_in_chain::<h2::Error>(&self.0).is_some_and(|e| {
+        find_in_chain::<h2::Error>(&self.error).is_some_and(|e| {
             e.is_remote()
                 && ((e.is_go_away() && e.reason() == Some(h2::Reason::NO_ERROR))
                     || (e.is_reset() && e.reason() == Some(h2::Reason::REFUSED_STREAM)))
@@ -297,7 +327,7 @@ impl SendError {
 impl std::fmt::Display for SendError {
     /// The whole source chain, for tests and debugging.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&self.0);
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&self.error);
         let mut first = true;
         while let Some(error) = current {
             if !first {
@@ -313,7 +343,7 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        Some(&self.error)
     }
 }
 

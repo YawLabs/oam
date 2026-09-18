@@ -53,15 +53,39 @@ use crate::net_connect::{self, ConnectOptions, Pin};
 pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> AsyncIo for T {}
 
+/// The requests one connection has carried, shared by every copy of its
+/// `Connected`: hyper-util clones that into each request that checks the
+/// connection out, extras included, and `capture_connection` hands the copy
+/// back to the sender.
+///
+/// [`super::transport::HttpTransport::send`] counts a request in once it is
+/// done with the connection, so a request that finds the count above zero
+/// went out on a connection an earlier request had already used -- a POOLED
+/// connection, the only kind a server can have closed while it sat idle.
+/// hyper-util knows this too (`is_reused`) but keeps it to itself unless the
+/// request never left.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConnUses(Arc<AtomicU64>);
+
+impl ConnUses {
+    /// Counts one more request on this connection: true when an earlier
+    /// request had already used it.
+    pub(crate) fn count_one(&self) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed) > 0
+    }
+}
+
 /// A connection handed to hyper-util. `Connected` is not publicly `Clone`, so
-/// the two facts it carries are kept as flags and a fresh one is built on
-/// every call.
+/// the facts it carries are kept here and a fresh one is built on every
+/// call.
 pub(crate) struct OamConn {
     io: TokioIo<Box<dyn AsyncIo>>,
     /// ALPN selected h2.
     h2: bool,
     /// An http request through a proxy: hyper writes the absolute form.
     proxied: bool,
+    /// The requests this connection has carried.
+    uses: ConnUses,
 }
 
 impl OamConn {
@@ -70,13 +94,16 @@ impl OamConn {
             io: TokioIo::new(io),
             h2,
             proxied,
+            uses: ConnUses::default(),
         }
     }
 }
 
 impl Connection for OamConn {
     fn connected(&self) -> Connected {
-        let connected = Connected::new().proxy(self.proxied);
+        let connected = Connected::new()
+            .proxy(self.proxied)
+            .extra(self.uses.clone());
         if self.h2 {
             connected.negotiated_h2()
         } else {

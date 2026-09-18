@@ -5722,6 +5722,77 @@ process.exit(0);
     );
 }
 
+/// A redirect hop that takes a pooled connection the server has already
+/// closed is sent again on a fresh one, and a request whose FRESH connection
+/// dies unanswered is not. Both lines are node v22.22.2's output for this
+/// script.
+///
+/// The first is the idle-timeout shape: a 302 with keep-alive, then a FIN.
+/// oam's redirect loop has no event-loop tick between the 3xx and the hop, so
+/// the hop almost always picks the dead connection out of the pool before its
+/// FIN is processed; before the stale-connection retry this was 0-14 of 20
+/// (8/20 on the pre-retry build with this script), and nothing else tests it
+/// -- conformance 111 uses `http.createServer`, which keeps every connection
+/// alive. The second pins the retry to REUSED connections: when it fired on
+/// any connection, a server that closes every connection unanswered saw a
+/// GET twice from oam and once from node.
+#[test]
+fn a_dead_pooled_connection_is_retried_and_a_dead_fresh_one_is_not() {
+    let script = write_temp(
+        "stale_pooled_retry/main.mjs",
+        r#"import net from 'node:net';
+// A 302 then FIN on a keep-alive connection (an idle-timeout shape); /final
+// stays open. The redirect hop takes the just-pooled, already-dead connection.
+const finAfter = net.createServer((sock) => {
+  let buf = '';
+  sock.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      const path = buf.slice(0, i).split(' ')[1];
+      buf = buf.slice(i + 4);
+      if (path.startsWith('/redir')) {
+        sock.write('HTTP/1.1 302 Found\r\nlocation: /final\r\ncontent-length: 0\r\n\r\n');
+        sock.end();
+      } else {
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+      }
+    }
+  });
+  sock.on('error', () => {});
+});
+// Closes every connection as soon as a request arrives, unanswered.
+let seen = 0;
+const silent = net.createServer((sock) => {
+  sock.on('data', () => { seen++; sock.destroy(); });
+  sock.on('error', () => {});
+});
+await new Promise((r) => finAfter.listen(0, '127.0.0.1', r));
+await new Promise((r) => silent.listen(0, '127.0.0.1', r));
+let ok = 0;
+for (let i = 0; i < 20; i++) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${finAfter.address().port}/redir${i}`);
+    if (r.status === 200 && (await r.text()) === 'ok') ok++;
+  } catch {}
+}
+console.log(`302 then FIN, 20 GET redirects: ok=${ok}/20`);
+let verdict = 'RESOLVED';
+try { await fetch(`http://127.0.0.1:${silent.address().port}/x`); } catch (e) { verdict = `rejected ${e.constructor.name}`; }
+await new Promise((r) => setTimeout(r, 200));
+console.log(`a fresh connection closed unanswered: ${verdict}, request seen ${seen} time(s)`);
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "302 then FIN, 20 GET redirects: ok=20/20\n\
+         a fresh connection closed unanswered: rejected TypeError, request seen 1 time(s)"
+    );
+}
+
 /// A fetch whose dispatcher carries a connect.lookup hook never goes through
 /// the environment proxy: an undici Agent does not read HTTP_PROXY, and a
 /// pin that a proxy resolved again would pin nothing. The same fetch without

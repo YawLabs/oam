@@ -376,11 +376,18 @@ async fn run(
                 // -- oam DID put the request on the wire and cannot know the
                 // server ignored it. node loses this race far less often
                 // because its event loop reads the FIN before it writes.
+                //
+                // Only on a REUSED connection: a fresh one that dies before
+                // the response is the server's answer to this request, not a
+                // stale pool entry, and node sends such a request once (a
+                // server that closes every connection unanswered saw a GET
+                // twice from oam when this retried on any connection).
                 Err(e)
                     if !stale_retried
                         && state.source.replayable()
                         && is_idempotent(&state.method)
-                        && e.is_incomplete_message() =>
+                        && e.is_incomplete_message()
+                        && e.on_reused_connection() =>
                 {
                     stale_retried = true;
                 }
