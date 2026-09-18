@@ -551,6 +551,15 @@ impl ChunkedState {
 
         match byte {
             b'\r' => Poll::Ready(Ok(ChunkedState::TrailerLf)),
+            // oam patch: a bare LF is not a line end here. The trailer
+            // section runs to CRLF CRLF, but decode_trailers stops at the
+            // first empty line httparse sees, and httparse takes a bare LF
+            // as one -- so the bytes after a bare-LF blank line (a whole
+            // request, even) were consumed and silently dropped.
+            b'\n' => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid trailer: bare LF",
+            ))),
             _ => Poll::Ready(Ok(ChunkedState::Trailer)),
         }
     }
@@ -603,6 +612,13 @@ impl ChunkedState {
                 }
                 Poll::Ready(Ok(ChunkedState::EndLf))
             }
+            // oam patch: a line that starts with a bare LF would be the empty
+            // line that ends the trailers for decode_trailers (see
+            // read_trailer) while this state machine reads on.
+            b'\n' => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid chunk end: bare LF",
+            ))),
             byte => {
                 match trailers_buf {
                     None => {

@@ -1,8 +1,8 @@
 # hyper 1.10.1, patched for oam
 
-This directory is hyper **1.10.1** as published on crates.io, plus two
-changes: a fix for a client hang (items 1-3 below) and one server extension
-(item 4). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+This directory is hyper **1.10.1** as published on crates.io, plus three
+changes: a fix for a client hang (items 1-3 below), one server extension
+(item 4) and a stricter chunked-trailer reader (item 5). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -18,9 +18,9 @@ changes: a fix for a client hang (items 1-3 below) and one server extension
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix **and** oam no longer
-  needs item 4 (see "The request-head extension" below for what replacing
-  it takes). To do that:
+- **Remove it when** a hyper release ships the fix and item 5's, **and** oam
+  no longer needs item 4 (see "The request-head extension" below for what
+  replacing it takes). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
      from the root `Cargo.toml`.
@@ -63,6 +63,10 @@ whole of it.
    line. It is a clone of the `Bytes` slice the parse already holds (the
    header values point into the same buffer), so nothing is copied. See
    "The request-head extension" below.
+5. **`src/proto/h1/decode.rs`, `read_trailer` and `read_end_cr`.** A bare LF
+   in the trailer section of a chunked body is an error ("Invalid trailer:
+   bare LF" / "Invalid chunk end: bare LF") instead of a trailer byte. See
+   "Chunked trailers" below.
 
 ## Why
 
@@ -130,6 +134,33 @@ to detect it by, so a move to 1.11.x keeps this hunk.
 It is exercised by `crates/oam_cli/tests/http_server_wire.rs` and the
 conformance cases 131 and 132 (a stock hyper does not compile with oam, since
 oam names the type).
+
+## Chunked trailers (item 5)
+
+The chunked decoder reads the trailer section byte by byte until CR LF CR LF,
+treating a bare LF as an ordinary byte, and then hands the buffer to
+`decode_trailers`, whose `httparse::parse_headers` stops at the first empty
+line it sees -- and httparse accepts a bare LF as a line end. So in
+`0
+X: a
+
+GET /x HTTP/1.1
+Host: a
+
+` the decoder read up to the
+final CR LF CR LF, the parse returned after `X: a`, and the bytes between --
+here a complete second request -- were consumed and dropped, with the
+connection kept alive. A front end that ends the trailers at the bare-LF
+blank line forwards that second request and then expects a response the
+server never sends. node refuses the body (400). With the patch the body
+fails at the bare LF and hyper closes the connection; the request handler
+sees a body error. Only a bare LF is refused: a CR must still be followed by
+LF, as before. The decoder is shared with the client, where a response
+carrying such trailers now fails too, as it does in node.
+
+Tested by `crates/oam_cli/tests/http_server_wire.rs`
+`a_bare_lf_in_the_trailers_fails_the_request` (fails on stock 1.10.1).
+hyper 1.11.1's decoder is unchanged here.
 
 ## Reproduction
 

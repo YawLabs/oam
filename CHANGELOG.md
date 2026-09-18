@@ -86,6 +86,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
   `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
   and in `NODE_OPTIONS`.
+- **A bare LF in a chunked body's trailers was not refused.** The trailer reader and
+  the trailer parser disagreed about where the trailers end, so bytes after a bare-LF
+  blank line were read and silently dropped while the connection stayed open. Such a
+  body now fails and the connection is closed (Node answers `400`). The same applies to
+  chunked responses read by `fetch` and `http.request`.
 - **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
   and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
   head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it

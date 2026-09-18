@@ -531,3 +531,60 @@ fn the_response_head_limit_follows_the_flag() {
         "a raised limit"
     );
 }
+
+/// Reads each request body to the end before answering, and reports how the
+/// body ended. Has no 'upgrade' listener.
+const BODY_SERVER: &str = r#"
+import http from "node:http";
+const server = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (d) => (body += d));
+  req.on("end", () => {
+    console.log(JSON.stringify({ kind: "end", url: req.url, body }));
+    res.end("ok");
+  });
+  req.on("error", () => console.log(JSON.stringify({ kind: "body error", url: req.url })));
+});
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+
+/// A chunked body whose trailer section holds a bare-LF blank line fails
+/// and ends the connection. hyper's trailer reader ran on to the next CRLF
+/// CRLF while its trailer parse stopped at the bare-LF blank line, so the
+/// bytes in between -- a whole request -- were read and dropped, and the
+/// connection stayed open for more (node answers 400).
+#[test]
+fn a_bare_lf_in_the_trailers_fails_the_request() {
+    let server = Server::start("trailer.mjs", BODY_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    for bytes in [
+        &b"POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+           3\r\nabc\r\n0\r\nX: a\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        b"POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+           3\r\nabc\r\n0\r\nX: a\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+        b"POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+           3\r\nabc\r\n0\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+    ] {
+        let ex = exchange(target, None, bytes, Duration::from_secs(5));
+        assert!(
+            !ex.response.contains("HTTP/1.1 200"),
+            "the request must not complete: {:?}",
+            ex.response
+        );
+        assert!(ex.closed, "the connection must close: {:?}", ex.response);
+        let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+        assert_eq!(seen["kind"], "body error", "{seen}");
+        assert_no_more_lines(&server, Duration::from_millis(300));
+    }
+    // Well-formed trailers still work.
+    let ex = exchange(
+        target,
+        None,
+        b"POST /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\nX: a\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+    assert_eq!(seen["body"], "abc");
+}
