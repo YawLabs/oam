@@ -1156,7 +1156,7 @@ pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value
 /// The peer's certificate chain as base64 DER, leaf first -- what the JS side
 /// builds `getPeerCertificate()` and `getPeerX509Certificate()` from. None
 /// when the peer sent no certificate (a server whose client sent none).
-fn peer_certificates_b64(
+pub(crate) fn peer_certificates_b64(
     chain: Option<&[rustls::pki_types::CertificateDer<'static>]>,
 ) -> Option<Vec<String>> {
     use base64::Engine;

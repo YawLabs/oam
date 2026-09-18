@@ -34,6 +34,7 @@ use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, PROXY_AUTHORIZAT
 use hyper::body::Incoming;
 
 use super::body::{FetchBodies, FetchBody, StreamSlot};
+use super::connector::ConnInfo;
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
@@ -527,6 +528,7 @@ fn respond(
     ids: &AtomicU64,
 ) -> OpOutcome {
     let status = response.status();
+    let conn = response.extensions().get::<ConnInfo>().cloned();
     let codings = if state.decode {
         let encodings: Vec<&[u8]> = response
             .headers()
@@ -563,7 +565,7 @@ fn respond(
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let body = FetchBody::new(response.into_body(), codings.as_deref());
     lock(bodies).insert(handle, body);
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "status": status.as_u16(),
         "statusText": status.canonical_reason().unwrap_or_default(),
         "url": url.as_str(),
@@ -571,5 +573,32 @@ fn respond(
         "headers": headers,
         "bodyHandle": handle,
     });
+    if let Some(conn) = conn {
+        conn_payload(&mut payload, &conn);
+    }
     OpOutcome::Json(payload.to_string())
+}
+
+/// The connection a response arrived on, as `http.request` reports it on
+/// `req.socket` / `res.socket`: `socket` holds the dialled peer and the
+/// local end (`{address, port, family}`, the net.connect shape), `tls` an
+/// https origin's session in `tls.connect`'s spelling. fetch() ignores both.
+fn conn_payload(payload: &mut serde_json::Value, conn: &ConnInfo) {
+    let mut socket = serde_json::Map::new();
+    if let Some(peer) = conn.peer {
+        socket.insert("remoteAddr".to_string(), crate::tcp::addr_to_json(peer));
+    }
+    if let Some(local) = conn.local {
+        socket.insert("localAddr".to_string(), crate::tcp::addr_to_json(local));
+    }
+    payload["socket"] = serde_json::Value::Object(socket);
+    if let Some(tls) = &conn.tls {
+        payload["tls"] = serde_json::json!({
+            "protocol": tls.protocol,
+            "cipher": tls.cipher,
+            "cipherStandardName": tls.cipher_standard_name,
+            "alpnProtocol": tls.alpn,
+            "peerCertificates": tls.peer_certificates,
+        });
+    }
 }

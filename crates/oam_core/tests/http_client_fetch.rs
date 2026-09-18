@@ -310,6 +310,98 @@ async fn response_header_values_are_latin1_not_lossy_utf8() {
     .await;
 }
 
+/// Every response names the connection it arrived on: the dialled peer and
+/// the local end, as `http.request` reports them on `req.socket` (the peer's
+/// IP, never the host as written). A pooled connection's second response
+/// names the same connection. The local port is the port the server saw.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_payload_names_the_connection_fresh_and_pooled() {
+    within(async {
+        let peers: Arc<Mutex<Vec<u16>>> = Arc::new(Mutex::new(Vec::new()));
+        let server = {
+            let peers = peers.clone();
+            serve(move |mut conn, _, _| {
+                let peers = peers.clone();
+                async move {
+                    peers
+                        .lock()
+                        .unwrap()
+                        .push(conn.io.peer_addr().unwrap().port());
+                    while conn.request().await.is_some() {
+                        if !conn.send(&response("200 OK", &[], b"ok")).await {
+                            return;
+                        }
+                    }
+                }
+            })
+            .await
+        };
+        let reg = Reg::new();
+        let t = plain();
+        // A name, so the address reported is the one dialled, not the host.
+        let url = format!("http://localhost:{}/", server.port);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let p = payload(reg.fetch(&t, json!({ "url": url })).await);
+            assert_eq!(reg.text(handle_of(&p)).await, "ok");
+            let socket = &p["socket"];
+            let remote = &socket["remoteAddr"];
+            assert!(
+                remote["address"] == "127.0.0.1" || remote["address"] == "::1",
+                "{p}"
+            );
+            assert_eq!(remote["port"], server.port);
+            let family = if remote["address"] == "::1" {
+                "IPv6"
+            } else {
+                "IPv4"
+            };
+            assert_eq!(remote["family"], family);
+            assert_eq!(socket["localAddr"]["family"], family);
+            assert!(p.get("tls").is_none(), "{p}");
+            seen.push(socket["localAddr"]["port"].as_u64().unwrap() as u16);
+            let_the_pool_settle().await;
+        }
+        // One connection, reused; its local port is the one the server saw.
+        assert_eq!(server.accepts(), 1);
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(*peers.lock().unwrap(), [seen[0]]);
+    })
+    .await;
+}
+
+/// An https response carries the origin's TLS session too, in tls.connect's
+/// spelling, h2 included (the extra rides every stream of the connection).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_payload_names_the_tls_session_over_h2() {
+    within(async {
+        let server = serve_h2_tls("ok").await;
+        let reg = Reg::new();
+        let url = format!("https://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(p["socket"]["remoteAddr"]["address"], "127.0.0.1");
+        assert_eq!(p["socket"]["remoteAddr"]["port"], server.port);
+        assert!(p["socket"]["localAddr"]["port"].as_u64().unwrap() > 0);
+        let tls = &p["tls"];
+        assert_eq!(tls["alpnProtocol"], "h2", "{p}");
+        assert!(
+            tls["protocol"] == "TLSv1.3" || tls["protocol"] == "TLSv1.2",
+            "{p}"
+        );
+        assert!(!tls["cipher"].as_str().unwrap().is_empty(), "{p}");
+        assert!(
+            !tls["cipherStandardName"].as_str().unwrap().is_empty(),
+            "{p}"
+        );
+        assert!(
+            !tls["peerCertificates"].as_array().unwrap().is_empty(),
+            "{p}"
+        );
+    })
+    .await;
+}
+
 /// A request on a pooled connection the server closes without answering is
 /// sent again on a fresh one, so long as it is idempotent. This is the shape
 /// a server that hit its idle timeout leaves behind, and the one a redirect
