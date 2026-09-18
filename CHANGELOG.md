@@ -86,6 +86,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
   `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
   and in `NODE_OPTIONS`.
+- **The `http` server took requests that were not upgrades for upgrades, and leaked
+  their sockets.** Any connection whose first bytes contained a `connection:` line
+  mentioning `upgrade` -- in a request body, or without any `Upgrade` header -- was
+  handed to the `'upgrade'` event, and with no `'upgrade'` listener the socket was never
+  answered or closed, outside the server's connection limit. A request is now an upgrade
+  only when its head has an `Upgrade` header and `upgrade` in `Connection`, as in Node;
+  anything else is an ordinary request, and an upgrade nobody listens for is closed.
 - **A bare LF in a chunked body's trailers was not refused.** The trailer reader and
   the trailer parser disagreed about where the trailers end, so bytes after a bare-LF
   blank line were read and silently dropped while the connection stayed open. Such a

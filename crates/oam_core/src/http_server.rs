@@ -528,25 +528,10 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     })
 }
 
-// ---- HTTP upgrade detection (raw-TCP peek, bypasses hyper) ----
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn is_connection_upgrade(buf: &[u8]) -> bool {
-    let text = match std::str::from_utf8(buf) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    for line in text.split("\r\n") {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("connection:") && lower.contains("upgrade") {
-            return true;
-        }
-    }
-    false
-}
+// ---- HTTP upgrade requests (raw-TCP peek, bypasses hyper) ----
+// A connection whose first request is an upgrade (`http_head::
+// upgrade_head_len`) has that head read off the socket here and the socket
+// handed to JS; everything else goes to hyper.
 
 /// Refuse a request head the way node does: its status line and
 /// `Connection: close`, nothing else, then close. For the upgrade path,
@@ -648,23 +633,14 @@ pub async fn http_serve(
                             peeked = stream.peek(&mut peek_buf) => peeked,
                             _ = conn_shutdown.changed() => return,
                         };
-                        let is_upgrade = match peeked {
+                        let upgrade_head = match peeked {
                             Ok(n) if n > 16 => {
-                                find_header_end(&peek_buf[..n]).is_some()
-                                    && is_connection_upgrade(&peek_buf[..n])
+                                crate::http_head::upgrade_head_len(&peek_buf[..n])
                             }
-                            _ => false,
+                            _ => None,
                         };
 
-                        if is_upgrade {
-                            let n = match stream.peek(&mut peek_buf).await {
-                                Ok(n) => n,
-                                Err(_) => return,
-                            };
-                            let Some(hdr_end) = find_header_end(&peek_buf[..n]) else {
-                                return;
-                            };
-                            let consume = hdr_end + 4;
+                        if let Some(consume) = upgrade_head {
                             let mut head = vec![0u8; consume];
                             if stream.read_exact(&mut head).await.is_err() {
                                 return;

@@ -588,3 +588,19 @@ fn a_bare_lf_in_the_trailers_fails_the_request() {
     let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
     assert_eq!(seen["body"], "abc");
 }
+
+/// An upgrade request to a server with no 'upgrade' listener is closed, not
+/// left open: the socket had already been taken from hyper, and nothing
+/// would ever answer or close it (one leaked socket per such request).
+#[test]
+fn an_upgrade_nobody_listens_for_is_closed() {
+    let server = Server::start("noupgrade.mjs", BODY_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(
+        target,
+        None,
+        b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert!(ex.closed, "the connection must close: {:?}", ex.response);
+}

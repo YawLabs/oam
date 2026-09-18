@@ -332,6 +332,45 @@ pub fn parse_request_head(head: &[u8], policy: HeadPolicy) -> Result<ParsedHead,
     })
 }
 
+/// Where the head of an upgrade request ends in `buf` -- the first bytes of
+/// a new connection -- or `None` when they do not start with one.
+///
+/// node treats a request as an upgrade when it has an `Upgrade` header and a
+/// `Connection` header listing the `upgrade` token (llhttp's F_UPGRADE and
+/// F_CONNECTION_UPGRADE); anything else is an ordinary request, whatever its
+/// body or a pipelined request behind it contains. So only the head is looked
+/// at: leading empty lines skipped, cut at the first CRLF CRLF, and parsed
+/// with httparse. A head that does not parse to exactly that point is left to
+/// hyper, whose parser and [`check_request_head`] refuse it. The caller still
+/// runs [`parse_request_head`] on the bytes it takes.
+pub fn upgrade_head_len(buf: &[u8]) -> Option<usize> {
+    let lead = buf
+        .iter()
+        .take_while(|&&b| b == b'\r' || b == b'\n')
+        .count();
+    let end = buf[lead..].windows(4).position(|w| w == b"\r\n\r\n")? + lead + 4;
+    let mut headers = [httparse::EMPTY_HEADER; 100];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(&buf[..end]) {
+        Ok(httparse::Status::Complete(len)) if len == end => {}
+        _ => return None,
+    }
+    let upgrade = req
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("upgrade"));
+    let connection_upgrade = req
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("connection"))
+        .any(|h| {
+            h.value
+                .split(|&b| b == b',')
+                .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade"))
+        });
+    (upgrade && connection_upgrade).then_some(end)
+}
+
 /// A request head [`parse_request_head`] accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHead {
@@ -619,6 +658,37 @@ mod tests {
             parse_request_head(big.as_bytes(), small),
             Err(HeadError::HeaderOverflow)
         );
+    }
+
+    /// Only a head with both headers is an upgrade, and only the head
+    /// decides: a body or a pipelined request that mentions `connection:
+    /// upgrade` does not make its request one (it used to: any peeked line
+    /// did).
+    #[test]
+    fn upgrade_requests_are_told_apart_from_the_head_alone() {
+        let up = b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(upgrade_head_len(up), Some(up.len()));
+        let mut with_body = up.to_vec();
+        with_body.extend_from_slice(b"early data");
+        assert_eq!(upgrade_head_len(&with_body), Some(up.len()));
+        let lead = b"\r\nGET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n";
+        assert_eq!(upgrade_head_len(lead), Some(lead.len()), "leading CRLF");
+        for not_upgrade in [
+            &b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: upgraded\r\nUpgrade: x\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\nconnection: upgrade\r\nupgrade: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\n\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n",
+        ] {
+            assert_eq!(
+                upgrade_head_len(not_upgrade),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(not_upgrade)
+            );
+        }
     }
 
     #[test]

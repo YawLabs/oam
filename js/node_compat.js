@@ -17861,7 +17861,12 @@
                   // node: the upgrade request's socket IS the socket handed
                   // to the 'upgrade' listener.
                   req.socket = req.connection = socket;
-                  this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0));
+                  // Nobody to hand the connection to: close it rather than
+                  // leave it open forever. (node answers such a request as an
+                  // ordinary one; this socket has already left hyper.)
+                  if (!this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0))) {
+                    socket.destroy();
+                  }
                 } else {
                   const req = new IncomingMessage(meta);
                   // Node's server keeps a request-stream error from becoming

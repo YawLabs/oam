@@ -7,6 +7,11 @@
 // length headers, so a request could be framed one way by a proxy in front
 // and another way here; its upgrade path accepted all of them.
 //
+// Whether a request is an upgrade is decided by its head alone, as in node:
+// an `Upgrade` header plus `upgrade` listed in `Connection`. oam used to
+// send any connection whose first bytes held a `connection: ...upgrade`
+// line -- a body's included -- down the upgrade path.
+//
 // A second server with `insecureHTTPParser: true` shows the rules node
 // relaxes there (and the duplicate Content-Length it still refuses).
 //
@@ -42,6 +47,9 @@ const cases = {
   "obs-fold": `GET / HTTP/1.1\r\n${H}X-A: a\r\n b\r\n\r\n`,
   "leading CRLF": `\r\nGET / HTTP/1.1\r\n${H}\r\n`,
   "upgrade": `GET /up HTTP/1.1\r\n${H}Connection: Upgrade\r\nUpgrade: x\r\n\r\n`,
+  "upgrade after a leading CRLF": `\r\nGET /up HTTP/1.1\r\n${H}Connection: Upgrade\r\nUpgrade: x\r\n\r\n`,
+  "connection upgrade without an Upgrade header": `GET /plain HTTP/1.1\r\n${H}Connection: Upgrade\r\n\r\n`,
+  "a body that mentions connection: upgrade": `POST /plain HTTP/1.1\r\n${H}Content-Length: 33\r\n\r\nconnection: upgrade\r\nupgrade: x\r\n`,
   "upgrade, cl and te": `POST /up HTTP/1.1\r\n${H}Connection: Upgrade\r\nUpgrade: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n${CHUNKED_ABC}`,
   "upgrade, duplicate cl": `GET /up HTTP/1.1\r\n${H}Connection: Upgrade\r\nUpgrade: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n`,
   "upgrade, obs-fold": `GET /up HTTP/1.1\r\n${H}Connection: Upgrade\r\nUpgrade: x\r\nX-A: a\r\n b\r\n\r\n`,
@@ -86,10 +94,12 @@ function send(port, bytes) {
     let raw = "";
     let timer = null;
     let settled = false;
+    let backstop = null;
     const done = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(backstop);
       socket.destroy();
       const statuses = [...raw.matchAll(/HTTP\/1\.[01] \d{3}[^\r\n]*/g)].map((m) => m[0]);
       resolve(statuses.join(" + ") || "(nothing)");
@@ -102,6 +112,9 @@ function send(port, bytes) {
     socket.on("close", done);
     socket.on("error", () => {});
     socket.write(Buffer.from(bytes, "latin1"));
+    // A backstop, so a runtime that never answers fails the case instead
+    // of hanging it.
+    backstop = setTimeout(done, 3000);
   });
 }
 
