@@ -450,6 +450,13 @@
   /// as node does; only the exported module object is wrapped.
   let rawFsPromises = null;
 
+  /// Captured when node_compat.js is evaluated, so a script that replaces
+  /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
+  /// fs/promises settles.
+  const PromiseCtor = Promise;
+  const promiseThen = Promise.prototype.then;
+  const captureStackTrace = Error.captureStackTrace;
+
   function asAlwaysRejecting(api) {
     const out = {};
     for (const key of Object.keys(api)) {
@@ -466,19 +473,40 @@
         out[key] = fn;
         continue;
       }
+      // A system error from the native op is built with no stack frames (as
+      // node's binding builds it), and node's fs/promises gives it frames at
+      // the promise boundary: every binding call is
+      // `PromisePrototypeThen(binding.x(..., kUsePromises), undefined,
+      // handleErrorFromBinding)`, which re-captures the stack
+      // (lib/internal/fs/promises.js). So `await fsp.readFile(missing)` prints
+      // unbracketed with `at async open` frames on v22.22.2, while the callback
+      // form -- built on the unwrapped functions -- stays frameless and
+      // bracketed. The handler carries the method's name so the frame reads
+      // `at readFile (...)`; an async caller adds its `at async` frames below.
+      const onRejected = {
+        [key]: function (err) {
+          if (err !== null && typeof err === "object" && typeof err.syscall === "string") {
+            captureStackTrace(err);
+          }
+          throw err;
+        },
+      }[key];
       // Named + arity-preserving: `fsp.unlink.name` and `.length` are
       // observable, and node's own tests read them.
       const wrapped = {
         [key]: function (...args) {
           // The RETURN VALUE is passed through untouched -- only a synchronous
-          // THROW is converted. `Promise.resolve(...)` on the way out would
-          // silently re-type any future non-promise member the set above has
-          // not caught yet, which is exactly how `glob` broke.
+          // THROW is converted, and a native promise's rejection re-framed.
+          // `Promise.resolve(...)` on the way out would silently re-type any
+          // future non-promise member the set above has not caught yet, which
+          // is exactly how `glob` broke.
+          let ret;
           try {
-            return fn.apply(this, args);
+            ret = fn.apply(this, args);
           } catch (e) {
             return Promise.reject(e);
           }
+          return ret instanceof PromiseCtor ? promiseThen.call(ret, undefined, onRejected) : ret;
         },
       }[key];
       Object.defineProperty(wrapped, "length", { value: fn.length, configurable: true });
@@ -609,8 +637,14 @@
     const other = [];
     for (const value of expected) {
       const low = String(value).toLowerCase();
+      // node's kTypes (lib/internal/errors.js): 'string', 'function',
+      // 'number', 'object', 'Function', 'Object', 'boolean', 'bigint',
+      // 'symbol'. "undefined" and "null" are NOT types -- they fall to
+      // `other`, which is why node writes `must be of type string or one of
+      // undefined or null` and not `one of type string or undefined or null`
+      // (measured on node v22.22.2 for http.request's hostname check).
       if (
-        ["string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function"].includes(low)
+        ["string", "number", "bigint", "boolean", "symbol", "object", "function"].includes(low)
       ) {
         types.push(low);
       } else if (/^[A-Z]/.test(String(value))) {
@@ -701,9 +735,13 @@
         return "an instance of Object";
       }
     }
+    // `require` is not in scope here (this runs inside the errors factory),
+    // so the old `require("util").inspect` ALWAYS threw and fell back to
+    // String(value) -- a string then showed with no quotes where node writes
+    // `type string ('abc')`. nodeInspect resolves util off the registry, late.
     let inspected;
     try {
-      inspected = require("util").inspect(value, { colors: false });
+      inspected = nodeInspect(value, { colors: false });
     } catch {
       inspected = String(value);
     }
@@ -747,7 +785,27 @@
   codes.ERR_UNESCAPED_CHARACTERS = E("ERR_UNESCAPED_CHARACTERS", TypeError, function(name) {
     return name + ' contains unescaped characters';
   });
+  // A connect.lookup hook's answer that net cannot dial (node
+  // lib/internal/errors.js; thrown by bootstrap.js's fetch the way node's
+  // lookupAndConnectMultiple throws it). `%s` formatting, as node's message.
+  codes.ERR_INVALID_IP_ADDRESS = E("ERR_INVALID_IP_ADDRESS", TypeError, function(ip) {
+    return registry.get("util").format("Invalid IP address: %s", ip);
+  });
   // ---- RangeError family ----
+  // node's message function also sets `host` and `port` on the error; E()
+  // calls a message function with no instance, so they are set after the code,
+  // which keeps node's enumerable order (code, host, port -- measured).
+  {
+    const AddressFamilyError = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
+      return `Invalid address family: ${addressType} ${host}:${port}`;
+    });
+    codes.ERR_INVALID_ADDRESS_FAMILY = function ERR_INVALID_ADDRESS_FAMILY(addressType, host, port) {
+      const err = AddressFamilyError(addressType, host, port);
+      err.host = host;
+      err.port = port;
+      return err;
+    };
+  }
   // node's addNumericalSeparator (lib/internal/errors.js): group a big
   // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
   // Works on the STRING form and is sign-aware -- the leading "-" is never
@@ -788,8 +846,18 @@
   codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
     return 'Child closed before reply';
   });
+  // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
+  // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
+  // (not quoted, no " option" suffix) and the value goes through
+  // determineSpecificType, so a string shows its quotes. Measured on node
+  // v22.22.2: `Port should be >= 0 and < 65536. Received type string ('abc').`
+  // oam carried an older node's wording; nothing raised it before
+  // ClientRequest's port check, so no call site moves with it.
   codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
-    return '"' + name + '" option should be >= ' + (allowZero ? '0' : '1') + ' and < 65536. Received ' + port;
+    var operator = allowZero === false ? '>' : '>=';
+    var floor = allowZero === false ? '1' : '0';
+    return name + ' should be ' + operator + ' ' + floor + ' and < 65536. Received ' +
+      determineSpecificType(port) + '.';
   });
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
@@ -17769,31 +17837,201 @@
       closeAllConnections() {}
     }
 
+    // Node's urlToHttpOptions (lib/internal/url.js): the options a URL or a
+    // URL string stands for. `hostname` loses its IPv6 brackets, `port` is ""
+    // for a scheme default (so the caller's default wins), and userinfo
+    // becomes `auth` -- ALWAYS in `user:pass` form, both parts
+    // percent-decoded. Measured on node v22.22.2:
+    // `http.request('http://onlyu@h/')` sends `Basic b25seXU6` ("onlyu:")
+    // and `http://u:p%40w@h/` sends `Basic dTpwQHc=` ("u:p@w").
+    function urlToHttpOptions(url) {
+      var hostname = url.hostname;
+      if (hostname.charAt(0) === "[") hostname = hostname.slice(1, -1);
+      var options = {
+        protocol: url.protocol,
+        hostname: hostname,
+        port: url.port,
+        path: (url.pathname || "") + (url.search || ""),
+        href: url.href,
+      };
+      if (url.username || url.password) {
+        options.auth =
+          decodeURIComponent(url.username) + ":" + decodeURIComponent(url.password);
+      }
+      return options;
+    }
+
+    // Node's ClientRequest argument normalisation (lib/_http_client.js): a
+    // string or URL first argument becomes options, a second object is merged
+    // OVER it (so `http.request(url, { path })` wins), and only a function is
+    // taken as the listener. Measured on node v22.22.2: all three of
+    // `(url, options, cb)`, `(url, cb)` and `(options, cb)` send; oam threw
+    // `The "listener" argument must be a function` on the three-argument form.
+    function normalizeClientArgs(input, options, cb) {
+      var derived = null;
+      if (typeof input === "string") {
+        derived = urlToHttpOptions(new URL(input));
+      } else if (input instanceof URL) {
+        derived = urlToHttpOptions(input);
+      } else {
+        // (options[, cb]): the second argument IS the listener.
+        cb = options;
+        options = input;
+        derived = null;
+      }
+      if (typeof options === "function") {
+        cb = options;
+        options = derived || {};
+      } else {
+        options = Object.assign(derived || {}, options);
+      }
+      return { options: options, callback: cb };
+    }
+
+    // Node's INVALID_PATH_REGEX (lib/_http_client.js): a request path carries
+    // only 0x21-0xFF. A space, a tab or a CR/LF -- request-line and header
+    // injection -- is refused before anything dials, and so is any code point
+    // past 0xFF. Measured on node v22.22.2: '/a b', '/a\tb', '/a\r\nX: 1\r\n'
+    // and '/cafĀ' throw ERR_UNESCAPED_CHARACTERS; '/café',
+    // '/%20' and even a target with no leading slash are accepted.
+    var INVALID_PATH_REGEX = /[^!-ÿ]/;
+
+    // Node's validateHost: only a string, undefined or null. It is checked on
+    // `hostname` first and on `host` only when `hostname` is absent, so
+    // `{hostname: '127.0.0.1', host: 0}` is fine and `{host: 0}` is not
+    // (measured on node v22.22.2, both messages name the option that failed).
+    function validateHost(host, name) {
+      if (host !== null && host !== undefined && typeof host !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options." + name,
+          ["string", "undefined", "null"],
+          host,
+        );
+      }
+      return host;
+    }
+
+    // Node's validatePort, as ClientRequest applies it: the port is defaulted
+    // FIRST, so a falsy one (0, '', NaN, null) becomes the scheme default and
+    // is never rejected. Measured on node v22.22.2: 65536, -1, 1.5, 70000,
+    // 'abc', ' ' and '1@127.0.0.1:2' throw RangeError ERR_SOCKET_BAD_PORT;
+    // '80', '0x50', '80 ' and ' 80' are accepted; a boolean or an object
+    // throws TypeError ERR_INVALID_ARG_TYPE.
+    //
+    // It returns the NUMBER, because node dials the coercion and not the
+    // spelling: `port: '0x50'`, `'80 '` and `' 80'` all reach a server on port
+    // 80 (measured -- the request completes). oam carries the target as a URL
+    // string, where every one of those three spellings fails to parse, and the
+    // request died with a bare `TypeError: fetch failed`. The one thing that
+    // does not follow node is the Host header: node writes the caller's raw
+    // spelling there (`Host: 127.0.0.1:0xc4df`, and `127.0.0.1: 50399` for a
+    // leading space -- both measured on v22.22.2), oam writes the normalised
+    // port. See docs/node-divergences.md.
+    function validateClientPort(port) {
+      if (typeof port !== "number" && typeof port !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.port", ["number", "string"], port);
+      }
+      if (
+        (typeof port === "string" && port.trim().length === 0) ||
+        +port !== (+port >>> 0) ||
+        port > 0xffff
+      ) {
+        throw codes.ERR_SOCKET_BAD_PORT("Port", port, true);
+      }
+      return +port;
+    }
+
     class ClientRequest extends EventEmitter {
-      constructor(options, callback) {
+      constructor(input, options, callback) {
         super();
-        if (typeof options === "string") options = new URL(options);
-        if (options instanceof URL) {
-          options = {
-            hostname: options.hostname,
-            port: options.port || (options.protocol === "https:" ? 443 : 80),
-            path: options.pathname + options.search,
-            protocol: options.protocol,
-          };
-        }
-        var opts = options || {};
+        var normalized = normalizeClientArgs(input, options, callback);
+        var opts = normalized.options || {};
+        callback = normalized.callback;
         this.method = (opts.method || "GET").toUpperCase();
         var protocol = opts.protocol || "http:";
-        var host = opts.hostname || opts.host || "localhost";
-        var port = opts.port || (protocol === "https:" ? 443 : 80);
+        // Node's order: the path is validated before the port (measured with
+        // both bad -- ERR_UNESCAPED_CHARACTERS wins).
         var reqPath = opts.path || "/";
-        this._url = protocol + "//" + host + ":" + port + reqPath;
+        if (opts.path) {
+          reqPath = String(opts.path);
+          if (INVALID_PATH_REGEX.test(reqPath)) {
+            throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+          }
+        }
+        var host =
+          validateHost(opts.hostname, "hostname") ||
+          validateHost(opts.host, "host") ||
+          "localhost";
+        var port = validateClientPort(opts.port || (protocol === "https:" ? 443 : 80));
+        // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
+        // `http://::1:80/` would not parse and the request would fail with
+        // "fetch failed" where node connects to ::1. A URL's hostname already
+        // carries its brackets (net.isIP('[::1]') is 0).
+        var urlHost = registry.get("net").isIP(host) === 6 ? "[" + host + "]" : host;
+        // The connect target must not be movable by the caller's `path` or
+        // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
+        // as an OPAQUE request target. oam carries the request as a URL
+        // string, and plain concatenation let both escape -- measured before
+        // this guard, `{hostname: SAFE, port: GOOD, path: '@127.0.0.1:EVIL/x'}`
+        // and `{hostname: 'u:p@127.0.0.1', ...}` both reached the OTHER origin,
+        // and take_userinfo then sent the intended origin to it as
+        // `Authorization: Basic base64(SAFE:GOOD)`.
+        //
+        // A path that does not start with "/" is given one, so it can only
+        // ever be a path (node would send it verbatim, which its own servers
+        // answer with 400); and a `host` the URL parser cannot hold as a bare
+        // authority fails the request, where node fails it in the resolver
+        // (see docs/node-divergences.md).
+        if (reqPath.charAt(0) !== "/") reqPath = "/" + reqPath;
+        this._urlError = null;
+        var authority = null;
+        try {
+          var probe = new URL(protocol + "//" + urlHost + "/");
+          if (
+            probe.username === "" &&
+            probe.password === "" &&
+            probe.port === "" &&
+            probe.pathname === "/" &&
+            probe.search === "" &&
+            probe.hash === ""
+          ) {
+            authority = probe;
+          }
+        } catch {
+          authority = null;
+        }
+        if (authority === null) {
+          // node resolves the literal string and fails there. Its own code
+          // varies by spelling on Windows (ENOTFOUND for '127.0.0.1/x',
+          // EAI_FAIL for 'u:p@127.0.0.1'); oam reports the ENOTFOUND shape.
+          this._urlError = globalThis.__oamMakeSysError({
+            message: "getaddrinfo ENOTFOUND " + host,
+            errno: -3008,
+            code: "ENOTFOUND",
+            syscall: "getaddrinfo",
+            hostname: host,
+          });
+        }
+        this._url = protocol + "//" + urlHost + ":" + port + reqPath;
         this._headers = {};
         if (opts.headers) {
           var keys = Object.keys(opts.headers);
           for (var i = 0; i < keys.length; i++) {
             this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
           }
+        }
+        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
+        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
+        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
+        // string's UTF-8 (measured: `auth: 'café:p'` sends
+        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
+        // nothing, and an explicit authorization header wins in either case.
+        // oam dropped the documented option entirely, so every caller using it
+        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
+        // this option -- talked to the server unauthenticated and got a 401.
+        if (opts.auth && this._headers["authorization"] === undefined) {
+          this._headers["authorization"] =
+            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
         }
         this._body = [];
         this._ended = false;
@@ -17813,6 +18051,17 @@
         this.errored = null;
         this._bodyLength = 0;
         this._bodyStream = null;
+        // Every operation on the outbound body channel queues behind the one
+        // before it (see _channelWrite). Unordered calls race: the write op is
+        // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
+        // sender before a spawned write has cloned it, that write fails as an
+        // unknown stream, and the chunk is LOST -- the server sees a
+        // well-formed, complete chunked body missing its tail and neither side
+        // reports an error. Measured on node v22.22.2: write('aa') write('bb')
+        // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
+        // most runs before this chain existed. Two writes in flight at once
+        // could also reach the mpsc channel out of order (multi-thread tokio).
+        this._channelTail = null;
         this._streamArmed = false;
         this._sent = false;
         this._droppedWrites = false;
@@ -17864,7 +18113,7 @@
           // Already streaming: hand the chunk to the transport. The op
           // resolves once the socket accepts it, so write() backpressure
           // follows the wire rather than buffering.
-          natives.fetchBodyChannelWrite(this._bodyStream, bytes).then(
+          this._channelWrite(bytes).then(
             () => { if (callback) callback(); },
             () => { if (callback) callback(); },
           );
@@ -17882,6 +18131,34 @@
           queueMicrotask(() => this._startBodyStreamIfOpen());
         }
         return true;
+      }
+
+      // One chunk onto the outbound body channel, after everything already
+      // queued. Resolves when the transport has accepted it, so write()
+      // backpressure still follows the wire.
+      _channelWrite(bytes) {
+        var stream = this._bodyStream;
+        var next = this._channelTail === null
+          ? natives.fetchBodyChannelWrite(stream, bytes)
+          : this._channelTail.then(function () {
+              return natives.fetchBodyChannelWrite(stream, bytes);
+            });
+        // The tail never rejects: a failed write is the transport's report,
+        // not a reason to strand the writes queued behind it.
+        this._channelTail = next.then(function () {}, function () {});
+        return next;
+      }
+
+      // Close the channel -- which ends the request body -- after every write
+      // already queued has reached it.
+      _channelEnd() {
+        var stream = this._bodyStream;
+        var end = function () { natives.fetchBodyChannelEnd(stream); };
+        if (this._channelTail === null) {
+          end();
+          return;
+        }
+        this._channelTail = this._channelTail.then(end, end);
       }
 
       _startBodyStreamIfOpen() {
@@ -17915,7 +18192,7 @@
         // Send now; the body follows over the channel.
         this._doFetchRequest(null);
         for (const chunk of pending) {
-          natives.fetchBodyChannelWrite(this._bodyStream, chunk).then(
+          this._channelWrite(chunk).then(
             () => {},
             () => {},
           );
@@ -17958,14 +18235,8 @@
         if (self._bodyStream !== null) {
           // Already in flight: flush the tail and close the channel, which
           // ends the body. Must NOT send a second request.
-          if (bodyData) {
-            natives.fetchBodyChannelWrite(self._bodyStream, bodyData).then(
-              () => natives.fetchBodyChannelEnd(self._bodyStream),
-              () => natives.fetchBodyChannelEnd(self._bodyStream),
-            );
-          } else {
-            natives.fetchBodyChannelEnd(self._bodyStream);
-          }
+          if (bodyData) self._channelWrite(bodyData).then(() => {}, () => {});
+          self._channelEnd();
         } else if (self._sent) {
           // Dispatched bodyless on first write (GET/HEAD): nothing further
           // goes on the wire, and re-sending would fire a second request.
@@ -17996,9 +18267,26 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
+        // A `host` the URL parser cannot hold as a bare authority: the request
+        // never goes out, and the failure surfaces as the resolver error node
+        // reports for the same options (see the constructor).
+        if (self._urlError !== null) {
+          var urlError = self._urlError;
+          process.nextTick(function () {
+            if (self._aborted) return;
+            self.errored = urlError;
+            self.destroyed = true;
+            self._emitClose();
+            self.emit("error", urlError);
+          });
+          return;
+        }
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
+          // node's http.request has no Fetch-spec bad-port block: port 1
+          // or 25 is dialled (and refused), not refused by the client.
+          __oamFetchSemantics: false,
         };
         if (self._bodyStream !== null) {
           fetchOpts.__oamBodyStream = self._bodyStream;
@@ -18065,17 +18353,21 @@
           // ECONNRESET is never re-emitted on the destroyed request.
           if (self._aborted) return;
           // Map transport failures to Node-shaped codes: retry logic keys
-          // on err.code, and reqwest's strings carry none.
+          // on err.code, and the transport's own texts carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
           // fetch() rejects with the bare "fetch failed" and the transport
           // error as `cause`: a connect or resolver failure arrives there
           // already in node's shape (errno, code, syscall, address/port or
-          // hostname) and is emitted as-is; anything else is matched on the
-          // cause's text, which is where reqwest's detail now lives.
+          // hostname; node's AggregateError when a name resolved to several
+          // addresses and every one refused) and is emitted as-is -- node's
+          // http.request emits exactly that error. Anything else is matched
+          // on the cause's text.
           var cause = err && err.cause;
           var detail = cause && cause.message ? cause.message : msg;
           var mapped;
           if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+            mapped = cause;
+          } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
@@ -18095,11 +18387,30 @@
       }
       _doUpgradeRequest(bodyData) {
         var self = this;
+        // Same guard as _doFetchRequest: an unusable `host` never dials.
+        if (self._urlError !== null) {
+          var urlError = self._urlError;
+          process.nextTick(function () {
+            if (self._aborted) return;
+            self.errored = urlError;
+            self.destroyed = true;
+            self._emitClose();
+            self.emit("error", urlError);
+          });
+          return;
+        }
         var parsed = new URL(self._url);
         var host = parsed.hostname;
         var port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
         var reqPath = parsed.pathname + parsed.search;
-        natives.tcpConnect(host, port).then(function (result) {
+        // Node's http hands net the hostname without URL brackets
+        // (urlToHttpOptions); the Host header keeps them.
+        var connectHost = host.charAt(0) === "[" ? host.slice(1, -1) : host;
+        var net = registry.get("net");
+        // A refusal is emitted as the connect op rejected it: node's own
+        // shape (address/port, or the NodeAggregateError of a `localhost`
+        // whose every address refused).
+        natives.tcpConnect(connectHost, port, net.getDefaultAutoSelectFamilyAttemptTimeout()).then(function (result) {
           var handle = result.handle;
           if (!self._headers["host"]) {
             self._headers["host"] = port === 80 ? host : host + ":" + port;
@@ -18243,12 +18554,14 @@
       }
     }
 
-    function request(options, callback) {
-      return new ClientRequest(options, callback);
+    // Node's documented signatures are (options[, cb]), (url[, cb]) and
+    // (url, options[, cb]); ClientRequest normalises all three.
+    function request(input, options, callback) {
+      return new ClientRequest(input, options, callback);
     }
 
-    function get(options, callback) {
-      var req = request(options, callback);
+    function get(input, options, callback) {
+      var req = request(input, options, callback);
       req.end();
       return req;
     }
@@ -18489,6 +18802,13 @@
     function _shapeConnectError(err, host, port) {
       const code = err && err.code;
       if (!code) return err;
+      // The connect op already rejects with node's exact error (#143): the
+      // ExceptionWithHostPort / DNSException shape with node's key order and
+      // the RESOLVED address, or the NodeAggregateError of a name whose every
+      // address failed. Rebuilding it here would reorder the keys and name the
+      // host as written (`localhost`) instead of the address that refused.
+      // Only an error without that shape is rebuilt.
+      if (err.syscall !== undefined || err instanceof AggregateError) return err;
       const errno = _netErrno(code);
       let e;
       if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
@@ -18619,7 +18939,7 @@
         // _doClose() both early-return and the entry would be pinned in this
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
-        const pending = natives.tcpConnect(host, port).then(
+        const pending = natives.tcpConnect(host, port, autoSelectFamilyAttemptTimeoutDefault).then(
           (result) => {
             if (this.destroyed) {
               // destroy() raced the connect: close the just-established
@@ -20739,18 +21059,39 @@
       return new Server(options, handler);
     }
 
+    // node lib/https.js builds a FRESH options object (`options = {}` /
+    // `urlToHttpOptions(url)`, then `ObjectAssign(options, args.shift())`), so
+    // the caller's object is never written to. oam used to assign into it,
+    // which leaks derived state into a reused options literal: after
+    // `https.request(urlA, shared)` the `shared` object carries urlA's
+    // hostname, port and path, and `https.request(urlB, shared)` then keeps
+    // sending to A. Copy first.
     function request(url, options, callback) {
       if (typeof url === "string" || url instanceof URL) {
         var parsed = typeof url === "string" ? new URL(url) : url;
         if (typeof options === "function") { callback = options; options = {}; }
-        options = options || {};
-        options.hostname = options.hostname || parsed.hostname;
+        options = Object.assign({}, options);
+        // node's urlToHttpOptions: a URL's IPv6 hostname loses its brackets
+        // before it reaches tls.connect and the resolver. POSIX getaddrinfo
+        // does not resolve `[::1]` (Windows' does), so keeping them failed
+        // `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })`
+        // with `getaddrinfo ENOTFOUND [::1]` off Windows, where node connects
+        // to ::1 (conformance case 110 on the macOS leg).
+        var urlHostname = parsed.hostname;
+        if (urlHostname.charAt(0) === "[") urlHostname = urlHostname.slice(1, -1);
+        options.hostname = options.hostname || urlHostname;
         options.port = options.port || parsed.port || 443;
         options.path = options.path || parsed.pathname + parsed.search;
         options.protocol = "https:";
+        // node's urlToHttpOptions turns a URL's userinfo into the `auth`
+        // option, which ClientRequest then sends as Basic credentials.
+        if (!options.auth && (parsed.username || parsed.password)) {
+          options.auth =
+            decodeURIComponent(parsed.username) + ":" + decodeURIComponent(parsed.password);
+        }
       } else {
         callback = options;
-        options = url || {};
+        options = Object.assign({}, url);
         if (!options.protocol) options.protocol = "https:";
         if (!options.port) options.port = 443;
       }
@@ -20790,6 +21131,12 @@
         if (options.headers) {
           var keys = Object.keys(options.headers);
           for (var i = 0; i < keys.length; i++) this._headers[keys[i].toLowerCase()] = options.headers[keys[i]];
+        }
+        // node's `auth` option (or a URL's userinfo) as Basic credentials, the
+        // same rule http.ClientRequest applies.
+        if (options.auth && this._headers["authorization"] === undefined) {
+          this._headers["authorization"] =
+            "Basic " + globalThis.Buffer.from(String(options.auth), "utf8").toString("base64");
         }
         this._body = [];
         this._ended = false;
@@ -20864,7 +21211,22 @@
           // Content-Length fields are an RFC 7230 / request-smuggling hazard).
           // We force a single Connection: close (no keep-alive reuse here).
           var reqStr = self.method + " " + path + " HTTP/1.1\r\n";
-          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : host) + "\r\n";
+          // node's ClientRequest Host header: an IPv6 literal bracketed (two
+          // or more colons, not already bracketed), then `:port` unless it is
+          // https' default 443. Measured on node v22.22.2: `https.get` to
+          // `https://[::1]:PORT/` and to `{ hostname: '::1', port: PORT }`
+          // both send `Host: [::1]:PORT`; oam sent a bare `::1`.
+          var hostHeader = String(host);
+          var firstColon = hostHeader.indexOf(":");
+          if (
+            firstColon !== -1 &&
+            hostHeader.indexOf(":", firstColon + 1) !== -1 &&
+            hostHeader.charAt(0) !== "["
+          ) {
+            hostHeader = "[" + hostHeader + "]";
+          }
+          if (port && port !== 443) hostHeader += ":" + port;
+          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : hostHeader) + "\r\n";
           var hkeys = Object.keys(lc);
           for (var i = 0; i < hkeys.length; i++) {
             var hk = hkeys[i];
@@ -22950,7 +23312,13 @@
         }
 
         const doSend = () => {
-          natives.udpSend(this._handle, data, String(address), port).then((result) => {
+          // The op refuses an ungranted destination by THROWING
+          // (ERR_ACCESS_DENIED); run it inside the executor so that reaches
+          // the callback or 'error' like any other send failure, instead of
+          // escaping send() or the auto-bind's 'listening' listener.
+          new Promise((resolve) => {
+            resolve(natives.udpSend(this._handle, data, String(address), port));
+          }).then((result) => {
             if (cb) cb(null, result.bytesSent);
           }).catch((err) => {
             if (cb) cb(err);
@@ -23747,7 +24115,8 @@
           }
           bodyData = merged;
         }
-        var fetchOpts = { method: method, headers: fetchHeaders };
+        // node's http2 client has no Fetch-spec bad-port block.
+        var fetchOpts = { method: method, headers: fetchHeaders, __oamFetchSemantics: false };
         if (bodyData && method !== "GET" && method !== "HEAD") {
           fetchOpts.body = bodyData;
         }
@@ -24455,7 +24824,8 @@
       // handle).
       registry._activeHandles.set(socket, "TCPSocketWrap");
 
-      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max).then(
+      var attemptTimeout = registry.get("net").getDefaultAutoSelectFamilyAttemptTimeout();
+      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max, attemptTimeout).then(
         (info) => {
           socket._connectPending = false;
           if (socket.destroyed) {
@@ -24501,9 +24871,11 @@
           socket._connectPending = false;
           socket.connecting = false;
           if (typeof err === "string") err = new Error(err);
-          if (err && typeof err.code === "string" && err.syscall === undefined) {
+          if (err && typeof err.code === "string" && err.syscall === undefined && !(err instanceof AggregateError)) {
             // The verifier refused the certificate (a connect-syscall error
-            // carries `syscall`; this one carries only Node's code): Node
+            // carries `syscall`, and a NodeAggregateError of refused addresses
+            // carries neither but is no verdict; this one carries only Node's
+            // code): Node
             // records the verdict on the socket before destroying it, and
             // its ERR_TLS_CERT_ALTNAME_INVALID carries the reason, the name
             // it checked and the peer certificate.

@@ -423,6 +423,16 @@ preference -- reqwest 0.13 exposes no `happy_eyeballs_timeout`, so it needs
 either a custom connector/resolver or an upstream knob. Node avoids both
 tails via autoSelectFamily with a 250ms attempt timeout.
 
+RESOLVED in #143 (2026-09-17): the client moved off reqwest onto oam's own
+connector (`crates/oam_core/src/http_client`), which dials the resolved
+addresses the way Node's `lookupAndConnect` does, with the 250ms attempt
+timeout and libuv's no-SYN-retransmit ioctl for loopback on Windows. The
+IPv4-first override is gone. Measured on Windows (debug build, cold first
+fetch through `localhost`): to an IPv4-only listener 8.9-28.8ms (was
+4.1-7.8ms with the override; Node 22.8-28.3ms), to a dual-stack `::`
+listener 8-22ms (was 305-326ms; Node 20-33ms). See
+docs/node-divergences.md entry 35.
+
 ## Resuming this work
 
 Paste-able brief for a fresh session. Read the rest of this document first --
@@ -441,8 +451,9 @@ found along the way is fixed.
 
 **Remaining follow-ups:**
 
-- Happy-eyeballs for loopback: BLOCKED UPSTREAM, root cause fully
-  identified (2026-08-04). The ~307ms a `::1`-only server pays is
+- DONE in #143 (2026-09-17), by moving the client off reqwest; see the
+  RESOLVED note above. Kept for the history: Happy-eyeballs for loopback:
+  BLOCKED UPSTREAM, root cause fully identified (2026-08-04). The ~307ms a `::1`-only server pays is
   hyper-util's `happy_eyeballs_timeout` -- `ConnectingTcp::new`
   (hyper-util 0.1.20, client/legacy/connect/http.rs) parks the fallback
   address family behind a `tokio::time::sleep(300ms)` default.

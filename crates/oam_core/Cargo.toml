@@ -9,17 +9,30 @@ license.workspace = true
 [dependencies]
 oam_diagnostics = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # node:zlib compression backend.
 flate2 = { workspace = true }
-# HTTP server (hyper rides in-tree via reqwest).
-hyper = { workspace = true }
-hyper-util = { workspace = true }
+# HTTP server, and since #143 the client half: the fetch transport is
+# hyper-util's pooled legacy client with oam's own connector, its env-proxy
+# Matcher and CONNECT tunnel (reqwest is oam_loader's install client only; it
+# enables every one of these features on the same versions).
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "client-proxy", "http1", "http2"] }
+h2 = { workspace = true }
+tower-service = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# http_client (#143): request preparation and the redirect step.
+url = { workspace = true }
+http = { workspace = true }
+percent-encoding = { workspace = true }
+# http_client response decoding: brotli's decoder stream, driven directly.
+brotli-decompressor = { workspace = true }
+# http_client gzip/deflate: miniz_oxide's core inflate (flate2's backend).
+miniz_oxide = { workspace = true }
 # V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
@@ -46,6 +59,17 @@ rustls-pemfile = { workspace = true }
 # enables. These are new dependency EDGES onto crates already being built.
 x509-parser = { workspace = true }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+# The outbound connector net.connect and tls.connect share (net_connect.rs):
+# one socket per attempt, created, bound and connected by hand so a failure
+# connect(2) reports synchronously can be told from one that arrives later
+# (node words the two differently) and so Windows can pre-bind a dual-stack
+# IPv6 socket before connecting, as libuv does.
+#
+# NOT new supply chain: socket2 0.6.4 already compiles in the graph via tokio
+# and hyper-util. A new dependency EDGE onto a crate already being built.
+# "all" for the fetch connector's keepalive probe count and TCP_USER_TIMEOUT;
+# hyper-util already builds socket2 with it.
+socket2 = { version = "0.6", features = ["all"] }
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

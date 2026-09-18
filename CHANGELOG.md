@@ -16,6 +16,52 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Security
+
+- **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
+  only against the URL a script passed to `fetch`, `http.request`, `https.request` or
+  `undici.request`; the redirects those follow were not checked at all. So under
+  `oam --permission --allow-net=<host>`, any granted host -- or anything able to answer
+  on its behalf -- could send `302 Location: http://<any other host>/` and the script
+  received the response from a host it was never granted: loopback, a cloud metadata
+  address, an internal service. A 307 re-sent the request body there too. Measured on
+  0.16.1, where every spelling of an ungranted host tried (`localhost`, `LOCALHOST`,
+  `localhost.`, `%6c%6fcalhost`, `[::1]`) was reached. Every release since
+  `--allow-net` was added in 0.8.3 checked only the initial URL, so all of them are
+  affected; a run without `--permission`, or with a bare `--allow-net`, is not. Each
+  hop's host is now checked against the grant before it is dialled -- before a
+  `connect.lookup` hook is asked about it, and whatever route the request takes, an
+  environment proxy included (the destination is checked, not the proxy). A refused hop
+  is never contacted, and the request fails with the same `ERR_ACCESS_DENIED` a direct
+  request to that host gets (`permission` `Net`, `resource` the host). The host checked
+  is the URL parser's normalisation (case, percent-encoding, IDNA and non-canonical IP
+  forms folded; a trailing dot kept), the same string the connection dials, so no
+  spelling of the `Location` reaches a different host than the one checked. How the
+  grant matches a request is otherwise unchanged and is now documented in
+  `docs/node-divergences.md` entry 4: on the host alone, so a port-scoped entry
+  (`--allow-net=127.0.0.1:8080`) admits `net.connect` to that port but no HTTP request.
+  (#143, #151)
+- **A bracketed IPv6 grant admitted any host name that began with it.** Under
+  `--allow-net=[::1]`, the grant matcher read a target such as
+  `[::1].127.0.0.1.nip.io:443` as `[::1]` (it stopped at the first `]`), while
+  `net.connect`, `tls.connect` and `https.request` with `rejectUnauthorized: false` handed
+  the whole name to the system resolver, so a wildcard DNS name starting with the granted
+  literal reached any address it resolved to (measured on macOS, 0.16.1: a connection to
+  127.0.0.1, which the same grant refuses by name). `fetch`, `http.request` and WebSocket
+  were not affected: they check the URL parser's hostname, which can never start with `[`.
+  Present since 0.15.0, when net grants became exact matches; before that the raw prefix
+  match admitted the same names. A bracketed entry now matches only the literal itself,
+  alone or followed by `:<port>`. (#151)
+- **A UDP datagram's destination was never checked against `--allow-net`.** Only
+  `dgram`'s `bind` was, and it names the local address, so a script granted any address
+  to bind could `send()` to any host and port: with a loopback grant to every other
+  loopback address and port, with a `0.0.0.0` grant to any host (a DNS or UDP exfil
+  endpoint). Measured on 0.16.1: under `--allow-net=127.0.0.1`, a datagram sent to
+  127.0.0.2 was delivered. Every release since `--allow-net` was added in 0.8.3 is
+  affected. The destination is now checked by the same rule as `net.connect`
+  (`host:port`), and a refused send fails with `ERR_ACCESS_DENIED` through the send
+  callback, or `'error'` without one, and is never sent. (#151)
+
 ### Fixed
 
 - **`socket.unref()` and `server.unref()` did not release the event loop**

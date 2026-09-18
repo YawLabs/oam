@@ -22,8 +22,13 @@ pub use oam_diagnostics as diagnostics;
 pub mod child;
 pub mod cluster;
 pub mod dns;
+/// oam's own HTTP client transport for the `fetch` op (#143).
+pub mod http_client;
 pub mod http_server;
 pub mod inspector;
+/// The outbound TCP connector net.connect and tls.connect share: node's
+/// lookupAndConnectMultiple algorithm and its error shapes.
+pub mod net_connect;
 /// Inbound OS signal delivery (SIGTERM/SIGINT/SIGHUP). Unix uses
 /// tokio::signal::unix; Windows uses SetConsoleCtrlHandler. Both feed the op
 /// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine
@@ -71,6 +76,54 @@ pub type OpId = u64;
 /// counted in `inflight`) and route it to `process.emit(name)`.
 pub const SIGNAL_OP_ID: OpId = 0;
 
+/// One Node system error, fully shaped on the native side: the fields node
+/// puts on the error a libuv or resolver failure produces.
+///
+/// Two of node's error classes are built from exactly these fields (node
+/// v22.22.2 lib/internal/errors.js): `ExceptionWithHostPort` for a connect
+/// failure (`errno, code, syscall, address, port`, message `connect
+/// ECONNREFUSED 127.0.0.1:8080`) and `DNSException` for a resolver failure
+/// (`errno, code, syscall, hostname`, message `getaddrinfo ENOTFOUND host`).
+/// The engine hands the fields to the JS factory `__oamMakeSysError`
+/// (js/bootstrap.js), which picks the class from which of `address` / `port` /
+/// `hostname` is present. One of these is also a child of an aggregate
+/// (`OpOutcome::NodeAggregateFailed`).
+///
+/// `port` is `None` for port 0: node sets the key only when the port is
+/// truthy, and the message then carries the address alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeSysError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscall: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// A `--permission` refusal an async op raised after its synchronous gate had
+/// already passed -- a `fetch` whose redirect leads to a host the net grant
+/// does not cover (`http_client::NetCheck`).
+///
+/// The engine rejects with the same error its synchronous gates throw
+/// (`throw_permission_denied`): Node's `ERR_ACCESS_DENIED`, message `Access to
+/// this API has been restricted`, carrying `permission` and `resource`. oam_core
+/// has no permission model of its own (the grant lives in the engine), so this
+/// only carries the verdict the engine's check returned.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccessDenial {
+    /// The permission's name as the refusal reports it (`Net`).
+    pub permission: String,
+    /// What was refused, as the check saw it (a host).
+    pub resource: String,
+}
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -98,6 +151,10 @@ pub enum OpOutcome {
     /// packages that branch on `err.syscall === "open"` or read `err.path`
     /// (graceful-fs, chokidar, rimraf) saw nothing. Optional because the
     /// non-fs producers (dns/net/tls) have no path to report.
+    ///
+    /// `hostname` / `address` / `port` name the peer the way node does on a
+    /// resolver or connect failure (see `NodeSysError`). All three are serde
+    /// defaults, so a replay file recorded before they existed still loads.
     NodeFailed {
         code: String,
         message: String,
@@ -107,7 +164,27 @@ pub enum OpOutcome {
         path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         errno: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
     },
+    /// Every address of a multi-address connect failed: node's
+    /// `NodeAggregateError` (lib/net.js `internalConnectMultiple`), one child
+    /// per attempt, in attempt order. The aggregate itself has no message and
+    /// takes `code` from its first child; the engine builds it through the JS
+    /// factory `__oamMakeAggregateError`. A new variant rather than more
+    /// fields, so a replay file recorded before it existed still loads.
+    NodeAggregateFailed {
+        errors: Vec<NodeSysError>,
+    },
+    /// A `--permission` refusal raised mid-op (see [`AccessDenial`]): the
+    /// engine rejects with the `ERR_ACCESS_DENIED` error its synchronous gates
+    /// throw. A new variant, so a replay file recorded before it existed still
+    /// loads.
+    AccessDenied(AccessDenial),
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
     /// maps it to `process.emit(name)` rather than resolving a promise. serde-
@@ -124,6 +201,24 @@ impl OpOutcome {
             syscall: None,
             path: None,
             errno: None,
+            hostname: None,
+            address: None,
+            port: None,
+        }
+    }
+
+    /// A fully shaped system error (a connect or resolver failure). It never
+    /// carries a filesystem path.
+    pub fn sys(err: NodeSysError) -> Self {
+        OpOutcome::NodeFailed {
+            code: err.code,
+            message: err.message,
+            syscall: err.syscall,
+            path: None,
+            errno: err.errno,
+            hostname: err.hostname,
+            address: err.address,
+            port: err.port,
         }
     }
 
@@ -149,6 +244,9 @@ impl OpOutcome {
             syscall: Some(syscall.to_string()),
             path: path.map(|p| p.to_string()),
             errno,
+            hostname: None,
+            address: None,
+            port: None,
         }
     }
 }
@@ -160,10 +258,10 @@ pub struct OpCompletion {
 }
 
 /// Live streaming response bodies, keyed by handle. A std (not tokio)
-/// Mutex on purpose: readers REMOVE the response under a short lock, await
-/// the chunk with no lock held, then reinsert — no guard ever crosses an
+/// Mutex on purpose: a reader REMOVES the body under a short lock, reads one
+/// chunk with no lock held, then reinserts it — no guard ever crosses an
 /// await. Single-reader discipline is guaranteed by ReadableStream's lock.
-pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Response>>>;
+pub type BodyRegistry = http_client::body::FetchBodies;
 
 /// Cancel tombstones for the remove-await-reinsert race: fetchBodyCancel on
 /// a handle whose read is IN FLIGHT (absent from the registry) records the
@@ -171,10 +269,17 @@ pub type BodyRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, reqwest::Re
 /// reinserting -- otherwise a cancelled body silently revives and holds its
 /// connection open for the rest of the run.
 pub type CancelledBodies = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>;
-/// Outbound request-body channels: JS writes chunks, reqwest drains them.
-/// The receiver is taken by `fetch` when the request goes out; the sender
-/// stays here so later writes reach the in-flight request.
+/// Outbound request-body channels: JS writes chunks, the fetch transport
+/// drains them. The receiver is taken by `fetch` when the request goes out;
+/// the sender stays here so later writes reach the in-flight request.
 /// Slice 4 of docs/design/streaming-bodies.md.
+///
+/// Entry lifecycle (`http_client::body::StreamSlot`): a fetch that fails
+/// before it sends drops the receiver, so writes resolve instead of blocking
+/// on a full channel; a request that fails after it sent removes the entry;
+/// `fetchBodyChannelEnd` removes it once the receiver is taken, and
+/// `fetchBodyChannelCancel` removes it outright. A successful request whose
+/// body JS never ends keeps `(sender, None)`: that body is still open.
 pub type OutboundBodies = std::sync::Arc<
     std::sync::Mutex<
         HashMap<
@@ -570,9 +675,13 @@ impl HandleRef {
 pub struct CoreRuntime {
     /// Option so Drop can take it for shutdown_background (see below).
     tokio: Option<tokio::runtime::Runtime>,
-    /// Shared HTTP client (connection pool). Owned per CoreRuntime so pooled
-    /// connections never outlive the tokio runtime they were spawned on.
-    http: reqwest::Client,
+    /// The fetch transport: oam's pooled HTTP client (#143). Owned per
+    /// CoreRuntime so pooled connections, which live on this runtime's tokio,
+    /// never outlive it.
+    http: http_client::HttpTransport,
+    /// Hook-mode fetches parked on their `connect.lookup` hook
+    /// (`http_client::send`); dropped with the run.
+    fetch_continuations: http_client::send::FetchContinuations,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -635,49 +744,25 @@ impl CoreRuntime {
         // NODE_EXTRA_CA_CERTS: read once, here at boot, with Node's warning
         // on stderr if the file will not load -- before any script runs and
         // whether or not a TLS connection ever follows, as Node does.
-        let extra_ca = tls::extra_ca_certs();
+        tls::extra_ca_certs();
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("oam-io")
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime: {e}"))?;
-        let mut http = reqwest::Client::builder()
-            .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
-            // Stated rather than inherited from the cargo features: reqwest
-            // turns these on by default once the feature is compiled in, so an
-            // implicit version would silently stop negotiating if that default
-            // ever changed, and the symptom -- a body of raw DEFLATE bytes --
-            // does not look like a networking regression. Written out, a
-            // dropped feature is a compile error instead. Matches Node's
-            // advertised set; see the Cargo.toml note for why not brotli.
-            .gzip(true)
-            .deflate(true)
-            // `localhost` IPv4-first. Measured: oam's first request to
-            // localhost cost ~317ms against Node's ~6ms, because resolution
-            // yields ::1 first, the common case is a server bound to
-            // 127.0.0.1, and the connector waits out its happy-eyeballs
-            // fallback delay before trying IPv4. ::1 stays in the list as a
-            // fallback, so a server bound only to IPv6 loopback still works.
-            .resolve_to_addrs(
-                "localhost",
-                &[
-                    std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                    std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-                ],
-            );
-        // Node's undici and https share the one root store, so the extra CAs
-        // apply to fetch() and https.request() as they do to tls.connect().
-        for cert in &extra_ca.certs {
-            if let Ok(cert) = reqwest::Certificate::from_der(cert.as_ref()) {
-                http = http.add_root_certificate(cert);
-            }
-        }
-        let http = http.build().map_err(|e| format!("http client: {e}"))?;
+        // Infallible and spawns nothing: the platform TLS configs (with the
+        // NODE_EXTRA_CA_CERTS roots read above) are built on the first https
+        // request, so a verifier that cannot be built fails that request, not
+        // boot. No `localhost` override: node dials the addresses in resolver
+        // order (::1 then 127.0.0.1 on Windows), and a refused ::1 costs about
+        // a millisecond with the loopback RTO ioctl net_connect sets.
+        let http = http_client::HttpTransport::new();
         let (tx, rx) = mpsc::channel();
         Ok(Self {
             tokio: Some(tokio),
             http,
+            fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
             next_id: 1,
@@ -729,9 +814,20 @@ impl CoreRuntime {
         self.outbound_bodies.clone()
     }
 
-    /// Cheap Arc clone for ops that need the pooled HTTP client.
-    pub fn http_client(&self) -> reqwest::Client {
+    /// `fetchBodyChannelEnd`: end the request body under `handle`, and drop
+    /// its channel entry if the fetch already took the receiver.
+    pub fn end_outbound_body(&self, handle: u64) {
+        http_client::body::end_outbound(&self.outbound_bodies, handle);
+    }
+
+    /// Cheap Arc clone for ops that need the pooled HTTP transport.
+    pub fn http_client(&self) -> http_client::HttpTransport {
         self.http.clone()
+    }
+
+    /// Hook-mode fetches waiting on their `connect.lookup` hook (Arc clone).
+    pub fn fetch_continuations(&self) -> http_client::send::FetchContinuations {
+        self.fetch_continuations.clone()
     }
 
     /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,
@@ -1055,7 +1151,7 @@ impl Drop for CoreRuntime {
     fn drop(&mut self) {
         // The run is over: nothing on the IO runtime may block process
         // exit. A plain Runtime::drop WAITS — an idle keep-alive
-        // connection (reqwest pool, 90s idle timeout; a hyper server
+        // connection (oam's fetch transport pool, 90s idle timeout; a hyper server
         // conn) turned exit into a 90-second hang. shutdown_background
         // drops everything without waiting.
         if let Some(runtime) = self.tokio.take() {
@@ -2716,45 +2812,6 @@ pub mod ops {
         )
     }
 
-    #[cfg(test)]
-    mod statfs_wire_tests {
-        use super::statfs_fields_json;
-
-        /// The decimal-string wire format is the whole reason
-        /// `statfs(path, {bigint: true})` can be trusted. As JSON NUMBERS
-        /// these would be doubles: 2^53+1 and u64::MAX both round on the way
-        /// through, and the BigInt built from a rounded value is silently
-        /// wrong -- precisely the case bigint mode exists to serve.
-        ///
-        /// No filesystem available to a test reports block counts that large,
-        /// so the serializer is the only place this is checkable at all.
-        #[test]
-        fn fields_past_2_pow_53_survive_exactly() {
-            let big = (1u64 << 53) + 1; // first integer a f64 cannot represent
-            let json = statfs_fields_json(u64::MAX, 4096, big, big - 1, 0, u64::MAX - 1, 7);
-
-            let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-            let field = |name: &str| parsed[name].as_str().expect("string").parse::<u64>();
-            assert_eq!(field("type").unwrap(), u64::MAX);
-            assert_eq!(field("blocks").unwrap(), big);
-            assert_eq!(field("bfree").unwrap(), big - 1);
-            assert_eq!(field("files").unwrap(), u64::MAX - 1);
-
-            // The rounding this format exists to avoid, demonstrated.
-            assert_eq!(big as f64 as u64, big - 1);
-        }
-
-        /// Pins the payload contract the JS `StatFs` constructor reads by
-        /// name: all seven fields present, none emitted as a bare number.
-        #[test]
-        fn payload_carries_all_seven_fields_as_strings() {
-            assert_eq!(
-                statfs_fields_json(0, 1, 2, 3, 4, 5, 6),
-                r#"{"type":"0","bsize":"1","blocks":"2","bfree":"3","bavail":"4","files":"5","ffree":"6"}"#
-            );
-        }
-    }
-
     /// statfs of the filesystem `path` lives on, as the JSON payload the JS
     /// side consumes. Blocking; async callers must run it on a blocking thread.
     ///
@@ -3679,244 +3736,11 @@ pub mod ops {
         serde_json::from_str(json).map_err(|e| format!("fetch: malformed request: {e}"))
     }
 
-    /// The wire shape `fetch` sends down from JS (serialized JSON).
-    #[derive(serde::Deserialize)]
-    pub struct FetchRequest {
-        pub url: String,
-        #[serde(default)]
-        pub method: Option<String>,
-        #[serde(default)]
-        pub headers: Vec<(String, String)>,
-        #[serde(default)]
-        pub body: Option<String>,
-        #[serde(default)]
-        pub body_base64: Option<String>,
-        /// Handle into OutboundBodies: stream the body from JS instead of
-        /// sending a materialized one. Mutually exclusive with body /
-        /// body_base64.
-        #[serde(default)]
-        pub body_stream: Option<u64>,
-        /// Connection pin: dial this IP for the URL's host instead of
-        /// resolving DNS, while keeping Host header + TLS SNI = the host.
-        /// Set by globalThis.fetch when an undici dispatcher carries a
-        /// connect.lookup hook (DNS-rebind / SSRF pinning).
-        #[serde(default)]
-        pub pin: Option<FetchPin>,
-    }
-
-    /// A DNS/connect pin: `host` (the URL hostname, kept for Host + SNI) ->
-    /// `ip` (the literal address to dial).
-    #[derive(serde::Deserialize)]
-    pub struct FetchPin {
-        pub host: String,
-        pub ip: String,
-    }
-
-    /// Build a one-off reqwest client that resolves `pin.host` to `pin.ip`
-    /// (port from the URL), keeping the shared client's config. Used only for
-    /// pinned requests, so the normal fetch path keeps the pooled client.
-    fn build_pinned_client(url: &str, pin: &FetchPin) -> Result<reqwest::Client, String> {
-        let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
-        let port = parsed
-            .port_or_known_default()
-            .ok_or_else(|| "url has no port and no known default".to_string())?;
-        let ip: std::net::IpAddr = pin
-            .ip
-            .parse()
-            .map_err(|e| format!("pin ip '{}' is not an IP: {e}", pin.ip))?;
-        let addr = std::net::SocketAddr::new(ip, port);
-        reqwest::Client::builder()
-            .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
-            // The pinned client is a second, separately-built client for
-            // connect-hook fetches. Every transport-visible behaviour has to
-            // match the shared one above or a pinned request decodes
-            // differently from an ordinary one -- the kind of divergence that
-            // only shows up in whichever code path the test suite forgot.
-            .gzip(true)
-            .deflate(true)
-            .resolve(&pin.host, addr)
-            .build()
-            .map_err(|e| format!("pinned http client: {e}"))
-    }
-
-    /// A transport failure from `Client::send`, shaped the way node reports
-    /// it. reqwest's Display stops at "error sending request for url (...)"
-    /// and the refusal, timeout or resolver failure sits deeper in its source
-    /// chain, as the `io::Error` hyper-util's connector wrapped under a "tcp
-    /// connect error" or "dns error" label. Walking to it gives node's `code`
-    /// / `errno` / `syscall` and the message node builds from them: `connect
-    /// ECONNREFUSED 127.0.0.1:8080` or `getaddrinfo ENOTFOUND host`. The host
-    /// is the URL's, as written: the connector does not say which resolved
-    /// address refused, where node names the IP and reports one error per
-    /// address (an AggregateError) for a name with several. Retry logic keys
-    /// on `code`, and used to see `ECONNRESET` (the http client's guess from
-    /// reqwest's text) or nothing at all (fetch). Every other failure keeps
-    /// reqwest's text, uncoded, as before.
-    fn fetch_send_failed(error: reqwest::Error, url: &str) -> OpOutcome {
-        use std::error::Error as _;
-        let mut stage = None;
-        let mut io = None;
-        let mut cur = error.source();
-        while let Some(e) = cur {
-            if let Some(e) = e.downcast_ref::<std::io::Error>() {
-                io = Some(e);
-                break;
-            }
-            let text = e.to_string();
-            if text == "tcp connect error" || text == "dns error" {
-                stage = Some(text);
-            }
-            cur = e.source();
-        }
-        let (Some(stage), Some(io)) = (stage, io) else {
-            return OpOutcome::Failed(format!("{error}"));
-        };
-        let parsed = reqwest::Url::parse(url).ok();
-        // `host_str` keeps the brackets of an IPv6 literal; node's address
-        // and message do not ("connect ECONNREFUSED ::1:8080").
-        let host = parsed
-            .as_ref()
-            .and_then(|u| u.host_str())
-            .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_string())
-            .unwrap_or_default();
-        if stage == "dns error" {
-            // Windows carries WSAHOST_NOT_FOUND / WSATRY_AGAIN on the error;
-            // std builds the unix resolver failure with no OS code at all,
-            // only gai_strerror's text, so "try again" is told apart from
-            // "no such name" by that text.
-            let code = match super::node_error_code(io) {
-                "EAI_AGAIN" => "EAI_AGAIN",
-                _ if io.to_string().contains("Temporary failure") => "EAI_AGAIN",
-                _ => "ENOTFOUND",
-            };
-            let errno = if code == "EAI_AGAIN" { -3001 } else { -3008 };
-            return OpOutcome::node_failed_at(
-                code,
-                format!("getaddrinfo {code} {host}"),
-                "getaddrinfo",
-                None,
-                Some(errno),
-            );
-        }
-        let code = super::node_error_code(io);
-        if code == "EIO" {
-            // Not a network failure the table knows; do not invent a code.
-            return OpOutcome::Failed(format!("{error}"));
-        }
-        let port = parsed
-            .as_ref()
-            .and_then(|u| u.port_or_known_default())
-            .unwrap_or(0);
-        OpOutcome::node_failed_at(
-            code,
-            format!("connect {code} {host}:{port}"),
-            "connect",
-            None,
-            super::node_errno(code, io),
-        )
-    }
-
-    /// Streaming fetch: resolves at HEADERS time with the response shape
-    /// plus a body handle. The body streams through fetch_body_read one
-    /// chunk per op — `for await (const chunk of response.body)` sees
-    /// tokens as the server flushes them (the SSE/AI-client path).
-    pub async fn fetch(
-        client: reqwest::Client,
-        req: FetchRequest,
-        bodies: super::BodyRegistry,
-        ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        outbound: super::OutboundBodies,
-    ) -> OpOutcome {
-        let method = req.method.as_deref().unwrap_or("GET");
-        let method = match reqwest::Method::from_bytes(method.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => return OpOutcome::Failed(format!("fetch: invalid method '{method}'")),
-        };
-        // Connection pin (DNS-rebind / SSRF protection): a one-off client that
-        // dials the verified IP for this host. Normal requests keep the
-        // pooled client untouched.
-        let client = match &req.pin {
-            Some(pin) => match build_pinned_client(&req.url, pin) {
-                Ok(c) => c,
-                Err(e) => return OpOutcome::Failed(format!("fetch: connect pin failed: {e}")),
-            },
-            None => client,
-        };
-        let mut builder = client.request(method, &req.url);
-        for (name, value) in &req.headers {
-            builder = builder.header(name, value);
-        }
-        if let Some(handle) = req.body_stream {
-            // Streamed body: hand reqwest the receiving half. Note this
-            // sends chunked (no Content-Length) unless the caller set one.
-            let rx = outbound
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&handle)
-                .and_then(|slot| slot.1.take());
-            let Some(rx) = rx else {
-                return OpOutcome::Failed(format!("fetch: unknown body stream {handle}"));
-            };
-            // futures-util (already a dep) rather than tokio-stream: unfold
-            // the receiver into a Stream of io::Result chunks.
-            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-                rx.recv()
-                    .await
-                    .map(|item| (item.map_err(std::io::Error::other), rx))
-            });
-            builder = builder.body(reqwest::Body::wrap_stream(stream));
-        } else if let Some(body) = req.body {
-            builder = builder.body(body);
-        } else if let Some(b64) = req.body_base64 {
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(&b64) {
-                Ok(bytes) => {
-                    builder = builder.body(bytes);
-                }
-                Err(_) => return OpOutcome::Failed("fetch: malformed base64 body".into()),
-            }
-        }
-        let response = match builder.send().await {
-            Ok(r) => r,
-            Err(e) => return fetch_send_failed(e, &req.url),
-        };
-        let status = response.status().as_u16();
-        let status_text = response
-            .status()
-            .canonical_reason()
-            .unwrap_or_default()
-            .to_string();
-        let url = response.url().to_string();
-        // Compare PARSED urls: string comparison false-positives on
-        // normalization (trailing slash, default port, percent-casing).
-        let redirected = reqwest::Url::parse(&req.url)
-            .map(|original| *response.url() != original)
-            .unwrap_or(false);
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_string(),
-                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
-        let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        bodies
-            .lock()
-            .expect("body registry lock")
-            .insert(handle, response);
-        let payload = serde_json::json!({
-            "status": status,
-            "statusText": status_text,
-            "url": url,
-            "redirected": redirected,
-            "headers": headers,
-            "bodyHandle": handle,
-        });
-        OpOutcome::Json(payload.to_string())
-    }
+    /// The fetch op and its wire request: oam's own transport (#143). The
+    /// body reader is [`fetch_body_read`].
+    pub use crate::http_client::send::{
+        FetchContinuations, FetchRequest, RedirectMode, fetch, fetch_abandon, fetch_continue,
+    };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.
     /// Returns Json {handle} on success. compress=true for encoding,
@@ -4370,72 +4194,48 @@ pub mod ops {
     }
 
     /// Read one chunk from a streaming body. Bytes = a chunk, Done = EOF
-    /// (handle dropped). Remove-await-reinsert keeps the lock short; the
-    /// JS ReadableStream lock guarantees a single reader per handle. A
-    /// cancel that landed while the read was in flight (tombstone in
-    /// `cancelled`) drops the response instead of reinserting it.
-    pub async fn fetch_body_read(
-        bodies: super::BodyRegistry,
-        cancelled: super::CancelledBodies,
-        cancel_signal: super::BodyCancelSignal,
-        handle: u64,
-    ) -> OpOutcome {
-        let response = bodies
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle);
-        let Some(mut response) = response else {
-            return OpOutcome::Failed(format!("fetch: body handle {handle} is gone"));
-        };
-        // Preemptive cancel: a peer that stops sending without closing would
-        // otherwise park this await forever (aborting a request could never
-        // release the op, and the loop could never drain). Re-check the
-        // tombstone after waking -- Notify is broadcast, so another handle's
-        // cancel can wake us spuriously.
-        let result = loop {
-            tokio::select! {
-                r = response.chunk() => break r,
-                _ = cancel_signal.notified() => {
-                    if cancelled
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&handle)
-                    {
-                        return OpOutcome::Done;
-                    }
-                }
-            }
-        };
-        let was_cancelled = cancelled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle);
-        if was_cancelled {
-            // Drop the response (closes the connection); report EOF -- the
-            // JS stream is already cancelled and discards the outcome.
-            return OpOutcome::Done;
+    /// (handle dropped). Remove-read-reinsert keeps the lock short; the JS
+    /// ReadableStream lock guarantees a single reader per handle. A cancel
+    /// that landed while the read was in flight drops the body instead of
+    /// reinserting it.
+    pub use crate::http_client::body::read as fetch_body_read;
+
+    #[cfg(test)]
+    mod statfs_wire_tests {
+        use super::statfs_fields_json;
+
+        /// The decimal-string wire format is the whole reason
+        /// `statfs(path, {bigint: true})` can be trusted. As JSON NUMBERS
+        /// these would be doubles: 2^53+1 and u64::MAX both round on the way
+        /// through, and the BigInt built from a rounded value is silently
+        /// wrong -- precisely the case bigint mode exists to serve.
+        ///
+        /// No filesystem available to a test reports block counts that large,
+        /// so the serializer is the only place this is checkable at all.
+        #[test]
+        fn fields_past_2_pow_53_survive_exactly() {
+            let big = (1u64 << 53) + 1; // first integer a f64 cannot represent
+            let json = statfs_fields_json(u64::MAX, 4096, big, big - 1, 0, u64::MAX - 1, 7);
+
+            let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+            let field = |name: &str| parsed[name].as_str().expect("string").parse::<u64>();
+            assert_eq!(field("type").unwrap(), u64::MAX);
+            assert_eq!(field("blocks").unwrap(), big);
+            assert_eq!(field("bfree").unwrap(), big - 1);
+            assert_eq!(field("files").unwrap(), u64::MAX - 1);
+
+            // The rounding this format exists to avoid, demonstrated.
+            assert_eq!(big as f64 as u64, big - 1);
         }
-        match result {
-            Ok(Some(bytes)) => {
-                bodies
-                    .lock()
-                    .expect("body registry lock")
-                    .insert(handle, response);
-                // Double-check AFTER reinserting: a cancel can land between
-                // the tombstone check above and the insert (tombstone-miss,
-                // registry-miss) -- without this, the cancelled body revives
-                // in the registry and holds its connection for the run.
-                if cancelled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&handle)
-                {
-                    bodies.lock().expect("body registry lock").remove(&handle);
-                }
-                OpOutcome::Bytes(bytes.to_vec())
-            }
-            Ok(None) => OpOutcome::Done,
-            Err(e) => OpOutcome::Failed(format!("fetch: body read failed: {e}")),
+
+        /// Pins the payload contract the JS `StatFs` constructor reads by
+        /// name: all seven fields present, none emitted as a bare number.
+        #[test]
+        fn payload_carries_all_seven_fields_as_strings() {
+            assert_eq!(
+                statfs_fields_json(0, 1, 2, 3, 4, 5, 6),
+                r#"{"type":"0","bsize":"1","blocks":"2","bfree":"3","bavail":"4","files":"5","ffree":"6"}"#
+            );
         }
     }
 }
@@ -5042,5 +4842,149 @@ mod tests {
         let registry: SyncFileRegistry =
             std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
         assert!(!adopt_inherited_fd(&registry, fd));
+    }
+}
+
+/// The op-outcome error contract as record/replay persists it: replay.rs
+/// writes every outcome with serde_json and reads it back on replay, so a file
+/// recorded before a field existed must still load (and falls back to the live
+/// outcome only if it does not parse at all).
+#[cfg(test)]
+mod op_outcome_serde_tests {
+    use super::*;
+
+    fn sys(code: &str) -> NodeSysError {
+        NodeSysError {
+            code: code.to_string(),
+            message: format!("connect {code} 127.0.0.1:8080"),
+            errno: Some(-4078),
+            syscall: Some("connect".to_string()),
+            hostname: None,
+            address: Some("127.0.0.1".to_string()),
+            port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn a_node_failed_recorded_before_the_peer_fields_still_loads() {
+        // The exact shape an older oam wrote: no hostname / address / port.
+        let old = r#"{"NodeFailed":{"code":"ENOENT","message":"ENOENT: no such file or directory, open 'x'","syscall":"open","path":"x","errno":-4058}}"#;
+        match serde_json::from_str::<OpOutcome>(old).expect("old payload parses") {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                path,
+                errno,
+                hostname,
+                address,
+                port,
+            } => {
+                assert_eq!(code, "ENOENT");
+                assert_eq!(message, "ENOENT: no such file or directory, open 'x'");
+                assert_eq!(syscall.as_deref(), Some("open"));
+                assert_eq!(path.as_deref(), Some("x"));
+                assert_eq!(errno, Some(-4058));
+                assert_eq!((hostname, address, port), (None, None, None));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+        // The minimal old form (node_failed: code + message only) too.
+        let minimal = r#"{"NodeFailed":{"code":"ENOTFOUND","message":"m"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<OpOutcome>(minimal).expect("minimal payload parses"),
+            OpOutcome::NodeFailed {
+                syscall: None,
+                path: None,
+                errno: None,
+                hostname: None,
+                address: None,
+                port: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn absent_fields_are_not_written() {
+        // A new recording of an fs-shaped failure is byte-identical to what an
+        // older oam wrote, so an older oam can still replay it.
+        let outcome = OpOutcome::node_failed_at("ENOENT", "m", "open", Some("x"), Some(-2));
+        assert_eq!(
+            serde_json::to_string(&outcome).unwrap(),
+            r#"{"NodeFailed":{"code":"ENOENT","message":"m","syscall":"open","path":"x","errno":-2}}"#
+        );
+        let bare = NodeSysError {
+            code: "EAI_AGAIN".to_string(),
+            message: "getaddrinfo EAI_AGAIN".to_string(),
+            errno: None,
+            syscall: None,
+            hostname: None,
+            address: None,
+            port: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"code":"EAI_AGAIN","message":"getaddrinfo EAI_AGAIN"}"#
+        );
+    }
+
+    #[test]
+    fn sys_fills_node_failed_without_a_path() {
+        match OpOutcome::sys(sys("ECONNREFUSED")) {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                path,
+                errno,
+                hostname,
+                address,
+                port,
+            } => {
+                assert_eq!(code, "ECONNREFUSED");
+                assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
+                assert_eq!(syscall.as_deref(), Some("connect"));
+                assert_eq!(path, None);
+                assert_eq!(errno, Some(-4078));
+                assert_eq!(hostname, None);
+                assert_eq!(address.as_deref(), Some("127.0.0.1"));
+                assert_eq!(port, Some(8080));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_fields_and_aggregates_round_trip() {
+        let single = OpOutcome::sys(sys("ECONNREFUSED"));
+        let json = serde_json::to_string(&single).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::NodeFailed { address, port, .. } => {
+                assert_eq!((address.as_deref(), port), (Some("127.0.0.1"), Some(8080)));
+            }
+            other => panic!("expected NodeFailed, got {other:?}"),
+        }
+        let aggregate = OpOutcome::NodeAggregateFailed {
+            errors: vec![sys("ECONNREFUSED"), sys("ETIMEDOUT")],
+        };
+        let json = serde_json::to_string(&aggregate).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::NodeAggregateFailed { errors } => {
+                assert_eq!(errors, vec![sys("ECONNREFUSED"), sys("ETIMEDOUT")]);
+            }
+            other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
+        // A child missing every optional field (an older writer) loads too.
+        let sparse =
+            r#"{"NodeAggregateFailed":{"errors":[{"code":"ECONNREFUSED","message":"m"}]}}"#;
+        match serde_json::from_str::<OpOutcome>(sparse).unwrap() {
+            OpOutcome::NodeAggregateFailed { errors } => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].errno, None);
+                assert_eq!(errors[0].port, None);
+            }
+            other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
     }
 }

@@ -2523,21 +2523,16 @@ fn op_fetch_body_channel_write(
     });
 }
 
-/// Close the channel: drops the sender, which ends the request body.
+/// Close the channel: drops the sender, which ends the request body, and
+/// the entry itself once the fetch has taken the receiver (it used to stay
+/// behind as `(None, None)` for the rest of the run).
 fn op_fetch_body_channel_end(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    if let Some(slot) = core_runtime!(scope)
-        .outbound_bodies()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_mut(&handle)
-    {
-        slot.0 = None;
-    }
+    core_runtime!(scope).end_outbound_body(handle);
 }
 
 /// Abort an in-flight upload (req.destroy()): send an error so the transport
@@ -2812,6 +2807,9 @@ fn op_tcp_connect(
         return;
     };
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
+    // connect; JS owns the value, so nothing is cached per runtime.
+    let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -2822,8 +2820,25 @@ fn op_tcp_connect(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tcp::tcp_connect(tcp, ids, host, port),
+        oam_core::tcp::tcp_connect(tcp, ids, host, port, attempt_timeout),
     );
+}
+
+/// The optional per-connect attempt timeout (milliseconds) a connect op takes
+/// as argument `index`: node's 250 ms default when it is absent or not a
+/// positive finite number, floored at node's 10 ms.
+fn attempt_timeout_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> std::time::Duration {
+    let value = args.get(index);
+    let ms = if value.is_number() {
+        value.number_value(scope)
+    } else {
+        None
+    };
+    oam_core::net_connect::attempt_timeout_from_ms(ms)
 }
 
 fn op_tcp_read(
@@ -3006,6 +3021,15 @@ fn op_udp_send(
         return;
     };
     let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    // The DESTINATION is a net subject, by the same rule as `tcpConnect`.
+    // Only the bind was checked, and it names the LOCAL address, so any bind
+    // grant was a grant to send datagrams anywhere: with a loopback grant to
+    // every loopback port and address, with a 0.0.0.0 one to any host (a DNS
+    // or UDP exfil endpoint).
+    let net_resource = format!("{host}:{port}");
+    if !check_net_perm(scope, &net_resource) {
+        return;
+    }
     let udp = core_runtime!(scope).udp();
     crate::ops::spawn_op(
         scope,
@@ -3060,6 +3084,7 @@ fn op_tls_connect(
     // means "Node's default range" (min TLSv1.2, max TLSv1.3).
     let min_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 8).filter(|s| !s.is_empty());
+    let attempt_timeout = attempt_timeout_arg(scope, &args, 9);
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3082,6 +3107,7 @@ fn op_tls_connect(
             client_key_pem,
             min_version,
             max_version,
+            attempt_timeout,
         ),
     );
 }
@@ -5369,14 +5395,29 @@ pub(crate) fn throw_permission_denied(
     scope: &mut v8::PinScope<'_, '_>,
     denial: &crate::permissions::PermissionDenial,
 ) {
-    let msg_v8 = v8::String::new(scope, &denial.to_string())
+    let exception = access_denied_error(scope, denial.permission, &denial.resource);
+    scope.throw_exception(exception);
+}
+
+/// The error every `--permission` refusal surfaces as, thrown by a
+/// synchronous gate ([`throw_permission_denied`]) or rejected by an async op
+/// that refused mid-flight (`OpOutcome::AccessDenied`: a fetch redirect to a
+/// host the net grant does not cover). One builder, so the two cannot drift:
+/// a caller branching on `err.code === 'ERR_ACCESS_DENIED'` or reading
+/// `err.resource` sees the same shape either way.
+pub(crate) fn access_denied_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    permission: &str,
+    resource: &str,
+) -> v8::Local<'s, v8::Value> {
+    let msg_v8 = v8::String::new(scope, crate::permissions::ACCESS_DENIED_MESSAGE)
         .unwrap_or_else(|| v8::String::new(scope, "ERR_ACCESS_DENIED").unwrap());
     let exception = v8::Exception::error(scope, msg_v8);
     if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
         for (key, value) in [
             ("code", "ERR_ACCESS_DENIED"),
-            ("permission", denial.permission),
-            ("resource", denial.resource.as_str()),
+            ("permission", permission),
+            ("resource", resource),
         ] {
             if let (Some(k), Some(v)) = (v8::String::new(scope, key), v8::String::new(scope, value))
             {
@@ -5384,7 +5425,7 @@ pub(crate) fn throw_permission_denied(
             }
         }
     }
-    scope.throw_exception(exception);
+    exception
 }
 
 /// The isolate's permission set, for code that needs to HAND IT to a child

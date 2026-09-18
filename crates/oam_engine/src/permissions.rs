@@ -92,10 +92,30 @@ fn path_eq_fold(a: &str) -> String {
 
 /// Split `host[:port]` into its host part, tolerating a bracketed IPv6
 /// literal (`[::1]:8080`), whose host half itself contains colons.
+///
+/// The bracketed form is taken ONLY when the `]` ends the string or is
+/// followed by `:<port>`. Anything else after it returns the target WHOLE, so
+/// it can never equal a bare `[...]` entry. It used to split at the first `]`
+/// and ignore the rest: `[::1].evil.example:80` read as `[::1]`, while the
+/// connect ops hand the full name to getaddrinfo, so `--allow-net=[::1]`
+/// admitted whatever a wildcard DNS name starting with `[::1].` resolves to
+/// (on macOS `[::1].127.0.0.1.nip.io` connected to 127.0.0.1 under it).
 fn host_of(hostport: &str) -> &str {
-    if let Some(end) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
-        // `[::1]:8080` -> `[::1]`
-        return &hostport[..=end];
+    if hostport.starts_with('[') {
+        let Some(end) = hostport.find(']') else {
+            return hostport;
+        };
+        let is_port = |p: &str| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+        };
+        let rest = &hostport[end + 1..];
+        let bracketed = rest.is_empty() || rest.strip_prefix(':').is_some_and(is_port);
+        // `[::1]:8080` -> `[::1]`; `[::1].evil:80`, `[::1]x:80` -> whole.
+        return if bracketed {
+            &hostport[..=end]
+        } else {
+            hostport
+        };
     }
     match hostport.rsplit_once(':') {
         // A bare IPv6 literal has several colons and no port; leave it whole.
@@ -373,9 +393,86 @@ pub struct PermissionDenial {
     pub resource: String,
 }
 
+/// Node's message for `ERR_ACCESS_DENIED`.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access to this API has been restricted";
+
 impl std::fmt::Display for PermissionDenial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Access to this API has been restricted")
+        f.write_str(ACCESS_DENIED_MESSAGE)
+    }
+}
+
+impl From<PermissionDenial> for oam_core::AccessDenial {
+    fn from(denial: PermissionDenial) -> Self {
+        oam_core::AccessDenial {
+            permission: denial.permission.to_string(),
+            resource: denial.resource,
+        }
+    }
+}
+
+/// The `--permission` net check a fetch applies to every host it dials: the
+/// URL JS passed in (at the op, synchronously) and every redirect hop (in the
+/// transport's loop, before the hop parks for a `connect.lookup` hook or
+/// dials). `None` when the grant covers every host -- no `--permission`, or a
+/// bare `--allow-net` -- so an unrestricted run pays nothing per hop.
+///
+/// Both call sites go through this one closure, so the initial URL and a
+/// redirect cannot be judged by different rules. The rule is
+/// [`Permissions::check_net`] on the URL's HOST ALONE, as the fetch gate has
+/// always applied it:
+///
+/// - The host is the WHATWG serialization (see `oam_core::http_client::
+///   NetTarget`): case, percent-encoding and non-canonical IP spellings are
+///   folded by the URL parser before the grant is asked, so `LOCALHOST`,
+///   `%6c%6fcalhost`, `0x7f.1` and `[0:0::1]` are judged as `localhost`,
+///   `localhost`, `127.0.0.1` and `[::1]`. Userinfo is never part of it.
+/// - A trailing dot is NOT folded: `localhost.` is a different string from a
+///   `localhost` grant, so it is refused. That fails closed; granting it takes
+///   an entry spelled with the dot.
+/// - An IPv6 literal is checked in brackets, so a grant names it `[::1]`.
+/// - The port is not part of the resource. A bare-host entry admits the host
+///   on any port, and a port-scoped entry (`127.0.0.1:8080`) never matches a
+///   fetch -- it grants `net.connect` to that port, not `fetch`. Fail-closed,
+///   and unchanged from the initial-URL gate's behaviour.
+pub fn fetch_net_check(
+    permissions: &std::sync::Arc<Permissions>,
+) -> Option<oam_core::http_client::NetCheck> {
+    if matches!(permissions.net, PermValue::All) {
+        return None;
+    }
+    let permissions = std::sync::Arc::clone(permissions);
+    Some(std::sync::Arc::new(
+        move |target: &oam_core::http_client::NetTarget<'_>| {
+            permissions
+                .check_net(target.host)
+                .map_err(oam_core::AccessDenial::from)
+        },
+    ))
+}
+
+/// The net resource a `connect.lookup` hook's answer is checked as: the host
+/// a URL naming that address serializes to, so one grant spelling covers the
+/// address whether a script names it in a URL or a hook answers with it.
+///
+/// IPv4 is dotted-quad. IPv6 is bracketed and in the URL parser's canonical
+/// form -- `::1`, `0:0:0:0:0:0:0:1` and `::0:1` are all `[::1]`, and
+/// `::ffff:127.0.0.1` is `[::ffff:7f00:1]` (the WHATWG form; Rust's own
+/// Display keeps the dotted tail, which a URL check never produces). It was
+/// the raw answer, so `--allow-net=[::1]` (what `http://[::1]/` needs) refused
+/// a hook answering `::1`, and only the unbracketed `::1`, which no URL check
+/// ever matches, admitted it. An answer that is not an address is checked
+/// as given; the transport refuses to dial it anyway.
+pub fn lookup_answer_resource(answer: &str) -> String {
+    match answer.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let bracketed = format!("[{v6}]");
+            ada_url::Url::parse(&format!("http://{bracketed}/"), None)
+                .map(|url| url.hostname().to_string())
+                .unwrap_or(bracketed)
+        }
+        Err(_) => answer.to_string(),
     }
 }
 
@@ -536,6 +633,197 @@ mod tests {
         );
         assert!(p.check_net("[::1]:8080").is_ok());
         assert!(p.check_net("[::2]:8080").is_err());
+    }
+
+    #[test]
+    fn net_allowlist_bracketed_entry_does_not_admit_a_name_that_merely_starts_with_it() {
+        // The connect ops check `{host}:{port}` and dial `host` through
+        // getaddrinfo, so a target whose host only BEGINS with `[::1]` is a
+        // DNS name (`[::1].127.0.0.1.nip.io` resolves to 127.0.0.1 on macOS)
+        // and must never be read as the bracketed literal.
+        let p = perms(
+            PermValue::None,
+            PermValue::List(vec!["[::1]".to_string()]),
+            PermValue::None,
+        );
+        for target in [
+            "[::1].evil.example:80",
+            "[::1].127.0.0.1.nip.io:443",
+            "[::1]x:80",
+            "[::1]]:80",
+            "[::1]:80:90",
+            "[::1]:",
+            "[::1]:99999",
+            "[::1]:+80",
+            "[::1].evil.example",
+            "[::1",
+        ] {
+            assert!(p.check_net(target).is_err(), "{target} must be refused");
+            assert_eq!(p.query_state("net", Some(target)), "denied", "{target}");
+        }
+        // The literal itself, with and without a port, is still the grant.
+        assert!(p.check_net("[::1]").is_ok());
+        assert!(p.check_net("[::1]:0").is_ok());
+        assert!(p.check_net("[::1]:65535").is_ok());
+        // A port-scoped bracketed entry is still pinned to its port.
+        let scoped = perms(
+            PermValue::None,
+            PermValue::List(vec!["[::1]:8080".to_string()]),
+            PermValue::None,
+        );
+        assert!(scoped.check_net("[::1]:8080").is_ok());
+        assert!(scoped.check_net("[::1]:8081").is_err());
+        assert!(scoped.check_net("[::1]:8080.evil.example:80").is_err());
+    }
+
+    // ------------------------------------------- fetch: every hop, one rule
+
+    fn target(host: &str, port: u16) -> oam_core::http_client::NetTarget<'_> {
+        oam_core::http_client::NetTarget { host, port }
+    }
+
+    #[test]
+    fn fetch_net_check_costs_nothing_when_every_host_is_granted() {
+        // No --permission, and a bare --allow-net: no closure at all, so the
+        // redirect loop does no per-hop work.
+        let unrestricted = std::sync::Arc::new(Permissions::default());
+        assert!(fetch_net_check(&unrestricted).is_none());
+        let bare = std::sync::Arc::new(Permissions::from_opts(Some(PermissionsOptions {
+            net: BoolOrList::Bool(true),
+            ..opts_net_only(vec![])
+        })));
+        assert!(fetch_net_check(&bare).is_none());
+        // Denied outright, or an empty list: a check that refuses.
+        for net in [BoolOrList::Bool(false), BoolOrList::List(vec![])] {
+            let p = std::sync::Arc::new(Permissions::from_opts(Some(PermissionsOptions {
+                net,
+                ..opts_net_only(vec![])
+            })));
+            let check = fetch_net_check(&p).expect("a restricted grant must check");
+            assert!(check(&target("127.0.0.1", 80)).is_err());
+        }
+    }
+
+    #[test]
+    fn fetch_net_check_is_check_net_on_the_host_alone() {
+        let p = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
+            "127.0.0.1",
+            "[::1]",
+            "granted.test",
+            "10.0.0.1:5432",
+        ]))));
+        let check = fetch_net_check(&p).unwrap();
+        // A bare-host entry admits the host on any port.
+        assert!(check(&target("127.0.0.1", 80)).is_ok());
+        assert!(check(&target("127.0.0.1", 65535)).is_ok());
+        assert!(check(&target("[::1]", 8080)).is_ok());
+        assert!(check(&target("granted.test", 443)).is_ok());
+        // The refusal is the synchronous gate's, naming the host.
+        let denial = check(&target("localhost", 80)).unwrap_err();
+        assert_eq!(
+            denial,
+            oam_core::AccessDenial {
+                permission: "Net".to_string(),
+                resource: "localhost".to_string(),
+            }
+        );
+        // A trailing dot is its own name, and a suffix is not the grant.
+        assert!(check(&target("granted.test.", 80)).is_err());
+        assert!(check(&target("granted.test.evil.example", 80)).is_err());
+        // An unbracketed IPv6 host never matches the bracketed entry.
+        assert!(check(&target("::1", 80)).is_err());
+        // A port-scoped entry grants net.connect to that port, never a fetch:
+        // the port is not part of a fetch's resource. Fail-closed.
+        assert!(p.check_net("10.0.0.1:5432").is_ok());
+        assert!(check(&target("10.0.0.1", 5432)).is_err());
+        // The empty host (a URL that did not parse) is never granted.
+        assert!(check(&target("", 80)).is_err());
+    }
+
+    /// The initial URL's host is read by ada (`op_fetch`), a redirect hop's
+    /// by the `url` crate (the transport's loop, which is what dials). Both
+    /// are WHATWG parsers; if they ever disagreed on a host, the same URL
+    /// would get one verdict as the URL a script passed in and another as a
+    /// redirect target. Each spelling here is one a grant could be probed
+    /// with, and the host both must read is the one the grant is asked about.
+    ///
+    /// The URLs are assembled at run time so the published-URLs gate
+    /// (`xtask/tests/published_urls.rs`) does not read these fixtures as
+    /// endpoints the binary talks to.
+    #[test]
+    fn the_two_fetch_gates_read_the_same_host() {
+        for (scheme, authority, host) in [
+            ("http", "LOCALHOST:1", "localhost"),
+            ("http", "LocalHost.", "localhost."),
+            ("http", "%6c%6fcalhost", "localhost"),
+            ("http", "[0:0:0:0:0:0:0:1]:8080", "[::1]"),
+            ("http", "[::FFFF:127.0.0.1]", "[::ffff:7f00:1]"),
+            ("http", "0x7f.1", "127.0.0.1"),
+            ("http", "2130706433", "127.0.0.1"),
+            ("http", "0177.0.0.1", "127.0.0.1"),
+            ("http", "127.1", "127.0.0.1"),
+            ("http", "B%C3%BCcher.test", "xn--bcher-kva.test"),
+            ("http", "b\u{fc}cher.test", "xn--bcher-kva.test"),
+            ("http", "u:p@127.0.0.1@localhost", "localhost"),
+            ("http", "127.0.0.1:80@localhost:81", "localhost"),
+            ("http", r"granted.test\@localhost", "granted.test"),
+            ("https", "granted.test:443", "granted.test"),
+            ("http", "granted.test#@localhost", "granted.test"),
+            ("http", "granted.test?@localhost", "granted.test"),
+        ] {
+            let raw = format!("{scheme}://{authority}/");
+            let by_ada = ada_url::Url::parse(&raw, None)
+                .ok()
+                .map(|u| u.hostname().to_string());
+            let by_url = url::Url::parse(&raw)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string));
+            assert_eq!(by_ada.as_deref(), Some(host), "ada: {raw}");
+            assert_eq!(by_url.as_deref(), Some(host), "url: {raw}");
+        }
+    }
+
+    /// A hook's answer is checked as the host a URL naming that address
+    /// serializes to, so it matches what `op_fetch` checks for the URL.
+    #[test]
+    fn a_lookup_answer_is_checked_as_a_url_naming_it_would_be() {
+        for (answer, resource) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.9.9.9", "10.9.9.9"),
+            ("::1", "[::1]"),
+            ("0:0:0:0:0:0:0:1", "[::1]"),
+            ("::0:1", "[::1]"),
+            ("FE80::1", "[fe80::1]"),
+            ("::ffff:127.0.0.1", "[::ffff:7f00:1]"),
+            ("2001:db8:0:0:1:0:0:1", "[2001:db8::1:0:0:1]"),
+            // Not an address: checked as given (the transport will not dial it).
+            ("not-an-ip", "not-an-ip"),
+        ] {
+            assert_eq!(lookup_answer_resource(answer), resource, "{answer}");
+            if resource.starts_with('[') {
+                let url = format!("http://{resource}/");
+                assert_eq!(
+                    ada_url::Url::parse(&url, None).unwrap().hostname(),
+                    resource,
+                    "{answer}: a URL naming it reads the same host"
+                );
+            }
+        }
+        let p = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
+            "granted.test",
+            "[::1]",
+        ]))));
+        // `[::1]` is the grant a URL needs, and now a hook answer too.
+        assert!(p.check_net(&lookup_answer_resource("::1")).is_ok());
+        assert!(p.check_net(&lookup_answer_resource("0::1")).is_ok());
+        assert!(p.check_net(&lookup_answer_resource("::2")).is_err());
+        let unbracketed =
+            std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec!["::1"]))));
+        assert!(
+            unbracketed
+                .check_net(&lookup_answer_resource("::1"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -2,11 +2,16 @@
 // creation today; compiled into the startup snapshot once that pipeline
 // lands (same source, faster boot).
 //
-// M1 fetch subset: buffered bodies (no ReadableStream yet), plain-object
-// Response/Headers shapes (real spec classes arrive with oam_web + WPT).
-// Wire contract with crates/oam_core ops::fetch:
-//   request:  JSON string {url, method, headers: [[k,v]], body}
-//   response: {status, statusText, url, headers: [[k,v]], body}
+// fetch: plain-object Response/Headers shapes (real spec classes arrive with
+// oam_web + WPT) over a streamed body. Wire contract with crates/oam_core
+// http_client::send (__oam.fetch / fetchContinue / fetchAbandon):
+//   request:  JSON string {url, method, headers: [[k,v]],
+//             body | body_base64 | body_stream, attempt_timeout_ms,
+//             fetch_semantics, lookup_hook?}
+//   response: {status, statusText, url, redirected, headers: [[k,v]],
+//             bodyHandle} -- or, for a lookup_hook request,
+//             {lookup: {token, host, port}}: run the hook, then
+//             fetchContinue(token, JSON {ips}) or fetchAbandon(token)
 // SNAPSHOT CONSTRAINT: this file is evaluated at BUILD time into the V8
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
@@ -353,12 +358,23 @@
   // Headers (Fetch-standard subset): case-insensitive, repeated values
   // combine per the comma rule, iterable. Shared by fetch responses,
   // server requests, and the Response constructor.
+  //
+  // The store is a LIST of [lowercased name, value], not a Map, because
+  // `set-cookie` is the one name the standard never combines: a cookie's
+  // `Expires` attribute contains a comma, so `a=1, b=2` cannot be split back
+  // into the two lines the server sent, and cookie-handling code was silently
+  // reading one broken cookie where node gives it two. Every other name still
+  // combines in place, so iteration order is unchanged for them: wire order,
+  // which is what `oam.serve` writes back out. (The standard also sorts
+  // iteration by name and node does; oam does not -- see
+  // docs/node-divergences.md.)
   class Headers {
     constructor(init) {
-      this._map = new Map();
+      /** @type {Array<[string, string]>} */
+      this._list = [];
       if (init === undefined || init === null) return;
       if (init instanceof Headers) {
-        for (const [k, v] of init) this._map.set(k, v);
+        for (const [k, v] of init) this.append(k, v);
       } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
         for (const pair of init) this.append(pair[0], pair[1]);
       } else {
@@ -368,32 +384,56 @@
     append(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
-      this._map.set(key, this._map.has(key) ? `${this._map.get(key)}, ${text}` : text);
+      if (key === "set-cookie") {
+        this._list.push([key, text]);
+        return;
+      }
+      const entry = this._list.find((e) => e[0] === key);
+      if (entry === undefined) this._list.push([key, text]);
+      else entry[1] = `${entry[1]}, ${text}`;
     }
     set(name, value) {
-      this._map.set(String(name).toLowerCase(), String(value));
+      const key = String(name).toLowerCase();
+      const text = String(value);
+      const at = this._list.findIndex((e) => e[0] === key);
+      if (at < 0) {
+        this._list.push([key, text]);
+        return;
+      }
+      this._list[at][1] = text;
+      // set() replaces every entry for the name; only set-cookie can repeat.
+      if (key === "set-cookie") {
+        this._list = this._list.filter((e, i) => e[0] !== key || i === at);
+      }
     }
     get(name) {
-      const value = this._map.get(String(name).toLowerCase());
-      return value === undefined ? null : value;
+      const key = String(name).toLowerCase();
+      const values = this._list.filter((e) => e[0] === key).map((e) => e[1]);
+      return values.length === 0 ? null : values.join(", ");
+    }
+    /** Every `set-cookie` line, uncombined (Fetch Standard, node 19.7+). */
+    getSetCookie() {
+      return this._list.filter((e) => e[0] === "set-cookie").map((e) => e[1]);
     }
     has(name) {
-      return this._map.has(String(name).toLowerCase());
+      const key = String(name).toLowerCase();
+      return this._list.some((e) => e[0] === key);
     }
     delete(name) {
-      this._map.delete(String(name).toLowerCase());
+      const key = String(name).toLowerCase();
+      this._list = this._list.filter((e) => e[0] !== key);
     }
     forEach(fn, thisArg) {
-      for (const [key, value] of this._map) fn.call(thisArg, value, key, this);
+      for (const [key, value] of this._list.slice()) fn.call(thisArg, value, key, this);
     }
     *entries() {
-      yield* this._map.entries();
+      for (const [key, value] of this._list.slice()) yield [key, value];
     }
     *keys() {
-      yield* this._map.keys();
+      for (const [key] of this._list.slice()) yield key;
     }
     *values() {
-      yield* this._map.values();
+      for (const [, value] of this._list.slice()) yield value;
     }
     [Symbol.iterator]() {
       return this.entries();
@@ -827,10 +867,58 @@
     return headers;
   }
 
-  function makeResponse(raw) {
+  function makeResponse(raw, signal) {
     const handle = raw.bodyHandle;
     let consumed = false;
     let bodyStream = null;
+    let streamController = null;
+
+    // An abort AFTER the response head still ends the body, whether or not
+    // anything is reading it: node errors the body with the abort reason and
+    // destroys the connection, and stopping a large download part-way
+    // through is the case an AbortController is normally reached for. The
+    // listener therefore goes on here, at the head, not when the body stream
+    // is first touched -- registered lazily, an abort on a body nobody had
+    // read yet cancelled nothing, and the server kept streaming into a
+    // connection oam held for the rest of the run (measured: node's server
+    // sees the client leave at once, oam's never did). The chunks already
+    // delivered stay delivered, as in node.
+    //
+    // The same path finishes an abort that landed BEFORE the head: the fetch
+    // promise already rejected with the reason, and the response that turns
+    // up later is cancelled on arrival instead of holding its connection.
+    let bodyAborted = false;
+    let onAbort = null;
+    const abortReason = () =>
+      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    // Read to the end, failed or cancelled: nothing is left for an abort to
+    // stop. Stop listening, so a signal shared by many fetches does not
+    // collect one listener per response, and a late abort does not leave a
+    // cancel tombstone for a handle that is already gone.
+    function bodyOver() {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      onAbort = null;
+    }
+    if (signal) {
+      onAbort = () => {
+        onAbort = null;
+        bodyAborted = true;
+        try {
+          globalThis.__oam.fetchBodyCancel(handle);
+        } catch {
+          /* already drained */
+        }
+        if (streamController) {
+          try {
+            streamController.error(abortReason());
+          } catch {
+            /* already closed or errored */
+          }
+        }
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     // The body is a real ReadableStream over the wire handle: each pull is
     // one op, so chunks surface as the server flushes them (SSE / token
@@ -838,12 +926,32 @@
     // a read op; the handle dies with the run's CoreRuntime.
     function ensureBody() {
       bodyStream ??= new ReadableStream({
+        start(controller) {
+          streamController = controller;
+          // Aborted before anything asked for the body: it starts errored,
+          // as node's does (a reader's first read rejects with the reason).
+          if (bodyAborted) controller.error(abortReason());
+        },
         async pull(controller) {
-          const chunk = await globalThis.__oam.fetchBodyRead(handle);
-          if (chunk === undefined) controller.close();
-          else controller.enqueue(chunk);
+          let chunk;
+          try {
+            chunk = await globalThis.__oam.fetchBodyRead(handle);
+          } catch (e) {
+            if (bodyAborted) return;
+            bodyOver();
+            throw e;
+          }
+          // The read that was in flight when the abort landed returns here
+          // against a stream that is already errored; closing or enqueuing
+          // on it throws, and the throw would surface as a bogus rejection.
+          if (bodyAborted) return;
+          if (chunk === undefined) {
+            bodyOver();
+            controller.close();
+          } else controller.enqueue(chunk);
         },
         cancel() {
+          bodyOver();
           globalThis.__oam.fetchBodyCancel(handle);
         },
       });
@@ -852,6 +960,13 @@
 
     async function drainBytes() {
       if (consumed) throw new TypeError("Body already consumed");
+      // Consuming a body whose fetch was already aborted fails before it
+      // starts, with undici's own AbortError rather than the signal's
+      // reason (measured on node v22.22.2: `ac.abort(new Error('why'))` then
+      // `r.text()` rejects with `DOMException [AbortError]: The operation was
+      // aborted.`). An abort that lands DURING the read rejects with the
+      // reason, through the stream, in both.
+      if (bodyAborted) throw new globalThis.DOMException("The operation was aborted.", "AbortError");
       consumed = true;
       const chunks = [];
       let total = 0;
@@ -895,24 +1010,197 @@
     return String(value).toWellFormed();
   }
 
-  function shapeFetchCause(e, url) {
-    if (!(e instanceof Error)) return new Error(String(e));
-    if (e.syscall !== "connect" && e.syscall !== "getaddrinfo") return e;
-    let parsed = null;
+  // net's happy-eyeballs attempt timeout
+  // (net.setDefaultAutoSelectFamilyAttemptTimeout) is process-wide, and node's
+  // fetch connects with it too (undici passes none of its own). A net module
+  // nobody has loaded cannot have changed it: node's 250 ms.
+  function netAttemptTimeoutMs() {
     try {
-      parsed = new URL(url);
+      const net = globalThis.__oamNode?.cache?.get?.("net");
+      const ms = net?.getDefaultAutoSelectFamilyAttemptTimeout?.();
+      if (typeof ms === "number") return ms;
     } catch {
-      return e;
+      // the default below
     }
-    // URL keeps the brackets of an IPv6 literal; node's address does not.
-    const host = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
-    if (e.syscall === "getaddrinfo") {
-      e.hostname = host;
-    } else {
-      e.address = host;
-      e.port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
+    return 250;
+  }
+
+  // The `hints` node's net.connect hands a connect.lookup hook
+  // (lib/net.js lookupAndConnect): 0 on Windows, dns.ADDRCONFIG -- the
+  // platform's AI_ADDRCONFIG -- elsewhere. Measured: node v22.22.2 passes
+  // `{ family: undefined, hints, all: true }` with hints 0 on win32, 1024 on
+  // macOS 26 arm64 and 32 (0x20) on Debian 12 x64 (glibc 2.36). FreeBSD's
+  // 1024 is its <netdb.h> value, unmeasured. oam's own dns.ADDRCONFIG is
+  // still 0 everywhere (a separate follow-up).
+  function lookupHints() {
+    const platform = globalThis.process?.platform;
+    if (platform === "win32") return 0;
+    if (platform === "darwin" || platform === "freebsd") return 1024;
+    return 0x20;
+  }
+
+  // node lib/net.js lookupAndConnectMultiple (v22.22.2): keep the addresses
+  // net would dial -- isIP(address) and family 4 or 6 -- in the hook's order,
+  // and with none, fail on the FIRST entry. The statements are node's own, so
+  // the TypeErrors are too: an empty list throws "Cannot destructure property
+  // 'address' of 'addresses[0]' as it is undefined." (measured as fetch's
+  // cause), and a string answer (`cb(null, ip, family)`, the non-`all` form)
+  // walks its characters and fails as `Invalid IP address: undefined`.
+  // Family interleaving and repeats are Rust's (net_connect).
+  function pinAddresses(addresses, host, port) {
+    const reg = globalThis.__oamNode;
+    const { isIP } = reg.get("net");
+    const ips = [];
+    for (let i = 0, l = addresses.length; i < l; i++) {
+      const address = addresses[i];
+      const { address: ip, family: addressType } = address;
+      if (isIP(ip) && (addressType === 4 || addressType === 6)) ips.push(ip);
     }
-    return e;
+    if (ips.length > 0) return ips;
+    const { address: firstIp, family: firstAddressType } = addresses[0];
+    const { codes } = reg.get("internal/errors");
+    if (!isIP(firstIp)) throw new codes.ERR_INVALID_IP_ADDRESS(firstIp);
+    throw new codes.ERR_INVALID_ADDRESS_FAMILY(firstAddressType, host, port);
+  }
+
+  // One connect.lookup call, as net.connect makes it for a fetch: the host,
+  // `{ family, hints, all: true }`, a callback. The first callback wins; an
+  // error (or a synchronous throw) rejects with that value unchanged.
+  function runConnectLookup(lookup, host, port) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      lookup(host, { family: undefined, hints: lookupHints(), all: true }, (err, addresses) => {
+        if (settled) return;
+        settled = true;
+        if (err) {
+          reject(err);
+          return;
+        }
+        try {
+          resolve(pinAddresses(addresses, host, port));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  // WHATWG: fetch() rejects with a TypeError on a network failure, and node's
+  // message is the bare "fetch failed" with the transport error underneath as
+  // `cause` -- that is where `code` (ECONNREFUSED, ENOTFOUND, ...) lives and
+  // what retry logic reads. The native op builds that error itself, in node's
+  // shape: errno / code / syscall and the address that refused (or the
+  // hostname that did not resolve), or node's AggregateError when every
+  // address of a name refused.
+  function fetchFailed(e) {
+    // A --permission refusal is not a network failure: the initial URL's
+    // denial reaches the caller as the ERR_ACCESS_DENIED error itself, and a
+    // refusal raised later (a redirect hop's host, which the native loop
+    // rejects with that same error; the connect.lookup hook's addresses,
+    // checked when the fetch resumes) has to look the same or a policy
+    // failure reads as an unreachable host.
+    if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
+    return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
+  }
+
+  // The op, settled: a response, or -- for a fetch whose dispatcher carries a
+  // connect.lookup hook -- a lookup request first. undici calls the hook for
+  // every connection to a host name, redirect hops included, so the native
+  // loop parks before it dials a name it has no addresses for and hands the
+  // name up here. A hook that fails fails the fetch CLOSED (its error is the
+  // cause, unchanged, as in node) and never falls back to system DNS; an
+  // abort while parked drops the parked fetch.
+  async function settleFetch(pending, lookup, signal) {
+    const internal = globalThis.__oam;
+    const aborted = () =>
+      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    let raw;
+    try {
+      raw = await pending;
+    } catch (e) {
+      throw fetchFailed(e);
+    }
+    let resumed = false;
+    while (raw && raw.lookup) {
+      const { token, host, port } = raw.lookup;
+      const abandon = () => internal.fetchAbandon(token);
+      // Aborted while the previous hop was on the wire: node ends the fetch
+      // there and never looks the redirect target up (measured). The FIRST
+      // host is looked up even after an abort that follows fetch() in the
+      // same tick -- undici has already started connecting (measured: one
+      // call) -- so only a resumed fetch stops here. The abort race already
+      // rejected the fetch with the reason.
+      if (resumed && signal?.aborted) {
+        abandon();
+        throw aborted();
+      }
+      signal?.addEventListener("abort", abandon, { once: true });
+      let ips;
+      try {
+        ips = await runConnectLookup(lookup, host, port);
+      } catch (err) {
+        abandon();
+        throw new TypeError("fetch failed", { cause: err });
+      } finally {
+        signal?.removeEventListener("abort", abandon);
+      }
+      if (signal?.aborted) {
+        abandon();
+        // The abort race already rejected the fetch with the reason.
+        throw aborted();
+      }
+      resumed = true;
+      try {
+        raw = await internal.fetchContinue(token, JSON.stringify({ ips }));
+      } catch (e) {
+        throw fetchFailed(e);
+      }
+    }
+    return makeResponse(raw, signal);
+  }
+
+  // The methods the Fetch Standard byte-uppercases. Anything else keeps the
+  // caller's spelling: node sends `patch /p HTTP/1.1` for `{method: 'patch'}`
+  // and `fooBar /p` for `{method: 'fooBar'}` (measured on v22.22.2), where
+  // oam used to uppercase every method unconditionally.
+  const NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+
+  // Request headers undici refuses to dispatch, and the error each one
+  // raises. Measured on node v22.22.2 + undici 6.24.1 against a raw-socket
+  // server: every one of these fails the fetch BEFORE anything reaches the
+  // wire.
+  //
+  // `connection` is the one that turns on the VALUE, case-insensitively:
+  // `close` and `keep-alive` are both accepted and go out lowercased
+  // (`{connection: 'CLOSE'}` writes `connection: close`), and anything else --
+  // notably `close, transfer-encoding`, the CL.TE evasion -- is refused.
+  //
+  // This is NOT the Fetch Standard's forbidden-header list: node sends
+  // `via`, `date`, `dnt`, `origin`, `referer`, `cookie`, `cookie2`,
+  // `accept-charset`, `set-cookie`, `trailer`, `te`, `proxy-*` and
+  // `access-control-request-*` straight through (all measured), so oam does
+  // too. `host` is the one node silently drops.
+  //
+  // Returns `[name, message]` to refuse with, or the value to send.
+  function dispatchHeader(name, value) {
+    switch (name) {
+      case "transfer-encoding":
+        return { refuse: ["InvalidArgumentError", "invalid transfer-encoding header"] };
+      case "keep-alive":
+        return { refuse: ["InvalidArgumentError", "invalid keep-alive header"] };
+      case "upgrade":
+        return { refuse: ["InvalidArgumentError", "invalid upgrade header"] };
+      case "expect":
+        return { refuse: ["NotSupportedError", "expect header not supported"] };
+      case "connection": {
+        const lower = value.toLowerCase();
+        return lower === "close" || lower === "keep-alive"
+          ? { value: lower }
+          : { refuse: ["InvalidArgumentError", "invalid connection header"] };
+      }
+      default:
+        return { value };
+    }
   }
 
   globalThis.fetch = async function fetch(input, init) {
@@ -922,60 +1210,114 @@
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
+    // Internal callers that are not fetch in node (http.request, the http2
+    // client, undici.request) opt out of every Fetch-level rule below.
+    const fetchSemantics = init.__oamFetchSemantics !== false;
+    // undici's DISPATCH-level rules are a smaller set that node applies to
+    // `undici.request` as well, because both build the same internal Request:
+    // the five hop-by-hop header refusals and the content-length check, but
+    // NOT the Fetch-level ones. Measured on node v22.22.2 + undici 6.24.1:
+    // `undici.request` throws `invalid transfer-engine header` /
+    // `expect header not supported` / `Request body length does not match
+    // content-length header` exactly as `fetch` does, and at the same time
+    // SENDS a caller `host` (which fetch drops) and leaves the method alone.
+    // `http.request` and the http2 client set these headers legitimately in
+    // node and are not subject to either set.
+    const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
+    const rawUrl = wellFormed(input);
+    if (fetchSemantics) {
+      // node parses the URL in the Request constructor, so a bad URL is a URL
+      // error and not a network failure -- the caller can tell them apart.
+      // oam reported both as `TypeError: fetch failed` with cause
+      // `Error: builder error`, which named neither.
+      let parsed;
+      try {
+        parsed = new URL(rawUrl);
+      } catch {
+        const cause = new TypeError("Invalid URL");
+        cause.code = "ERR_INVALID_URL";
+        throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
+      }
+      // node: `TypeError: Request cannot be constructed from a URL that
+      // includes credentials` -- nothing reaches the wire. oam converted the
+      // userinfo to `Authorization: Basic ...` and sent it, which is also
+      // inconsistent with this slice's own redirect rule (a Location with
+      // userinfo already fails as `cross origin not allowed ...`). The
+      // http.request path keeps the conversion: there the userinfo IS node's
+      // documented `auth` option.
+      if (parsed.username !== "" || parsed.password !== "") {
+        throw new TypeError(
+          `Request cannot be constructed from a URL that includes credentials: ${rawUrl}`,
+        );
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
+      }
+    }
     let headers = [];
     if (init.headers) {
       // Branch on iterability, not Array-ness: a Map (valid HeadersInit)
       // is not an Array, and Object.entries(map) is [] — auth headers were
       // silently dropped.
       const h = init.headers;
-      headers =
+      const pairs =
         typeof h !== "string" && typeof h[Symbol.iterator] === "function"
           ? [...h].map(([k, v]) => [wellFormed(k), wellFormed(v)])
           : Object.entries(h).map(([k, v]) => [wellFormed(k), wellFormed(v)]);
-    }
-    const request = {
-      url: wellFormed(input),
-      method: init.method ? String(init.method).toUpperCase() : "GET",
-      headers,
-    };
-    // Connection pin: an undici-style dispatcher (init.dispatcher) may carry a
-    // connect.lookup hook used for DNS-rebind / SSRF pinning. oam owns the
-    // transport (reqwest), so we resolve the hook HERE to an IP and pass it as
-    // a pin: reqwest then dials that IP while keeping Host + TLS SNI = the
-    // hostname. The dispatcher exposes the hook as `_oamConnectLookup` (set by
-    // the oam:undici shim). No dispatcher / no hook = the normal path, no cost.
-    const dispatcher = init.dispatcher;
-    const connectLookup = dispatcher && dispatcher._oamConnectLookup;
-    if (typeof connectLookup === "function") {
-      let host = "";
-      try {
-        host = new globalThis.URL(request.url).hostname;
-      } catch {
-        host = "";
-      }
-      if (host) {
-        const ip = await new Promise((resolve) => {
-          let settled = false;
-          const done = (value) => {
-            if (!settled) {
-              settled = true;
-              resolve(value);
-            }
-          };
-          try {
-            connectLookup(host, { all: true }, (err, addrs) => {
-              if (err) return done(null);
-              if (Array.isArray(addrs) && addrs[0] && addrs[0].address) return done(addrs[0].address);
-              if (typeof addrs === "string" && addrs) return done(addrs);
-              done(null);
-            });
-          } catch {
-            done(null);
+      if (!dispatchSemantics) {
+        headers = pairs;
+      } else {
+        // Repeated names combine, as node's Headers does: two `x-d` entries
+        // go out as one `x-d: 1, 2` line, not two lines. Fetch only --
+        // `undici.request` sends them as the caller wrote them.
+        let list = pairs;
+        if (fetchSemantics) {
+          const combined = new Headers();
+          for (const [k, v] of pairs) combined.append(k, v);
+          list = [...combined];
+        }
+        for (const [rawName, value] of list) {
+          const name = fetchSemantics ? rawName : String(rawName).toLowerCase();
+          // `host` is node's one silent drop, and it is fetch-only: node's
+          // `undici.request` sends a caller host. Left through on a fetch, a
+          // caller controls the authority a name-based virtual host, a cache
+          // or an SSRF filter sees while the connection goes somewhere else.
+          if (fetchSemantics && name === "host") continue;
+          const verdict = dispatchHeader(name, value);
+          if (verdict.refuse !== undefined) {
+            const cause = new Error(verdict.refuse[1]);
+            cause.name = verdict.refuse[0];
+            throw new TypeError("fetch failed", { cause });
           }
-        });
-        if (ip) request.pin = { host, ip };
+          headers.push([rawName, verdict.value]);
+        }
       }
     }
+    const method = init.method ? String(init.method) : "GET";
+    const request = {
+      url: rawUrl,
+      // Fetch-level normalisation only: `undici.request` and the http2
+      // client send the method as written in node.
+      method:
+        fetchSemantics && NORMALIZED_METHODS.has(method.toUpperCase())
+          ? method.toUpperCase()
+          : method,
+      headers,
+      attempt_timeout_ms: netAttemptTimeoutMs(),
+      // undici's Fetch-spec bad-port block on the initial URL.
+      fetch_semantics: fetchSemantics,
+    };
+    // An undici-style dispatcher may carry a connect.lookup hook -- the
+    // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
+    // `_oamConnectLookup`. node honours that hook however the dispatcher was
+    // installed, so the GLOBAL one counts too (undici.setGlobalDispatcher,
+    // which plain fetch() and undici.fetch() both dispatch through);
+    // `init.dispatcher` overrides it, as in node. No dispatcher / no hook =
+    // the plain path, no cost -- the holder does not exist until a run imports
+    // undici.
+    const dispatcher = init.dispatcher ?? globalThis.__oamUndiciDispatcher?.current;
+    const lookup = dispatcher && dispatcher._oamConnectLookup;
+    if (typeof lookup === "function") request.lookup_hook = true;
     // Internal escape hatch: a request whose body is produced over time
     // rides an outbound body channel instead of a materialized body
     // (docs/design/streaming-bodies.md). Not part of the WHATWG surface --
@@ -992,21 +1334,44 @@
         request.body_base64 = btoa(binary);
       } else {
         request.body = wellFormed(init.body);
+        // node's "extract a body": a string body's Content-Type is
+        // `text/plain;charset=UTF-8` unless the caller set one (measured).
+        // Servers branch on it, and oam sent none at all.
+        if (fetchSemantics && !headers.some((h) => h[0] === "content-type")) {
+          headers.push(["content-type", "text/plain;charset=UTF-8"]);
+        }
       }
     }
-    const op = globalThis.__oam
-      .fetch(JSON.stringify(request))
-      .then(makeResponse, (e) => {
-        // WHATWG: fetch() rejects with a TypeError on network failure, and
-        // node's message is the bare "fetch failed" with the transport error
-        // underneath as `cause` -- that is where `code` (ECONNREFUSED,
-        // ENOTFOUND, ...) lives and what retry logic reads. The native op
-        // rejects with node's errno / code / syscall for a connect or
-        // resolver failure; node also names the peer on it, which the
-        // request URL supplies here: address + port for connect, hostname
-        // for getaddrinfo.
-        throw new TypeError("fetch failed", { cause: shapeFetchCause(e, request.url) });
-      });
+    // A caller `content-length` that disagrees with the body is refused, not
+    // framed. hyper writes exactly the declared length, so a short one
+    // SILENTLY TRUNCATED the body and still returned 200 -- data loss, and
+    // the classic CL desync primitive if anything downstream re-frames.
+    // node never dispatches either shape: a long one rejects with
+    // `RequestContentLengthMismatchError: Request body length does not match
+    // content-length header`, a short one hangs until its timeout (measured).
+    // oam rejects both with node's long-form error.
+    if (dispatchSemantics) {
+      const declared = headers.find((h) => h[0].toLowerCase() === "content-length");
+      if (declared !== undefined) {
+        const want = Number(declared[1]);
+        const have =
+          request.body_base64 !== undefined
+            ? atob(request.body_base64).length
+            : request.body !== undefined
+              ? new TextEncoder().encode(request.body).length
+              : request.body_stream !== undefined
+                ? null
+                : 0;
+        if (have !== null && (!Number.isInteger(want) || want < 0 || want !== have)) {
+          const cause = new Error("Request body length does not match content-length header");
+          cause.name = "RequestContentLengthMismatchError";
+          throw new TypeError("fetch failed", { cause });
+        }
+      }
+    }
+    // Started synchronously: a malformed request or a --permission refusal
+    // throws from here, as it always has.
+    const op = settleFetch(globalThis.__oam.fetch(JSON.stringify(request)), lookup, signal);
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch
@@ -1303,6 +1668,158 @@
     }
   }
   globalThis.WebSocket = WebSocket;
+})();
+
+// Node's system-error classes, for the errors native ops reject with. The
+// engine's settle path (crates/oam_engine/src/ops.rs sys_error /
+// aggregate_error) calls these for every OpOutcome::NodeFailed and
+// NodeAggregateFailed, and builds the same own properties natively only if
+// they are unreachable.
+//
+// Locked globals, not `__oam` members: __oam does not exist while this file is
+// snapshotted and ops::install replaces it after restore, and it is writable
+// by user code. Every worker and fork isolate restores the same snapshot, so
+// each has its own copy. Built from intrinsics captured HERE, never looked up
+// at call time, so a script that replaces globalThis.Error or AggregateError
+// changes nothing.
+//
+// Shapes measured on node v22.22.2 (lib/internal/errors.js):
+// - ExceptionWithHostPort (a connect failure) and DNSException (a resolver
+//   failure) are Error subclasses whose prototype carries only a `constructor`
+//   getter answering `Error`: `err.constructor === Error`, yet
+//   `Object.getPrototypeOf(err) === Error.prototype` is false. Own properties:
+//   stack, message, then enumerable errno, code, syscall, address, port -- or
+//   errno, code, syscall, hostname. `port` only when truthy. The stack header
+//   is the plain `Error: <message>` (they are not kIsNodeError).
+// - NodeAggregateError (every address of a multi-address connect failed):
+//   `extends AggregateError` with `code` = errors[0].code and prototype getters
+//   `constructor` (answering AggregateError) and [kIsNodeError]. Own
+//   properties stack, errors, code; no own message; Object.keys ["code"];
+//   String(err) "AggregateError"; stack header `AggregateError [CODE]: `.
+// - Anything else (the fs shape: errno, code, syscall, path) is a plain Error,
+//   as before.
+// Stack frames are observable: util.inspect brackets an error with none
+// (`[Error: ...] {`), and an uncaught throw of one is headed by the user's
+// throw site rather than by the error's first frame. Node's connect and DNS
+// errors are built in JS and print unbracketed, so those classes keep the
+// factory frame. Node's fs errors are built by the binding (uvException) with
+// no JS on the stack: an fs.readFile / readdir / access / unlink callback
+// error and a createReadStream 'error' print bracketed, and
+// `fs.readFile(p, (e) => { throw e })` is headed by the `throw e` line
+// (measured on v22.22.2). So the plain-Error branch drops its frame, exactly
+// as the native build it replaced did. fs/promises adds node's frames at its
+// own boundary (node_compat.js asAlwaysRejecting), as node does in
+// handleErrorFromBinding, not here.
+(() => {
+  const ErrorCtor = Error;
+  const captureStackTrace = ErrorCtor.captureStackTrace;
+  const AggregateErrorCtor = AggregateError;
+  const SymbolIterator = Symbol.iterator;
+  const kIsNodeError = Symbol("kIsNodeError");
+
+  class ExceptionWithHostPort extends ErrorCtor {
+    get ["constructor"]() {
+      return ErrorCtor;
+    }
+  }
+
+  class DNSException extends ErrorCtor {
+    get ["constructor"]() {
+      return ErrorCtor;
+    }
+  }
+
+  // `fields` is a null-prototype record from the engine: message, code and,
+  // each only when present, errno, syscall, path, hostname, address, port.
+  function makeSysError(fields) {
+    const message = fields.message;
+    let err;
+    if (fields.address !== undefined || fields.port !== undefined) {
+      err = new ExceptionWithHostPort(message);
+    } else if (fields.hostname !== undefined) {
+      err = new DNSException(message);
+    } else {
+      err = new ErrorCtor(message);
+      // Skipping makeSysError and everything above it leaves no frames: the
+      // engine calls this with no JS below it.
+      captureStackTrace(err, makeSysError);
+    }
+    if (fields.errno !== undefined) err.errno = fields.errno;
+    err.code = fields.code;
+    if (fields.syscall !== undefined) err.syscall = fields.syscall;
+    if (fields.path !== undefined) err.path = fields.path;
+    if (fields.hostname !== undefined) err.hostname = fields.hostname;
+    if (fields.address !== undefined) err.address = fields.address;
+    if (fields.port) err.port = fields.port;
+    return err;
+  }
+
+  // Node passes `new SafeArrayIterator(errors)`: the children are read without
+  // consulting an Array.prototype[Symbol.iterator] user code may have replaced.
+  function listIterable(list) {
+    return {
+      [SymbolIterator]() {
+        let i = 0;
+        return {
+          next() {
+            return i < list.length
+              ? { value: list[i++], done: false }
+              : { value: undefined, done: true };
+          },
+        };
+      },
+    };
+  }
+
+  class NodeAggregateError extends AggregateErrorCtor {
+    constructor(errors, message) {
+      super(listIterable(errors), message);
+      this.code = errors[0]?.code;
+    }
+
+    get [kIsNodeError]() {
+      return true;
+    }
+
+    get ["constructor"]() {
+      return AggregateErrorCtor;
+    }
+  }
+
+  function makeAggregateError(errors) {
+    const err = new NodeAggregateError(errors);
+    // Node's prepareStackTrace writes `${name} [${code}]: ${message}` for a
+    // kIsNodeError error. Rewrite line 0 only when it is the default render
+    // (`AggregateError`, an empty message): a user's Error.prepareStackTrace
+    // output is theirs to keep, exactly as in node. `stack` stays an accessor
+    // after the assignment.
+    try {
+      const stack = err.stack;
+      if (typeof stack === "string") {
+        const nl = stack.indexOf("\n");
+        const head = nl === -1 ? stack : stack.slice(0, nl);
+        if (head === "AggregateError") {
+          err.stack = `AggregateError [${err.code}]: ${nl === -1 ? "" : stack.slice(nl)}`;
+        }
+      }
+    } catch {
+      // A throwing user Error.prepareStackTrace: the error is still whole.
+    }
+    return err;
+  }
+
+  Object.defineProperty(globalThis, "__oamMakeSysError", {
+    value: makeSysError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  Object.defineProperty(globalThis, "__oamMakeAggregateError", {
+    value: makeAggregateError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
 })();
 
 // Node reports an uncaught exception as util.inspect(err): the stack, then a

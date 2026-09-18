@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "ed891ec+wip",
-  "oamVersion": "oam 0.15.3",
+  "commit": "5cc05cc+wip",
+  "oamVersion": "oam 0.16.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 111,
-      "total": 111,
+      "pass": 116,
+      "total": 116,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -104,6 +104,26 @@
         },
         {
           "case": "11-json-modules.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "110-connect-refused-shapes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "111-fetch-redirect-and-bad-port.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "112-fetch-content-decoding.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "113-http-request-options-and-auth.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "114-fetch-request-rules.mjs",
           "status": "pass"
         },
         {
@@ -562,7 +582,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 350,
+        "knownMissing": 349,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
