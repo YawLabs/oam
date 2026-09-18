@@ -328,6 +328,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpsServe", op_https_serve),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
+        ("netResolve", op_net_resolve),
+        ("netCheck", op_net_check),
+        ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
         ("tcpWrite", op_tcp_write),
         ("tcpClose", op_tcp_close),
@@ -2797,6 +2800,9 @@ fn op_https_serve(
 
 // ------------------------------------------------------------------- TCP
 
+/// `__oam.node.tcpConnect(host, port, attemptTimeout, spec?)`. `spec` is
+/// the optional address spec [`connect_pin_arg`] reads: without it the
+/// connect resolves `host` itself (getaddrinfo), as it always has.
 fn op_tcp_connect(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2810,18 +2816,249 @@ fn op_tcp_connect(
     // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
+    let Some(pin) = connect_pin_arg(scope, &args, 3, "tcpConnect", &host) else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
+    let pin = match pin {
+        PinArg::Absent => None,
+        PinArg::Ticket(pin) => Some(pin),
+        PinArg::Hook { pin, spelled } => {
+            if !check_hook_answer_perm(scope, &spelled, port) {
+                return;
+            }
+            Some(pin)
+        }
+        PinArg::Refused(message) => {
+            crate::ops::spawn_op(scope, &mut rv, async move {
+                oam_core::OpOutcome::Failed(message)
+            });
+            return;
+        }
+    };
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tcp::tcp_connect(tcp, ids, host, port, attempt_timeout),
+        oam_core::tcp::tcp_connect_pinned(tcp, ids, host, port, attempt_timeout, pin),
     );
+}
+
+/// `__oam.node.netResolve(host, family, all)`: resolve `host` for a net /
+/// tls connect ahead of it (`net_connect::resolve`: getaddrinfo, narrowed to
+/// family 4 or 6), so JS can emit node's `'lookup'` events -- which a
+/// listener may veto -- before anything is dialled. Resolves with `{token,
+/// addresses: [{address, family}]}` (the first address only unless `all`)
+/// and files exactly that list under `token`, for the connect to redeem with
+/// `{"ticket": token}` or JS to drop with `netResolveDrop`. Rejects with the
+/// error a connect to the same name reports. No net grant is asked, as for
+/// `dnsLookup`: the connect that redeems the ticket asks it about the host.
+fn op_net_resolve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "netResolve requires a host");
+        return;
+    };
+    let family = match args.get(1).number_value(scope) {
+        Some(4.0) => Some(4),
+        Some(6.0) => Some(6),
+        _ => None,
+    };
+    let all = args.get(2).boolean_value(scope);
+    let core = core_runtime!(scope);
+    let answers = core.resolved_answers();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let mut addrs = match oam_core::net_connect::resolve(&host, family).await {
+            Ok(addrs) => addrs,
+            Err(e) => return e.to_outcome(),
+        };
+        if !all {
+            addrs.truncate(1);
+        }
+        let addresses: Vec<serde_json::Value> = addrs
+            .iter()
+            .map(|ip| {
+                serde_json::json!({
+                    "address": ip.to_string(),
+                    "family": if ip.is_ipv4() { 4 } else { 6 },
+                })
+            })
+            .collect();
+        let token = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        oam_core::net_connect::store_answer(&answers, token, &host, addrs);
+        oam_core::OpOutcome::Json(
+            serde_json::json!({ "token": token, "addresses": addresses }).to_string(),
+        )
+    });
+}
+
+/// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to
+/// `host:port`, the resource `tcpConnect` / `tlsConnect` ask about, taken
+/// synchronously inside `net.connect()` / `tls.connect()` before the name is
+/// looked up or a literal is dialled on the next tick. A refused host is
+/// never resolved, and the refusal is still thrown from `connect()` itself.
+/// Throws ERR_ACCESS_DENIED; returns undefined when the grant covers it. The
+/// connect op asks again: this is the early answer, not the gate.
+fn op_net_check(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "netCheck requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let _ = check_net_perm(scope, &format!("{host}:{port}"));
+}
+
+/// `__oam.node.netResolveDrop(token)`: drop a `netResolve` answer no connect
+/// will redeem (the connect was vetoed or destroyed first). True if it was
+/// still there.
+fn op_net_resolve_drop(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let dropped = token >= 0.0
+        && oam_core::net_connect::drop_answer(
+            &core_runtime!(scope).resolved_answers(),
+            token as u64,
+        );
+    rv.set_bool(dropped);
+}
+
+/// A connect's address spec, as [`connect_pin_arg`] read it.
+enum PinArg {
+    /// No spec: the connect resolves its host itself.
+    Absent,
+    /// A redeemed `netResolve` ticket: oam's own resolver's answer for the
+    /// connect's host.
+    Ticket(oam_core::net_connect::Pin),
+    /// A `lookup` hook's answer, and each address as JS spelled it (what the
+    /// net grant is asked about).
+    Hook {
+        pin: oam_core::net_connect::Pin,
+        spelled: Vec<String>,
+    },
+    /// The spec cannot be honoured (a ticket that is gone or names another
+    /// host, an address that is not one): the connect rejects with this,
+    /// and nothing is dialled.
+    Refused(String),
+}
+
+/// The optional address spec a net / tls connect takes as argument `index`,
+/// a JSON string:
+///
+/// - `{"ticket": N}` redeems the answer `netResolve` filed under `N` -- one
+///   shot, and only for the host it was resolved for
+///   (`net_connect::redeem_answer`). The connect then dials exactly what the
+///   resolver answered, so a hostname grant keeps working.
+/// - `{"ips": ["addr", ...]}` dials the addresses a `lookup` hook (the
+///   `lookup` option, or a replaced `dns.lookup`) answered, in that order.
+///   The caller must check each one against the net grant
+///   ([`check_hook_answer_perm`]) before dialling.
+///
+/// Anything else throws a TypeError. `None` means an exception is pending.
+fn connect_pin_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+    host: &str,
+) -> Option<PinArg> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return Some(PinArg::Absent);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Spec {
+        ticket: Option<u64>,
+        ips: Option<Vec<String>>,
+    }
+    let spec = if value.is_string() {
+        let text = value.to_rust_string_lossy(scope);
+        serde_json::from_str::<Spec>(&text).ok()
+    } else {
+        None
+    };
+    match spec {
+        Some(Spec {
+            ticket: Some(ticket),
+            ips: None,
+        }) => {
+            let Some(core) = scope.get_slot::<oam_core::CoreRuntime>() else {
+                throw_type_error(scope, "internal: runtime not initialized");
+                return None;
+            };
+            let answers = core.resolved_answers();
+            Some(
+                match oam_core::net_connect::redeem_answer(&answers, ticket, host) {
+                    Ok(pin) => PinArg::Ticket(pin),
+                    Err(message) => PinArg::Refused(format!("{op}: {message}")),
+                },
+            )
+        }
+        Some(Spec {
+            ticket: None,
+            ips: Some(ips),
+        }) => {
+            let mut addrs = Vec::with_capacity(ips.len());
+            for ip in &ips {
+                match ip.parse::<std::net::IpAddr>() {
+                    Ok(addr) => addrs.push(addr),
+                    Err(_) => {
+                        return Some(PinArg::Refused(format!("{op}: pin ip '{ip}' is not an IP")));
+                    }
+                }
+            }
+            Some(PinArg::Hook {
+                pin: oam_core::net_connect::Pin {
+                    host: host.to_ascii_lowercase(),
+                    addrs,
+                },
+                spelled: ips,
+            })
+        }
+        _ => {
+            throw_type_error(
+                scope,
+                &format!("{op}: the address spec must be {{ticket}} or {{ips}}"),
+            );
+            None
+        }
+    }
+}
+
+/// Every address a `lookup` hook answered, checked against the net grant
+/// exactly as a connect to that address named directly is (`addr:port`, the
+/// address spelled as the hook spelled it, which is the resource the op
+/// builds for a literal host), so a grant that admits
+/// `net.connect(port, addr)` admits the answer and nothing else does. The
+/// natives are reachable from user JS, and without this
+/// `--allow-net=example.com` plus a hook answering `169.254.169.254` would
+/// dial the metadata address under the name's grant -- the rule
+/// `fetchContinue` applies to a fetch's hook. Throws ERR_ACCESS_DENIED on the
+/// first refused address and returns false.
+///
+/// A ticket's addresses need no check: they come from oam's own resolver and
+/// are what the granted name resolves to, the same trust a connect without a
+/// spec gives getaddrinfo.
+fn check_hook_answer_perm(scope: &mut v8::PinScope<'_, '_>, spelled: &[String], port: u16) -> bool {
+    spelled
+        .iter()
+        .all(|ip| check_net_perm(scope, &format!("{ip}:{port}")))
 }
 
 /// The optional per-connect attempt timeout (milliseconds) a connect op takes
@@ -3085,17 +3322,37 @@ fn op_tls_connect(
     let min_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 8).filter(|s| !s.is_empty());
     let attempt_timeout = attempt_timeout_arg(scope, &args, 9);
+    // The address spec, as tcpConnect takes it (see connect_pin_arg).
+    let Some(pin) = connect_pin_arg(scope, &args, 10, "tlsConnect", &host) else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
+    let pin = match pin {
+        PinArg::Absent => None,
+        PinArg::Ticket(pin) => Some(pin),
+        PinArg::Hook { pin, spelled } => {
+            if !check_hook_answer_perm(scope, &spelled, port) {
+                return;
+            }
+            Some(pin)
+        }
+        PinArg::Refused(message) => {
+            crate::ops::spawn_op(scope, &mut rv, async move {
+                oam_core::OpOutcome::Failed(message)
+            });
+            return;
+        }
+    };
     let core = core_runtime!(scope);
     let tls = core.tls();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tls::tls_connect(
+        oam_core::tls::tls_connect_pinned(
             tls,
             ids,
             host,
@@ -3108,6 +3365,7 @@ fn op_tls_connect(
             min_version,
             max_version,
             attempt_timeout,
+            pin,
         ),
     );
 }

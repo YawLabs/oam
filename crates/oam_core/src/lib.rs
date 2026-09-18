@@ -682,6 +682,10 @@ pub struct CoreRuntime {
     /// Hook-mode fetches parked on their `connect.lookup` hook
     /// (`http_client::send`); dropped with the run.
     fetch_continuations: http_client::send::FetchContinuations,
+    /// Names `netResolve` resolved for a net / tls connect, by ticket, until
+    /// the connect redeems them (`net_connect::ResolvedAnswers`); dropped
+    /// with the run.
+    resolved_answers: net_connect::ResolvedAnswers,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -763,6 +767,7 @@ impl CoreRuntime {
             tokio: Some(tokio),
             http,
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
             next_id: 1,
@@ -828,6 +833,12 @@ impl CoreRuntime {
     /// Hook-mode fetches waiting on their `connect.lookup` hook (Arc clone).
     pub fn fetch_continuations(&self) -> http_client::send::FetchContinuations {
         self.fetch_continuations.clone()
+    }
+
+    /// Addresses resolved ahead of a net / tls connect, by ticket (Arc
+    /// clone).
+    pub fn resolved_answers(&self) -> net_connect::ResolvedAnswers {
+        self.resolved_answers.clone()
     }
 
     /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,

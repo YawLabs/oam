@@ -70,9 +70,10 @@ pub struct ConnectOptions {
     /// How long every attempt but the last may take before it is abandoned
     /// with `ETIMEDOUT`. Floored at `MIN_ATTEMPT_TIMEOUT`.
     pub attempt_timeout: Duration,
-    /// Pre-resolved addresses standing in for DNS -- undici's
-    /// `connect.lookup`, for fetch only. Applies only when the connect's host
-    /// is `pin.host`.
+    /// Pre-resolved addresses standing in for DNS: undici's `connect.lookup`
+    /// for fetch, and for net / tls the `lookup` option, a replaced
+    /// `dns.lookup` or a redeemed [`resolve`] ticket. Applies only when the
+    /// connect's host is `pin.host`.
     pub pin: Option<Pin>,
 }
 
@@ -88,7 +89,8 @@ impl Default for ConnectOptions {
 /// Addresses a caller resolved itself for one host.
 #[derive(Debug, Clone)]
 pub struct Pin {
-    /// Lowercased, no URI brackets.
+    /// Lowercased: fetch's URL host (no URI brackets), or net / tls's host as
+    /// the caller spelled it.
     pub host: String,
     pub addrs: Vec<IpAddr>,
 }
@@ -166,6 +168,126 @@ pub async fn connect(
 ) -> Result<Connected, ConnectError> {
     let (stream, attempted) = connect_with(host, port, opts, &SystemDialer).await?;
     Ok(Connected { stream, attempted })
+}
+
+/// Name resolution ahead of a connect: what node's default `dns.lookup` hands
+/// `net.connect` (lib/net.js `lookupAndConnect`), so JS can emit the socket's
+/// `'lookup'` events -- and let a listener veto the connect -- before anything
+/// is dialled. getaddrinfo in the resolver's order, narrowed to `family` (4 or
+/// 6; anything else keeps both); a failure, or an answer the family leaves
+/// empty, is the error a connect to the same name reports (`getaddrinfo
+/// ENOTFOUND host`).
+pub async fn resolve(host: &str, family: Option<u8>) -> Result<Vec<IpAddr>, ConnectError> {
+    resolve_with(host, family, &SystemDialer).await
+}
+
+pub(crate) async fn resolve_with<D: Dialer>(
+    host: &str,
+    family: Option<u8>,
+    dialer: &D,
+) -> Result<Vec<IpAddr>, ConnectError> {
+    let resolved = dialer
+        .lookup(host, 0)
+        .await
+        .map_err(|error| ConnectError::Resolve(Box::new(resolve_error(host, &error))))?;
+    let addrs: Vec<IpAddr> = resolved
+        .iter()
+        .map(SocketAddr::ip)
+        .filter(|ip| match family {
+            Some(4) => ip.is_ipv4(),
+            Some(6) => ip.is_ipv6(),
+            _ => true,
+        })
+        .collect();
+    if addrs.is_empty() {
+        return Err(ConnectError::Resolve(Box::new(dns_error(
+            host,
+            "ENOTFOUND",
+            -3008,
+        ))));
+    }
+    Ok(addrs)
+}
+
+/// Answers [`resolve`] handed to JS, by ticket, until the connect that dials
+/// them redeems the ticket ([`redeem_answer`]) or JS drops it
+/// ([`drop_answer`]). A connect trusts only what is filed here -- never
+/// addresses JS hands back -- so a hostname grant under `--allow-net` keeps
+/// working for the default resolver, while the addresses a user's `lookup`
+/// hook answers are each checked against the grant (the engine's
+/// `tcpConnect` / `tlsConnect`).
+///
+/// An entry lives until it is redeemed, dropped, or the runtime drops: the
+/// same bound as a parked fetch continuation. JS redeems or drops every
+/// ticket it is given.
+pub type ResolvedAnswers =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Resolved>>>;
+
+/// One ticket's answer: the host it was resolved for and its addresses.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// [`pin_host_key`] of the resolved host.
+    host: String,
+    addrs: Vec<IpAddr>,
+}
+
+/// The spelling a ticket's host is compared in: lowercased, URI brackets
+/// stripped.
+fn pin_host_key(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.to_ascii_lowercase()
+}
+
+fn lock_answers(
+    answers: &ResolvedAnswers,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, Resolved>> {
+    answers.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// File `addrs`, resolved for `host`, under `token`.
+pub fn store_answer(answers: &ResolvedAnswers, token: u64, host: &str, addrs: Vec<IpAddr>) {
+    lock_answers(answers).insert(
+        token,
+        Resolved {
+            host: pin_host_key(host),
+            addrs,
+        },
+    );
+}
+
+/// Drop the answer under `token` (a vetoed or destroyed connect). True if it
+/// was there.
+pub fn drop_answer(answers: &ResolvedAnswers, token: u64) -> bool {
+    lock_answers(answers).remove(&token).is_some()
+}
+
+/// How many answers are waiting to be redeemed or dropped.
+pub fn pending_answers(answers: &ResolvedAnswers) -> usize {
+    lock_answers(answers).len()
+}
+
+/// Redeem `token` for a connect to `host`: the pin that stands in for that
+/// connect's lookup. One-shot -- the entry is consumed whether or not it
+/// matches -- and bound to the host it was resolved for, so an answer for one
+/// name can never be dialled under another.
+pub fn redeem_answer(answers: &ResolvedAnswers, token: u64, host: &str) -> Result<Pin, String> {
+    let Some(resolved) = lock_answers(answers).remove(&token) else {
+        return Err(format!("resolve ticket {token} is gone"));
+    };
+    if resolved.host != pin_host_key(host) {
+        return Err(format!(
+            "resolve ticket {token} was issued for another host"
+        ));
+    }
+    Ok(Pin {
+        // connect_with matches a pin against the connect's host as the
+        // caller spelled it.
+        host: host.to_ascii_lowercase(),
+        addrs: resolved.addrs,
+    })
 }
 
 /// How one attempt failed.
@@ -1355,5 +1477,151 @@ mod tests {
         };
         assert_eq!(errors[0].code, "ETIMEDOUT");
         assert_eq!(errors[1].code, "ECONNREFUSED");
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_the_resolver_order_and_filters_by_family() {
+        let script = Script::new(&["::1", "127.0.0.1", "::2"], &[]);
+        let all = resolve_with("dual.example", None, &script).await.unwrap();
+        let all: Vec<String> = all.iter().map(|ip| ip.to_string()).collect();
+        assert_eq!(all, ["::1", "127.0.0.1", "::2"]);
+        // A family that is neither 4 nor 6 keeps both, as dns.lookup does
+        // for family 0.
+        let zero = resolve_with("dual.example", Some(0), &script)
+            .await
+            .unwrap();
+        assert_eq!(zero.len(), 3);
+        let v4 = resolve_with("dual.example", Some(4), &script)
+            .await
+            .unwrap();
+        assert_eq!(v4, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let v6 = resolve_with("dual.example", Some(6), &script)
+            .await
+            .unwrap();
+        assert_eq!(v6.len(), 2);
+        assert!(script.dialled().is_empty(), "resolving never dials");
+    }
+
+    #[tokio::test]
+    async fn resolve_fails_as_a_connect_to_the_same_name_would() {
+        // A family the name has no address in: getaddrinfo ENOTFOUND.
+        let script = Script::new(&["127.0.0.1"], &[]);
+        let Err(ConnectError::Resolve(error)) =
+            resolve_with("v4only.example", Some(6), &script).await
+        else {
+            panic!("expected a resolver error");
+        };
+        assert_eq!(error.code, "ENOTFOUND");
+        assert_eq!(error.errno, Some(-3008));
+        assert_eq!(error.message, "getaddrinfo ENOTFOUND v4only.example");
+        assert_eq!(error.hostname.as_deref(), Some("v4only.example"));
+
+        // A resolver failure is classified exactly as connect classifies it.
+        let script = Script::failing_lookup("Name or service not known");
+        let Err(ConnectError::Resolve(resolved)) = resolve_with("nx.example", None, &script).await
+        else {
+            panic!("expected a resolver error");
+        };
+        let Err(ConnectError::Resolve(connected)) =
+            connect_with("nx.example", 80, &opts(250), &script).await
+        else {
+            panic!("expected a resolver error");
+        };
+        assert_eq!(resolved, connected);
+    }
+
+    fn answers() -> ResolvedAnswers {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    fn a_ticket_is_redeemed_once_for_its_own_host() {
+        let answers = answers();
+        let addrs: Vec<IpAddr> = vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+        store_answer(&answers, 7, "Guard.Test", addrs.clone());
+        assert_eq!(pending_answers(&answers), 1);
+        // Case-insensitive, and the pin carries the connect's spelling.
+        let pin = redeem_answer(&answers, 7, "GUARD.test").expect("redeems");
+        assert_eq!(pin.host, "guard.test");
+        assert_eq!(pin.addrs, addrs);
+        assert_eq!(pending_answers(&answers), 0);
+        // One-shot.
+        let again = redeem_answer(&answers, 7, "guard.test").unwrap_err();
+        assert_eq!(again, "resolve ticket 7 is gone");
+    }
+
+    #[test]
+    fn a_ticket_for_one_host_is_consumed_and_refused_for_another() {
+        let answers = answers();
+        store_answer(&answers, 3, "a.test", vec!["127.0.0.1".parse().unwrap()]);
+        let err = redeem_answer(&answers, 3, "b.test").unwrap_err();
+        assert_eq!(err, "resolve ticket 3 was issued for another host");
+        // The mismatch consumed it: a retry with the right host finds nothing.
+        assert!(redeem_answer(&answers, 3, "a.test").is_err());
+        assert_eq!(pending_answers(&answers), 0);
+    }
+
+    #[test]
+    fn a_bracketed_host_matches_its_bare_spelling() {
+        let answers = answers();
+        store_answer(&answers, 1, "[::1]", vec!["::1".parse().unwrap()]);
+        let pin = redeem_answer(&answers, 1, "::1").unwrap();
+        assert_eq!(pin.host, "::1");
+        store_answer(&answers, 2, "::1", vec!["::1".parse().unwrap()]);
+        assert!(redeem_answer(&answers, 2, "[::1]").is_ok());
+    }
+
+    #[test]
+    fn a_dropped_ticket_cannot_be_redeemed() {
+        let answers = answers();
+        store_answer(&answers, 9, "a.test", vec!["127.0.0.1".parse().unwrap()]);
+        assert!(drop_answer(&answers, 9));
+        assert!(!drop_answer(&answers, 9));
+        assert!(redeem_answer(&answers, 9, "a.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_redeemed_ticket_drives_the_connect_like_a_lookup() {
+        // The ticket's list goes through the same grouping and interleaving
+        // a getaddrinfo answer would.
+        let answers = answers();
+        store_answer(
+            &answers,
+            5,
+            "ticket.example",
+            vec![
+                "127.0.0.1".parse().unwrap(),
+                "127.0.0.2".parse().unwrap(),
+                "::1".parse().unwrap(),
+            ],
+        );
+        let pin = redeem_answer(&answers, 5, "ticket.example").unwrap();
+        let pinned = ConnectOptions {
+            attempt_timeout: Duration::from_millis(250),
+            pin: Some(pin),
+        };
+        let script = Script::new(&["10.9.9.9"], &[]);
+        let _ = connect_with("ticket.example", 80, &pinned, &script).await;
+        assert!(script.lookups.lock().unwrap().is_empty());
+        assert_eq!(script.dialled(), ["127.0.0.1", "::1", "127.0.0.2"]);
+
+        // A one-address ticket is a single attempt with a plain error.
+        store_answer(
+            &answers,
+            6,
+            "one.example",
+            vec!["127.0.0.1".parse().unwrap()],
+        );
+        let pinned = ConnectOptions {
+            attempt_timeout: Duration::from_millis(250),
+            pin: Some(redeem_answer(&answers, 6, "one.example").unwrap()),
+        };
+        let script = Script::new(&[], &[]);
+        let Err(ConnectError::Single(error)) =
+            connect_with("one.example", 9, &pinned, &script).await
+        else {
+            panic!("expected a plain error");
+        };
+        assert_eq!(error.message, "connect ECONNREFUSED 127.0.0.1:9");
     }
 }

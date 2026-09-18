@@ -1198,6 +1198,43 @@ pub async fn tls_connect(
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
 ) -> OpOutcome {
+    tls_connect_pinned(
+        registry,
+        ids,
+        host,
+        port,
+        server_name,
+        ca_pem,
+        reject_unauthorized,
+        client_cert_pem,
+        client_key_pem,
+        min_version,
+        max_version,
+        attempt_timeout,
+        None,
+    )
+    .await
+}
+
+/// [`tls_connect`] with the addresses JS resolved for `host` standing in for
+/// getaddrinfo, as [`crate::tcp::tcp_connect_pinned`] takes them. The server
+/// name is still `server_name` or `host`, never an address from the pin.
+#[allow(clippy::too_many_arguments)]
+pub async fn tls_connect_pinned(
+    registry: TlsRegistry,
+    ids: Arc<std::sync::atomic::AtomicU64>,
+    host: String,
+    port: u16,
+    server_name: Option<String>,
+    ca_pem: Option<String>,
+    reject_unauthorized: bool,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
+    min_version: Option<String>,
+    max_version: Option<String>,
+    attempt_timeout: std::time::Duration,
+    pin: Option<crate::net_connect::Pin>,
+) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
     // Node connects the transport first and only sets the SSL handshake up once
@@ -1214,7 +1251,7 @@ pub async fn tls_connect(
     // unchanged.
     let opts = crate::net_connect::ConnectOptions {
         attempt_timeout,
-        pin: None,
+        pin,
     };
     let tcp = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,
