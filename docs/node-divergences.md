@@ -1254,6 +1254,16 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   every hop -- though not on the URL it was given, which Node's `http.request` dials whatever
   the port. It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does
   neither.
+- **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
+  has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
+  with keep-alive and then FINs (the idle-timeout shape), the hop usually picks that dead
+  connection out of the pool; Node reads the FIN first and opens a fresh socket. oam sends the
+  hop again on a fresh connection once when the method is idempotent (`GET`, `HEAD`, `PUT`,
+  `DELETE`, `OPTIONS`, `TRACE`) and the dead connection had carried an earlier request, so
+  those match Node (20 of 20 redirects on every server shape measured). A `POST` that a 307
+  or 308 carries onto the dead connection is not sent again -- oam did write it, and cannot
+  know the server ignored it -- so it fails with `error sending request for url (...)` where
+  Node's succeeds (measured: 12-14 of 20 succeed in oam, 20 of 20 in Node).
 
 **Responses and requests**
 
