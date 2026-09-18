@@ -133,6 +133,17 @@ impl PendingFetch {
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
+/// How many times one hop's idempotent request may be resent after a pooled
+/// connection the server had closed swallowed it. Each resend follows a
+/// failure on a REUSED connection, which takes that connection out of the
+/// pool, so the cap binds only when the server keeps closing idle
+/// connections as fast as the resends use them. Measured with eight
+/// concurrent redirect chains against a server that FINs after every 302
+/// (6000 fetches per run, Windows arm64): 1 resend failed 78-110 fetches per
+/// run, 2 failed 0-5, and 3 failed none in 10 runs. node v22.22.2 failed
+/// none.
+pub const MAX_STALE_RESENDS: u32 = 3;
+
 /// Everything the loop needs between hops, and across a park.
 struct LoopState {
     transport: HttpTransport,
@@ -376,7 +387,7 @@ async fn run(
         }
 
         let mut retries = 0;
-        let mut stale_retried = false;
+        let mut stale_resends = 0;
         let response = loop {
             let body = match state.source.build() {
                 Ok(body) => body,
@@ -396,26 +407,36 @@ async fn run(
                     retries += 1;
                 }
                 // A pooled connection the server had already closed: no part
-                // of a response arrived, so the request may go out again on a
-                // fresh one (RFC 9112 s9.6). Once per hop, only for a body
-                // that can be sent twice, and only for an idempotent method
-                // -- oam DID put the request on the wire and cannot know the
-                // server ignored it. node loses this race far less often
-                // because its event loop reads the FIN before it writes.
+                // of a response arrived, so the request may go out again
+                // (RFC 9112 s9.6). Only for a body that can be sent twice,
+                // and only for an idempotent method -- oam DID put the
+                // request on the wire and cannot know the server ignored it.
+                // node loses this race far less often because its event loop
+                // reads the FIN before it writes.
                 //
                 // Only on a REUSED connection: a fresh one that dies before
                 // the response is the server's answer to this request, not a
                 // stale pool entry, and node sends such a request once (a
                 // server that closes every connection unanswered saw a GET
                 // twice from oam when this retried on any connection).
+                //
+                // Up to MAX_STALE_RESENDS times, not once. The resend goes
+                // back through the pool, and when several connections are
+                // idle for the origin the server may be closing those too.
+                // Each failure takes one dead connection out of the pool, and
+                // a resend that dials afresh ends the run: its failure is
+                // final. With a single resend, eight concurrent redirect
+                // chains against a server that FINs after each 302 failed
+                // 78-110 of 6000 fetches, with the resend landing on a second
+                // dead connection, where node failed none.
                 Err(e)
-                    if !stale_retried
+                    if stale_resends < MAX_STALE_RESENDS
                         && state.source.replayable()
                         && is_idempotent(&state.method)
                         && e.is_incomplete_message()
                         && e.on_reused_connection() =>
                 {
-                    stale_retried = true;
+                    stale_resends += 1;
                 }
                 Err(e) => {
                     state.source.request_failed();

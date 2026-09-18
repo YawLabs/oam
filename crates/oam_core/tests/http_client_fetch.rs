@@ -370,6 +370,95 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
     .await;
 }
 
+/// A server whose connections each answer their first request and close on
+/// their second without a byte of response, and whose first `pooled`
+/// connections hold that first answer until all of them are open -- so as
+/// many concurrent fetches leave exactly that many connections in the pool.
+async fn closes_on_second_request(pooled: usize) -> Server {
+    let all_open = Arc::new(tokio::sync::Barrier::new(pooled));
+    serve(move |mut conn, n, seen| {
+        let all_open = all_open.clone();
+        async move {
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+                if n < pooled {
+                    all_open.wait().await;
+                }
+                conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+            }
+            if let Some(request) = conn.request().await {
+                seen.lock().unwrap().push(request);
+            }
+        }
+    })
+    .await
+}
+
+/// `pooled` concurrent fetches of `url`, read to the end, then time for
+/// hyper-util to pool every connection.
+async fn fill_the_pool(reg: &Reg, transport: &HttpTransport, url: &str, pooled: usize) {
+    let fetches = (0..pooled).map(|_| reg.fetch(transport, json!({ "url": url })));
+    for outcome in futures_util::future::join_all(fetches).await {
+        assert_eq!(reg.text(handle_of(&payload(outcome))).await, "ok");
+    }
+    let_the_pool_settle().await;
+}
+
+/// When the server has closed more than one idle connection, the resend goes
+/// back through the pool and can meet another dead one. It is resent again
+/// until a connection answers: with a single resend, eight concurrent
+/// redirect chains against a server that FINs after each 302 failed 78-110
+/// of 6000 fetches, where node failed none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resend_that_meets_another_closed_pooled_connection_is_resent() {
+    within(async {
+        let server = closes_on_second_request(2).await;
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/x", server.port);
+        fill_the_pool(&reg, &transport, &url, 2).await;
+        assert_eq!(server.accepts(), 2);
+
+        let p = payload(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(server.accepts(), 3, "the second resend dialled afresh");
+        assert_eq!(
+            server.seen().len(),
+            2 + 3,
+            "each dead connection read one try, the fresh one the last"
+        );
+    })
+    .await;
+}
+
+/// The resends are bounded: a pool of dead connections deeper than
+/// `MAX_STALE_RESENDS` fails the fetch after the first try and that many
+/// resends, rather than walking the whole pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_resends_stop_at_the_cap() {
+    within(async {
+        let pooled = send::MAX_STALE_RESENDS as usize + 2;
+        let server = closes_on_second_request(pooled).await;
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/x", server.port);
+        fill_the_pool(&reg, &transport, &url, pooled).await;
+        assert_eq!(server.accepts(), pooled);
+
+        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(text, format!("error sending request for url ({url})"));
+        assert_eq!(server.accepts(), pooled, "no connection was dialled");
+        assert_eq!(
+            server.seen().len(),
+            pooled + 1 + send::MAX_STALE_RESENDS as usize,
+            "the first try and MAX_STALE_RESENDS resends, each on a dead connection"
+        );
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]
