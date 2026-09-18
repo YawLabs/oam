@@ -18828,6 +18828,239 @@
       return e;
     }
 
+    // ---- connect-time name resolution ----
+    // node lib/net.js lookupAndConnect / lookupAndConnectMultiple (v22.22.2),
+    // ported statement for statement wherever the order of calls, events and
+    // errors can be observed. net.connect and tls.connect share it. What a
+    // caller relies on, all measured on node:
+    //  - an IP-literal host is never looked up and fires no 'lookup'; it is
+    //    dialled on the next tick, and only if the socket is still connecting
+    //    (a destroy() right after connect() opens nothing);
+    //  - otherwise the lookup -- the `lookup` option, else the dns module's
+    //    `lookup` as it is NOW (a replaced one is honoured) -- is called
+    //    synchronously inside connect(), with (host, {family, hints[, all]},
+    //    cb); a hook that throws makes connect() throw;
+    //  - its answer is emitted as 'lookup' (err, address, family, host), one
+    //    event per address, before anything is dialled, and a listener that
+    //    destroys the socket stops the connect (no connection is made);
+    //  - an error, an empty or unusable answer, never falls back to system
+    //    DNS: the socket fails with the hook's own error object, or node's
+    //    ERR_INVALID_IP_ADDRESS / ERR_INVALID_ADDRESS_FAMILY.
+    // The connect op dials exactly what was answered: a hook's addresses as
+    // an explicit list (each one checked against --allow-net in Rust), oam's
+    // own resolver's by a one-shot ticket (natives.netResolve), so a hostname
+    // grant keeps working and no address JS hands back is trusted.
+    function socketToDnsFamily(family) {
+      switch (family) {
+        case "IPv4":
+          return 4;
+        case "IPv6":
+          return 6;
+      }
+      return family;
+    }
+
+    // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
+    // the caller gave none: the platform's AI_ADDRCONFIG. The table
+    // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
+    // 1024 on macOS 26, 0x20 on glibc).
+    function addrconfigHints() {
+      const platform = globalThis.process.platform;
+      if (platform === "darwin" || platform === "freebsd") return 1024;
+      return 0x20;
+    }
+
+    // The dns module's `lookup` as a connect reads it: at call time. null is
+    // oam's own resolver: the dns module was never loaded (so nothing can
+    // have replaced its lookup), or its lookup is still the original.
+    function connectDnsLookup() {
+      if (!registry.cache.has("dns")) return null;
+      const lookup = registry.cache.get("dns").lookup;
+      return lookup === registry._dnsLookupOriginal ? null : lookup;
+    }
+
+    function connectErrorNT(self, err) {
+      self.destroy(err);
+    }
+
+    // node's emitLookup for the `all` form (lookupAndConnectMultiple's
+    // callback). `dialList(ips)` gets the addresses to attempt, interleaved
+    // by family exactly as node attempts them.
+    function onLookupMultiple(self, options, host, err, addresses, dialList) {
+      // It's possible we were destroyed while looking this up.
+      if (!self.connecting) {
+        return;
+      } else if (err) {
+        self.emit("lookup", err, undefined, undefined, host);
+        process.nextTick(connectErrorNT, self, err);
+        return;
+      }
+      // Keep the addresses net can dial; the first valid one picks which
+      // family is attempted first.
+      const validAddresses = [[], []];
+      const validIps = [[], []];
+      let destinations;
+      for (let i = 0, l = addresses.length; i < l; i++) {
+        const address = addresses[i];
+        const { address: ip, family: addressType } = address;
+        self.emit("lookup", err, ip, addressType, host);
+        // A 'lookup' listener may have destroyed the socket.
+        if (!self.connecting) {
+          return;
+        }
+        if (isIP(ip) && (addressType === 4 || addressType === 6)) {
+          destinations ||= addressType === 6 ? { 6: 0, 4: 1 } : { 4: 0, 6: 1 };
+          const destination = destinations[addressType];
+          // Only try an address once.
+          if (!validIps[destination].includes(ip)) {
+            validAddresses[destination].push(address);
+            validIps[destination].push(ip);
+          }
+        }
+      }
+      // Nothing usable: fail on the first entry. node's destructure, so an
+      // empty answer throws its TypeError into the hook and the socket stays
+      // connecting, as in node.
+      if (!validAddresses[0].length && !validAddresses[1].length) {
+        const { address: firstIp, family: firstAddressType } = addresses[0];
+        if (!isIP(firstIp)) {
+          err = codes.ERR_INVALID_IP_ADDRESS(firstIp);
+          process.nextTick(connectErrorNT, self, err);
+        } else if (firstAddressType !== 4 && firstAddressType !== 6) {
+          err = codes.ERR_INVALID_ADDRESS_FAMILY(firstAddressType, options.host, options.port);
+          process.nextTick(connectErrorNT, self, err);
+        }
+        return;
+      }
+      const toAttempt = [];
+      for (let i = 0, l = Math.max(validAddresses[0].length, validAddresses[1].length); i < l; i++) {
+        if (i in validAddresses[0]) toAttempt.push(validAddresses[0][i].address);
+        if (i in validAddresses[1]) toAttempt.push(validAddresses[1][i].address);
+      }
+      dialList(toAttempt);
+    }
+
+    // node's emitLookup for the single form (family 4 / 6, a localAddress,
+    // or autoSelectFamily false): the event comes BEFORE the connecting
+    // check.
+    function onLookupSingle(self, options, host, err, ip, addressType, dialOne) {
+      self.emit("lookup", err, ip, addressType, host);
+      if (!self.connecting) return;
+      if (err) {
+        process.nextTick(connectErrorNT, self, err);
+      } else if (typeof ip !== "string" || !isIP(ip)) {
+        process.nextTick(connectErrorNT, self, codes.ERR_INVALID_IP_ADDRESS(ip));
+      } else if (addressType !== 4 && addressType !== 6) {
+        process.nextTick(
+          connectErrorNT,
+          self,
+          codes.ERR_INVALID_ADDRESS_FAMILY(addressType, options.host, options.port),
+        );
+      } else {
+        dialOne(ip);
+      }
+    }
+
+    // `host` is the caller's (net: options.host || 'localhost'). `dial(spec)`
+    // starts the native connect: spec null for an IP literal, `{ ips }` for a
+    // hook's answer, `{ ticket }` for oam's resolver's. Throws synchronously
+    // what node's connect() throws: a bad host / localAddress /
+    // autoSelectFamily / lookup option, a hook's own synchronous throw, and
+    // (oam) a --allow-net refusal of the host, which is asked before the name
+    // is looked up.
+    function lookupAndConnect(self, options, host, port, dial) {
+      const localAddress = options.localAddress;
+      if (typeof host !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.host", "string", host);
+      }
+      if (localAddress && !isIP(localAddress)) {
+        throw codes.ERR_INVALID_IP_ADDRESS(localAddress);
+      }
+      let autoSelectFamily = options.autoSelectFamily;
+      if (autoSelectFamily != null) {
+        if (typeof autoSelectFamily !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.autoSelectFamily", "boolean", autoSelectFamily);
+        }
+      } else {
+        autoSelectFamily = true;
+      }
+      natives.netCheck(host, port);
+
+      // If host is an IP, skip performing a lookup.
+      if (isIP(host)) {
+        process.nextTick(() => {
+          if (self.connecting) dial(null);
+        });
+        return;
+      }
+
+      if (options.lookup != null && typeof options.lookup !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.lookup", "Function", options.lookup);
+      }
+      const dnsopts = {
+        family: socketToDnsFamily(options.family),
+        hints: options.hints || 0,
+      };
+      if (
+        globalThis.process.platform !== "win32" &&
+        dnsopts.family !== 4 &&
+        dnsopts.family !== 6 &&
+        dnsopts.hints === 0
+      ) {
+        dnsopts.hints = addrconfigHints();
+      }
+      self._host = host;
+      let lookup = options.lookup || connectDnsLookup();
+      // `lookup: dns.lookup` passed explicitly is oam's own resolver too.
+      if (lookup === registry._dnsLookupOriginal) lookup = null;
+      const multiple =
+        dnsopts.family !== 4 && dnsopts.family !== 6 && !localAddress && autoSelectFamily;
+      if (multiple) dnsopts.all = true;
+
+      if (lookup !== null) {
+        if (multiple) {
+          lookup(host, dnsopts, function emitLookup(err, addresses) {
+            onLookupMultiple(self, options, host, err, addresses, (ips) => dial({ ips }));
+          });
+        } else {
+          lookup(host, dnsopts, function emitLookup(err, ip, addressType) {
+            onLookupSingle(self, options, host, err, ip, addressType, (one) => dial({ ips: [one] }));
+          });
+        }
+        return;
+      }
+
+      // oam's resolver: the addresses come back with a ticket the connect
+      // redeems, and every path that does not dial drops it.
+      const family = dnsopts.family === 4 || dnsopts.family === 6 ? dnsopts.family : 0;
+      natives.netResolve(host, family, multiple).then(
+        (answer) => {
+          const token = answer.token;
+          let redeemed = false;
+          const dialTicket = () => {
+            redeemed = true;
+            dial({ ticket: token });
+          };
+          try {
+            if (multiple) {
+              onLookupMultiple(self, options, host, null, answer.addresses, dialTicket);
+            } else {
+              const first = answer.addresses[0];
+              onLookupSingle(self, options, host, null, first.address, first.family, dialTicket);
+            }
+          } finally {
+            if (!redeemed) natives.netResolveDrop(token);
+          }
+        },
+        (err) => {
+          if (multiple) onLookupMultiple(self, options, host, err);
+          else onLookupSingle(self, options, host, err);
+        },
+      );
+    }
+    // tls.connect runs the same flow (see _connectTls).
+    registry._netLookupAndConnect = lookupAndConnect;
+
     // In Node, tls.TLSSocket EXTENDS net.Socket, so `x instanceof net.Socket`
     // is how library code decides it holds a socket. Here the two classes
     // cannot share a base -- this Socket is a hand-rolled EventEmitter over
@@ -18896,6 +19129,8 @@
         // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
         // CONNECTION for callbacks queued on a dead socket (Node parity).
         this._everConnected = false;
+        // Opens the write chain once a connect settles (see connect()).
+        this._connectGate = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -18918,18 +19153,19 @@
       }
 
       connect(...args) {
-        let port, host, cb;
+        let options, cb;
         if (typeof args[0] === "object" && args[0] !== null) {
-          const opts = args[0];
-          port = opts.port;
-          host = opts.host || "127.0.0.1";
+          options = args[0];
           cb = args[1];
         } else {
-          port = args[0];
-          host = typeof args[1] === "string" ? args[1] : "127.0.0.1";
+          options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         }
-        if (cb) this.once("connect", cb);
+        const port = options.port;
+        // node: `options.host || 'localhost'`, and the name is looked up like
+        // any other (a `lookup` option sees 'localhost').
+        const host = options.host || "localhost";
+        if (typeof cb === "function") this.once("connect", cb);
         this.connecting = true;
         // Node registers the TCPSocketWrap synchronously inside connect(), well
         // before the connection is established (probe: _getActiveHandles()
@@ -18939,7 +19175,44 @@
         // _doClose() both early-return and the entry would be pinned in this
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
-        const pending = natives.tcpConnect(host, port, autoSelectFamilyAttemptTimeoutDefault).then(
+        // Node queues writes (and the end() FIN) issued before the
+        // connection exists; the write chain waits on this gate, which opens
+        // once the connect settles -- or once the socket is destroyed while
+        // its name is still being looked up (destroy() opens it).
+        let openGate;
+        const gate = new Promise((resolve) => {
+          openGate = resolve;
+        });
+        this._connectGate = openGate;
+        this._chain = this._chain.then(() => gate);
+        const dial = (spec) => {
+          let connecting;
+          try {
+            connecting = natives.tcpConnect(
+              host,
+              port,
+              autoSelectFamilyAttemptTimeoutDefault,
+              spec === null ? undefined : JSON.stringify(spec),
+            );
+          } catch (err) {
+            // A refusal the op raises synchronously (ERR_ACCESS_DENIED for an
+            // address the net grant does not cover) is this socket's connect
+            // failure -- never an exception into the lookup hook that
+            // answered.
+            process.nextTick(connectErrorNT, this, err);
+            return;
+          }
+          this._startConnect(connecting, host, port).then(openGate);
+        };
+        lookupAndConnect(this, options, host, port, dial);
+        return this;
+      }
+
+      // The native connect in flight: its success handler and failure
+      // handler, as net.connect has always run them. Resolves once either
+      // has run.
+      _startConnect(connecting, host, port) {
+        return connecting.then(
           (result) => {
             if (this.destroyed) {
               // destroy() raced the connect: close the just-established
@@ -18975,12 +19248,6 @@
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
-        // Node queues writes (and the end() FIN) issued before the
-        // connection exists; gate the write chain on the pending connect so
-        // an immediate end() shuts the socket down instead of silently
-        // skipping tcpShutdown on a null handle.
-        this._chain = this._chain.then(() => pending);
-        return this;
       }
 
       write(data, encoding, cb) {
@@ -19114,6 +19381,14 @@
         this.writable = false;
         this.connecting = false;
         registry._activeHandles.delete(this);
+        // Destroyed while its name was still being looked up: nothing will
+        // settle the connect, so release the writes queued behind it (they
+        // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
+        if (this._connectGate) {
+          const openGate = this._connectGate;
+          this._connectGate = null;
+          openGate();
+        }
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;
@@ -23677,6 +23952,11 @@
     const V4MAPPED = 0;
     const ALL = 0;
 
+    // net.connect / tls.connect / http read `dns.lookup` at call time, as
+    // node does; while it is still this function they use oam's own resolver
+    // directly (lookupAndConnect), and a replaced one is called instead.
+    registry._dnsLookupOriginal = lookup;
+
     return {
       lookup,
       resolve,
@@ -24824,8 +25104,34 @@
       // handle).
       registry._activeHandles.set(socket, "TCPSocketWrap");
 
-      var attemptTimeout = registry.get("net").getDefaultAutoSelectFamilyAttemptTimeout();
-      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max, attemptTimeout).then(
+      var net = registry.get("net");
+      var attemptTimeout = net.getDefaultAutoSelectFamilyAttemptTimeout();
+      // The name is looked up as net.connect looks it up (the `lookup`
+      // option, a replaced dns.lookup, 'lookup' events a listener can veto);
+      // `dial` starts the native connect with what that answered. The TLS
+      // server name stays `servername` or the host, never an address.
+      var dial = function (spec) {
+        var connecting;
+        try {
+          connecting = natives.tlsConnect(
+            host, port, serverName, ca, rejectUnauthorized, cert, key,
+            tlsVersions.min, tlsVersions.max, attemptTimeout,
+            spec === null ? undefined : JSON.stringify(spec),
+          );
+        } catch (err) {
+          // A synchronous refusal (ERR_ACCESS_DENIED for an address the net
+          // grant does not cover) fails this socket, never the lookup hook.
+          process.nextTick(() => socket.destroy(err));
+          return;
+        }
+        _settleTlsConnect(socket, connecting, serverName);
+      };
+      registry._netLookupAndConnect(socket, options, host, port, dial);
+    }
+
+    // The native tls connect in flight, settled onto `socket`.
+    function _settleTlsConnect(socket, connecting, serverName) {
+      connecting.then(
         (info) => {
           socket._connectPending = false;
           if (socket.destroyed) {

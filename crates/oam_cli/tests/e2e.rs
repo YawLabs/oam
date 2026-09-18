@@ -5520,6 +5520,260 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
     server.join().unwrap();
 }
 
+/// A TCP listener that counts the connections it accepts, for the net / tls
+/// lookup-permission tests: the refused runs must never arrive.
+fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (port, hits)
+}
+
+/// net.connect / tls.connect's `lookup` hook decides where the granted NAME
+/// is dialled, so every address it answers is a `--permission` subject,
+/// checked as a connect naming that address directly is (`addr:port`): under
+/// `--allow-net=granted.invalid` a hook answering 127.0.0.1 is refused with
+/// ERR_ACCESS_DENIED before anything is dialled, and a grant that covers the
+/// address admits it. oam 0.16.2 ignored the option, so there was nothing to
+/// check; the rule is fetch's (`a_connect_lookup_answer_is_checked_against_
+/// the_net_permission`).
+#[test]
+fn a_net_or_tls_lookup_answer_is_checked_against_the_net_permission() {
+    let script = write_temp(
+        "net_lookup_permission/main.mjs",
+        r#"import net from 'node:net';
+import tls from 'node:tls';
+const port = Number(process.argv[2]);
+const lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+const attempt = (name, start) => new Promise((res) => {
+  let s;
+  try { s = start(); } catch (e) { console.log(name, 'THROW', e.code); res(); return; }
+  s.on('error', (e) => {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'NOT DENIED');
+    res();
+  });
+  s.on('connect', () => { console.log(name, 'CONNECTED'); s.destroy(); res(); });
+});
+await attempt('net', () => net.connect({ host: 'granted.invalid', port, lookup }));
+await attempt('tls', () => tls.connect({ host: 'granted.invalid', port, lookup, rejectUnauthorized: false }));
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let port_arg = port.to_string();
+    let run = |grant: &str| {
+        let out = oam(&["--permission", grant, "--", &path, &port_arg]);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (stdout, stderr) = run("--allow-net=granted.invalid");
+    let resource = format!("\"127.0.0.1:{port}\"");
+    assert_eq!(
+        stdout,
+        format!("net DENIED {resource}\ntls DENIED {resource}"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused answer must never be dialled"
+    );
+
+    // Granted by the address too: both dial it (the listener speaks no TLS,
+    // so tls fails its handshake -- after the connection was made).
+    let (stdout, stderr) = run("--allow-net=granted.invalid,127.0.0.1");
+    assert_eq!(stdout, "net CONNECTED\ntls NOT DENIED", "stderr: {stderr}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// oam's own resolver keeps a hostname grant working: the name's answer
+/// travels as a one-shot ticket the connect redeems, not as addresses JS
+/// hands back, so `--allow-net=localhost` still connects to `localhost`
+/// (resolved by oam) while the same addresses offered by a hook are refused.
+/// A replaced `dns.lookup` is a hook.
+#[test]
+fn the_default_resolver_keeps_a_hostname_grant_and_a_replaced_dns_lookup_does_not() {
+    let script = write_temp(
+        "net_lookup_ticket_grant/main.mjs",
+        r#"import net from 'node:net';
+import dns from 'node:dns';
+const port = Number(process.argv[2]);
+const attempt = (name) => new Promise((res) => {
+  const s = net.connect({ host: 'localhost', port });
+  s.on('error', (e) => { console.log(name, e.code === 'ERR_ACCESS_DENIED' ? 'DENIED' : `ERR ${e.code}`); res(); });
+  s.on('connect', () => { console.log(name, 'CONNECTED'); s.destroy(); res(); });
+});
+await attempt('resolver');
+const original = dns.lookup;
+dns.lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+await attempt('replaced');
+dns.lookup = original;
+await attempt('restored');
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let out = oam(&[
+        "--permission",
+        "--allow-net=localhost",
+        "--",
+        &path,
+        &port.to_string(),
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace("\r\n", "\n"),
+        "resolver CONNECTED\nreplaced DENIED\nrestored CONNECTED",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The connect natives are reachable from user JS (`__oam.node`), so the
+/// address spec they take is attacker input. An explicit address list is
+/// checked against the net grant (never trusted because the host was
+/// granted); a resolver ticket is one-shot, bound to the host it was resolved
+/// for, and gone once dropped; anything else is refused.
+#[test]
+fn the_connect_natives_refuse_a_forged_address_spec() {
+    let script = write_temp(
+        "net_lookup_forgery/main.mjs",
+        r#"const node = globalThis.__oam.node;
+const port = Number(process.argv[2]);
+const show = async (name, run) => {
+  try {
+    const r = await run();
+    console.log(name, 'CONNECTED');
+    node.tcpClose(r.handle);
+  } catch (e) {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `${e.name}: ${e.message}`);
+  }
+};
+await show('ips', () => node.tcpConnect('granted.invalid', port, 250, JSON.stringify({ ips: ['127.0.0.1'] })));
+await show('tls ips', () => node.tlsConnect('granted.invalid', port, 'x', undefined, false, undefined, undefined, '', '', 250, JSON.stringify({ ips: ['127.0.0.1'] })));
+const a = await node.netResolve('localhost', 0, true);
+await show('other host', () => node.tcpConnect('granted.invalid', port, 250, JSON.stringify({ ticket: a.token })));
+await show('reused', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: a.token })));
+const b = await node.netResolve('localhost', 0, true);
+console.log('dropped', node.netResolveDrop(b.token), node.netResolveDrop(b.token));
+await show('after drop', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: b.token })));
+await show('malformed', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ips: ['127.0.0.1'], ticket: 1 })));
+await show('not an ip', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ips: ['nope'] })));
+const c = await node.netResolve('localhost', 0, true);
+await show('ticket', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: c.token })));
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let out = oam(&[
+        "--permission",
+        "--allow-net=granted.invalid,localhost",
+        "--",
+        &path,
+        &port.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace("\r\n", "\n");
+    let expected = format!(
+        "ips DENIED \"127.0.0.1:{port}\"\n\
+         tls ips DENIED \"127.0.0.1:{port}\"\n\
+         other host Error: tcpConnect: resolve ticket TOKEN was issued for another host\n\
+         reused Error: tcpConnect: resolve ticket TOKEN is gone\n\
+         dropped true false\n\
+         after drop Error: tcpConnect: resolve ticket TOKEN is gone\n\
+         malformed TypeError: tcpConnect: the address spec must be {{ticket}} or {{ips}}\n\
+         not an ip Error: tcpConnect: pin ip 'nope' is not an IP\n\
+         ticket CONNECTED"
+    );
+    let redacted: String = stdout
+        .lines()
+        .map(|line| {
+            let mut words: Vec<String> = line.split(' ').map(str::to_string).collect();
+            for i in 1..words.len() {
+                if words[i - 1] == "ticket" && words[i].chars().all(|c| c.is_ascii_digit()) {
+                    words[i] = "TOKEN".to_string();
+                }
+            }
+            words.join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        redacted,
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Only the last, legitimate, connect arrived.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A connect vetoed in its 'lookup' listener drops its resolver ticket (none
+/// is left behind however many are vetoed), dials nothing, and holds nothing
+/// open: the run exits on its own. So does one whose hook never answers,
+/// once the socket is destroyed.
+#[test]
+fn a_vetoed_or_abandoned_lookup_leaves_nothing_behind() {
+    let script = write_temp(
+        "net_lookup_leak/main.mjs",
+        r#"import net from 'node:net';
+const node = globalThis.__oam.node;
+const resolve = node.netResolve;
+const tokens = [];
+node.netResolve = (...args) => resolve.apply(node, args).then((a) => { tokens.push(a.token); return a; });
+const port = Number(process.argv[2]);
+let vetoed = 0;
+for (let i = 0; i < 2000; i++) {
+  await new Promise((res) => {
+    const s = net.connect({ host: 'localhost', port });
+    s.once('lookup', () => s.destroy(new Error('veto')));
+    s.on('error', () => { vetoed++; res(); });
+  });
+}
+console.log('vetoed', vetoed, 'tokens', tokens.length, 'left', tokens.filter((t) => node.netResolveDrop(t)).length);
+const hung = net.connect({ host: 'never.invalid', port, lookup: () => {} });
+hung.on('error', () => {});
+setTimeout(() => hung.destroy(), 20);
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let started = std::time::Instant::now();
+    let out = oam(&[&path, &port.to_string()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "vetoed 2000 tokens 2000 left 0",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a vetoed connect must dial nothing"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the run must exit on its own"
+    );
+}
+
 /// A thread-per-connection HTTP/1.1 server for the redirect-permission test:
 /// each connection is one request (head plus a content-length body), recorded
 /// as `METHOD target`, answered with `reply(target)` and closed.
