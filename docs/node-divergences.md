@@ -1239,8 +1239,7 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   grant, exactly as a URL naming that address directly would be -- so
   `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
   `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
-  allows it. Node has no `--permission` net grant to compare against. Redirect HOPS are
-  still not checked (only the initial URL's hostname is).
+  allows it. Node has no `--permission` net grant to compare against.
 
 **Redirects**
 
