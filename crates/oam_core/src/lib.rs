@@ -686,6 +686,9 @@ pub struct CoreRuntime {
     /// the connect redeems them (`net_connect::ResolvedAnswers`); dropped
     /// with the run.
     resolved_answers: net_connect::ResolvedAnswers,
+    /// http.request exchanges over a JS socket (`http_client::bridge`);
+    /// dropped with the run.
+    http_bridges: http_client::bridge::Bridges,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -768,6 +771,7 @@ impl CoreRuntime {
             http,
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
             next_id: 1,
@@ -839,6 +843,11 @@ impl CoreRuntime {
     /// clone).
     pub fn resolved_answers(&self) -> net_connect::ResolvedAnswers {
         self.resolved_answers.clone()
+    }
+
+    /// http.request exchanges over a JS socket (Arc clone).
+    pub fn http_bridges(&self) -> http_client::bridge::Bridges {
+        self.http_bridges.clone()
     }
 
     /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,

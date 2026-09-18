@@ -31,12 +31,15 @@
 //!   continuation, and the payload a fetch resolves with.
 //! - [`body`]: the response body reader and the outbound request-body
 //!   channel lifecycle.
+//! - [`bridge`]: an HTTP/1.1 exchange over a byte stream JS pumps to and from
+//!   a socket object (`http.request` over an agent's socket).
 //!
 //! The modules are `pub` so the URL-heavy tests live in
 //! `crates/oam_core/tests/http_client_*.rs`, outside the published-URLs gate's
 //! scan (an `http://[::1]` literal parses to the host `[` there).
 
 pub mod body;
+pub mod bridge;
 mod connector;
 pub mod decode;
 pub mod prepare;

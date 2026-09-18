@@ -329,6 +329,13 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
         ("netResolve", op_net_resolve),
+        // http.request over an agent's socket (oam_core http_client::bridge)
+        ("httpBridgeStart", op_http_bridge_start),
+        ("httpBridgeResponse", op_http_bridge_response),
+        ("httpBridgeOut", op_http_bridge_out),
+        ("httpBridgeIn", op_http_bridge_in),
+        ("httpBridgeInEnd", op_http_bridge_in_end),
+        ("httpBridgeClose", op_http_bridge_close),
         ("netCheck", op_net_check),
         ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
@@ -2899,6 +2906,113 @@ fn op_net_resolve(
             serde_json::json!({ "token": token, "addresses": addresses }).to_string(),
         )
     });
+}
+
+// ------------------------------------------------------- HTTP bridge
+
+/// `__oam.node.httpBridgeStart(requestJson) -> id`: set up an HTTP/1.1
+/// exchange JS will pump over a socket (`oam_core::http_client::bridge`).
+/// Throws a TypeError for a request that cannot be written.
+fn op_http_bridge_start(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(request) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "httpBridgeStart requires a request");
+        return;
+    };
+    let core = core_runtime!(scope);
+    let bridges = core.http_bridges();
+    let ids = core.body_ids();
+    let outbound = core.outbound_bodies();
+    match oam_core::http_client::bridge::start(&bridges, &ids, outbound, &request) {
+        Ok(id) => rv.set_double(id as f64),
+        Err(message) => throw_type_error(scope, &message),
+    }
+}
+
+/// `__oam.node.httpBridgeResponse(id)`: run the exchange; resolves at the
+/// response head with the fetch payload's shape (the body under
+/// `bodyHandle`, read with `__oam.fetchBodyRead`).
+fn op_http_bridge_response(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let core = core_runtime!(scope);
+    let bridges = core.http_bridges();
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::response(bridges, id, bodies, ids),
+    );
+}
+
+/// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
+/// or undefined at the end.
+fn op_http_bridge_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::out(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeIn(id, bytes)`: response bytes the socket read.
+fn op_http_bridge_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "httpBridgeIn requires bytes");
+        return;
+    };
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::input(bridges, id, bytes),
+    );
+}
+
+/// `__oam.node.httpBridgeInEnd(id)`: the socket reached EOF.
+fn op_http_bridge_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::input_end(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeClose(id)`: drop the exchange. True if it was
+/// open.
+fn op_http_bridge_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed = id >= 0.0
+        && oam_core::http_client::bridge::close(&core_runtime!(scope).http_bridges(), id as u64);
+    rv.set_bool(closed);
 }
 
 /// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to
