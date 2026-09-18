@@ -22852,8 +22852,10 @@ fn client_disconnect_mid_upload_does_not_kill_the_server() {
          await new Promise((r) => server.listen(0, r));\n\
          const sock = net.connect(server.address().port, '127.0.0.1');\n\
          sock.on('error', () => {});\n\
-         // Promise 10MB, send 1KB, then reset.\n\
-         sock.write(`POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: ${10 * 1024 * 1024}\r\n\r\n`);\n\
+         // Promise 10MB, send 1KB, then reset. The CRLFs are JS escapes: a\n\
+         // raw CR LF inside a template literal reads as a bare LF, which\n\
+         // Node's parser (and now oam's) refuses with 400.\n\
+         sock.write(`POST /u HTTP/1.1\\r\\nHost: x\\r\\nContent-Length: ${10 * 1024 * 1024}\\r\\n\\r\\n`);\n\
          sock.write('x'.repeat(1024));\n\
          await new Promise((r) => setTimeout(r, 150));\n\
          sock.destroy();\n\

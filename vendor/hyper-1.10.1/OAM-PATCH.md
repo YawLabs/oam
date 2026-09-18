@@ -1,7 +1,8 @@
 # hyper 1.10.1, patched for oam
 
-This directory is hyper **1.10.1** as published on crates.io, plus one fix.
-The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+This directory is hyper **1.10.1** as published on crates.io, plus two
+changes: a fix for a client hang (items 1-3 below) and one server extension
+(item 4). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -17,7 +18,9 @@ The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix. To do that:
+- **Remove it when** a hyper release ships the fix **and** oam no longer
+  needs item 4 (see "The request-head extension" below for what replacing
+  it takes). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
      from the root `Cargo.toml`.
@@ -53,6 +56,13 @@ whole of it.
    builds tokio 1.52.3 with `rt`, so the build graph is unchanged: the same
    packages with the same features. `Cargo.toml.orig` is left as upstream
    shipped it.
+4. **`src/ext/mod.rs` and `src/proto/h1/role.rs`, `RawRequestHead`.** A new
+   public extension type, built with `server` + `http1`, and one line in
+   `Server::parse` that inserts it into every HTTP/1 request's extensions:
+   the head's bytes as received, from the request line through the blank
+   line. It is a clone of the `Bytes` slice the parse already holds (the
+   header values point into the same buffer), so nothing is copied. See
+   "The request-head extension" below.
 
 ## Why
 
@@ -97,6 +107,29 @@ every client connection owns one `dispatch::Receiver`:
 
 hyper-util, like any caller that spawns the connection future, drops that
 future as soon as it completes.
+
+## The request-head extension (item 4)
+
+oam's http server applies node's rules for a request head on top of
+hyper's parser (`crates/oam_core/src/http_head.rs`): Content-Length together
+with Transfer-Encoding, a duplicate Content-Length, a coding after
+`chunked` and a bare-LF line ending are refused with 400, and node's
+`maxHeaderSize` count is enforced with 431. Those checks need the head as
+it arrived, because `Server::parse` drops two of the headers they look at
+before a service sees the request: a `content-length` that follows
+`transfer-encoding` is skipped (`if is_te { continue; }`), and a second
+`content-length` with the same value is skipped too. Nothing in hyper's
+public API exposes the raw head, so the patch adds the extension.
+
+It only adds information: parsing, framing, keep-alive and every existing
+extension are unchanged, and a caller that never reads it sees stock hyper.
+hyper 1.11.0 changed the CL + TE case (#4124: the `content-length` is now
+removed and the connection closed), which still leaves nothing for a caller
+to detect it by, so a move to 1.11.x keeps this hunk.
+
+It is exercised by `crates/oam_cli/tests/http_server_wire.rs` and the
+conformance cases 131 and 132 (a stock hyper does not compile with oam, since
+oam names the type).
 
 ## Reproduction
 

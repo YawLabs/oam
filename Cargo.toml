@@ -119,6 +119,9 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+# The upgrade path of the http server reads request heads itself and parses
+# them with the parser hyper uses (already in the graph through hyper).
+httparse = "1"
 # oam's own fetch transport (crates/oam_core/src/http_client, #143): request
 # URLs, the http types and userinfo decoding. All three already compile in the
 # graph (url and percent-encoding via reqwest, http via hyper); declaring them

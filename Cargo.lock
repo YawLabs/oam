@@ -1922,6 +1922,7 @@ dependencies = [
  "hickory-resolver",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "io-uring",

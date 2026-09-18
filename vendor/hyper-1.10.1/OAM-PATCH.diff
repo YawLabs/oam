@@ -78,3 +78,51 @@ diff -ruN a/src/common/task.rs b/src/common/task.rs
  pub(crate) fn yield_now(cx: &mut Context<'_>) -> Poll<std::convert::Infallible> {
      cx.waker().wake_by_ref();
      Poll::Pending
+diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
+--- a/src/ext/mod.rs
++++ b/src/ext/mod.rs
+@@ -54,6 +54,31 @@
+ #[cfg(any(feature = "http1", feature = "ffi"))]
+ pub use h1_reason_phrase::ReasonPhrase;
+ 
++/// oam patch: an HTTP/1 request head exactly as the server received it, from
++/// the request line through the empty line that ends it.
++///
++/// The server inserts this extension on every HTTP/1 request it parses. The
++/// parse keeps only part of what arrived -- a second, identical
++/// `content-length` and a `content-length` that follows `transfer-encoding`
++/// are dropped -- so a caller that must apply stricter rules than hyper's
++/// (oam applies node's) needs the bytes themselves. They are a slice of the
++/// buffer the header values already point into; nothing is copied.
++#[cfg(all(feature = "server", feature = "http1"))]
++#[derive(Clone, Debug)]
++pub struct RawRequestHead(Bytes);
++
++#[cfg(all(feature = "server", feature = "http1"))]
++impl RawRequestHead {
++    pub(crate) fn new(head: Bytes) -> Self {
++        RawRequestHead(head)
++    }
++
++    /// The head's bytes.
++    pub fn as_bytes(&self) -> &[u8] {
++        &self.0
++    }
++}
++
+ #[cfg(all(feature = "http1", feature = "client"))]
+ mod informational;
+ #[cfg(all(feature = "http1", feature = "client"))]
+diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
+--- a/src/proto/h1/role.rs
++++ b/src/proto/h1/role.rs
+@@ -336,6 +336,9 @@
+ 
+         let mut extensions = http::Extensions::default();
+ 
++        // oam patch: the head as received (see ext::RawRequestHead).
++        extensions.insert(crate::ext::RawRequestHead::new(slice.clone()));
++
+         if let Some(header_case_map) = header_case_map {
+             extensions.insert(header_case_map);
+         }

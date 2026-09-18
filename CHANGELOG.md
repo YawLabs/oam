@@ -70,6 +70,22 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `localFamily`, spelled as Node spells them, `address()` returns the local end, and
   `req.connection` is the same object. The socket an `'upgrade'` listener receives now
   reports the client's real family (it said `IPv4` for every client) and its local end.
+- **The `http` server accepted request heads that Node refuses.** A request carrying both
+  `Content-Length` and `Transfer-Encoding` (in either order) reached the handler with
+  both headers, and so did a repeated `Content-Length`, a `Transfer-Encoding` with a
+  coding after `chunked`, and header lines ending in a bare LF; an upgrade request was
+  not checked at all (obs-fold and control characters got through too). A proxy in
+  front of the server that frames such a request differently disagrees with it about
+  where the request ends. These heads are now answered `400` and the connection is
+  closed, as in Node, for `http`, `https` and the HTTP/1 side of `http2.createServer`;
+  `insecureHTTPParser` and `--insecure-http-parser` relax the same rules Node's do.
+- **`maxHeaderSize` was not enforced.** Request heads of hundreds of KiB were accepted,
+  and the server's `maxHeaderSize` option, `--max-http-header-size` and
+  `http.maxHeaderSize` had no effect. Heads are now counted as Node counts them and
+  answered `431` at the limit (16 KiB by default), and a head that never ends is refused
+  once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
+  `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
+  and in `NODE_OPTIONS`.
 - **One silent connection stopped an `http` server from accepting.** The server waited
   for each new connection's first bytes before accepting the next, so a client that
   connected and sent nothing (a browser preconnect, or anyone) held every later client

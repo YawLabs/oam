@@ -336,6 +336,9 @@ impl Http1Transaction for Server {
 
         let mut extensions = http::Extensions::default();
 
+        // oam patch: the head as received (see ext::RawRequestHead).
+        extensions.insert(crate::ext::RawRequestHead::new(slice.clone()));
+
         if let Some(header_case_map) = header_case_map {
             extensions.insert(header_case_map);
         }

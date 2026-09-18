@@ -139,7 +139,9 @@ fn exchange(target: SocketAddr, local: Option<IpAddr>, bytes: &[u8], wait: Durat
         }
         let mut stream = socket.connect(target).await.expect("connect");
         let local = stream.local_addr().unwrap();
-        stream.write_all(bytes).await.unwrap();
+        // A server that refuses the head early may close while the rest is
+        // still being written; what it answered is still read below.
+        let _ = stream.write_all(bytes).await;
         let mut response = Vec::new();
         let mut closed = false;
         let deadline = tokio::time::Instant::now() + wait;
@@ -326,4 +328,150 @@ fn a_silent_connection_does_not_block_the_next_client() {
             .expect("request line"),
     );
     assert_eq!(seen["url"], "/next");
+}
+
+/// Nothing arrives at the script within `wait`.
+fn assert_no_more_lines(server: &Server, wait: Duration) {
+    if let Some(line) = server.next_line(wait) {
+        panic!("the server handled something it should have refused: {line}");
+    }
+}
+
+/// A request carrying both Content-Length and Transfer-Encoding is refused
+/// before any handler runs, and the connection is closed -- so bytes the two
+/// headers disagree about are never read as a second request. (Before, the
+/// handler saw both headers, and the bytes after the chunked body were
+/// served as a request of their own.)
+#[test]
+fn a_request_with_two_body_lengths_is_refused_and_ends_the_connection() {
+    let server = Server::start("clte.mjs", ADDR_SERVER, &[], &[("HOST", "127.0.0.1")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(
+        target,
+        None,
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n\
+          0\r\n\r\nGET /second HTTP/1.1\r\nHost: x\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 400 Bad Request"],
+        "{:?}",
+        ex.response
+    );
+    assert!(ex.closed, "the connection must close after the refusal");
+    assert_no_more_lines(&server, Duration::from_millis(500));
+
+    // The same head as an upgrade request goes through the same rules.
+    let ex = exchange(
+        target,
+        None,
+        b"GET /up HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\
+          Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 400 Bad Request"],
+        "{:?}",
+        ex.response
+    );
+    assert!(ex.closed);
+    assert_no_more_lines(&server, Duration::from_millis(500));
+}
+
+/// A head over node's 16 KiB default is answered 431 without running a
+/// handler; a head that never ends is answered 431 once it outgrows the
+/// read buffer (64 KiB for the default limit), not buffered on and on.
+#[test]
+fn an_oversized_head_is_answered_431() {
+    let server = Server::start("big.mjs", ADDR_SERVER, &[], &[("HOST", "127.0.0.1")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let head = format!(
+        "GET /big HTTP/1.1\r\nHost: x\r\nX-A: {}\r\n\r\n",
+        "a".repeat(20_000)
+    );
+    let ex = exchange(target, None, head.as_bytes(), Duration::from_secs(5));
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 431 Request Header Fields Too Large"],
+        "{:?}",
+        ex.response
+    );
+    assert!(ex.closed);
+    assert_no_more_lines(&server, Duration::from_millis(300));
+
+    let endless = format!(
+        "GET /endless HTTP/1.1\r\nHost: x\r\nX-A: {}",
+        "a".repeat(300_000)
+    );
+    let ex = exchange(target, None, endless.as_bytes(), Duration::from_secs(5));
+    assert_eq!(
+        ex.statuses(),
+        ["HTTP/1.1 431 Request Header Fields Too Large"],
+        "{:?}",
+        &ex.response[..ex.response.len().min(200)]
+    );
+    assert_no_more_lines(&server, Duration::from_millis(300));
+}
+
+/// `--max-http-header-size` sets the limit for servers that set none, from
+/// the command line and from NODE_OPTIONS; `--insecure-http-parser` lets a
+/// Content-Length + Transfer-Encoding request through, as node does.
+#[test]
+fn the_parser_flags_apply_to_servers() {
+    let head = format!(
+        "GET /mid HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-A: {}\r\n\r\n",
+        "a".repeat(3000)
+    );
+    for (args, env) in [
+        (
+            &["--max-http-header-size=2000"][..],
+            &[("HOST", "127.0.0.1")][..],
+        ),
+        (
+            &[][..],
+            &[
+                ("HOST", "127.0.0.1"),
+                ("NODE_OPTIONS", "--max-http-header-size=2000"),
+            ][..],
+        ),
+    ] {
+        let server = Server::start("flag.mjs", ADDR_SERVER, args, env);
+        let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+        let ex = exchange(target, None, head.as_bytes(), Duration::from_secs(5));
+        assert_eq!(
+            ex.statuses(),
+            ["HTTP/1.1 431 Request Header Fields Too Large"],
+            "{args:?} {env:?}: {:?}",
+            ex.response
+        );
+    }
+    // Without the flag the same head is fine.
+    let server = Server::start("noflag.mjs", ADDR_SERVER, &[], &[("HOST", "127.0.0.1")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(target, None, head.as_bytes(), Duration::from_secs(5));
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+
+    let server = Server::start(
+        "insecure.mjs",
+        ADDR_SERVER,
+        &["--insecure-http-parser"],
+        &[("HOST", "127.0.0.1")],
+    );
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let ex = exchange(
+        target,
+        None,
+        b"POST /lenient HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\
+          Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    let seen = json(
+        &server
+            .next_line(Duration::from_secs(5))
+            .expect("request line"),
+    );
+    assert_eq!(seen["url"], "/lenient");
 }

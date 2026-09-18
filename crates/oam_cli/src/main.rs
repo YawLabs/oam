@@ -418,6 +418,29 @@ fn main() -> ExitCode {
             } else if arg == "--zero-fill-buffers" {
                 flags.zero_fill_buffers = true;
                 i += 1;
+            } else if let Some(v) = arg.strip_prefix("--max-http-header-size=") {
+                if v.is_empty() {
+                    eprintln!("oam: --max-http-header-size= requires an argument");
+                    return ExitCode::from(9);
+                }
+                flags.max_http_header_size = Some(v.to_string());
+                flags.max_http_header_size_spaced = false;
+                i += 1;
+            } else if arg == "--max-http-header-size" {
+                match raw.get(i + 1) {
+                    Some(v) => {
+                        flags.max_http_header_size = Some(v.clone());
+                        flags.max_http_header_size_spaced = true;
+                        i += 2;
+                    }
+                    None => {
+                        eprintln!("oam: --max-http-header-size requires an argument");
+                        return ExitCode::from(9);
+                    }
+                }
+            } else if arg == "--insecure-http-parser" {
+                flags.insecure_http_parser = true;
+                i += 1;
             } else if let Some(v) = arg.strip_prefix("--title=") {
                 flags.title = Some(v.to_string());
                 i += 1;
@@ -536,6 +559,10 @@ fn main() -> ExitCode {
         // this rather than taking a plumbed argument: resolution happens in
         // several places (require, dynamic import, the ESM path) and a
         // process-wide toggle keeps them from disagreeing.
+        // The HTTP parser flags are process-wide: every server that sets no
+        // option of its own, `http.maxHeaderSize`, and the response-head
+        // limit of the fetch transport read them.
+        flags.apply_http_parser_flags();
         if flags.expose_internals {
             // SAFETY: single-threaded startup, before any runtime exists.
             unsafe { std::env::set_var("OAM_EXPOSE_INTERNALS", "1") };
@@ -1742,6 +1769,14 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
         let tok = tok.as_str();
         if tok == "--pending-deprecation" {
             flags.pending_deprecation = true;
+        } else if let Some(v) = tok.strip_prefix("--max-http-header-size=") {
+            flags.max_http_header_size = Some(v.to_string());
+        } else if tok == "--max-http-header-size"
+            && let Some(v) = it.next()
+        {
+            flags.max_http_header_size = Some(v.clone());
+        } else if tok == "--insecure-http-parser" {
+            flags.insecure_http_parser = true;
         } else if tok == "--no-warnings" {
             flags.no_warnings = true;
         } else if tok == "--no-deprecation" {
@@ -2477,9 +2512,30 @@ struct NodeFlags {
     /// test/debug surface in Node too -- never listed in builtinModules.
     expose_internals: bool,
     experimental_vm_modules: bool,
+    /// `--max-http-header-size=N`, as given (node parses it like strtoull:
+    /// `12abc` is 12). Kept raw so execArgv hands it back unchanged.
+    max_http_header_size: Option<String>,
+    /// It was given as two tokens (`--max-http-header-size N`), which is how
+    /// execArgv hands it back.
+    max_http_header_size_spaced: bool,
+    /// `--insecure-http-parser`.
+    insecure_http_parser: bool,
 }
 
 impl NodeFlags {
+    /// Publish `--max-http-header-size` / `--insecure-http-parser` to the
+    /// process-wide state oam_core reads (they are not per-runtime: workers
+    /// share them, as in node).
+    fn apply_http_parser_flags(&self) {
+        use oam_engine::http_head;
+        if let Some(raw) = &self.max_http_header_size {
+            http_head::set_max_http_header_size(http_head::parse_max_header_size_flag(raw));
+        }
+        if self.insecure_http_parser {
+            http_head::set_insecure_http_parser(true);
+        }
+    }
+
     fn install(&self, rt: &mut oam_engine::JsRuntime) {
         let pending = self.pending_deprecation
             || std::env::var("NODE_PENDING_DEPRECATION").as_deref() == Ok("1");
@@ -2646,6 +2702,17 @@ impl NodeFlags {
         }
         if let Some(p) = &self.redirect_warnings {
             out.push(format!("--redirect-warnings={p}"));
+        }
+        if let Some(v) = &self.max_http_header_size {
+            if self.max_http_header_size_spaced {
+                out.push("--max-http-header-size".into());
+                out.push(v.clone());
+            } else {
+                out.push(format!("--max-http-header-size={v}"));
+            }
+        }
+        if self.insecure_http_parser {
+            out.push("--insecure-http-parser".into());
         }
         out
     }

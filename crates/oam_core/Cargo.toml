@@ -25,6 +25,8 @@ tower-service = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+# http_head: upgrade request heads, parsed with the parser hyper uses.
+httparse = { workspace = true }
 # http_client (#143): request preparation and the redirect step.
 url = { workspace = true }
 http = { workspace = true }

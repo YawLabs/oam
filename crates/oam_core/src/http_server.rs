@@ -27,6 +27,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::http_head::{HeadError, HeadPolicy};
+
 /// Per-request body cap (wave-1 buffered bodies).
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// After the per-request cap is hit we drain (discard) up to this many
@@ -546,28 +548,32 @@ fn is_connection_upgrade(buf: &[u8]) -> bool {
     false
 }
 
-type UpgradeHeaders = (String, String, Vec<(String, String)>);
+/// Refuse a request head the way node does: its status line and
+/// `Connection: close`, nothing else, then close. For the upgrade path,
+/// which owns the raw socket; hyper's path answers through
+/// [`refused_head_response`].
+async fn refuse_raw(stream: &mut tokio::net::TcpStream, error: HeadError) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.write_all(error.node_response()).await;
+    let _ = stream.shutdown().await;
+}
 
-fn parse_upgrade_headers(buf: &[u8]) -> Option<UpgradeHeaders> {
-    let text = std::str::from_utf8(buf).ok()?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let uri = parts.next()?.to_string();
+/// hyper's answer to a refused head: the status, `connection: close` (so
+/// hyper closes the connection instead of reading on from wherever the
+/// refused request's body was supposed to end), and no body.
+fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
+    hyper::Response::builder()
+        .status(error.status())
+        .header(hyper::header::CONNECTION, "close")
+        .body(http_body_util::Empty::new().boxed())
+        .expect("static refusal builds")
+}
 
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = line.find(':') {
-            let name = line[..colon].to_string();
-            let value = line[colon + 1..].trim().to_string();
-            headers.push((name, value));
-        }
-    }
-    Some((method, uri, headers))
+/// An HTTP/1 connection builder for a server with `policy`.
+fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.max_buf_size(policy.read_buffer_limit());
+    builder
 }
 
 /// Bind + spawn the accept loop. Resolves Json {serverId, port}.
@@ -580,6 +586,8 @@ pub async fn http_serve(
     // Dispatch the JS handler on headers and stream the body (slice 2 of
     // docs/design/streaming-bodies.md). Off = today's buffered behavior.
     stream_request_body: bool,
+    // maxHeaderSize / insecureHTTPParser for this server.
+    policy: HeadPolicy,
 ) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -657,13 +665,15 @@ pub async fn http_serve(
                                 return;
                             };
                             let consume = hdr_end + 4;
-                            let mut discard = vec![0u8; consume];
-                            if stream.read_exact(&mut discard).await.is_err() {
+                            let mut head = vec![0u8; consume];
+                            if stream.read_exact(&mut head).await.is_err() {
                                 return;
                             }
-                            if let Some((method, uri, headers)) =
-                                parse_upgrade_headers(&discard[..hdr_end])
-                            {
+                            // The same grammar and rules as every other
+                            // request (hyper's parser, then node's): an
+                            // upgrade request is not a way around them.
+                            match crate::http_head::parse_request_head(&head, policy) {
+                                Ok(parsed) => {
                                 let id = conn_state.next_id();
                                 let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
                                 let (reader, writer) = stream.into_split();
@@ -674,14 +684,16 @@ pub async fn http_serve(
                                 let _ = conn_queue
                                     .send(IncomingRequest {
                                         id,
-                                        method,
-                                        uri,
-                                        headers,
+                                        method: parsed.method,
+                                        uri: parsed.target,
+                                        headers: parsed.headers,
                                         is_upgrade: true,
                                         socket_handle: Some(handle),
                                         conn: conn_addrs,
                                     })
                                     .await;
+                                }
+                                Err(error) => refuse_raw(&mut stream, error).await,
                             }
                             // The upgraded socket belongs to JS now; it no
                             // longer counts against the connection cap.
@@ -699,10 +711,10 @@ pub async fn http_serve(
                                 req,
                                 conn_stream_bodies, // per-server opt-in
                                 conn_addrs,
+                                policy,
                             )
                         });
-                        let conn = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, service);
+                        let conn = http1_builder(policy).serve_connection(io, service);
                         // GRACEFUL shutdown on close(): disable keep-alive and
                         // let the IN-FLIGHT request finish (Node's
                         // server.close() semantics), instead of resetting it.
@@ -922,7 +934,17 @@ async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
     stream_request_body: bool,
     conn: ConnAddrs,
+    policy: HeadPolicy,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
+    // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
+    // an HTTP/2 request has no such head). A refused request never reaches
+    // JS and its body is never read: the connection closes after the
+    // refusal, so nothing after the head is ever parsed as a request.
+    if let Some(raw) = req.extensions().get::<hyper::ext::RawRequestHead>()
+        && let Err(error) = crate::http_head::check_request_head(raw.as_bytes(), policy)
+    {
+        return Ok(refused_head_response(error));
+    }
     let (parts, body) = req.into_parts();
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
     // drain up to DRAIN_BUDGET additional bytes before returning 413.
@@ -1059,6 +1081,7 @@ async fn handle_request(
 /// Bind a TLS-wrapped HTTP server. Same as http_serve but each accepted
 /// connection goes through a TLS handshake before reaching hyper. The
 /// request/response lifecycle is identical (shared HttpState, same ops).
+#[allow(clippy::too_many_arguments)]
 pub async fn https_serve(
     state: Arc<HttpState>,
     host: String,
@@ -1067,6 +1090,8 @@ pub async fn https_serve(
     key_pem: String,
     min_version: Option<String>,
     max_version: Option<String>,
+    // maxHeaderSize / insecureHTTPParser for this server.
+    policy: HeadPolicy,
 ) -> super::OpOutcome {
     // The server's minVersion / maxVersion (#144), already validated by the JS
     // https layer; empty means Node's default range. A range with nothing to
@@ -1146,10 +1171,10 @@ pub async fn https_serve(
                                 req,
                                 false, // TLS: buffered until a later slice
                                 conn_addrs,
+                                policy,
                             )
                         });
-                        let conn = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, service);
+                        let conn = http1_builder(policy).serve_connection(io, service);
                         let mut conn = std::pin::pin!(conn);
                         let mut shutting_down = false;
                         loop {
@@ -1248,7 +1273,13 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// connection preface it runs through hyper's http2 builder, otherwise it
 /// falls back to the http1 builder. This matches Node's `http2.createServer()`
 /// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
-pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> super::OpOutcome {
+pub async fn http2_serve(
+    state: Arc<HttpState>,
+    host: String,
+    port: u16,
+    // Applied to the HTTP/1 connections this server also accepts.
+    policy: HeadPolicy,
+) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
@@ -1324,6 +1355,7 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
                                 req,
                                 false, // http2: buffered until a later slice
                                 conn_addrs,
+                                policy,
                             )
                         });
 
@@ -1347,8 +1379,7 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
                                 }
                             }
                         } else {
-                            let conn = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, service);
+                            let conn = http1_builder(policy).serve_connection(io, service);
                             let mut conn = std::pin::pin!(conn);
                             let mut shutting_down = false;
                             loop {

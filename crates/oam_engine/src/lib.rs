@@ -41,6 +41,9 @@ pub use crash::install_panic_hook;
 pub use modules::ModuleHost;
 // Re-exported so the CLI can register its `-e` artifact without taking a direct
 // oam_core dependency; the hard-exit paths that drain it live in this crate.
+// Also re-exported for the CLI: `--max-http-header-size` and
+// `--insecure-http-parser` set process-wide state there.
+pub use oam_core::http_head;
 pub use oam_core::{
     exit_process, register_exit_cleanup, register_exit_hook, register_process_state_hook,
     run_exit_cleanup, run_exit_hooks, run_process_state_hooks, snapshot_inherited_fds,

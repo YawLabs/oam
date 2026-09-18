@@ -54,6 +54,31 @@ mod h1_reason_phrase;
 #[cfg(any(feature = "http1", feature = "ffi"))]
 pub use h1_reason_phrase::ReasonPhrase;
 
+/// oam patch: an HTTP/1 request head exactly as the server received it, from
+/// the request line through the empty line that ends it.
+///
+/// The server inserts this extension on every HTTP/1 request it parses. The
+/// parse keeps only part of what arrived -- a second, identical
+/// `content-length` and a `content-length` that follows `transfer-encoding`
+/// are dropped -- so a caller that must apply stricter rules than hyper's
+/// (oam applies node's) needs the bytes themselves. They are a slice of the
+/// buffer the header values already point into; nothing is copied.
+#[cfg(all(feature = "server", feature = "http1"))]
+#[derive(Clone, Debug)]
+pub struct RawRequestHead(Bytes);
+
+#[cfg(all(feature = "server", feature = "http1"))]
+impl RawRequestHead {
+    pub(crate) fn new(head: Bytes) -> Self {
+        RawRequestHead(head)
+    }
+
+    /// The head's bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[cfg(all(feature = "http1", feature = "client"))]
 mod informational;
 #[cfg(all(feature = "http1", feature = "client"))]

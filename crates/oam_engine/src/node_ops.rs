@@ -322,6 +322,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
+        // --max-http-header-size / --insecure-http-parser, as the CLI set them
+        ("httpMaxHeaderSize", op_http_max_header_size),
+        ("httpInsecureParser", op_http_insecure_parser),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
         ("http2Serve", op_http2_serve),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
@@ -2433,6 +2436,51 @@ fn parse_headers_json(json: &str) -> Vec<(String, String)> {
     serde_json::from_str::<Vec<(String, String)>>(json).unwrap_or_default()
 }
 
+/// A server's request-head policy from two op args: `maxHeaderSize` (a
+/// number of bytes; anything else means the process-wide
+/// `--max-http-header-size`) and `insecureHTTPParser` (a boolean; anything
+/// else means `--insecure-http-parser`). JS passes the effective values
+/// (`server.maxHeaderSize || http.maxHeaderSize`); callers that pass nothing
+/// -- oam.serve, the http2 compat server -- get the process defaults.
+fn head_policy_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    first: i32,
+) -> oam_core::http_head::HeadPolicy {
+    let mut policy = oam_core::http_head::HeadPolicy::process_default();
+    let size = args.get(first);
+    if size.is_number()
+        && let Some(n) = size.number_value(scope)
+        && n >= 0.0
+    {
+        // `as` saturates: 2**64 and above is u64::MAX, which is no limit.
+        policy.max_header_size = n as u64;
+    }
+    let insecure = args.get(first + 1);
+    if insecure.is_boolean() {
+        policy.lenient = insecure.is_true();
+    }
+    policy
+}
+
+fn op_http_max_header_size(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let limit = oam_core::http_head::max_http_header_size() as f64;
+    rv.set(v8::Number::new(scope, limit).into());
+}
+
+fn op_http_insecure_parser(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let on = oam_core::http_head::insecure_http_parser();
+    rv.set(v8::Boolean::new(scope, on).into());
+}
+
 fn op_http_serve(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2449,6 +2497,8 @@ fn op_http_serve(
     let state = rt.http();
     let tcp = rt.tcp();
     let tcp_ids = rt.body_ids();
+    // args 3, 4: maxHeaderSize, insecureHTTPParser.
+    let policy = head_policy_args(scope, &args, 3);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2460,6 +2510,7 @@ fn op_http_serve(
             port,
             // arg 2: opt into dispatch-on-headers + streamed request bodies.
             args.get(2).is_true(),
+            policy,
         ),
     );
 }
@@ -2747,10 +2798,12 @@ fn op_http2_serve(
         return;
     }
     let state = core_runtime!(scope).http();
+    // args 2, 3: maxHeaderSize, insecureHTTPParser (HTTP/1 connections).
+    let policy = head_policy_args(scope, &args, 2);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http2_serve(state, host, port),
+        oam_core::http_server::http2_serve(state, host, port, policy),
     );
 }
 
@@ -2780,6 +2833,8 @@ fn op_https_serve(
         return;
     }
     let state = core_runtime!(scope).http();
+    // args 6, 7: maxHeaderSize, insecureHTTPParser.
+    let policy = head_policy_args(scope, &args, 6);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2791,6 +2846,7 @@ fn op_https_serve(
             key_pem,
             min_version,
             max_version,
+            policy,
         ),
     );
 }

@@ -17723,9 +17723,71 @@
       }
     }
 
+    // node's storeHTTPOptions (lib/_http_server.js), the parser half:
+    // `maxHeaderSize` (validateInteger(v, 'maxHeaderSize', 0)) and
+    // `insecureHTTPParser` (a boolean) are validated, stored on the server
+    // as given (undefined when absent), and applied by the native server to
+    // every request head. Shared with the https server.
+    function storeHTTPParserOptions(server, options) {
+      const maxHeaderSize = options.maxHeaderSize;
+      if (maxHeaderSize !== undefined) {
+        if (typeof maxHeaderSize !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
+        }
+        if (!Number.isInteger(maxHeaderSize)) {
+          throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
+        }
+        if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
+          throw codes.ERR_OUT_OF_RANGE(
+            "maxHeaderSize",
+            ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
+            maxHeaderSize,
+          );
+        }
+      }
+      server.maxHeaderSize = maxHeaderSize;
+      const insecureHTTPParser = options.insecureHTTPParser;
+      if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.insecureHTTPParser",
+          "boolean",
+          insecureHTTPParser,
+        );
+      }
+      server.insecureHTTPParser = insecureHTTPParser;
+    }
+
+    // What the native server enforces: node's `server.maxHeaderSize ||
+    // --max-http-header-size` (0 means the global) and
+    // `server.insecureHTTPParser ?? --insecure-http-parser`, with node's
+    // one-time warning when the flag is what turns lenient parsing on.
+    let warnedLenient = false;
+    function serverHeadPolicy(server) {
+      const maxHeaderSize = server.maxHeaderSize || natives.httpMaxHeaderSize();
+      let insecure = server.insecureHTTPParser;
+      if (insecure === undefined) {
+        insecure = natives.httpInsecureParser();
+        if (insecure && !warnedLenient) {
+          warnedLenient = true;
+          process.emitWarning("Using insecure HTTP parsing");
+        }
+      }
+      return { maxHeaderSize, insecure };
+    }
+
     class Server extends EventEmitter {
-      constructor(handler) {
+      constructor(options, handler) {
         super();
+        // node: Server([options][, requestListener]).
+        if (typeof options === "function") {
+          handler = options;
+          options = {};
+        } else if (options === undefined || options === null) {
+          options = {};
+        } else if (typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+        }
+        storeHTTPParserOptions(this, options);
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
@@ -17762,7 +17824,8 @@
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
-        natives.httpServe(hostname, port ?? 0, true).then(
+        const policy = serverHeadPolicy(this);
+        natives.httpServe(hostname, port ?? 0, true, policy.maxHeaderSize, policy.insecure).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
@@ -18680,9 +18743,10 @@
       });
       return proxy;
     };
+    // The https server shares the parser options and their policy.
+    registry._httpParserOptions = { store: storeHTTPParserOptions, policy: serverHeadPolicy };
     return {
-      createServer: (options, handler) =>
-        new Server(typeof options === "function" ? options : handler),
+      createServer: (options, handler) => new Server(options, handler),
       Server: callableHttp(Server),
       IncomingMessage: callableHttp(IncomingMessage),
       ServerResponse: callableHttp(ServerResponse),
@@ -18692,7 +18756,10 @@
       get,
       globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
       Agent,
-      maxHeaderSize: 16384,
+      // node: a getter for --max-http-header-size (16384 by default).
+      get maxHeaderSize() {
+        return natives.httpMaxHeaderSize();
+      },
       validateHeaderName,
       validateHeaderValue,
       METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
@@ -21026,6 +21093,9 @@
           options = {};
         }
         this._options = options || {};
+        // maxHeaderSize / insecureHTTPParser, validated and stored as the
+        // http server does (node's https.Server runs storeHTTPOptions too).
+        registry._httpParserOptions.store(this, this._options);
         var serverVersions = resolveTlsVersions(this._options);
         this._tlsMin = serverVersions.min;
         this._tlsMax = serverVersions.max;
@@ -21051,7 +21121,17 @@
           ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
         var keyPem = typeof this._options.key === "object" && this._options.key instanceof Uint8Array
           ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
-        natives.httpsServe(hostname, port || 0, certPem, keyPem, this._tlsMin, this._tlsMax).then(
+        var policy = registry._httpParserOptions.policy(this);
+        natives.httpsServe(
+          hostname,
+          port || 0,
+          certPem,
+          keyPem,
+          this._tlsMin,
+          this._tlsMax,
+          policy.maxHeaderSize,
+          policy.insecure,
+        ).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
