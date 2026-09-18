@@ -1,0 +1,9 @@
+# Feature sets scripts/check-vendor.sh --build compiles this crate with, one
+# per line, each warning-free. The patch touches client code shared by h1 and
+# h2 and a module gated on them, so every client/protocol combination is here.
+"client", "http1"
+"client", "http2"
+"client", "http1", "http2"
+"server", "http1"
+"server", "http2"
+"client", "server", "http1", "http2"

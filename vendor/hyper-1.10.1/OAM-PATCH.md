@@ -4,10 +4,19 @@ This directory is hyper **1.10.1** as published on crates.io, plus one fix.
 The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
-  `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`. That is
-  the checksum Cargo.lock recorded before the swap. Commit `258e0e9` adds the
-  extracted crate byte for byte. Check it with
-  `git diff 258e0e9 -- vendor/hyper-1.10.1`.
+  `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
+  (`OAM-PATCH.sha256`). That is the checksum Cargo.lock recorded before the
+  swap; a path dependency gets none.
+- **The patch:** `OAM-PATCH.diff`, against the unpacked crate.
+- **The gate:** `scripts/check-vendor.sh`, run by `scripts/ci-local.sh`
+  step 11. It takes the published crate (cargo's download cache, else
+  static.crates.io), checks the sha256, applies `OAM-PATCH.diff`, and fails
+  unless the result equals this directory byte for byte (the `OAM-PATCH.*`
+  files aside). With `--build` it also compiles this copy, warning-free, for
+  each feature set in `OAM-PATCH.features`. Nothing else gates this
+  directory: it is outside the workspace (no fmt, clippy or tests) and outside
+  the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
+  --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix. To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
@@ -18,7 +27,8 @@ The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 ## The diff
 
-Everything else in this directory is upstream's.
+Everything else in this directory is upstream's. `OAM-PATCH.diff` is the
+whole of it.
 
 1. **`src/client/dispatch.rs`, `impl Drop for Receiver`.** After the existing
    `taker.cancel()`, the drop now:
@@ -31,15 +41,18 @@ Everything else in this directory is upstream's.
    Dropping an envelope answers its callback with the error the channel
    already uses for this case: `Canceled("connection closed")`, with the
    request handed back.
-2. **`Cargo.toml`, `[dependencies.tokio]`.** The version changes from `"1"` to
+2. **`src/common/mod.rs` and `src/common/task.rs`.** `common::task` (where
+   `now_or_never` lives) was compiled only with `http1`, but `Receiver::drop`
+   is client code for HTTP/1 and HTTP/2 alike, so `client` + `http2` without
+   `http1` did not compile. The module is now built for any `client` build
+   (and for `server` + `http1`, as before), and its `yield_now`, which only
+   the h1 dispatcher uses, is gated on `http1` so no build warns.
+3. **`Cargo.toml`, `[dependencies.tokio]`.** The version changes from `"1"` to
    `"1.44"` and the features from `["sync"]` to `["sync", "rt"]`. The fix
    needs `tokio::task::coop::unconstrained`, which needs both. oam already
    builds tokio 1.52.3 with `rt`, so the build graph is unchanged: the same
    packages with the same features. `Cargo.toml.orig` is left as upstream
    shipped it.
-
-`git diff 258e0e9 -- vendor/hyper-1.10.1` prints the whole patch: 28 added
-lines of code and comments, plus the manifest lines.
 
 ## Why
 

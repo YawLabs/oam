@@ -32,6 +32,11 @@
 #                                            real unsafe_count ceiling per
 #                                            crate; per-site coverage is
 #                                            clippy's job, enforced in step 3)
+#      + vendored crates                  (GATING; scripts/check-vendor.sh --
+#                                            each vendor/ crate is its
+#                                            crates.io release plus the
+#                                            reviewed OAM-PATCH.diff, and
+#                                            builds for its feature sets)
 #  12. npm/ launcher packaging            (GATING when node is present --
 #                                            manifest drift against
 #                                            [workspace.package], plus the
@@ -526,7 +531,7 @@ else
   esac
 fi
 
-say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5)"
+say "11/14 Unsafe budget (bidirectional ratchet -- AI-POLICY.md gate 5) + vendored crates"
 # GATING. Replaces the old advisory `grep -c unsafe` loop: xtask lexes out the
 # noise that grep counted (#[unsafe(...)] attributes, // SAFETY: comments, and
 # unsafe extern "C" fn(...) POINTER TYPES) and ratchets the real count. A crate
@@ -541,6 +546,21 @@ if cargo run -p xtask -- unsafe-budget; then
 else
   ko "unsafe-budget ratchet violated (see above) -- fix, or re-bless with 'cargo run -p xtask -- unsafe-budget --regen'"
 fi
+# The budget scan walks crates/ and xtask only, and vendor/ is outside the
+# workspace (no fmt, clippy or tests) with no Cargo.lock checksum. So a
+# vendored crate's one gate is this: byte-equal to its checksummed crates.io
+# release plus the committed OAM-PATCH.diff, and warning-free in every feature
+# set OAM-PATCH.features lists. Exit 2 is "could not run" (crate neither in
+# cargo's cache nor downloadable), which is not a clean result.
+set +e
+bash scripts/check-vendor.sh --build
+vendor_rc=$?
+set -e
+case "$vendor_rc" in
+  0) ok "vendored crates match their releases plus OAM-PATCH.diff" ;;
+  2) ko "vendored-crate check could not run (above) -- NOT a clean result" ;;
+  *) ko "vendored crate drifted from its release plus OAM-PATCH.diff, or does not build (above)" ;;
+esac
 
 say "12/14 npm launcher packaging (manifest drift + node --test)"
 # GATING, and compiles nothing -- seconds, not minutes.

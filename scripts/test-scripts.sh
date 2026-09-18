@@ -801,6 +801,21 @@ for want in miri_current_verdict miri_held_verdict 'OAM_MIRI_HELD_CASES\[@\]'; d
 done
 if [ -z "$WIRE_BAD" ]; then pass; else fail "ci-local.sh no longer references:$WIRE_BAD"; fi
 
+# vendor/ is outside the workspace and the unsafe-budget scan, so
+# check-vendor.sh is the only gate a vendored crate has. A ci-local.sh that
+# stopped calling it, or a vendored crate without the files it checks
+# against, would leave that crate ungated with every step still green.
+it "ci-local.sh runs the vendored-crate check, and every vendored crate carries its patch files"
+VENDOR_BAD=""
+grep -qE 'bash scripts/check-vendor\.sh --build' scripts/ci-local.sh || VENDOR_BAD="$VENDOR_BAD ci-local.sh-does-not-call-check-vendor.sh--build"
+for vdir in vendor/*/; do
+  [ -d "$vdir" ] || continue
+  for vfile in OAM-PATCH.sha256 OAM-PATCH.diff OAM-PATCH.md; do
+    [ -f "$vdir$vfile" ] || VENDOR_BAD="$VENDOR_BAD $vdir$vfile(missing)"
+  done
+done
+if [ -z "$VENDOR_BAD" ]; then pass; else fail "vendored-crate gate out of sync:$VENDOR_BAD"; fi
+
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
 # no coverage anywhere: `no-default-features` appeared in no script, no test and

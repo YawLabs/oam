@@ -11,7 +11,9 @@ pub(crate) mod either;
 pub(crate) mod future;
 pub(crate) mod io;
 pub(crate) mod lock;
-#[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
+// oam patch: also for client + http2 without http1, where the patched
+// client::dispatch::Receiver::drop uses now_or_never.
+#[cfg(any(feature = "client", all(feature = "server", feature = "http1")))]
 pub(crate) mod task;
 #[cfg(any(
     all(feature = "server", feature = "http1"),
