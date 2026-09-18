@@ -48,8 +48,11 @@
 #   - gcloud CLI authenticated; identity has roles/iap.tunnelResourceAccessor
 #     + compute.instances.get/use (and start/stop for the lifecycle step).
 #   - Firewall allows TCP:22 from 35.235.240.0/20 (IAP range).
-#   - VM image: build-essential + Node 22 (already there for yaw builds).
-#     rustup is auto-installed by scripts/build-remote.sh prep on first run.
+#   - VM image: build-essential, curl, outbound HTTPS to nodejs.org.
+#     rustup is auto-installed by scripts/build-remote.sh prep on first run,
+#     and so is the conformance oracle: exactly the Node in .node-version,
+#     cached under ~/.cache/oam-node (the image's own Node 22 is NOT used --
+#     see scripts/lib/node-pin.sh).
 # =============================================================================
 
 set -euo pipefail

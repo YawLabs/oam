@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod bench;
 mod conformance;
+mod node_pin;
 mod node_suite;
 mod unsafe_budget;
 
@@ -37,6 +38,9 @@ enum Command {
     },
     /// Run the conformance suites (WPT URL, Node differential, builtin
     /// surface) and regenerate CONFORMANCE.md + conformance/scorecard.json.
+    ///
+    /// The `node` on PATH must be exactly the version pinned in .node-version;
+    /// OAM_ALLOW_NODE_MISMATCH=1 downgrades that refusal to a warning.
     ///
     /// Pass --release to test the release binary instead of debug.
     /// Alternatively set CONFORMANCE_RELEASE=1 in the environment.

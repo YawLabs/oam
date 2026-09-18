@@ -5,8 +5,9 @@
 //   node scripts/gen-surface-gaps.mjs [path/to/oam]
 //   node scripts/gen-surface-gaps.mjs --allow-regression   (see below)
 //
-// Runs conformance/runners/surface.mjs under BOTH oam and the node on PATH,
-// then writes every Node export name oam lacks. Run it after CLOSING gaps so
+// Runs conformance/runners/surface.mjs under BOTH oam and the node running this
+// script -- which must be the version pinned in .node-version -- then writes
+// every Node export name oam lacks. Run it after CLOSING gaps so
 // the list shrinks; the conformance gate fails on a listed name that oam now
 // has, which is what stops the file from silently covering a regression.
 //
@@ -38,6 +39,45 @@ const gapsPath = join(repo, "conformance/surface-gaps.json");
 
 const args = process.argv.slice(2);
 const allowRegression = args.includes("--allow-regression");
+
+// The section this writes is committed data measured against THIS node, and the
+// conformance gate then diffs oam against it on every run -- so it must be the
+// Node pinned in .node-version, the same one the node-differential compares
+// with (rationale: scripts/lib/node-pin.sh). Checked before the build so a wrong
+// node fails in a second. Same parse as node_pin_parse / xtask's parse_pin.
+const pinFile = join(repo, ".node-version");
+let pinned;
+try {
+  const text = readFileSync(pinFile, "utf8").trim();
+  const bare = text.startsWith("v") ? text.slice(1) : text;
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(bare)) {
+    throw new Error(
+      `must hold exactly one MAJOR.MINOR.PATCH version (e.g. 22.22.2), got ${JSON.stringify(text.slice(0, 80))}`,
+    );
+  }
+  pinned = `v${bare}`;
+} catch (e) {
+  console.error(`cannot read the pinned Node version from ${pinFile}: ${e.message}`);
+  process.exit(1);
+}
+if (process.version !== pinned) {
+  if (process.env.OAM_ALLOW_NODE_MISMATCH === "1") {
+    console.error(
+      `WARNING: recording against node ${process.version}, NOT the pinned ${pinned} -- ` +
+        "continuing because OAM_ALLOW_NODE_MISMATCH=1. The section's generatedAgainst will say so.",
+    );
+  } else {
+    console.error(
+      `refusing to record: this is node ${process.version} (${process.execPath}), but ` +
+        `.node-version pins ${pinned}. The ratchet must be measured against the same Node the ` +
+        "conformance gate compares with. Run it under the pinned Node (on a build host: " +
+        "`bash scripts/build-remote.sh surface-gaps`, which provisions it), or set " +
+        "OAM_ALLOW_NODE_MISMATCH=1 for an ad-hoc run.",
+    );
+    process.exit(1);
+  }
+}
+
 let oamBin = args.find((a) => !a.startsWith("--"));
 if (!oamBin) {
   // cargo's freshness check makes this a no-op when current, and the profile

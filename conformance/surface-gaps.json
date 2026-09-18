@@ -2,11 +2,11 @@
   "_comment": "Builtin export names oam does not provide, per platform, measured against the node named in each section. A builtin's ESM named exports are its module object's own enumerable keys, so every name here is a link-time SyntaxError ('does not provide an export named X') for any program that imports it -- even one that never calls it. Bundled CLIs import the union of their dependency tree, which is how a single unused name takes down a whole program. This list GATES: on a platform with a section, a missing name absent from it fails `cargo run -p xtask -- conformance`, and so does a listed name oam now has. It may only shrink. Sections are keyed by process.platform because Node's own surface is platform-conditional (WSA* errnos on Windows, getuid/setgid on POSIX). Regenerate the current platform's section with scripts/gen-surface-gaps.mjs; it merges and never touches the others.",
   "platforms": {
     "darwin": {
-      "generatedAgainst": "v22.23.1 on darwin-arm64",
+      "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1422,
-        "missing": 362,
+        "present": 1423,
+        "missing": 361,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -500,11 +500,11 @@
       }
     },
     "linux": {
-      "generatedAgainst": "v22.23.1 on linux-x64",
+      "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1422,
-        "missing": 366,
+        "present": 1423,
+        "missing": 365,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
