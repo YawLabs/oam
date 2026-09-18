@@ -5604,9 +5604,12 @@ fn oam_without_proxy_env(args: &[&str]) -> Output {
 /// redirect loop that follows runs natively, so a granted host that answered
 /// `302 Location: http://<ungranted host>/` handed the script a response from
 /// a host it was never granted -- through `fetch`, `http.request` and
-/// `undici.request`, on the pooled route and on a `connect.lookup`-hooked one
-/// (whose hook was asked about the ungranted name and whose address answer,
-/// 127.0.0.1, WAS granted). Present in 0.16.1 and every release before it.
+/// `undici.request`, the 307 re-sent body included. That pooled-route bypass
+/// is in every release from 0.8.3 (`--allow-net`) through 0.16.1. The
+/// `connect.lookup`-hooked variant (the hook asked about the ungranted name,
+/// its granted 127.0.0.1 answer dialled) existed only on #151's owned
+/// transport before this fix: on 0.16.1 the hooked fetch never reached the
+/// ungranted host, and its hook was never asked about it.
 ///
 /// Under `--allow-net=127.0.0.1,granted.invalid`, the granted origin
 /// (127.0.0.1) redirects each request to a target named by the case:
