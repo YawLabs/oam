@@ -61,6 +61,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   affected. The destination is now checked by the same rule as `net.connect`
   (`host:port`), and a refused send fails with `ERR_ACCESS_DENIED` through the send
   callback, or `'error'` without one, and is never sent. (#151)
+- **`http` and `https` servers reported every client as `127.0.0.1`.** `req.socket`
+  carried a fixed `remoteAddress` of `127.0.0.1` and no port or family, whatever address
+  the client connected from, so anything that decides on the peer address (a
+  loopback-only route, a loopback `trust proxy` setting, per-IP allow lists and rate
+  limits) treated every client as local. `req.socket` now carries the connection's own
+  `remoteAddress`, `remotePort`, `remoteFamily`, `localAddress`, `localPort` and
+  `localFamily`, spelled as Node spells them, `address()` returns the local end, and
+  `req.connection` is the same object. The socket an `'upgrade'` listener receives now
+  reports the client's real family (it said `IPv4` for every client) and its local end.
 
 ### Fixed
 

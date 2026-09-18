@@ -1437,6 +1437,23 @@ fails every request it applies to: `fetch` with `error sending request for url (
 _(probed)_ Node v22.22.2 + undici 6.24.1 vs oam on Windows, the same scripts, unless marked
 _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 
+### 39. An HTTP server's `req.socket`: one object per request, no `'connection'` event
+
+`req.socket` on an `http` or `https` server carries the connection's own addresses, spelled as
+Node spells them: `remoteAddress` / `remotePort` / `remoteFamily`, `localAddress` /
+`localPort` / `localFamily`, and `address()` for the local end. An IPv4 client of a
+dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6`. A link-local peer carries
+its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
+and the index elsewhere, where Node writes the name. `req.connection` is the same object.
+What still differs: each request gets its own socket object, so two keep-alive requests on
+one connection see two objects where Node shows one, and the server emits no
+`'connection'` event (Node: one per connection). That socket is an `EventEmitter` that
+never emits. An `'upgrade'` listener gets a real `net.Socket` for the connection, and the
+request's `req.socket` is that socket, as in Node.
+
+_(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
+`::1`, clients from four local IPv4 and three IPv6 addresses.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is
@@ -1656,11 +1673,6 @@ comment, **not** something measured. Do not rely on either the claim or its nega
 - **`net.Socket` read-side state.** A source comment says oam's socket is always in
   flowing mode, so `_readableState.length` stays `0`. That is an internal some libraries
   (e.g. `ws`) read; not measured here.
-- **`req.socket` on an HTTP server** may be a synthetic `EventEmitter` with a fixed
-  `remoteAddress` of `127.0.0.1` rather than the real peer. Measured so far only from a
-  `127.0.0.1` client, where `remoteAddress` is right but `localAddress`, `localPort` and
-  `remotePort` are `undefined` and the server emits no `'connection'` event (Node: all
-  populated, one `'connection'`).
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.

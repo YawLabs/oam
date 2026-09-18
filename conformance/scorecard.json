@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "5cc05cc+wip",
-  "oamVersion": "oam 0.16.1",
+  "commit": "75a660a+wip",
+  "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 116,
-      "total": 116,
+      "pass": 117,
+      "total": 117,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -132,6 +132,10 @@
         },
         {
           "case": "13-zlib.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "130-http-server-peer-address.mjs",
           "status": "pass"
         },
         {

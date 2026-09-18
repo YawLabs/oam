@@ -85,8 +85,87 @@ pub struct IncomingRequest {
     pub headers: Vec<(String, String)>,
     pub is_upgrade: bool,
     pub socket_handle: Option<u64>,
-    pub remote_addr: Option<String>,
-    pub remote_port: Option<u16>,
+    /// Both ends of the connection the request arrived on.
+    pub conn: ConnAddrs,
+}
+
+/// Both ends of an accepted connection, as the OS reports them.
+///
+/// node's `req.socket` carries these (`remoteAddress` / `remotePort` /
+/// `remoteFamily`, `localAddress` / `localPort` / `localFamily`), and they
+/// are what an application's access decisions key on: loopback-only admin
+/// routes, `trust proxy` settings (proxy-addr reads `remoteAddress`), per-IP
+/// allow lists and rate limits. They are taken from the accepted socket
+/// itself, never from anything the client sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnAddrs {
+    pub remote: std::net::SocketAddr,
+    /// `None` only if the OS could not report the accepted socket's own
+    /// address (node leaves the fields undefined then too).
+    pub local: Option<std::net::SocketAddr>,
+}
+
+impl ConnAddrs {
+    /// The accept meta fields, node's names and shapes.
+    fn write_meta(&self, meta: &mut serde_json::Value) {
+        meta["remoteAddress"] = serde_json::json!(node_ip_string(&self.remote));
+        meta["remotePort"] = serde_json::json!(self.remote.port());
+        meta["remoteFamily"] = serde_json::json!(node_family(&self.remote));
+        if let Some(local) = &self.local {
+            meta["localAddress"] = serde_json::json!(node_ip_string(local));
+            meta["localPort"] = serde_json::json!(local.port());
+            meta["localFamily"] = serde_json::json!(node_family(local));
+        }
+    }
+}
+
+/// `IPv4` / `IPv6` from the socket's address family, as node reports it. An
+/// IPv4 client of a dual-stack `::` listener arrives as a v4-mapped IPv6
+/// address, and node reports that as `IPv6` -- so the family comes from the
+/// socket address, never from the address's IPv4-ness.
+fn node_family(addr: &std::net::SocketAddr) -> &'static str {
+    match addr {
+        std::net::SocketAddr::V4(_) => "IPv4",
+        std::net::SocketAddr::V6(_) => "IPv6",
+    }
+}
+
+/// An address as node's `remoteAddress` / `localAddress` spell it
+/// (src/tcp_wrap.cc AddressToJS): `inet_ntop` text, a v4-mapped IPv6 address
+/// left mapped (`::ffff:127.0.0.1`; Rust's `Ipv6Addr` Display writes that
+/// form too), and a link-local IPv6 address with a nonzero scope id
+/// suffixed `%<interface>` -- the index on Windows, the interface name on
+/// POSIX (`uv_if_indextoiid`).
+pub fn node_ip_string(addr: &std::net::SocketAddr) -> String {
+    match addr {
+        std::net::SocketAddr::V4(v4) => v4.ip().to_string(),
+        std::net::SocketAddr::V6(v6) => {
+            let ip = v6.ip();
+            let scope = v6.scope_id();
+            if scope != 0 && ip.is_unicast_link_local() {
+                format!("{ip}%{}", interface_id(scope))
+            } else {
+                ip.to_string()
+            }
+        }
+    }
+}
+
+/// `uv_if_indextoiid`: the scope id itself on Windows, the interface name on
+/// POSIX. Linux names come from sysfs; where the name cannot be found (or
+/// on a POSIX system without sysfs, macOS among them) the index is written,
+/// which still names the interface unambiguously.
+fn interface_id(scope: u32) -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let index = std::fs::read_to_string(entry.path().join("ifindex"));
+            if index.ok().and_then(|s| s.trim().parse::<u32>().ok()) == Some(scope) {
+                return entry.file_name().to_string_lossy().into_owned();
+            }
+        }
+    }
+    scope.to_string()
 }
 
 /// An inbound request body as the JS side will consume it.
@@ -536,6 +615,10 @@ pub async fn http_serve(
                         drop(stream);
                         continue;
                     };
+                    let conn_addrs = ConnAddrs {
+                        remote: peer,
+                        local: stream.local_addr().ok(),
+                    };
 
                     // Peek for Connection: Upgrade before hyper takes ownership.
                     let mut peek_buf = [0u8; 8192];
@@ -579,8 +662,7 @@ pub async fn http_serve(
                                     headers,
                                     is_upgrade: true,
                                     socket_handle: Some(handle),
-                                    remote_addr: Some(peer.ip().to_string()),
-                                    remote_port: Some(peer.port()),
+                                    conn: conn_addrs,
                                 })
                                 .await;
                         }
@@ -602,6 +684,7 @@ pub async fn http_serve(
                                 conn_queue.clone(),
                                 req,
                                 conn_stream_bodies, // per-server opt-in
+                                conn_addrs,
                             )
                         });
                         let conn = hyper::server::conn::http1::Builder::new()
@@ -824,6 +907,7 @@ async fn handle_request(
     queue: mpsc::Sender<IncomingRequest>,
     req: hyper::Request<hyper::body::Incoming>,
     stream_request_body: bool,
+    conn: ConnAddrs,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     let (parts, body) = req.into_parts();
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -931,8 +1015,7 @@ async fn handle_request(
             headers,
             is_upgrade: false,
             socket_handle: None,
-            remote_addr: None,
-            remote_port: None,
+            conn,
         })
         .await;
     if sent.is_err() {
@@ -1014,10 +1097,16 @@ pub async fn https_serve(
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer)) = accepted else { continue };
                     let Ok(permit) = connections.clone().try_acquire_owned() else {
                         drop(stream);
                         continue;
+                    };
+                    // Taken from the TCP socket before the TLS handshake
+                    // wraps it: the peer is the TCP peer, as in node.
+                    let conn_addrs = ConnAddrs {
+                        remote: peer,
+                        local: stream.local_addr().ok(),
                     };
                     let Some(conn_acceptor) = acceptor.clone() else {
                         tokio::spawn(async move {
@@ -1042,6 +1131,7 @@ pub async fn https_serve(
                                 conn_queue.clone(),
                                 req,
                                 false, // TLS: buffered until a later slice
+                                conn_addrs,
                             )
                         });
                         let conn = hyper::server::conn::http1::Builder::new()
@@ -1120,15 +1210,10 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "uri": request.uri,
                 "headers": request.headers,
             });
+            request.conn.write_meta(&mut meta);
             if request.is_upgrade {
                 meta["isUpgrade"] = serde_json::json!(true);
                 meta["socketHandle"] = serde_json::json!(request.socket_handle);
-                if let Some(addr) = &request.remote_addr {
-                    meta["remoteAddress"] = serde_json::json!(addr);
-                }
-                if let Some(port) = request.remote_port {
-                    meta["remotePort"] = serde_json::json!(port);
-                }
             }
             super::OpOutcome::Json(meta.to_string())
         }
@@ -1177,10 +1262,14 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
+                    let Ok((stream, peer)) = accepted else { continue };
                     let Ok(permit) = connections.clone().try_acquire_owned() else {
                         drop(stream);
                         continue;
+                    };
+                    let conn_addrs = ConnAddrs {
+                        remote: peer,
+                        local: stream.local_addr().ok(),
                     };
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
@@ -1220,6 +1309,7 @@ pub async fn http2_serve(state: Arc<HttpState>, host: String, port: u16) -> supe
                                 conn_queue.clone(),
                                 req,
                                 false, // http2: buffered until a later slice
+                                conn_addrs,
                             )
                         });
 
@@ -1318,6 +1408,87 @@ pub async fn http_body_push(
             state.end_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    fn meta_for(remote: &str, local: Option<&str>) -> serde_json::Value {
+        let conn = ConnAddrs {
+            remote: remote.parse().unwrap(),
+            local: local.map(|l| l.parse().unwrap()),
+        };
+        let mut meta = serde_json::json!({});
+        conn.write_meta(&mut meta);
+        meta
+    }
+
+    #[test]
+    fn ipv4_peers_are_dotted_quads() {
+        let meta = meta_for("192.168.1.55:60884", Some("192.168.1.55:60881"));
+        assert_eq!(
+            meta,
+            serde_json::json!({
+                "remoteAddress": "192.168.1.55", "remotePort": 60884, "remoteFamily": "IPv4",
+                "localAddress": "192.168.1.55", "localPort": 60881, "localFamily": "IPv4",
+            })
+        );
+    }
+
+    /// node keeps an IPv4 client of a dual-stack listener v4-mapped, with
+    /// family IPv6 (measured: `::ffff:127.0.0.1` / `IPv6`). Unmapping it
+    /// would change what an allow list compares against.
+    #[test]
+    fn a_v4_mapped_peer_stays_mapped_and_ipv6() {
+        let meta = meta_for("[::ffff:127.0.0.1]:60888", Some("[::ffff:127.0.0.1]:60887"));
+        assert_eq!(meta["remoteAddress"], "::ffff:127.0.0.1");
+        assert_eq!(meta["remoteFamily"], "IPv6");
+        assert_eq!(meta["localAddress"], "::ffff:127.0.0.1");
+        assert_eq!(meta["localFamily"], "IPv6");
+    }
+
+    #[test]
+    fn ipv6_peers_are_compressed() {
+        let meta = meta_for("[2600:6c51:403f:4249:0:0:0:1045]:1", None);
+        assert_eq!(meta["remoteAddress"], "2600:6c51:403f:4249::1045");
+        assert_eq!(meta["remoteFamily"], "IPv6");
+        assert!(
+            meta.get("localAddress").is_none(),
+            "no local end, no fields"
+        );
+    }
+
+    /// A link-local peer carries its interface (node: `fe80::...%18` on
+    /// Windows). Only link-local addresses do; a global one with a scope id
+    /// does not.
+    #[test]
+    fn a_link_local_peer_carries_its_scope() {
+        let ll = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::b222:28be:4382:9993".parse().unwrap(),
+            5000,
+            0,
+            18,
+        ));
+        let text = node_ip_string(&ll);
+        assert!(text.starts_with("fe80::b222:28be:4382:9993%"), "{text}");
+        #[cfg(windows)]
+        assert_eq!(text, "fe80::b222:28be:4382:9993%18");
+        let unscoped = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            5000,
+            0,
+            0,
+        ));
+        assert_eq!(node_ip_string(&unscoped), "fe80::1");
+        let global = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            5000,
+            0,
+            7,
+        ));
+        assert_eq!(node_ip_string(&global), "2001:db8::1");
     }
 }
 

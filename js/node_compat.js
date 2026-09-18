@@ -17325,10 +17325,31 @@
         // An EventEmitter, not a bare object: handlers register error/close
         // listeners on req.socket (test-stream-pipeline does), and Node's
         // socket is an emitter even when oam never surfaces events on it.
-        this.socket = Object.assign(new EventEmitter(), {
-          remoteAddress: "127.0.0.1",
-          encrypted: false,
+        //
+        // The addresses are the accepted connection's own, from the native
+        // accept record: node's net.Socket fields, spelled as node spells
+        // them (an IPv4 client of a dual-stack `::` server is
+        // `::ffff:a.b.c.d` / 'IPv6'). Applications gate on these --
+        // loopback-only routes, `trust proxy` (proxy-addr reads
+        // req.socket.remoteAddress), per-IP limits -- so an absent record
+        // leaves them undefined, as on an unconnected node socket; nothing
+        // is ever filled in.
+        const socket = Object.assign(new EventEmitter(), {
+          remoteAddress: meta.remoteAddress,
+          remotePort: meta.remotePort,
+          remoteFamily: meta.remoteFamily,
+          localAddress: meta.localAddress,
+          localPort: meta.localPort,
+          localFamily: meta.localFamily,
         });
+        // net.Socket#address(): the LOCAL end, {address, family, port}.
+        socket.address = function address() {
+          if (this.localAddress === undefined) return {};
+          return { address: this.localAddress, family: this.localFamily, port: this.localPort };
+        };
+        this.socket = socket;
+        // node's deprecated alias, the same object.
+        this.connection = socket;
         this._requestId = meta.requestId;
         this._bodyPushed = false;
         this._bodyDone = false;
@@ -17754,16 +17775,29 @@
                 if (meta === undefined) break;
                 if (meta.isUpgrade && meta.socketHandle !== undefined) {
                   const NetSocket = registry.get("net").Socket;
+                  // The accepted connection's real ends (never a stand-in:
+                  // an upgrade handler's address checks read these).
                   const socket = new NetSocket({
                     _handle: meta.socketHandle,
                     _remoteAddr: {
-                      address: meta.remoteAddress || "127.0.0.1",
-                      port: meta.remotePort || 0,
-                      family: "IPv4",
+                      address: meta.remoteAddress,
+                      port: meta.remotePort,
+                      family: meta.remoteFamily,
                     },
+                    _localAddr:
+                      meta.localAddress === undefined
+                        ? undefined
+                        : {
+                            address: meta.localAddress,
+                            port: meta.localPort,
+                            family: meta.localFamily,
+                          },
                   });
                   socket._readLoop();
                   const req = new IncomingMessage(meta);
+                  // node: the upgrade request's socket IS the socket handed
+                  // to the 'upgrade' listener.
+                  req.socket = req.connection = socket;
                   this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0));
                 } else {
                   const req = new IncomingMessage(meta);
@@ -21029,7 +21063,9 @@
                 const meta = await natives.httpAccept(bound.serverId);
                 if (meta === undefined) break;
                 const req = new http.IncomingMessage(meta);
-                req.socket = { remoteAddress: "127.0.0.1", encrypted: true };
+                // The request's socket carries the TCP connection's real
+                // addresses (the accept record); a TLS socket is `encrypted`.
+                req.socket.encrypted = true;
                 const res = new http.ServerResponse(meta.requestId);
                 this.emit("request", req, res);
               }
