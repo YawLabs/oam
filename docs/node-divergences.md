@@ -236,6 +236,24 @@ Differences from Node's model:
   bad-option error. That is the cost of the grant, and it is deliberate. Both take their
   list with `=`, not a space; the space form is rejected with a hint rather than being
   read as the script path.
+- **`--allow-net` is checked on every host an HTTP request reaches**, not only the one
+  the script named. `fetch`, `http.request`, a verifying `https.request` and
+  `undici.request` run on oam's HTTP client, which follows redirects itself (entry 38),
+  and each hop's host is checked against the grant before it is dialled, before a
+  `connect.lookup` hook is asked to resolve it, and whether or not the request goes
+  through an environment proxy (the destination is checked, not the proxy). A refused
+  hop is never contacted, and the request fails with the same `ERR_ACCESS_DENIED` error a
+  direct request to that host gets -- not wrapped in `TypeError: fetch failed`, so
+  `err.code` and `err.resource` read the same whichever hop was refused; `http.request`
+  emits it as `'error'`. Up to 0.16.1 only the initial URL was checked, and a granted
+  host's redirect reached any host. What these requests compare is the URL's host as the
+  URL parser normalises it, without the port: `LOCALHOST`, `%6c%6fcalhost` and `0x7f.1`
+  are checked as `localhost`, `localhost` and `127.0.0.1`, and an IPv6 literal as
+  `[::1]` (so a grant names it in brackets). A trailing dot is not dropped, so
+  `localhost.` is refused under `--allow-net=localhost`. Because the port is not part of
+  their resource, a port-scoped entry such as `--allow-net=127.0.0.1:8080` admits
+  `net.connect` and `tls.connect` to that port but none of these requests; grant the
+  bare host to allow them.
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
@@ -1239,7 +1257,9 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   grant, exactly as a URL naming that address directly would be -- so
   `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
   `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
-  allows it. Node has no `--permission` net grant to compare against.
+  allows it. A redirect hop's host is checked against the grant too (entry 4), before the
+  hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
+  `--permission` net grant to compare against.
 
 **Redirects**
 
