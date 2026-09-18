@@ -16496,6 +16496,78 @@ process.exit(0);
     );
 }
 
+/// `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })` takes the
+/// URL's hostname WITHOUT its brackets, as node's urlToHttpOptions does. oam
+/// kept them: the connect then failed everywhere with `invalid server name
+/// '[::1]'` (the brackets reached the TLS server name), and a refused one
+/// reported `getaddrinfo ENOTFOUND [::1]` off Windows, whose getaddrinfo is
+/// the only one that resolves the bracketed form (conformance case 110 on the
+/// macOS and Linux legs). The Host header is node's: the IPv6 literal
+/// bracketed, then `:port` for a port other than 443 -- oam sent a bare
+/// `::1`. Every line was measured on node v22.22.2 (Windows) with this script.
+#[test]
+fn https_get_ipv6_url_connects_to_the_bare_address_and_sends_node_s_host() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+setTimeout(() => {{ console.log('TIMEOUT'); process.exit(3); }}, 20000).unref();
+
+const hosts = [];
+const server = tls.createServer({{ cert, key }}, (s) => {{
+  let seen = '';
+  s.on('data', (d) => {{
+    seen += d;
+    if (seen.includes('\r\n\r\n')) {{
+      hosts.push(/\r\nhost: ([^\r]*)/i.exec(seen)?.[1]);
+      s.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
+    }}
+  }});
+  s.on('error', () => {{}});
+}});
+await new Promise((r) => server.listen(0, '::1', r));
+const port = server.address().port;
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+function get(...args) {{
+  return new Promise((resolve) => {{
+    const req = https.get(...args, (res) => {{
+      let b = '';
+      res.on('data', (d) => (b += d));
+      res.on('end', () => resolve(res.statusCode + ' ' + b));
+    }});
+    req.on('error', (e) => resolve(P(JSON.stringify([e.code, e.syscall, e.address, e.hostname, e.message]))));
+  }});
+}}
+console.log('url=' + await get(`https://[::1]:${{port}}/`, {{ rejectUnauthorized: false }}));
+console.log('options=' + await get({{ hostname: '::1', port, rejectUnauthorized: false }}));
+console.log('hosts=' + P(JSON.stringify(hosts)));
+await new Promise((r) => server.close(r));
+console.log('refused=' + await get(`https://[::1]:${{port}}/`, {{ rejectUnauthorized: false }}));
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("https_get_ipv6_url.mjs", &src);
+    let output = oam(&["run", file.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "url=200 ok\n\
+         options=200 ok\n\
+         hosts=[\"[::1]:PORT\",\"[::1]:PORT\"]\n\
+         refused=[\"ECONNREFUSED\",\"connect\",\"::1\",null,\"connect ECONNREFUSED ::1:PORT\"]",
+        "stderr: {stderr}"
+    );
+}
+
 /// Issue #132: Node's tls.TLSSocket extends net.Socket, so a TLS socket
 /// carries the whole socket API; oam's did not (no shared base), and ioredis
 /// crashed over rediss:// on its first `stream.setNoDelay(true)`. Every

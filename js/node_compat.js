@@ -21071,7 +21071,15 @@
         var parsed = typeof url === "string" ? new URL(url) : url;
         if (typeof options === "function") { callback = options; options = {}; }
         options = Object.assign({}, options);
-        options.hostname = options.hostname || parsed.hostname;
+        // node's urlToHttpOptions: a URL's IPv6 hostname loses its brackets
+        // before it reaches tls.connect and the resolver. POSIX getaddrinfo
+        // does not resolve `[::1]` (Windows' does), so keeping them failed
+        // `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })`
+        // with `getaddrinfo ENOTFOUND [::1]` off Windows, where node connects
+        // to ::1 (conformance case 110 on the macOS leg).
+        var urlHostname = parsed.hostname;
+        if (urlHostname.charAt(0) === "[") urlHostname = urlHostname.slice(1, -1);
+        options.hostname = options.hostname || urlHostname;
         options.port = options.port || parsed.port || 443;
         options.path = options.path || parsed.pathname + parsed.search;
         options.protocol = "https:";
@@ -21203,7 +21211,22 @@
           // Content-Length fields are an RFC 7230 / request-smuggling hazard).
           // We force a single Connection: close (no keep-alive reuse here).
           var reqStr = self.method + " " + path + " HTTP/1.1\r\n";
-          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : host) + "\r\n";
+          // node's ClientRequest Host header: an IPv6 literal bracketed (two
+          // or more colons, not already bracketed), then `:port` unless it is
+          // https' default 443. Measured on node v22.22.2: `https.get` to
+          // `https://[::1]:PORT/` and to `{ hostname: '::1', port: PORT }`
+          // both send `Host: [::1]:PORT`; oam sent a bare `::1`.
+          var hostHeader = String(host);
+          var firstColon = hostHeader.indexOf(":");
+          if (
+            firstColon !== -1 &&
+            hostHeader.indexOf(":", firstColon + 1) !== -1 &&
+            hostHeader.charAt(0) !== "["
+          ) {
+            hostHeader = "[" + hostHeader + "]";
+          }
+          if (port && port !== 443) hostHeader += ":" + port;
+          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : hostHeader) + "\r\n";
           var hkeys = Object.keys(lc);
           for (var i = 0; i < hkeys.length; i++) {
             var hk = hkeys[i];
