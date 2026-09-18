@@ -451,6 +451,31 @@ pub fn fetch_net_check(
     ))
 }
 
+/// The net resource a `connect.lookup` hook's answer is checked as: the host
+/// a URL naming that address serializes to, so one grant spelling covers the
+/// address whether a script names it in a URL or a hook answers with it.
+///
+/// IPv4 is dotted-quad. IPv6 is bracketed and in the URL parser's canonical
+/// form -- `::1`, `0:0:0:0:0:0:0:1` and `::0:1` are all `[::1]`, and
+/// `::ffff:127.0.0.1` is `[::ffff:7f00:1]` (the WHATWG form; Rust's own
+/// Display keeps the dotted tail, which a URL check never produces). It was
+/// the raw answer, so `--allow-net=[::1]` (what `http://[::1]/` needs) refused
+/// a hook answering `::1`, and only the unbracketed `::1`, which no URL check
+/// ever matches, admitted it. An answer that is not an address is checked
+/// as given; the transport refuses to dial it anyway.
+pub fn lookup_answer_resource(answer: &str) -> String {
+    match answer.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let bracketed = format!("[{v6}]");
+            ada_url::Url::parse(&format!("http://{bracketed}/"), None)
+                .map(|url| url.hostname().to_string())
+                .unwrap_or(bracketed)
+        }
+        Err(_) => answer.to_string(),
+    }
+}
+
 /// Caller-facing descriptor for `JsRuntime::with_permissions`.
 /// Each field is `None` (default: granted) | `Some(true)` (granted) |
 /// `Some(false)` (denied) | list of strings (whitelist).
@@ -756,6 +781,49 @@ mod tests {
             assert_eq!(by_ada.as_deref(), Some(host), "ada: {raw}");
             assert_eq!(by_url.as_deref(), Some(host), "url: {raw}");
         }
+    }
+
+    /// A hook's answer is checked as the host a URL naming that address
+    /// serializes to, so it matches what `op_fetch` checks for the URL.
+    #[test]
+    fn a_lookup_answer_is_checked_as_a_url_naming_it_would_be() {
+        for (answer, resource) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("10.9.9.9", "10.9.9.9"),
+            ("::1", "[::1]"),
+            ("0:0:0:0:0:0:0:1", "[::1]"),
+            ("::0:1", "[::1]"),
+            ("FE80::1", "[fe80::1]"),
+            ("::ffff:127.0.0.1", "[::ffff:7f00:1]"),
+            ("2001:db8:0:0:1:0:0:1", "[2001:db8::1:0:0:1]"),
+            // Not an address: checked as given (the transport will not dial it).
+            ("not-an-ip", "not-an-ip"),
+        ] {
+            assert_eq!(lookup_answer_resource(answer), resource, "{answer}");
+            if resource.starts_with('[') {
+                let url = format!("http://{resource}/");
+                assert_eq!(
+                    ada_url::Url::parse(&url, None).unwrap().hostname(),
+                    resource,
+                    "{answer}: a URL naming it reads the same host"
+                );
+            }
+        }
+        let p = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
+            "granted.test",
+            "[::1]",
+        ]))));
+        // `[::1]` is the grant a URL needs, and now a hook answer too.
+        assert!(p.check_net(&lookup_answer_resource("::1")).is_ok());
+        assert!(p.check_net(&lookup_answer_resource("0::1")).is_ok());
+        assert!(p.check_net(&lookup_answer_resource("::2")).is_err());
+        let unbracketed =
+            std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec!["::1"]))));
+        assert!(
+            unbracketed
+                .check_net(&lookup_answer_resource("::1"))
+                .is_err()
+        );
     }
 
     #[test]

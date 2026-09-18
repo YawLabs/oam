@@ -5422,6 +5422,104 @@ try {
     server.join().unwrap();
 }
 
+/// Two properties of the hook-answer gate above.
+///
+/// An IPv6 answer is checked as a URL naming that address is -- bracketed,
+/// in the URL parser's canonical form -- so the one grant that admits
+/// `http://[::1]/` (`[::1]`) also admits a hook answering `::1` (or any
+/// spelling of it), and the unbracketed `::1`, which no URL check ever
+/// matches, admits neither. The answer used to be checked as the raw string,
+/// so no single grant spelling admitted both routes.
+///
+/// A refused answer does not leave its fetch parked. The op threw before it
+/// consumed the parked entry, and nothing abandoned it, so the fetch's state
+/// (transport, route, headers, an untaken request body) stayed pinned for the
+/// rest of the run. The script wraps `fetchContinue` to learn the token and
+/// asks `fetchAbandon` afterwards whether anything was still there.
+#[test]
+fn a_connect_lookup_ipv6_answer_is_checked_bracketed_and_a_refusal_is_not_left_parked() {
+    let script = write_temp(
+        "lookup_permission_v6/main.mjs",
+        r#"import { Agent } from 'undici';
+const port = Number(process.argv[2]);
+const answer = process.argv[3];
+const internal = globalThis.__oam;
+const continueOp = internal.fetchContinue;
+const tokens = [];
+internal.fetchContinue = (token, json) => {
+  tokens.push(token);
+  return continueOp.call(internal, token, json);
+};
+const family = answer.includes(':') ? 6 : 4;
+const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: answer, family }]) } });
+try {
+  const r = await fetch(`http://granted.invalid:${port}/`, { dispatcher: agent });
+  console.log('ALLOWED', r.status, await r.text());
+} catch (e) {
+  console.log(e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `FAILED ${e.name}: ${e.message}`);
+}
+console.log('continued', tokens.length, 'still parked', tokens.some((t) => internal.fetchAbandon(t)));
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let run = |grant: &str, port: u16, answer: &str| {
+        let out = oam(&[
+            "--permission",
+            grant,
+            "--",
+            &path,
+            &port.to_string(),
+            answer,
+        ]);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // Refused (the address is not granted), and released.
+    let (stdout, stderr) = run("--allow-net=granted.invalid", 1234, "10.9.9.9");
+    assert_eq!(
+        stdout, "DENIED \"10.9.9.9\"\ncontinued 1 still parked false",
+        "stderr: {stderr}"
+    );
+    // The unbracketed spelling matches no URL, and no longer a hook answer:
+    // refused as the URL `http://[::1]/` is, naming the same resource.
+    let (stdout, stderr) = run("--allow-net=granted.invalid,::1", 1234, "::1");
+    assert_eq!(
+        stdout, "DENIED \"[::1]\"\ncontinued 1 still parked false",
+        "stderr: {stderr}"
+    );
+
+    // The bracketed grant admits the answer, in any spelling, and it
+    // connects. Needs a [::1] listener; a box without IPv6 loopback skips it.
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("no [::1] on this host: the admitted half is not exercised");
+        return;
+    };
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { continue };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+        }
+    });
+    for answer in ["::1", "0:0:0:0:0:0:0:1"] {
+        let (stdout, stderr) = run("--allow-net=granted.invalid,[::1]", port, answer);
+        assert_eq!(
+            stdout, "ALLOWED 200 ok\ncontinued 1 still parked false",
+            "answer {answer}; stderr: {stderr}"
+        );
+    }
+    server.join().unwrap();
+}
+
 /// A thread-per-connection HTTP/1.1 server for the redirect-permission test:
 /// each connection is one request (head plus a content-length body), recorded
 /// as `METHOD target`, answered with `reply(target)` and closed.

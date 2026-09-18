@@ -1257,7 +1257,9 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   grant, exactly as a URL naming that address directly would be -- so
   `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
   `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
-  allows it. A redirect hop's host is checked against the grant too (entry 4), before the
+  allows it. An IPv6 answer is checked bracketed and canonical, as a URL's host is: a hook
+  answering `::1` (or `0:0:0:0:0:0:0:1`) needs the same `[::1]` grant that
+  `http://[::1]/` does. A redirect hop's host is checked against the grant too (entry 4), before the
   hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
   `--permission` net grant to compare against.
 

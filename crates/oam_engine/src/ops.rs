@@ -385,8 +385,14 @@ fn op_fetch(
 /// `127.0.0.1` used to be a grant to connect ANYWHERE -- to loopback, to a
 /// link-local metadata address, to an RFC 1918 host -- while the wire still
 /// carried the granted name. An address is checked exactly as a URL naming it
-/// directly would be, so `--allow-net=127.0.0.1` still admits a hook that
-/// answers `127.0.0.1`, and `--allow-net` (all) costs nothing.
+/// directly would be ([`crate::permissions::lookup_answer_resource`]: an IPv6
+/// answer bracketed and canonical), so `--allow-net=127.0.0.1` still admits a
+/// hook that answers `127.0.0.1`, `--allow-net=[::1]` one that answers `::1`,
+/// and `--allow-net` (all) costs nothing.
+///
+/// A refused answer drops the parked fetch before the op throws. The op is
+/// what consumes the entry, and bootstrap.js does not abandon after a throw,
+/// so without that the fetch's state stayed parked for the rest of the run.
 fn op_fetch_continue(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -414,7 +420,10 @@ fn op_fetch_continue(
         // reports it, with its own message.
         if let Ok(parsed) = serde_json::from_str::<Answer>(&answer) {
             for ip in &parsed.ips {
-                if let Err(denial) = permissions.check_net(ip) {
+                let resource = crate::permissions::lookup_answer_resource(ip);
+                if let Err(denial) = permissions.check_net(&resource) {
+                    let continuations = core_runtime!(scope).fetch_continuations();
+                    oam_core::ops::fetch_abandon(token, &continuations);
                     crate::node_ops::throw_permission_denied(scope, &denial);
                     return;
                 }
