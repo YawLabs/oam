@@ -41,6 +41,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `docs/node-divergences.md` entry 4: on the host alone, so a port-scoped entry
   (`--allow-net=127.0.0.1:8080`) admits `net.connect` to that port but no HTTP request.
   (#143, #151)
+- **A bracketed IPv6 grant admitted any host name that began with it.** Under
+  `--allow-net=[::1]`, the grant matcher read a target such as
+  `[::1].127.0.0.1.nip.io:443` as `[::1]` (it stopped at the first `]`), while
+  `net.connect`, `tls.connect` and `https.request` with `rejectUnauthorized: false` handed
+  the whole name to the system resolver, so a wildcard DNS name starting with the granted
+  literal reached any address it resolved to (measured on macOS, 0.16.1: a connection to
+  127.0.0.1, which the same grant refuses by name). `fetch`, `http.request` and WebSocket
+  were not affected: they check the URL parser's hostname, which can never start with `[`.
+  Present since 0.15.0, when net grants became exact matches; before that the raw prefix
+  match admitted the same names. A bracketed entry now matches only the literal itself,
+  alone or followed by `:<port>`. (#151)
 
 ### Fixed
 

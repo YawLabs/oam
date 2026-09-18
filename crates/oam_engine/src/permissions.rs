@@ -92,10 +92,30 @@ fn path_eq_fold(a: &str) -> String {
 
 /// Split `host[:port]` into its host part, tolerating a bracketed IPv6
 /// literal (`[::1]:8080`), whose host half itself contains colons.
+///
+/// The bracketed form is taken ONLY when the `]` ends the string or is
+/// followed by `:<port>`. Anything else after it returns the target WHOLE, so
+/// it can never equal a bare `[...]` entry. It used to split at the first `]`
+/// and ignore the rest: `[::1].evil.example:80` read as `[::1]`, while the
+/// connect ops hand the full name to getaddrinfo, so `--allow-net=[::1]`
+/// admitted whatever a wildcard DNS name starting with `[::1].` resolves to
+/// (on macOS `[::1].127.0.0.1.nip.io` connected to 127.0.0.1 under it).
 fn host_of(hostport: &str) -> &str {
-    if let Some(end) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
-        // `[::1]:8080` -> `[::1]`
-        return &hostport[..=end];
+    if hostport.starts_with('[') {
+        let Some(end) = hostport.find(']') else {
+            return hostport;
+        };
+        let is_port = |p: &str| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+        };
+        let rest = &hostport[end + 1..];
+        let bracketed = rest.is_empty() || rest.strip_prefix(':').is_some_and(is_port);
+        // `[::1]:8080` -> `[::1]`; `[::1].evil:80`, `[::1]x:80` -> whole.
+        return if bracketed {
+            &hostport[..=end]
+        } else {
+            hostport
+        };
     }
     match hostport.rsplit_once(':') {
         // A bare IPv6 literal has several colons and no port; leave it whole.
@@ -588,6 +608,47 @@ mod tests {
         );
         assert!(p.check_net("[::1]:8080").is_ok());
         assert!(p.check_net("[::2]:8080").is_err());
+    }
+
+    #[test]
+    fn net_allowlist_bracketed_entry_does_not_admit_a_name_that_merely_starts_with_it() {
+        // The connect ops check `{host}:{port}` and dial `host` through
+        // getaddrinfo, so a target whose host only BEGINS with `[::1]` is a
+        // DNS name (`[::1].127.0.0.1.nip.io` resolves to 127.0.0.1 on macOS)
+        // and must never be read as the bracketed literal.
+        let p = perms(
+            PermValue::None,
+            PermValue::List(vec!["[::1]".to_string()]),
+            PermValue::None,
+        );
+        for target in [
+            "[::1].evil.example:80",
+            "[::1].127.0.0.1.nip.io:443",
+            "[::1]x:80",
+            "[::1]]:80",
+            "[::1]:80:90",
+            "[::1]:",
+            "[::1]:99999",
+            "[::1]:+80",
+            "[::1].evil.example",
+            "[::1",
+        ] {
+            assert!(p.check_net(target).is_err(), "{target} must be refused");
+            assert_eq!(p.query_state("net", Some(target)), "denied", "{target}");
+        }
+        // The literal itself, with and without a port, is still the grant.
+        assert!(p.check_net("[::1]").is_ok());
+        assert!(p.check_net("[::1]:0").is_ok());
+        assert!(p.check_net("[::1]:65535").is_ok());
+        // A port-scoped bracketed entry is still pinned to its port.
+        let scoped = perms(
+            PermValue::None,
+            PermValue::List(vec!["[::1]:8080".to_string()]),
+            PermValue::None,
+        );
+        assert!(scoped.check_net("[::1]:8080").is_ok());
+        assert!(scoped.check_net("[::1]:8081").is_err());
+        assert!(scoped.check_net("[::1]:8080.evil.example:80").is_err());
     }
 
     // ------------------------------------------- fetch: every hop, one rule

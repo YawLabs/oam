@@ -22948,6 +22948,60 @@ fn allow_net_list_is_scoped_to_the_listed_host() {
     );
 }
 
+/// A bracketed IPv6 grant (`--allow-net=[::1]`) admits that literal and
+/// nothing that merely STARTS with it. The matcher used to split a target at
+/// its first `]` and drop the rest, so `[::1].<anything>:<port>` compared equal
+/// to the grant, while the connect ops handed the whole name to getaddrinfo:
+/// on macOS `[::1].127.0.0.1.nip.io` connected to 127.0.0.1 under this grant,
+/// through `net.connect`, `tls.connect` and `https.request` with
+/// `rejectUnauthorized: false`. Here the name is `.invalid`, so the unfixed
+/// build fails at DNS (`ENOTFOUND`) instead of the permission layer: the
+/// assertion is on WHICH layer refused, which is the whole defect.
+#[test]
+fn allow_net_bracketed_ipv6_grant_does_not_admit_a_name_starting_with_it() {
+    let script = write_temp(
+        "net_permission_bracket_prefix.mjs",
+        r#"import net from 'node:net';
+import tls from 'node:tls';
+import https from 'node:https';
+const host = '[::1].oam-test.invalid';
+const port = 9;
+const fmt = (e) => e && e.code === 'ERR_ACCESS_DENIED'
+  ? `DENIED ${e.permission} ${JSON.stringify(e.resource)}`
+  : `ERR ${e?.code}`;
+const attempt = (name, start) => new Promise((res) => {
+  try {
+    const h = start();
+    h.on('error', (e) => { console.log(name, fmt(e)); res(); });
+    h.on('connect', () => { console.log(name, 'CONNECTED'); h.destroy(); res(); });
+    h.on('secureConnect', () => { console.log(name, 'CONNECTED'); h.destroy(); res(); });
+    if (typeof h.end === 'function' && name === 'https.request') h.end();
+  } catch (e) {
+    console.log(name, fmt(e));
+    res();
+  }
+});
+await attempt('net.connect', () => net.connect({ host, port }));
+await attempt('tls.connect', () => tls.connect({ host, port, servername: 'x.test', rejectUnauthorized: false }));
+await attempt('https.request', () => https.request({ hostname: host, port, servername: 'x.test', rejectUnauthorized: false }));
+"#,
+    );
+    let path = script.to_string_lossy().to_string();
+    let out = oam(&["--permission", "--allow-net=[::1]", "--", &path]);
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let resource = "\"[::1].oam-test.invalid:9\"";
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "net.connect DENIED Net {resource}\n\
+             tls.connect DENIED Net {resource}\n\
+             https.request DENIED Net {resource}"
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ------------------------------------------------- fs.watchFile / unwatchFile
 //
 // Timing-dependent (the poller is an interval), so these live here rather than
