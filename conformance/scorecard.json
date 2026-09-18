@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "75a660a+wip",
+  "commit": "3a3318b",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 117,
-      "total": 117,
+      "pass": 120,
+      "total": 120,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -136,6 +136,18 @@
         },
         {
           "case": "130-http-server-peer-address.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "131-http-server-request-framing.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "132-http-server-max-header-size.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "133-http-client-response-header-limit.mjs",
           "status": "pass"
         },
         {

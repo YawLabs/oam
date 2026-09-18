@@ -1454,6 +1454,35 @@ request's `req.socket` is that socket, as in Node.
 _(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
 `::1`, clients from four local IPv4 and three IPv6 addresses.
 
+### 40. The HTTP server's request parser: what still differs
+
+The server applies Node's rules for the framing of a request -- `Content-Length` with
+`Transfer-Encoding`, a repeated `Content-Length`, a coding after `chunked`, bare-LF line
+endings and obs-fold are all `400`, on plain and upgrade requests -- and Node's
+`maxHeaderSize` count (`431`), with `insecureHTTPParser` / `--insecure-http-parser`
+relaxing what Node's relaxes. The parser underneath is hyper's, so some heads still get a
+different answer:
+
+- **oam refuses, Node accepts:** `Transfer-Encoding` on an HTTP/1.0 request; request lines
+  with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an empty `Transfer-Encoding` next to
+  `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
+  and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
+  `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
+  values and `Transfer-Encoding` codings other than a final `chunked` stay refused.
+- **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
+  HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
+  implement).
+- A malformed chunked body gets no `400`: the handler was already running, so the request
+  stream errors and the connection closes.
+- A refused head is answered with `content-length: 0` and `date` headers next to
+  `connection: close` (Node: `Connection: close` alone), except on the upgrade path, which
+  writes Node's bytes. There is no `'clientError'` event.
+- A head that never ends is refused once it outgrows hyper's read buffer, four times the
+  limit (64 KiB for the default), rather than when its count crosses the limit.
+
+_(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
+request heads over TCP.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is
