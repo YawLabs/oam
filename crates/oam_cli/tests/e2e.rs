@@ -15215,7 +15215,8 @@ console.log('ear_listeners=' + ear.listenerCount('test'));
         "Agent=function",
         "agent_keepAlive=true",
         "agent_maxSockets=Infinity",
-        "agent_getName=x.com:443",
+        // node's getName: host:port:localAddress, the last field empty.
+        "agent_getName=x.com:443:",
         "maxHeaderSize=16384",
         "validateName=ok",
         "validateValue=ok",
@@ -18274,9 +18275,12 @@ server.close();
 
 // Drive an https (rejectUnauthorized:false) client against a raw TLS server
 // that writes a fixed (possibly malformed/truncated) HTTP/1.1 response then
-// closes. `resp_js` is a JS string literal for the bytes to send. Asserts the
-// request surfaces an error whose code contains `expect_code`.
-fn https_client_error_case(name: &str, resp_js: &str, expect_code: &str) {
+// closes. `resp_js` is a JS string literal for the bytes to send. Asserts how
+// the exchange ends, `expect` being node's (v22.22.2, measured): a response
+// the peer cuts short is `aborted` -- 'aborted' on the response, never its
+// 'end', and no error on the request -- while a malformed chunk-size line is
+// also a parse error on the request, which comes first.
+fn https_client_error_case(name: &str, resp_js: &str, expect: &str) {
     let src = r#"
 import tls from 'node:tls';
 import https from 'node:https';
@@ -18293,6 +18297,7 @@ let result = 'none';
 const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, (res) => {
   res.on('data', () => {});
   res.on('end', () => { if (result === 'none') result = 'end'; });
+  res.on('aborted', () => { if (result === 'none') result = 'aborted'; });
 });
 req.on('error', (e) => { if (result === 'none') result = 'error:' + (e && e.code); });
 await new Promise((r) => setTimeout(r, 800));
@@ -18312,12 +18317,8 @@ server.close();
         out.status
     );
     assert!(
-        stdout.contains("result=error:"),
-        "expected an error, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(expect_code),
-        "expected code {expect_code}, got: {stdout}"
+        stdout.contains(&format!("result={expect}")),
+        "expected result={expect}, got: {stdout}"
     );
 }
 
@@ -18328,7 +18329,7 @@ fn https_client_content_length_truncation_errors() {
     https_client_error_case(
         "https_len_trunc.mjs",
         r#"'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort'"#,
-        "result=error:",
+        "aborted",
     );
 }
 
@@ -18339,7 +18340,7 @@ fn https_client_chunked_truncation_errors() {
     https_client_error_case(
         "https_chunk_trunc.mjs",
         r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n'"#,
-        "result=error:",
+        "aborted",
     );
 }
 
@@ -18350,7 +18351,7 @@ fn https_client_malformed_chunk_size_errors() {
     https_client_error_case(
         "https_chunk_bad.mjs",
         r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nGG\r\nxxxx\r\n'"#,
-        "HPE_INVALID_CHUNK_SIZE",
+        "error:HPE_INVALID_CHUNK_SIZE",
     );
 }
 

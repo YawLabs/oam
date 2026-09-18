@@ -244,6 +244,42 @@ async fn eof_mid_body_fails_the_body() {
     .await;
 }
 
+/// A malformed chunk-size line fails the body with node's coded parse error
+/// (the fetch path keeps its one text for every body failure).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_chunk_size_is_a_coded_body_error() {
+    within(async {
+        let reg = Reg::new();
+        let id = reg.start(json!({ "method": "GET", "target": "/", "headers": [["host", "h"]] }));
+        let head = reg.response(id);
+        reg.written_until(id, "\r\n\r\n").await;
+        // All in one read, and the connection stays open: the bad size line
+        // alone fails the body.
+        reg.feed(
+            id,
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nGG\r\nxxxx\r\n",
+        )
+        .await;
+        let p = payload(head.await.unwrap());
+        let handle = p["bodyHandle"].as_u64().unwrap();
+        let outcome = body::read(
+            reg.bodies.clone(),
+            reg.cancelled.clone(),
+            reg.signal.clone(),
+            handle,
+        )
+        .await;
+        assert_eq!(
+            node_failure(outcome),
+            (
+                "HPE_INVALID_CHUNK_SIZE".to_string(),
+                "Parse Error: Invalid character in chunk size".to_string()
+            )
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_status_line_is_a_coded_parse_error() {
     within(async {

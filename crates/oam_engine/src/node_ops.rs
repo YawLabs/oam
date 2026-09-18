@@ -2953,7 +2953,9 @@ fn op_http_bridge_response(
 }
 
 /// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
-/// or undefined at the end.
+/// or undefined at the end. Unref'd: it waits on hyper, which may never
+/// write again (a response whose body nobody reads), and the socket's own
+/// read is what keeps a live connection's process running, as in node.
 fn op_http_bridge_out(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2961,7 +2963,7 @@ fn op_http_bridge_out(
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
     let bridges = core_runtime!(scope).http_bridges();
-    crate::ops::spawn_op(
+    crate::ops::spawn_op_unref(
         scope,
         &mut rv,
         oam_core::http_client::bridge::out(bridges, id),

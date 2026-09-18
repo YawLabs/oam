@@ -311,7 +311,7 @@ pub async fn response(
         .map(|(name, value)| (name.as_str().to_string(), latin1(value.as_bytes())))
         .collect();
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    lock(&bodies).insert(handle, FetchBody::new(response.into_body(), None));
+    lock(&bodies).insert(handle, FetchBody::coded(response.into_body()));
     OpOutcome::Json(
         serde_json::json!({
             "status": status.as_u16(),
