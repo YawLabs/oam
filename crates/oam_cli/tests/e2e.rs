@@ -5693,6 +5693,13 @@ await show('malformed', () => node.tcpConnect('localhost', port, 250, JSON.strin
 await show('not an ip', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ips: ['nope'] })));
 const c = await node.netResolve('localhost', 0, true);
 await show('ticket', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: c.token })));
+// The resolver resolves only a name the grant covers.
+try {
+  await node.netResolve('ungranted.invalid', 0, true, port);
+  console.log('ungranted resolve RESOLVED');
+} catch (e) {
+  console.log('ungranted resolve', e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `${e.name}: ${e.message}`);
+}
 "#,
     );
     let path = script.to_str().unwrap().to_string();
@@ -5716,7 +5723,8 @@ await show('ticket', () => node.tcpConnect('localhost', port, 250, JSON.stringif
          after drop Error: tcpConnect: resolve ticket TOKEN is gone\n\
          malformed TypeError: tcpConnect: the address spec must be {{ticket}} or {{ips}}\n\
          not an ip Error: tcpConnect: pin ip 'nope' is not an IP\n\
-         ticket CONNECTED"
+         ticket CONNECTED\n\
+         ungranted resolve DENIED \"ungranted.invalid:{port}\""
     );
     let redacted: String = stdout
         .lines()
@@ -6036,6 +6044,71 @@ secure.close();
          connections after refusal 0\n\
          crlf error ERR_INVALID_CHAR\n\
          injected header reached the server false"
+    );
+}
+
+/// What an upgrade request reads off its socket is bounded, as node's parser
+/// bounds it: a response head that never ends fails with
+/// `HPE_HEADER_OVERFLOW` once it passes 16 KiB, and a non-101 answer whose
+/// body nobody reads stops the socket being read. Both used to grow without
+/// limit.
+#[test]
+fn an_upgrade_response_is_bounded() {
+    let src = r#"import http from 'node:http';
+import net from 'node:net';
+function hostile(kind) {
+  const server = net.createServer((sock) => {
+    sock.on('error', () => {});
+    sock.once('data', () => {
+      sock.write(kind === 'head' ? 'HTTP/1.1 101 Switching Protocols\r\nX-Long: ' : 'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n');
+      const chunk = Buffer.alloc(64 * 1024, 97);
+      const pump = () => {
+        while (server.sent < 64 * 1024 * 1024) {
+          server.sent += chunk.length;
+          if (!sock.write(chunk)) return sock.once('drain', pump);
+        }
+      };
+      pump();
+    });
+  });
+  server.sent = 0;
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}
+const headers = { Connection: 'Upgrade', Upgrade: 'websocket' };
+{
+  const server = await hostile('head');
+  const started = Date.now();
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, headers });
+    req.on('upgrade', () => resolve('upgraded?!'));
+    req.on('error', (e) => resolve(`error ${e.code} fast=${Date.now() - started < 5000}`));
+    req.end();
+  });
+  console.log('endless head:', result);
+  server.close();
+}
+{
+  const server = await hostile('body');
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, headers });
+    req.on('response', (res) => {
+      res.pause();
+      setTimeout(() => {
+        resolve(`response ${res.statusCode}, unread body bounded=${server.sent < 32 * 1024 * 1024}`);
+        req.destroy();
+      }, 1500);
+    });
+    req.on('error', (e) => resolve(`error ${e.code}`));
+    req.end();
+  });
+  console.log('unread body:', result);
+  server.close();
+}
+"#;
+    assert_eq!(
+        run_ok("http_upgrade_bounds.mjs", src).replace("\r\n", "\n"),
+        "endless head: error HPE_HEADER_OVERFLOW fast=true\n\
+         unread body: response 200, unread body bounded=true"
     );
 }
 
@@ -6455,8 +6528,10 @@ console.log(lines.join('\n'));
             "fetch ip 200 inner /fetch/ip",
             "fetch hex 200 inner /fetch/hex",
             r#"fetch307 localhost DENIED Net "localhost""#,
-            r#"http localhost DENIED Net "localhost""#,
-            "http ip 200 inner /http/ip",
+            // http.request follows no redirect, as in node: the 3xx is the
+            // response, and neither hop is dialled.
+            "http localhost 302 ",
+            "http ip 302 ",
             r#"undici localhost DENIED Net "localhost""#,
             "undici ip 200 inner /undici/ip",
             r#"hook denied DENIED Net "denied.invalid""#,
@@ -6477,7 +6552,6 @@ console.log(lines.join('\n'));
         [
             "GET /fetch/ip",
             "GET /fetch/hex",
-            "GET /http/ip",
             "GET /undici/ip",
             "GET /hook/granted",
         ]
@@ -6486,10 +6560,11 @@ console.log(lines.join('\n'));
         assert!(seen.is_empty(), "a refused IPv6 hop was dialled: {seen:?}");
     }
 
-    // No --permission, and a bare --allow-net: the redirects are followed.
+    // No --permission, and a bare --allow-net: fetch and undici follow the
+    // redirects; http.request still returns the 3xx.
     let followed = [
         "fetch localhost 200 inner /fetch/localhost",
-        "http localhost 200 inner /http/localhost",
+        "http localhost 302 ",
         "undici localhost 200 inner /undici/localhost",
         "hook denied 200 inner /hook/denied",
         r#"hook-calls ["granted.invalid","denied.invalid"]"#,
@@ -6499,7 +6574,7 @@ console.log(lines.join('\n'));
     for flags in [&[][..], &["--permission", "--allow-net"][..]] {
         let (stdout, stderr, inner_seen, _) = run(flags, "off");
         assert_eq!(stdout, followed, "{flags:?} stderr: {stderr}");
-        assert_eq!(inner_seen.len(), 4, "{flags:?}: {inner_seen:?}");
+        assert_eq!(inner_seen.len(), 3, "{flags:?}: {inner_seen:?}");
     }
 }
 
@@ -17429,10 +17504,10 @@ process.exit(0);
 /// its pin to the handshake and, for a range with nothing to offer, binds and
 /// refuses each handshake with the alert (the shape that used to hang the
 /// client -- bounded here by the harness timeout); https.request validates
-/// the options synchronously on both of its paths, carries the pin on the
-/// non-verifying one, and says ONCE, on stderr, that the verifying path's
-/// shared client does not take it. All measured on Node v22.22.2 except the
-/// warning, which is oam's own.
+/// the options synchronously and carries the pin, verifying or not: a request
+/// with a pin goes over tls.connect, which honours it, so the warning the
+/// shared client used to print about dropping it has nothing left to say.
+/// All measured on Node v22.22.2.
 #[test]
 fn https_min_max_version_threads_pins_and_warns_once_on_the_shared_client() {
     let src = format!(
@@ -17496,10 +17571,11 @@ function viaRequest(opts) {{
 console.log('rejectFalseMax1.2=' + await viaRequest({{ rejectUnauthorized: false, maxVersion: 'TLSv1.2' }}));
 console.log('rejectFalseSp1.2=' + await viaRequest({{ rejectUnauthorized: false, secureProtocol: 'TLSv1_2_method' }}));
 console.log('rejectFalseDefault=' + await viaRequest({{ rejectUnauthorized: false }}));
+// A verifying request carries its pin too.
+console.log('verifyingMax1.2=' + await viaRequest({{ ca: cert, servername: 'localhost', maxVersion: 'TLSv1.2' }}));
 await new Promise((r) => echo.close(r));
 
-// The verifying path: a pin that changes nothing stays quiet; one that would
-// change the negotiated version warns, once, however many times it is asked.
+// No pin is dropped any more, so nothing warns about one.
 let warnings = 0;
 process.on('warning', (w) => {{ if (String(w.message).includes('minVersion, maxVersion and secureProtocol are not applied')) warnings++; }});
 function verifying(opts) {{
@@ -17567,14 +17643,18 @@ process.exit(0);
         stdout.contains("rejectFalseDefault=proto=TLSv1.3"),
         "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("verifyingMax1.2=proto=TLSv1.2"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("quietPins=0"), "stdout: {stdout}");
-    assert!(stdout.contains("loudPins=1"), "stdout: {stdout}");
+    assert!(stdout.contains("loudPins=0"), "stdout: {stdout}");
     assert_eq!(
         stderr
             .matches("minVersion, maxVersion and secureProtocol are not applied")
             .count(),
-        1,
-        "the shared-client warning prints once.\nstderr: {stderr}"
+        0,
+        "no pin is dropped, so nothing warns.\nstderr: {stderr}"
     );
 }
 

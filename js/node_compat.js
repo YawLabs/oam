@@ -17995,6 +17995,39 @@
       return registry.cache.get("dns").lookup !== registry._dnsLookupOriginal;
     }
 
+    // A wrapped socket layer -- net.createConnection or
+    // net.Socket.prototype.connect for http, tls.connect or
+    // TLSSocket.prototype.connect for https -- is how instrumentation and
+    // some guards see every connection node's agents open; the agent path
+    // goes through it, oam's own client does not. (A wrapped
+    // net.Socket.prototype.connect is not reached by oam's tls.connect,
+    // whose TLSSocket is not a net.Socket subclass.)
+    function socketLayerPatched(https) {
+      if (https) {
+        var tls = registry.get("tls");
+        var tlsStock = registry._tlsStock;
+        return tls.connect !== tlsStock.connect ||
+          tls.TLSSocket.prototype.connect !== tlsStock.socketConnect;
+      }
+      var net = registry.get("net");
+      var netStock = registry._netStock;
+      return net.createConnection !== netStock.createConnection ||
+        net.Socket.prototype.connect !== netStock.socketConnect;
+    }
+
+    // TLS options node applies per connection and oam's own client cannot
+    // (its shared HTTPS client verifies with one trust store and one range):
+    // a request carrying any of them goes over tls.connect, which honours
+    // them. A `checkServerIdentity` -- a certificate pin -- above all.
+    function carriesTlsPolicy(options) {
+      return options.rejectUnauthorized === false ||
+        options.ca != null || options.cert != null || options.key != null ||
+        options.pfx != null || options.servername != null ||
+        typeof options.checkServerIdentity === "function" ||
+        options.minVersion != null || options.maxVersion != null ||
+        options.secureProtocol != null;
+    }
+
     function isSocketLike(socket) {
       return socket !== null && typeof socket === "object" &&
         typeof socket.on === "function" && typeof socket.write === "function" &&
@@ -18304,7 +18337,8 @@
           (!agent && typeof opts.createConnection === "function") ||
           (!literal && merged.lookup != null) ||
           (!literal && dnsLookupReplaced()) ||
-          (protocol === "https:" && merged.rejectUnauthorized === false);
+          socketLayerPatched(protocol === "https:") ||
+          (protocol === "https:" && carriesTlsPolicy(merged));
         this._options = opts;
         this._port = port;
         this._fetchSocket = null;
@@ -18537,11 +18571,18 @@
         socket._httpMessage = this;
         this._attachSocketListeners(socket);
         this.emit("socket", socket);
-        this._socketEmitted = true;
-        if (this._pendingDispatch !== null) {
-          if (this._agentPath) this._maybeStartExchange();
-          else this._runFetchDispatch();
-        }
+        // node's name lookup answers a thread-pool round trip after
+        // 'socket', so a listener attached a little later -- after an await
+        // in an async 'socket' handler -- still sees 'lookup' and 'connect'.
+        // The decision on how to send waits a macrotask for the same reason.
+        var self = this;
+        globalThis.setImmediate(function () {
+          self._socketEmitted = true;
+          if (self._pendingDispatch !== null) {
+            if (self._agentPath) self._maybeStartExchange();
+            else self._runFetchDispatch();
+          }
+        });
       }
 
       _runFetchDispatch() {
@@ -18618,6 +18659,11 @@
           // node's http.request has no Fetch-spec bad-port block: port 1
           // or 25 is dialled (and refused), not refused by the client.
           __oamFetchSemantics: false,
+          // node's http client never follows a redirect: a 3xx is the
+          // response. Following it here dialled hosts the caller never
+          // named -- and a `lookup` / 'lookup' guard, which the request's
+          // own (literal) host never needed, never saw them.
+          __oamManualRedirect: true,
         };
         if (self._bodyStream !== null) {
           fetchOpts.__oamBodyStream = self._bodyStream;
@@ -19049,6 +19095,12 @@
         socket.write(globalThis.Buffer.from(head + "\r\n", "latin1"));
         if (bodyData && bodyData.length > 0) socket.write(bodyData);
         var responseBuf = globalThis.Buffer.alloc(0);
+        // node's parser gives up on a head past maxHeaderSize (16 KiB by
+        // default): a peer that never ends its head cannot grow this buffer
+        // without bound.
+        var maxHeaderSize = typeof this._options.maxHeaderSize === "number"
+          ? this._options.maxHeaderSize
+          : 16384;
         var onEnd = function () {
           socket.removeListener("data", onData);
           self._failBeforeResponse(connResetException("socket hang up"));
@@ -19057,7 +19109,17 @@
           var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
           responseBuf = globalThis.Buffer.concat([responseBuf, bytes]);
           var headerEnd = responseBuf.indexOf("\r\n\r\n");
-          if (headerEnd === -1) return;
+          if (headerEnd === -1 || headerEnd > maxHeaderSize) {
+            if (responseBuf.length > maxHeaderSize) {
+              socket.removeListener("data", onData);
+              socket.removeListener("end", onEnd);
+              var overflow = new Error("Parse Error: Header overflow");
+              overflow.code = "HPE_HEADER_OVERFLOW";
+              self._failBeforeResponse(overflow);
+              socket.destroy();
+            }
+            return;
+          }
           socket.removeListener("data", onData);
           socket.removeListener("end", onEnd);
           var headStr = responseBuf.slice(0, headerEnd).toString("latin1");
@@ -19074,7 +19136,28 @@
             }
           }
           var parsed = agentPathHeaders(pairs);
-          var res = new Readable({ read: function () {} });
+          // A non-101 answer is read off the socket as the consumer reads
+          // it: the socket is paused while the response is full.
+          var socketPaused = false;
+          var res = new Readable({
+            read: function () {
+              if (socketPaused) {
+                socketPaused = false;
+                if (typeof socket.resume === "function") socket.resume();
+              }
+            },
+            // node's IncomingMessage._destroy, as for every other response.
+            destroy: function (err, cb) {
+              if (!res.complete) {
+                res.aborted = true;
+                res.emit("aborted");
+              }
+              process.nextTick(function () {
+                cb(res.listenerCount("error") > 0 ? err : undefined);
+              });
+            },
+          });
+          res.aborted = false;
           res.statusCode = statusCode;
           res.statusMessage = statusMatch && statusMatch[4] ? statusMatch[4] : "";
           res.httpVersion = statusMatch ? statusMatch[1] + "." + statusMatch[2] : "1.1";
@@ -19105,7 +19188,12 @@
           self._res = res;
           self.emit("response", res);
           if (remaining.length > 0) res.push(remaining);
-          socket.on("data", function (more) { res.push(more); });
+          socket.on("data", function (more) {
+            if (!res.push(more) && !socketPaused && typeof socket.pause === "function") {
+              socketPaused = true;
+              socket.pause();
+            }
+          });
           socket.on("end", function () {
             res.complete = true;
             res.push(null);
@@ -20092,7 +20180,7 @@
       // oam's resolver: the addresses come back with a ticket the connect
       // redeems, and every path that does not dial drops it.
       const family = dnsopts.family === 4 || dnsopts.family === 6 ? dnsopts.family : 0;
-      natives.netResolve(host, family, multiple).then(
+      natives.netResolve(host, family, multiple, port).then(
         (answer) => {
           const token = answer.token;
           let redeemed = false;
@@ -20807,6 +20895,11 @@
       }
       get rules() { return this._rules.slice(); }
     }
+
+    // What http's agent path needs to tell a patched socket layer (an
+    // instrumentation or guard wrapping connect) from the stock one, captured
+    // before any caller can patch it.
+    registry._netStock = { createConnection, socketConnect: Socket.prototype.connect };
 
     return {
       isIPv4, isIPv6, isIP,
@@ -22317,7 +22410,6 @@
       registry.get("tls");
       return registry._resolveTlsVersions(options);
     }
-    let httpsVersionPinWarned = false;
 
     class Server extends EventEmitter {
       constructor(options, handler) {
@@ -22433,33 +22525,17 @@
       // Node validates the version options when it builds the request's
       // SecureContext, so an invalid name or method, or a secureProtocol +
       // min/max conflict, throws here at https.request() on either path.
-      var tlsVersions = resolveTlsVersions(options);
+      resolveTlsVersions(options);
       // node: an https request's default agent is https.globalAgent (as it
       // is now, assignments included). A request with rejectUnauthorized
       // false -- like any other that carries connection policy -- goes over
       // a socket that agent's tls.connect opened, which honours every TLS
       // option; only the fetch path's shared client cannot.
+      // A version pin (like `ca`, a client certificate or a
+      // checkServerIdentity) sends the request over tls.connect, which
+      // honours it (http's carriesTlsPolicy), so no pin is dropped.
       options._defaultAgent = agents.state.httpsGlobalAgent;
-      var req = http.request(options, callback);
-      // The fetch path's shared HTTPS client negotiates the default TLS
-      // 1.2-1.3 range and takes no per-request pin (docs/node-divergences.md).
-      // A pin that would change what is negotiated is said so once, rather
-      // than silently connecting with a version the caller ruled out; the
-      // default-range spellings (minVersion TLSv1.2, maxVersion TLSv1.3,
-      // TLS_method) change nothing and stay quiet.
-      if (
-        !req._agentPath &&
-        !httpsVersionPinWarned &&
-        (tlsVersions.min === "TLSv1.3" || (tlsVersions.max !== "" && tlsVersions.max !== "TLSv1.3"))
-      ) {
-        httpsVersionPinWarned = true;
-        process.emitWarning(
-          "https.request: minVersion, maxVersion and secureProtocol are not applied to a " +
-            "verifying request in oam; the shared HTTPS client negotiates TLS 1.2-1.3 " +
-            "(YawLabs/oam#146). tls.connect honours them. See docs/node-divergences.md.",
-        );
-      }
-      return req;
+      return http.request(options, callback);
     }
 
     function get(url, options, callback) {
@@ -25918,13 +25994,21 @@
           process.nextTick(() => socket.destroy(err));
           return;
         }
-        _settleTlsConnect(socket, connecting, serverName);
+        _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized);
       };
       registry._netLookupAndConnect(socket, options, host, port, dial);
     }
 
+    // tls.checkServerIdentity: rustls has already matched the name against
+    // the certificate by the time a caller could ask, so this answers
+    // "matches"; a caller's own checkServerIdentity that calls it and then
+    // adds a pin works as in node.
+    function stubCheckServerIdentity() {
+      return undefined;
+    }
+
     // The native tls connect in flight, settled onto `socket`.
-    function _settleTlsConnect(socket, connecting, serverName) {
+    function _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized) {
       connecting.then(
         (info) => {
           socket._connectPending = false;
@@ -25966,6 +26050,25 @@
           // A 'connect' listener that destroyed the socket (a guard vetting
           // the peer) ends it there: no 'secureConnect', nothing read.
           if (socket.destroyed) return;
+          // node's onConnectSecure: a certificate the chain check accepted
+          // is handed to `checkServerIdentity(hostname, cert)` -- the
+          // caller's own identity or pinning check -- and an Error it returns
+          // makes the socket unauthorized; with rejectUnauthorized the socket
+          // is destroyed with it before 'secureConnect'. The host name check
+          // node's default does is rustls's, already applied.
+          var identityCheck = options && options.checkServerIdentity;
+          if (socket.authorized && typeof identityCheck === "function" && identityCheck !== stubCheckServerIdentity) {
+            var hostname = options.servername || options.host || "localhost";
+            var identityError = identityCheck(hostname, socket.getPeerCertificate(true));
+            if (identityError) {
+              socket.authorized = false;
+              socket.authorizationError = identityError.code || identityError.message;
+              if (rejectUnauthorized) {
+                socket.destroy(identityError);
+                return;
+              }
+            }
+          }
           socket.emit("ready");
           socket.emit("secureConnect");
           socket._startReading();
@@ -26003,9 +26106,18 @@
       // Node arms the idle timer from the option when it opens the transport
       // itself (never for a wrapped socket, which is refused here anyway).
       if (options.timeout && !options.socket) socket.setTimeout(options.timeout);
+      // node's tls.connect calls the socket's own connect(): a caller that
+      // wraps TLSSocket.prototype.connect sees every tls connection.
+      if (socket.connect !== stockTlsSocketConnect) {
+        socket.connect(options);
+        if (parsed[1]) socket.once("secureConnect", parsed[1]);
+        return socket;
+      }
       _connectTls(socket, options, parsed[1], "secureConnect");
       return socket;
     }
+    var stockTlsSocketConnect = TLSSocket.prototype.connect;
+    registry._tlsStock = { connect, socketConnect: stockTlsSocketConnect };
 
     function createSecureContext(options) {
       return Object.assign({}, options);
@@ -26172,7 +26284,7 @@
       DEFAULT_MIN_VERSION: "TLSv1.2",
       rootCertificates: [],
       getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
-      checkServerIdentity: () => undefined,
+      checkServerIdentity: stubCheckServerIdentity,
     };
   };
 

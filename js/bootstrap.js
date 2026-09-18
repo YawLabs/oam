@@ -1348,6 +1348,11 @@
       // undici's Fetch-spec bad-port block on the initial URL.
       fetch_semantics: fetchSemantics,
     };
+    // http.request (through the internal entry only) gets a 3xx as the
+    // response, as node's does: node's http client never follows a
+    // redirect, and an application that vets a URL before requesting it
+    // relies on that.
+    if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was

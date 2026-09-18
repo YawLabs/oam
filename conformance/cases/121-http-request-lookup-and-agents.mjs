@@ -25,6 +25,7 @@ import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
+import tls from "node:tls";
 
 setTimeout(() => {
   console.log("WATCHDOG");
@@ -402,6 +403,130 @@ await run("https agent with a patched createConnection", (ev) => {
   };
   return https.get({ host: "127.0.0.1", port: T4, agent });
 });
+
+console.log("==== redirects are not followed");
+{
+  // A 3xx is the response: node's http client never follows it, so a hop the
+  // caller never named is never dialled -- with or without a guard that the
+  // literal first host never needed.
+  const redirector = http.createServer((req, res) => {
+    res.writeHead(302, { location: `http://localhost:${P4}/internal` });
+    res.end();
+  });
+  await listen(redirector, "127.0.0.1");
+  const R = redirector.address().port;
+  ports.push(R);
+  await run("302, no guard", () => http.get({ host: "127.0.0.1", port: R, agent: new http.Agent() }));
+  await run("302, request lookup", (ev) =>
+    http.get({ host: "127.0.0.1", port: R, agent: new http.Agent(), lookup: hook(ev, refuse) }));
+  await run("302, default agent", () => http.get(`http://127.0.0.1:${R}/start`));
+  redirector.close();
+}
+
+console.log("==== listeners attached later");
+await run("veto in 'lookup' after an await in 'socket'", () => {
+  const req = http.get({ host: "localhost", port: P4, agent: new http.Agent() });
+  req.on("socket", async (s) => {
+    await null;
+    await null;
+    s.once("lookup", () => s.destroy(deny));
+  });
+  return req;
+}, { err: deny });
+
+console.log("==== a wrapped socket layer");
+{
+  const calls = [];
+  const original = net.Socket.prototype.connect;
+  net.Socket.prototype.connect = function (...args) {
+    calls.push("connect");
+    return original.apply(this, args);
+  };
+  await run("net.Socket.prototype.connect wrapped", () =>
+    http.get({ host: "127.0.0.1", port: P4, agent: new http.Agent() }));
+  net.Socket.prototype.connect = original;
+  console.log("  calls", j(calls));
+}
+{
+  const calls = [];
+  const original = net.createConnection;
+  net.createConnection = function (...args) {
+    calls.push(`createConnection ${args[0].host}`);
+    return original.apply(this, args);
+  };
+  await run("net.createConnection wrapped", () =>
+    http.get({ host: "127.0.0.1", port: P4, agent: new http.Agent() }));
+  net.createConnection = original;
+  console.log("  calls", j(calls));
+}
+{
+  const calls = [];
+  const original = tls.connect;
+  tls.connect = function (...args) {
+    calls.push(`tls.connect ${args[0].host}`);
+    throw deny;
+  };
+  await run("tls.connect wrapped, refusing", () =>
+    https.get({ host: "localhost", port: T4, ca: CA, agent: new https.Agent() }), { err: deny });
+  tls.connect = original;
+  console.log("  calls", j(calls));
+}
+{
+  const calls = [];
+  const original = tls.TLSSocket.prototype.connect;
+  tls.TLSSocket.prototype.connect = function (...args) {
+    calls.push(typeof args[0] === "object" ? `TLSSocket connect ${args[0].host}` : "TLSSocket connect");
+    return original.apply(this, args);
+  };
+  await run("TLSSocket.prototype.connect wrapped", () =>
+    https.get({ host: "localhost", port: T4, ca: CA, agent: new https.Agent() }));
+  tls.TLSSocket.prototype.connect = original;
+  console.log("  calls", j(calls));
+}
+
+console.log("==== TLS identity");
+const pinMismatch = Object.assign(new Error("pin mismatch"), { code: "EPIN" });
+await run("https checkServerIdentity refuses", (ev) =>
+  https.get({
+    host: "localhost",
+    port: T4,
+    ca: CA,
+    agent: new https.Agent(),
+    checkServerIdentity: (host, cert) => {
+      ev.push(`checkServerIdentity(${j(host)}, ${cert.subject.CN})`);
+      return pinMismatch;
+    },
+  }), { err: pinMismatch });
+await run("https checkServerIdentity accepts", (ev) =>
+  https.get({
+    host: "localhost",
+    port: T4,
+    ca: CA,
+    agent: new https.Agent(),
+    checkServerIdentity: (host, cert) => {
+      ev.push(`checkServerIdentity(${j(host)}, ${cert.subject.CN})`);
+      return undefined;
+    },
+  }), { tls: true });
+await run("https servername the certificate does not name", () =>
+  https.get({ host: "localhost", port: T4, ca: CA, servername: "other.example", agent: new https.Agent() }));
+{
+  const events = [];
+  const outcome = await new Promise((resolve) => {
+    const s = tls.connect({
+      host: "localhost",
+      port: T4,
+      ca: CA,
+      checkServerIdentity: (host) => {
+        events.push(`checkServerIdentity(${j(host)})`);
+        return pinMismatch;
+      },
+    });
+    s.on("secureConnect", () => resolve("secureConnect"));
+    s.on("error", (e) => resolve(`error same=${e === pinMismatch} authorized=${s.authorized} authorizationError=${s.authorizationError}`));
+  });
+  console.log("tls.connect checkServerIdentity refuses", outcome, j(events));
+}
 
 srv4.close();
 srv6.close();
