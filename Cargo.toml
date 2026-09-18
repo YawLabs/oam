@@ -12,6 +12,12 @@ members = [
     "crates/oam_aliasing_model",
     "xtask",
 ]
+# vendor/ holds patched copies of third-party crates, wired in by
+# [patch.crates-io] at the bottom of this file. They are path dependencies,
+# NOT members: without the exclude, cargo would adopt a path dependency that
+# sits under the workspace root as a member, and `--workspace` clippy and test
+# would run over upstream code (and its dev-dependencies).
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.16.1"
@@ -206,3 +212,12 @@ opt-level = 1
 # version bump to fix this -- the fix is the C++ opt level.
 [profile.dev.package.ada-url]
 opt-level = 2
+
+# hyper 1.10.1 with one fix oam cannot wait for: a request sent onto a pooled
+# HTTP/1 or HTTP/2 connection at the instant its connection task ends could be
+# stranded in hyper's dispatch channel, and its fetch then never settled.
+# vendor/hyper-1.10.1/OAM-PATCH.md has the diff, the reproduction and the
+# upstream status. Delete this entry, the exclude above and the vendor/ copy
+# when a hyper release ships the fix.
+[patch.crates-io]
+hyper = { path = "vendor/hyper-1.10.1" }
