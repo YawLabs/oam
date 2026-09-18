@@ -9295,7 +9295,7 @@ SOFTWARE.
 
 Used by:
 
-- h2 0.4.14
+- h2 0.4.19
 
 ```text
 Copyright (c) 2017 h2 authors

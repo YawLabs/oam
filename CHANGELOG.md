@@ -70,6 +70,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `localFamily`, spelled as Node spells them, `address()` returns the local end, and
   `req.connection` is the same object. The socket an `'upgrade'` listener receives now
   reports the client's real family (it said `IPv4` for every client) and its local end.
+- **The `h2` crate is updated from 0.4.14 to 0.4.19**, which bounds the number of empty
+  HTTP/2 DATA frames a peer can have queued (RUSTSEC-2026-0258, GHSA-q83h-524g-xf6h: a
+  low-severity denial of service against a stream that is not being read). oam's
+  HTTP/2 server (`http2.createServer`) and the `fetch` transport's HTTP/2 connections
+  both use it.
 
 ### Fixed
 
