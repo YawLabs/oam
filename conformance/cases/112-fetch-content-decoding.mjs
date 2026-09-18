@@ -21,6 +21,15 @@
 // node and oam both keep them: undecoded bodies and HEAD / 204 / 304. A decode
 // failure is printed as `rejected` only: node's is a TypeError "terminated",
 // oam's a plain Error.
+//
+// `/junk` (a valid gzip member followed by bytes that are not one) has no
+// content-length and the server holds its close for 250 ms, so the decode
+// error arrives while the response is still open. With a content-length and
+// an immediate close, the oracle itself sometimes never settled: node v22.22.2
+// on macOS arm64 hung at `/junk` in 4 of 60 parallel runs (its line never
+// printed; event loop idle, no client socket left), and three macOS
+// conformance runs in a row timed out on this case because of it. The printed
+// line is the same either way.
 import net from "node:net";
 
 const text = "The quick brown fox jumps over the lazy dog. ".repeat(200);
@@ -146,6 +155,9 @@ const server = net.createServer((socket) => {
       [status, lines, body, length] = [204, ["content-encoding: gzip"], Buffer.alloc(0), null];
     } else if (path === "/304") {
       [status, lines, body, length] = [304, ["content-encoding: gzip"], Buffer.alloc(0), fix.gzip.length];
+    } else if (path === "/junk") {
+      // Framed by the close, and the close is held: see the note at the top.
+      [status, lines, body, length] = [...routes[path], null];
     } else {
       [status, lines, body] = routes[path] ?? [404, [], Buffer.alloc(0)];
       length = body.length;
@@ -155,7 +167,8 @@ const server = net.createServer((socket) => {
     wire.push("connection: close", "", "");
     socket.write(wire.join("\r\n"), "latin1");
     if (method !== "HEAD" && body.length > 0) socket.write(body);
-    socket.end();
+    if (path === "/junk") setTimeout(() => socket.end(), 250);
+    else socket.end();
   });
   socket.on("error", () => {});
 });
