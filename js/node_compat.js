@@ -18818,6 +18818,14 @@
         if (this._aborted) return;
         if (!this._responded) {
           this._failBeforeResponse(err);
+          // The fetch path's stand-in destroyed with an error aborts the
+          // request there and then: a response that lands before its 'close'
+          // (a TLSSocket's comes a tick later) is dropped, not delivered after
+          // the error.
+          if (!this._agentPath) {
+            this._aborted = true;
+            this._cancelBodyStream();
+          }
         } else if (this.res && !this.res.complete && !this.res.destroyed) {
           this.res.destroy(err);
         }
