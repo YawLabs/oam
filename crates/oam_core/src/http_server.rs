@@ -619,63 +619,77 @@ pub async fn http_serve(
                         remote: peer,
                         local: stream.local_addr().ok(),
                     };
-
-                    // Peek for Connection: Upgrade before hyper takes ownership.
-                    let mut peek_buf = [0u8; 8192];
-                    let is_upgrade = match stream.peek(&mut peek_buf).await {
-                        Ok(n) if n > 16 => {
-                            find_header_end(&peek_buf[..n]).is_some()
-                                && is_connection_upgrade(&peek_buf[..n])
-                        }
-                        _ => false,
-                    };
-
-                    if is_upgrade {
-                        let n = match stream.peek(&mut peek_buf).await {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
-                        let Some(hdr_end) = find_header_end(&peek_buf[..n]) else {
-                            continue;
-                        };
-                        let consume = hdr_end + 4;
-                        let mut discard = vec![0u8; consume];
-                        if stream.read_exact(&mut discard).await.is_err() {
-                            continue;
-                        }
-                        if let Some((method, uri, headers)) =
-                            parse_upgrade_headers(&discard[..hdr_end])
-                        {
-                            let id = accept_state.next_id();
-                            let handle =
-                                accept_tcp_ids.fetch_add(1, Ordering::Relaxed);
-                            let (reader, writer) = stream.into_split();
-                            accept_tcp
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .register_stream(handle, reader, writer);
-                            let _ = queue_tx
-                                .send(IncomingRequest {
-                                    id,
-                                    method,
-                                    uri,
-                                    headers,
-                                    is_upgrade: true,
-                                    socket_handle: Some(handle),
-                                    conn: conn_addrs,
-                                })
-                                .await;
-                        }
-                        drop(permit);
-                        continue;
-                    }
-
-                    // Normal HTTP: hand to hyper.
+                    // Everything after the accept runs on the connection's
+                    // own task. The upgrade peek below waits for the client's
+                    // first bytes; run inline, it held up this loop, so one
+                    // connection that never sent anything kept every later
+                    // client from being accepted.
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
+                    let conn_tcp = accept_tcp.clone();
+                    let conn_tcp_ids = accept_tcp_ids.clone();
                     let conn_stream_bodies = stream_request_body;
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
+                        let permit = permit;
+                        // Peek for Connection: Upgrade before hyper takes
+                        // ownership. A server close() while the client has
+                        // sent nothing ends the connection here.
+                        let mut peek_buf = [0u8; 8192];
+                        let peeked = tokio::select! {
+                            peeked = stream.peek(&mut peek_buf) => peeked,
+                            _ = conn_shutdown.changed() => return,
+                        };
+                        let is_upgrade = match peeked {
+                            Ok(n) if n > 16 => {
+                                find_header_end(&peek_buf[..n]).is_some()
+                                    && is_connection_upgrade(&peek_buf[..n])
+                            }
+                            _ => false,
+                        };
+
+                        if is_upgrade {
+                            let n = match stream.peek(&mut peek_buf).await {
+                                Ok(n) => n,
+                                Err(_) => return,
+                            };
+                            let Some(hdr_end) = find_header_end(&peek_buf[..n]) else {
+                                return;
+                            };
+                            let consume = hdr_end + 4;
+                            let mut discard = vec![0u8; consume];
+                            if stream.read_exact(&mut discard).await.is_err() {
+                                return;
+                            }
+                            if let Some((method, uri, headers)) =
+                                parse_upgrade_headers(&discard[..hdr_end])
+                            {
+                                let id = conn_state.next_id();
+                                let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
+                                let (reader, writer) = stream.into_split();
+                                conn_tcp
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .register_stream(handle, reader, writer);
+                                let _ = conn_queue
+                                    .send(IncomingRequest {
+                                        id,
+                                        method,
+                                        uri,
+                                        headers,
+                                        is_upgrade: true,
+                                        socket_handle: Some(handle),
+                                        conn: conn_addrs,
+                                    })
+                                    .await;
+                            }
+                            // The upgraded socket belongs to JS now; it no
+                            // longer counts against the connection cap.
+                            drop(permit);
+                            return;
+                        }
+
+                        // Normal HTTP: hand to hyper.
                         let _permit = permit;
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let service = hyper::service::service_fn(move |req| {

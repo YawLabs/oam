@@ -303,3 +303,27 @@ fn an_ipv4_client_of_a_dual_stack_listener_stays_v4_mapped() {
     assert_eq!(seen["localAddress"], "::ffff:127.0.0.1", "{seen}");
     assert_eq!(seen["localFamily"], "IPv6", "{seen}");
 }
+
+/// A connection that has sent nothing yet does not hold up the next client.
+/// The accept loop used to wait, inline, for each new connection's first
+/// bytes (to spot an upgrade), so one silent connection -- a browser's
+/// preconnect, or anyone -- stopped the server from accepting at all.
+#[test]
+fn a_silent_connection_does_not_block_the_next_client() {
+    let server = Server::start("idle.mjs", ADDR_SERVER, &[], &[("HOST", "127.0.0.1")]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let _silent = std::net::TcpStream::connect(target).expect("connect");
+    let ex = exchange(
+        target,
+        None,
+        b"GET /next HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    let seen = json(
+        &server
+            .next_line(Duration::from_secs(5))
+            .expect("request line"),
+    );
+    assert_eq!(seen["url"], "/next");
+}
