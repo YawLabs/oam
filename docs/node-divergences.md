@@ -237,16 +237,18 @@ Differences from Node's model:
   list with `=`, not a space; the space form is rejected with a hint rather than being
   read as the script path.
 - **`--allow-net` is checked on every host an HTTP request reaches**, not only the one
-  the script named. `fetch`, `http.request`, a verifying `https.request` and
-  `undici.request` run on oam's HTTP client, which follows redirects itself (entry 38),
-  and each hop's host is checked against the grant before it is dialled, before a
-  `connect.lookup` hook is asked to resolve it, and whether or not the request goes
-  through an environment proxy (the destination is checked, not the proxy). A refused
-  hop is never contacted, and the request fails with the same `ERR_ACCESS_DENIED` error a
-  direct request to that host gets -- not wrapped in `TypeError: fetch failed`, so
-  `err.code` and `err.resource` read the same whichever hop was refused; `http.request`
-  emits it as `'error'`. Up to 0.16.1 only the initial URL was checked, and a granted
-  host's redirect reached any host. What these requests compare is the URL's host as the
+  the script named. `fetch` and `undici.request` run on oam's HTTP client, which follows
+  redirects itself (entry 38), and each hop's host is checked against the grant before it
+  is dialled, before a `connect.lookup` hook is asked to resolve it, and whether or not
+  the request goes through an environment proxy (the destination is checked, not the
+  proxy). A refused hop is never contacted, and the request fails with the same
+  `ERR_ACCESS_DENIED` error a direct request to that host gets -- not wrapped in
+  `TypeError: fetch failed`, so `err.code` and `err.resource` read the same whichever hop
+  was refused. Up to 0.16.1 only the initial URL was checked, and a granted host's
+  redirect reached any host. `http.request` and `https.request`, which followed redirects
+  on the same client up to 0.16.2, follow none now, as in Node; on oam's own client they
+  are checked like `fetch`, and emit a refusal as `'error'`. What these requests compare
+  is the URL's host as the
   URL parser normalises it, without the port: `LOCALHOST`, `%6c%6fcalhost` and `0x7f.1`
   are checked as `localhost`, `localhost` and `127.0.0.1`, and an IPv6 literal as
   `[::1]` (so a grant names it in brackets). A trailing dot is not dropped, so
@@ -1050,18 +1052,16 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
   exists, open the TLS connection with `tls.connect({ host, port })` instead.
 - **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
-  `tls.createServer`, `https.createServer` and every `https.request` sent over an agent's
-  socket (entry 39) -- a `rejectUnauthorized: false` one included (#144) -- with
-  Node's synchronous `TypeError`s and its asynchronous codes
+  `tls.createServer`, `https.createServer` and `https.request` (#144) -- which sends a
+  request carrying any of them, or `ca`, a client certificate, `servername`,
+  `checkServerIdentity` or `rejectUnauthorized: false`, over `tls.connect` (entry 39) --
+  with Node's synchronous `TypeError`s and its asynchronous codes
   (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
-  `conformance/cases/109-tls-protocol-version.mjs`. What still differs:
-  - A **verifying `https.request` on oam's own client** (the default: `rejectUnauthorized`
-    not `false`, and nothing that sends it over an agent's socket, entry 39) goes
-    through one shared HTTPS client, which negotiates the default TLS 1.2-1.3 range and takes
-    no per-request `minVersion` / `maxVersion` / `secureProtocol` -- nor `ca`. The options are
-    validated (the same throws as Node), and a pin that would change the negotiated version
-    prints one `Warning` per process rather than being silently dropped. `tls.connect` honours
-    the pin; a per-request client keyed by these options is the fix (#146).
+  `conformance/cases/109-tls-protocol-version.mjs`. `tls.connect` calls a
+  `checkServerIdentity` after the chain check, as Node does, and destroys the socket with
+  its error before `'secureConnect'`. Up to 0.16.2 a verifying `https.request` went through
+  one shared client that applied none of these (a version pin printed a `Warning`), and
+  `tls.connect` never called `checkServerIdentity`. What still differs:
   - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
     which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
     either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).
@@ -1473,9 +1473,13 @@ the parser -- whenever the request carries connection-level policy Node applies 
 socket: an agent whose `addRequest`, `createSocket` or `createConnection` is not the stock
 one (a subclass that overrides it, or a patched instance or prototype), an
 `options.createConnection`, a `lookup` in the request's or the agent's options, a replaced
-`dns.lookup`, https with `rejectUnauthorized: false`, an upgrade, or `'lookup'` /
-`'connect'` / `'secureConnect'` listeners on `req.socket` when the request is dispatched.
-Guard packages that vet the destination in any of those places (request-filtering-agent,
+`dns.lookup`, a wrapped `net.createConnection` / `net.Socket.prototype.connect` (http) or
+`tls.connect` / `tls.TLSSocket.prototype.connect` (https), https with a TLS option oam's own
+client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`,
+`servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), an
+upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
+request is dispatched -- one macrotask after `'socket'`, so a listener added after an
+`await` in an async `'socket'` handler counts. Guard packages that vet the destination in any of those places (request-filtering-agent,
 ssrf-req-filter, a `'connect'` listener checking `remoteAddress`) therefore run, and what
 they refuse never reaches the wire, matching Node
 (`conformance/cases/121-http-request-lookup-and-agents.mjs`). Every other request stays on
@@ -1496,7 +1500,14 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   #148). Redirects are not followed and bodies are not decoded, as in Node.
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
-  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. `req.destroy()` without an error emits no
+  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
+  `maxHeaderSize` (or 16 KiB), counted as Node's parser counts it -- reason phrase, header
+  names and values, refused at a count at or over the limit -- and fails with Node's
+  `Parse Error: Header overflow` (`HPE_HEADER_OVERFLOW`, `reason` `Header overflow`), but
+  without its `bytesParsed` / `rawPacket` (`conformance/cases/123-http-request-max-header-size.mjs`).
+  A `101` head is measured as it arrives, CRLFs included, so it trips a few bytes before
+  Node's count would. `insecureHTTPParser` is validated as in Node but relaxes nothing
+  (it does not lift the limit in Node either). `req.destroy()` without an error emits no
   `'socket hang up'` error (Node does, before a response). An upgrade's head is written
   by hand, so a header value carrying CR or LF fails that request with Node's
   `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).

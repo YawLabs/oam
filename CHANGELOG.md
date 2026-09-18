@@ -33,11 +33,25 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `http.request` and `https.request` sent every request through oam's own HTTP client,
   so a custom or patched agent -- the way request-filtering-agent, ssrf-req-filter and
   similar packages vet a destination -- was never called, and neither were
-  `options.createConnection` or listeners on `req.socket`. A request that carries such
-  connection policy now goes over the socket the agent returns, as in node. So does
-  `https.request` with `rejectUnauthorized: false`, which ignored the agent too, and an
-  upgrade request. Such requests open a new connection each and send
-  `Connection: close` (oam keeps no agent socket pool yet).
+  `options.createConnection`, a wrapped `net.createConnection` / `tls.connect`, or
+  listeners on `req.socket`. A request that carries such connection policy now goes over
+  the socket the agent returns, as in node. So does `https.request` with
+  `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. Such
+  requests open a new connection each and send `Connection: close` (oam keeps no agent
+  socket pool yet). Their response heads are held to node's `maxHeaderSize`, and
+  `http.request` now takes node's per-request `maxHeaderSize` and `insecureHTTPParser`
+  options, validated as node validates them; an oversized head fails the request with
+  node's own `HPE_HEADER_OVERFLOW` error.
+- **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
+  response; oam's followed it, so a request whose URL an application had vetted could
+  end at a host it never named. It now returns the `3xx`, as node does.
+- **TLS options of `https.request` were not applied.** A verifying `https.request` went
+  through one shared client that ignored the request's `ca`, client certificate,
+  `servername` and `checkServerIdentity`, and `tls.connect` never called a
+  `checkServerIdentity` either, so a certificate pin or a private CA an application set
+  was not enforced. `tls.connect` now calls it after the chain check and fails the
+  connection with its error, and an `https.request` carrying any of these options goes
+  over `tls.connect`.
 - **`req.socket` did not name the connection.** A `ClientRequest`'s socket reported the
   host as written, `localAddress` `127.0.0.1` and `localPort` `0`, so a check of
   `req.socket.remoteAddress` / `res.socket.remoteAddress` against a list of internal
