@@ -1095,9 +1095,10 @@
   function fetchFailed(e) {
     // A --permission refusal is not a network failure: the initial URL's
     // denial reaches the caller as the ERR_ACCESS_DENIED error itself, and a
-    // refusal raised later (the connect.lookup hook's addresses, checked when
-    // the fetch resumes) has to look the same or a policy failure reads as an
-    // unreachable host.
+    // refusal raised later (a redirect hop's host, which the native loop
+    // rejects with that same error; the connect.lookup hook's addresses,
+    // checked when the fetch resumes) has to look the same or a policy
+    // failure reads as an unreachable host.
     if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
     return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
   }
