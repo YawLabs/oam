@@ -263,6 +263,34 @@ build_mac_x64() {
     || die "Rosetta 2 not installed -- run: softwareupdate --install-rosetta --agree-to-license  (or set OAM_SKIP_MAC_X64=1 to drop the mac-x64 asset)"
   # --force-non-host: rustup refuses a foreign-host toolchain without it.
   rustup toolchain install stable-x86_64-apple-darwin --profile minimal --force-non-host
+  # The C toolchain runs NATIVE (arm64), not under Rosetta. Command Line Tools
+  # 27.0 ships libxcrun.dylib, clang and ld as arm64/arm64e only, so every
+  # /usr/bin shim (cc, ar, xcrun, ...) that an x86_64 process launches -- and
+  # rustc, cargo and every build script here ARE x86_64 -- inherits x86_64,
+  # fails to dlopen libxcrun, and the link dies before any code is built
+  # ("fat file, but missing compatible architecture (have 'arm64,arm64e',
+  # need 'x86_64')"). An arm64 clang/ld handed `-arch x86_64` (rustc and the
+  # cc crate both pass it) links a genuine x86_64 binary, so only the tools'
+  # own architecture changes: cargo, rustc and the build scripts still run
+  # x86_64 under Rosetta, which is what makes the V8 snapshot x64. The
+  # wrappers go first on PATH (rustc's default linker is `cc`, the cc crate
+  # finds `ar` and `xcrun` by name), and SDKROOT is resolved natively up front
+  # because rustc and the cc crate would otherwise ask an x86_64 `xcrun`.
+  local tools="target/x64-host/arm64-tools" tool
+  mkdir -p "$tools"
+  tools="$(cd "$tools" && pwd)"
+  for tool in cc c++ clang clang++ ar ranlib ld libtool strip nm xcrun lipo; do
+    [ -x "/usr/bin/$tool" ] || continue
+    printf '#!/bin/sh\nexec /usr/bin/arch -arm64 /usr/bin/%s "$@"\n' "$tool" > "$tools/$tool"
+    chmod +x "$tools/$tool"
+  done
+  local sdkroot
+  sdkroot="$(/usr/bin/arch -arm64 /usr/bin/xcrun --sdk macosx --show-sdk-path)" \
+    || die "could not resolve the macOS SDK path (xcrun --show-sdk-path)"
+  PATH="$tools:$PATH" SDKROOT="$sdkroot" \
+  CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$tools/cc" \
+  CC_x86_64_apple_darwin="$tools/cc" CXX_x86_64_apple_darwin="$tools/c++" \
+  AR_x86_64_apple_darwin="$tools/ar" \
   CARGO_TARGET_DIR=target/x64-host \
     cargo +stable-x86_64-apple-darwin build --release --target x86_64-apple-darwin -p oam_cli
   mkdir -p dist
