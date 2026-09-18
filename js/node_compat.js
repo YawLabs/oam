@@ -19066,7 +19066,10 @@
       // node's parser limit for this request's response head: its own
       // maxHeaderSize, or (0 / absent) the process-wide one.
       _maxHeaderSizeLimit() {
-        return this.maxHeaderSize || registry.get("http").maxHeaderSize;
+        var limit = this.maxHeaderSize || registry.get("http").maxHeaderSize;
+        // (node's http.maxHeaderSize is a read-only getter; a reassigned
+        // one here must not unbound the head or break the request.)
+        return Number.isSafeInteger(limit) && limit > 0 ? limit : 16384;
       }
 
       // Bytes between the socket and the bridge. The socket is paused while
