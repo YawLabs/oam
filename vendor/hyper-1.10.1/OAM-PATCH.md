@@ -88,21 +88,27 @@ future as soon as it completes.
 ## Reproduction
 
 The regression tests are in `crates/oam_core/tests/http_client_stale_pool.rs`.
-All counts below are from the Windows arm64 dev box, on 2026-09-18.
+All counts below are from 2026-09-18.
 
 - `a_send_racing_the_dispatcher_teardown_is_answered` runs the exact
   interleaving in memory: an idle connection reads a FIN and finishes, then
   one thread drops it while another sends on it.
-  - Stock 1.10.1: 309 to 525 requests stranded out of 20,000, and the test
-    failed in 5 of 5 runs.
-  - Patched: 0 stranded out of 300,000 rounds.
+  - Stock 1.10.1: the test failed 5 of 5 runs on Windows arm64 (309 to 525
+    of 20,000 requests stranded) and 5 of 5 runs on an M-series Mac (15 to
+    66 stranded).
+  - Patched: 0 stranded, both platforms. That covers 300,000 extra rounds
+    on Windows.
 - `a_request_racing_a_closing_pooled_connection_settles` is the end-to-end
   shape, through oam's transport and a loopback server that answers and then
   sends a FIN.
-  - Stock: failed 1 run in 5.
-  - Patched: 0 failures.
-- `oam run` on a 302-then-FIN redirect loop (L3 `hang-many.mjs`): the
-  stress-run results are in the CHANGELOG entry and the L-3 report.
+  - Stock: failed about 1 run in 5 on each platform.
+  - Patched: never failed.
+- `oam run` on a loop of 20 redirects answered `302` then FIN, 500 processes
+  6 at a time, on Windows arm64:
+  - `main` before the patch hung 14 and 16 processes in two passes;
+  - patched: 0 hung.
+- A single process sending 20,000 such fetches, 6 runs: before the patch 3
+  and 6 of 6 hung (two passes); patched: 0.
 
 ## Upstream status (checked 2026-09-18)
 

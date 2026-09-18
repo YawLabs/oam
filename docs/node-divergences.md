@@ -1279,9 +1279,13 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs (the idle-timeout shape), the hop usually picks that dead
   connection out of the pool; Node reads the FIN first and opens a fresh socket. oam sends the
-  hop again on a fresh connection once when the method is idempotent (`GET`, `HEAD`, `PUT`,
+  hop again, up to three times, when the method is idempotent (`GET`, `HEAD`, `PUT`,
   `DELETE`, `OPTIONS`, `TRACE`) and the dead connection had carried an earlier request, so
-  those match Node (20 of 20 redirects on every server shape measured). A `POST` that a 307
+  those match Node (20 of 20 redirects on every server shape measured). Each resend goes back
+  through the pool, and a dead connection that failed one leaves it. More than one resend is
+  needed when concurrent requests leave several of the server's connections closing at once.
+  With eight concurrent chains, a single resend failed 78-110 of 6000 fetches, while three
+  resends failed none, matching Node. A `POST` that a 307
   or 308 carries onto the dead connection is not sent again -- oam did write it, and cannot
   know the server ignored it -- so it fails with `error sending request for url (...)` where
   Node's succeeds (measured: 12-14 of 20 succeed in oam, 20 of 20 in Node).

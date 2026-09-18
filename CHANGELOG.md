@@ -64,6 +64,65 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A `fetch` could hang forever when the server closed a keep-alive
+  connection just as the next request went out on it.** This also affected
+  `http.request`, `https.request` and `undici.request`, which ride the same
+  op. A typical case is a keep-alive idle timeout, or a `302` followed by a
+  FIN with the redirect hop sent at once.
+
+  The cause was in hyper 1.10.1. The request was pushed into the pooled
+  connection's dispatch channel while, on the other I/O worker, that
+  connection read the FIN, finished and dropped its receiver. tokio's
+  close-time drain misses a message that is still being published, so the
+  request stayed in the channel. The only thing that would ever answer it is
+  the channel's last sender, and hyper-util holds that sender while it
+  waits for the answer. There was no socket, no timer and no error: the
+  promise never settled, and nothing else could make it settle.
+
+  The fix: oam now builds hyper 1.10.1 with one patch. The dispatch
+  receiver's drop closes the channel and drains it until tokio reports no
+  send in flight, so the request is handed back unsent and hyper-util sends
+  it again on a fresh connection. The patch is in `vendor/hyper-1.10.1/`,
+  and `OAM-PATCH.md` there has the diff, the reproduction and the upstream
+  status (hyperium/hyper#4122 and #4150, still open, and they do not cover
+  this path).
+
+  Measured on Windows arm64 with a loop of 20 redirects answered `302` then
+  FIN, 500 processes, 6 at a time:
+  - 0.16.1 hung 3 processes;
+  - `main` before the fix hung 14 and 16 in two passes;
+  - the fix hung none in either pass.
+
+  A single process sending 20,000 such fetches hung 2 of 6 runs on 0.16.1
+  and 6 of 6 on `main` before the fix. With the fix, 0 of 6 runs hung.
+
+  This did ship. 0.16.1's `fetch` runs on reqwest over the same hyper 1.10.1,
+  and releases back to 0.13.2 pin that same hyper; releases before 0.13.2
+  were not checked. Pinned by
+  `crates/oam_core/tests/http_client_stale_pool.rs`. On stock hyper its
+  in-memory race test failed 10 of 10 runs, 5 on Windows and 5 on macOS.
+  (#151 follow-up)
+- **Concurrent requests to a server that closes its keep-alive connections
+  failed with `fetch failed` where node's succeeded.** An idempotent request
+  whose pooled connection died before any part of a response arrived was
+  resent only once. With several connections idle for the origin, the resend
+  could meet another connection the server was closing.
+
+  With eight concurrent redirect chains against a server that FINs after
+  every `302` (6000 fetches per run), `main` failed 78 to 110 fetches per run.
+  node v22.22.2 failed none. 0.16.1, which has no resend at all, failed about
+  93% of all fetches on the single-chain form of this loop.
+
+  The request is now resent up to three times. The conditions are the same
+  as before:
+  - only for an idempotent method;
+  - only with a body that can be sent again;
+  - only after a failure on a reused connection.
+
+  Each failure takes that dead connection out of the pool, and a failure on a
+  fresh connection is final. The eight-chain runs now fail none, as node's
+  do. A POST is still never resent. (#151 follow-up)
+
 - **`socket.unref()` and `server.unref()` did not release the event loop**
   (#140). They removed the handle from `process.getActiveResourcesInfo()` as
   Node's do, but a connected, reading, unref'd `net.Socket` or `tls.TLSSocket`,
