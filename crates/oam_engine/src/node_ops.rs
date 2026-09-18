@@ -2856,15 +2856,15 @@ fn op_tcp_connect(
     );
 }
 
-/// `__oam.node.netResolve(host, family, all)`: resolve `host` for a net /
+/// `__oam.node.netResolve(host, family, all, port)`: resolve `host` for a net /
 /// tls connect ahead of it (`net_connect::resolve`: getaddrinfo, narrowed to
 /// family 4 or 6), so JS can emit node's `'lookup'` events -- which a
 /// listener may veto -- before anything is dialled. Resolves with `{token,
 /// addresses: [{address, family}]}` (the first address only unless `all`)
 /// and files exactly that list under `token`, for the connect to redeem with
 /// `{"ticket": token}` or JS to drop with `netResolveDrop`. Rejects with the
-/// error a connect to the same name reports. No net grant is asked, as for
-/// `dnsLookup`: the connect that redeems the ticket asks it about the host.
+/// error a connect to the same name reports. The net grant is asked about
+/// `host:port` first (ERR_ACCESS_DENIED), as the connect will be.
 fn op_net_resolve(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2880,6 +2880,13 @@ fn op_net_resolve(
         _ => None,
     };
     let all = args.get(2).boolean_value(scope);
+    // The connect's port: the name is resolved only for a connect the net
+    // grant covers (`host:port`, as tcpConnect / tlsConnect ask), so the
+    // resolver is never a way to look up a name the grant refuses.
+    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    if !check_net_perm(scope, &format!("{host}:{port}")) {
+        return;
+    }
     let core = core_runtime!(scope);
     let answers = core.resolved_answers();
     let ids = core.body_ids();
