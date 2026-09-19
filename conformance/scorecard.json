@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "ea6e201+wip",
+  "commit": "1901c4b",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 139,
-      "total": 139,
+      "pass": 140,
+      "total": 140,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -220,6 +220,10 @@
         },
         {
           "case": "140-http2-connect-lookup-and-create-connection.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "149-tls-connect-local-end-and-alpn.mjs",
           "status": "pass"
         },
         {
