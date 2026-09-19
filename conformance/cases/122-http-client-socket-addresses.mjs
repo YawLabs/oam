@@ -166,6 +166,45 @@ for (const host of ["LocalHost", "0177.0.0.1", "127.000.000.001", "127.0.0.1.", 
   await probe(`http host ${JSON.stringify(host)}`, http, { host, port: P4 }, false);
 }
 
+// The facts are there at 'response' even when the server closes the
+// connection straight after its answer: node's parser emits 'response' as it
+// reads the head, before the socket gets to the EOF behind it, and closes
+// the socket after. oam's head comes back from its parser a few ticks later,
+// and a socket that ended itself on that EOF in between reported no local
+// address and no peer certificate there (about one request in eight).
+let alive = 0;
+let closedAfter = 0;
+const ROUNDS = 25;
+for (let i = 0; i < ROUNDS; i++) {
+  for (const [mod, options] of [
+    [https, { host: "127.0.0.1", port: T4, rejectUnauthorized: false }],
+    [http, { host: "127.0.0.1", port: P4 }],
+  ]) {
+    await new Promise((resolve) => {
+      const req = mod.get({ agent: new mod.Agent(), ...options });
+      req.on("socket", (s) => {
+        s.on("connect", () => {});
+        s.on("close", () => {
+          closedAfter++;
+          resolve();
+        });
+      });
+      req.on("response", (res) => {
+        const s = res.socket;
+        const up = !s.destroyed && s.address().port === s.localPort &&
+          (mod === http || s.getPeerCertificate().subject.CN === "localhost");
+        if (up) alive++;
+        res.resume();
+      });
+      req.on("error", (e) => {
+        console.log("ERROR", e.code);
+        resolve();
+      });
+    });
+  }
+}
+console.log(`closing server: socket up at 'response' ${alive}/${2 * ROUNDS}, closed after ${closedAfter}/${2 * ROUNDS}`);
+
 srv4.close();
 srv6.close();
 tsrv4.close();

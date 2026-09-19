@@ -18449,6 +18449,8 @@
         // has to read; the request let go of a kept-alive socket.
         this._socketGone = false;
         this._keptAlive = false;
+        // The socket's EOF, held back while the response head is due.
+        this._eofHold = null;
         this._exchangeQueued = false;
         this._waitingConnect = false;
         this._earlySocketEvents = null;
@@ -19255,19 +19257,51 @@
           return;
         }
         this._bridge = id;
+        this._holdSocketEof(socket);
         this._pumpBridge(socket, id);
         var self = this;
         natives.httpBridgeResponse(id).then(function (raw) {
           if (self._aborted) {
+            self._releaseSocketEof();
             bodyCancel(raw.bodyHandle);
             return;
           }
           self._emitResponse(raw, true);
+          self._releaseSocketEof();
         }, function (err) {
+          self._releaseSocketEof();
           if (self._aborted) return;
           self._failBeforeResponse(withParseReason(err));
           if (!socket.destroyed) socket.destroy();
         });
+      }
+
+      // node's parser emits 'response' as it reads the head, before the
+      // socket gets to an EOF that came right behind it. Here the head comes
+      // back from the bridge some ticks after its bytes were read, and by
+      // then a socket that ends itself on EOF (allowHalfOpen false) may have
+      // closed: address() empty, no peer certificate at 'response'. So
+      // while the head is outstanding an EOF only half-closes the socket
+      // (the bridge still sees it), and the end it would have caused
+      // follows once the head has been emitted.
+      _holdSocketEof(socket) {
+        if (socket.allowHalfOpen !== false) return;
+        var hold = { socket: socket, ended: false, onEnd: null };
+        hold.onEnd = function () { hold.ended = true; };
+        socket.allowHalfOpen = true;
+        socket.once("end", hold.onEnd);
+        this._eofHold = hold;
+      }
+      _releaseSocketEof() {
+        var hold = this._eofHold;
+        if (!hold) return;
+        this._eofHold = null;
+        var socket = hold.socket;
+        socket.removeListener("end", hold.onEnd);
+        socket.allowHalfOpen = false;
+        if (!hold.ended || socket.destroyed) return;
+        var ws = socket._writableState;
+        if (ws ? !ws.ended : !socket.writableEnded) socket.end();
       }
 
       // node's parser limit for this request's response head: its own
