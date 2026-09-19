@@ -1140,11 +1140,11 @@
 
   // The connection policy of the undici dispatcher a fetch rides (the
   // `dispatcher` option, else the global one): `{ connector }` for one whose
-  // `connect` is a function (a connect object carrying socket or TLS options
-  // is turned into one, as undici's buildConnector does), `{ refuse }` for
-  // one oam cannot run faithfully -- a dispatch() override, interceptors, an
-  // Agent factory, or an object that is not one of the oam:undici shim's
-  // dispatchers -- since oam would otherwise send the request without it.
+  // `connect` is a function (a connect object carrying socket or TLS options,
+  // or an Agent `factory`, is turned into one), `{ refuse }` for one oam
+  // cannot run faithfully -- a dispatch() override, interceptors, or an
+  // object that is not one of the oam:undici shim's dispatchers -- since oam
+  // would otherwise send the request without it.
   function dispatcherPolicy(dispatcher, holder) {
     if (holder && typeof holder.policy === "function") return holder.policy(dispatcher);
     const refuse = new Error(
