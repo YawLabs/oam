@@ -449,7 +449,7 @@ pub(crate) fn authority_key(uri: &Uri) -> Option<String> {
 }
 
 /// A connection JS supplied for one fetch whose undici dispatcher carries a
-/// `connect` FUNCTION: the consumer end of a [`super::pipe`] JS pumps to and
+/// `connect` FUNCTION: the near end of a [`crate::byte_pipe`] JS pumps to and
 /// from the socket that function handed back. That socket is already the
 /// whole transport -- connected, and for an https origin already TLS -- so
 /// the connector adds nothing to it.

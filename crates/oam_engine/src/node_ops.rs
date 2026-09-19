@@ -21,7 +21,7 @@ use crate::crypto_ops::{
     op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
-use crate::timers::{timer_ref, timer_unref};
+use crate::timers::{timer_immediate, timer_ref, timer_unref};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -209,6 +209,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
         ("timerUnref", timer_unref),
+        // setImmediate: due at once, never an OS timer wait.
+        ("timerImmediate", timer_immediate),
         // Inbound OS signals: install/remove native delivery of a Node signal
         // name (SIGTERM/SIGINT/SIGHUP/...). Gated JS-side on process
         // listenerCount so start fires on the FIRST listener and stop on the
@@ -336,15 +338,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
-        // A socket's bytes to and from a Rust consumer (oam_core
-        // http_client::pipe): http2.connect sessions, and fetches over an
-        // undici connect function's socket.
-        ("socketPipeOpen", op_socket_pipe_open),
-        ("socketPipeOut", op_socket_pipe_out),
-        ("socketPipeIn", op_socket_pipe_in),
-        ("socketPipeInEnd", op_socket_pipe_in_end),
-        ("socketPipeClose", op_socket_pipe_close),
-        // http2.connect sessions over a pipe (http_client::h2_session)
+        // http2.connect sessions over a pipe (tlsPipe*; http_client::h2_session)
         ("http2SessionOpen", op_http2_session_open),
         ("http2SessionRequest", op_http2_session_request),
         ("http2SessionWait", op_http2_session_wait),
@@ -416,6 +410,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoCheckPrime", op_crypto_check_prime),
         // TLS sockets (node:tls)
         ("tlsConnect", op_tls_connect),
+        ("tlsConnectOver", op_tls_connect_over),
+        ("tlsPipeOpen", op_tls_pipe_open),
+        ("tlsPipeOut", op_tls_pipe_out),
+        ("tlsPipeIn", op_tls_pipe_in),
+        ("tlsPipeInEnd", op_tls_pipe_in_end),
+        ("tlsPipeClose", op_tls_pipe_close),
         ("tlsRead", op_tls_read),
         ("tlsWrite", op_tls_write),
         ("tlsClose", op_tls_close),
@@ -3038,85 +3038,11 @@ fn op_http_bridge_close(
     rv.set_bool(closed);
 }
 
-// ------------------------------------------------------- socket pipes
-
-/// `__oam.node.socketPipeOpen() -> id`: a byte pipe JS pumps to and from a
-/// socket, whose other end a Rust consumer takes (`http2SessionOpen`,
-/// `__oam.fetchSupply`).
-fn op_socket_pipe_open(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let core = core_runtime!(scope);
-    let id = oam_core::http_client::pipe::open(&core.socket_pipes(), &core.body_ids());
-    rv.set_double(id as f64);
-}
-
-/// `__oam.node.socketPipeOut(id)`: the next bytes the consumer wrote, for the
-/// socket, or undefined at the end. Unref'd, as `httpBridgeOut`: it waits on
-/// the consumer, and the socket's own read is what keeps a live connection's
-/// process running.
-fn op_socket_pipe_out(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
-    let pipes = core_runtime!(scope).socket_pipes();
-    crate::ops::spawn_op_unref(scope, &mut rv, oam_core::http_client::pipe::out(pipes, id));
-}
-
-/// `__oam.node.socketPipeIn(id, bytes)`: bytes the socket read.
-fn op_socket_pipe_in(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
-    let Some(bytes) = arg_bytes(scope, &args, 1) else {
-        throw_type_error(scope, "socketPipeIn requires bytes");
-        return;
-    };
-    let pipes = core_runtime!(scope).socket_pipes();
-    crate::ops::spawn_op(
-        scope,
-        &mut rv,
-        oam_core::http_client::pipe::input(pipes, id, bytes),
-    );
-}
-
-/// `__oam.node.socketPipeInEnd(id)`: the socket reached EOF.
-fn op_socket_pipe_in_end(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
-    let pipes = core_runtime!(scope).socket_pipes();
-    crate::ops::spawn_op(
-        scope,
-        &mut rv,
-        oam_core::http_client::pipe::input_end(pipes, id),
-    );
-}
-
-/// `__oam.node.socketPipeClose(id)`: drop the pipe. True if it was open.
-fn op_socket_pipe_close(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    let closed = id >= 0.0
-        && oam_core::http_client::pipe::close(&core_runtime!(scope).socket_pipes(), id as u64);
-    rv.set_bool(closed);
-}
-
 // ------------------------------------------------------- http2 sessions
 
 /// `__oam.node.http2SessionOpen(pipeId)`: an HTTP/2 client session over the
-/// consumer end of socket pipe `pipeId`; resolves with `{session}`.
+/// near end of pipe `pipeId` (a `tlsPipeOpen` pipe JS pumps to and from the
+/// session's socket); resolves with `{session}`.
 fn op_http2_session_open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3125,7 +3051,7 @@ fn op_http2_session_open(
     let pipe_id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
     let core = core_runtime!(scope);
     let sessions = core.h2_sessions();
-    let pipes = core.socket_pipes();
+    let pipes = core.tls_pipes();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
@@ -3683,6 +3609,132 @@ fn op_tls_connect(
             max_version,
             attempt_timeout,
             pin,
+            alpn,
+        ),
+    );
+}
+
+/// `__oam.node.tlsPipeOpen() -> id`: a pipe TLS will run over for
+/// `tls.connect({ socket })`; JS pumps its far end to the socket
+/// (`oam_core::byte_pipe`).
+fn op_tls_pipe_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let core = core_runtime!(scope);
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    rv.set_double(oam_core::byte_pipe::open(&pipes, &ids) as f64);
+}
+
+/// `__oam.node.tlsPipeOut(id)`: the next bytes TLS wrote, for the socket, or
+/// undefined at the end. Unref'd, as httpBridgeOut: an idle connection's TLS
+/// may never write again, and the socket's own read is what keeps a live
+/// connection's process running.
+fn op_tls_pipe_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op_unref(scope, &mut rv, oam_core::byte_pipe::out(pipes, id));
+}
+
+/// `__oam.node.tlsPipeIn(id, bytes)`: bytes the socket read.
+fn op_tls_pipe_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "tlsPipeIn requires bytes");
+        return;
+    };
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input(pipes, id, bytes));
+}
+
+/// `__oam.node.tlsPipeInEnd(id)`: the socket reached EOF.
+fn op_tls_pipe_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input_end(pipes, id));
+}
+
+/// `__oam.node.tlsPipeClose(id)`: drop the pipe. True if it was open.
+fn op_tls_pipe_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed =
+        id >= 0.0 && oam_core::byte_pipe::close(&core_runtime!(scope).tls_pipes(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
+/// cert, key, minVersion, maxVersion, alpn)`: the client handshake over a pipe
+/// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
+/// addresses. No net grant is asked: the socket underneath was opened (and
+/// checked) by whoever made it.
+fn op_tls_connect_over(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pipe = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if pipe < 0.0 {
+        throw_type_error(scope, "tlsConnectOver requires a pipe");
+        return;
+    }
+    let Some(server_name) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "tlsConnectOver requires a server name");
+        return;
+    };
+    let ca_pem = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
+    let reject_unauthorized = args.get(3).boolean_value(scope);
+    let client_cert_pem = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
+    let client_key_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
+    let min_version = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
+    // ALPNProtocols, as tlsConnect takes them (argument 11 there).
+    let alpn = match arg_string(scope, &args, 8).filter(|s| !s.is_empty()) {
+        None => Vec::new(),
+        Some(json) => match oam_core::tls::parse_alpn_protocols(&json) {
+            Ok(alpn) => alpn,
+            Err(message) => {
+                throw_type_error(scope, &message);
+                return;
+            }
+        },
+    };
+    let core = core_runtime!(scope);
+    let tls = core.tls();
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tls::tls_connect_over(
+            tls,
+            pipes,
+            ids,
+            pipe as u64,
+            server_name,
+            ca_pem,
+            reject_unauthorized,
+            client_cert_pem,
+            client_key_pem,
+            min_version,
+            max_version,
             alpn,
         ),
     );

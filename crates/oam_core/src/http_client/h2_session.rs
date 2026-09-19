@@ -1,4 +1,4 @@
-//! An HTTP/2 client session over a [`pipe`](super::pipe): what
+//! An HTTP/2 client session over a [`byte_pipe`](crate::byte_pipe): what
 //! `http2.connect` runs over the socket `net.connect` / `tls.connect` or the
 //! caller's `createConnection` returned. The socket is the session's, as in
 //! node: every stream of the session travels over it, so a `lookup` hook, a
@@ -32,8 +32,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
 use super::ReqBody;
 use super::body::{FetchBodies, FetchBody, StreamSlot};
-use super::pipe::{self, Pipes};
 use super::transport::{channel_body, empty_body, full_body};
+use crate::byte_pipe::Pipes;
 use crate::{OpOutcome, OutboundBodies};
 
 /// Live sessions by id (ids from the runtime's shared handle allocator).
@@ -113,8 +113,8 @@ fn ended_payload(result: Result<(), hyper::Error>) -> serde_json::Value {
     serde_json::json!({ "error": detail })
 }
 
-/// `http2SessionOpen(pipeId)`: an HTTP/2 client session over the consumer end
-/// of pipe `pipeId`. Resolves with `{session}` once the preface and SETTINGS
+/// `http2SessionOpen(pipeId)`: an HTTP/2 client session over the near end of
+/// pipe `pipeId`. Resolves with `{session}` once the preface and SETTINGS
 /// are written into the pipe.
 pub async fn open(
     sessions: H2Sessions,
@@ -122,7 +122,7 @@ pub async fn open(
     pipe_id: u64,
     ids: Arc<AtomicU64>,
 ) -> OpOutcome {
-    let Some(io) = pipe::take(&pipes, pipe_id) else {
+    let Some(io) = crate::byte_pipe::take_near(&pipes, pipe_id) else {
         return OpOutcome::Failed(format!("http2SessionOpen: pipe {pipe_id} is gone"));
     };
     let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());

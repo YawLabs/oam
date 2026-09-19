@@ -19,6 +19,7 @@ use futures_util::FutureExt;
 
 pub use oam_diagnostics as diagnostics;
 
+pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
 pub mod dns;
@@ -689,9 +690,11 @@ pub struct CoreRuntime {
     /// http.request exchanges over a JS socket (`http_client::bridge`);
     /// dropped with the run.
     http_bridges: http_client::bridge::Bridges,
-    /// Byte pipes between a JS socket and a Rust consumer
-    /// (`http_client::pipe`); dropped with the run.
-    socket_pipes: http_client::pipe::Pipes,
+    /// Pipes TLS runs over for `tls.connect({ socket })` (`byte_pipe`) --
+    /// and, the same kind of pipe, what an http2.connect session and a fetch
+    /// over an undici connect function's socket run over; dropped with the
+    /// run.
+    tls_pipes: byte_pipe::Pipes,
     /// http2.connect sessions over a pipe (`http_client::h2_session`);
     /// dropped with the run.
     h2_sessions: http_client::h2_session::H2Sessions,
@@ -778,7 +781,7 @@ impl CoreRuntime {
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            socket_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tls_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             h2_sessions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
@@ -858,9 +861,10 @@ impl CoreRuntime {
         self.http_bridges.clone()
     }
 
-    /// Byte pipes between a JS socket and a Rust consumer (Arc clone).
-    pub fn socket_pipes(&self) -> http_client::pipe::Pipes {
-        self.socket_pipes.clone()
+    /// The pipes TLS runs over for `tls.connect({ socket })` (Arc clone);
+    /// http2.connect sessions and supplied fetch connections use them too.
+    pub fn tls_pipes(&self) -> byte_pipe::Pipes {
+        self.tls_pipes.clone()
     }
 
     /// http2.connect sessions (Arc clone).

@@ -38,10 +38,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   the socket the agent returns, as in node. So does `https.request` with
   `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. The
   agent pools these connections as node's does. Their response heads are held to node's
-  `maxHeaderSize`, and
-  `http.request` now takes node's per-request `maxHeaderSize` and `insecureHTTPParser`
-  options, validated as node validates them; an oversized head fails the request with
-  node's own `HPE_HEADER_OVERFLOW` error.
+  `maxHeaderSize`, and `http.request` now takes node's per-request `maxHeaderSize` and
+  `insecureHTTPParser` options, validated as node validates them; an oversized head
+  fails the request with node's own `HPE_HEADER_OVERFLOW` error.
 - **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
   response; oam's followed it, so a request whose URL an application had vetted could
   end at a host it never named. It now returns the `3xx`, as node does.
@@ -106,9 +105,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
+  slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
+  awaited immediates took 3 s where node takes 2 ms. An immediate is now due at once.
+  `http.get` / `http.request` on oam's own transport also no longer wait one after
+  `'socket'` unless something listens for `'socket'`: 200 sequential requests to a local
+  server took about 3 s on Windows and now take about 50 ms, as the same `fetch` loop does.
 - **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
-  agent's socket (a custom agent such as agentkeepalive's, which openai v4 and
-  node-fetch use, or a socket got watches) opened a new connection and TLS handshake
+  agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
+  node-fetch, or a socket got watches) opened a new connection and TLS handshake
   per request and said `Connection: close`. The agent now pools them with node's rules:
   `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
   `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the
@@ -119,6 +124,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`req.end(callback)` called the callback with the response.** node calls it on
   `'finish'`, with no arguments; got treated the response as the request's error, so
   every got request failed once it went over a socket.
+- **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
+  tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
+  any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in
+  node, with node's events, the wrapped socket's addresses and the certificate checks of
+  any other `tls.connect`. https-proxy-agent (5 and 7) tunnels to https targets through
+  it, a refusing proxy's answer included, and got 14 loads (http2-wrapper reaches node's
+  `JSStreamSocket` through `new tls.TLSSocket(stream)._handle._parentWrap`).
+- **`net.Socket` had no paused mode.** A `'readable'` listener and `socket.read()` --
+  how https-proxy-agent reads a proxy's answer -- threw `socket.read is not a function`;
+  `push()` into a socket without a handle was missing too. Both now behave as in node.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same

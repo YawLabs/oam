@@ -1,4 +1,4 @@
-//! `http_client::pipe` and `http_client::h2_session`: an HTTP/2 client
+//! `byte_pipe` and `http_client::h2_session`: an HTTP/2 client
 //! session over bytes a socket pumps, as `http2.connect` runs one over the
 //! socket it connected (or `createConnection` returned). The "socket" here is
 //! a TCP stream the test pumps to and from the pipe exactly as JS does; the
@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use common::*;
 use http_body_util::BodyExt as _;
+use oam_core::byte_pipe::{self as pipe, Pipes};
 use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::h2_session::{self, H2Sessions};
-use oam_core::http_client::pipe::{self, Pipes};
 use oam_core::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -228,7 +228,7 @@ async fn a_session_carries_its_streams_over_the_pumped_socket() {
         let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let pipe_id = reg.pump(socket);
         let session = reg.open(pipe_id).await;
-        assert!(pipe::take(&reg.pipes, pipe_id).is_none(), "the session took the pipe's end");
+        assert!(pipe::take_near(&reg.pipes, pipe_id).is_none(), "the session took the pipe's end");
 
         // Two streams at once, on the one connection.
         let first = reg.request(

@@ -6042,6 +6042,53 @@ for (const secure of [false, true]) {{
     );
 }
 
+/// An http.get on oam's own transport is sent without waiting on a timer,
+/// and setImmediate is due at once. Each used to cost a whole OS timer tick
+/// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
+/// and every request waited one after 'socket' -- 200 sequential http.get
+/// took about 60 times the same fetch loop. The bound is loose (3x the
+/// fetch loop, best of three) so a loaded machine does not trip it.
+#[test]
+fn sequential_http_requests_do_not_wait_on_a_timer() {
+    let src = r#"
+import http from 'node:http';
+const server = http.createServer((req, res) => res.end('ok'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const N = 100;
+const get = () => new Promise((resolve, reject) => {
+  http.get({ host: '127.0.0.1', port, path: '/' }, (res) => { res.resume(); res.on('end', resolve); }).on('error', reject);
+});
+async function time(fn) {
+  let best = Infinity;
+  for (let round = 0; round < 3; round++) {
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) await fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+const viaFetch = await time(async () => { await (await fetch(`http://127.0.0.1:${port}/`)).text(); });
+const viaGet = await time(get);
+let t0 = performance.now();
+for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
+const immediates = performance.now() - t0;
+console.log(`http.get within 3x of fetch: ${viaGet < 3 * viaFetch + 50} (get ${viaGet.toFixed(0)} ms, fetch ${viaFetch.toFixed(0)} ms)`);
+console.log(`200 immediates under 100 ms: ${immediates < 100} (${immediates.toFixed(0)} ms)`);
+server.close();
+"#;
+    let out = run_ok("sequential_http_latency.mjs", src);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("http.get within 3x of fetch: true"),
+        "{out}"
+    );
+    assert!(
+        lines[1].starts_with("200 immediates under 100 ms: true"),
+        "{out}"
+    );
+}
+
 /// Pooled sockets do not keep the process alive, as in node: the agent unrefs
 /// a socket it keeps, and a socket's idle timer (the global agent's 5 s, an
 /// agent's `timeout`) is an unref'd timer. The server is in this test
@@ -6102,6 +6149,118 @@ console.log(`pooled ${{free(agent)}} ${{free(http.globalAgent)}}`);
         started.elapsed() < std::time::Duration::from_secs(4),
         "the run waited on its pooled sockets: {:?}",
         started.elapsed()
+    );
+}
+
+/// Copy a directory tree (the vendored npm fixtures into a project's
+/// node_modules).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// The real https-proxy-agent tunnels an https request as it does under node:
+/// a CONNECT to the proxy, then TLS to the target over the proxy's socket
+/// (`tls.connect({ socket })`), checked against the target's own certificate
+/// -- so the proxy relays only ciphertext, never the request -- and a proxy
+/// that refuses the CONNECT has its answer delivered as the response. The
+/// packages are vendored under tests/fixtures/https-proxy-agent as published
+/// (https-proxy-agent 7.0.6, agent-base 7.1.4, debug 4.4.3, ms 2.1.3; MIT,
+/// each with its license; runtime files only). Up to 0.16.2 the TLS step
+/// failed with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+#[test]
+fn https_proxy_agent_tunnels_to_an_https_target() {
+    let src = r#"
+import https from 'node:https';
+import net from 'node:net';
+import { createRequire } from 'node:module';
+const { HttpsProxyAgent } = createRequire(import.meta.url)('https-proxy-agent');
+const cert = `__LEAF__`;
+const key = `__KEY__`;
+const ca = `__CA__`;
+const target = https.createServer({ cert, key }, (req, res) => res.end(`hello ${req.method} ${req.url}`));
+await new Promise((r) => target.listen(0, '127.0.0.1', r));
+const tport = target.address().port;
+function proxy(answer) {
+  const seen = { connects: [], tunnelled: '' };
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    let head = '';
+    const onData = (d) => {
+      head += d.toString('latin1');
+      if (!head.includes('\r\n\r\n')) return;
+      c.removeListener('data', onData);
+      seen.connects.push(head.slice(0, head.indexOf('\r\n')).replace(`:${tport} `, ':PORT '));
+      if (answer !== 200) {
+        c.end(`HTTP/1.1 ${answer} Proxy Says No\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope`);
+        return;
+      }
+      const up = net.connect(tport, '127.0.0.1', () => {
+        c.write('HTTP/1.1 200 Connection established\r\n\r\n');
+        c.on('data', (d) => {
+          seen.tunnelled += d.toString('latin1');
+          up.write(d);
+        });
+        c.on('end', () => up.end());
+        up.pipe(c);
+      });
+      up.on('error', () => c.destroy());
+      c.on('close', () => up.destroy());
+    };
+    c.on('data', onData);
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, seen })));
+}
+const get = (url, agent) => new Promise((resolve) => {
+  const req = https.get(url, { agent, ca }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(`${res.statusCode} ${body}`));
+  });
+  req.on('error', (e) => resolve(`error ${e.code} ${e.message}`));
+});
+{
+  const { server, seen } = await proxy(200);
+  const agent = new HttpsProxyAgent(`http://127.0.0.1:${server.address().port}`);
+  console.log(`response: ${await get(`https://localhost:${tport}/secret`, agent)}`);
+  console.log(`proxy saw: ${seen.connects.join(' / ')}`);
+  console.log(`tunnelled: ${seen.tunnelled.length > 0}, request visible to the proxy: ${seen.tunnelled.includes('/secret')}`);
+  server.close();
+}
+{
+  const { server } = await proxy(407);
+  const agent = new HttpsProxyAgent(`http://127.0.0.1:${server.address().port}`);
+  console.log(`refusing proxy: ${await get(`https://localhost:${tport}/`, agent)}`);
+  server.close();
+}
+target.close();
+"#
+    .replace("__LEAF__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY)
+    .replace("__CA__", TLS_TEST_CA_CERT);
+    let main = write_temp("https-proxy-agent-project/main.mjs", &src);
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/https-proxy-agent");
+    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "response: 200 hello GET /secret\n\
+         proxy saw: CONNECT localhost:PORT HTTP/1.1\n\
+         tunnelled: true, request visible to the proxy: false\n\
+         refusing proxy: 407 nope",
+        "stderr: {stderr}"
     );
 }
 

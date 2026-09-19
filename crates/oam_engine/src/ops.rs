@@ -449,8 +449,8 @@ fn op_fetch_continue(
 
 /// `__oam.fetchSupply(token, pipeId, h2)`: resume the connector-mode fetch
 /// parked under `token` with the connection its dispatcher's `connect`
-/// function returned -- the consumer end of socket pipe `pipeId`, which JS
-/// pumps to and from that socket. Settles like `fetch`. The hop's host was
+/// function returned -- the near end of pipe `pipeId` (a `tlsPipeOpen` pipe),
+/// which JS pumps to and from that socket. Settles like `fetch`. The hop's host was
 /// checked against the `--permission` net grant before it parked, and the
 /// socket itself was opened through net / tls, which check what they dial.
 /// A pipe that is gone fails the op and drops the parked fetch.
@@ -465,7 +465,7 @@ fn op_fetch_supply(
     let core = core_runtime!(scope);
     let continuations = core.fetch_continuations();
     let io = if pipe_id >= 0.0 {
-        oam_core::http_client::pipe::take(&core.socket_pipes(), pipe_id as u64)
+        oam_core::byte_pipe::take_near(&core.tls_pipes(), pipe_id as u64)
     } else {
         None
     };

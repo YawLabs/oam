@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "ba5928e+wip",
+  "commit": "296d2ff+wip",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 121,
-      "total": 121,
+      "pass": 122,
+      "total": 122,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -148,6 +148,10 @@
         },
         {
           "case": "124-http-agent-keepalive-pool.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "125-tls-connect-over-a-socket.mjs",
           "status": "pass"
         },
         {
