@@ -170,6 +170,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`req.end(callback)` called the callback with the response.** node calls it on
   `'finish'`, with no arguments; got treated the response as the request's error, so
   every got request failed once it went over a socket.
+- **A request on oam's own HTTP transport never timed out.** `req.setTimeout()`, the
+  `timeout` option and an agent's `timeout` (the global agents' 5 s included) fired no
+  `'timeout'` unless the request went over an agent's socket, so a client that gives up
+  on a stalled server waited for it forever. They now fire as node's do: on the request,
+  once, after that long without activity -- before the response head, or while its body
+  stalls -- and on the response while it is still being read; nothing fires once the
+  response has ended, and the value is validated as node validates it. `req.destroy()`
+  and `req.abort()` before the response now fail the request with node's `ECONNRESET`
+  `socket hang up` (they were silent), on either path; as in node, that `'error'` ends
+  the process unless something listens for it.
 - **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
   tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
   any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in

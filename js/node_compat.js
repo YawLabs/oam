@@ -18188,9 +18188,11 @@
     }
 
     // ---- req.socket on the fetch path ----
-    // Nothing passes through this object: writes go nowhere, its idle timer
-    // could not see a response it never carries, and address() answers from
-    // the fields the transport's facts fill in.
+    // Nothing passes through this object: writes go nowhere, and address()
+    // answers from the fields the transport's facts fill in. Its idle timer
+    // is the socket's own (setTimeout, 'timeout'), reset by what the
+    // transport does for the request (ClientRequest#_fetchActivity) as a
+    // real socket's is by its reads and writes.
     function fetchSocketWrite(data, encoding, cb) {
       if (typeof encoding === "function") cb = encoding;
       if (typeof cb === "function") process.nextTick(cb);
@@ -18202,14 +18204,11 @@
       if (typeof cb === "function") process.nextTick(cb);
       return this;
     }
-    function fetchSocketSetTimeout() {
-      return this;
-    }
     function fetchSocketAddress() {
       if (this.localAddress === undefined) return {};
       return { address: this.localAddress, family: this.localFamily || "IPv4", port: this.localPort };
     }
-    const FETCH_SOCKET_OVERRIDES = ["write", "end", "setTimeout", "address"];
+    const FETCH_SOCKET_OVERRIDES = ["write", "end", "address"];
     function makeFetchSocket(encrypted) {
       let socket;
       if (encrypted) {
@@ -18220,7 +18219,6 @@
       }
       socket.write = fetchSocketWrite;
       socket.end = fetchSocketEnd;
-      socket.setTimeout = fetchSocketSetTimeout;
       socket.address = fetchSocketAddress;
       return socket;
     }
@@ -18442,7 +18440,15 @@
         this._responseEnd = false;
         // An agent-path request between addRequest and its socket.
         this._awaitingSocket = false;
-        if (opts.timeout !== undefined) this.timeout = opts.timeout;
+        if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
+        // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
+        // 1 listening (it is re-emitted on the request once), 2 done.
+        this._timeoutListen = 0;
+        this._timeoutAfterResponse = false;
+        // A response teardown held until the socket's 'timeout' listeners
+        // have all run (_onSocketTimeout).
+        this._inSocketTimeout = false;
+        this._resTeardown = null;
         this._pendingDispatch = null;
         this._socketEmitted = false;
         this._responded = false;
@@ -18579,6 +18585,7 @@
       // queued. Resolves when the transport has accepted it, so write()
       // backpressure still follows the wire.
       _channelWrite(bytes) {
+        this._fetchActivity();
         var stream = this._bodyStream;
         var next = this._channelTail === null
           ? natives.fetchBodyChannelWrite(stream, bytes)
@@ -18821,6 +18828,7 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
+        self._fetchActivity();
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
@@ -19073,11 +19081,74 @@
         this._socketListeners = {
           error: function (err) { self._onSocketError(err); },
           close: function () { self._onSocketClose(); },
-          timeout: function () { self.emit("timeout"); },
+          timeout: function () { self._onSocketTimeout(); },
         };
+        // node's tickOnSocket: a request with a timeout -- its own, or its
+        // agent's (the global agents' is 5 s) -- hears its socket's.
+        var agent = this.agent;
+        if (this.timeout !== undefined || (agent && agent.options && agent.options.timeout)) {
+          this._listenSocketTimeout();
+        }
+        // The stand-in's idle timeout is the one node's agent gives the
+        // socket it creates: the request's timeout, else the agent's.
+        if (socket === this._fetchSocket && !this._agentPath) {
+          var idle = this.timeout || (agent && agent.options && agent.options.timeout) || 0;
+          if (idle) socket.setTimeout(idle);
+        }
         socket.on("error", this._socketListeners.error);
         socket.on("close", this._socketListeners.close);
         socket.on("timeout", this._socketListeners.timeout);
+      }
+
+      _listenSocketTimeout() {
+        if (this._timeoutListen !== 0) return;
+        this._timeoutListen = 1;
+        // node adds its request listener to the socket's 'timeout' now; one
+        // added after the response came runs after the response's own.
+        this._timeoutAfterResponse = this.res != null;
+      }
+
+      // The socket went idle: node's two socket 'timeout' listeners, in the
+      // order they were added -- emitRequestTimeout (the request, once,
+      // while it listens) and responseOnTimeout (the response, every time)
+      // -- until the response has ended. A request destroyed from its
+      // 'timeout' listener tears its response down after both have run, as
+      // node's does when the destroyed socket closes.
+      _onSocketTimeout() {
+        if (this._responseEnd) return;
+        var self = this;
+        var toRequest = function () {
+          if (self._timeoutListen !== 1) return;
+          self._timeoutListen = 2;
+          self.emit("timeout");
+        };
+        var toResponse = function () {
+          if (self.res) self.res.emit("timeout");
+        };
+        this._inSocketTimeout = true;
+        try {
+          if (this._timeoutAfterResponse) {
+            toResponse();
+            toRequest();
+          } else {
+            toRequest();
+            toResponse();
+          }
+        } finally {
+          this._inSocketTimeout = false;
+          var teardown = this._resTeardown;
+          this._resTeardown = null;
+          if (teardown !== null) teardown();
+        }
+      }
+
+      // The transport did something for this request (sent it, a body
+      // chunk, the response head, a response chunk): the fetch path's
+      // stand-in socket was active, as a real one is on a read or write.
+      _fetchActivity() {
+        var socket = this._fetchSocket;
+        if (this._agentPath || !socket || socket.destroyed) return;
+        if (socket._timeoutMs > 0) socket._resetTimeout();
       }
 
       _detachSocketListeners(socket) {
@@ -19626,6 +19697,7 @@
                 res.push(null);
                 self._responseEnded();
               } else {
+                if (!agentPath) self._fetchActivity();
                 res.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
               }
             }, function (err) {
@@ -19677,6 +19749,7 @@
         this.res = res;
         this._res = res;
         if (!agentPath) {
+          this._fetchActivity();
           // node detaches a kept-alive socket from the response at its end;
           // the transport's connection stays pooled likewise.
           if (this.shouldKeepAlive && responseKeepsAlive(raw, this.method)) {
@@ -19772,6 +19845,12 @@
         // The agent path's socket is settled by the response's 'end'
         // (_agentResponseOnEnd).
         if (this._agentPath) return;
+        this._responseEnd = true;
+        var socket = this._fetchSocket;
+        if (socket && socket._timeoutId !== null) {
+          globalThis.clearTimeout(socket._timeoutId);
+          socket._timeoutId = null;
+        }
         this.destroyed = true;
         this._emitClose();
       }
@@ -19781,7 +19860,7 @@
         this.aborted = true;
         this._aborted = true;
         this.emit("abort");
-        this._tearDown();
+        this._tearDown(true);
       }
       destroy(err) {
         // Node's ClientRequest.destroy() returns early on an already-
@@ -19789,7 +19868,7 @@
         // (or one after abort()) is silent.
         if (this._aborted) return this;
         this._aborted = true;
-        this._tearDown();
+        this._tearDown(!err);
         if (err) {
           this._errorEmitted = true;
           this.errored = err;
@@ -19808,7 +19887,10 @@
         }
       }
 
-      _tearDown() {
+      // `hangUp`: destroyed without an error of the caller's (destroy(),
+      // abort()) -- which before a response fails the request with node's
+      // 'socket hang up' (its socketCloseListener), ahead of 'close'.
+      _tearDown(hangUp) {
         if (this.destroyed) return;
         this.destroyed = true;
         // Abort an in-flight upload so the transport tears the request down
@@ -19818,7 +19900,14 @@
         if (res && !res.destroyed) {
           const reset = new Error("aborted");
           reset.code = "ECONNRESET";
-          res.destroy(reset);
+          if (this._inSocketTimeout) {
+            // Inside the socket's 'timeout': after its other listener.
+            this._resTeardown = function () {
+              if (!res.destroyed) res.destroy(reset);
+            };
+          } else {
+            res.destroy(reset);
+          }
         }
         this._closeBridge();
         var socket = this.socket || this._fetchSocket;
@@ -19827,6 +19916,13 @@
         // maxSockets, or its createConnection pending) closes when the socket
         // comes, as node's onSocketNT does -- handing that socket back.
         if (this._agentPath && this._awaitingSocket) return;
+        if (hangUp && !this._responded && !this._errorEmitted) {
+          var self = this;
+          var hungUp = connResetException("socket hang up");
+          this._errorEmitted = true;
+          this.errored = hungUp;
+          process.nextTick(function () { self.emit("error", hungUp); });
+        }
         this._emitClose();
       }
       _emitClose() {
@@ -19835,14 +19931,20 @@
         var self = this;
         process.nextTick(function () { self.emit("close"); });
       }
-      // The agent path's socket is real: its idle timeout is node's (the
-      // socket's 'timeout' is re-emitted on the request). The fetch path's
-      // stand-in carries no bytes, so it has none.
+      // node's: nothing once the response has ended; else the request hears
+      // its socket's 'timeout' (once) and the socket's idle timeout is set
+      // -- the agent path's real socket's (after it connects), or the fetch
+      // path's stand-in's, which the transport's progress resets.
       setTimeout(ms, callback) {
+        if (this._responseEnd) return this;
+        this._listenSocketTimeout();
+        ms = requestTimerDuration(ms, "msecs");
         if (callback) this.once("timeout", callback);
-        if (!this._agentPath) return this;
+        var self = this;
         var apply = function (socket) {
-          if (socket.connecting) {
+          if (socket === self._fetchSocket && !self._agentPath) {
+            socket.setTimeout(ms);
+          } else if (socket.connecting) {
             socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
               socket.setTimeout(ms);
             });
@@ -20355,6 +20457,24 @@
           /(?:^|\s)--use-env-proxy(?:\s|$)/.test(env.NODE_OPTIONS || ""));
       }
       return envProxyEnabled;
+    }
+
+    // node's getTimerDuration (lib/internal/timers.js): a request's
+    // `timeout` option and setTimeout(msecs).
+    function requestTimerDuration(msecs, name) {
+      if (typeof msecs !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
+      if (msecs < 0 || !Number.isFinite(msecs)) {
+        throw codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
+      }
+      if (msecs > 2147483647) {
+        process.emitWarning(
+          msecs + " does not fit into a 32-bit signed integer." +
+            "\nTimer duration was truncated to 2147483647.",
+          "TimeoutOverflowWarning",
+        );
+        return 2147483647;
+      }
+      return msecs;
     }
 
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;

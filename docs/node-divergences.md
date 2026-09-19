@@ -1253,9 +1253,13 @@ What still differs:
   differs: the fields arrive with the response, where Node's socket has them on
   `'connect'` (a `'lookup'`, `'connect'` or `'secureConnect'` listener present when the
   request is dispatched therefore sends it over a real socket instead, entry 39); no bytes
-  pass through it, so it emits no `'data'` and its `setTimeout` does nothing; it emits
-  `'close'` only when the request is aborted or destroyed; and through an environment
-  proxy its peer is the proxy. At the end of a response whose connection stays open,
+  pass through it, so it emits no `'data'`, and its idle timer (`setTimeout`, the
+  request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
+  for the request -- sending it, each upload chunk, the response head, each body chunk --
+  rather than by each read and write on a wire
+  (`conformance/cases/150-http-request-timeouts.mjs`); it emits `'close'` only when the
+  request is aborted or destroyed; and through an environment proxy its peer is the
+  proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
 - **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
@@ -1555,9 +1559,7 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   without its `bytesParsed` / `rawPacket` (`conformance/cases/123-http-request-max-header-size.mjs`).
   A `101` head is measured as it arrives, CRLFs included, so it trips a few bytes before
   Node's count would. `insecureHTTPParser` is validated as in Node but relaxes nothing
-  (it does not lift the limit in Node either). `req.destroy()` without an error on a
-  request that has its socket emits no `'socket hang up'` error (Node does, before a
-  response); one still waiting for its socket does, as in Node. An upgrade's head is written
+  (it does not lift the limit in Node either). An upgrade's head is written
   by hand, so a header value carrying CR or LF fails that request with Node's
   `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).
 - **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots

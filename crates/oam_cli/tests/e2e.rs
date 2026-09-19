@@ -13220,6 +13220,9 @@ fn http_request_and_get_client() {
              console.log('setHeader:', req2.getHeader('x-test') === 'val');\n\
              req2.removeHeader('x-test');\n\
              console.log('removeHeader:', req2.getHeader('x-test') === undefined);\n\
+             // node: destroyed before its response, the request fails with\n\
+             // 'socket hang up' (unhandled, that 'error' ends the process).\n\
+             req2.on('error', (e) => console.log('destroy_hang_up:', e.code === 'ECONNRESET' && e.message === 'socket hang up'));\n\
              req2.destroy();",
             port = addr.port(),
         ),
@@ -13230,6 +13233,10 @@ fn http_request_and_get_client() {
             "assertion failed: {line}\nfull output: {stdout}"
         );
     }
+    assert!(
+        stdout.contains("destroy_hang_up: true"),
+        "no 'socket hang up' from the destroyed request: {stdout}"
+    );
 }
 
 #[test]
