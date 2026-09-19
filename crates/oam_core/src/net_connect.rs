@@ -178,16 +178,42 @@ pub async fn connect(
 /// empty, is the error a connect to the same name reports (`getaddrinfo
 /// ENOTFOUND host`).
 pub async fn resolve(host: &str, family: Option<u8>) -> Result<Vec<IpAddr>, ConnectError> {
-    resolve_with(host, family, &SystemDialer).await
+    resolve_with(host, host, family, &SystemDialer).await
+}
+
+/// [`resolve`], with getaddrinfo handed `name` where errors name `host`.
+/// node's GetAddrInfo (src/cares_wrap.cc) runs the host through UTS #46
+/// ToASCII (`ada::idna::to_ascii`) before libuv sees it, so a fullwidth
+/// `localhost`, or one with a soft hyphen in it, resolves as `localhost`,
+/// while the error still reads `getaddrinfo CODE <host as written>`; the
+/// caller passes that mapping as `name`. An empty `name` -- ToASCII refused
+/// the host, or mapped it to nothing -- is the `EINVAL` libuv's
+/// `uv__idna_toascii` reports for it.
+pub async fn resolve_as(
+    host: &str,
+    name: &str,
+    family: Option<u8>,
+) -> Result<Vec<IpAddr>, ConnectError> {
+    resolve_with(host, name, family, &SystemDialer).await
+}
+
+/// The error a lookup of an empty name reports: libuv's `UV_EINVAL`,
+/// `getaddrinfo EINVAL <host as written>`.
+pub fn empty_name_error(host: &str) -> NodeSysError {
+    dns_error(host, "EINVAL", fallback_errno("EINVAL").unwrap_or(-22))
 }
 
 pub(crate) async fn resolve_with<D: Dialer>(
     host: &str,
+    name: &str,
     family: Option<u8>,
     dialer: &D,
 ) -> Result<Vec<IpAddr>, ConnectError> {
+    if name.is_empty() {
+        return Err(ConnectError::Resolve(Box::new(empty_name_error(host))));
+    }
     let resolved = dialer
-        .lookup(host, 0)
+        .lookup(name, 0)
         .await
         .map_err(|error| ConnectError::Resolve(Box::new(resolve_error(host, &error))))?;
     let addrs: Vec<IpAddr> = resolved
@@ -1482,20 +1508,22 @@ mod tests {
     #[tokio::test]
     async fn resolve_keeps_the_resolver_order_and_filters_by_family() {
         let script = Script::new(&["::1", "127.0.0.1", "::2"], &[]);
-        let all = resolve_with("dual.example", None, &script).await.unwrap();
+        let all = resolve_with("dual.example", "dual.example", None, &script)
+            .await
+            .unwrap();
         let all: Vec<String> = all.iter().map(|ip| ip.to_string()).collect();
         assert_eq!(all, ["::1", "127.0.0.1", "::2"]);
         // A family that is neither 4 nor 6 keeps both, as dns.lookup does
         // for family 0.
-        let zero = resolve_with("dual.example", Some(0), &script)
+        let zero = resolve_with("dual.example", "dual.example", Some(0), &script)
             .await
             .unwrap();
         assert_eq!(zero.len(), 3);
-        let v4 = resolve_with("dual.example", Some(4), &script)
+        let v4 = resolve_with("dual.example", "dual.example", Some(4), &script)
             .await
             .unwrap();
         assert_eq!(v4, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
-        let v6 = resolve_with("dual.example", Some(6), &script)
+        let v6 = resolve_with("dual.example", "dual.example", Some(6), &script)
             .await
             .unwrap();
         assert_eq!(v6.len(), 2);
@@ -1503,11 +1531,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_looks_up_the_mapped_name_and_reports_the_host_as_written() {
+        // getaddrinfo is handed the ToASCII form; errors name the host.
+        let script = Script::new(&["127.0.0.1"], &[]);
+        let found = resolve_with("LOC\u{AD}ALHOST", "localhost", None, &script)
+            .await
+            .unwrap();
+        assert_eq!(found, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(*script.lookups.lock().unwrap(), ["localhost"]);
+
+        let script = Script::failing_lookup("Name or service not known");
+        let Err(ConnectError::Resolve(error)) = resolve_with(
+            "b\u{FC}cher.invalid",
+            "xn--bcher-kva.invalid",
+            None,
+            &script,
+        )
+        .await
+        else {
+            panic!("expected a resolver error");
+        };
+        assert_eq!(error.message, "getaddrinfo ENOTFOUND b\u{FC}cher.invalid");
+        assert_eq!(error.hostname.as_deref(), Some("b\u{FC}cher.invalid"));
+
+        // ToASCII refused the host (or mapped it to nothing): libuv's EINVAL,
+        // and nothing is looked up.
+        let script = Script::new(&["127.0.0.1"], &[]);
+        let Err(ConnectError::Resolve(error)) = resolve_with("\u{AD}", "", None, &script).await
+        else {
+            panic!("expected EINVAL");
+        };
+        assert_eq!(error.code, "EINVAL");
+        assert_eq!(error.message, "getaddrinfo EINVAL \u{AD}");
+        #[cfg(windows)]
+        assert_eq!(error.errno, Some(-4071));
+        #[cfg(unix)]
+        assert_eq!(error.errno, Some(-libc::EINVAL));
+        assert!(script.lookups.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn resolve_fails_as_a_connect_to_the_same_name_would() {
         // A family the name has no address in: getaddrinfo ENOTFOUND.
         let script = Script::new(&["127.0.0.1"], &[]);
         let Err(ConnectError::Resolve(error)) =
-            resolve_with("v4only.example", Some(6), &script).await
+            resolve_with("v4only.example", "v4only.example", Some(6), &script).await
         else {
             panic!("expected a resolver error");
         };
@@ -1518,7 +1586,8 @@ mod tests {
 
         // A resolver failure is classified exactly as connect classifies it.
         let script = Script::failing_lookup("Name or service not known");
-        let Err(ConnectError::Resolve(resolved)) = resolve_with("nx.example", None, &script).await
+        let Err(ConnectError::Resolve(resolved)) =
+            resolve_with("nx.example", "nx.example", None, &script).await
         else {
             panic!("expected a resolver error");
         };

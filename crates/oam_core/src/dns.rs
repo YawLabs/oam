@@ -90,8 +90,14 @@ fn host(name: &hickory_resolver::proto::rr::Name) -> String {
     s.strip_suffix('.').map(str::to_owned).unwrap_or(s)
 }
 
-pub async fn dns_lookup(hostname: String, family: i32, all: bool) -> OpOutcome {
-    let lookup = format!("{}:0", hostname);
+/// dns.lookup: getaddrinfo of `name`, the UTS #46 ToASCII form of `hostname`
+/// node's GetAddrInfo hands libuv; errors name `hostname` as written. An
+/// empty `name` is libuv's EINVAL (see `net_connect::resolve_as`).
+pub async fn dns_lookup(hostname: String, name: String, family: i32, all: bool) -> OpOutcome {
+    if name.is_empty() {
+        return OpOutcome::sys(crate::net_connect::empty_name_error(&hostname));
+    }
+    let lookup = format!("{}:0", name);
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&lookup).await {
         Ok(iter) => iter.collect(),
         Err(_) => {

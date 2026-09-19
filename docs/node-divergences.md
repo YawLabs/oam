@@ -1455,9 +1455,12 @@ above.
   `net.connect` with the string as given, and the platform's `getaddrinfo` answers it as it
   answers Node (`ENOTFOUND` for all of those on Windows; glibc's resolver takes octal
   IPv4), with Node's `ERR_INVALID_CHAR` thrown first for a Host header no header may carry
-  (`conformance/cases/121` and `122`). Up to 0.16.2 the parser's rewrite was dialled. One
-  resolver difference remains: on Windows Node's `dns.lookup` maps a fullwidth-digit name to
-  its ASCII address and oam's refuses it (fail-closed; `http.request` throws on it in both).
+  (`conformance/cases/121` and `122`). Up to 0.16.2 the parser's rewrite was dialled. The
+  resolver is handed what Node's is: the UTS #46 ToASCII form of the name (Node's
+  GetAddrInfo runs `ada::idna::to_ascii` before getaddrinfo, and so does oam's, for
+  `dns.lookup`, `net.connect` and `tls.connect`), so a soft hyphen vanishes and a fullwidth
+  or superscript digit is a digit, and a name ToASCII refuses is `getaddrinfo EINVAL`; the
+  error names the host as written. Up to 0.16.2 oam's resolver took the name raw.
 - **A port that is a coercible string dials the same place, but the `Host` header differs.**
   Node dials the coercion and writes the caller's raw spelling: `port: '0x50'` sends
   `Host: 127.0.0.1:0xc4df`, and `port: ' 50399'` sends `Host: 127.0.0.1: 50399`. oam dials

@@ -556,6 +556,42 @@ for (const host of [
   console.log(`host ${j(host)}: ${outcome} | reached=${hits > before}`);
 }
 
+// What the resolver is handed is node's: the UTS #46 ToASCII form of the
+// name (node's GetAddrInfo runs ada::idna::to_ascii first), so a soft hyphen
+// vanishes and a superscript or fullwidth digit is a digit -- and a name
+// ToASCII refuses or maps to nothing is getaddrinfo EINVAL. The error still
+// names the host as written.
+const FULLWIDTH_LOCALHOST = "ｌｏｃａｌｈｏｓｔ";
+for (const host of ["loc­alhost", "127.0.0.¹", FULLWIDTH_LOCALHOST, "LOCAL­HOST.", "­", "xn--a.localhost"]) {
+  const looked = await new Promise((resolve) =>
+    dns.lookup(host, { family: 4 }, (e, address) =>
+      resolve(e ? `ERROR ${e.code} ${e.syscall} ${j(e.hostname)} ${e.message === `getaddrinfo ${e.code} ${host}`}` : address)),
+  );
+  const connected = await new Promise((resolve) => {
+    const s = net.connect({ host, port: P4, family: 4 });
+    s.on("connect", () => {
+      resolve(`connect ${s.remoteAddress}`);
+      s.destroy();
+    });
+    s.on("error", (e) => resolve(`ERROR ${e.code}`));
+  });
+  const before = hits;
+  const got = await new Promise((resolve) => {
+    let req;
+    try {
+      req = http.get({ host, port: P4, family: 4, path: "/idna" }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(`RESPONSE ${res.statusCode}`));
+      });
+    } catch (e) {
+      resolve(`THROW ${e.code}`);
+      return;
+    }
+    req.on("error", (e) => resolve(`ERROR ${e.code}`));
+  });
+  console.log(`resolver ${j(host)}: lookup ${looked} | net ${connected} | http ${got} reached=${hits > before}`);
+}
+
 srv4.close();
 srv6.close();
 tsrv4.close();

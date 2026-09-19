@@ -25357,6 +25357,9 @@
       if (lookupPath) {
         const errno = _dnsLookupErrno(code);
         if (errno !== undefined) e.errno = errno;
+        // A name ToASCII refused is libuv's EINVAL, whose number the native
+        // side already took for this platform.
+        else if (code === "EINVAL" && typeof err.errno === "number") e.errno = err.errno;
       }
       return e;
     }

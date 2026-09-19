@@ -51,6 +51,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   node never dials. Such a host now goes to the resolver as written, as in node, and a
   Host header no header may carry throws node's `ERR_INVALID_CHAR`. `net.isIP` also
   accepts an IPv6 zone id, and `dns.lookup` answers an IP literal as written, as node's do.
+  The resolver behind `dns.lookup`, `net.connect` and `tls.connect` is handed the name's
+  UTS #46 ToASCII form, as node's is (a soft hyphen vanishes, a fullwidth digit is a digit,
+  a name ToASCII refuses is `getaddrinfo EINVAL`).
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

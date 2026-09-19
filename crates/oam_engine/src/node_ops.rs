@@ -2898,8 +2898,10 @@ fn op_net_resolve(
     let core = core_runtime!(scope);
     let answers = core.resolved_answers();
     let ids = core.body_ids();
+    // What node's GetAddrInfo hands getaddrinfo: the UTS #46 ToASCII form.
+    let name = ada_url::Idna::ascii(&host);
     crate::ops::spawn_op(scope, &mut rv, async move {
-        let mut addrs = match oam_core::net_connect::resolve(&host, family).await {
+        let mut addrs = match oam_core::net_connect::resolve_as(&host, &name, family).await {
             Ok(addrs) => addrs,
             Err(e) => return e.to_outcome(),
         };
@@ -7170,11 +7172,13 @@ fn op_dns_lookup(
         0
     };
     let all = args.get(2).is_true();
+    // node's GetAddrInfo hands getaddrinfo the UTS #46 ToASCII form.
+    let name = ada_url::Idna::ascii(&hostname);
 
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::dns::dns_lookup(hostname, family, all),
+        oam_core::dns::dns_lookup(hostname, name, family, all),
     );
 }
 
