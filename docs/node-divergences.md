@@ -1479,18 +1479,24 @@ client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`
 `servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), an
 upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
 request is dispatched -- one macrotask after `'socket'`, so a listener added after an
-`await` in an async `'socket'` handler counts. Guard packages that vet the destination in any of those places (request-filtering-agent,
+`await` in an async `'socket'` handler counts -- or when the agent's pool already holds a
+socket for the request (a stock agent's included). Guard packages that vet the destination in any of those places (request-filtering-agent,
 ssrf-req-filter, a `'connect'` listener checking `remoteAddress`) therefore run, and what
 they refuse never reaches the wire, matching Node
 (`conformance/cases/121-http-request-lookup-and-agents.mjs`). Every other request stays on
 oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, `lookup` and
 `createConnection` were ignored. What differs on this path:
 
-- **No socket pool.** oam's `http.Agent` has Node's option merge, `getName`, `createSocket`
-  and bookkeeping, but it never reuses a socket: every request opens its own connection
-  (and TLS handshake) and says `Connection: close` unless the caller set the header. A
-  `keepAlive` agent in Node reuses its sockets, and calls `lookup` and `createConnection`
-  only for new ones, so oam calls them more often. `maxSockets` does not queue requests.
+- **The pool is Node's.** `http.Agent` is lib/_http_agent.js ported: `keepAlive`,
+  `maxSockets` (requests queue in `agent.requests`), `maxFreeSockets`, `maxTotalSockets`,
+  `scheduling`, the `'free'` event, `freeSockets` keyed by `getName()`, the response's
+  `Keep-Alive: timeout=` hint, `reusedSocket`, `keepSocketAlive` / `reuseSocket` called
+  where Node calls them (agentkeepalive overrides both), and the request's `Connection`
+  header by Node's rules; `conformance/cases/124-http-agent-keepalive-pool.mjs` pins it.
+  What differs: a socket that is not reused because its response said `close` (or was
+  destroyed) leaves `agent.sockets` at once, where Node's leaves it in a later loop
+  phase, when its `'close'` arrives (see Sockets below). Not ported: `proxyEnv`
+  (`--use-env-proxy`) and the `'keylog'` relay.
 - **The wire.** Header names go out lowercased (hyper keeps no original case), and
   `rawHeaders` of the response are lowercased too. A request target byte that hyper's URI
   type refuses (`"`, `<`, `>`, `\`, `^`, `` ` ``, and any byte above 0x7F) is
@@ -1507,8 +1513,9 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   without its `bytesParsed` / `rawPacket` (`conformance/cases/123-http-request-max-header-size.mjs`).
   A `101` head is measured as it arrives, CRLFs included, so it trips a few bytes before
   Node's count would. `insecureHTTPParser` is validated as in Node but relaxes nothing
-  (it does not lift the limit in Node either). `req.destroy()` without an error emits no
-  `'socket hang up'` error (Node does, before a response). An upgrade's head is written
+  (it does not lift the limit in Node either). `req.destroy()` without an error on a
+  request that has its socket emits no `'socket hang up'` error (Node does, before a
+  response); one still waiting for its socket does, as in Node. An upgrade's head is written
   by hand, so a header value carrying CR or LF fails that request with Node's
   `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).
 - **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots

@@ -36,9 +36,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `options.createConnection`, a wrapped `net.createConnection` / `tls.connect`, or
   listeners on `req.socket`. A request that carries such connection policy now goes over
   the socket the agent returns, as in node. So does `https.request` with
-  `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. Such
-  requests open a new connection each and send `Connection: close` (oam keeps no agent
-  socket pool yet). Their response heads are held to node's `maxHeaderSize`, and
+  `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. The
+  agent pools these connections as node's does. Their response heads are held to node's
+  `maxHeaderSize`, and
   `http.request` now takes node's per-request `maxHeaderSize` and `insecureHTTPParser`
   options, validated as node validates them; an oversized head fails the request with
   node's own `HPE_HEADER_OVERFLOW` error.
@@ -106,6 +106,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
+  agent's socket (a custom agent such as agentkeepalive's, which openai v4 and
+  node-fetch use, or a socket got watches) opened a new connection and TLS handshake
+  per request and said `Connection: close`. The agent now pools them with node's rules:
+  `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
+  `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the
+  response's `Connection` / `Keep-Alive: timeout=` and framing, `reusedSocket`, and
+  node's `Connection` header on the request. A pooled socket is unref'd, and a socket's
+  idle timeout no longer keeps the process alive. A request destroyed while it waits
+  for a socket hands that socket on and reports `socket hang up`, as in node.
+- **`req.end(callback)` called the callback with the response.** node calls it on
+  `'finish'`, with no arguments; got treated the response as the request's error, so
+  every got request failed once it went over a socket.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same

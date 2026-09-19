@@ -5963,6 +5963,148 @@ endless.close();
     );
 }
 
+/// A keepAlive agent that overrides createConnection (agentkeepalive's and
+/// openai v4's shape) keeps its socket for the next request, as node's does:
+/// five sequential requests go over ONE server-side connection, each says
+/// `Connection: keep-alive`, the second on report `reusedSocket`, and the
+/// socket sits in `agent.freeSockets` between requests -- over http and over
+/// https (one TLS handshake). Up to 0.16.2 every request opened its own
+/// connection and said `Connection: close`.
+#[test]
+fn a_keepalive_agent_reuses_the_socket_its_createconnection_returned() {
+    let src = format!(
+        r#"
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const ca = `{ca}`;
+function serve(secure) {{
+  const stats = {{ connections: 0, headers: [] }};
+  const onConn = (c) => {{
+    stats.connections++;
+    let buf = '';
+    c.on('error', () => {{}});
+    c.on('data', (d) => {{
+      buf += d.toString('latin1');
+      let i;
+      while ((i = buf.indexOf('\r\n\r\n')) !== -1) {{
+        const head = buf.slice(0, i);
+        buf = buf.slice(i + 4);
+        stats.headers.push((/\r\nconnection: *([^\r]*)/i.exec(head) || [])[1]);
+        c.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+      }}
+    }});
+  }};
+  const server = secure ? tls.createServer({{ cert, key }}, onConn) : net.createServer(onConn);
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({{ server, stats }})));
+}}
+class OwnAgent extends http.Agent {{
+  createConnection(options, cb) {{ return net.createConnection(options, cb); }}
+}}
+class OwnHttpsAgent extends https.Agent {{
+  createConnection(options, cb) {{ return tls.connect(options, cb); }}
+}}
+for (const secure of [false, true]) {{
+  const {{ server, stats }} = await serve(secure);
+  const agent = secure ? new OwnHttpsAgent({{ keepAlive: true, ca }}) : new OwnAgent({{ keepAlive: true }});
+  const reused = [];
+  const pooled = [];
+  for (let i = 0; i < 5; i++) {{
+    const req = await new Promise((resolve, reject) => {{
+      const options = {{ host: '127.0.0.1', port: server.address().port, agent }};
+      if (secure) options.servername = 'localhost';
+      const req = (secure ? https : http).get(options, (res) => {{
+        res.resume();
+        res.on('end', () => resolve(req));
+      }});
+      req.on('error', reject);
+    }});
+    reused.push(req.reusedSocket);
+    pooled.push(Object.values(agent.freeSockets).reduce((n, list) => n + list.length, 0));
+  }}
+  console.log(`${{secure ? 'https' : 'http'}} connections=${{stats.connections}} requests=${{stats.headers.length}} sent=${{[...new Set(stats.headers)]}} reused=${{reused}} pooled=${{pooled}}`);
+  agent.destroy();
+  server.close();
+}}
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+    );
+    let out = run_ok("keepalive_agent_pool.mjs", &src);
+    assert_eq!(
+        out,
+        "http connections=1 requests=5 sent=keep-alive reused=false,true,true,true,true pooled=1,1,1,1,1\n\
+         https connections=1 requests=5 sent=keep-alive reused=false,true,true,true,true pooled=1,1,1,1,1"
+    );
+}
+
+/// Pooled sockets do not keep the process alive, as in node: the agent unrefs
+/// a socket it keeps, and a socket's idle timer (the global agent's 5 s, an
+/// agent's `timeout`) is an unref'd timer. The server is in this test
+/// process, so only the client's handles count.
+#[test]
+fn pooled_sockets_do_not_keep_the_process_alive() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.drain(..end + 4);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nkeep-alive: timeout=30\r\n\r\nok",
+                        );
+                    }
+                }
+            });
+        }
+    });
+    let src = format!(
+        r#"
+import http from 'node:http';
+import net from 'node:net';
+class OwnAgent extends http.Agent {{
+  createConnection(options, cb) {{ return net.createConnection(options, cb); }}
+}}
+const agent = new OwnAgent({{ keepAlive: true, timeout: 20000 }});
+const get = (options) => new Promise((resolve, reject) => {{
+  const req = http.get({{ host: '127.0.0.1', port: {port}, ...options }}, (res) => {{
+    res.resume();
+    res.on('end', resolve);
+  }});
+  // A watched socket sends the request over the global agent's socket.
+  req.on('socket', (s) => s.once('connect', () => {{}}));
+  req.on('error', reject);
+}});
+await get({{ agent }});
+await get({{}});
+const free = (a) => Object.values(a.freeSockets).reduce((n, list) => n + list.length, 0);
+console.log(`pooled ${{free(agent)}} ${{free(http.globalAgent)}}`);
+"#
+    );
+    let started = std::time::Instant::now();
+    let out = run_ok("pooled_sockets_exit.mjs", &src);
+    assert_eq!(out, "pooled 1 1");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the run waited on its pooled sockets: {:?}",
+        started.elapsed()
+    );
+}
+
 /// An upgrade goes over a real socket: the ws library's shape
 /// (`createConnection: net.connect` / `tls.connect`, the upgrade headers) gets
 /// 'upgrade' with that socket and echoes over it, for ws and wss; and a

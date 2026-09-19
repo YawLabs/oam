@@ -17960,9 +17960,11 @@
     //    request's or the agent's options, a replaced dns.lookup, https with
     //    rejectUnauthorized:false, an upgrade, or 'lookup' / 'connect' /
     //    'secureConnect' listeners on req.socket by the time the request is
-    //    dispatched. A guard in any of those places runs, and every byte goes
-    //    over the socket it vetted. oam keeps no socket pool: each request
-    //    gets its own connection and says `Connection: close`.
+    //    dispatched -- or when the agent's pool already holds a socket for
+    //    the request. A guard in any of those places runs, and every byte
+    //    goes over the socket it vetted. The agent pools sockets as node's
+    //    does (keepAlive, maxSockets, maxFreeSockets, 'free'); each exchange
+    //    on a reused socket starts once the last one finished writing.
     //  - The FETCH path otherwise: oam's pooled transport (the fetch op),
     //    through bootstrap's internal entry (never the user-replaceable
     //    globalThis.fetch). req.socket is still a real net.Socket /
@@ -18038,6 +18040,60 @@
         typeof options.checkServerIdentity === "function" ||
         options.minVersion != null || options.maxVersion != null ||
         options.secureProtocol != null;
+    }
+
+    // Set on a socket that carried an agent-path exchange and was kept
+    // alive: settles once that exchange has finished writing.
+    const kSocketBridgeTail = Symbol("oamBridgeTail");
+
+    // Whether the agent's pool holds a live socket for the name this request
+    // would be given (node's addRequest takes it before creating one).
+    function agentHasFreeSocket(agent, req, opts, host, port) {
+      var free = agent.freeSockets;
+      if (!free || typeof free !== "object" || Object.keys(free).length === 0) return false;
+      if (typeof agent.getName !== "function") return false;
+      var options = Object.assign({ __proto__: null }, opts, { host: host, port: port }, agent.options);
+      if (options.socketPath) options.path = options.socketPath;
+      var name;
+      try {
+        normalizeServerName(options, req);
+        name = agent.getName(options);
+      } catch (e) {
+        return false;
+      }
+      var list = free[name];
+      if (!Array.isArray(list)) return false;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && !list[i].destroyed) return true;
+      }
+      return false;
+    }
+
+    // llhttp's should_keep_alive for a response: HTTP/1.1 unless it says
+    // `Connection: close`, HTTP/1.0 only if it says `keep-alive`, and never
+    // when the body runs to the end of the connection.
+    function responseKeepsAlive(raw, method) {
+      var connection = "";
+      var te = null;
+      var hasLength = false;
+      var headers = raw.headers || [];
+      for (var i = 0; i < headers.length; i++) {
+        var name = String(headers[i][0]).toLowerCase();
+        var value = String(headers[i][1]);
+        if (name === "connection") connection += "," + value.toLowerCase();
+        else if (name === "transfer-encoding") te = te === null ? value : te + "," + value;
+        else if (name === "content-length") hasLength = true;
+      }
+      var tokens = connection.split(",").map(function (t) { return t.trim(); });
+      if (raw.httpVersion === "1.0") {
+        if (tokens.indexOf("keep-alive") === -1) return false;
+      } else if (tokens.indexOf("close") !== -1) {
+        return false;
+      }
+      var status = raw.status;
+      if ((status / 100 | 0) === 1 || status === 204 || status === 304 || method === "HEAD") return true;
+      if (te !== null) return /(?:^|,)\s*chunked\s*$/i.test(te);
+      return hasLength;
     }
 
     function isSocketLike(socket) {
@@ -18355,7 +18411,17 @@
         this.host = host;
         this.protocol = protocol;
         this.reusedSocket = false;
-        this.shouldKeepAlive = false;
+        // node: with an agent the socket is kept alive unless the agent could
+        // never reuse it (no keepAlive and no maxSockets cap); without one
+        // (a createConnection option) it is closed.
+        this.shouldKeepAlive = !!this.agent &&
+          !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
+        this._removedConnection = false;
+        // node's req._ended: the response has ended (the socket may be freed
+        // once the request has finished too).
+        this._responseEnd = false;
+        // An agent-path request between addRequest and its socket.
+        this._awaitingSocket = false;
         if (opts.timeout !== undefined) this.timeout = opts.timeout;
         this._pendingDispatch = null;
         this._socketEmitted = false;
@@ -18380,7 +18446,10 @@
           (!literal && merged.lookup != null) ||
           (!literal && dnsLookupReplaced()) ||
           socketLayerPatched(protocol === "https:") ||
-          (protocol === "https:" && carriesTlsPolicy(merged));
+          (protocol === "https:" && carriesTlsPolicy(merged)) ||
+          // A socket an earlier request over this (stock) agent left in its
+          // pool is reused, as node's addRequest reuses it.
+          (!!agent && agentHasFreeSocket(agent, this, opts, host, port));
         this._options = opts;
         this._port = port;
         this._fetchSocket = null;
@@ -18407,9 +18476,19 @@
       // node's deprecated alias for `socket`.
       get connection() { return this.socket; }
       set connection(value) { this.socket = value; }
-      setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
+      setHeader(name, value) {
+        var key = name.toLowerCase();
+        if (key === "connection") this._removedConnection = false;
+        this._headers[key] = value;
+        return this;
+      }
       getHeader(name) { return this._headers[name.toLowerCase()]; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      removeHeader(name) {
+        var key = name.toLowerCase();
+        // node: a removed Connection header is not sent at all.
+        if (key === "connection") this._removedConnection = true;
+        delete this._headers[key];
+      }
       getHeaders() { return Object.assign({}, this._headers); }
       hasHeader(name) { return name.toLowerCase() in this._headers; }
       flushHeaders() {
@@ -18529,12 +18608,16 @@
         // pipeline ends the destination, then the caller ends it too --
         // fires a SECOND request over the wire.
         if (this._ended) {
-          // The response may already have arrived (a GET dispatched on its
-          // first write, or a re-end after completion): once('response')
-          // would never fire again, silently dropping the callback.
-          if (callback) {
-            if (this.res) queueMicrotask(callback);
-            else this.once("response", callback);
+          // node: the callback of a second end() waits for 'finish', or is
+          // told the message already finished.
+          if (typeof callback === "function") {
+            if (!this._finished) {
+              this.once("finish", callback);
+            } else {
+              var already = new Error("Cannot call end after a stream was finished");
+              already.code = "ERR_STREAM_ALREADY_FINISHED";
+              callback(already);
+            }
           }
           return this;
         }
@@ -18576,13 +18659,9 @@
           self._bodyLength = 0;
           self.emit("finish");
         });
-        if (callback) {
-          // A GET dispatched on its first write may have its response
-          // before end() is ever called; once('response') would then
-          // never fire.
-          if (self.res) queueMicrotask(callback);
-          else self.once("response", callback);
-        }
+        // node: end()'s callback is a 'finish' listener, called with no
+        // arguments (got treats an argument as the request's failure).
+        if (typeof callback === "function") self.once("finish", callback);
         return this;
       }
 
@@ -18656,6 +18735,16 @@
         }
         this._agentPath = true;
         var options = this._agentConnectOptions();
+        // The socket joins the agent as createSocket's would, so the agent
+        // can keep it alive for the next request.
+        var agent = this.agent;
+        if (agent && agent.sockets && typeof agent.getName === "function") {
+          var name = options._agentKey;
+          agent.sockets[name] ||= [];
+          agent.sockets[name].push(socket);
+          agent.totalSocketCount++;
+          installListeners(agent, socket, options);
+        }
         try {
           socket.connect(options);
         } catch (err) {
@@ -18815,6 +18904,7 @@
         delete options.signal;
         options.port = this._port;
         options.host = this.host;
+        this._awaitingSocket = true;
         if (this.agent) {
           this.agent.addRequest(this, options);
           return;
@@ -18827,7 +18917,11 @@
         }
         var oncreate = once(function (err, socket) {
           if (err) {
-            process.nextTick(function () { self._failBeforeResponse(err); });
+            self._awaitingSocket = false;
+            process.nextTick(function () {
+              if (self._aborted) self._emitClose();
+              else self._failBeforeResponse(err);
+            });
           } else {
             self.onSocket(socket);
           }
@@ -18846,6 +18940,7 @@
       // destroy() synchronously, where node's does it on a later tick.
       onSocket(socket, err) {
         var self = this;
+        this._awaitingSocket = false;
         if (!err && isSocketLike(socket)) {
           var early = [];
           var onError = function (e) { early.push(["error", e]); };
@@ -18868,8 +18963,28 @@
         }
         if (!err && !isSocketLike(socket)) err = unusableSocketError();
         if (this._aborted || err) {
-          if (isSocketLike(socket) && !socket.destroyed) socket.destroy();
-          if (err) this._failBeforeResponse(err);
+          // node's onSocketNT: a request destroyed before its socket came
+          // hands a healthy socket back to its agent ('free': the next
+          // queued request, or the pool).
+          if (isSocketLike(socket)) {
+            if (!err && this.agent && !socket.destroyed) socket.emit("free");
+            else if (!socket.destroyed) socket.destroy();
+          }
+          if (!this._aborted) {
+            this._failBeforeResponse(err);
+            return;
+          }
+          // ...and then reports it: a destroy() (not an abort()) as the
+          // hang-up, then 'close'.
+          if (!this._errorEmitted) {
+            var failure = err || (this.aborted ? null : connResetException("socket hang up"));
+            if (failure) {
+              this._errorEmitted = true;
+              this.errored = failure;
+              this.emit("error", failure);
+            }
+          }
+          this._emitClose();
           return;
         }
         this.socket = socket;
@@ -18999,9 +19114,8 @@
       }
 
       // The request's header lines, in order: the caller's, then Host (node's
-      // rule), then -- for the bridge -- `Connection: close`, since the
-      // socket is not reused.
-      _headerList(closeConnection) {
+      // rule), then -- for the bridge -- node's Connection header.
+      _headerList(forBridge) {
         var list = [];
         var headers = this._headers;
         var names = Object.keys(headers);
@@ -19014,12 +19128,46 @@
           }
         }
         if (headers.host === undefined && this._setHost) list.push(["host", this._hostHeader]);
-        if (closeConnection && headers.connection === undefined) list.push(["connection", "close"]);
+        if (forBridge) {
+          var connection = this._connectionHeader();
+          if (connection !== null) list.push(["connection", connection]);
+        }
         return list;
+      }
+
+      // node's _storeHeader keep-alive logic: a Connection header the caller
+      // set is sent as set (and one that is not `close` keeps the socket
+      // alive); a removed one is not sent; otherwise `keep-alive` when the
+      // socket is to be kept, else `close`.
+      _connectionHeader() {
+        var set = this._headers.connection;
+        if (set !== undefined) {
+          if (!/(?:^|\W)close(?:$|\W)/i.test(String(set))) this.shouldKeepAlive = true;
+          return null;
+        }
+        if (this._removedConnection) return null;
+        var method = this.method;
+        var chunkedByDefault = method !== "GET" && method !== "HEAD" && method !== "DELETE" &&
+          method !== "OPTIONS" && method !== "TRACE" && method !== "CONNECT";
+        var send = this.shouldKeepAlive &&
+          (this._headers["content-length"] !== undefined || chunkedByDefault || !!this.agent);
+        return send ? "keep-alive" : "close";
       }
 
       _startExchange() {
         var socket = this.socket;
+        // A reused socket carries this exchange only once the last one on it
+        // has finished writing (hyper releases its end of the pipe then).
+        var tail = socket[kSocketBridgeTail];
+        if (tail) {
+          socket[kSocketBridgeTail] = null;
+          var waiting = this;
+          tail.then(function () {
+            if (socket.destroyed || waiting._aborted || waiting.destroyed) return;
+            waiting._startExchange();
+          });
+          return;
+        }
         var bodyData = this._pendingDispatch.bodyData;
         var conn = String(this._headers["connection"] || "").toLowerCase();
         if (conn.indexOf("upgrade") !== -1) {
@@ -19092,15 +19240,26 @@
         socket.on("data", onData);
         socket.on("end", onEnd);
         this._bridgeSocketListeners = { socket: socket, data: onData, end: onEnd };
+        // Settles once every byte hyper wrote for this exchange has been
+        // written to the socket and hyper released the pipe: the point a
+        // reused socket may carry the next exchange.
+        var outDone;
+        this._bridgeOutDone = new Promise(function (resolve) { outDone = resolve; });
         var pumpOut = function () {
           natives.httpBridgeOut(id).then(function (bytes) {
             // undefined: hyper is done with the connection.
-            if (bytes === undefined || socket.destroyed) return;
+            if (bytes === undefined || socket.destroyed) {
+              outDone();
+              return;
+            }
             socket.write(
               globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-              function (err) { if (!err) pumpOut(); },
+              function (err) {
+                if (err) outDone();
+                else pumpOut();
+              },
             );
-          }, function () {});
+          }, function () { outDone(); });
         };
         pumpOut();
       }
@@ -19125,6 +19284,33 @@
           natives.httpBridgeClose(this._bridge);
           this._bridge = null;
         }
+      }
+
+      // The response is done and the socket stays open for another request:
+      // the socket stops feeding this exchange, which is left to finish
+      // writing (its pipe is closed once hyper released it, or when the
+      // socket closes), and the socket reads on -- a peer's FIN on an idle
+      // pooled socket closes it, which takes it out of the pool.
+      _releaseBridge(socket) {
+        var listeners = this._bridgeSocketListeners;
+        if (listeners) {
+          listeners.socket.removeListener("data", listeners.data);
+          listeners.socket.removeListener("end", listeners.end);
+          this._bridgeSocketListeners = null;
+        }
+        var id = this._bridge;
+        this._bridge = null;
+        if (id === null) return;
+        var closed = false;
+        var closeBridge = function () {
+          if (closed) return;
+          closed = true;
+          socket.removeListener("close", closeBridge);
+          natives.httpBridgeClose(id);
+        };
+        socket.on("close", closeBridge);
+        socket[kSocketBridgeTail] = (this._bridgeOutDone || Promise.resolve()).then(closeBridge);
+        if (!socket.destroyed && typeof socket.resume === "function") socket.resume();
       }
 
       // An upgrade over the socket: the request head written straight to it,
@@ -19338,7 +19524,75 @@
         // surfaces as ECONNRESET on an in-flight response stream.
         this.res = res;
         this._res = res;
-        this.emit("response", res);
+        if (!agentPath) {
+          this.emit("response", res);
+          return;
+        }
+        // node's parserOnIncomingClient: the socket is kept only if the
+        // response allows it, and the response's end -- seen first, before
+        // any 'end' listener of the caller's -- decides what becomes of it.
+        if (this.shouldKeepAlive && !responseKeepsAlive(raw, this.method)) {
+          this.shouldKeepAlive = false;
+        }
+        res.on("end", function () {
+          self._agentResponseOnEnd(res);
+        });
+        // A response nobody listens for is read to its end, so the socket
+        // is not left holding it.
+        if (!this.emit("response", res)) res.resume();
+      }
+
+      // node's responseOnEnd.
+      _agentResponseOnEnd(res) {
+        var self = this;
+        this._responseEnd = true;
+        if (!this.shouldKeepAlive) {
+          // The connection is done with once its response is -- closed
+          // after the response's own 'end' has been delivered.
+          var socket = this.socket;
+          globalThis.setImmediate(function () {
+            self._closeBridge();
+            if (socket) {
+              socket._httpMessage = null;
+              if (!socket.destroyed) socket.destroy();
+            }
+          });
+          this.destroyed = true;
+          this._emitClose();
+        } else if (this._finished && !res.aborted) {
+          this._responseKeepAlive();
+        } else {
+          // node's requestOnFinish: the whole response arrived before the
+          // request finished.
+          this.once("finish", function () {
+            if (self.shouldKeepAlive && self._responseEnd) self._responseKeepAlive();
+          });
+        }
+      }
+
+      // node's responseKeepAlive + emitFreeNT: the request lets go of the
+      // socket, closes, and the socket is 'free' for its agent.
+      _responseKeepAlive() {
+        var socket = this.socket;
+        if (!socket || this._keptAlive) return;
+        this._keptAlive = true;
+        this._detachSocketListeners(socket);
+        this._releaseBridge(socket);
+        this.destroyed = true;
+        if (this.res) {
+          // Detach the socket from the response, so destroying the response
+          // does not destroy the freed socket.
+          this.res.socket = null;
+          this.res.connection = null;
+        }
+        var self = this;
+        process.nextTick(function () {
+          if (!self.closed) {
+            self.closed = true;
+            self.emit("close");
+          }
+          if (self.socket) self.socket.emit("free");
+        });
       }
 
       // The response stopped before its end (a failed body, a destroy): the
@@ -19355,19 +19609,9 @@
 
       _responseEnded() {
         this._responseDone = true;
-        if (this._agentPath) {
-          // No pool: the connection is done with once its response is --
-          // closed after the response's own 'end' has been delivered.
-          var socket = this.socket;
-          var self = this;
-          globalThis.setImmediate(function () {
-            self._closeBridge();
-            if (socket) {
-              socket._httpMessage = null;
-              if (!socket.destroyed) socket.destroy();
-            }
-          });
-        }
+        // The agent path's socket is settled by the response's 'end'
+        // (_agentResponseOnEnd).
+        if (this._agentPath) return;
         this.destroyed = true;
         this._emitClose();
       }
@@ -19387,6 +19631,7 @@
         this._aborted = true;
         this._tearDown();
         if (err) {
+          this._errorEmitted = true;
           this.errored = err;
           this.emit("error", err);
         }
@@ -19418,6 +19663,10 @@
         this._closeBridge();
         var socket = this.socket || this._fetchSocket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
+        // An agent-path request still waiting for its socket (queued behind
+        // maxSockets, or its createConnection pending) closes when the socket
+        // comes, as node's onSocketNT does -- handing that socket back.
+        if (this._agentPath && this._awaitingSocket) return;
         this._emitClose();
       }
       _emitClose() {
@@ -19465,14 +19714,27 @@
       return req;
     }
 
-    // ---- http.Agent: node lib/_http_agent.js, without the socket pool ----
-    // oam opens a new connection for every request an agent carries (the
-    // request says `Connection: close`, and a socket handed back as free is
-    // closed). The rest is node's: the option merge, getName, createSocket's
+    // ---- http.Agent: node lib/_http_agent.js (v22.22.2) ----
+    // node's connection pool, statement for statement: the option merge,
+    // getName, addRequest (a free socket for the name, else a new one under
+    // maxSockets / maxTotalSockets, else the request queues), createSocket's
     // createConnection call with its three result shapes (a socket, a later
-    // callback, a callback with an error), and the per-name socket
-    // bookkeeping. An ES5 constructor, so `http.Agent.call(this, options)`
-    // subclasses work.
+    // callback, a callback with an error), the 'free' handler that hands a
+    // socket to the next queued request or keeps it in freeSockets
+    // (keepAlive, maxFreeSockets, the response's Keep-Alive hint), and
+    // removeSocket making a socket for a request still queued. An ES5
+    // constructor, so `http.Agent.call(this, options)` subclasses work, and
+    // packages that override keepSocketAlive / reuseSocket (agentkeepalive)
+    // are called where node calls them. Not ported: proxyEnv (--use-env-proxy)
+    // and the keylog relay.
+    const kRequestOptions = Symbol("requestOptions");
+
+    function freeSocketErrorListener(err) {
+      const socket = this;
+      socket.destroy();
+      socket.emit("agentRemove");
+    }
+
     function Agent(options) {
       if (!(this instanceof Agent)) return new Agent(options);
       EventEmitter.call(this);
@@ -19492,6 +19754,12 @@
       this.scheduling = this.options.scheduling || "lifo";
       this.maxTotalSockets = this.options.maxTotalSockets;
       this.totalSocketCount = 0;
+      this.agentKeepAliveTimeoutBuffer =
+        typeof this.options.agentKeepAliveTimeoutBuffer === "number" &&
+        this.options.agentKeepAliveTimeoutBuffer >= 0 &&
+        Number.isFinite(this.options.agentKeepAliveTimeoutBuffer)
+          ? this.options.agentKeepAliveTimeoutBuffer
+          : 1000;
       if (this.scheduling !== "fifo" && this.scheduling !== "lifo") {
         throw codes.ERR_INVALID_ARG_VALUE(
           "scheduling",
@@ -19499,9 +19767,55 @@
           "must be one of: 'fifo', 'lifo'",
         );
       }
-      if (this.maxTotalSockets === undefined) this.maxTotalSockets = Infinity;
-      this.on("free", function (socket) {
-        socket.destroy();
+      if (this.maxTotalSockets !== undefined) {
+        if (typeof this.maxTotalSockets !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("maxTotalSockets", "number", this.maxTotalSockets);
+        }
+        if (this.maxTotalSockets < 1 || Number.isNaN(this.maxTotalSockets)) {
+          throw codes.ERR_OUT_OF_RANGE("maxTotalSockets", ">= 1", this.maxTotalSockets);
+        }
+      } else {
+        this.maxTotalSockets = Infinity;
+      }
+
+      this.on("free", (socket, options) => {
+        const name = this.getName(options);
+        if (!socket.writable) {
+          socket.destroy();
+          return;
+        }
+        const requests = this.requests[name];
+        if (requests && requests.length) {
+          const req = requests.shift();
+          setRequestSocket(this, req, socket);
+          if (requests.length === 0) delete this.requests[name];
+          return;
+        }
+        // If there are no pending requests, then put it in the freeSockets
+        // pool, but only if we're allowed to do so.
+        const req = socket._httpMessage;
+        if (!req || !req.shouldKeepAlive || !this.keepAlive) {
+          socket.destroy();
+          return;
+        }
+        const freeSockets = this.freeSockets[name] || [];
+        const freeLen = freeSockets.length;
+        let count = freeLen;
+        if (this.sockets[name]) count += this.sockets[name].length;
+        if (
+          this.totalSocketCount > this.maxTotalSockets ||
+          count > this.maxSockets ||
+          freeLen >= this.maxFreeSockets ||
+          !this.keepSocketAlive(socket)
+        ) {
+          socket.destroy();
+          return;
+        }
+        this.freeSockets[name] = freeSockets;
+        socket._httpMessage = null;
+        this.removeSocket(socket, options);
+        socket.once("error", freeSocketErrorListener);
+        freeSockets.push(socket);
       });
     }
     Object.setPrototypeOf(Agent.prototype, EventEmitter.prototype);
@@ -19537,14 +19851,38 @@
       normalizeServerName(options, req);
       const name = this.getName(options);
       this.sockets[name] ||= [];
-      // No free socket to reuse and no queue: a new connection.
-      this.createSocket(req, options, (err, socket) => {
-        if (err) {
-          req.onSocket(socket, err);
-          return;
-        }
+
+      const freeSockets = this.freeSockets[name];
+      let socket;
+      if (freeSockets) {
+        while (freeSockets.length && freeSockets[0].destroyed) freeSockets.shift();
+        socket = this.scheduling === "fifo" ? freeSockets.shift() : freeSockets.pop();
+        if (!freeSockets.length) delete this.freeSockets[name];
+      }
+      const freeLen = freeSockets ? freeSockets.length : 0;
+      const sockLen = freeLen + this.sockets[name].length;
+
+      if (socket) {
+        // Reusing a socket from the pool.
+        this.reuseSocket(socket, req);
         setRequestSocket(this, req, socket);
-      });
+        this.sockets[name].push(socket);
+      } else if (sockLen < this.maxSockets && this.totalSocketCount < this.maxTotalSockets) {
+        // Under maxSockets: a new one.
+        this.createSocket(req, options, (err, socket) => {
+          if (err) {
+            req.onSocket(socket, err);
+            return;
+          }
+          setRequestSocket(this, req, socket);
+        });
+      } else {
+        // Over the limit: the request waits for a socket.
+        this.requests[name] ||= [];
+        // Used to create sockets for pending requests from different origin.
+        req[kRequestOptions] = options;
+        this.requests[name].push(req);
+      }
     };
 
     Agent.prototype.createSocket = function createSocket(req, options, cb) {
@@ -19609,16 +19947,26 @@
       s.on("free", onFree);
       function onClose() {
         // This is the only place where sockets get removed from the Agent.
+        // If you want to remove a socket from the pool, just close it.
         agent.totalSocketCount--;
         agent.removeSocket(s, options);
       }
       s.on("close", onClose);
+      function onTimeout() {
+        // Destroy if in free list.
+        const sockets = agent.freeSockets;
+        if (Object.keys(sockets).some((name) => sockets[name].includes(s))) {
+          return s.destroy();
+        }
+      }
+      s.on("timeout", onTimeout);
       function onRemove() {
-        // An upgraded socket leaves the agent.
+        // An upgraded socket leaves the pool: it is locked up indefinitely.
         agent.totalSocketCount--;
         agent.removeSocket(s, options);
         s.removeListener("close", onClose);
         s.removeListener("free", onFree);
+        s.removeListener("timeout", onTimeout);
         s.removeListener("agentRemove", onRemove);
       }
       s.on("agentRemove", onRemove);
@@ -19647,17 +19995,67 @@
           }
         }
       }
+      let req;
+      if (this.requests[name] && this.requests[name].length) {
+        req = this.requests[name][0];
+      } else {
+        // (node: not FIFO across origins.)
+        const keys = Object.keys(this.requests);
+        for (let i = 0; i < keys.length; i++) {
+          const prop = keys[i];
+          // Check whether this specific origin is already at maxSockets.
+          if (this.sockets[prop] && this.sockets[prop].length) break;
+          req = this.requests[prop][0];
+          options = req[kRequestOptions];
+          break;
+        }
+      }
+      if (req && options) {
+        req[kRequestOptions] = undefined;
+        // If we have pending requests and a socket gets closed make a new one.
+        this.createSocket(req, options, (err, socket) => {
+          if (err) {
+            req.onSocket(null, err);
+            return;
+          }
+          socket.emit("free");
+        });
+      }
     };
 
     Agent.prototype.keepSocketAlive = function keepSocketAlive(socket) {
       socket.setKeepAlive(true, this.keepAliveMsecs);
       socket.unref();
-      return true;
+      let agentTimeout = this.options.timeout || 0;
+      let canKeepSocketAlive = true;
+      const req = socket._httpMessage;
+      if (req && req.res) {
+        const keepAliveHint = req.res.headers["keep-alive"];
+        if (keepAliveHint) {
+          const match = /^timeout=(\d+)/.exec(keepAliveHint);
+          const hint = match ? match[1] : undefined;
+          if (hint) {
+            // Let the timer expire before the announced timeout to reduce the
+            // likelihood of ECONNRESET errors.
+            let serverHintTimeout = Number.parseInt(hint) * 1000 - this.agentKeepAliveTimeoutBuffer;
+            serverHintTimeout = serverHintTimeout > 0 ? serverHintTimeout : 0;
+            if (serverHintTimeout === 0) {
+              // Cannot safely reuse the socket: the server timeout is too short.
+              canKeepSocketAlive = false;
+            } else if (serverHintTimeout < agentTimeout) {
+              agentTimeout = serverHintTimeout;
+            }
+          }
+        }
+      }
+      if (socket.timeout !== agentTimeout) socket.setTimeout(agentTimeout);
+      return canKeepSocketAlive;
     };
 
     Agent.prototype.reuseSocket = function reuseSocket(socket, req) {
-      socket.ref();
+      socket.removeListener("error", freeSocketErrorListener);
       req.reusedSocket = true;
+      socket.ref();
     };
 
     Agent.prototype.destroy = function destroy() {
@@ -20711,6 +21109,9 @@
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
+          // node's socket timeouts are unref'd timers: an idle timeout never
+          // keeps the process alive (a pooled, unref'd socket's included).
+          if (typeof this._timeoutId.unref === "function") this._timeoutId.unref();
         }
       }
       setNoDelay() { return this; }
@@ -25814,6 +26215,9 @@
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
+          // node's socket timeouts are unref'd timers: an idle timeout never
+          // keeps the process alive (a pooled, unref'd socket's included).
+          if (typeof this._timeoutId.unref === "function") this._timeoutId.unref();
         }
       }
       // Chainable no-ops, as on net.Socket: ioredis calls both on every
