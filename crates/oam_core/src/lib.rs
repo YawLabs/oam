@@ -689,6 +689,12 @@ pub struct CoreRuntime {
     /// http.request exchanges over a JS socket (`http_client::bridge`);
     /// dropped with the run.
     http_bridges: http_client::bridge::Bridges,
+    /// Byte pipes between a JS socket and a Rust consumer
+    /// (`http_client::pipe`); dropped with the run.
+    socket_pipes: http_client::pipe::Pipes,
+    /// http2.connect sessions over a pipe (`http_client::h2_session`);
+    /// dropped with the run.
+    h2_sessions: http_client::h2_session::H2Sessions,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -772,6 +778,8 @@ impl CoreRuntime {
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            socket_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            h2_sessions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
             next_id: 1,
@@ -848,6 +856,16 @@ impl CoreRuntime {
     /// http.request exchanges over a JS socket (Arc clone).
     pub fn http_bridges(&self) -> http_client::bridge::Bridges {
         self.http_bridges.clone()
+    }
+
+    /// Byte pipes between a JS socket and a Rust consumer (Arc clone).
+    pub fn socket_pipes(&self) -> http_client::pipe::Pipes {
+        self.socket_pipes.clone()
+    }
+
+    /// http2.connect sessions (Arc clone).
+    pub fn h2_sessions(&self) -> http_client::h2_session::H2Sessions {
+        self.h2_sessions.clone()
     }
 
     /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,
@@ -3760,6 +3778,7 @@ pub mod ops {
     /// body reader is [`fetch_body_read`].
     pub use crate::http_client::send::{
         FetchContinuations, FetchRequest, RedirectMode, fetch, fetch_abandon, fetch_continue,
+        fetch_supply,
     };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.

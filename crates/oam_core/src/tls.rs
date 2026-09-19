@@ -1212,13 +1212,38 @@ pub async fn tls_connect(
         max_version,
         attempt_timeout,
         None,
+        Vec::new(),
     )
     .await
+}
+
+/// `tls.connect`'s `ALPNProtocols` as the connect op carries it: a JSON array
+/// of protocol names, each one byte per code point (a Buffer entry arrives
+/// latin1-decoded). Each name is 1-255 bytes, the limits TLS puts on one.
+pub fn parse_alpn_protocols(json: &str) -> Result<Vec<Vec<u8>>, String> {
+    let names: Vec<String> = serde_json::from_str(json)
+        .map_err(|e| format!("tlsConnect: malformed ALPNProtocols: {e}"))?;
+    names
+        .iter()
+        .map(|name| {
+            let bytes = name
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| "tlsConnect: an ALPN protocol name must be bytes".to_string())?;
+            if bytes.is_empty() || bytes.len() > 255 {
+                return Err("tlsConnect: an ALPN protocol name must be 1-255 bytes".to_string());
+            }
+            Ok(bytes)
+        })
+        .collect()
 }
 
 /// [`tls_connect`] with the addresses JS resolved for `host` standing in for
 /// getaddrinfo, as [`crate::tcp::tcp_connect_pinned`] takes them. The server
 /// name is still `server_name` or `host`, never an address from the pin.
+/// `alpn` is `ALPNProtocols` in preference order (empty: none offered); the
+/// protocol the server selected is the result's `alpnProtocol`.
 #[allow(clippy::too_many_arguments)]
 pub async fn tls_connect_pinned(
     registry: TlsRegistry,
@@ -1234,6 +1259,7 @@ pub async fn tls_connect_pinned(
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
     pin: Option<crate::net_connect::Pin>,
+    alpn: Vec<Vec<u8>>,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
@@ -1275,7 +1301,7 @@ pub async fn tls_connect_pinned(
         Err(e) => return OpOutcome::Failed(format!("invalid server name '{sni}': {e}")),
     };
 
-    let (config, verdict) = match build_client_config(
+    let (mut config, verdict) = match build_client_config(
         ca_pem.as_deref(),
         client_cert_pem.as_deref(),
         client_key_pem.as_deref(),
@@ -1285,6 +1311,7 @@ pub async fn tls_connect_pinned(
         Ok(built) => built,
         Err(e) => return OpOutcome::Failed(e),
     };
+    config.alpn_protocols = alpn;
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tls_stream = match connector.connect(server_name, tcp).await {

@@ -26,7 +26,8 @@ use hyper_util::client::proxy::matcher::Matcher;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 
 use super::connector::{
-    ConnStats, HostAddrs, OamConnector, Shared, TlsSetupError, Via, authority_key,
+    ConnStats, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via,
+    authority_key,
 };
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
@@ -126,6 +127,32 @@ impl HttpTransport {
         Route {
             attempt_timeout,
             hooked,
+            supplied: None,
+        }
+    }
+
+    /// The route of one fetch whose undici dispatcher carries a `connect`
+    /// FUNCTION: its own client, whose every connection is one JS supplied
+    /// (recorded with [`Route::supply`]) from the socket that function
+    /// returned. Nothing on it is pooled -- each hop parks for a connection
+    /// of its own and uses it once -- so a supplied connection can never be
+    /// reused for a request the dispatcher's function was not asked about.
+    pub fn supplied_route(&self, attempt_timeout: Duration) -> Route {
+        let conns: SuppliedConns = Arc::new(Mutex::new(HashMap::new()));
+        let client = Client::builder(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .pool_timer(TokioTimer::new())
+            .pool_max_idle_per_host(0)
+            .build(OamConnector {
+                shared: self.shared.clone(),
+                via: Via::Supplied {
+                    conns: conns.clone(),
+                },
+            });
+        Route {
+            attempt_timeout,
+            hooked: None,
+            supplied: Some(Supplied { conns, client }),
         }
     }
 
@@ -135,9 +162,10 @@ impl HttpTransport {
         route: &Route,
         mut request: http::Request<ReqBody>,
     ) -> Result<http::Response<Incoming>, SendError> {
-        let client = match &route.hooked {
-            Some(hooked) => &hooked.client,
-            None => {
+        let client = match (&route.hooked, &route.supplied) {
+            (Some(hooked), _) => &hooked.client,
+            (None, Some(supplied)) => &supplied.client,
+            (None, None) => {
                 self.shared.set_attempt_timeout(route.attempt_timeout);
                 &self.client
             }
@@ -169,9 +197,9 @@ impl HttpTransport {
     /// The `proxy-authorization` value this hop needs: only an http request
     /// on a pooled route that the proxy rules send to an http(s) proxy with
     /// credentials. An https request carries the credentials in its CONNECT
-    /// instead, and a hooked route never uses a proxy.
+    /// instead, and a hooked or supplied route never uses a proxy.
     pub fn proxy_authorization(&self, route: &Route, uri: &Uri) -> Option<HeaderValue> {
-        if route.hooked.is_some() || uri.scheme_str() != Some("http") {
+        if route.hooked.is_some() || route.supplied.is_some() || uri.scheme_str() != Some("http") {
             return None;
         }
         let intercept = self.shared.proxy.as_ref()?.intercept(uri)?;
@@ -205,10 +233,16 @@ fn build_client(connector: OamConnector) -> Client<OamConnector, ReqBody> {
 pub struct Route {
     attempt_timeout: Duration,
     hooked: Option<Hooked>,
+    supplied: Option<Supplied>,
 }
 
 struct Hooked {
     addrs: HostAddrs,
+    client: Client<OamConnector, ReqBody>,
+}
+
+struct Supplied {
+    conns: SuppliedConns,
     client: Client<OamConnector, ReqBody>,
 }
 
@@ -242,6 +276,37 @@ impl Route {
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&key);
         (!known).then_some((key, host))
+    }
+
+    /// On a supplied route, the authority key `uri` needs a connection for:
+    /// `None` when one JS supplied is waiting for it, and on every other
+    /// route. Every hop asks, IP literals included -- undici calls its
+    /// connector for every connection, whatever the host.
+    pub fn connection_needed(&self, uri: &Uri) -> Option<String> {
+        let supplied = self.supplied.as_ref()?;
+        let key = authority_key(uri)?;
+        let waiting = supplied
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_some_and(|queue| !queue.is_empty());
+        (!waiting).then_some(key)
+    }
+
+    /// Record a connection JS supplied under the `key`
+    /// [`Route::connection_needed`] returned (no-op on another route, which
+    /// drops it).
+    pub(crate) fn supply(&self, key: &str, conn: SuppliedConn) {
+        if let Some(supplied) = &self.supplied {
+            supplied
+                .conns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key.to_string())
+                .or_default()
+                .push(conn);
+        }
     }
 
     /// Record the hook's addresses under the `key` [`Route::lookup_needed`]

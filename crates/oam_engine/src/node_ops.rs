@@ -336,6 +336,20 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
+        // A socket's bytes to and from a Rust consumer (oam_core
+        // http_client::pipe): http2.connect sessions, and fetches over an
+        // undici connect function's socket.
+        ("socketPipeOpen", op_socket_pipe_open),
+        ("socketPipeOut", op_socket_pipe_out),
+        ("socketPipeIn", op_socket_pipe_in),
+        ("socketPipeInEnd", op_socket_pipe_in_end),
+        ("socketPipeClose", op_socket_pipe_close),
+        // http2.connect sessions over a pipe (http_client::h2_session)
+        ("http2SessionOpen", op_http2_session_open),
+        ("http2SessionRequest", op_http2_session_request),
+        ("http2SessionWait", op_http2_session_wait),
+        ("http2SessionClose", op_http2_session_close),
+        ("http2SessionDestroy", op_http2_session_destroy),
         ("netCheck", op_net_check),
         ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
@@ -3024,6 +3038,173 @@ fn op_http_bridge_close(
     rv.set_bool(closed);
 }
 
+// ------------------------------------------------------- socket pipes
+
+/// `__oam.node.socketPipeOpen() -> id`: a byte pipe JS pumps to and from a
+/// socket, whose other end a Rust consumer takes (`http2SessionOpen`,
+/// `__oam.fetchSupply`).
+fn op_socket_pipe_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let core = core_runtime!(scope);
+    let id = oam_core::http_client::pipe::open(&core.socket_pipes(), &core.body_ids());
+    rv.set_double(id as f64);
+}
+
+/// `__oam.node.socketPipeOut(id)`: the next bytes the consumer wrote, for the
+/// socket, or undefined at the end. Unref'd, as `httpBridgeOut`: it waits on
+/// the consumer, and the socket's own read is what keeps a live connection's
+/// process running.
+fn op_socket_pipe_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).socket_pipes();
+    crate::ops::spawn_op_unref(scope, &mut rv, oam_core::http_client::pipe::out(pipes, id));
+}
+
+/// `__oam.node.socketPipeIn(id, bytes)`: bytes the socket read.
+fn op_socket_pipe_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "socketPipeIn requires bytes");
+        return;
+    };
+    let pipes = core_runtime!(scope).socket_pipes();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::pipe::input(pipes, id, bytes),
+    );
+}
+
+/// `__oam.node.socketPipeInEnd(id)`: the socket reached EOF.
+fn op_socket_pipe_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).socket_pipes();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::pipe::input_end(pipes, id),
+    );
+}
+
+/// `__oam.node.socketPipeClose(id)`: drop the pipe. True if it was open.
+fn op_socket_pipe_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed = id >= 0.0
+        && oam_core::http_client::pipe::close(&core_runtime!(scope).socket_pipes(), id as u64);
+    rv.set_bool(closed);
+}
+
+// ------------------------------------------------------- http2 sessions
+
+/// `__oam.node.http2SessionOpen(pipeId)`: an HTTP/2 client session over the
+/// consumer end of socket pipe `pipeId`; resolves with `{session}`.
+fn op_http2_session_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pipe_id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let core = core_runtime!(scope);
+    let sessions = core.h2_sessions();
+    let pipes = core.socket_pipes();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::open(sessions, pipes, pipe_id, ids),
+    );
+}
+
+/// `__oam.node.http2SessionRequest(session, requestJson)`: open one stream;
+/// resolves at its response head with the body under `bodyHandle` (read with
+/// `__oam.fetchBodyRead`).
+fn op_http2_session_request(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(request) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "http2SessionRequest requires a request");
+        return;
+    };
+    let core = core_runtime!(scope);
+    let sessions = core.h2_sessions();
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    let outbound = core.outbound_bodies();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::request(sessions, id, request, bodies, ids, outbound),
+    );
+}
+
+/// `__oam.node.http2SessionWait(session)`: resolves when the session's
+/// connection ends, with how it ended. Unref'd: the socket keeps a live
+/// session's process running, as in node.
+fn op_http2_session_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let sessions = core_runtime!(scope).h2_sessions();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::wait(sessions, id),
+    );
+}
+
+/// `__oam.node.http2SessionClose(session)`: open no more streams; the
+/// connection ends with a GOAWAY once the open ones are done.
+fn op_http2_session_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed = id >= 0.0
+        && oam_core::http_client::h2_session::close(&core_runtime!(scope).h2_sessions(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.http2SessionDestroy(session)`: drop the session and abort its
+/// connection.
+fn op_http2_session_destroy(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let destroyed = id >= 0.0
+        && oam_core::http_client::h2_session::destroy(
+            &core_runtime!(scope).h2_sessions(),
+            id as u64,
+        );
+    rv.set_bool(destroyed);
+}
+
 /// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to
 /// `host:port`, the resource `tcpConnect` / `tlsConnect` ask about, taken
 /// synchronously inside `net.connect()` / `tls.connect()` before the name is
@@ -3449,6 +3630,19 @@ fn op_tls_connect(
     let Some(pin) = connect_pin_arg(scope, &args, 10, "tlsConnect", &host) else {
         return;
     };
+    // ALPNProtocols: a JSON array of protocol names, one byte per code
+    // point, in preference order (tls.connect has already refused an empty
+    // or over-long one); absent or empty offers none.
+    let alpn = match arg_string(scope, &args, 11).filter(|s| !s.is_empty()) {
+        None => Vec::new(),
+        Some(json) => match oam_core::tls::parse_alpn_protocols(&json) {
+            Ok(alpn) => alpn,
+            Err(message) => {
+                throw_type_error(scope, &message);
+                return;
+            }
+        },
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3489,6 +3683,7 @@ fn op_tls_connect(
             max_version,
             attempt_timeout,
             pin,
+            alpn,
         ),
     );
 }

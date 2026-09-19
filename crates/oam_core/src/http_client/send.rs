@@ -16,6 +16,14 @@
 //! before the first park (a bad-port URL never reaches the hook), and a
 //! hop's redirect checks, bad port included, run before that hop parks.
 //!
+//! A fetch whose dispatcher carries a `connect` FUNCTION (a custom undici
+//! connector) runs in connector mode, which parks the same way for a
+//! different answer: before every send it resolves with
+//! `{"connect": {token, host, hostname, protocol, port}}` -- the parameters
+//! undici calls its connector with -- and JS resumes it with the socket that
+//! function returned, piped ([`fetch_supply`]). The request then goes over
+//! that socket and nowhere else; no hop is ever dialled here.
+//!
 //! Under `--permission`, the engine's net grant ([`NetCheck`]) is applied to
 //! every hop's host at the top of the loop: before the hop parks for its
 //! lookup hook, before anything dials, and whichever route (pooled, hooked,
@@ -34,7 +42,7 @@ use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, PROXY_AUTHORIZAT
 use hyper::body::Incoming;
 
 use super::body::{FetchBodies, FetchBody, StreamSlot};
-use super::connector::ConnInfo;
+use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
@@ -65,6 +73,10 @@ pub struct FetchRequest {
     /// the module docs).
     #[serde(default)]
     pub lookup_hook: bool,
+    /// The dispatcher carries a `connect` FUNCTION: run in connector mode
+    /// (see the module docs). Wins over `lookup_hook`.
+    #[serde(default)]
+    pub connect_hook: bool,
     /// `net.getDefaultAutoSelectFamilyAttemptTimeout()` at call time.
     /// Missing or not a positive number: node's 250 ms.
     #[serde(default)]
@@ -122,6 +134,17 @@ pub struct PendingFetch {
     /// (`connector::authority_key`), which is not the host: a hop to the same
     /// name on another port is a separate authority and parks again.
     key: String,
+    /// What the fetch waits for: a lookup answer, or a connection.
+    wants: Wants,
+}
+
+/// The answer a parked fetch takes; the other is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wants {
+    /// `fetchContinue` with the hook's addresses.
+    Addresses,
+    /// `fetchSupply` with a connection from the dispatcher's `connect`.
+    Connection,
 }
 
 impl PendingFetch {
@@ -250,10 +273,12 @@ pub async fn fetch(
     } else {
         BodySource::Empty
     };
-    let route = transport.route(
-        req.lookup_hook,
-        attempt_timeout_from_ms(req.attempt_timeout_ms),
-    );
+    let attempt_timeout = attempt_timeout_from_ms(req.attempt_timeout_ms);
+    let route = if req.connect_hook {
+        transport.supplied_route(attempt_timeout)
+    } else {
+        transport.route(req.lookup_hook, attempt_timeout)
+    };
     let state = LoopState {
         transport,
         route,
@@ -280,13 +305,8 @@ pub async fn fetch_continue(
     ids: Arc<AtomicU64>,
     continuations: FetchContinuations,
 ) -> OpOutcome {
-    let pending = lock(&continuations).remove(&token);
-    let Some(PendingFetch {
-        state,
-        host: _,
-        key,
-    }) = pending
-    else {
+    let pending = take_parked(&continuations, token, Wants::Addresses);
+    let Some(PendingFetch { state, key, .. }) = pending else {
         return OpOutcome::Failed(format!("fetch: lookup continuation {token} is gone"));
     };
     #[derive(serde::Deserialize)]
@@ -311,6 +331,43 @@ pub async fn fetch_continue(
     // An empty list reaches the connector, which fails it as node's
     // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here).
     state.route.set_addrs(&key, addrs);
+    run(state, &bodies, &ids, &continuations).await
+}
+
+/// The fetch parked under `token`, if it waits for `wants`. One that waits
+/// for the other answer stays parked: a connector-mode fetch is never
+/// resumed with addresses (it would park again for its connection), nor a
+/// lookup-mode fetch with a connection.
+fn take_parked(
+    continuations: &FetchContinuations,
+    token: u64,
+    wants: Wants,
+) -> Option<PendingFetch> {
+    let mut map = lock(continuations);
+    if map.get(&token)?.wants != wants {
+        return None;
+    }
+    map.remove(&token)
+}
+
+/// `fetchSupply`: resume the connector-mode fetch parked under `token` with
+/// the connection its dispatcher's `connect` function returned -- the
+/// consumer end of the pipe JS pumps that socket through (`h2`: the socket
+/// negotiated h2 by ALPN). Resolves like [`fetch`]. A fetch that is not
+/// parked for a connection is left alone and the op fails.
+pub async fn fetch_supply(
+    token: u64,
+    io: tokio::io::DuplexStream,
+    h2: bool,
+    bodies: FetchBodies,
+    ids: Arc<AtomicU64>,
+    continuations: FetchContinuations,
+) -> OpOutcome {
+    let pending = take_parked(&continuations, token, Wants::Connection);
+    let Some(PendingFetch { state, key, .. }) = pending else {
+        return OpOutcome::Failed(format!("fetch: connect continuation {token} is gone"));
+    };
+    state.route.supply(&key, SuppliedConn { io, h2 });
     run(state, &bodies, &ids, &continuations).await
 }
 
@@ -344,6 +401,45 @@ async fn run(
             Ok(uri) => uri,
             Err(text) => return OpOutcome::Failed(text.to_string()),
         };
+        if let Some(key) = state.route.connection_needed(&uri) {
+            // undici's connector parameters (dispatcher/client.js connect):
+            // `host` / `hostname` / `protocol` / `port` of the origin URL --
+            // the host with its port when the URL names one, the hostname
+            // unbracketed, the port a string, '' for the scheme's default.
+            let url = &state.current;
+            let hostname = url.host_str().unwrap_or_default();
+            let unbracketed = hostname
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(hostname)
+                .to_string();
+            let port = url.port().map(|p| p.to_string()).unwrap_or_default();
+            let host = if port.is_empty() {
+                hostname.to_string()
+            } else {
+                format!("{hostname}:{port}")
+            };
+            let token = ids.fetch_add(1, Ordering::Relaxed);
+            let payload = serde_json::json!({
+                "connect": {
+                    "token": token,
+                    "host": host,
+                    "hostname": unbracketed,
+                    "protocol": format!("{}:", url.scheme()),
+                    "port": port,
+                },
+            });
+            lock(continuations).insert(
+                token,
+                PendingFetch {
+                    state,
+                    host: unbracketed,
+                    key,
+                    wants: Wants::Connection,
+                },
+            );
+            return OpOutcome::Json(payload.to_string());
+        }
         if let Some((key, host)) = state.route.lookup_needed(&uri) {
             // The port as undici's connector hands it to net.connect, which
             // is what node's ERR_INVALID_ADDRESS_FAMILY carries: the URL's
@@ -360,7 +456,15 @@ async fn run(
             let payload = serde_json::json!({
                 "lookup": { "token": token, "host": host, "port": port },
             });
-            lock(continuations).insert(token, PendingFetch { state, host, key });
+            lock(continuations).insert(
+                token,
+                PendingFetch {
+                    state,
+                    host,
+                    key,
+                    wants: Wants::Addresses,
+                },
+            );
             return OpOutcome::Json(payload.to_string());
         }
         let mut hop_url = state.current.clone();

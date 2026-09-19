@@ -90,13 +90,19 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 19] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 20] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
         (
             "fetchContinue",
             v8::Function::new(scope, op_fetch_continue).unwrap(),
+        ),
+        // A fetch whose dispatcher has a `connect` function parks before
+        // every connection; JS calls it and resumes with its socket, piped.
+        (
+            "fetchSupply",
+            v8::Function::new(scope, op_fetch_supply).unwrap(),
         ),
         (
             "fetchAbandon",
@@ -438,6 +444,45 @@ fn op_fetch_continue(
         scope,
         &mut rv,
         oam_core::ops::fetch_continue(token, answer, bodies, ids, continuations),
+    );
+}
+
+/// `__oam.fetchSupply(token, pipeId, h2)`: resume the connector-mode fetch
+/// parked under `token` with the connection its dispatcher's `connect`
+/// function returned -- the consumer end of socket pipe `pipeId`, which JS
+/// pumps to and from that socket. Settles like `fetch`. The hop's host was
+/// checked against the `--permission` net grant before it parked, and the
+/// socket itself was opened through net / tls, which check what they dial.
+/// A pipe that is gone fails the op and drops the parked fetch.
+fn op_fetch_supply(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let pipe_id = args.get(1).number_value(scope).unwrap_or(-1.0);
+    let h2 = args.get(2).boolean_value(scope);
+    let core = core_runtime!(scope);
+    let continuations = core.fetch_continuations();
+    let io = if pipe_id >= 0.0 {
+        oam_core::http_client::pipe::take(&core.socket_pipes(), pipe_id as u64)
+    } else {
+        None
+    };
+    let Some(io) = io else {
+        oam_core::ops::fetch_abandon(token, &continuations);
+        let message = format!("fetch: connection pipe {pipe_id} is gone");
+        spawn_op(scope, &mut rv, async move {
+            oam_core::OpOutcome::Failed(message)
+        });
+        return;
+    };
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fetch_supply(token, io, h2, bodies, ids, continuations),
     );
 }
 
